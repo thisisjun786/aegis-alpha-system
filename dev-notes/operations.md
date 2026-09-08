@@ -131,6 +131,26 @@ docker compose run --rm aas doctor
 상시 앱의 소켓·예약 실행은 [0013](decisions/0013-first-install-workspace.md)에서 승인됐지만
 미구현인 설계다. 현재 명령은 소켓으로 전달되지 않으며 잠금 충돌 시 `installation_busy`로 실패한다.
 
+## Qveris 원문 수집
+
+`aas collect daily --config /path/to/collection.json --state-root /path/to/private-journal`은
+명시한 공급자 설정으로 하루 한 번 수집을 접수한다. Qveris 설정은 `provider=qveris`,
+`mode=daily`, 비공개 `credential_file`, 양수 `max_calls`를 요구한다. `options`에는
+`jobs`, `jobs_sha256`, `raw_store_root`, `max_credits`, `timeout_seconds`를 지정한다.
+작업 문서는 [qveris_contracts.py](../src/aegis_alpha/data/qveris_contracts.py), 설정 검증은
+[provider_config.py](../src/aegis_alpha/application/provider_config.py)가 소유한다.
+
+작업 해시가 다르면 키를 읽기 전에 실패한다. 유료 호출 전에 견적과 잔액을 확인하며,
+원문을 저장한 뒤 사용량을 대조한다. 완료된 작업은 재사용하고 결과가 불확실한 호출은
+자동 재시도하지 않는다. 같은 UTC 날짜의 접수 기록을 유지해야 중복 실행을 막을 수 있다.
+`provider_calls`와 `http_requests`는 각각 유료 실행과 전체 HTTP 시도 수다.
+
+이 명령은 원문 수집까지만 수행하며 `native_import_completed=false`를 반환한다.
+검증된 원문을 DuckDB 원본 자료실에 적재하려면 별도의 명시적 적재 작업이 필요하다.
+가격의 조정 기준·종목 식별·거래일·공개 시각을 확인하기 전에는 백테스트 입력이나
+`data datasets`의 시장 버전으로 자동 승격하지 않는다. 예약 실행은 운영자가 별도로
+설치하고 실제 적재 결과와 중복 호출 여부를 확인한다. 패키지 설치는 예약 작업을 만들지 않는다.
+
 ## 전환 중인 공급자 도구
 
 `aas providers`와 기존 수집기는 유지되지만 일부는 아직 PostgreSQL/Parquet adapter를 쓴다.
