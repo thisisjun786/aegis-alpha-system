@@ -8,7 +8,7 @@ from __future__ import annotations
 
 # ruff: noqa: S608 -- dynamic identifiers are manifest-owned and always quoted.
 import base64
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
@@ -111,7 +111,7 @@ def iter_source_rows(
     *,
     columns: Sequence[str] | None = None,
     batch_size: int = 65536,
-) -> Iterator[tuple[Mapping[str, object], ...]]:
+) -> Generator[tuple[Mapping[str, object], ...], None, None]:
     """Yield selected columns in bounded batches, without reading other tables."""
     if type(batch_size) is not int or not 1 <= batch_size <= _MAX_BATCH_ROWS:
         raise ValueError("batch_size must be an integer in [1, 1000000]")
@@ -124,8 +124,10 @@ def iter_source_rows(
         or len(set(selected)) != len(selected)
     ):
         raise ValueError("selected columns must be unique members of the source schema")
-    cursor = connections(workspace)[str(table["store"])].execute(
-        _query(str(table["target"]), selected)
-    )
-    while rows := cursor.fetchmany(batch_size):
-        yield tuple(MappingProxyType(dict(zip(selected, row, strict=True))) for row in rows)
+    cursor = connections(workspace)[str(table["store"])].cursor()
+    try:
+        cursor.execute(_query(str(table["target"]), selected))
+        while rows := cursor.fetchmany(batch_size):
+            yield tuple(MappingProxyType(dict(zip(selected, row, strict=True))) for row in rows)
+    finally:
+        cursor.close()

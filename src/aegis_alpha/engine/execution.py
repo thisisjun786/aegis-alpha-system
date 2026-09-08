@@ -54,7 +54,10 @@ class ReplayResult:
 def _finite(value: object) -> bool:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
-    return math.isfinite(value)
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _as_finite(value: object) -> float | None:
@@ -147,7 +150,7 @@ def _validate_targets(
         for symbol, weight in mapping.items():
             _require_symbol(symbol)
             parsed = _as_finite(weight)
-            if parsed is None or parsed < 0:
+            if parsed is None or not 0 <= parsed <= 1:
                 msg = "long-only target weights must sum to at most one"
                 raise ValueError(msg)
             values.append(parsed)

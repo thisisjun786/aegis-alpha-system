@@ -99,3 +99,20 @@ def test_invalid_batch_size_rejected_before_source_lookup(tmp_path: Path, size: 
                 workspace, SourcePin("missing", "0" * 64, "x", "0" * 64), batch_size=size
             )
         )
+
+
+def test_interleaved_duckdb_readers_keep_independent_results(tmp_path: Path) -> None:
+    home = tmp_path / "native"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        import_arrow(
+            workspace, "prices", "0" * 64, "bars", pa.table({"value": [10, 20]}).to_reader()
+        )
+        table = list_tables(workspace, "prices")[0]
+        pin = SourcePin("prices", "0" * 64, "bars", str(table["digest"]))
+        first = iter_source_rows(workspace, pin, batch_size=1)
+        second = iter_source_rows(workspace, pin, batch_size=1)
+        assert [dict(next(first)[0]), dict(next(second)[0])] == [{"value": 10}, {"value": 10}]
+        assert [dict(next(first)[0]), dict(next(second)[0])] == [{"value": 20}, {"value": 20}]
+        first.close()
+        second.close()

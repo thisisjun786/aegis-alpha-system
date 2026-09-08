@@ -245,9 +245,19 @@ def test_nonfinite_portfolio_arithmetic_is_rejected() -> None:
 
 
 def test_compensated_weight_sum_preserves_full_allocation() -> None:
-    # One third plus four rounded sixths totals one; naive += adds rounding drift.
+    # Correctly rounded sum is one (exact rational sum exceeds it by 5.55e-17).
     weights = {"SYN_A": 1 / 3, **{f"SYN_{n}": 0.16666666666666669 for n in range(4)}}
     prices = dict.fromkeys(weights, 1.0)
     result = replay_next_open(DAYS, [prices] * 3, [prices] * 3, {DAYS[0]: weights}, 100.0, 0.0)
     assert result.nav[-1].equity == pytest.approx(100.0)
     assert result.nav[-1].cash == pytest.approx(0.0, abs=1e-12)
+
+
+def test_extreme_inputs_keep_value_error_boundary() -> None:
+    prices = [{"SYN_A": 1.0, "SYN_B": 1.0}] * 3
+    with pytest.raises(ValueError, match="weights"):
+        replay_next_open(
+            DAYS, prices, prices, {DAYS[0]: {"SYN_A": 1e308, "SYN_B": 1e308}}, 100.0, 0.0
+        )
+    with pytest.raises(ValueError, match="initial cash"):
+        replay_next_open(DAYS, prices, prices, {}, 10**1000, 0.0)
