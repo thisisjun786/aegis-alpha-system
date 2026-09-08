@@ -80,10 +80,16 @@ def verify_workspace(workspace: Workspace) -> dict[str, object]:  # noqa: C901, 
     ).fetchone()[0]
     untracked = workspace.market.execute("SELECT generation_id FROM market_generations").fetchall()
     visible = {row["generation_id"] for row in versions}
-    return {
+    report: dict[str, object] = {
         "verified": True,
         "dataset_versions": len(versions),
         "strategy_versions": len(strategies),
         "pending_operations": pending,
         "orphan_generations": [row[0] for row in untracked if row[0] not in visible],
     }
+    from aegis_alpha.storage.source_library import verify_sources  # noqa: PLC0415
+
+    sources = verify_sources(workspace)
+    if sources is not None:
+        report["source_library"] = sources
+    return report

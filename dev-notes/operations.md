@@ -45,6 +45,35 @@ aas data read --dataset ID --version VERSION --cutoff-us UTC_MICROSECONDS
 시각을 기록하며 파일에 적힌 수집 시각을 시스템 관측으로 인정하지 않는다. 공급자의 조정 가격은 참고값이며
 PIT 입력으로 승격하지 않는다. 조회·게시만으로 coverage·backtest 자격이 확보됐다고 표시하지 않는다.
 
+## 원본 자료 이전과 조회
+
+```bash
+aas db source-import /path/to/private-snapshot.sqlite3 --id SOURCE_ID --sha256 SHA256
+aas db sources
+aas db source-tables --source SOURCE_ID
+aas db source-read --source SOURCE_ID --table TABLE_NAME --limit 20
+```
+
+`source-import`는 원본 SQLite 테이블을 비공개 원본 자료실에 보존한다. 먼저 읽기 전용
+연결의 SQLite backup API로 일관된 사본을 만들고, 닫힌 사본의 해시를 지정한다.
+원본의 실행 코드·뷰·트리거를 실행하거나 기존 엔진 bundle로 추정 변환하지 않는다.
+원본 설정, 연구용 설정, 원래 성과는 각각 원래 테이블과 열의 의미를 유지한다.
+`strategy list`는 검증된 실행 bundle 목록이며 `db sources`의 원본 자료 목록과 구분된다.
+
+대량 분석 자료는 `storage.source_library.import_arrow`로 명시적인 Arrow reader에서
+DuckDB에 적재한다. 같은 스키마끼리 묶고 파일 경로와 원본 행 번호를 보존한다.
+원본 시각이나 숫자의 정밀도를 임의로 줄이지 않는다. 원본 자료실 등록은 PIT 사용 자격이나
+백테스트 실행 성공을 뜻하지 않으며, `data datasets`의 게시된 데이터 버전에 자동 추가되지 않는다.
+Arrow 가져오기는 한 source당 최대 200만 행이다. 더 큰 자료는 원본 파일·행 번호를 유지한
+여러 source로 나눠 적재한다. 이 제한과 DuckDB 설정만으로 전체 Python 프로세스의 메모리가
+제한되지는 않으므로 대량 이전은 작은 단위의 별도 프로세스로 실행한다.
+
+기존 원본과 수집 설정을 유지한 채 새 홈으로 이전한다. 실제 자료·파일 목록·원본 해시·
+행 수 대조 결과는 비공개로 기록한다. 원본 파일을 보존할 때는 `raw/` 아래에 스트리밍으로
+저장하면 기존 백업에 포함된다. 전체 검증은 모든 등록 원본을 다시 읽고, 백업은 추가 사본을
+만드므로 자료 크기에 맞는 디스크 공간과 I/O 시간이 필요하다. 원본 자료 이전만으로
+기존 수집기나 예약 작업의 저장 위치가 바뀌지는 않는다.
+
 ## 검사·복구·백업
 
 ```bash

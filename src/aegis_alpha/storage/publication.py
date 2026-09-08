@@ -313,6 +313,12 @@ def recover_operations(workspace: Workspace) -> dict[str, object]:
                 marker["request_hash"],
             )
             complete_operation(workspace.state, op_id, operation["request_hash"])
+        elif operation["kind"] == "source_import":
+            from aegis_alpha.storage.source_library import recover_source  # noqa: PLC0415
+
+            if not recover_source(workspace, op_id):
+                pending.append(op_id)
+                continue
         elif operation["kind"] == "market_publish":
             marker_row = workspace.market.execute(
                 "SELECT generation_id FROM market_generations WHERE operation_id=?", [op_id]

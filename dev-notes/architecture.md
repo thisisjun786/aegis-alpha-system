@@ -86,6 +86,13 @@ universe·전략·시장 관례의 exact version/hash를 묶고, 각 의사결�
 내장 저장 경로는 `storage/`와 CLI `init`·`doctor`·`db`·`strategy`·`data`에 연결돼 있다.
 전체 백테스트 입력 조합과 공급자 수집기의 전환은 별도로 검증한다.
 
+`storage/source_library`는 기존 전략·연구·시장 자료를 조회할 수 있는 원본 자료실이다.
+원본 SQLite의 테이블은 비공개 SQLite에, 명시적으로 전달한 Arrow 자료는 DuckDB에
+원래 값과 출처를 보존한다. 별도 버전·체크섬을 가진 선택적 저장 확장이며 기존 core v1
+스키마나 `EngineBundle` 계약을 바꾸지 않는다. 상태 DB의 저장 의도와 대상 DB의 완료
+기록을 대조하고 내용·행 수를 검증한다. 원본 자료는 실행 전략이나 PIT 데이터 게시물로
+자동 승격되지 않으며 `aas db sources/source-tables/source-read`로 조회한다.
+
 **남아 있는 전환 전 코드**는 `legacy-db`·`legacy-data`와 일부 수집기다. 이 경로에만
 `legacy` 추가 의존성과 PostgreSQL이 필요하다. 기본 설치는 SQLite·DuckDB를 사용한다.
 전환 전 코드는 PostgreSQL DB 설치·기존 데이터 채택·카탈로그·가격 조회를 지원한다.

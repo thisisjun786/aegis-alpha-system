@@ -10,6 +10,7 @@ import pytest
 from aegis_alpha.storage import publication
 from aegis_alpha.storage.backup import backup, restore
 from aegis_alpha.storage.import_document import parse_import
+from aegis_alpha.storage.raw import put_raw_file
 from aegis_alpha.storage.strategy_import import register_strategy
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace, write_json
@@ -152,3 +153,34 @@ def test_backup_refuses_unresolved_prepared(
     monkeypatch.setattr(publication, "_complete_publication", complete)
     with pytest.raises(ValueError, match="recovered operations"):
         backup(home)
+
+
+def test_streamed_source_archive_survives_backup_restore(tmp_path: Path) -> None:
+    home = tmp_path / "aas"
+    initialize(home)
+    source = tmp_path / "synthetic-archive"
+    payload = b"synthetic retained bytes\x00" * 10_000
+    source.write_bytes(payload)
+    source.chmod(0o600)
+    with open_workspace(home, writable=True) as workspace:
+        relative, digest, size = put_raw_file(workspace.paths.raw, source)
+        with workspace.state:
+            workspace.state.execute(
+                "INSERT INTO source_snapshots VALUES "
+                "('local-copy','local-migration',1,2,NULL,'raw_verified')"
+            )
+            workspace.state.execute(
+                "INSERT INTO source_files VALUES ('local-copy',?,?,?)", (relative, digest, size)
+            )
+    backup_root = Path(str(backup(home)["backup_root"]))
+    restored = tmp_path / "restored"
+    restore(backup_root, restored)
+    assert (restored / "raw" / relative).read_bytes() == payload
+    with open_workspace(restored) as workspace:
+        assert verify_workspace(workspace)["verified"] is True
+        assert tuple(
+            workspace.state.execute(
+                "SELECT requested_at_us,retrieved_at_us,publication_at_us "
+                "FROM source_snapshots WHERE snapshot_id='local-copy'"
+            ).fetchone()
+        ) == (1, 2, None)

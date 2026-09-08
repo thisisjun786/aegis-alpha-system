@@ -72,3 +72,39 @@ def test_native_help_without_site_packages(name: str) -> None:
         timeout=30,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_source_catalog_cli_roundtrip(tmp_path: Path) -> None:
+    import hashlib  # noqa: PLC0415 -- synthetic source fixture
+    import sqlite3  # noqa: PLC0415
+
+    home = tmp_path / "aas"
+    source = tmp_path / "snapshot"
+    with sqlite3.connect(source) as origin:
+        origin.execute("CREATE TABLE catalog (name TEXT, value INTEGER)")
+        origin.execute("INSERT INTO catalog VALUES ('synthetic',7)")
+    source.chmod(0o600)
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    assert run_cli("init", home=home).returncode == 0
+    result = run_cli(
+        "db", "source-import", str(source), "--id", "synthetic", "--sha256", digest, home=home
+    )
+    assert result.returncode == 0, result.stderr
+    result = run_cli("db", "sources", home=home)
+    assert json.loads(result.stdout)["sources"][0]["source_id"] == "synthetic"
+    result = run_cli(
+        "db",
+        "source-read",
+        "--source",
+        "synthetic",
+        "--table",
+        "catalog",
+        "--limit",
+        "1",
+        home=home,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["rows"] == [{"name": "synthetic", "value": 7}]
+    assert json.loads(run_cli("strategy", "list", home=home).stdout)["strategies"] == []
+    result = run_cli("db", "verify", home=home)
+    assert json.loads(result.stdout)["source_library"] == {"sources": 1, "tables": 1, "rows": 1}
