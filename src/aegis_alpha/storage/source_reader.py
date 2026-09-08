@@ -2,6 +2,8 @@
 
 This internal streaming path does not grant PIT or trading eligibility. Its
 workspace admission must remain open for the lifetime of the iterator.
+Consume or close each iterator before mutating source stores; verification and
+streaming must not straddle a caller-managed write transaction.
 """
 
 from __future__ import annotations

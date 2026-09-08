@@ -63,7 +63,10 @@ def _finite(value: object) -> bool:
 def _as_finite(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if not math.isfinite(value):
+    try:
+        if not math.isfinite(value):
+            return None
+    except OverflowError:
         return None
     return float(value)
 

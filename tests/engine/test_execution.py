@@ -261,3 +261,9 @@ def test_extreme_inputs_keep_value_error_boundary() -> None:
         )
     with pytest.raises(ValueError, match="initial cash"):
         replay_next_open(DAYS, prices, prices, {}, 10**1000, 0.0)
+    with pytest.raises(ValueError, match="weights"):
+        replay_next_open(DAYS, prices, prices, {DAYS[0]: {"SYN_A": 10**1000}}, 100.0, 0.0)
+    with pytest.raises(ValueError, match="observed open/close"):
+        replay_next_open(
+            DAYS, [{"SYN_A": 10**1000}] * 3, prices, {DAYS[0]: {"SYN_A": 1.0}}, 100.0, 0.0
+        )
