@@ -95,7 +95,7 @@ def _pins(value: object) -> list[dict[str, str]]:
     return result
 
 
-def run_document(raw: bytes, expected_sha256: str) -> dict[str, object]:
+def run_document(raw: bytes, expected_sha256: str) -> dict[str, object]:  # noqa: C901 -- single explicit envelope and accounting boundary
     """Run explicit prices/targets, without claiming to resolve their source pins."""
     from aegis_alpha.engine.execution import replay_next_open  # noqa: PLC0415 -- execution owner
 
