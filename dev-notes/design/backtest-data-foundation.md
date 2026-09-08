@@ -2,7 +2,10 @@
 
 [0014](../decisions/0014-local-embedded-databases.md)에 따른 **구현 대상 설계**다.
 현재 CLI의 기본 DB 경로는 `storage/`의 SQLite·DuckDB 구현이다.
-이 문서에는 완료한 로컬 경로와 후속 수집·전체 백테스트 계약이 함께 있다. 설치는 [0013](../decisions/0013-first-install-workspace.md),
+이 문서에는 구현된 로컬 경로와 후속 수집·전체 백테스트 계약이 함께 있다. 아래 물리 테이블은
+소유 schema 파일이 정본이며, 테이블이 존재해도 호출자와 실행 흐름이 연결됐다는 뜻은 아니다.
+제품 책임은 [0015](../decisions/0015-research-engine-product-boundary.md)를 따른다.
+[전환 표](#전환-계획과-기존-코드)에서 항목별 현재 상태와 남은 검증을 구분한다. 설치는 [0013](../decisions/0013-first-install-workspace.md),
 현재 실행 상태는 [architecture](../architecture.md), 실제 명령은 [operations](../operations.md)가 소유한다.
 
 ## 저장소와 실행 소유자
@@ -20,6 +23,9 @@
 전략이 비어 있어도 설치·데이터 조회·합성 예제는 가능하다. PostgreSQL 서비스·DB 계정·
 Parquet publication·데이터 배포 서버를 기본 구성에 포함하지 않는다.
 
+다음 그림은 통합 후의 목표 연결이다. 현재 CLI의 데이터 명령과 Python 계산 API는 각각
+존재하지만 저장된 입력을 계산·결과 확정까지 자동 연결하지 않는다.
+
 ```mermaid
 flowchart LR
     CLI[CLI] --> APP[AAS 프로세스]
@@ -31,23 +37,16 @@ flowchart LR
     E --> APP
 ```
 
-한 설치에서 DuckDB를 여는 프로세스는 하나다. 수집·분석·전략 계산은 같은 프로세스 안의
-작업으로 실행한다. 병렬 CPU 계산을 별도 프로세스에 위임할 때는 검증한 입력 배열만 전달하고
-DB 연결·비밀키를 넘기지 않는다. 반환 결과는 원래 프로세스가 저장한다.
+한 설치의 DB 연결은 `storage/workspace.py`가 소유하며 연결 수명 전체에 설치·파일 잠금을
+유지한다. 외부 디스크와 별도 전략 경로도 한 설치가 소유하고, 다른 설치가 같은 파일을
+공유하도록 허용하지 않는다. store ID·설치 ID·실제 파일 정체성을 대조한다.
+현재 CLI는 잠금 경쟁 시 기다리거나 소켓에 연결하지 않고 `installation_busy`로 실패한다.
+읽기 전용 명령도 이 잠금을 우회하지 않는다.
 
-외부 디스크나 별도 전략 경로도 한 설치가 소유한다. 다른 설치가 같은 파일을 공유하도록
-허용하지 않는다. store_info의 installation_id와 실제 파일 정체성을 확인하고, 외부로 옮긴
-저장소에는 해당 파일 옆의 잠금도 취득한다. 서로 다른 AAS_HOME이 같은 파일을 가리키는
-경우를 초기화·기동·백업 검사에 포함한다.
-
-설치 루트의 OS 파일 잠금을 DB 연결 수명 전체에 유지한다. PID 파일이나 만료 시간만으로
-소유권을 넘기지 않는다. 잠긴 상태에서 다른 CLI는 사용자 전용 로컬 소켓으로 같은 앱에
-요청한다. 앱이 없으면 일회 실행이 잠금을 얻고 같은 저장 계층을 열었다 닫는다.
-소켓이 끊겨도 잠금이 유지되면 두 번째 writer를 시작하지 않는다. 소켓은 같은 UID·설치 ID를
-검증하고 크기를 제한한 구조화 명령만 받으며, 임의 SQL·코드·경로 실행을 제공하지 않는다.
-Docker에서는 같은 컨테이너 안의 CLI가 이 소켓을 사용한다.
-일회 CLI가 잠금을 소유하고 소켓을 제공하지 않을 때 다른 명령은 제한 시간만 대기한 뒤
-`installation_busy`로 종료한다. 읽기 전용이라는 이유로 DuckDB 파일을 직접 열지 않는다.
+[0013](../decisions/0013-first-install-workspace.md)의 상시 프로세스·로컬 소켓·예약 실행은
+승인됐지만 미구현인 설계다. 이식 후에도 한 프로세스가 저장을 소유하고 별도 계산 프로세스에는
+검증한 입력만 넘겨야 한다. DB 연결과 비밀키를 넘기지 않는다. 로컬 소켓의 사용자·설치 ID 검증,
+구조화 명령·크기 제한, 연결 실패 시 두 번째 writer 금지는 그 후속 구현의 검증 조건이다.
 
 DuckDB는 내장 모드에서 한 읽기·쓰기 프로세스 안의 여러 thread를 지원한다.
 각 작업은 별도 connection을 사용하고, 게시와 결과 확정은 짧은 직렬 구간으로 조정한다.
@@ -80,7 +79,11 @@ PostgreSQL의 exclusion constraint나 trigger를 DuckDB에도 있다고 가정�
 
 ## state.sqlite3: 종목·출처·작업·실행
 
-아래는 구현할 물리 테이블의 책임과 최소 필드다. `PK(a,b)`는 복합키, `FK`는 **같은 파일 안의**
+아래는 목표 테이블의 책임과 최소 필드다. 현재 DDL은
+[state_schema.py](../../src/aegis_alpha/storage/state_schema.py), 전략 DDL은
+[strategy_schema.py](../../src/aegis_alpha/storage/strategy_schema.py), 시장 DDL은
+[market_schema.py](../../src/aegis_alpha/storage/market_schema.py)가 소유한다.
+전체 writer·reader·실행 연동 여부는 이 표가 아니라 전환 표로 판정한다. `PK(a,b)`는 복합키, `FK`는 **같은 파일 안의**
 외래 키다. 기본키·필수 참조는 NOT NULL, 선택 필드의 null 의미는 표와 시간 규칙에 따른다.
 대량 관측을 JSON 한 열에 넣는 방식은 사용하지 않는다.
 
@@ -186,7 +189,8 @@ DuckDB 물리 파일 hash는 논리 dataset hash가 아니다. 한 테이블이 
 각 행을 길이 접두 필드로 직렬화하며, type tag·null·Decimal scale·UTC 값·정규 IEEE float 표현을
 구분한다. NaN/Infinity는 거부하고 -0 정책도 schema에 명시한다. delta hash에 부모 chain hash,
 source hash와 schema version을 결합한다. 같은 행 중복, 반올림, row 순서 차이를 숨기지 않는다.
-정확한 byte codec과 golden vector는 구현 단계에서 버전 동결한다. 백업은 별도 물리 파일 hash도 기록한다.
+현재 codec과 합성 기대값은 [rowset.py](../../src/aegis_alpha/storage/rowset.py)와
+[검증 예제](../../tests/storage/test_rowset.py)가 소유한다. 문서 표만으로 codec을 다시 구현하지 않는다. 백업은 별도 물리 파일 hash도 기록한다.
 
 ## 시간·수정·상장 이력 조회
 
@@ -219,6 +223,10 @@ action만 사용한다. 규칙 ID·버전·raw/action 입력·T·환산 조건�
 상폐·휴장·실패한 수집·미지원 필드를 생존 종목이나 최신 자료로 대체하지 않는다.
 
 ## DB 간 저장과 장애 복구
+
+로컬 데이터 게시·전략 등록과 영수증 기반 재개는 구현돼 있다. 아래의 공급자 예산·watermark
+결합 및 run 결과 SUCCESS 확정은 후속 통합 계약이다. 현재 `recover`는 marker가 없으면
+pending을 남기고 임의 재실행하지 않는다. 호출자는 미완료 상태를 처리해야 한다.
 
 SQLite 두 파일과 DuckDB·원본 파일에 걸친 공통 ACID transaction은 없다. 앱이 `storage_operations`
 의 의도 기록과 대상 DB의 완료 영수증을 대조해 게시를 확정한다. 단일 프로세스여도 이 절차가
@@ -257,6 +265,10 @@ marker가 없는 임시 결과는 정상 결과 테이블 조회에 노출하지
 재계산해 PK를 재사용하지 않는다. 저장 재개와 새 계산은 서로 다른 동작이다.
 
 ## 실행 입력·전략 성과·결과
+
+이 절은 후속 통합 실행 계약이다. 아래 `read_*`는 설계상의 역할 이름이며 현재 공개 API
+목록이 아니다. 현재 명시적 입력 계산은 `engine.replay`, 저장 조회는 `storage/publication.py`와
+`market.py`가 제공하며 전체 입력 조합·실행 결과 확정은 아직 연결되지 않았다.
 
 엔진에는 SQL이나 DB 파일을 넘기지 않는다. `read_prices`, `read_universe`, `read_fundamentals`,
 `read_macro`, `read_features`는 bundle, window, decision cutoff와 필요한 basis를 받는다.
@@ -301,7 +313,7 @@ DB 내부 transaction만으로 세 파일의 snapshot이 일치한다고 주장�
 현재 루트에 덮어쓰지 않는다. 다른 위치로 이동해도 ID·논리 hash·입력 pin은 유지한다.
 복원된 DB의 논리 store_id는 유지하되 새 배포 인스턴스 식별자는 별도 발급해 경로·잠금을 재생성한다.
 
-schema upgrade는 설치 잠금+백업 이후 대상 schema version과 script checksum을 기록하며 수행한다.
+schema upgrade는 미구현이다. 후속 구현은 설치 잠금+백업 이후 대상 schema version과 script checksum을 기록하며 수행한다.
 SQLite와 DuckDB 중 하나만 성공하면 설치는 migration-incomplete로 남고 호환되지 않는 앱은
 기동하지 않는다. 재개 또는 새 루트 백업 복원만 허용한다. 이미지 rollback이 DB downgrade를
 자동 해결하지 않는다. DB 파일 형식과 앱 schema의 호환성 검사는 각각 수행한다.
@@ -311,16 +323,19 @@ SQLite와 DuckDB 중 하나만 성공하면 설치는 migration-incomplete로 �
 같은 SQL을 모든 DB에 돌리는 호환 계층을 만들지 않는다. 기존 value model·파서·해시·시점·
 권한 검증을 재사용하고 새 저장소에 맞춘 전용 SQL과 adapter를 작성한다. 다음 경로는 제안이다.
 
-| 단계 | 변경할 소유 파일·디렉터리 | 완료 기준 |
+| 단계 | 현재 상태와 소유 코드 | 남은 작업과 완료 기준 |
 | --- | --- | --- |
-| L1 저장소 기반 | 신규 `src/aegis_alpha/storage/`의 paths·SQLite/DuckDB connection·schema·installation lock, `application/data_config.py` 연결 | 빈 임시 루트·반복 init·파일 정체성·독점 잠금·schema 버전 거부 |
-| L2 전략·상태 | storage의 strategy/state adapter, `engine/bundle.py` 재사용, `application/cli.py` 연결 | 합성 전략 등록·재기동·동일 version 충돌·원본 성과 보존·별도 DB 분리 |
-| L3 시장·publication | storage의 market writer/reader, `data/catalog_access.py`, `pinned_prices.py`, identity/metadata 호출자 전환 | typed table·수정 재생·identity·publication 중단 복구·고정 입력 동일 결과 |
-| L4 수집·실행 | `collection/`, `data/fmp_*`, `fred_alfred_*`, `sec_*`, `finimpulse_*`, application 실행기 | 예산·불확실 호출·watermark·수집 중 고정 입력 조회·결과 완료 원자성 |
-| L5 설치·백업 | `application/container_install.py`, `container_runtime.py`, `Dockerfile`, Compose, backup/restore 명령 | source checkout 없는 artifact 설치·단일 컨테이너·백업·빈 루트 복원·업데이트 실패 |
-| L6 구경로 제거 | `metadata/database.py`, runtime_install/snapshot_import, Alembic chain, PG 전용 schema/SQL·tests, `scripts/ci_changes.py`, verifier, locks | 모든 호출자 전환 후 PostgreSQL·필수 Parquet 의존 제거; 새 실패 계약 회귀 유지 |
+| L1 저장소 기반 | 로컬 경로 구현: `storage/paths.py`, `workspace.py`, `locks.py`, `sqlite.py`, 세 schema 파일. `tests/storage/test_workspace.py`에 초기화·잠금·정체성 거부 사례 | 현재 초기화·검증 경로 유지. 자동 schema 업그레이드와 서비스 소유권 인계는 미구현이며 별도 실패·복구 계약 검증 필요 |
+| L2 전략·상태 | bundle 등록·로드와 영수증 구현: `strategies.py`, `strategy_import.py`, `state.py`. CLI는 등록·목록 제공; lineage·원래 성과용 schema 존재 | 원래 성과·비교 조건의 전체 입력 경로, 실행 입력 bundle·run 소비자 연결 필요. schema만으로 DB 재실행 완료를 주장하지 않음 |
+| L3 시장·publication | typed JSON import, generation·revision 조회, 중단 게시 재개 구현: `import_document.py`, `market.py`, `publication.py`; `tests/storage/test_market.py`, `test_publication.py`에 합성 사례 | 기존 `data/catalog_access.py`·`pinned_prices.py`, identity/metadata 소비자와 수집기 전환 필요. 도메인별 품질·사용 자격과 전체 입력 고정 검증은 별도 |
+| L4 수집·실행 | `collection/`, `data/`의 공급자 도구와 `application/daily_collection.py`는 전환 전 경로. `engine/replay.py`는 주입 입력 계산; 결과용 테이블 존재 | 수집기 내장 DB 이식, 예산·watermark 결합, 저장 전략→시장 입력→계산→결과 확정 연결 필요. 불확실 호출·부분 결과·재시작 시나리오를 검증해야 완료 |
+| L5 설치·백업 | native CLI와 선택적 단일 이미지, `storage/backup.py`의 일관 백업·새 루트 복원 구현. `tests/storage/test_backup.py`에 합성 복원·손상 거부 사례 | 0013의 상시 앱·소켓·예약 실행, 자동 업그레이드, artifact 게시·실제 자료 이전은 미완료. 구현·게시·운영 검증을 각각 기록 |
+| L6 구경로 제거 | PostgreSQL adapter·Alembic chain·Parquet reader와 `legacy` 추가 의존성 유지 | 앞 단계에서 모든 호출자와 실패 계약을 대체한 뒤 미사용 코드·의존성·관련 테스트·CI 선택을 함께 정리. 현재 제거 완료로 표시하지 않음 |
 
-L1~L6는 후속 구현 순서다. 임시 이중 지원은 전환 기간에만 존재하고 최종 설치 선택지가 아니다.
+표의 구현 표시는 소스와 테스트의 존재·연결 범위다. 이 문서 변경에서 실제 DB나 공급자를
+실행한 증거는 아니다. 후속 작업은 저장 계약→수집·실행 통합→구경로 제거 순서로 진행한다.
+L1~L6를 모두 미착수로 취급하거나 모두 완료로 묶지 않는다. 임시 이중 지원은 전환 기간에만
+존재하고 최종 설치 선택지가 아니다.
 폐기할 코드와 그 코드만 검증하던 테스트는 새 동작 증명이 생긴 단계에서 함께 제거한다.
 옛 DB의 실제 복원·추출은 새 설치의 선행 조건이 아니며 이번 문서 작업에서 실행하지 않는다.
 필요 시 별도 import로 원본·행수·hash·누락·eligibility를 대조하고 old/new ID의 mapping을 남긴다.

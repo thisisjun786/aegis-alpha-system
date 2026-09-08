@@ -2,7 +2,7 @@
 
 ## Suites and fixtures
 
-Tests mirror current source owners: application, engine, container, data,
+Tests mirror current source owners: application, engine, storage, container, data,
 collection, identity and metadata. `tools/` checks CI selection, aggregation,
 security and verifier behavior. Provider-neutral JSON fixtures are synthetic.
 The root `conftest.py` owns network, data-root and disposable DB isolation.
@@ -11,7 +11,8 @@ The root `conftest.py` owns network, data-root and disposable DB isolation.
 - **PostgreSQL tests are `database`** (current contracts; decisions 0010/0012).
   `tests/conftest.py` tags every test whose fixture closure includes `test_database`; a test
   that opens PostgreSQL any other way must carry `@pytest.mark.database` itself.
-  `uv run pytest -m "not database"` is the database-free oracle and needs no database.
+  `uv run pytest -m "not database"` needs no PostgreSQL server; native storage tests
+  still create disposable SQLite/DuckDB files.
 - **`AAS_TEST_DATABASE_URL` is mandatory for `database`.** `test_database` calls `pytest.fail`
   when it is unset; it must use the `postgresql+psycopg` driver, name a disposable `*_test`
   admin database, and the server version must match the pin asserted in `conftest.py`.
@@ -22,7 +23,8 @@ The root `conftest.py` owns network, data-root and disposable DB isolation.
   order *before and after* each test. Schema state is migration-derived, never hand-built.
 - `AAS_DATA_ROOT` is `setdefault` to a session `TemporaryDirectory` **before** `aegis_alpha`
   imports — that ordering is why `tests/conftest.py` carries `# noqa: E402`. A caller-supplied
-  root wins, for mounted real-input acceptance runs.
+  root wins; it must still contain only synthetic disposable test inputs, never
+  recovered or production data.
 - No `__init__.py` anywhere under `tests/`. Support helpers resolve two ways: bare
   (through pytest directory insertion) and dotted (through the configured project Python path).
 - `ruff select = ["ALL"]` applies to tests; the only per-file relief is `INP001` and `S101`.

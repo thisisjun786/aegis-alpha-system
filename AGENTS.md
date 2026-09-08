@@ -13,7 +13,7 @@ Read [POLICY.md](POLICY.md) for development, merge, CI, and release rules. It is
 
 ## Current application
 
-AAS is a standalone CLI application with **Aegis**, **Alpha**, and **Hedge** module boundaries. [Decision 0009](dev-notes/decisions/0009-standalone-three-modules.md) supersedes the VT-only product direction. External code is reference material; retained imports require provenance and license notices.
+AAS targets a data and research engine consumed by external tools, as defined in [Decision 0015](dev-notes/decisions/0015-research-engine-product-boundary.md). The current package exposes a CLI and generic Python engine API. **Aegis**, **Alpha**, and **Hedge** remain the current preview contracts and research-area names. [Decision 0009](dev-notes/decisions/0009-standalone-three-modules.md) retains those contracts; its CLI-centered product direction is superseded by 0015. External code is reference material; retained imports require provenance and license notices.
 
 - `src/aegis_alpha/application/` owns strict allocation requests, portfolio composition, and the CLI.
 - `src/aegis_alpha/modules/` declares the three module responsibilities. `engine/` supplies generic rule evaluation; the allocation-preview CLI does not execute it automatically.
@@ -21,7 +21,7 @@ AAS is a standalone CLI application with **Aegis**, **Alpha**, and **Hedge** mod
 - `storage/` owns the native SQLite/DuckDB installation under `AAS_HOME` (default `~/.aas`).
 - `Dockerfile` packages the optional single AAS image. Native DB commands need no server or Docker; preview remains DB-independent.
 
-The preview reads input and returns a result; it does not call providers, restore databases, execute strategies, or place orders. `aas init/doctor/db/strategy/data` use the embedded stores. Transitional `aas legacy-db install/adopt` and `legacy-data` retain the old explicit PostgreSQL/Parquet operations. Price inspection is not full historical revision replay or backtest execution. Recheck the current architecture and capability output as the application evolves. Import new domains directly rather than widening the legacy package facade.
+The preview reads input and returns a result; it does not call providers, restore databases, execute strategies, or place orders. `aas init/doctor/db/strategy/data` use the embedded stores. Transitional `aas legacy-db install/adopt` and `legacy-data` retain the old explicit PostgreSQL/Parquet operations. Native generation reads support cutoff-based revision visibility; legacy price inspection is separate. Neither is integrated backtest execution. Python `engine.replay` calculates explicit injected inputs; the CLI does not yet connect stored strategies and market inputs to that calculation. Recheck the current architecture and capability output as the application evolves. Import new domains directly rather than widening the legacy package facade.
 
 ## Preserved contracts
 

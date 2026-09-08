@@ -1,6 +1,8 @@
 @AGENTS.md
 
-Follow the current standalone AAS architecture and repository policy.
+Follow the current AAS architecture and repository policy. Decision 0015 defines
+the external-tool-facing data/research engine goal; the existing CLI and Python
+API remain current interfaces, not proof of integrated backtest execution.
 
 - `dev-notes/architecture.md` owns module and data boundaries.
 - `dev-notes/operations.md` owns runnable commands and their authorization scope.
