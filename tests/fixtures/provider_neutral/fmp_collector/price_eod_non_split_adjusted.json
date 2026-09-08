@@ -1,0 +1,20 @@
+[
+  {
+    "symbol": "SYNTH.A",
+    "date": "2026-07-27",
+    "adjOpen": 21.0,
+    "adjHigh": 22.5,
+    "adjLow": 20.5,
+    "adjClose": 22.0,
+    "volume": 62500
+  },
+  {
+    "symbol": "SYNTH.A",
+    "date": "2026-07-28",
+    "adjOpen": 22.0,
+    "adjHigh": 23.0,
+    "adjLow": 21.8,
+    "adjClose": 22.8,
+    "volume": 49000
+  }
+]

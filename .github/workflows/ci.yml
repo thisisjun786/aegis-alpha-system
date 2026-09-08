@@ -1,0 +1,195 @@
+name: AAS CI
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aas-ci-${{ github.base_ref }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+  CANDIDATE_SHA: ${{ github.sha }}
+
+jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    outputs:
+      selection: ${{ steps.select.outputs['selection'] }}
+      images: ${{ steps.select.outputs['images'] }}
+      style: ${{ steps.select.outputs['style'] }}
+      types: ${{ steps.select.outputs['types'] }}
+      tests: ${{ steps.select.outputs['tests'] }}
+      database: ${{ steps.select.outputs['database'] }}
+      package: ${{ steps.select.outputs['package'] }}
+      container: ${{ steps.select.outputs['container'] }}
+      docs: ${{ steps.select.outputs['docs'] }}
+      security: ${{ steps.select.outputs['security'] }}
+    steps:
+      - name: Require same-repository numeric ID promotion from dev into main
+        if: github.base_ref == 'main' && (github.head_ref != 'dev' || github.event.pull_request.head.repo.id != github.event.pull_request.base.repo.id)
+        run: exit 1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select checks and record tested tree
+        id: select
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REPO_ID: ${{ github.event.pull_request.base.repo.id }}
+          HEAD_REPO_ID: ${{ github.event.pull_request.head.repo.id }}
+        run: |
+          args=()
+          if [[ "$BASE_REF" == main ]]; then args+=(--release); fi
+          python3 -m scripts.ci_changes --base "$BASE_SHA" --head "$HEAD_SHA" \
+            --candidate "$CANDIDATE_SHA" --head-ref "$HEAD_REF" \
+            --base-repo-id "$BASE_REPO_ID" --head-repo-id "$HEAD_REPO_ID" \
+            "${args[@]}"
+
+  style:
+    needs: changes
+    if: needs.changes.outputs['style'] == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python
+        with:
+          profile: style
+      - run: ./scripts/verify-lane-style
+      - run: ./scripts/verify-workflows
+
+  types:
+    needs: changes
+    if: needs.changes.outputs['types'] == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python
+        with:
+          profile: full
+      - run: ./scripts/verify-lane-types
+
+  tests:
+    needs: changes
+    if: needs.changes.outputs['tests'] == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python
+        with:
+          profile: full
+      - run: ./scripts/verify-lane-test
+
+  database:
+    needs: changes
+    if: needs.changes.outputs['database'] == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python
+        with:
+          profile: full
+      - run: ./scripts/verify-lane-database
+
+  package:
+    needs: changes
+    if: needs.changes.outputs['package'] == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python
+        with:
+          profile: full
+      - run: ./scripts/verify-lane-build
+
+  container:
+    needs: changes
+    if: needs.changes.outputs.container == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Build and smoke-test isolated AAS image
+        run: ./scripts/verify-lane-container aas
+
+  docs:
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate changed documents and removed-link references
+        run: |
+          merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          python3 -m scripts.ci_docs --base "$merge_base" --head "$HEAD_SHA"
+
+  security:
+    needs: changes
+    if: needs.changes.outputs.security == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan history, candidate tree, locked packages, and public content
+        run: |
+          ./scripts/verify-secrets
+          python3 -m scripts.ci_security
+          python3 -m scripts.ci_public
+
+  gate:
+    name: ${{ github.base_ref == 'main' && 'release-gate' || 'dev-gate' }}
+    if: always()
+    needs: [changes, style, types, tests, database, package, container, docs, security]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Aggregate results only
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+          CI_MODE: ${{ github.base_ref == 'main' && 'release' || 'dev' }}
+        run: python3 -m scripts.ci_gate --mode "$CI_MODE"

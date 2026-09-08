@@ -1,0 +1,24 @@
+[
+  {
+    "symbol": "SYNTH.A",
+    "companyName": "Synthetic Alpha Holdings",
+    "exchange": "SYNTHEX",
+    "exchangeFullName": "Synthetic Exchange",
+    "currency": "SYN",
+    "country": "SX",
+    "sector": "Synthetic Sector",
+    "industry": "Synthetic Industry",
+    "cik": "0000000001",
+    "cusip": "SYNTH0001",
+    "isin": "SX0000000001",
+    "isActivelyTrading": true,
+    "isAdr": false,
+    "isEtf": false,
+    "isFund": false,
+    "ipoDate": "2015-01-02",
+    "price": 11.4,
+    "beta": 1.05,
+    "marketCap": 1234000000.0,
+    "lastDividend": 0.24
+  }
+]

@@ -1,0 +1,24 @@
+[
+  {
+    "symbol": "SYNTH.A",
+    "date": "2026-05-15",
+    "dividend": 0.24,
+    "adjDividend": 0.24,
+    "declarationDate": "2026-04-30",
+    "recordDate": "2026-05-16",
+    "paymentDate": "2026-06-01",
+    "frequency": "SYNTH_QUARTERLY",
+    "yield": 0.87
+  },
+  {
+    "symbol": "SYNTH.A",
+    "date": "2026-02-13",
+    "dividend": 0.22,
+    "adjDividend": 0.22,
+    "declarationDate": null,
+    "recordDate": null,
+    "paymentDate": null,
+    "frequency": null,
+    "yield": null
+  }
+]

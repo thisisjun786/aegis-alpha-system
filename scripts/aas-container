@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Launch an installed AAS container using the repository-owned host wrapper."""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from aegis_alpha.application.container_runtime import main
+
+raise SystemExit(main())

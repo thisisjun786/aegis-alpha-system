@@ -1,0 +1,11 @@
+[Unit]
+Description=Run AAS daily collection at 06:30 UTC
+
+[Timer]
+OnCalendar=*-*-* 06:30:00 UTC
+Persistent=true
+AccuracySec=1min
+Unit=aas-data-collection.service
+
+[Install]
+WantedBy=timers.target

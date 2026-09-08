@@ -1,0 +1,17 @@
+[Unit]
+Description=AAS bounded daily data collection
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=%h
+ExecStart=%h/.local/bin/aas collect daily
+ExecStopPost=%h/.local/bin/aas --stop-managed
+RuntimeMaxSec=22h
+TimeoutStopSec=5min
+KillSignal=SIGINT
+KillMode=mixed
+SendSIGKILL=yes
+Restart=no
+UMask=0077

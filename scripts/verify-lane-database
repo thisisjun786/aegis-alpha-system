@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# PostgreSQL contracts, tested only against disposable databases.
+# Provision the pinned container when AAS_TEST_DATABASE_URL is absent; the
+# database-free suite runs separately in scripts/verify-lane-test.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+. "$(dirname "${BASH_SOURCE[0]}")/verify-lib.sh"
+ensure_verify_toolchain
+
+scratch=""
+provisioned_container=""
+label="org.aegis-alpha.verify"
+cleanup() {
+  local rc=$? found
+  trap - EXIT INT TERM
+  verify_stop_child
+  if [[ -n "$provisioned_container" ]]; then
+    found="$(timeout -k 2 10 docker container inspect --format "{{index .Config.Labels \"$label\"}}" "$provisioned_container" 2>/dev/null)" || found=""
+    if [[ "$found" == "$provisioned_container" ]]; then
+      if ! timeout -k 2 10 docker container rm --force --volumes "$provisioned_container" >/dev/null; then
+        echo "verify: database container cleanup failed: $provisioned_container" >&2
+        (( rc != 0 )) || rc=1
+      fi
+    else
+      echo "verify: unable to verify database container ownership: $provisioned_container" >&2
+      (( rc != 0 )) || rc=1
+    fi
+  fi
+  if [[ -n "$scratch" ]]; then
+    rm -rf -- "$scratch" || { (( rc != 0 )) || rc=1; }
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# The suites require PostgreSQL 18.4 (tests/conftest.py) and an admin-capable
+# role that may create and drop disposable databases.
+if [[ -z "${AAS_TEST_DATABASE_URL:-}" ]]; then
+  command -v docker >/dev/null 2>&1 || {
+    echo "AAS_TEST_DATABASE_URL is not set and docker is unavailable to provision one" >&2
+    exit 1
+  }
+  scratch="$(mktemp -d "${TMPDIR:-/tmp}/aas-ci-pg.XXXXXXXXXX")"
+  provisioned_container="${scratch##*/}"
+  pg_image="postgres:18.4-bookworm@sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296"
+  verify_run docker run -d --name "$provisioned_container" --label "$label=$provisioned_container" \
+    -e POSTGRES_DB=aas_test -e POSTGRES_USER=aas_test -e POSTGRES_PASSWORD=aas_ci_test_only \
+    "$pg_image" >/dev/null
+  ready=0
+  for _ in $(seq 1 60); do
+    if verify_run docker exec "$provisioned_container" pg_isready -U aas_test -d aas_test >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    verify_run sleep 2
+  done
+  [[ "$ready" == 1 ]] || { echo "ephemeral postgresql container never became ready" >&2; exit 1; }
+  verify_run docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$provisioned_container" > "$scratch/address"
+  pg_address="$(cat "$scratch/address")"
+  [[ -n "$pg_address" ]] || { echo "could not resolve the ephemeral postgresql address" >&2; exit 1; }
+  export AAS_TEST_DATABASE_URL="postgresql+psycopg://aas_test:aas_ci_test_only@${pg_address}:5432/aas_test"
+fi
+
+verify_run uv run --no-sync pytest -m database

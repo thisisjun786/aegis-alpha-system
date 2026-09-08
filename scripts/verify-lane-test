@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Lane: database-free pytest using synthetic temporary data. Every test that
+# requires PostgreSQL carries the `database` marker
+# (tests/conftest.py tags the `test_database` fixture chain) and belongs to
+# scripts/verify-lane-database.  AAS_TEST_DATABASE_URL is unset here on purpose
+# so an untagged PostgreSQL test fails loudly instead of passing by accident.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+. "$(dirname "${BASH_SOURCE[0]}")/verify-lib.sh"
+ensure_verify_toolchain
+
+unset AAS_TEST_DATABASE_URL
+exec uv run --no-sync pytest -m "not database"

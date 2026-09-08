@@ -1,0 +1,12 @@
+{
+  "registry_version": "1.0.0",
+  "policies": [
+    {
+      "policy_id": "fmp-operational-candidate-v1",
+      "provider": "fmp",
+      "scheduled_collection_allowed": false,
+      "license_classification": "SYNTHETIC_CLEARED_FOR_TEST",
+      "retention_classification": "SYNTHETIC_CLEARED_FOR_TEST"
+    }
+  ]
+}

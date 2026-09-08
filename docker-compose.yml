@@ -1,0 +1,43 @@
+{
+  "name": "aegis-alpha-system",
+  "services": {
+    "aas": {
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile"
+      },
+      "image": "aas-cli:local",
+      "command": [
+        "status"
+      ],
+      "user": "${AAS_UID:-1000}:${AAS_GID:-1000}",
+      "environment": {
+        "AAS_HOME": "/state/aas"
+      },
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "${AAS_HOME:-${HOME}/.aas}",
+          "target": "/state/aas",
+          "bind": {
+            "create_host_path": false
+          }
+        }
+      ],
+      "read_only": true,
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "tmpfs": [
+        "/tmp"
+      ],
+      "mem_limit": "512m",
+      "cpus": 2,
+      "pids_limit": 128,
+      "restart": "no"
+    }
+  }
+}

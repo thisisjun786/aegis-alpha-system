@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "data_config": "/config/runtime.json",
+  "providers": [
+    {
+      "provider": "fmp",
+      "enabled": false,
+      "credential_file": "/run/secrets/fmp.env",
+      "max_calls": 10,
+      "mode": "daily",
+      "options": {
+        "registry": "/config/fmp-daily-authority-registry.json",
+        "storage_notification": "/config/storage-notification.json",
+        "tier": "/config/tier.json",
+        "recurring_authority": "/config/fmp-recurring-authority.json",
+        "recurring_authority_signature": "/config/fmp-recurring-authority.json.sig",
+        "raw_store_root": "/data/aegis-alpha-system/raw",
+        "dataset_root": "/data/aegis-alpha-system/normalized"
+      }
+    },
+    {
+      "provider": "fred_alfred",
+      "enabled": false,
+      "credential_file": "/run/secrets/fred_alfred.env",
+      "max_calls": 10,
+      "mode": "incremental",
+      "options": {}
+    },
+    {
+      "provider": "sec",
+      "enabled": false,
+      "credential_file": "/run/secrets/sec.env",
+      "max_calls": 10,
+      "mode": "incremental",
+      "options": {}
+    },
+    {
+      "provider": "finimpulse",
+      "enabled": false,
+      "credential_file": "/run/secrets/finimpulse.env",
+      "max_calls": 10,
+      "mode": "probe",
+      "options": {}
+    },
+    {
+      "provider": "norgate",
+      "enabled": false,
+      "credential_file": null,
+      "max_calls": 10,
+      "mode": "inspect",
+      "options": {}
+    }
+  ]
+}

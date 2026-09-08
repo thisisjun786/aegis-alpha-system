@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Lane: ruff format --check (stateless).
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+. "$(dirname "${BASH_SOURCE[0]}")/verify-lib.sh"
+ensure_verify_toolchain
+exec uv run --no-sync ruff format --check .

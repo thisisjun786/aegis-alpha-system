@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "installation_id": "aas-local",
+  "image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "compose_file": "/absolute/checkout/docker-compose.data.yml",
+  "environment": {
+    "AAS_DATA_IMAGE": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "AAS_INSTALL_ROOT": "/absolute/aas-state",
+    "AAS_DATA_ROOT": "/absolute/aas-state/data",
+    "AAS_DATABASE_NETWORK": "aas-data-private",
+    "AAS_POSTGRES_VOLUME": "aas-data-postgres-data",
+    "AAS_INSTALL_ID": "aas-local",
+    "AAS_UID": "1000",
+    "AAS_GID": "1000",
+    "AAS_FMP_CREDENTIAL_FILE": "/etc/aegis-alpha-system/fmp-daily.env",
+    "AAS_FMP_OWNER_TRUST_FILE": "/etc/aegis-trust/owner-authority.json",
+    "AAS_FMP_USAGE_TRUST_DIR": "/absolute/aas-state/trust/fmp",
+    "AAS_FMP_REVOCATIONS_DIR": "/data/aegis-alpha-system/raw/fmp/authority-revocations"
+  }
+}

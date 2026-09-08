@@ -1,0 +1,30 @@
+name: Bug report
+description: Report a reproducible problem using synthetic inputs.
+title: "[bug] "
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Expected and observed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Commands and minimal synthetic inputs. Exclude real strategies, holdings, private data and credentials.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Commit or installed version, OS, Python, runtime profile and relevant dependency/provider versions.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted diagnostics
+      description: Remove personal/private data. Vulnerabilities follow SECURITY.md instead of a public issue.
+      render: text

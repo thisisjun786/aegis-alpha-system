@@ -1,0 +1,13 @@
+{
+  "as_of_utc": "2026-08-18T00:00:00Z",
+  "instruments": [
+    {
+      "instrument_id": "inst-no-cik",
+      "issuer_id": "issuer-no-cik",
+      "cik_source": null,
+      "effective_start": "2020-01-01T00:00:00Z",
+      "effective_end": null
+    }
+  ],
+  "conflicts": []
+}

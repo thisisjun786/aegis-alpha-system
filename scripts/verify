@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Full local regression. CI invokes selected lanes as independent jobs instead.
+# AAS_VERIFY_TOPOLOGY=serial (default): style -> types -> test -> database -> build.
+# parallel overlaps style/types only; mutable test fixtures remain serial.
+# Setup runs once before any children. All lanes validate the inherited token.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+topology="${AAS_VERIFY_TOPOLOGY-serial}"
+case "$topology" in
+  serial|parallel) ;;
+  *)
+    echo "AAS_VERIFY_TOPOLOGY must be 'serial' or 'parallel' (unset defaults to serial); got: '${topology}'" >&2
+    exit 2
+    ;;
+esac
+echo "topology=${topology}"
+
+. "$(dirname "${BASH_SOURCE[0]}")/verify-lib.sh"
+export AAS_VERIFY_PROFILE=full
+ensure_verify_toolchain
+
+# Preserve existing budgets, combining format/lint for style. Build now also
+# installs the artifact; CI applies its own job timeout independently.
+BUDGET_STYLE=300
+BUDGET_TYPES=600
+BUDGET_TEST=150
+BUDGET_DATABASE=600
+BUDGET_BUILD=300
+
+tmpdir="$(mktemp -d)"
+active_pids=()
+cleanup() {
+  local rc=$? pid
+  trap - EXIT INT TERM
+  for pid in "${active_pids[@]}"; do
+    # timeout owns its process group. Fall back to its PID if it has not exec'd.
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in "${active_pids[@]}"; do
+    AAS_VERIFY_CHILD_PID="$pid"
+    verify_stop_child
+  done
+  rm -rf -- "$tmpdir"
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+lane() { # name budget cmd...
+  local name="$1" budget="$2"
+  shift 2
+  local start end rc=0
+  start=$(date +%s)
+  echo "lane-start ${name}"
+  timeout -k 15 "$budget" "$@" &
+  active_pids=("$!")
+  wait "${active_pids[0]}" || rc=$?
+  active_pids=()
+  end=$(date +%s)
+  echo "lane-end ${name} rc=${rc} secs=$((end - start))"
+  return "$rc"
+}
+
+lane_bg() { # name budget logfile cmd...
+  local name="$1" budget="$2" log="$3"
+  shift 3
+  echo "lane-start ${name}"
+  date +%s > "${log}.start"
+  # The callsite's & owns the tracked job; never background again inside here.
+  exec timeout -k 15 "${budget}" "$@" >"${log}" 2>&1
+}
+
+finish_bg() { # name logfile pid
+  local name="$1" log="$2" pid="$3" rc=0 end
+  wait "${pid}" || rc=$?
+  end=$(date +%s)
+  echo "lane-end ${name} rc=${rc} secs=$((end - $(cat "${log}.start")))"
+  cat "${log}"
+  return "$rc"
+}
+
+fail() {
+  echo "verify: failed in lane '${1}'" >&2
+  exit "$2"
+}
+
+if [[ "$topology" == "parallel" ]]; then
+  lane_bg style "$BUDGET_STYLE" "$tmpdir/style.log" ./scripts/verify-lane-style &
+  p_style=$!; active_pids+=("$p_style")
+  lane_bg types "$BUDGET_TYPES" "$tmpdir/types.log" ./scripts/verify-lane-types &
+  p_types=$!; active_pids+=("$p_types")
+  src=0; finish_bg style "$tmpdir/style.log" "$p_style" || src=$?
+  active_pids=("$p_types")
+  trc=0; finish_bg types "$tmpdir/types.log" "$p_types" || trc=$?
+  active_pids=()
+  (( src == 0 )) || fail style "$src"
+  (( trc == 0 )) || fail types "$trc"
+else
+  lane style "$BUDGET_STYLE" ./scripts/verify-lane-style || fail style "$?"
+  lane types "$BUDGET_TYPES" ./scripts/verify-lane-types || fail types "$?"
+fi
+
+lane test "$BUDGET_TEST" ./scripts/verify-lane-test || fail test "$?"
+lane database "$BUDGET_DATABASE" ./scripts/verify-lane-database || fail database "$?"
+lane build "$BUDGET_BUILD" ./scripts/verify-lane-build || fail build "$?"
+echo "repository verification: pass (topology=${topology})"

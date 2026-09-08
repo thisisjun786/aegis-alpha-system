@@ -1,0 +1,20 @@
+[
+  {
+    "symbol": "SCCO",
+    "date": "2026-08-10",
+    "adjOpen": 199.15,
+    "adjHigh": 204.74,
+    "adjLow": 197.31,
+    "adjClose": 200.11,
+    "volume": 1569606.72
+  },
+  {
+    "symbol": "SCCO",
+    "date": "2026-08-28",
+    "adjOpen": 217.56,
+    "adjHigh": 217.56,
+    "adjLow": 209.57,
+    "adjClose": 209.8,
+    "volume": 1341216
+  }
+]

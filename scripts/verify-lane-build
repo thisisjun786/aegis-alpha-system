@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Build sdist/wheel, install into a fresh environment and smoke the installed CLI.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+. "$(dirname "${BASH_SOURCE[0]}")/verify-lib.sh"
+ensure_verify_toolchain
+
+scratch="$(mktemp -d /tmp/aas-verify-package.XXXXXXXXXX)"
+native_home=""
+cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM
+  verify_stop_child
+  if [[ -n "$native_home" ]]; then rm -rf -- "$native_home"; fi
+  rm -rf -- "$scratch"
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Build isolation may need a build backend absent from the development lock.
+verify_run env UV_OFFLINE=0 uv build --python "$AAS_VERIFY_PYTHON" --out-dir "$scratch/dist"
+shopt -s nullglob
+wheels=("$scratch"/dist/*.whl)
+[[ ${#wheels[@]} == 1 ]] || { echo "verify: expected exactly one built wheel" >&2; exit 1; }
+sdists=("$scratch"/dist/*.tar.gz)
+[[ ${#sdists[@]} == 1 ]] || { echo "verify: expected exactly one built sdist" >&2; exit 1; }
+"$AAS_VERIFY_PYTHON" - "${wheels[0]}" "${sdists[0]}" <<'PY'
+import sys
+from pathlib import Path
+from scripts.ci_public import check_distribution
+
+errors = [error for value in sys.argv[1:] for error in check_distribution(Path(value))]
+if errors:
+    raise SystemExit("\n".join(errors))
+print("wheel/sdist contents and legal notices: pass")
+PY
+verify_run uv export --locked --no-dev --no-emit-project --output-file "$scratch/requirements.txt" >/dev/null
+verify_run uv venv --python "$AAS_VERIFY_PYTHON" "$scratch/installed"
+verify_run env UV_OFFLINE=0 uv pip install --python "$scratch/installed/bin/python" \
+  --require-hashes -r "$scratch/requirements.txt"
+verify_run uv pip install --python "$scratch/installed/bin/python" --no-deps "${wheels[0]}"
+verify_run uv pip check --python "$scratch/installed/bin/python"
+cp "$_AAS_VERIFY_ROOT/examples/portfolio-preview.json" "$scratch/request.json"
+cd "$scratch"
+unset PYTHONPATH PYTHONHOME VIRTUAL_ENV AAS_TEST_DATABASE_URL AAS_DATA_ROOT AAS_PROJECT_ROOT
+export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
+"$scratch/installed/bin/python" -I - <<'PY'
+import sys
+from pathlib import Path
+import aegis_alpha
+import aegis_alpha.engine
+
+if not Path(aegis_alpha.__file__).resolve().is_relative_to(Path(sys.prefix).resolve()):
+    sys.exit("verify: smoke imported the checkout instead of the installed wheel")
+root = Path(aegis_alpha.__file__).parent
+for name in (
+    "strategies", "persistence", "data/canonical_production.py",
+    "data/canonical_publish.py", "data/postgres_rebind.py",
+):
+    if (root / name).exists():
+        sys.exit(f"verify: retired/private code was installed: {name}")
+PY
+verify_run "$scratch/installed/bin/aas" status > "$scratch/status.json"
+verify_run "$scratch/installed/bin/aas" preview --input "$scratch/request.json" > "$scratch/preview.json"
+verify_aas_smoke_json "$scratch/status.json" "$scratch/preview.json"
+
+# Native installation must work with only the base wheel dependencies, outside Git.
+native_home="$(mktemp -d /var/tmp/aas-native-package.XXXXXXXXXX)"
+verify_run "$scratch/installed/bin/aas" --home "$native_home/aas" init > "$scratch/init.json"
+verify_run "$scratch/installed/bin/aas" --home "$native_home/aas" doctor > "$scratch/doctor.json"
+verify_run "$scratch/installed/bin/aas" --home "$native_home/aas" db backup --output "$native_home/backup" > "$scratch/backup.json"
+verify_run "$scratch/installed/bin/aas" --home "$native_home/restored" db restore --backup "$native_home/backup" > "$scratch/restored.json"
+"$scratch/installed/bin/python" -I - "$scratch/doctor.json" "$scratch/restored.json" <<'PY'
+import importlib.util
+import json
+import sys
+from pathlib import Path
+report = json.loads(Path(sys.argv[1]).read_text())
+assert report["ready"] and report["strategy_versions"] == 0
+assert report["docker_required"] is False and report["database_server_required"] is False
+assert json.loads(Path(sys.argv[2]).read_text())["restored"] is True
+assert all(importlib.util.find_spec(name) is None for name in ("sqlalchemy", "psycopg", "alembic", "pyarrow"))
+print("installed native init/doctor/backup/restore without PostgreSQL or Parquet dependencies: pass")
+PY
+rm -rf -- "$native_home"

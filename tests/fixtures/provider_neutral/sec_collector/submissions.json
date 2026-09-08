@@ -1,0 +1,24 @@
+{
+  "cik": "990001",
+  "entityType": "operating",
+  "sic": "7372",
+  "sicDescription": "Synthetic software",
+  "name": "SYNTHETIC ISSUER INC",
+  "tickers": ["SYNTH"],
+  "exchanges": ["XNAS"],
+  "filings": {
+    "recent": {
+      "accessionNumber": [
+        "0000990001-25-000002",
+        "0000990001-25-000001"
+      ],
+      "filingDate": ["2025-02-15", "2025-01-10"],
+      "acceptanceDateTime": [
+        "2025-02-15T16:01:00.000Z",
+        "2025-01-10T16:01:00.000Z"
+      ],
+      "form": ["10-K", "13F-HR"],
+      "primaryDocument": ["synth-20241231.htm", "form13f.xml"]
+    }
+  }
+}
