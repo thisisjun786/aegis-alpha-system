@@ -26,8 +26,7 @@ from aegis_alpha.data.qveris_contracts import (
     object_value,
 )
 from aegis_alpha.data.qveris_payloads import validate_payload
-from aegis_alpha.data.qveris_store import QverisStore
-from aegis_alpha.data.sec_collector import validate_destination
+from aegis_alpha.data.qveris_store import QverisStore, validate_destination
 from aegis_alpha.data.serialization import content_sha256
 
 MAX_OPERATOR_REASON = 500

@@ -59,7 +59,9 @@ _REQUIRED_OPTIONS = {
             "budget_usd",
         }
     ),
-    "qveris": frozenset({"jobs", "raw_store_root", "max_credits", "timeout_seconds"}),
+    "qveris": frozenset(
+        {"jobs", "jobs_sha256", "raw_store_root", "max_credits", "timeout_seconds"}
+    ),
     "norgate": frozenset({"dataset_id", "dataset_version"}),
 }
 _OPTIONAL_OPTIONS = {
@@ -80,6 +82,7 @@ _TEXT_OPTIONS = frozenset(
         "as_of",
         "max_credits",
         "timeout_seconds",
+        "jobs_sha256",
     }
 )
 _LIST_OPTIONS = frozenset({"series", "instrument_ids"})
@@ -132,6 +135,11 @@ class ProviderProfile:
 def _validate_qveris_options(options: Mapping[str, str | tuple[str, ...]]) -> None:
     from decimal import Decimal, InvalidOperation  # noqa: PLC0415 -- provider-specific validation
 
+    if (
+        "jobs_sha256" in options
+        and re.fullmatch(r"[0-9a-f]{64}", str(options["jobs_sha256"])) is None
+    ):
+        raise ValueError("Qveris jobs_sha256 must pin the exact job manifest")
     try:
         if "max_credits" in options:
             credit_limit = Decimal(str(options["max_credits"]))

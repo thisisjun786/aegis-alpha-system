@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -21,7 +22,10 @@ def run_qveris_profile(
     profile: ProviderProfile, *, client: QverisPort | None = None
 ) -> dict[str, object]:
     budget = InvocationBudget(profile.max_calls, Decimal(str(profile.options["max_credits"])))
-    jobs = load_jobs(read_bytes(Path(str(profile.options["jobs"]))))
+    payload = read_bytes(Path(str(profile.options["jobs"])))
+    if hashlib.sha256(payload).hexdigest() != profile.options["jobs_sha256"]:
+        raise ValueError("Qveris jobs manifest hash differs")
+    jobs = load_jobs(payload)
     root = Path(str(profile.options["raw_store_root"]))
     if client is None:
         if profile.credential_file is None:

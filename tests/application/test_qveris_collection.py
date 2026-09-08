@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -23,6 +24,7 @@ def profile(tmp_path: Path) -> ProviderProfile:
         mode="daily",
         options={
             "jobs": str(jobs),
+            "jobs_sha256": hashlib.sha256(jobs.read_bytes()).hexdigest(),
             "raw_store_root": str(tmp_path / "raw"),
             "max_credits": "3",
             "timeout_seconds": "30",
@@ -79,3 +81,12 @@ def test_profile_rejects_invalid_budget_before_credential_read(
             mode="daily",
             options={**selected.options, key: value},
         )
+
+
+def test_job_manifest_changed_before_credentials_or_network(tmp_path: Path) -> None:
+    selected = profile(tmp_path)
+    Path(str(selected.options["jobs"])).write_text("{}")
+    client = FakeQveris()
+    with pytest.raises(ValueError, match="manifest hash"):
+        run_qveris_profile(selected, client=client)
+    assert client.calls == []
