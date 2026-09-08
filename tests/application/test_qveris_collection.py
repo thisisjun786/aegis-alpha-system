@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -86,7 +87,21 @@ def test_profile_rejects_invalid_budget_before_credential_read(
 def test_job_manifest_changed_before_credentials_or_network(tmp_path: Path) -> None:
     selected = profile(tmp_path)
     Path(str(selected.options["jobs"])).write_text("{}")
-    client = FakeQveris()
-    with pytest.raises(ValueError, match="manifest hash"):
-        run_qveris_profile(selected, client=client)
-    assert client.calls == []
+    key = tmp_path / "synthetic-key"
+    key.write_text("synthetic-key")
+    key.chmod(0o644)
+    selected = replace(selected, credential_file=key)
+    report = run_qveris_profile(selected)
+    assert report["error_type"] == "ValueError"
+    assert report["execution_started"] is False
+    payload = report["result"]
+    assert isinstance(payload, dict)
+    assert payload["http_requests"] == 0
+
+
+def test_bad_key_returns_safe_failure_envelope(tmp_path: Path) -> None:
+    selected = replace(profile(tmp_path), credential_file=tmp_path / "missing-key")
+    report = run_qveris_profile(selected)
+    assert report["status"] == "failed"
+    assert report["error_type"] == "QverisKeyFileError"
+    assert report["execution_started"] is False

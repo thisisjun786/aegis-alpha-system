@@ -22,14 +22,18 @@ from aegis_alpha.data.sec_evidence import open_directory
 from aegis_alpha.data.serialization import canonical_json_bytes
 
 
+class QverisDestinationError(RuntimeError):
+    """Evidence root admission failed before provider work."""
+
+
 def validate_destination(label: str, destination: Path) -> Path:
-    """Admit evidence roots without loading a legacy provider or Arrow runtime."""
+    """Admit roots using the retained sec_collector rule without its runtime imports."""
     if not destination.is_absolute() or ".." in destination.parts:
-        raise RuntimeError(f"{label} must be an absolute path without parent traversal")
+        raise QverisDestinationError(f"{label} must be an absolute path without parent traversal")
     if any((parent / ".git").exists() for parent in (destination, *destination.parents)):
-        raise RuntimeError(f"{label} must be outside a Git repository")
+        raise QverisDestinationError(f"{label} must be outside a Git repository")
     if destination.is_symlink():
-        raise RuntimeError(f"{label} must not be a symlink")
+        raise QverisDestinationError(f"{label} must not be a symlink")
     ancestor = destination if destination.is_dir() else destination.parent
     while not ancestor.exists():
         ancestor = ancestor.parent
@@ -37,7 +41,7 @@ def validate_destination(label: str, destination: Path) -> Path:
         with open_directory(ancestor):
             pass
     except (ValueError, OSError) as error:
-        raise RuntimeError(f"{label} must not traverse a symlink") from error
+        raise QverisDestinationError(f"{label} must not traverse a symlink") from error
     return destination
 
 

@@ -54,13 +54,20 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901 -- exclusive CLI m
             if args.execute:
                 if args.key_file is None:
                     raise ValueError("execution requires --key-file")  # noqa: TRY301 -- CLI validation
-                from aegis_alpha.data.qveris import InvocationBudget  # noqa: PLC0415
+                from aegis_alpha.data.qveris import (  # noqa: PLC0415
+                    InvocationBudget,
+                    RequestBudgetPort,
+                )
 
                 budget = InvocationBudget(args.max_calls, args.max_credits)
                 client = QverisClient(
                     args.key_file, max_response_bytes=max(job.max_response_bytes for job in jobs)
                 )
-                result = acquire_jobs(jobs, args.output_root, client, budget=budget)
+                port = RequestBudgetPort(client, max(32, budget.max_calls * 16), 900)
+                result = acquire_jobs(jobs, args.output_root, port, budget=budget)
+                result.update(
+                    paid_executions=port.paid_executions, http_requests=port.http_requests
+                )
         print(json.dumps(result, sort_keys=True, indent=2))  # noqa: T201 -- CLI output
     except (OSError, ValueError, TypeError, RuntimeError) as error:
         print(  # noqa: T201 -- sanitized CLI diagnostic

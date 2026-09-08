@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+from aegis_alpha.data.qveris import RequestBudgetPort
 from aegis_alpha.data.qveris_billing import (
     account_credits,
     audit_request,
@@ -394,13 +395,19 @@ def acquire_jobs(
 
 
 def reconcile_pending(root: Path, client: QverisPort) -> dict[str, object]:
+    client = RequestBudgetPort(client, 256, 900)
     with QverisStore(root, client.account_key) as store:
         store.require_no_pending_batches()
         pages = store.pending_pages(include_quarantined=True)
         outcomes = [
             {"page": page, "billing": reconcile_page(client, store, page)} for page in pages
         ]
-    return {"provider_calls": 0, "reconciled_pages": outcomes}
+    return {
+        "provider_calls": 0,
+        "paid_executions": 0,
+        "http_requests": client.http_requests,
+        "reconciled_pages": outcomes,
+    }
 
 
 def quarantine_pending(root: Path, page: str, reason: str, client: QverisPort) -> dict[str, object]:
@@ -409,6 +416,7 @@ def quarantine_pending(root: Path, page: str, reason: str, client: QverisPort) -
         raise ValueError("quarantine requires an exact existing page path")
     if not reason.strip() or len(reason) > MAX_OPERATOR_REASON:
         raise ValueError("quarantine requires a short operator reason")
+    client = RequestBudgetPort(client, 256, 900)
     with QverisStore(root, client.account_key) as store:
         if page not in store.pending_pages(include_quarantined=True):
             raise ValueError("only an unresolved existing page can be quarantined")
@@ -421,7 +429,13 @@ def quarantine_pending(root: Path, page: str, reason: str, client: QverisPort) -
         except (RuntimeError, ValueError, TypeError) as error:
             status = type(error).__name__
         if store.exists(f"{page}.billing.json"):
-            return {"page": page, "status": "SETTLED", "provider_calls": 0}
+            return {
+                "page": page,
+                "status": "SETTLED",
+                "provider_calls": 0,
+                "paid_executions": 0,
+                "http_requests": client.http_requests,
+            }
         document = {
             "page": page,
             "intent": store.pin(f"{page}.intent.json"),
@@ -439,4 +453,9 @@ def quarantine_pending(root: Path, page: str, reason: str, client: QverisPort) -
             document = store.document(destination)
         else:
             store.publish_document(destination, document)
-        return {**document, "provider_calls": 0}
+        return {
+            **document,
+            "provider_calls": 0,
+            "paid_executions": 0,
+            "http_requests": client.http_requests,
+        }

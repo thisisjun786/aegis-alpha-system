@@ -15,6 +15,7 @@ from types import MappingProxyType
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.data.qveris_contracts import (
     EOD_HISTORY_JSON_TOOL,
+    EOD_TOOL,
     QverisJob,
     credit_value,
     load_json,
@@ -32,6 +33,7 @@ class CompletedHistory:
     raw_sha256: str
     retrieved_at: datetime
     rows: tuple[Mapping[str, object], ...]
+    provider_warning: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,16 +74,21 @@ def read_completed_job(  # noqa: C901, PLR0912, PLR0915 -- one complete evidence
         if (
             job.fingerprint != fingerprint
             or marker.get("fingerprint") != fingerprint
-            or job.market != "KR"
-            or job.dataset != "price_history"
-            or job.tool_id != EOD_HISTORY_JSON_TOOL
-            or marker.get("status") != "RAW_ACQUIRED"
+            or (job.market, job.dataset, job.tool_id)
+            not in {
+                ("KR", "price_history", EOD_HISTORY_JSON_TOOL),
+                ("KR", "prices", EOD_TOOL),
+                ("US", "prices", EOD_TOOL),
+            }
+            or marker.get("status") not in {"RAW_ACQUIRED", "RAW_ACQUIRED_WITH_WARNINGS"}
+            or type(marker.get("schema_version")) is not int
             or marker.get("schema_version") != 1
+            or type(marker.get("pages")) is not int
             or marker.get("pages") != 1
             or marker.get("gateway") != "qveris"
             or marker.get("upstream") != "eodhd"
-            or marker.get("market") != "KR"
-            or marker.get("dataset") != "price_history"
+            or marker.get("market") != job.market
+            or marker.get("dataset") != job.dataset
         ):
             raise ValueError("unsupported or inconsistent completed Korean history")
         pins = marker.get("files")
@@ -128,6 +135,10 @@ def read_completed_job(  # noqa: C901, PLR0912, PLR0915 -- one complete evidence
         usage = object_value(billing.get("usage"))
         if any(usage.get(key) != intent.get(key) for key in ("tool_id", "session_id", "search_id")):
             raise ValueError("Qveris usage identity differs")
+        warning = usage.get("outcome") not in {None, "success"}
+        expected_status = "RAW_ACQUIRED_WITH_WARNINGS" if warning else "RAW_ACQUIRED"
+        if marker.get("status") != expected_status:
+            raise ValueError("Qveris completion warning state differs from usage")
         settled = credit_value(billing.get("settled_credits"))
         if (
             billing.get("over_quote") is not False
@@ -142,7 +153,7 @@ def read_completed_job(  # noqa: C901, PLR0912, PLR0915 -- one complete evidence
         if retrieved.utcoffset() is None:
             raise ValueError("Qveris retrieval timestamp must be timezone-aware")
         shape = validate_payload(job, job.parameters, raw, retrieved_on=retrieved.date())
-        if shape.rows != marker.get("rows"):
+        if type(marker.get("rows")) is not int or shape.rows != marker.get("rows"):
             raise ValueError("Qveris completion row count differs")
         values = object_value(raw.get("result")).get("data")
         if not isinstance(values, list):
@@ -153,6 +164,7 @@ def read_completed_job(  # noqa: C901, PLR0912, PLR0915 -- one complete evidence
             hashlib.sha256(payloads["raw"]).hexdigest(),
             retrieved,
             tuple(MappingProxyType(dict(object_value(row))) for row in values),
+            provider_warning=warning,
         )
 
 
@@ -168,10 +180,7 @@ def _number(value: object, *, positive: bool = True) -> float:
     return number
 
 
-def normalize_korean_price_history(
-    history: CompletedHistory, identities: Mapping[str, Mapping[str, str]]
-) -> NormalizedHistory:
-    symbol = str(history.job.parameters["symbol"])
+def _identity(symbol: str, identities: Mapping[str, Mapping[str, str]]) -> Mapping[str, str]:
     identity = identities.get(symbol)
     if identity is None or set(identity) != {
         "instrument_id",
@@ -180,50 +189,93 @@ def normalize_korean_price_history(
         "currency",
     }:
         raise ValueError("explicit instrument identity is required")
+    exchange = symbol.rsplit(".", 1)[-1]
     if (
-        identity["venue"] != symbol.rsplit(".", 1)[1]
-        or identity["currency"] != "KRW"
+        identity["venue"] != exchange
+        or identity["currency"] != ("USD" if exchange == "US" else "KRW")
         or identity["instrument_type"] not in {"ETF", "Common Stock"}
         or not identity["instrument_id"]
     ):
         raise ValueError("provider identity or currency differs")
+    return identity
+
+
+def _bar(
+    history: CompletedHistory,
+    raw: Mapping[str, object],
+    ordinal: int,
+    symbol: str,
+    identity: Mapping[str, str],
+) -> Mapping[str, object]:
+    observed = date.fromisoformat(str(raw["date"]))
+    prices = {
+        name: _number(raw.get(name)) for name in ("open", "high", "low", "close", "adjusted_close")
+    }
+    volume = _number(raw.get("volume"), positive=False)
+    if (
+        prices["low"] > min(prices["open"], prices["close"])
+        or prices["high"] < max(prices["open"], prices["close"])
+        or prices["low"] > prices["high"]
+    ):
+        raise ValueError("inconsistent_ohlc")
+    return MappingProxyType(
+        {
+            **identity,
+            "provider_symbol": symbol,
+            "date": observed,
+            **prices,
+            "volume": volume,
+            "source_fingerprint": history.job.fingerprint,
+            "raw_sha256": history.raw_sha256,
+            "retrieved_at": history.retrieved_at,
+            "source_row": ordinal,
+            "calendar_verified": False,
+            "independent_identity_verified": False,
+        }
+    )
+
+
+def _normalize(
+    history: CompletedHistory, identities: Mapping[str, Mapping[str, str]], fixed_symbol: str | None
+) -> NormalizedHistory:
     accepted, rejected = [], []
     for ordinal, raw in enumerate(history.rows):
+        if history.provider_warning:
+            rejected.append(
+                MappingProxyType(
+                    {
+                        "ordinal": ordinal,
+                        "reason": "provider_reported_partial",
+                        "source_row": dict(raw),
+                    }
+                )
+            )
+            continue
+        symbol = fixed_symbol or str(raw.get("code")) + "." + str(raw.get("exchange_short_name"))
         try:
-            observed = date.fromisoformat(str(raw["date"]))
-            prices = {
-                name: _number(raw.get(name))
-                for name in ("open", "high", "low", "close", "adjusted_close")
-            }
-            volume = _number(raw.get("volume"), positive=False)
-            if (
-                prices["low"] > min(prices["open"], prices["close"])
-                or prices["high"] < max(prices["open"], prices["close"])
-                or prices["low"] > prices["high"]
-            ):
-                raise ValueError("inconsistent_ohlc")  # noqa: TRY301 -- quarantine this source row
+            accepted.append(_bar(history, raw, ordinal, symbol, _identity(symbol, identities)))
         except (ValueError, TypeError, KeyError) as error:
             rejected.append(
                 MappingProxyType(
                     {"ordinal": ordinal, "reason": str(error), "source_row": dict(raw)}
                 )
             )
-            continue
-        accepted.append(
-            MappingProxyType(
-                {
-                    **identity,
-                    "provider_symbol": symbol,
-                    "date": observed,
-                    **prices,
-                    "volume": volume,
-                    "source_fingerprint": history.job.fingerprint,
-                    "raw_sha256": history.raw_sha256,
-                    "retrieved_at": history.retrieved_at,
-                    "source_row": ordinal,
-                    "calendar_verified": False,
-                    "independent_identity_verified": False,
-                }
-            )
-        )
     return NormalizedHistory(tuple(accepted), tuple(rejected))
+
+
+def normalize_korean_price_history(
+    history: CompletedHistory, identities: Mapping[str, Mapping[str, str]]
+) -> NormalizedHistory:
+    if history.job.market != "KR" or history.job.dataset != "price_history":
+        raise ValueError("expected Korean single-instrument history")
+    symbol = str(history.job.parameters["symbol"])
+    _identity(symbol, identities)
+    return _normalize(history, identities, symbol)
+
+
+def normalize_bulk_prices(
+    history: CompletedHistory, identities: Mapping[str, Mapping[str, str]]
+) -> NormalizedHistory:
+    if history.job.tool_id != EOD_TOOL or history.job.dataset != "prices":
+        raise ValueError("expected exchange bulk prices")
+    return _normalize(history, identities, None)

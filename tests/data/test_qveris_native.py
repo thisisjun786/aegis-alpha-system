@@ -110,3 +110,54 @@ def test_unknown_identity_and_wrong_venue_rejected(tmp_path: Path) -> None:
         normalize_korean_price_history(
             history, {"123456.KO": {**IDENTITY["123456.KO"], "venue": "KQ"}}
         )
+
+
+def test_bulk_keeps_unknown_identity_in_quarantine(tmp_path: Path) -> None:
+    from test_qveris_acquisition import eod_job  # noqa: PLC0415 -- shared synthetic transport
+
+    from aegis_alpha.data.qveris_native import normalize_bulk_prices  # noqa: PLC0415
+
+    job = eod_job()
+    acquire_jobs((job,), tmp_path, FakeQveris(), budget=InvocationBudget(1, Decimal(3)))
+    marker = tmp_path / "jobs" / job.fingerprint / "complete.json"
+    history = read_completed_job(
+        tmp_path, job.fingerprint, hashlib.sha256(marker.read_bytes()).hexdigest()
+    )
+    result = normalize_bulk_prices(history, {})
+    assert not result.rows
+    assert len(result.quarantine) == 1
+    result = normalize_bulk_prices(
+        history,
+        {
+            "AAA.US": {
+                "instrument_id": "synthetic-us",
+                "venue": "US",
+                "instrument_type": "ETF",
+                "currency": "USD",
+            }
+        },
+    )
+    assert len(result.rows) == 1
+    assert result.rows[0]["provider_symbol"] == "AAA.US"
+    assert not result.next_open_eligible
+
+
+@pytest.mark.parametrize("field", ["schema_version", "pages", "rows"])
+def test_boolean_marker_counts_rejected(tmp_path: Path, field: str) -> None:
+    import json  # noqa: PLC0415 -- tampered synthetic source
+
+    root, fingerprint, _pin = complete(tmp_path)
+    marker = root / "jobs" / fingerprint / "complete.json"
+    body = json.loads(marker.read_bytes())
+    body[field] = True
+    marker.write_bytes(canonical_json_bytes(body))
+    with pytest.raises(ValueError, match=r"inconsistent|row count"):
+        read_completed_job(root, fingerprint, hashlib.sha256(marker.read_bytes()).hexdigest())
+
+
+def test_provider_warning_never_admits_rows(tmp_path: Path) -> None:
+    history = read_completed_job(*complete(tmp_path))
+    result = normalize_korean_price_history(replace(history, provider_warning=True), IDENTITY)
+    assert not result.rows
+    assert len(result.quarantine) == len(history.rows)
+    assert result.quarantine[0]["reason"] == "provider_reported_partial"

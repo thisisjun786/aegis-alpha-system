@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from test_qveris_acquisition import FakeQveris, eod_job
 
-from aegis_alpha.data.qveris import InvocationBudget
+from aegis_alpha.data.qveris import InvocationBudget, RequestBudgetPort
 from aegis_alpha.data.qveris_acquisition import acquire_jobs
 
 
@@ -44,3 +44,24 @@ def test_completed_replay_consumes_no_budget(tmp_path: Path) -> None:
 def test_invalid_credit_budget(amount: object) -> None:
     with pytest.raises((ValueError, TypeError)):
         InvocationBudget(1, amount)  # ty: ignore[invalid-argument-type] -- invalid boundary input
+
+
+def test_http_bound_counts_audits_separately() -> None:
+    client = FakeQveris()
+    port = RequestBudgetPort(client, 1, 30)
+    port.request("/auth/credits")
+    with pytest.raises(RuntimeError, match="HTTP_LIMIT"):
+        port.request("/auth/credits")
+    assert port.http_requests == 1
+    assert port.paid_executions == 0
+    assert client.calls == ["/auth/credits"]
+
+
+def test_elapsed_budget_prevents_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("aegis_alpha.data.qveris.time.monotonic", lambda: 100)
+    client = FakeQveris()
+    port = RequestBudgetPort(client, 10, 5)
+    monkeypatch.setattr("aegis_alpha.data.qveris.time.monotonic", lambda: 105)
+    with pytest.raises(RuntimeError, match="HTTP_LIMIT"):
+        port.request("/auth/credits")
+    assert client.calls == []
