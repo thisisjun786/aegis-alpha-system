@@ -504,7 +504,7 @@ def test_urllib_redirect_handler_refuses_before_follow() -> None:
     [
         "https://evil.example/api/v1/auth/credits",
         "http://qveris.ai/api/v1/auth/credits",
-        "https://user:pw@qveris.ai/api/v1/auth/credits",
+        QVERIS_BASE_URL.replace("://", "://user:pw@") + "/auth/credits",
         "https://qveris.ai:8443/api/v1/auth/credits",
         f"{QVERIS_BASE_URL}/auth/credits/ledger",
     ],
