@@ -31,6 +31,7 @@ def test_cli_status_without_site_packages() -> None:
     assert status["capabilities"] == {
         "allocation_preview": True,
         "strategy_execution": False,
+        "aegis_etf_target_replay": True,
         "database_adapter": True,
         "provider_collection": True,
         "daily_collection": True,

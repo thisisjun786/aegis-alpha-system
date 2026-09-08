@@ -99,6 +99,22 @@ raw/runs도 포함하며 키·provider 설정과 절대 운영 경로는 제외�
 지원 schema는 [저장소 검증 코드](../src/aegis_alpha/storage/workspace.py)가 기준이다.
 자동 업그레이드·다운그레이드와 자료 삭제 명령은 제공하지 않는다.
 
+## 명시한 ETF 목표 비중 재생
+
+`aas backtest --input request.json --sha256 <파일의-SHA256>`는 명시한 ETF 목표 비중을
+다음 공급 거래일 시가에 체결하고 비용·현금·일별 NAV를 반환한다. 입력은 최대 64MiB이며
+스키마는 `aas-etf-backtest-v1`이다. 필수 필드는 `module`(aegis), `instrument_types`,
+`dates`, `opens`, `closes`, `targets`, `initial_cash`, `cost`, `source_pins`,
+`research_mode`다. 날짜는 YYYY-MM-DD, 가격 배열의 각 원소는 종목 ID와 숫자의 객체다.
+`targets`는 의사결정 날짜별 종목 목표 비중이며 현금은 비중의 나머지로 표현한다.
+
+양수 목표 비중의 종목 유형은 ETF여야 한다. `research_mode`는 합성 입력의 `synthetic`
+또는 실제 ETF 자료를 제출하는 `observed_etf_research`다. 제출한 분류·가격의 진위와
+달력 완전성은 호출자 책임이다. `source_pins`의 각 항목은 `source_id`, `source_sha256`,
+`table`, `table_digest`이며 이 명령은 해당 DB를 읽어 출처를 검증하지 않는다. 출력의
+`source_pins_verified`, `observed_prices_verified`, `point_in_time_verified`는 false다.
+원본 전략 규칙의 자동 해석이나 실주문을 시작하지 않는다.
+
 ## 선택적 단일 컨테이너
 
 ```bash

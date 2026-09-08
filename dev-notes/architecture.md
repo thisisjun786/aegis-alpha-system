@@ -13,6 +13,7 @@ AAS의 목표는 외부 앱과 에이전트가 사용하는 데이터·연구 �
 | --- | --- | --- |
 | `aas preview` | `application/portfolio.py`의 명시적 세 모듈 비중 합성 | 모듈별 전략 실행·DB 읽기·주문 |
 | `engine.load_bundle` / `engine.replay` | 외부 bundle 검증과 호출자가 주입한 입력 계산 | DB에서 전략·시장 입력 자동 선택 |
+| `aas backtest` | 명시한 ETF 목표 비중의 다음 거래일 시가 체결·비용·NAV 계산 | 원본 전략 규칙 자동 해석·제출 가격의 출처 및 시점 인증 |
 | `aas init/doctor/db/strategy/data` | `storage/`의 내장 DB 설치·등록·조회·복구 | 등록 전략을 실행하고 전체 결과를 확정하는 경로 |
 | `aas providers/collect` | 기존 공급자·예산·실행 영수증 도구 | 수집기의 내장 DB 이식·스케줄러 자동 활성화 |
 
@@ -92,6 +93,15 @@ universe·전략·시장 관례의 exact version/hash를 묶고, 각 의사결�
 스키마나 `EngineBundle` 계약을 바꾸지 않는다. 상태 DB의 저장 의도와 대상 DB의 완료
 기록을 대조하고 내용·행 수를 검증한다. 원본 자료는 실행 전략이나 PIT 데이터 게시물로
 자동 승격되지 않으며 `aas db sources/source-tables/source-read`로 조회한다.
+
+`storage/source_reader`는 명시한 원본·테이블 해시와 완료 기록을 확인하고, 선택한 테이블의
+내용 해시를 다시 계산한 뒤 제한된 크기로 읽는다. 다른 테이블 전체를 재검사하지 않는다.
+읽은 자료가 시점에 적합하거나 거래 가능한지는 별도 입력 계약이 판단한다.
+
+`engine/execution.py`는 외부의 목표 비중·시가·종가·거래일과 비용을 받아 일별 NAV와 체결
+원장을 계산한다. `aas backtest --input ... --sha256 ...`는 이지스의 ETF 양수 비중만
+허용한다. 파일 해시는 제출한 입력의 동일성을 확인하며, 입력 가격의 출처를 인증하지
+않는다. 따라서 이 명령은 `source_pins_verified=false`와 시점 미검증 상태를 명시한다.
 
 **남아 있는 전환 전 코드**는 `legacy-db`·`legacy-data`와 일부 수집기다. 이 경로에만
 `legacy` 추가 의존성과 PostgreSQL이 필요하다. 기본 설치는 SQLite·DuckDB를 사용한다.
