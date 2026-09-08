@@ -64,5 +64,7 @@ def test_operation_completion_rolls_back_with_catalog_transaction(tmp_path: Path
         complete_operation(connection, "op", "a" * 64)
         raise RuntimeError("crash")
     assert connection.execute("SELECT count(*) FROM issuers").fetchone()[0] == 0
-    assert get_operation(connection, "op")["phase"] == "PREPARED"
+    operation = get_operation(connection, "op")
+    assert operation is not None
+    assert operation["phase"] == "PREPARED"
     connection.close()
