@@ -242,3 +242,12 @@ def test_nonfinite_portfolio_arithmetic_is_rejected() -> None:
             1000,
             0,
         )
+
+
+def test_compensated_weight_sum_preserves_full_allocation() -> None:
+    # One third plus four rounded sixths totals one; naive += adds rounding drift.
+    weights = {"SYN_A": 1 / 3, **{f"SYN_{n}": 0.16666666666666669 for n in range(4)}}
+    prices = dict.fromkeys(weights, 1.0)
+    result = replay_next_open(DAYS, [prices] * 3, [prices] * 3, {DAYS[0]: weights}, 100.0, 0.0)
+    assert result.nav[-1].equity == pytest.approx(100.0)
+    assert result.nav[-1].cash == pytest.approx(0.0, abs=1e-12)

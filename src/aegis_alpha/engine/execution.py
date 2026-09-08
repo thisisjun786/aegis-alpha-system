@@ -143,15 +143,15 @@ def _validate_targets(
             msg = "each decision must have a following supplied session"
             raise ValueError(msg)
         mapping = _require_mapping(weights, field="target weights")
-        total = 0.0
+        values: list[float] = []
         for symbol, weight in mapping.items():
             _require_symbol(symbol)
             parsed = _as_finite(weight)
             if parsed is None or parsed < 0:
                 msg = "long-only target weights must sum to at most one"
                 raise ValueError(msg)
-            total += parsed
-        if total > 1:
+            values.append(parsed)
+        if math.fsum(values) > 1:
             msg = "long-only target weights must sum to at most one"
             raise ValueError(msg)
 
