@@ -1,7 +1,9 @@
 # Aegis Alpha System
 
-AAS는 이지스·알파·헷지 세 모듈을 가진 독립 투자 연구 CLI다. 공개 레포에는 범용 엔진과
-입력·저장 계약을 두고, 전략 정의와 사용자 데이터는 별도 비공개 저장소에서 관리한다.
+AAS는 외부 앱과 에이전트가 사용하는 데이터·투자 연구 엔진을 목표로 한다. AAS가 데이터와
+계산을 제공하고 외부 도구가 화면과 작업 진행을 맡는다. 현재는 범용 계산 Python API와
+데이터·전략 저장 및 비중 합성 CLI를 제공하며, 수집기는 전환 중인 PostgreSQL 저장 경로를 사용한다.
+공개 레포에는 범용 엔진과 입력·저장 계약을 두고, 전략 정의와 사용자 데이터는 별도 비공개 저장소에서 관리한다.
 라이선스는 Apache-2.0이다.
 
 ## 설치와 첫 실행
@@ -61,6 +63,12 @@ aas --home /path/to/new-home db restore --backup /path/to/new-backup
 `aas preview --input examples/portfolio-preview.json`은 합성 모듈 비중을 결합한다.
 `aegis_alpha.engine.load_bundle`과 `replay`는 명시한 외부 전략과 검증한 입력을 계산하는
 Python API다. CLI 전체 백테스트·상시 앱·실주문은 아직 구현 전이다.
+
+이지스·알파·헷지는 자산배분·개별 종목·방어 배분의 연구 영역이다. 현재 preview 입력은
+세 모듈을 모두 명시해야 하지만, 각 모듈이 전략을 실행하는 것은 아니다. 전략 등록은
+bundle을 검증·저장하며 실행을 시작하지 않는다. 내장 데이터 조회와 전략 계산·결과 저장의
+통합 경로 및 HTTP/MCP 서버는 제공하지 않는다. [제품 경계 결정](dev-notes/decisions/0015-research-engine-product-boundary.md)에
+목표와 현재 구현의 차이를 기록했다.
 
 기존 공급자 수집기는 전환 중이다. `legacy-db`·`legacy-data`와 해당 수집기를 쓸 때만
 `legacy` 추가 의존성 및 명시한 이전 DB 설정이 필요하다. 새 기본 설치에는 PostgreSQL

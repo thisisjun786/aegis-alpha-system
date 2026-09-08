@@ -1,6 +1,7 @@
 # AAS operations
 
-기본 실행은 네이티브 CLI다. SQLite와 DuckDB는 앱 내부에서 파일을 열며 별도 DB 서버나
+현재 운영 진입점은 네이티브 CLI다. 외부 도구도 이를 호출할 수 있으며, Python 계산 API의
+역할과 연결 한계는 [구조](architecture.md)가 설명한다. SQLite와 DuckDB는 앱 내부에서 파일을 열며 별도 DB 서버나
 Docker가 필요 없다. [설계](design/backtest-data-foundation.md)와 [설치 결정](decisions/0013-first-install-workspace.md)이 저장 계약을 소유한다.
 
 ## 처음 설치
@@ -66,7 +67,8 @@ raw/runs도 포함하며 키·provider 설정과 절대 운영 경로는 제외�
 
 복원은 존재하지 않는 새 루트만 받는다. 파일·스키마·FK·논리 해시 검증이 끝나야 ready로 바꾸며
 실패한 복원은 정상 설치로 열지 않는다. store ID는 유지하고 deployment ID는 새로 만든다.
-현재 schema는 v1이며 자동 업그레이드·다운그레이드는 제공하지 않는다. 자료 삭제 명령도 없다.
+지원 schema는 [저장소 검증 코드](../src/aegis_alpha/storage/workspace.py)가 기준이다.
+자동 업그레이드·다운그레이드와 자료 삭제 명령은 제공하지 않는다.
 
 ## 선택적 단일 컨테이너
 
@@ -81,7 +83,8 @@ docker compose run --rm aas doctor
 기본 Compose는 AAS 앱 하나와 사용자 루트 bind mount만 사용한다. DB 서비스·named DB volume·
 공개 포트가 없다. 이미지에 DB·전략·키를 넣지 않는다. 외부 데이터 경로를 사용하면 해당 경로도
 컨테이너에 명시적으로 연결해야 한다. 동시에 실행한 CLI는 설치 잠금으로 거부한다.
-상시 앱의 소켓·자동 예약 실행은 후속 구현이다.
+상시 앱의 소켓·예약 실행은 [0013](decisions/0013-first-install-workspace.md)에서 승인됐지만
+미구현인 설계다. 현재 명령은 소켓으로 전달되지 않으며 잠금 충돌 시 `installation_busy`로 실패한다.
 
 ## 전환 중인 공급자 도구
 

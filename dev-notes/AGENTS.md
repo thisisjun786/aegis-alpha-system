@@ -1,8 +1,9 @@
 # Development documentation
 
 Current architecture lives in `architecture.md`, runnable procedures in
-`operations.md`, and decisions in `decisions/README.md`. Decisions 0009 through 0014 own the standalone app, data foundation,
-public/private boundary, legacy retirement and local embedded storage target.
+`operations.md`, and decisions in `decisions/README.md`. Decision 0015 owns the external-tool-facing data/research engine goal. Decisions 0009
+through 0014 retain current CLI/module, data, public/private, legacy retirement and
+embedded-storage contracts within their documented scope.
 
 - Keep architecture, procedures and rationale in their owning documents.
 - Runtime versions, image digests and trust pins belong in code/config/locks;
@@ -13,6 +14,7 @@ public/private boundary, legacy retirement and local embedded storage target.
 - Preserve generic failure contracts when moving their original evidence privately.
 - Earlier VT-only or retired-DB proposals do not override current decisions.
 - Decision 0014 replaces PostgreSQL/Parquet as the target storage. Distinguish the
-  new SQLite/DuckDB design from current PostgreSQL code and operational commands.
+  implemented SQLite/DuckDB commands from transitional PostgreSQL commands and
+  accepted-but-unimplemented service designs. An accepted decision is not runtime proof.
 - Do not claim implementation, installed behavior or provider success from a design.
 - Match the document's existing language. POLICY.md and agent instructions use English.

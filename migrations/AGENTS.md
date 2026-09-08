@@ -2,11 +2,12 @@
 
 ## OVERVIEW
 
-Alembic revision chain for every AAS metadata surface — PostgreSQL only, with guarded
+Alembic revision chain for the retained AAS PostgreSQL metadata surfaces — PostgreSQL only, with guarded
 destructive downgrades. **Preserved for controlled adoption** (`dev-notes/decisions/0010-backtest-data-foundation.md`).
-Existing revisions are immutable historical contracts. A new revision requires a scoped R1
-implementation plan and migration/data-preservation validation on disposable and restored-clone
-databases. The design alone does not authorize runtime DDL, collection restart, or deletion.
+Existing revisions are immutable historical contracts. A new revision requires a scoped
+implementation plan and migration/data-preservation validation on disposable synthetic
+databases under [POLICY.md](../POLICY.md) and [test instructions](../tests/AGENTS.md).
+Actual restored or production data must not be used for these tests. The design alone does not authorize runtime DDL, collection restart, or deletion.
 
 Decision [0014](../dev-notes/decisions/0014-local-embedded-databases.md) replaces this
 PostgreSQL chain as the target for new installations. Implement new embedded schemas
@@ -26,9 +27,9 @@ then retire its unused code and tests together. Do not translate these revisions
 
 ## CONVENTIONS
 
-- The revision id is the filename prefix: `revision = "20260829_0010"` with
-  `down_revision = "20260825_0009"`. The head is whatever `alembic heads` prints. Extend only through the controlled adoption
-  process in decision 0010; never edit an existing revision .
+- Revision identifiers and parent links are owned by `versions/`. Read the actual chain
+  and `alembic heads` before extending it; do not copy a historical head from prose.
+  Extend only through the scoped change process; never edit an existing revision.
 - The chain branched at `0004` (`20260806_0004_canonical_generation_chain` and
   `20260818_0004_signed_usage_checkpoints`) and was merged by
   `20260821_0005_merge_generation_and_usage_heads`. Check `alembic heads` before adding.
