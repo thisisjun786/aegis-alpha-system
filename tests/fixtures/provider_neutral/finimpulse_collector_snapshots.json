@@ -1,0 +1,205 @@
+{
+  "fixture_version": 1,
+  "fixture_kind": "synthetic_provider_neutral_collector",
+  "data_classification": "synthetic_provider_neutral",
+  "task_id": "AAS-DATA-008C",
+  "provider": "finimpulse",
+  "endpoint": "https://api.finimpulse.com/v1/analysis/earnings",
+  "notes": "Hand-authored synthetic estimates. No provider call produced this file.",
+  "snapshots": {
+    "baseline": {
+      "AAPL": {
+        "cost": 0.0014,
+        "headers": {
+          "content-type": "application/json",
+          "x-ratelimit-limit": "2000",
+          "x-ratelimit-remaining": "1999"
+        },
+        "items": [
+          {
+            "type": "eps_trend",
+            "date": "2026-09-30",
+            "date_type": "quarter",
+            "current": 1.7,
+            "seven_days_ago": 1.69,
+            "thirty_days_ago": 1.66,
+            "sixty_days_ago": 1.62,
+            "ninety_days_ago": 1.6
+          },
+          {
+            "type": "eps_trend",
+            "date": "2026-12-31",
+            "date_type": "quarter",
+            "current": 1.8,
+            "seven_days_ago": 1.79,
+            "thirty_days_ago": 1.75,
+            "sixty_days_ago": 1.7,
+            "ninety_days_ago": null
+          },
+          {
+            "type": "eps_revisions",
+            "date": "2026-09-30",
+            "date_type": "quarter",
+            "up_last7days": 2,
+            "up_last30days": 5,
+            "down_last7days": 1,
+            "down_last30days": 1
+          },
+          {
+            "type": "eps_revisions",
+            "date": "2026-12-31",
+            "date_type": "quarter",
+            "up_last7days": 1,
+            "up_last30days": 3,
+            "down_last7days": 0,
+            "down_last30days": 2
+          }
+        ]
+      },
+      "PLAB": {
+        "cost": 0.0011,
+        "headers": {
+          "content-type": "application/json",
+          "x-ratelimit-limit": "2000",
+          "x-ratelimit-remaining": "1998"
+        },
+        "items": [
+          {
+            "type": "eps_trend",
+            "date": "2026-09-30",
+            "date_type": "quarter",
+            "current": 0.42,
+            "seven_days_ago": 0.42,
+            "thirty_days_ago": 0.4,
+            "sixty_days_ago": null,
+            "ninety_days_ago": null
+          },
+          {
+            "type": "eps_revisions",
+            "date": "2026-09-30",
+            "date_type": "quarter",
+            "up_last7days": 0,
+            "up_last30days": 1,
+            "down_last7days": 0,
+            "down_last30days": 0
+          }
+        ]
+      }
+    },
+    "expected_revision": {
+      "AAPL": {
+        "cost": 0.0014,
+        "headers": {
+          "content-type": "application/json",
+          "x-ratelimit-limit": "2000",
+          "x-ratelimit-remaining": "1990"
+        },
+        "items": [
+          {
+            "type": "eps_trend",
+            "date": "2026-09-30",
+            "date_type": "quarter",
+            "current": 1.74,
+            "seven_days_ago": 1.69,
+            "thirty_days_ago": 1.66,
+            "sixty_days_ago": 1.62,
+            "ninety_days_ago": 1.6
+          },
+          {
+            "type": "eps_trend",
+            "date": "2026-12-31",
+            "date_type": "quarter",
+            "current": 1.8,
+            "seven_days_ago": 1.79,
+            "thirty_days_ago": 1.75,
+            "sixty_days_ago": 1.7,
+            "ninety_days_ago": null
+          },
+          {
+            "type": "eps_revisions",
+            "date": "2026-09-30",
+            "date_type": "quarter",
+            "up_last7days": 3,
+            "up_last30days": 6,
+            "down_last7days": 1,
+            "down_last30days": 1
+          },
+          {
+            "type": "eps_revisions",
+            "date": "2026-12-31",
+            "date_type": "quarter",
+            "up_last7days": 1,
+            "up_last30days": 3,
+            "down_last7days": 0,
+            "down_last30days": 2
+          }
+        ]
+      }
+    },
+    "lookback_inconsistency": {
+      "AAPL": {
+        "cost": 0.0014,
+        "headers": {
+          "content-type": "application/json",
+          "x-ratelimit-limit": "2000",
+          "x-ratelimit-remaining": "1988"
+        },
+        "items": [
+          {
+            "type": "eps_trend",
+            "date": "2026-09-30",
+            "date_type": "quarter",
+            "current": 1.7,
+            "seven_days_ago": 1.69,
+            "thirty_days_ago": 1.41,
+            "sixty_days_ago": 1.62,
+            "ninety_days_ago": 1.6
+          }
+        ]
+      }
+    },
+    "post_actualization": {
+      "AAPL": {
+        "cost": 0.0014,
+        "headers": {
+          "content-type": "application/json",
+          "x-ratelimit-limit": "2000",
+          "x-ratelimit-remaining": "1986"
+        },
+        "items": [
+          {
+            "type": "eps_trend",
+            "date": "2026-09-30",
+            "date_type": "quarter",
+            "current": null,
+            "seven_days_ago": 1.69,
+            "thirty_days_ago": 1.66,
+            "sixty_days_ago": 1.62,
+            "ninety_days_ago": 1.6
+          }
+        ]
+      }
+    },
+    "rolling_window": {
+      "AAPL": {
+        "cost": 0.0014,
+        "headers": {
+          "content-type": "application/json",
+          "x-ratelimit-limit": "2000",
+          "x-ratelimit-remaining": "1984"
+        },
+        "items": [
+          {
+            "type": "eps_revisions",
+            "date": "2026-09-30",
+            "date_type": "quarter",
+            "up_last7days": 0,
+            "up_last30days": 5,
+            "down_last7days": 1,
+            "down_last30days": 1
+          }
+        ]
+      }
+    }
+  }
+}

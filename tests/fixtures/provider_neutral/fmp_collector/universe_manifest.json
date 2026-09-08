@@ -1,0 +1,35 @@
+{
+  "generated_at_utc": "2026-07-29T00:00:00+00:00",
+  "sources": [
+    {
+      "endpoint": "/stable/cik-list",
+      "retrieved_at_utc": "2026-07-29T00:00:00+00:00",
+      "raw_content_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    {
+      "endpoint": "/stable/delisted-companies",
+      "retrieved_at_utc": "2026-07-29T00:00:01+00:00",
+      "raw_content_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  ],
+  "entries": [
+    {
+      "symbol": "synth.a",
+      "ipoDate": "2015-01-02",
+      "delistedDate": null,
+      "active": true
+    },
+    {
+      "symbol": "synth.b",
+      "ipoDate": "2019-05-06",
+      "delistedDate": null,
+      "active": true
+    },
+    {
+      "symbol": "synth.c",
+      "ipoDate": "1998-01-01",
+      "delistedDate": "2001-02-03",
+      "active": false
+    }
+  ]
+}

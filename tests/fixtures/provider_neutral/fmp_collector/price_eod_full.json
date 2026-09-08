@@ -1,0 +1,26 @@
+[
+  {
+    "symbol": "SYNTH.A",
+    "date": "2026-07-27",
+    "open": 10.5,
+    "high": 11.25,
+    "low": 10.25,
+    "close": 11.0,
+    "volume": 125000,
+    "change": 0.5,
+    "changePercent": 4.76,
+    "vwap": 10.75
+  },
+  {
+    "symbol": "SYNTH.A",
+    "date": "2026-07-28",
+    "open": 11.0,
+    "high": 11.5,
+    "low": 10.9,
+    "close": 11.4,
+    "volume": 98000,
+    "change": 0.4,
+    "changePercent": 3.64,
+    "vwap": null
+  }
+]

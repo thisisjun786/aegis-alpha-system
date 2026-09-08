@@ -1,0 +1,13 @@
+{
+  "as_of_utc": "2026-08-18T00:00:00Z",
+  "instruments": [
+    {
+      "instrument_id": "inst-synth-common",
+      "issuer_id": "issuer-synth",
+      "cik_source": "990001",
+      "effective_start": "2020-01-01T00:00:00Z",
+      "effective_end": null
+    }
+  ],
+  "conflicts": []
+}

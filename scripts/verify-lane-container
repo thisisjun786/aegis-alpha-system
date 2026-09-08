@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Build only the requested image; smoke with no network, host mounts or service.
+set -euo pipefail
+if [[ $# != 1 || "$1" != aas ]]; then
+  echo "usage: scripts/verify-lane-container aas" >&2
+  exit 2
+fi
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+. "$(dirname "${BASH_SOURCE[0]}")/verify-lib.sh"
+AAS_VERIFY_PYTHON="$(command -v python3)"
+command -v docker >/dev/null || { echo "verify: docker is unavailable" >&2; exit 1; }
+
+scratch="$(mktemp -d /tmp/aas-verify-container.XXXXXXXXXX)"
+owner="${scratch##*/}"
+image="aas-verify-aas:${owner}"
+label="org.aegis-alpha.verify"
+containers=()
+image_built=0
+cleanup() {
+  local rc=$? name found
+  trap - EXIT INT TERM
+  verify_stop_child
+  for name in "${containers[@]}"; do
+    found="$(timeout -k 2 10 docker container inspect --format "{{index .Config.Labels \"$label\"}}" "$name" 2>/dev/null)" || continue
+    if [[ "$found" == "$owner" ]]; then
+      timeout -k 2 10 docker container rm --force "$name" >/dev/null || rc=1
+    fi
+  done
+  found="$(timeout -k 2 10 docker image inspect --format "{{index .Config.Labels \"$label\"}}" "$image" 2>/dev/null)" || found=""
+  if [[ "$found" == "$owner" ]]; then
+    timeout -k 2 10 docker image rm "$image" >/dev/null || rc=1
+  elif (( image_built )); then
+    echo "verify: unable to verify image ownership for cleanup: $image" >&2
+    (( rc != 0 )) || rc=1
+  fi
+  rm -rf -- "$scratch"
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+run_container() {
+  local entrypoint="$1" name="${owner}-${#containers[@]}"
+  shift
+  containers+=("$name")
+  verify_run docker run --rm --name "$name" --label "$label=$owner" \
+    --network=none --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+    --no-healthcheck --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+    --entrypoint "$entrypoint" "$image" "$@"
+}
+verify_run docker build --file Dockerfile --tag "$image" --label "$label=$owner" .
+image_built=1
+run_container /opt/venv/bin/python -I -c '
+from pathlib import Path
+import aegis_alpha
+import aegis_alpha.engine
+root = Path(aegis_alpha.__file__).parent
+for name in (
+    "strategies", "persistence", "data/canonical_production.py",
+    "data/canonical_publish.py", "data/postgres_rebind.py",
+):
+    assert not (root / name).exists(), f"retired/private code in image: {name}"
+assert not Path("/app/config/postgres/targets").exists(), "private profiles in image"
+assert Path("/app/LICENSE").is_file(), "missing license"
+assert Path("/app/THIRD_PARTY_NOTICES.md").is_file(), "missing notices"
+print("image engine/private-content/legal checks: pass")
+'
+run_container aas status > "$scratch/status.json"
+run_container aas preview --input /app/examples/portfolio-preview.json > "$scratch/preview.json"
+verify_aas_smoke_json "$scratch/status.json" "$scratch/preview.json"
+
+# Exercise native persistence across CLI processes inside the isolated image.
+run_container /opt/venv/bin/python -I -c '
+import json
+import subprocess
+from pathlib import Path
+
+def command(home, *args):
+    return json.loads(subprocess.check_output(["aas", "--home", home, *args], text=True))
+
+home = "/tmp/aas"
+command(home, "init")
+report = command(home, "doctor")
+assert report["ready"] and report["strategy_versions"] == 0
+assert report["docker_required"] is False and report["database_server_required"] is False
+assert all((Path(home) / name).is_file() for name in ("state.sqlite3", "strategies.sqlite3", "market.duckdb"))
+command(home, "db", "backup", "--output", "/tmp/aas-backup")
+restored = command("/tmp/aas-restored", "db", "restore", "--backup", "/tmp/aas-backup")
+assert restored["restored"] is True
+assert command("/tmp/aas-restored", "doctor")["ready"] is True
+print("image native init/doctor/backup/restore across CLI processes: pass")
+'

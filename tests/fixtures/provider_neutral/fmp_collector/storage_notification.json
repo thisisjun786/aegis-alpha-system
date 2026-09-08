@@ -1,0 +1,8 @@
+{
+  "notified_at_utc": "2026-07-29T00:00:00+00:00",
+  "channel": "email:synthetic-provider-contact@example.invalid",
+  "storage_aliases": [
+    "synthetic-host.example.invalid",
+    "203.0.113.7"
+  ]
+}

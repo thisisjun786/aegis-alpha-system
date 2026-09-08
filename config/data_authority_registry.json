@@ -1,0 +1,120 @@
+{
+  "registry_version": "1.0.0",
+  "policies": [
+    {
+      "policy_id": "norgate-historical-market-v1",
+      "provider": "norgate",
+      "role": "HISTORICAL_BACKTEST_REFERENCE",
+      "domains": [
+        "historical_universe",
+        "price",
+        "historical_membership"
+      ],
+      "fields": [
+        "active_and_delisted_universe",
+        "assetid",
+        "capital_price",
+        "total_return_price",
+        "historical_membership"
+      ],
+      "semantic_compatibility": "Historical reference inputs require explicit source and eligibility evidence; price bases remain distinct.",
+      "scheduled_collection_allowed": false,
+      "canonical_write_allowed": false,
+      "backtest_eligible": false,
+      "paper_eligible": false,
+      "order_eligible": false,
+      "license_classification": "PROPRIETARY_SUBSCRIPTION",
+      "retention_classification": "OWNER_CONTROLLED"
+    },
+    {
+      "policy_id": "fmp-operational-candidate-v1",
+      "provider": "fmp",
+      "role": "PRIMARY",
+      "domains": [
+        "current_price",
+        "financials",
+        "calendar",
+        "transcript",
+        "holdings"
+      ],
+      "fields": [
+        "provider_normalized_fields"
+      ],
+      "semantic_compatibility": "Collection, publication and downstream use require separately verified authority.",
+      "scheduled_collection_allowed": false,
+      "canonical_write_allowed": false,
+      "backtest_eligible": false,
+      "paper_eligible": false,
+      "order_eligible": false,
+      "license_classification": "PROPRIETARY_SUBSCRIPTION",
+      "retention_classification": "OWNER_CONTROLLED"
+    },
+    {
+      "policy_id": "finimpulse-eps-revision-candidate-v1",
+      "provider": "finimpulse",
+      "role": "NO_SAFE_FALLBACK",
+      "domains": [
+        "estimate_revision"
+      ],
+      "fields": [
+        "eps_revision_trend",
+        "revision_up_count",
+        "revision_down_count"
+      ],
+      "semantic_compatibility": "Disabled until coverage, PIT meaning, license, and identifier gates pass.",
+      "scheduled_collection_allowed": false,
+      "canonical_write_allowed": false,
+      "backtest_eligible": false,
+      "paper_eligible": false,
+      "order_eligible": false,
+      "license_classification": "PENDING_CONTRACT_REVIEW",
+      "retention_classification": "PENDING_CONTRACT_REVIEW"
+    },
+    {
+      "policy_id": "sec-official-verifier-v1",
+      "provider": "sec",
+      "role": "OFFICIAL_VERIFIER",
+      "domains": [
+        "filing",
+        "financial_fact",
+        "holdings"
+      ],
+      "fields": [
+        "accepted_at",
+        "xbrl_fact",
+        "filing_document",
+        "form_13f"
+      ],
+      "semantic_compatibility": "Official evidence and discrepancy investigation; never silent overwrite.",
+      "scheduled_collection_allowed": false,
+      "canonical_write_allowed": false,
+      "backtest_eligible": false,
+      "paper_eligible": false,
+      "order_eligible": false,
+      "license_classification": "PUBLIC_OFFICIAL_PENDING_POLICY_REVIEW",
+      "retention_classification": "PENDING_POLICY_REVIEW"
+    },
+    {
+      "policy_id": "fred-alfred-official-verifier-v1",
+      "provider": "fred_alfred",
+      "role": "OFFICIAL_VERIFIER",
+      "domains": [
+        "macro"
+      ],
+      "fields": [
+        "observation",
+        "realtime_start",
+        "realtime_end",
+        "vintage"
+      ],
+      "semantic_compatibility": "Macro verification candidate; observation and vintage times stay distinct.",
+      "scheduled_collection_allowed": false,
+      "canonical_write_allowed": false,
+      "backtest_eligible": false,
+      "paper_eligible": false,
+      "order_eligible": false,
+      "license_classification": "PUBLIC_OFFICIAL_PENDING_POLICY_REVIEW",
+      "retention_classification": "PENDING_POLICY_REVIEW"
+    }
+  ]
+}

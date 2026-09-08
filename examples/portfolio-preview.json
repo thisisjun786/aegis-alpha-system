@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "as_of": "2026-09-05",
+  "budgets": {"aegis": 0.6, "alpha": 0.25, "hedge": 0.1},
+  "modules": [
+    {
+      "module": "aegis",
+      "strategy_id": "demo-aegis",
+      "strategy_version": "1",
+      "as_of": "2026-09-05",
+      "targets": [{"instrument_id": "asset:equity-basket", "weight": 0.8}]
+    },
+    {
+      "module": "alpha",
+      "strategy_id": "demo-alpha",
+      "strategy_version": "1",
+      "as_of": "2026-09-05",
+      "targets": [
+        {"instrument_id": "asset:equity-basket", "weight": 0.4},
+        {"instrument_id": "asset:stock-b", "weight": 0.6}
+      ]
+    },
+    {
+      "module": "hedge",
+      "strategy_id": "demo-hedge",
+      "strategy_version": "1",
+      "as_of": "2026-09-05",
+      "targets": [{"instrument_id": "asset:protective-basket", "weight": 1}]
+    }
+  ]
+}

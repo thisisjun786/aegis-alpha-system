@@ -1,0 +1,13 @@
+{
+  "realtime_start": "2024-01-16",
+  "realtime_end": "2024-01-16",
+  "seriess": [
+    {
+      "id": "DGS10",
+      "title": "Synthetic 10-Year Treasury",
+      "frequency": "Daily",
+      "units": "Percent",
+      "seasonal_adjustment": "Not Seasonally Adjusted"
+    }
+  ]
+}

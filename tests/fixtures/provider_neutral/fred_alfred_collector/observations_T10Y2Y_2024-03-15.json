@@ -1,0 +1,14 @@
+{
+  "realtime_start": "2024-03-15",
+  "realtime_end": "2024-03-15",
+  "observation_start": "2024-01-15",
+  "observation_end": "2024-01-15",
+  "observations": [
+    {
+      "realtime_start": "2024-03-15",
+      "realtime_end": "9999-12-31",
+      "date": "2024-01-15",
+      "value": "0.41"
+    }
+  ]
+}

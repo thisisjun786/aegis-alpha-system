@@ -1,0 +1,24 @@
+[
+  {
+    "symbol": "SYNTH.A",
+    "companyName": "Synthetic Successor Corp",
+    "exchange": "SYNTHEX",
+    "exchangeFullName": "Synthetic Exchange",
+    "currency": "SYN",
+    "country": "SX",
+    "sector": "Synthetic Sector",
+    "industry": "Synthetic Industry",
+    "cik": "0000000999",
+    "cusip": "SYNTH0999",
+    "isin": "SX0000000999",
+    "isActivelyTrading": true,
+    "isAdr": false,
+    "isEtf": false,
+    "isFund": false,
+    "ipoDate": "2024-09-09",
+    "price": 4.2,
+    "beta": 1.4,
+    "marketCap": 42000000.0,
+    "lastDividend": 0.0
+  }
+]

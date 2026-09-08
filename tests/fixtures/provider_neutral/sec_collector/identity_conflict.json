@@ -1,0 +1,28 @@
+{
+  "as_of_utc": "2026-08-18T00:00:00Z",
+  "instruments": [
+    {
+      "instrument_id": "inst-conflict-a",
+      "issuer_id": "issuer-conflict-a",
+      "cik_source": "990002",
+      "effective_start": "2020-01-01T00:00:00Z",
+      "effective_end": null
+    },
+    {
+      "instrument_id": "inst-conflict-b",
+      "issuer_id": "issuer-conflict-b",
+      "cik_source": "990002",
+      "effective_start": "2020-01-01T00:00:00Z",
+      "effective_end": null
+    }
+  ],
+  "conflicts": [
+    {
+      "provider": "sec",
+      "namespace": "cik",
+      "provider_identifier": "0000990002",
+      "attempted_instrument_id": "inst-conflict-b",
+      "existing_instrument_id": "inst-conflict-a"
+    }
+  ]
+}

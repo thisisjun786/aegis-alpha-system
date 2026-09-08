@@ -1,0 +1,83 @@
+[build-system]
+requires = ["uv_build>=0.8.15,<0.9"]
+build-backend = "uv_build"
+
+[project]
+name = "aegis-alpha-system"
+version = "0.0.1"
+description = "Standalone Aegis, Alpha and Hedge investment research application"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+requires-python = ">=3.12"
+dependencies = [
+    "cryptography>=50.0.1,<51",
+    "duckdb==1.6.0.dev365",
+]
+
+# Transitional collectors retain their old storage until their owned adapters migrate.
+# The default application installation opens only local SQLite/DuckDB files.
+[project.optional-dependencies]
+legacy = [
+    "alembic>=1.18.5,<2",
+    "psycopg[binary]>=3.3.4,<4",
+    "pyarrow>=25,<26",
+    "sqlalchemy>=2.0.51,<2.1",
+]
+
+[project.scripts]
+aas = "aegis_alpha.application.cli:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "COM812",
+    "CPY001",
+    "D",
+    "EM101",
+    "EM102",
+    "ISC001",
+    "TC001",
+    "TC003",
+    "TRY003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/aegis_alpha/data/contracts.py" = ["S105"]
+"src/aegis_alpha/data/serialization.py" = ["C901", "PLR0911"]
+"tests/**/*.py" = ["INP001", "S101"]
+
+[tool.pytest.ini_options]
+addopts = ["--strict-config", "--strict-markers"]
+testpaths = ["tests"]
+markers = [
+    "database: requires disposable PostgreSQL; runs in scripts/verify-lane-database",
+]
+# Test support modules are imported by their full ``tests.<package>`` path so a
+# shared helper is never resolved as an implicit relative module.
+pythonpath = ["."]
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.terminal]
+error-on-warning = true
+
+[tool.uv.build-backend]
+module-name = "aegis_alpha"
+
+[dependency-groups]
+dev = [
+    "alembic>=1.18.5,<2",
+    "psycopg[binary]>=3.3.4,<4",
+    "pyarrow>=25,<26",
+    "sqlalchemy>=2.0.51,<2.1",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.16.0",
+    "ty>=0.0.64",
+]

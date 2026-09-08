@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Bundle short style checks; standalone use installs only locked dev tools.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+. "$(dirname "${BASH_SOURCE[0]}")/verify-lib.sh"
+export AAS_VERIFY_PROFILE="${AAS_VERIFY_PROFILE-style}"
+ensure_verify_toolchain
+uv run --no-sync ruff format --check .
+uv run --no-sync ruff check .

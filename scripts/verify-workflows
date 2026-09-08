@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Pinned upstream actionlint; validate workflows without installing the application.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+tool_dir=$(mktemp -d)
+trap 'rm -rf "$tool_dir"' EXIT
+version=1.7.12
+digest=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+curl --fail --location --silent --show-error --max-time 60 \
+  "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz" \
+  -o "$tool_dir/actionlint.tar.gz"
+printf '%s  %s\n' "$digest" "$tool_dir/actionlint.tar.gz" | sha256sum --check --status
+tar -xzf "$tool_dir/actionlint.tar.gz" -C "$tool_dir" actionlint
+"$tool_dir/actionlint" -shellcheck='' .github/workflows/*.yml
+# Shell entry points in this lane are also parsed independently of actionlint.
+for script in scripts/verify scripts/verify-lib.sh scripts/verify-lane-* scripts/verify-workflows; do
+  bash -n "$script"
+done

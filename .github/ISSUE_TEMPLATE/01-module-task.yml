@@ -1,0 +1,23 @@
+name: Feature or engine change
+description: Describe a useful change and how to verify it.
+title: "[feature] "
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired behavior
+      description: What should become possible, and why?
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and acceptance
+      description: Affected module, expected result, and a reproducible check using synthetic data.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context or constraints
+      description: Relevant code, compatibility needs, or data/operation boundaries. Omit private strategies and credentials.

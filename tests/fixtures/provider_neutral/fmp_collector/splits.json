@@ -1,0 +1,16 @@
+[
+  {
+    "symbol": "SYNTH.A",
+    "date": "2024-06-10",
+    "numerator": 2.0,
+    "denominator": 1.0,
+    "splitType": "SYNTH_STOCK_SPLIT"
+  },
+  {
+    "symbol": "SYNTH.A",
+    "date": "2021-02-01",
+    "numerator": 3.0,
+    "denominator": 2.0,
+    "splitType": null
+  }
+]

@@ -1,0 +1,25 @@
+name: Design decision
+description: Propose a change to a product or architecture boundary.
+title: "[decision] "
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Decision and context
+      description: What needs to be decided, and what concrete use requires it?
+    validations:
+      required: true
+  - type: textarea
+    id: options
+    attributes:
+      label: Options and recommendation
+      description: Compare the relevant consequences and explain the preferred choice.
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Contracts and verification
+      description: Affected interfaces, compatibility, data boundaries and checks. Link the current owning decision or code.
+    validations:
+      required: true

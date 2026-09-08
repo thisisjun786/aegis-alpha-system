@@ -1,0 +1,24 @@
+{
+  "generated_at_utc": "2026-07-29T00:00:00+00:00",
+  "sources": [
+    {
+      "endpoint": "/stable/cik-list",
+      "retrieved_at_utc": "2026-07-29T00:00:00+00:00",
+      "raw_content_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  ],
+  "entries": [
+    {
+      "symbol": "synth.a",
+      "ipoDate": "2015-01-02",
+      "delistedDate": null,
+      "active": true
+    },
+    {
+      "symbol": "synth.a",
+      "ipoDate": "2016-03-04",
+      "delistedDate": null,
+      "active": true
+    }
+  ]
+}

@@ -1,0 +1,59 @@
+{
+  "cik": 990001,
+  "entityName": "SYNTHETIC ISSUER INC",
+  "facts": {
+    "us-gaap": {
+      "Revenues": {
+        "label": "Revenues",
+        "units": {
+          "USD": [
+            {
+              "end": "2024-12-31",
+              "val": 1000000,
+              "accn": "0000990001-25-000002",
+              "fy": 2024,
+              "fp": "FY",
+              "form": "10-K",
+              "filed": "2025-02-15",
+              "frame": "CY2024"
+            }
+          ]
+        }
+      },
+      "CommonStockDividendsPerShareDeclared": {
+        "label": "Common stock dividends per share declared",
+        "units": {
+          "USD/shares": [
+            {
+              "end": "2024-11-15",
+              "val": 0.25,
+              "accn": "0000990001-25-000002",
+              "fy": 2024,
+              "fp": "FY",
+              "form": "10-K",
+              "filed": "2025-02-15",
+              "frame": "CY2024Q4"
+            }
+          ]
+        }
+      },
+      "StockholdersEquityNoteStockSplitConversionRatio": {
+        "label": "Stock split conversion ratio",
+        "units": {
+          "pure": [
+            {
+              "end": "2023-06-01",
+              "val": 2,
+              "accn": "0000990001-23-000010",
+              "fy": 2023,
+              "fp": "FY",
+              "form": "10-K",
+              "filed": "2024-02-15",
+              "frame": "CY2023"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

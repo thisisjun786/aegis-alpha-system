@@ -1,0 +1,26 @@
+{
+  "snapshot_id": "fmp-snap-synth",
+  "rows": [
+    {
+      "dataset": "fmp_income",
+      "cik": "990001",
+      "field": "revenue",
+      "period": "2024-12-31",
+      "value": 999999
+    },
+    {
+      "dataset": "fmp_dividends",
+      "cik": "0000990001",
+      "field": "dividend",
+      "period": "2024-11-15",
+      "value": 0.25
+    },
+    {
+      "dataset": "fmp_splits",
+      "cik": "0000990001",
+      "field": "split",
+      "period": "2023-06-01",
+      "value": 2
+    }
+  ]
+}

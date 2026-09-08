@@ -1,0 +1,12 @@
+{
+  "registry_version": "1.0.0",
+  "policies": [
+    {
+      "policy_id": "fmp-operational-candidate-v1",
+      "provider": "fmp",
+      "scheduled_collection_allowed": false,
+      "license_classification": "PENDING_CONTRACT_REVIEW",
+      "retention_classification": "PENDING_CONTRACT_REVIEW"
+    }
+  ]
+}

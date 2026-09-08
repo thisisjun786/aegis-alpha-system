@@ -1,0 +1,71 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+gha-creds-*.json
+
+# Local environments, caches, and editor state
+.re0/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.serena/
+.omo/
+.parallax/
+.codexclaw/
+__pycache__/
+*.py[cod]
+
+# Build and generated output
+build/
+dist/
+*.egg-info/
+.coverage
+coverage.xml
+htmlcov/
+
+# Local/raw data and database artifacts
+/data/
+*.duckdb
+*.db
+*.sqlite
+*.sqlite3
+*.parquet
+
+# Credential and key material
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local container credentials and operator backups
+.secrets/
+/backups/
+*.dump
+
+# Private strategy definitions, operator profiles and historical evidence
+/private/
+/strategy-db/
+/strategy-data/
+/config/postgres/targets/
+/dev-notes/archive/
+/artifacts/
+/devlog/
+*.tar
+*.tar.gz
+*.tar.zst
+*.zip
+
+# Native user workspace and embedded database sidecars
+.aas/
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+*.duckdb.wal

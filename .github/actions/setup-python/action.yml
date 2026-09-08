@@ -1,0 +1,33 @@
+name: Prepare isolated Python checks
+description: Cache downloads and prepare one validated locked environment per job.
+inputs:
+  profile:
+    description: full application environment or style-only development tools
+    default: full
+runs:
+  using: composite
+  steps:
+    - id: version
+      shell: bash
+      run: |
+        source scripts/verify-lib.sh
+        printf 'uv=%s\n' "$AAS_UV_VERSION" >> "$GITHUB_OUTPUT"
+    - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      with:
+        version: ${{ steps.version.outputs.uv }}
+        enable-cache: true
+        cache-python: true
+        cache-dependency-glob: |
+          uv.lock
+          pyproject.toml
+          .python-version
+        cache-suffix: ${{ runner.os }}-${{ runner.arch }}-${{ inputs.profile }}-${{ hashFiles('.python-version') }}
+    - name: Prepare once
+      shell: bash
+      env:
+        AAS_VERIFY_PROFILE: ${{ inputs.profile }}
+      run: |
+        source scripts/verify-lib.sh
+        ensure_verify_toolchain
+        printf 'AAS_VERIFY_PREPARED=%s\n' "$AAS_VERIFY_PREPARED" >> "$GITHUB_ENV"
+        printf 'AAS_VERIFY_PROFILE=%s\n' "$AAS_VERIFY_PROFILE" >> "$GITHUB_ENV"
