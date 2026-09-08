@@ -105,14 +105,25 @@ def _validate_history(job: QverisJob, params: dict[str, object]) -> None:
     if not isinstance(symbol, str) or _NAME.fullmatch(symbol) is None:
         raise ValueError("invalid EODHD history symbol")
     code, separator, exchange = symbol.rpartition(".")
-    _validate_exchange(job.market, exchange)
+    if job.market in {"INDEX", "CRYPTO"}:
+        expected_exchange = "INDX" if job.market == "INDEX" else "CC"
+        if job.tool_id != EOD_HISTORY_JSON_TOOL or exchange != expected_exchange:
+            raise ValueError("research history requires its reviewed JSON market route")
+        expected_dataset = "research_price_history"
+    else:
+        _validate_exchange(job.market, exchange)
+        expected_dataset = "price_history"
     if (
         not separator
         or not code
         or (job.market == "KR" and re.fullmatch(r"[0-9A-Z]{6}", code) is None)
     ):
         raise ValueError("invalid market symbol")
-    if job.dataset != "price_history" or params.get("period", "d") != "d" or params["order"] != "a":
+    if (
+        job.dataset != expected_dataset
+        or params.get("period", "d") != "d"
+        or params["order"] != "a"
+    ):
         raise ValueError("EODHD history requires daily ascending prices")
     if (
         not _date(params["from"])

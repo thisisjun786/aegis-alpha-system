@@ -77,6 +77,9 @@ def read_completed_job(  # noqa: C901, PLR0912, PLR0915 -- one complete evidence
             or (job.market, job.dataset, job.tool_id)
             not in {
                 ("KR", "price_history", EOD_HISTORY_JSON_TOOL),
+                ("US", "price_history", EOD_HISTORY_JSON_TOOL),
+                ("INDEX", "research_price_history", EOD_HISTORY_JSON_TOOL),
+                ("CRYPTO", "research_price_history", EOD_HISTORY_JSON_TOOL),
                 ("KR", "prices", EOD_TOOL),
                 ("US", "prices", EOD_TOOL),
             }
@@ -90,7 +93,7 @@ def read_completed_job(  # noqa: C901, PLR0912, PLR0915 -- one complete evidence
             or marker.get("market") != job.market
             or marker.get("dataset") != job.dataset
         ):
-            raise ValueError("unsupported or inconsistent completed Korean history")
+            raise ValueError("unsupported or inconsistent completed price history")
         pins = marker.get("files")
         suffixes = ("intent.json", "raw", "response.json", "billing.json")
         if not isinstance(pins, list) or len(pins) != len(suffixes):
