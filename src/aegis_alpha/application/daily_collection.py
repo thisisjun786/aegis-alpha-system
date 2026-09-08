@@ -18,7 +18,12 @@ from aegis_alpha.application.collection_journal import (
 from aegis_alpha.application.provider_config import CollectionConfig, ProviderProfile
 
 Runner = Callable[[CollectionConfig, ProviderProfile, str | None], dict[str, object]]
-_SCHEDULE_MODES = {"fmp": "daily", "fred_alfred": "incremental", "sec": "incremental"}
+_SCHEDULE_MODES = {
+    "fmp": "daily",
+    "fred_alfred": "incremental",
+    "sec": "incremental",
+    "qveris": "daily",
+}
 
 
 def _profile_hash(config: CollectionConfig, profile: ProviderProfile) -> str:
