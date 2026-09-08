@@ -20,8 +20,6 @@ if TYPE_CHECKING:
 
     from aegis_alpha.storage.workspace import Workspace
 
-_MAX_IMPORT_ROWS = 2_000_000
-
 
 def ingest_arrow(  # noqa: PLR0913 -- explicit provenance and reader input
     workspace: Workspace,
@@ -79,10 +77,6 @@ def ingest_arrow(  # noqa: PLR0913 -- explicit provenance and reader input
         )
         conn.unregister("source_incoming")
         for batch in fixed_batches(reader):
-            if count + len(batch) > _MAX_IMPORT_ROWS:
-                raise ValueError(  # noqa: TRY301 -- roll back the whole unpublished source
-                    "source import exceeds 2000000 rows; partition into separately pinned sources"
-                )
             digest.update(canonical_batch(batch))
             ordinal = pa.array(range(count, count + len(batch)), type=pa.int64())
             incoming = pa.RecordBatch.from_arrays([*batch.columns, ordinal], schema=augmented)

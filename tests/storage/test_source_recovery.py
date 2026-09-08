@@ -72,22 +72,21 @@ def test_arrow_replay_different_content_rejected(tmp_path: Path) -> None:
         ]
 
 
-def test_oversized_arrow_source_rolls_back_and_remains_pending(tmp_path: Path) -> None:
+def test_large_arrow_source_is_not_limited_by_arbitrary_row_count(tmp_path: Path) -> None:
     home = tmp_path / "aas"
     initialize(home)
     data = pa.table({"value": pa.nulls(2_000_001, type=pa.int32())})
     with open_workspace(home, writable=True, strategy_write=True) as workspace:
-        with pytest.raises(ValueError, match="partition into separately pinned sources"):
-            source_library.import_arrow(
-                workspace, "oversized", "b" * 64, "values", data.to_reader()
-            )
-        assert source_library.list_sources(workspace) == []
-        report = recover_operations(workspace)
-        assert report["recovered"] == []
-        assert len(cast("list[str]", report["pending"])) == 1
-        assert workspace.market.execute(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE 'sl_%'"
-        ).fetchone() == (0,)
+        result = source_library.import_arrow(
+            workspace, "large", "b" * 64, "values", data.to_reader()
+        )
+        assert result["reused"] is False
+        assert source_library.verify_sources(workspace) == {
+            "sources": 1,
+            "tables": 1,
+            "rows": 2_000_001,
+        }
+        assert recover_operations(workspace)["pending"] == []
 
 
 def test_unknown_extension_checksum_rejected(tmp_path: Path) -> None:
