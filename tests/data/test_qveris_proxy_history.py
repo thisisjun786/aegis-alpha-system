@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -10,6 +11,7 @@ from test_qveris_native import HistoryClient
 
 from aegis_alpha.data.qveris import InvocationBudget
 from aegis_alpha.data.qveris_acquisition import acquire_jobs
+from aegis_alpha.data.qveris_client import QverisResponse
 from aegis_alpha.data.qveris_contracts import (
     EOD_HISTORY_JSON_TOOL,
     EOD_TOOL,
@@ -143,3 +145,50 @@ def test_index_catalog_payload_requires_matching_unique_rows(shape: str) -> None
     else:
         with pytest.raises(ValueError, match=r"exchange|duplicate|empty"):
             validate_payload(job, job.parameters, response)
+
+
+class IndexCatalogClient(HistoryClient):
+    def request(
+        self,
+        path: str,
+        *,
+        body: dict[str, object] | None = None,
+        query: dict[str, str | int] | None = None,
+    ) -> QverisResponse:
+        response = super().request(path, body=body, query=query)
+        if path == "/tools/execute":
+            doc = response.document()
+            doc["result"] = {
+                "status_code": 200,
+                "data": [
+                    {
+                        "Code": "SYNTHETIC",
+                        "Name": "Synthetic index",
+                        "Exchange": "INDX",
+                        "Currency": "USD",
+                        "Type": "INDEX",
+                    }
+                ],
+            }
+            return replace(response, body=canonical_json_bytes(doc))
+        return response
+
+
+def test_index_catalog_persistence_reuse_and_tamper_rejection(tmp_path: Path) -> None:
+    job = index_universe()
+    client = IndexCatalogClient()
+    acquire_jobs((job,), tmp_path, client, budget=InvocationBudget(1, Decimal(3)))
+    calls = list(client.calls)
+    acquire_jobs((job,), tmp_path, client, budget=InvocationBudget(1, Decimal(3)))
+    assert client.calls == calls
+    assert client.execute_count == 1
+    marker = tmp_path / "jobs" / job.fingerprint / "complete.json"
+    with pytest.raises(ValueError, match="completed price history"):
+        read_completed_job(
+            tmp_path, job.fingerprint, hashlib.sha256(marker.read_bytes()).hexdigest()
+        )
+    raw = marker.parent / "0000.raw"
+    raw.write_bytes(raw.read_bytes() + b" ")
+    with pytest.raises(ValueError, match="evidence pin differs"):
+        acquire_jobs((job,), tmp_path, client, budget=InvocationBudget(1, Decimal(3)))
+    assert client.execute_count == 1
