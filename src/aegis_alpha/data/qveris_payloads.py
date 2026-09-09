@@ -104,8 +104,8 @@ def _eod_universe(job: QverisJob, data: object) -> PageShape:
         code = row["Code"]
         if not isinstance(code, str) or not code:
             raise ValueError("EODHD universe requires a symbol")
-        if job.market == "KR" and row["Exchange"] != params["EXCHANGE_CODE"]:
-            raise ValueError("EODHD universe returned a different Korean exchange")
+        if job.market in {"KR", "INDEX"} and row["Exchange"] != params["EXCHANGE_CODE"]:
+            raise ValueError("EODHD universe returned a different requested exchange")
         keys.append(f"{row['Exchange']}/{code}")
     if len(set(keys)) != len(keys):
         raise ValueError("EODHD universe has duplicate symbols")

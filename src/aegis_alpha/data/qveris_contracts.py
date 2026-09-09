@@ -135,6 +135,10 @@ def _validate_history(job: QverisJob, params: dict[str, object]) -> None:
 
 def _validate_universe(job: QverisJob, params: dict[str, object]) -> None:
     _exact_keys(params, {"EXCHANGE_CODE", "delisted", "fmt"}, set())
+    if job.market == "INDEX" and job.dataset == "research_universe":
+        if params != {"EXCHANGE_CODE": "INDX", "delisted": "0", "fmt": "json"}:
+            raise ValueError("research index universe requires active INDX JSON exchange")
+        return
     _validate_exchange(job.market, params["EXCHANGE_CODE"])
     if job.dataset != "universe" or params["delisted"] not in {"0", "1"} or params["fmt"] != "json":
         raise ValueError("invalid EODHD universe request")

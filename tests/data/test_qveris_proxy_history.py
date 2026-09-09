@@ -17,6 +17,7 @@ from aegis_alpha.data.qveris_contracts import (
     QverisJob,
 )
 from aegis_alpha.data.qveris_native import normalize_korean_price_history, read_completed_job
+from aegis_alpha.data.qveris_payloads import validate_payload
 from aegis_alpha.data.serialization import canonical_json_bytes
 
 
@@ -99,3 +100,46 @@ def test_research_markets_do_not_widen_bulk_or_universe(
             canonical_json_bytes(params).decode(),
             date(2026, 9, 6),
         )
+
+
+def index_universe(exchange: str = "INDX", delisted: str = "0") -> QverisJob:
+    return QverisJob(
+        "synthetic-index-catalog",
+        EOD_UNIVERSE_TOOL,
+        "eodhd",
+        "INDEX",
+        "research_universe",
+        canonical_json_bytes(
+            {"EXCHANGE_CODE": exchange, "delisted": delisted, "fmt": "json"}
+        ).decode(),
+        date(2026, 9, 6),
+    )
+
+
+@pytest.mark.parametrize(("exchange", "delisted"), [("US", "0"), ("INDX", "1")])
+def test_index_catalog_scope_rejected(exchange: str, delisted: str) -> None:
+    with pytest.raises(ValueError, match="active INDX"):
+        index_universe(exchange, delisted)
+
+
+@pytest.mark.parametrize("shape", ["valid", "wrong_exchange", "duplicate", "empty"])
+def test_index_catalog_payload_requires_matching_unique_rows(shape: str) -> None:
+    job = index_universe()
+    row = {
+        "Code": "SYNTHETIC",
+        "Name": "Synthetic index",
+        "Exchange": "US" if shape == "wrong_exchange" else "INDX",
+        "Currency": "USD",
+        "Type": "INDEX",
+    }
+    rows = [] if shape == "empty" else [row, row] if shape == "duplicate" else [row]
+    response: dict[str, object] = {
+        "success": True,
+        "execution_id": "synthetic",
+        "result": {"status_code": 200, "data": rows},
+    }
+    if shape == "valid":
+        assert validate_payload(job, job.parameters, response).rows == 1
+    else:
+        with pytest.raises(ValueError, match=r"exchange|duplicate|empty"):
+            validate_payload(job, job.parameters, response)
