@@ -110,6 +110,10 @@ universe·전략·시장 관례의 exact version/hash를 묶고, 각 의사결�
 주문이 없으며 항상 `research_only=true`, `non_executable=true`다. 호출자가 붙인
 종목 유형과 시점·출처 표시는 인증되지 않는다. 실제 ETF 체결의 상장일 제한은 유지한다.
 
+`data/nifty_history.py`는 외부에서 받은 Nifty 가격지수 응답의 원본 해시, 명시한 지수명,
+조회 기간과 중복 날짜를 검증한다. 날짜·종가·원본 행을 불변 결과로 반환하며 네트워크나
+DB에 접근하지 않는다. 가격지수 파싱은 ETF 조정가격·총수익·과거 가용 시각의 인증이 아니다.
+
 **남아 있는 전환 전 코드**는 `legacy-db`·`legacy-data`와 일부 수집기다. 이 경로에만
 `legacy` 추가 의존성과 PostgreSQL이 필요하다. 기본 설치는 SQLite·DuckDB를 사용한다.
 전환 전 코드는 PostgreSQL DB 설치·기존 데이터 채택·카탈로그·가격 조회를 지원한다.

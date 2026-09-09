@@ -117,6 +117,12 @@ raw/runs도 포함하며 키·provider 설정과 절대 운영 경로는 제외�
 
 ## 연구용 과거 수익률 연결
 
+외부에서 수집한 Nifty 가격지수 JSON은 `data.nifty_history.parse_nifty_price_history`에
+원본 바이트, 고정한 SHA256, 정확한 제공자 지수명과 조회 시작·종료일을 전달해 검증한다.
+UTF-8 BOM과 제공자의 `d` 응답 포장을 처리하며, 잘못된 지수명·중복 날짜·조회 기간 밖의
+행·유효하지 않은 종가는 거부한다. 빈 결과는 자료 없음으로 남긴다. 이 Python 함수는
+수집이나 DB 저장을 실행하지 않으며, 가격지수를 ETF 총수익으로 바꾸지 않는다.
+
 `aas proxy --input request.json --sha256 <파일의-SHA256>`는 최대 64MiB의
 `aas-proxy-returns-v1` 입력을 읽는다. 필수 필드는 `schema_version`, `module`(aegis),
 `target_type`(ETF), `donor`, `target`, `recipe`다.
