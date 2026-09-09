@@ -143,6 +143,23 @@ UTF-8 BOM과 제공자의 `d` 응답 포장을 처리하며, 잘못된 지수명
 섞을 수 없다. 같은 문자열을 제출했다는 사실은 실제 자료가 일치한다는 증거가 아니다.
 DB 출처·ETF 유형·시점 검증은 별도 호출자가 담당하며 결과에도 미검증 상태가 남는다.
 
+Python에서 `engine.reset_returns`의 `ResetCosts`, `ResetRecipe`,
+`build_reset_returns`를 직접 호출할 수 있다. `ResetCosts`에는 `anchor_date`,
+`dates`, `financing_drag`, `collateral_return`, `expense_drag`, `source_sha256`,
+`convention`, `basis`를 전달한다. `convention`은 `fraction_of_starting_nav`이며 각 항목은
+기간 시작 NAV의 비율이며 차입 규모 반영은 호출자가 맡는다. 자금조달비와 보수는 음수를 허용하지 않고, 담보수익은
+음수도 허용한다. `basis`는 `observed_inputs`, `explicit_assumptions`, `zero_sensitivity` 중 하나다.
+마지막 값은 모든 비용·수익 항목이 0일 때만 허용한다. 이 표시는 호출자의 주장이고
+자료를 인증하지 않는다. `source_sha256`은 비용 입력 파일의 식별값이다.
+`ResetRecipe`에는 일정한 `multiplier`와 가정을 설명하는 `reason`을
+명시한다. `expected_sessions`는 시작일을 포함하며 두 입력의 모든 날짜와 같아야 한다.
+
+기간 수익률은 `배율 × 기초 수익률 − 자금조달비 + 담보수익 − 보수`다. 비용이 이미
+반영된 기초 입력은 거부한다. 연간 금리, 차입 원금, 실제 ETF 비용을 자동 추정하지
+않으며 무비용 시나리오도 모든 비용 배열에 0을 명시해야 한다. 일별 자료인지와
+휴장일 누락 여부는 호출자가 확인해야 한다. 이 함수에는 별도 CLI 명령이 없고,
+기존 `aas proxy` 입력 형식은 그대로다.
+
 ## 선택적 단일 컨테이너
 
 ```bash
