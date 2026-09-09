@@ -115,6 +115,28 @@ raw/runs도 포함하며 키·provider 설정과 절대 운영 경로는 제외�
 `source_pins_verified`, `observed_prices_verified`, `point_in_time_verified`는 false다.
 원본 전략 규칙의 자동 해석이나 실주문을 시작하지 않는다.
 
+## 연구용 과거 수익률 연결
+
+`aas proxy --input request.json --sha256 <파일의-SHA256>`는 최대 64MiB의
+`aas-proxy-returns-v1` 입력을 읽는다. 필수 필드는 `schema_version`, `module`(aegis),
+`target_type`(ETF), `donor`, `target`, `recipe`다.
+
+두 시계열은 `instrument_id`, `currency`, `return_kind`(price_return 또는 total_return),
+`close_convention`, `net_of_fees`, `anchor_date`, `dates`, `returns`, `source_sha256`을
+명시한다. 각 수익률은 직전 날짜 또는 anchor_date부터 해당 날짜까지의 변화다.
+날짜는 중복 없이 증가해야 하며 두 시계열에 공통 전환 경계가 있어야 한다.
+
+`recipe`는 `target_id`, `donor_id`, `switch_date`, `annual_fee`, `fee_model`, `reason`을
+담는다. `already_net`은 비용 반영 후 수익률과 추가 비용 0만 허용한다.
+`annual_expense`는 비용 반영 전 수익률에 연간 비용을 실제 경과 일수로 나눠 적용한다.
+`zero_expense_sensitivity`는 비용 0을 가정한 민감도 분석이며 그 이유를 명시해야 한다.
+목표 ETF 수익률에는 비용이 이미 반영돼 있어야 한다.
+
+결과는 날짜별 연구 지수이며 체결 가격으로 사용할 수 없다. 지수·현물 자료를 기초
+시계열로 제출할 수 있지만 가격수익과 배당 재투자 총수익, 서로 다른 종가 시각을
+섞을 수 없다. 같은 문자열을 제출했다는 사실은 실제 자료가 일치한다는 증거가 아니다.
+DB 출처·ETF 유형·시점 검증은 별도 호출자가 담당하며 결과에도 미검증 상태가 남는다.
+
 ## 선택적 단일 컨테이너
 
 ```bash
