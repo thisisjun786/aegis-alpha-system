@@ -96,3 +96,13 @@ docker compose run --rm aas doctor
 
 라이브 공급자 검증·기존 DB 이전·스케줄러 활성화·실주문은 위 오프라인 설치 검사의 범위에
 포함되지 않는다. CLI preview는 합성 비중 계산이고 전체 백테스트는 아직 별도 구현이다.
+
+
+## 로컬 리소스 콘솔
+
+`python -m aegis_alpha.console --home <private-home>`으로 로컬 관리 화면을 연다.
+터미널에 출력된 루프백 주소로 접속한다. `--port`로 포트를 선택하고,
+`--registry-home`으로 리소스 등록·메모의 별도 비공개 저장 위치를 지정한다.
+종료는 Ctrl+C다. 조회 중 DB가 사용 중이면 잠시 후 새로고침한다.
+실제 데이터는 공개 코드와 분리하며, 이 화면은 원본 DB를 수정하지 않는다.
+[지원 기능과 접근 경계](design/local-resource-console.md)를 참고한다.
