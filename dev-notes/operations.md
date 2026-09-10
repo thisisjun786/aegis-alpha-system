@@ -119,6 +119,25 @@ raw/runs도 포함하며 키·provider 설정과 절대 운영 경로는 제외�
 `source_pins_verified`, `observed_prices_verified`, `point_in_time_verified`는 false다.
 원본 전략 규칙의 자동 해석이나 실주문을 시작하지 않는다.
 
+## 명시한 ETF 연구 후보 생성
+
+`aas research --input request.json --sha256 <파일의-SHA256>`는 최대 64MiB의 입력에서
+연구 후보를 생성한다. 스키마는 `aas-etf-research-v1`, `module`은 `aegis`, `action`은
+`generate`다. 나머지 필수 필드는 `parent_hash`, `seed`, `grid`, `train_end`,
+`validation_end`, `test_end`, `cost_ref`, `max_trials`다. 날짜는 YYYY-MM-DD 형식이고
+세 평가 구간의 끝 날짜가 순서대로 증가해야 한다. `max_trials`는 1~256의 정수다.
+
+`grid`에는 `etf_universes`, `instrument_types`, `momentum_horizons`, `absolute_filters`,
+`trend_filters`, `weightings`, `volatility_caps` 배열을 명시한다. 종목 유형은
+`[["ETF_A", "ETF"], ["ETF_B", "ETF"]]`처럼 ID·유형 쌍으로 제출하며, 후보 종목은 모두
+ETF여야 한다. 가중 방식은 `equal` 또는 `inverse_volatility`, 변동성 상한은 양의 숫자다.
+유형 표시의 진위와 비용 참조는 이 명령이 검증하지 않는다.
+
+출력은 해시가 포함된 전체 후보 명세와 개수다. `research_candidate_generation`만
+활성 기능으로 보고하며 `evaluation_performed`는 false다. 가격 조회·전략 실행·DB 저장·
+최종 시험 구간 평가를 시작하지 않는다. 학습·검증 평가와 별도 최종 평가가 필요하면
+Python 연구 API에 평가 함수를 명시하고, 실행 측에서 이전 평가 이력을 보존해야 한다.
+
 ## 연구용 과거 수익률 연결
 
 외부에서 수집한 Nifty 가격지수 JSON은 `data.nifty_history.parse_nifty_price_history`에

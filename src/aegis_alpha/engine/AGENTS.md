@@ -46,5 +46,6 @@ undocumented source strategy semantics or infer execution cadence.
 `research` owns explicitly typed ETF trial generation, train/validation outcome
 accounting and separate selected-winner holdout receipts. It calls an injected
 evaluator and records caller-supplied history; it cannot certify complete
-holdout history, source truth or profitability. No CLI/native persistence is
-implied by the pure API.
+holdout history, source truth or profitability. The application-owned `aas research`
+command exposes generation only; the pure API does not imply native persistence
+or an installed evaluator.
