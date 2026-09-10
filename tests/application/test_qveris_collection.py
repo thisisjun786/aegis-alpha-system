@@ -105,3 +105,27 @@ def test_bad_key_returns_safe_failure_envelope(tmp_path: Path) -> None:
     assert report["status"] == "failed"
     assert report["error_type"] == "QverisKeyFileError"
     assert report["execution_started"] is False
+
+
+@pytest.mark.parametrize(
+    "missing", ["jobs", "jobs_sha256", "raw_store_root", "max_credits", "timeout_seconds"]
+)
+def test_missing_option_fails_before_file_or_provider_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing: str
+) -> None:
+    selected = profile(tmp_path)
+    selected = replace(
+        selected, options={key: value for key, value in selected.options.items() if key != missing}
+    )
+
+    def unexpected_read(*_args: object) -> bytes:
+        pytest.fail("malformed configuration reached file access")
+
+    monkeypatch.setattr("aegis_alpha.application.qveris_collection.read_bytes", unexpected_read)
+    client = FakeQveris()
+    result = run_qveris_profile(selected, client=client)
+    assert result["status"] == "failed"
+    assert result["execution_started"] is False
+    assert result["error_type"] == "ValueError"
+    assert result["result"] == {"provider_calls": 0, "http_requests": 0}
+    assert client.calls == []

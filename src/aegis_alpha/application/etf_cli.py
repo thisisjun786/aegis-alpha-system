@@ -98,7 +98,10 @@ def _optional_day(value: object) -> date | None:
 def _number(value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError("etf comparison numeric fields must be numbers, not booleans")
-    return float(value)
+    try:
+        return float(value)
+    except OverflowError as error:
+        raise ValueError("etf comparison numeric fields must fit in a float") from error
 
 
 def _optional_number(value: object) -> float | None:

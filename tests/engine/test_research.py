@@ -835,3 +835,16 @@ def test_trial_scores_rejects_wholly_omitted_trial_outcomes() -> None:
                 _outcome(trials[0], "validation"),
             ),
         )
+
+
+@pytest.mark.parametrize("metrics", [[["sharpe"]], [3], ["ab"], [["sharpe", 1, 2]]])
+def test_trial_outcome_document_rejects_malformed_metric_pairs(metrics: object) -> None:
+    document = _outcome(_generate()[0], "train").to_document()
+    document["metrics"] = metrics
+    with pytest.raises(ContractDefinitionError, match="pair"):
+        TrialOutcome.from_document(document)
+
+
+def test_trial_outcome_document_roundtrip_preserves_values() -> None:
+    outcome = _outcome(_generate()[0], "train")
+    assert TrialOutcome.from_document(outcome.to_document()) == outcome

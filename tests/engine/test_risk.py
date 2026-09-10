@@ -320,3 +320,13 @@ def test_annualized_volatility_overflow_uses_contract_error(magnitude: float) ->
 def test_annualization_count_overflow_uses_contract_error() -> None:
     with pytest.raises(ContractDefinitionError, match="periods_per_year"):
         annualized_volatility([0, 0], periods_per_year=10**1000)
+
+
+@pytest.mark.parametrize("key", [1, None])
+def test_risk_mapping_keys_fail_as_contract_errors(key: object) -> None:
+    with pytest.raises(ContractDefinitionError, match="closes key"):
+        window(closes={"A": CLOSES["A"], key: CLOSES["B"]})
+    with pytest.raises(ContractDefinitionError, match="returns key"):
+        sample_covariance(cast("dict[str, tuple[float, ...]]", {"A": (0.1, 0.2), key: (0.2, 0.3)}))
+    with pytest.raises(ContractDefinitionError, match="variances key"):
+        inverse_volatility(cast("dict[str, float]", {"A": 1.0, key: 2.0}))

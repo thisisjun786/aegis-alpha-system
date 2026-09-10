@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime
 from decimal import Decimal
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
+from aegis_alpha.data.qveris_client import QverisDocumentError
 from aegis_alpha.data.qveris_contracts import MAX_PAGES, credit_value, object_value
 
 if TYPE_CHECKING:
@@ -51,17 +53,34 @@ def audit_request(
 ) -> dict[str, object]:
     store.assert_owned()
     response = client.request(path, body=body, query=query)
-    document = response.document()
+    record: dict[str, object] = {
+        "path": path,
+        "body": sanitized(body),
+        "query": sanitized(query),
+        "status": response.status,
+        "headers": response.headers,
+        "requested_at_utc": response.requested_at_utc,
+        "retrieved_at_utc": response.retrieved_at_utc,
+    }
+    try:
+        document = response.document()
+    except QverisDocumentError as error:
+        store.publish_document(
+            f"audits/{uuid4().hex}.json",
+            {
+                **record,
+                "response": None,
+                "representation": "undecodable response omitted",
+                "body_sha256": hashlib.sha256(response.body).hexdigest(),
+                "body_bytes": len(response.body),
+                "error_type": type(error).__name__,
+            },
+        )
+        raise
     store.publish_document(
         f"audits/{uuid4().hex}.json",
         {
-            "path": path,
-            "body": body,
-            "query": query,
-            "status": response.status,
-            "headers": response.headers,
-            "requested_at_utc": response.requested_at_utc,
-            "retrieved_at_utc": response.retrieved_at_utc,
+            **record,
             "response": sanitized(document),
             "representation": "credential-attribution-redacted JSON projection",
         },

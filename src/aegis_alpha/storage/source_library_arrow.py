@@ -62,12 +62,12 @@ def ingest_arrow(  # noqa: PLR0913 -- explicit provenance and reader input
     conn = workspace.market
     augmented = original.append(pa.field("_aas_ordinal", pa.int64()))
     empty = pa.Table.from_batches([], schema=augmented)
-    conn.register("source_incoming", empty)
     selection = ",".join(map(schema.quoted, augmented.names))
     count = 0
     digest = hashlib.sha256()
     conn.execute("BEGIN TRANSACTION")
     try:
+        conn.register("source_incoming", empty)
         conn.execute(
             "CREATE TABLE "
             + schema.quoted(target)

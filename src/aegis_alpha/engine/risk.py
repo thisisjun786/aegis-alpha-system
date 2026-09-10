@@ -79,8 +79,9 @@ class RiskWindow:
         if not isinstance(self.closes, Mapping) or not self.closes:
             raise ContractDefinitionError("closes must be a nonempty mapping of asset closes")
         trimmed_closes: dict[str, tuple[float, ...]] = {}
-        for asset_id in sorted(self.closes):
+        for asset_id in self.closes:
             _asset_id(asset_id, "closes key")
+        for asset_id in sorted(self.closes):
             raw = _sequence(self.closes[asset_id], f"closes[{asset_id}]")
             if len(raw) != len(sessions):
                 raise ContractDefinitionError(f"closes[{asset_id}] must align with sessions")
@@ -120,11 +121,10 @@ def sample_covariance(returns: Mapping[str, Sequence[float]]) -> tuple[tuple[flo
 
     if not isinstance(returns, Mapping) or not returns:
         raise ContractDefinitionError("returns must be a nonempty mapping of per-asset returns")
-    asset_ids = sorted(returns)
+    asset_ids = sorted(_asset_id(key, "returns key") for key in returns)
     series: list[tuple[float, ...]] = []
     observations: int | None = None
     for asset_id in asset_ids:
-        _asset_id(asset_id, "returns key")
         values = tuple(
             require_finite(value, field=f"returns[{asset_id}]")
             for value in _sequence(returns[asset_id], f"returns[{asset_id}]")
@@ -155,10 +155,9 @@ def inverse_volatility(variances: Mapping[str, float]) -> Mapping[str, float]:
 
     if not isinstance(variances, Mapping) or not variances:
         raise ContractDefinitionError("variances must be a nonempty mapping")
-    asset_ids = sorted(variances)
+    asset_ids = sorted(_asset_id(key, "variances key") for key in variances)
     inverse: dict[str, float] = {}
     for asset_id in asset_ids:
-        _asset_id(asset_id, "variances key")
         variance = require_positive(variances[asset_id], field=f"variances[{asset_id}]")
         inverse[asset_id] = 1 / (variance**0.5)
     total = sum(inverse.values())

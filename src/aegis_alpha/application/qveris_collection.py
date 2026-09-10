@@ -28,6 +28,8 @@ def run_qveris_profile(
 ) -> dict[str, object]:
     port = None
     try:
+        if profile.missing_options():
+            raise ValueError("Qveris profile is missing required options")  # noqa: TRY301
         budget = InvocationBudget(profile.max_calls, Decimal(str(profile.options["max_credits"])))
         payload = read_bytes(Path(str(profile.options["jobs"])))
         if hashlib.sha256(payload).hexdigest() != profile.options["jobs_sha256"]:

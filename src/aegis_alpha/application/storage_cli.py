@@ -109,7 +109,11 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             writable=mutation,
             strategy_write=mutation,
             require_strategies=args.command == "strategy"
-            or (args.command == "db" and args.db_command in {"verify", "recover"}),
+            or (
+                args.command == "db"
+                and args.db_command
+                in {"verify", "recover", "sources", "source-tables", "source-read"}
+            ),
         ) as workspace:
             return _workspace_command(workspace, args)
     except (sqlite3.Error, duckdb.Error):

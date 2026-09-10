@@ -80,13 +80,17 @@ def put_raw(root: Path, payload: bytes) -> tuple[str, str, int]:
             os.fsync(handle.fileno())
         try:
             # link is atomic and fails if the final name already exists.
-            os.link(
-                temporary,
-                relative,
-                src_dir_fd=tree.descriptor,
-                dst_dir_fd=tree.descriptor,
-                follow_symlinks=False,
-            )
+            try:
+                os.link(
+                    temporary,
+                    relative,
+                    src_dir_fd=tree.descriptor,
+                    dst_dir_fd=tree.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                if tree.read_bytes(relative, max_bytes=len(payload)) != payload:
+                    raise ValueError("raw hash path contains different bytes") from None
             tree.fsync_directory(digest[:2])
         finally:
             tree.unlink(temporary)

@@ -14,6 +14,7 @@ import pyarrow as pa
 import pytest
 
 from aegis_alpha.storage import source_library
+from aegis_alpha.storage import source_library_digest as source_digest
 from aegis_alpha.storage.backup import backup, restore
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace
@@ -308,6 +309,88 @@ def test_arrow_native_roundtrip(home: Path) -> None:
     assert report == {"sources": 1, "tables": 1, "rows": 2}
     assert workspace_report["source_library"] == report
     assert workspace_report["strategy_versions"] == 0
+
+
+@pytest.mark.parametrize("partition", [1, 2, 100])
+def test_arrow_canonical_hashes_remain_stable(partition: int) -> None:
+    cases = [
+        (
+            pa.table({"n": [1, None, 3], "raw": pa.array([b"a", None, b"bc"], type=pa.binary())}),
+            (3, "704eae4e37dc4a92cd05fb37d06b24aceabe8a2b2b59a9bf5237e40b304ae9c4"),
+        ),
+        (
+            pa.table(
+                {
+                    "x": pa.array([1.0, float("nan"), None, -0.0], type=pa.float64()),
+                    "s": ["alpha", "beta", None, "delta"],
+                }
+            ),
+            (4, "4cc0ecd88a45e89bb4290b332cc177c3a06e2d26d72378706edf5add9eacbc1b"),
+        ),
+    ]
+    for table, expected in cases:
+        reader = pa.RecordBatchReader.from_batches(
+            table.schema, table.to_batches(max_chunksize=partition)
+        )
+        assert source_digest.arrow_digest(reader) == expected
+
+
+def test_canonical_batch_rejects_multiple_chunks() -> None:
+    batch = pa.record_batch({"value": [b"a"]})
+    with pytest.raises(ValueError, match="one canonical Arrow batch"):
+        source_digest._single_batch(pa.Table.from_batches([batch, batch]))  # noqa: SLF001
+
+
+def test_arrow_batch_failure_rolls_back_and_allows_retry(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    table = pa.table({"value": pa.nulls(source_digest.BATCH_ROWS + 1, type=pa.int32())})
+    single = source_digest._single_batch  # noqa: SLF001
+    calls = 0
+
+    def split_second(combined: pa.Table) -> pa.RecordBatch:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            small = pa.record_batch({"value": [1]})
+            return single(pa.Table.from_batches([small, small]))
+        return single(combined)
+
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        before = workspace.market.execute(
+            "SELECT table_name FROM duckdb_tables() WHERE NOT temporary"
+        ).fetchall()
+        with monkeypatch.context() as patch:
+            patch.setattr(source_digest, "_single_batch", split_second)
+            with pytest.raises(ValueError, match="one canonical Arrow batch"):
+                source_library.import_arrow(
+                    workspace, _ARROW_SOURCE, "a" * 64, _ARROW_TABLE, _reader(table)
+                )
+        assert calls == 2
+        assert source_library.list_sources(workspace) == []
+        after = workspace.market.execute(
+            "SELECT table_name FROM duckdb_tables() WHERE NOT temporary"
+        ).fetchall()
+        assert set(after) - set(before) == {("source_library_schema",), ("source_library_commits",)}
+        assert [
+            tuple(row)
+            for row in workspace.state.execute(
+                "SELECT phase FROM storage_operations WHERE kind='source_import'"
+            )
+        ] == [("PREPARED",)]
+        source_library.import_arrow(
+            workspace, _ARROW_SOURCE, "a" * 64, _ARROW_TABLE, _reader(table)
+        )
+        assert source_library.verify_sources(workspace) == {
+            "sources": 1,
+            "tables": 1,
+            "rows": table.num_rows,
+        }
+    with open_workspace(home) as workspace:
+        assert len(source_library.list_sources(workspace)) == 1
+        report = source_library.verify_sources(workspace)
+        assert report is not None
+        assert report["rows"] == table.num_rows
 
 
 def test_arrow_target_corruption_fails_verify(home: Path) -> None:
