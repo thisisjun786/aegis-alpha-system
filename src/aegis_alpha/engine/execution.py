@@ -261,12 +261,18 @@ def _apply_cashflow(
     if not _finite(new_cash):
         msg = "nonfinite postflow cash"
         raise ArithmeticError(msg)
+    if new_cash == cash:
+        msg = "cashflow cash change is not representable"
+        raise ArithmeticError(msg)
     issued = amount / value
     if not _finite(issued) or issued == 0:
         msg = "nonfinite or zero cashflow unit issuance"
         raise ArithmeticError(msg)
     new_units = fund_units + issued
     _require_positive(new_units, field="postflow units")
+    if new_units == fund_units:
+        msg = "cashflow unit change is not representable"
+        raise ArithmeticError(msg)
     return new_cash, new_units
 
 

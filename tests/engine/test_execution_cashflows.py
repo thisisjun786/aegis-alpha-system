@@ -115,6 +115,29 @@ def test_postflow_account_overflow_is_rejected() -> None:
         )
 
 
+@pytest.mark.parametrize("amount", [-1, 1])
+def test_cashflow_that_rounds_away_in_cash_is_rejected(amount: float) -> None:
+    with pytest.raises(ArithmeticError, match="cash change is not representable"):
+        replay_next_open_cashflows(
+            DAYS, [{}] * 3, [{}] * 3, {}, 1e300, 0, [CashFlow(DAYS[1], amount)]
+        )
+
+
+def test_cashflow_that_changes_cash_but_rounds_away_in_units_is_rejected() -> None:
+    # The deposit changes zero cash to one, but cannot increase 1000 fund units
+    # after the security's very large opening gain.
+    with pytest.raises(ArithmeticError, match="unit change is not representable"):
+        replay_next_open_cashflows(
+            DAYS,
+            [{}, {"SYN_A": 10}, {"SYN_A": 1e300}],
+            [{}, {"SYN_A": 10}, {"SYN_A": 1e300}],
+            {DAYS[0]: {"SYN_A": 1}},
+            1000,
+            0,
+            [CashFlow(DAYS[2], 1)],
+        )
+
+
 def test_preflow_opening_equity_overflow_is_rejected_before_deposit() -> None:
     with pytest.raises(ArithmeticError, match="preflow opening equity"):
         replay_next_open_cashflows(
