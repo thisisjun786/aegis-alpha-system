@@ -37,7 +37,7 @@ from aegis_alpha.data.qveris_client import (
 )
 
 NOW = datetime(2026, 9, 6, 12, 0, tzinfo=UTC)
-SYNTHETIC_CREDENTIAL = "qv-synthetic-key-0123456789abcdef"
+SYNTHETIC_CREDENTIAL = "unit-test-credential"
 HTTP_OK = 200
 HTTP_FOUND = 302
 HTTP_PAYMENT_REQUIRED = 402
