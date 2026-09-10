@@ -55,12 +55,14 @@ class TrackingMeasure:
     end: date
     value: float
     source_hash: str
+    basis: str = "net_total_return"
 
     def __post_init__(self) -> None:
         if _day(self.start, "tracking.start") >= _day(self.end, "tracking.end"):
             raise ContractDefinitionError("tracking start must precede end")
         object.__setattr__(self, "value", _nonnegative(self.value, "tracking error"))
         _hash(self.source_hash)
+        _text(self.basis, "tracking.basis")
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +127,7 @@ class ComparisonPolicy:
     max_tracking_error: float
     tracking_start: date
     tracking_end: date
+    tracking_basis: str = "net_total_return"
 
     def __post_init__(self) -> None:
         for name in ("as_of", "tracking_start", "tracking_end"):
@@ -135,6 +138,7 @@ class ComparisonPolicy:
             raise ContractDefinitionError("max_profile_age_days must be a nonnegative integer")
         for name in ("min_liquidity", "min_fee_saving_bps", "max_tracking_error"):
             object.__setattr__(self, name, _nonnegative(getattr(self, name), name))
+        _text(self.tracking_basis, "tracking_basis")
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +177,8 @@ def _evidence_gap(profile: ETFProfile, policy: ComparisonPolicy) -> str | None:
         policy.tracking_end,
     ):
         return "tracking_window_mismatch"
+    if profile.tracking.basis != policy.tracking_basis:
+        return "tracking_basis_mismatch"
     return None
 
 

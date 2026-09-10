@@ -9,6 +9,7 @@ from aegis_alpha.application import (
     backtest_cli,
     compute_cli,
     data_cli,
+    etf_cli,
     provider_cli,
     proxy_cli,
     research_cli,
@@ -36,6 +37,7 @@ def _parser() -> argparse.ArgumentParser:
     backtest_cli.add_commands(commands)
     proxy_cli.add_commands(commands)
     research_cli.add_commands(commands)
+    etf_cli.add_commands(commands)
     return parser
 
 
@@ -54,6 +56,7 @@ def _status() -> dict[str, object]:
             "daily_collection": True,
             "compute_budget": True,
             "live_orders": False,
+            "etf_candidate_comparison": True,
         },
         "modules": module_catalog(),
         "runtime_dependencies": {
@@ -67,7 +70,7 @@ def _status() -> dict[str, object]:
     }
 
 
-def main(argv: list[str] | None = None) -> int:  # noqa: C901 -- explicit command dispatch
+def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912 -- explicit command dispatch
     args = _parser().parse_args(argv)
     try:
         match args.command:
@@ -83,6 +86,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901 -- explicit comman
                 result = proxy_cli.execute(args)
             case "research":
                 result = research_cli.execute(args)
+            case "etfs":
+                result = etf_cli.execute(args)
             case "providers" | "collect":
                 result = provider_cli.execute(args)
             case "legacy-db" | "legacy-data":

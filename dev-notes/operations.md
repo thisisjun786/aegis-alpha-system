@@ -138,6 +138,28 @@ ETF여야 한다. 가중 방식은 `equal` 또는 `inverse_volatility`, 변동�
 최종 시험 구간 평가를 시작하지 않는다. 학습·검증 평가와 별도 최종 평가가 필요하면
 Python 연구 API에 평가 함수를 명시하고, 실행 측에서 이전 평가 이력을 보존해야 한다.
 
+## 명시한 ETF 프로필 비교
+
+`aas etfs --input request.json --sha256 <파일의-SHA256>`는 최대 64MiB의 입력을
+검증한 뒤 현재 ETF와 최대 256개 후보를 비교한다. 최상위 필드는 `schema_version`,
+`module`, `action`, `current`, `candidates`, `policy`이며 각각의 고정값은
+`aas-etf-comparison-v1`, `aegis`, `compare`다. 해시가 다르거나 JSON 키가 중복되면 거부한다.
+
+프로필은 `instrument_id`, `exposure_id`, `currency`, `hedged`, `leverage`, `reset`,
+`fee_bps`, `inception`, `as_of`, `source_hash`, `tracking`, `liquidity`를 모두 포함한다.
+확인하지 못한 보수·상장일·자료일·출처 해시·추적오차·유동성은 `null`로 제출한다.
+`tracking` 객체에는 `start`, `end`, `value`, `source_hash`, `basis`가 필요하다.
+
+정책은 `as_of`, `max_profile_age_days`, `min_liquidity`, `min_fee_saving_bps`,
+`max_tracking_error`, `tracking_start`, `tracking_end`, `tracking_basis`를 포함한다.
+날짜는 YYYY-MM-DD 형식이다. 추적오차 기간과 수익률 기준이 정책과 맞지 않거나
+자료가 누락·만료되면 `insufficient_evidence`로 남긴다. 가격 총수익과 NAV 총수익 등
+서로 다른 기준을 같은 이름으로 제출해서는 안 된다.
+
+비교 결과는 출력의 `result`에 담긴다. `research_only=true`,
+`automatic_replacement=false`, `source_pins_verified=false`는 유지된다.
+입력 출처의 진위 확인, 프로필 수집, DB 저장과 정기 실행은 호출 측의 별도 책임이다.
+
 ## 연구용 과거 수익률 연결
 
 외부에서 수집한 Nifty 가격지수 JSON은 `data.nifty_history.parse_nifty_price_history`에

@@ -39,6 +39,7 @@ def test_cli_status_without_site_packages() -> None:
         "daily_collection": True,
         "compute_budget": True,
         "live_orders": False,
+        "etf_candidate_comparison": True,
     }
     assert status["runtime_dependencies"]["vibe_trading"] is False
 

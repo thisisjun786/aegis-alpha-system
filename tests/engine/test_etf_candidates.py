@@ -240,3 +240,45 @@ def test_every_candidate_has_one_disposition_and_tracking_breaks_fee_tie() -> No
 def test_untyped_candidates_fail_at_boundary(bad: object) -> None:
     with pytest.raises(ContractDefinitionError, match="ETFProfile"):
         compare_etfs(profile(), cast("list[ETFProfile]", bad), policy())
+
+
+def test_default_tracking_basis_and_positional_backward_compatibility() -> None:
+    measure = TrackingMeasure(START, END, 0.03, "b" * 64)
+    assert measure.basis == "net_total_return"
+    matching_policy = ComparisonPolicy(AS_OF, 10, 100, 2, 0.04, START, END)
+    assert matching_policy.tracking_basis == "net_total_return"
+
+
+def test_empty_tracking_basis_rejected() -> None:
+    with pytest.raises(ContractDefinitionError, match="text"):
+        replace(TrackingMeasure(START, END, 0.03, "b" * 64), basis=" ")
+    with pytest.raises(ContractDefinitionError, match="text"):
+        replace(policy(), tracking_basis=" ")
+
+
+@pytest.mark.parametrize("reference", [False, True])
+def test_tracking_basis_mismatch_checked_before_thresholds(*, reference: bool) -> None:
+    mismatched = TrackingMeasure(
+        START, END, 0.03, "b" * 64, basis="fund_market_tr_after_expenses_vs_index_gross_tr"
+    )
+    current, candidate = profile(), profile("CANDIDATE", 5)
+    if reference:
+        current = replace(current, tracking=mismatched)
+    else:
+        candidate = replace(candidate, tracking=mismatched)
+    result = compare_etfs(current, [candidate], policy())
+    who = "reference" if reference else "candidate"
+    assert result.decisions[0].status == "insufficient_evidence"
+    assert result.decisions[0].reason == f"{who}_tracking_basis_mismatch"
+    assert result.decisions[0].fee_saving_bps is None
+
+
+def test_custom_matching_tracking_basis_is_accepted() -> None:
+    custom = "fund_market_tr_after_expenses_vs_index_gross_tr"
+    measure = TrackingMeasure(START, END, 0.01, "c" * 64, basis=custom)
+    result = compare_etfs(
+        replace(profile(), tracking=measure),
+        [replace(profile("CANDIDATE", 5), tracking=measure)],
+        replace(policy(), tracking_basis=custom),
+    )
+    assert result.decisions[0].status == "matched"
