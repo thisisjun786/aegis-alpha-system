@@ -33,3 +33,18 @@ position. Derived dispatch uses explicit `operation` and named fields
 Private strategy data stays outside this package. CLI, CI classification, and
 root documentation links to this file are owned by the surrounding application
 change, not by this module.
+
+`etf_candidates.compare_etfs` compares explicit ETF profiles using exact exposure
+and common tracking-window evidence. It returns missingness and exclusions,
+never resolves ticker identities, fetches profiles, certifies sources, or changes
+an asset registry. Import this owner directly.
+
+`risk` owns explicit supplied-session covariance, volatility, bounded two-asset
+weights and caller-defined drawdown/reset rules. Its results do not certify
+undocumented source strategy semantics or infer execution cadence.
+
+`research` owns explicitly typed ETF trial generation, train/validation outcome
+accounting and separate selected-winner holdout receipts. It calls an injected
+evaluator and records caller-supplied history; it cannot certify complete
+holdout history, source truth or profitability. No CLI/native persistence is
+implied by the pure API.
