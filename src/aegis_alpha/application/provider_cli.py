@@ -22,6 +22,7 @@ _PRECONDITION_EXIT = 2
 _MAX_CATALOG_RECOVERY_RUNS = 1000
 
 _CAPABILITIES = {
+    "qveris": ("bounded_raw_collection", ("explicit_pinned_jobs",)),
     "norgate": ("historical_local_publication", ("security_master", "historical_prices")),
     "fmp": (
         "signed_daily_collection",
@@ -47,6 +48,7 @@ _CREDENTIALS = {
 }
 _INPUT_PATHS = frozenset(
     {
+        "jobs",
         "registry",
         "storage_notification",
         "tier",
@@ -132,7 +134,16 @@ def _configuration_reasons(profile: ProviderProfile) -> list[str]:
         and "observation_start" not in profile.options
     ):
         reasons.append("missing_option:observation_start")
-    if profile.provider != "norgate":
+    reasons.extend(_credential_reasons(profile))
+    return reasons
+
+
+def _credential_reasons(profile: ProviderProfile) -> list[str]:
+    reasons = []
+    if profile.provider == "qveris":
+        if profile.credential_file is None or not profile.credential_file.is_file():
+            reasons.append("missing_credential_file")
+    elif profile.provider != "norgate":
         if profile.credential_file is None or not profile.credential_file.is_file():
             reasons.append("missing_credential_file")
         else:
@@ -261,6 +272,10 @@ def run_collection_profile(
         return {**plan, "exit_code": 2, "execution_started": False}
     if profile.provider == "norgate":
         return _inspect_norgate(config, profile)
+    if profile.provider == "qveris":
+        from aegis_alpha.application.qveris_collection import run_qveris_profile
+
+        return run_qveris_profile(profile)
     data = load_data_config(config.data_config)
     environment = load_provider_environment(profile)
     database_url = read_secret(data.database_url_file)

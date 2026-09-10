@@ -5,7 +5,14 @@ import json
 import sys
 from pathlib import Path
 
-from aegis_alpha.application import compute_cli, data_cli, provider_cli, storage_cli
+from aegis_alpha.application import (
+    backtest_cli,
+    compute_cli,
+    data_cli,
+    provider_cli,
+    proxy_cli,
+    storage_cli,
+)
 from aegis_alpha.application.contracts import parse_request
 from aegis_alpha.application.portfolio import compose_portfolio
 from aegis_alpha.modules.catalog import module_catalog
@@ -25,6 +32,8 @@ def _parser() -> argparse.ArgumentParser:
     storage_cli.add_commands(commands)
     data_cli.add_commands(commands)
     provider_cli.add_commands(commands)
+    backtest_cli.add_commands(commands)
+    proxy_cli.add_commands(commands)
     return parser
 
 
@@ -35,6 +44,8 @@ def _status() -> dict[str, object]:
         "capabilities": {
             "allocation_preview": True,
             "strategy_execution": False,
+            "aegis_etf_target_replay": True,
+            "research_proxy_returns": True,
             "database_adapter": True,
             "provider_collection": True,
             "daily_collection": True,
@@ -53,7 +64,7 @@ def _status() -> dict[str, object]:
     }
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None) -> int:  # noqa: C901 -- explicit command dispatch
     args = _parser().parse_args(argv)
     try:
         match args.command:
@@ -63,6 +74,10 @@ def main(argv: list[str] | None = None) -> int:
                 result = _status()
             case "resources":
                 result = compute_cli.compute_status()
+            case "backtest":
+                result = backtest_cli.execute(args)
+            case "proxy":
+                result = proxy_cli.execute(args)
             case "providers" | "collect":
                 result = provider_cli.execute(args)
             case "legacy-db" | "legacy-data":

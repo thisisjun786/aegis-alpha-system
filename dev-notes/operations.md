@@ -45,6 +45,39 @@ aas data read --dataset ID --version VERSION --cutoff-us UTC_MICROSECONDS
 시각을 기록하며 파일에 적힌 수집 시각을 시스템 관측으로 인정하지 않는다. 공급자의 조정 가격은 참고값이며
 PIT 입력으로 승격하지 않는다. 조회·게시만으로 coverage·backtest 자격이 확보됐다고 표시하지 않는다.
 
+## 원본 자료 이전과 조회
+
+```bash
+aas db source-import /path/to/private-snapshot.sqlite3 --id SOURCE_ID --sha256 SHA256
+aas db sources
+aas db source-tables --source SOURCE_ID
+aas db source-read --source SOURCE_ID --table TABLE_NAME --limit 20
+```
+
+`source-import`는 원본 SQLite 테이블을 비공개 원본 자료실에 보존한다. 먼저 읽기 전용
+연결의 SQLite backup API로 일관된 사본을 만들고, 닫힌 사본의 해시를 지정한다.
+원본의 실행 코드·뷰·트리거를 실행하거나 기존 엔진 bundle로 추정 변환하지 않는다.
+원본 설정, 연구용 설정, 원래 성과는 각각 원래 테이블과 열의 의미를 유지한다.
+`strategy list`는 검증된 실행 bundle 목록이며 `db sources`의 원본 자료 목록과 구분된다.
+
+대량 분석 자료는 `storage.source_library.import_arrow`로 명시적인 Arrow reader에서
+DuckDB에 적재한다. 같은 스키마끼리 묶고 파일 경로와 원본 행 번호를 보존한다.
+원본 시각이나 숫자의 정밀도를 임의로 줄이지 않는다. 원본 자료실 등록은 PIT 사용 자격이나
+백테스트 실행 성공을 뜻하지 않으며, `data datasets`의 게시된 데이터 버전에 자동 추가되지 않는다.
+대량 이전은 원본 파일·행 번호를 유지한 여러 source로 나눠 적재할 수 있다. 행 수만으로
+메모리 사용량을 판단하지 않으며, 실제 사용량과 처리 속도에 맞춰 작업 단위를 조정한다.
+DuckDB의 메모리 설정은 전체 Python 프로세스의 메모리 한도가 아니다.
+
+검토한 시뮬레이션 결과를 원본 자료실에 보존할 때도 입력·출력 해시와 검토 근거를 함께
+기록하고, 저장 후 읽기 전용 연결에서 원래 행과 대조한다. 이 등록은 실행 가능한 전략
+등록이나 기존 실행 집계 변경과 별개다. 일부 저장만 끝난 상태를 완료로 기록하지 않는다.
+
+기존 원본과 수집 설정을 유지한 채 새 홈으로 이전한다. 실제 자료·파일 목록·원본 해시·
+행 수 대조 결과는 비공개로 기록한다. 원본 파일을 보존할 때는 `raw/` 아래에 스트리밍으로
+저장하면 기존 백업에 포함된다. 전체 검증은 모든 등록 원본을 다시 읽고, 백업은 추가 사본을
+만드므로 자료 크기에 맞는 디스크 공간과 I/O 시간이 필요하다. 원본 자료 이전만으로
+기존 수집기나 예약 작업의 저장 위치가 바뀌지는 않는다.
+
 ## 검사·복구·백업
 
 ```bash
@@ -70,6 +103,67 @@ raw/runs도 포함하며 키·provider 설정과 절대 운영 경로는 제외�
 지원 schema는 [저장소 검증 코드](../src/aegis_alpha/storage/workspace.py)가 기준이다.
 자동 업그레이드·다운그레이드와 자료 삭제 명령은 제공하지 않는다.
 
+## 명시한 ETF 목표 비중 재생
+
+`aas backtest --input request.json --sha256 <파일의-SHA256>`는 명시한 ETF 목표 비중을
+다음 공급 거래일 시가에 체결하고 비용·현금·일별 NAV를 반환한다. 입력은 최대 64MiB이며
+스키마는 `aas-etf-backtest-v1`이다. 필수 필드는 `module`(aegis), `instrument_types`,
+`dates`, `opens`, `closes`, `targets`, `initial_cash`, `cost`, `source_pins`,
+`research_mode`다. 날짜는 YYYY-MM-DD, 가격 배열의 각 원소는 종목 ID와 숫자의 객체다.
+`targets`는 의사결정 날짜별 종목 목표 비중이며 현금은 비중의 나머지로 표현한다.
+
+양수 목표 비중의 종목 유형은 ETF여야 한다. `research_mode`는 합성 입력의 `synthetic`
+또는 실제 ETF 자료를 제출하는 `observed_etf_research`다. 제출한 분류·가격의 진위와
+달력 완전성은 호출자 책임이다. `source_pins`의 각 항목은 `source_id`, `source_sha256`,
+`table`, `table_digest`이며 이 명령은 해당 DB를 읽어 출처를 검증하지 않는다. 출력의
+`source_pins_verified`, `observed_prices_verified`, `point_in_time_verified`는 false다.
+원본 전략 규칙의 자동 해석이나 실주문을 시작하지 않는다.
+
+## 연구용 과거 수익률 연결
+
+외부에서 수집한 Nifty 가격지수 JSON은 `data.nifty_history.parse_nifty_price_history`에
+원본 바이트, 고정한 SHA256, 정확한 제공자 지수명과 조회 시작·종료일을 전달해 검증한다.
+UTF-8 BOM과 제공자의 `d` 응답 포장을 처리하며, 잘못된 지수명·중복 날짜·조회 기간 밖의
+행·유효하지 않은 종가는 거부한다. 빈 결과는 자료 없음으로 남긴다. 이 Python 함수는
+수집이나 DB 저장을 실행하지 않으며, 가격지수를 ETF 총수익으로 바꾸지 않는다.
+
+`aas proxy --input request.json --sha256 <파일의-SHA256>`는 최대 64MiB의
+`aas-proxy-returns-v1` 입력을 읽는다. 필수 필드는 `schema_version`, `module`(aegis),
+`target_type`(ETF), `donor`, `target`, `recipe`다.
+
+두 시계열은 `instrument_id`, `currency`, `return_kind`(price_return 또는 total_return),
+`close_convention`, `net_of_fees`, `anchor_date`, `dates`, `returns`, `source_sha256`을
+명시한다. 각 수익률은 직전 날짜 또는 anchor_date부터 해당 날짜까지의 변화다.
+날짜는 중복 없이 증가해야 하며 두 시계열에 공통 전환 경계가 있어야 한다.
+
+`recipe`는 `target_id`, `donor_id`, `switch_date`, `annual_fee`, `fee_model`, `reason`을
+담는다. `already_net`은 비용 반영 후 수익률과 추가 비용 0만 허용한다.
+`annual_expense`는 비용 반영 전 수익률에 연간 비용을 실제 경과 일수로 나눠 적용한다.
+`zero_expense_sensitivity`는 비용 0을 가정한 민감도 분석이며 그 이유를 명시해야 한다.
+목표 ETF 수익률에는 비용이 이미 반영돼 있어야 한다.
+
+결과는 날짜별 연구 지수이며 체결 가격으로 사용할 수 없다. 지수·현물 자료를 기초
+시계열로 제출할 수 있지만 가격수익과 배당 재투자 총수익, 서로 다른 종가 시각을
+섞을 수 없다. 같은 문자열을 제출했다는 사실은 실제 자료가 일치한다는 증거가 아니다.
+DB 출처·ETF 유형·시점 검증은 별도 호출자가 담당하며 결과에도 미검증 상태가 남는다.
+
+Python에서 `engine.reset_returns`의 `ResetCosts`, `ResetRecipe`,
+`build_reset_returns`를 직접 호출할 수 있다. `ResetCosts`에는 `anchor_date`,
+`dates`, `financing_drag`, `collateral_return`, `expense_drag`, `source_sha256`,
+`convention`, `basis`를 전달한다. `convention`은 `fraction_of_starting_nav`이며 각 항목은
+기간 시작 NAV의 비율이며 차입 규모 반영은 호출자가 맡는다. 자금조달비와 보수는 음수를 허용하지 않고, 담보수익은
+음수도 허용한다. `basis`는 `observed_inputs`, `explicit_assumptions`, `zero_sensitivity` 중 하나다.
+마지막 값은 모든 비용·수익 항목이 0일 때만 허용한다. 이 표시는 호출자의 주장이고
+자료를 인증하지 않는다. `source_sha256`은 비용 입력 파일의 식별값이다.
+`ResetRecipe`에는 일정한 `multiplier`와 가정을 설명하는 `reason`을
+명시한다. `expected_sessions`는 시작일을 포함하며 두 입력의 모든 날짜와 같아야 한다.
+
+기간 수익률은 `배율 × 기초 수익률 − 자금조달비 + 담보수익 − 보수`다. 비용이 이미
+반영된 기초 입력은 거부한다. 연간 금리, 차입 원금, 실제 ETF 비용을 자동 추정하지
+않으며 무비용 시나리오도 모든 비용 배열에 0을 명시해야 한다. 일별 자료인지와
+휴장일 누락 여부는 호출자가 확인해야 한다. 이 함수에는 별도 CLI 명령이 없고,
+기존 `aas proxy` 입력 형식은 그대로다.
+
 ## 선택적 단일 컨테이너
 
 ```bash
@@ -85,6 +179,26 @@ docker compose run --rm aas doctor
 컨테이너에 명시적으로 연결해야 한다. 동시에 실행한 CLI는 설치 잠금으로 거부한다.
 상시 앱의 소켓·예약 실행은 [0013](decisions/0013-first-install-workspace.md)에서 승인됐지만
 미구현인 설계다. 현재 명령은 소켓으로 전달되지 않으며 잠금 충돌 시 `installation_busy`로 실패한다.
+
+## Qveris 원문 수집
+
+`aas collect daily --config /path/to/collection.json --state-root /path/to/private-journal`은
+명시한 공급자 설정으로 하루 한 번 수집을 접수한다. Qveris 설정은 `provider=qveris`,
+`mode=daily`, 비공개 `credential_file`, 양수 `max_calls`를 요구한다. `options`에는
+`jobs`, `jobs_sha256`, `raw_store_root`, `max_credits`, `timeout_seconds`를 지정한다.
+작업 문서는 [qveris_contracts.py](../src/aegis_alpha/data/qveris_contracts.py), 설정 검증은
+[provider_config.py](../src/aegis_alpha/application/provider_config.py)가 소유한다.
+
+작업 해시가 다르면 키를 읽기 전에 실패한다. 유료 호출 전에 견적과 잔액을 확인하며,
+원문을 저장한 뒤 사용량을 대조한다. 완료된 작업은 재사용하고 결과가 불확실한 호출은
+자동 재시도하지 않는다. 같은 UTC 날짜의 접수 기록을 유지해야 중복 실행을 막을 수 있다.
+`provider_calls`와 `http_requests`는 각각 유료 실행과 전체 HTTP 시도 수다.
+
+이 명령은 원문 수집까지만 수행하며 `native_import_completed=false`를 반환한다.
+검증된 원문을 DuckDB 원본 자료실에 적재하려면 별도의 명시적 적재 작업이 필요하다.
+가격의 조정 기준·종목 식별·거래일·공개 시각을 확인하기 전에는 백테스트 입력이나
+`data datasets`의 시장 버전으로 자동 승격하지 않는다. 예약 실행은 운영자가 별도로
+설치하고 실제 적재 결과와 중복 호출 여부를 확인한다. 패키지 설치는 예약 작업을 만들지 않는다.
 
 ## 전환 중인 공급자 도구
 
