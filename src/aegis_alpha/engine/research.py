@@ -616,12 +616,7 @@ class TrialOutcome:
     def from_document(cls, document: object) -> TrialOutcome:
         if not isinstance(document, Mapping) or set(document.keys()) != _OUTCOME_FIELDS:
             raise ContractDefinitionError("trial outcome document has missing or unknown fields")
-        metrics_raw = document["metrics"]
-        if not isinstance(metrics_raw, Sequence) or isinstance(
-            metrics_raw, (str, bytes, bytearray)
-        ):
-            raise ContractDefinitionError("trial outcome metrics must be a sequence of pairs")
-        metrics = tuple((pair[0], pair[1]) for pair in metrics_raw)
+        metrics = _require_metrics_axis(document["metrics"])
         return cls(
             trial_sha256=document["trial_sha256"],
             split=document["split"],

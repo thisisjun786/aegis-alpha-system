@@ -33,6 +33,13 @@ def sqlite_digest(rows: Iterable[tuple[object, ...]]) -> tuple[int, str]:
     return count, digest.hexdigest()
 
 
+def _single_batch(table: pa.Table) -> pa.RecordBatch:
+    batches = table.to_batches()
+    if len(batches) != 1 or batches[0].num_rows != table.num_rows:
+        raise ValueError("source rows must fit one canonical Arrow batch; use large-offset arrays")
+    return batches[0]
+
+
 def fixed_batches(reader: pa.RecordBatchReader) -> Iterator[pa.RecordBatch]:
     import pyarrow as pa  # noqa: PLC0415
 
@@ -46,14 +53,12 @@ def fixed_batches(reader: pa.RecordBatchReader) -> Iterator[pa.RecordBatch]:
             size += length
             offset += length
             if size == BATCH_ROWS:
-                yield (
-                    pa.Table.from_batches(pending, schema=reader.schema)
-                    .combine_chunks()
-                    .to_batches()[0]
+                yield _single_batch(
+                    pa.Table.from_batches(pending, schema=reader.schema).combine_chunks()
                 )
                 pending, size = [], 0
     if pending:
-        yield pa.Table.from_batches(pending, schema=reader.schema).combine_chunks().to_batches()[0]
+        yield _single_batch(pa.Table.from_batches(pending, schema=reader.schema).combine_chunks())
 
 
 def canonical_batch(batch: pa.RecordBatch) -> bytes:

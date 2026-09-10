@@ -108,3 +108,25 @@ def test_source_catalog_cli_roundtrip(tmp_path: Path) -> None:
     assert json.loads(run_cli("strategy", "list", home=home).stdout)["strategies"] == []
     result = run_cli("db", "verify", home=home)
     assert json.loads(result.stdout)["source_library"] == {"sources": 1, "tables": 1, "rows": 1}
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("sources",),
+        ("source-tables", "--source", "source"),
+        ("source-read", "--source", "source", "--table", "table"),
+    ],
+)
+def test_source_reads_require_strategy_store_at_admission(
+    tmp_path: Path, arguments: tuple[str, ...]
+) -> None:
+    home = tmp_path / "aas"
+    assert run_cli("init", home=home).returncode == 0
+    (home / "strategies.sqlite3").rename(home / "held-strategies.sqlite3")
+    result = run_cli("db", *arguments, home=home)
+    assert result.returncode == 1
+    assert "error" in json.loads(result.stderr)
+    assert "strategy database is missing" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert run_cli("doctor", home=home).returncode == 0

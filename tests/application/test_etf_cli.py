@@ -193,3 +193,19 @@ def test_candidates_cap_and_input_size_are_rejected_before_generation() -> None:
     raw = b"x" * (64 * 1024 * 1024 + 1)
     with pytest.raises(ValueError, match="byte limit"):
         run_document(raw, hashlib.sha256(raw).hexdigest())
+
+
+@pytest.mark.parametrize(("section", "key"), [("current", "fee_bps"), ("policy", "min_liquidity")])
+def test_cli_oversized_integer_returns_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], section: str, key: str
+) -> None:
+    body = document()
+    cast("dict[str, object]", body[section])[key] = 10**400
+    raw = json.dumps(body).encode()
+    path = tmp_path / "overflow.json"
+    path.write_bytes(raw)
+    assert main(["etfs", "--input", str(path), "--sha256", hashlib.sha256(raw).hexdigest()]) == 1
+    captured = capsys.readouterr()
+    assert "error" in json.loads(captured.err)
+    assert "Traceback" not in captured.err
+    assert not captured.out
