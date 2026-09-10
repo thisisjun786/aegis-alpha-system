@@ -119,6 +119,76 @@ raw/runs도 포함하며 키·provider 설정과 절대 운영 경로는 제외�
 `source_pins_verified`, `observed_prices_verified`, `point_in_time_verified`는 false다.
 원본 전략 규칙의 자동 해석이나 실주문을 시작하지 않는다.
 
+여러 전략을 외부 실행기로 재현할 때는 입력·계산 코드·환경을 고정하고, 전략별로
+원본 규칙과 연구용 변형의 결과를 따로 기록한다. 이전 결과와 비교할 때 날짜와 숫자뿐
+아니라 열 자료형도 확인한다. 허용 오차 안의 일치와 완전히 같은 결과를 구분한다.
+중단 후에는 해시로 검증한 완료 결과만 재사용하고, 미완료·실패 과정에서 남은 파일은
+DB 저장 대상에서 제외한다. 저장한 결과를 다시 열 때는 선택한 출처 명세와 결과 영수증,
+원본 파일 목록, 테이블 내용·행 수를 모두 대조한다. 연구용 재현의 일치는 원본 전략의
+비용·납입일·시점 가용성까지 확인했다는 뜻이 아니다.
+
+### 날짜별 납입·출금
+
+같은 `aas backtest` 명령에 `schema_version="aas-etf-backtest-v2"`를 제출하면
+v1의 모든 필드와 `cashflows` 배열이 필요하다. 예를 들어
+`[{"date":"2024-01-04","amount":100.0}]`은 해당 거래일 시가에서 100을 납입한다.
+양수는 납입, 음수는 출금이며 계좌와 같은 통화다. 배열이 비어 있으면 입출금 없이 계산한다.
+
+날짜는 제출한 거래일에 속하고 오름차순이어야 한다. 첫 기준일의 입출금, 중복 날짜,
+0·무한대·숫자가 아닌 금액은 거부한다. 휴일 이동이나 반복 납입일 추정은 하지 않는다.
+입출금은 보유 자산을 해당 시가로 평가한 뒤, 직전 종가의 목표 비중을 체결하기 전에
+반영한다. 출금액이 기존 현금보다 크면 거부한다. 매도 예정 자산도 출금 재원으로
+미리 계산하지 않는다. 목표 비중 체결이 없는 날의 납입액은 현금으로 남는다.
+
+v2의 `result.account`에는 기존 형식의 계좌 NAV·체결 내역이 담긴다.
+`result.unit_nav`는 `date`, `unit_value`, `units`, `external_flow`를 담는다.
+초기 단위당 가치는 1이고, 입출금 직전 단위당 가치로 단위를 발행·상환한다.
+납입액은 계좌 잔액을 늘리지만 투자 수익으로 기록되지 않는다. 수수료는 수익률에 반영된다.
+`result.cashflows`는 검증한 입력 내역이며 `cashflow_convention`은 처리 순서를 설명한다.
+원본 전략의 현금 흐름·시점·자료 검증은 별도로 필요하다. v1은 기존 응답을 유지하고
+`cashflows` 필드를 받지 않는다.
+
+## 명시한 ETF 연구 후보 생성
+
+`aas research --input request.json --sha256 <파일의-SHA256>`는 최대 64MiB의 입력에서
+연구 후보를 생성한다. 스키마는 `aas-etf-research-v1`, `module`은 `aegis`, `action`은
+`generate`다. 나머지 필수 필드는 `parent_hash`, `seed`, `grid`, `train_end`,
+`validation_end`, `test_end`, `cost_ref`, `max_trials`다. 날짜는 YYYY-MM-DD 형식이고
+세 평가 구간의 끝 날짜가 순서대로 증가해야 한다. `max_trials`는 1~256의 정수다.
+
+`grid`에는 `etf_universes`, `instrument_types`, `momentum_horizons`, `absolute_filters`,
+`trend_filters`, `weightings`, `volatility_caps` 배열을 명시한다. 종목 유형은
+`[["ETF_A", "ETF"], ["ETF_B", "ETF"]]`처럼 ID·유형 쌍으로 제출하며, 후보 종목은 모두
+ETF여야 한다. 가중 방식은 `equal` 또는 `inverse_volatility`, 변동성 상한은 양의 숫자다.
+유형 표시의 진위와 비용 참조는 이 명령이 검증하지 않는다.
+
+출력은 해시가 포함된 전체 후보 명세와 개수다. `research_candidate_generation`만
+활성 기능으로 보고하며 `evaluation_performed`는 false다. 가격 조회·전략 실행·DB 저장·
+최종 시험 구간 평가를 시작하지 않는다. 학습·검증 평가와 별도 최종 평가가 필요하면
+Python 연구 API에 평가 함수를 명시하고, 실행 측에서 이전 평가 이력을 보존해야 한다.
+
+## 명시한 ETF 프로필 비교
+
+`aas etfs --input request.json --sha256 <파일의-SHA256>`는 최대 64MiB의 입력을
+검증한 뒤 현재 ETF와 최대 256개 후보를 비교한다. 최상위 필드는 `schema_version`,
+`module`, `action`, `current`, `candidates`, `policy`이며 각각의 고정값은
+`aas-etf-comparison-v1`, `aegis`, `compare`다. 해시가 다르거나 JSON 키가 중복되면 거부한다.
+
+프로필은 `instrument_id`, `exposure_id`, `currency`, `hedged`, `leverage`, `reset`,
+`fee_bps`, `inception`, `as_of`, `source_hash`, `tracking`, `liquidity`를 모두 포함한다.
+확인하지 못한 보수·상장일·자료일·출처 해시·추적오차·유동성은 `null`로 제출한다.
+`tracking` 객체에는 `start`, `end`, `value`, `source_hash`, `basis`가 필요하다.
+
+정책은 `as_of`, `max_profile_age_days`, `min_liquidity`, `min_fee_saving_bps`,
+`max_tracking_error`, `tracking_start`, `tracking_end`, `tracking_basis`를 포함한다.
+날짜는 YYYY-MM-DD 형식이다. 추적오차 기간과 수익률 기준이 정책과 맞지 않거나
+자료가 누락·만료되면 `insufficient_evidence`로 남긴다. 가격 총수익과 NAV 총수익 등
+서로 다른 기준을 같은 이름으로 제출해서는 안 된다.
+
+비교 결과는 출력의 `result`에 담긴다. `research_only=true`,
+`automatic_replacement=false`, `source_pins_verified=false`는 유지된다.
+입력 출처의 진위 확인, 프로필 수집, DB 저장과 정기 실행은 호출 측의 별도 책임이다.
+
 ## 연구용 과거 수익률 연결
 
 외부에서 수집한 Nifty 가격지수 JSON은 `data.nifty_history.parse_nifty_price_history`에

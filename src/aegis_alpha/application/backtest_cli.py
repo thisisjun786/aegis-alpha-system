@@ -8,12 +8,15 @@ import math
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.engine.codec import decode_json
 from aegis_alpha.storage.publication import json_value
 from aegis_alpha.storage.source_reader import SourcePin
+
+if TYPE_CHECKING:
+    from aegis_alpha.engine.execution import CashFlow
 
 _MAX_INPUT_BYTES = 64 * 1024 * 1024
 _FIELDS = frozenset(
@@ -95,9 +98,28 @@ def _pins(value: object) -> list[dict[str, str]]:
     return result
 
 
+def _cashflows(value: object, session_count: int) -> tuple[CashFlow, ...]:
+    from aegis_alpha.engine.execution import CashFlow  # noqa: PLC0415 -- execution owner
+
+    if not isinstance(value, list):
+        raise TypeError("cashflows must be an array")
+    if len(value) > max(0, session_count - 1):
+        raise ValueError("cashflows exceed the supplied session count")
+    flows = []
+    for item in value:
+        body = _mapping(item)
+        if body.keys() != {"date", "amount"}:
+            raise ValueError("cashflow has missing or unknown fields")
+        flows.append(CashFlow(_day(body["date"]), _number(body["amount"])))
+    return tuple(flows)
+
+
 def run_document(raw: bytes, expected_sha256: str) -> dict[str, object]:  # noqa: C901 -- single explicit envelope and accounting boundary
     """Run explicit prices/targets, without claiming to resolve their source pins."""
-    from aegis_alpha.engine.execution import replay_next_open  # noqa: PLC0415 -- execution owner
+    from aegis_alpha.engine.execution import (  # noqa: PLC0415 -- execution owner
+        replay_next_open,
+        replay_next_open_cashflows,
+    )
 
     if len(raw) > _MAX_INPUT_BYTES:
         raise ValueError("backtest input exceeds the byte limit")
@@ -105,7 +127,9 @@ def run_document(raw: bytes, expected_sha256: str) -> dict[str, object]:  # noqa
     if digest != expected_sha256:
         raise ValueError("backtest input SHA-256 mismatch")
     body = _mapping(decode_json(raw))
-    if body.keys() != _FIELDS or body["schema_version"] != "aas-etf-backtest-v1":
+    version = body.get("schema_version")
+    fields = _FIELDS | {"cashflows"} if version == "aas-etf-backtest-v2" else _FIELDS
+    if body.keys() != fields or version not in ("aas-etf-backtest-v1", "aas-etf-backtest-v2"):
         raise ValueError("unsupported backtest schema or missing/unknown fields")
     if body["module"] != "aegis":
         raise ValueError("this backtest contract belongs to aegis")
@@ -122,18 +146,27 @@ def run_document(raw: bytes, expected_sha256: str) -> dict[str, object]:  # noqa
         if any(weight > 0 and types.get(symbol) != "ETF" for symbol, weight in weights.items()):
             raise ValueError("positive aegis target weights require explicit ETF instrument type")
     pins = _pins(body["source_pins"])
+    opens = _prices(body["opens"])
+    closes = _prices(body["closes"])
+    initial_cash = _number(body["initial_cash"])
+    cost = _number(body["cost"])
     try:
-        result = replay_next_open(
-            dates,
-            _prices(body["opens"]),
-            _prices(body["closes"]),
-            targets,
-            _number(body["initial_cash"]),
-            _number(body["cost"]),
+        result = (
+            replay_next_open_cashflows(
+                dates,
+                opens,
+                closes,
+                targets,
+                initial_cash,
+                cost,
+                _cashflows(body["cashflows"], len(dates)),
+            )
+            if version == "aas-etf-backtest-v2"
+            else replay_next_open(dates, opens, closes, targets, initial_cash, cost)
         )
     except ArithmeticError as error:
         raise ValueError(f"backtest accounting failed: {error}") from error
-    return {
+    response: dict[str, object] = {
         "module": "aegis",
         "input_sha256": digest,
         "research_mode": body["research_mode"],
@@ -145,6 +178,12 @@ def run_document(raw: bytes, expected_sha256: str) -> dict[str, object]:  # noqa
         "live_orders": False,
         "result": json_value(asdict(result)),
     }
+    if version == "aas-etf-backtest-v2":
+        response["cashflow_convention"] = (
+            "explicit cashflows at supplied session open before rebalancing; "
+            "withdrawals use existing cash only; unit NAV removes external flow effects"
+        )
+    return response
 
 
 def execute(args: argparse.Namespace) -> dict[str, object]:

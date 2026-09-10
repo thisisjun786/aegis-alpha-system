@@ -9,8 +9,10 @@ from aegis_alpha.application import (
     backtest_cli,
     compute_cli,
     data_cli,
+    etf_cli,
     provider_cli,
     proxy_cli,
+    research_cli,
     storage_cli,
 )
 from aegis_alpha.application.contracts import parse_request
@@ -34,6 +36,8 @@ def _parser() -> argparse.ArgumentParser:
     provider_cli.add_commands(commands)
     backtest_cli.add_commands(commands)
     proxy_cli.add_commands(commands)
+    research_cli.add_commands(commands)
+    etf_cli.add_commands(commands)
     return parser
 
 
@@ -46,11 +50,13 @@ def _status() -> dict[str, object]:
             "strategy_execution": False,
             "aegis_etf_target_replay": True,
             "research_proxy_returns": True,
+            "research_candidate_generation": True,
             "database_adapter": True,
             "provider_collection": True,
             "daily_collection": True,
             "compute_budget": True,
             "live_orders": False,
+            "etf_candidate_comparison": True,
         },
         "modules": module_catalog(),
         "runtime_dependencies": {
@@ -64,7 +70,7 @@ def _status() -> dict[str, object]:
     }
 
 
-def main(argv: list[str] | None = None) -> int:  # noqa: C901 -- explicit command dispatch
+def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912 -- explicit command dispatch
     args = _parser().parse_args(argv)
     try:
         match args.command:
@@ -78,6 +84,10 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901 -- explicit comman
                 result = backtest_cli.execute(args)
             case "proxy":
                 result = proxy_cli.execute(args)
+            case "research":
+                result = research_cli.execute(args)
+            case "etfs":
+                result = etf_cli.execute(args)
             case "providers" | "collect":
                 result = provider_cli.execute(args)
             case "legacy-db" | "legacy-data":
