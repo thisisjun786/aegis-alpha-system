@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import os
 import secrets
-from contextlib import AbstractContextManager, nullcontext
+import socket
+from contextlib import AbstractContextManager, ExitStack, nullcontext
 from decimal import Decimal
 from pathlib import Path
 from typing import Self
@@ -50,10 +52,25 @@ class QverisStore(AbstractContextManager["QverisStore"]):
         self.root = validate_destination("Qveris evidence root", root)
         self.account_key = account_key
         self.tree: DescriptorTree | None = None
+        self._resources: ExitStack | None = None
 
     def __enter__(self) -> Self:
-        tree = open_directory(self.root, create=True)
+        resources = ExitStack()
         try:
+            # A local kernel lease needs no extra storage root and dies with its owner.
+            # This abstract Unix socket only binds; it never listens or exchanges data.
+            lease = resources.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+            address = (
+                "\0aas-qveris-account-"
+                + hashlib.sha256(self.account_key.encode("utf-8")).hexdigest()
+            )
+            try:
+                lease.bind(address)
+            except OSError as error:
+                if error.errno == errno.EADDRINUSE:
+                    raise BlockingIOError("Qveris account is owned by another process") from None
+                raise
+            tree = resources.enter_context(open_directory(self.root, create=True))
             fcntl.flock(tree.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.tree = tree
             self.publish(
@@ -61,17 +78,19 @@ class QverisStore(AbstractContextManager["QverisStore"]):
                 canonical_json_bytes({"credential_sha256": self.account_key}),
             )
             self.assert_owned()
+            self._resources = resources
         except BaseException:
             self.tree = None
-            tree.close()
+            resources.close()
             raise
         return self
 
     def __exit__(self, *_args: object) -> None:
-        tree = self.tree
         self.tree = None
-        if tree is not None:
-            tree.close()
+        resources = self._resources
+        self._resources = None
+        if resources is not None:
+            resources.close()
 
     def _tree(self) -> DescriptorTree:
         if self.tree is None:
