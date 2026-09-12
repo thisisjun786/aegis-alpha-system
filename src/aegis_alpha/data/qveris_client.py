@@ -322,7 +322,7 @@ def _parse_key(payload: bytes) -> str:
 
 
 def _credential_forms(key: str) -> tuple[bytes, ...]:
-    forms = {key, quote(key, safe=""), quote(key, safe="/")}
+    forms = {key, quote(key, safe=""), quote(key, safe="/"), json.dumps(key)[1:-1]}
     return tuple(form.encode("utf-8") for form in forms if form)
 
 
