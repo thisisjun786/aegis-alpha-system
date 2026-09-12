@@ -169,5 +169,7 @@ def _source_command(workspace: object, args: argparse.Namespace) -> dict[str, ob
     if args.db_command == "source-tables":
         return {"tables": source_library.list_tables(workspace, args.source)}
     if args.db_command == "source-read":
-        return source_library.read_table(workspace, args.source, args.table, limit=args.limit)
+        from aegis_alpha.storage.source_reader import inspect_source
+
+        return dict(inspect_source(workspace, args.source, args.table, limit=args.limit))
     return source_library.import_sqlite(workspace, args.file.absolute(), args.id, args.sha256)
