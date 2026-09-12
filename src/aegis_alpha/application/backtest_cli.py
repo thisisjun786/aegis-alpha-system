@@ -187,7 +187,7 @@ def run_document(raw: bytes, expected_sha256: str) -> dict[str, object]:  # noqa
 
 
 def execute(args: argparse.Namespace) -> dict[str, object]:
-    path = cast("Path", args.input)
+    path = cast("Path", args.input).absolute()
     with DescriptorTree.open_path(path.parent) as tree:
         raw = tree.read_bytes(path.name, max_bytes=_MAX_INPUT_BYTES)
     return run_document(raw, args.sha256)

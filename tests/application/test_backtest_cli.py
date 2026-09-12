@@ -90,3 +90,36 @@ def test_numerical_overflow_is_reported_as_cli_json(
     captured = capsys.readouterr()
     assert not captured.out
     assert "error" in json.loads(captured.err)
+
+
+def test_relative_input_matches_absolute_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    raw = json.dumps(document()).encode()
+    (tmp_path / "backtest.json").write_bytes(raw)
+    monkeypatch.chdir(tmp_path)
+    assert (
+        main(["backtest", "--input", "backtest.json", "--sha256", hashlib.sha256(raw).hexdigest()])
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out) == run_document(raw, hashlib.sha256(raw).hexdigest())
+
+
+@pytest.mark.parametrize("directory_alias", [False, True])
+def test_relative_input_alias_still_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    directory_alias: bool,
+) -> None:
+    raw = json.dumps(document()).encode()
+    source = tmp_path / "original"
+    source.mkdir()
+    (source / "input.json").write_bytes(raw)
+    alias = tmp_path / "alias"
+    alias.symlink_to(source if directory_alias else source / "input.json")
+    monkeypatch.chdir(tmp_path)
+    name = "alias/input.json" if directory_alias else "alias"
+    assert main(["backtest", "--input", name, "--sha256", hashlib.sha256(raw).hexdigest()]) == 1
+    assert "error" in json.loads(capsys.readouterr().err)

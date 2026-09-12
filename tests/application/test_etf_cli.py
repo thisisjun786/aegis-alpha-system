@@ -195,6 +195,36 @@ def test_candidates_cap_and_input_size_are_rejected_before_generation() -> None:
         run_document(raw, hashlib.sha256(raw).hexdigest())
 
 
+def test_relative_input_matches_absolute_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    raw = json.dumps(document()).encode()
+    (tmp_path / "etfs.json").write_bytes(raw)
+    monkeypatch.chdir(tmp_path)
+    assert main(["etfs", "--input", "etfs.json", "--sha256", hashlib.sha256(raw).hexdigest()]) == 0
+    assert json.loads(capsys.readouterr().out) == run_document(raw, hashlib.sha256(raw).hexdigest())
+
+
+@pytest.mark.parametrize("directory_alias", [False, True])
+def test_relative_input_alias_still_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    directory_alias: bool,
+) -> None:
+    raw = json.dumps(document()).encode()
+    source = tmp_path / "original"
+    source.mkdir()
+    (source / "input.json").write_bytes(raw)
+    alias = tmp_path / "alias"
+    alias.symlink_to(source if directory_alias else source / "input.json")
+    monkeypatch.chdir(tmp_path)
+    name = "alias/input.json" if directory_alias else "alias"
+    assert main(["etfs", "--input", name, "--sha256", hashlib.sha256(raw).hexdigest()]) == 1
+    assert "error" in json.loads(capsys.readouterr().err)
+
+
 @pytest.mark.parametrize(("section", "key"), [("current", "fee_bps"), ("policy", "min_liquidity")])
 def test_cli_oversized_integer_returns_error(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], section: str, key: str
