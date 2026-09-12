@@ -68,9 +68,12 @@ def _eod_history(job: QverisJob, data: object, retrieved_on: date | None) -> Pag
     if not isinstance(data, list) or not data:
         raise ValueError("EODHD history requires a nonempty array")
     params = job.parameters
-    if "to" not in params and retrieved_on is None:
+    if "to" in params:
+        upper = str(params["to"])
+    elif retrieved_on is None:
         raise ValueError("open-ended history requires its actual retrieval date")
-    upper = str(params["to"]) if "to" in params else str(retrieved_on)
+    else:
+        upper = str(min(job.observation_date, retrieved_on))
     required = {"date", "open", "high", "low", "close", "adjusted_close", "volume"}
     keys = []
     for value in data:
