@@ -145,7 +145,7 @@ def ledger_items(client: QverisPort, store: QverisStore, start: str) -> list[dic
 
 
 def _signed_credit(value: object) -> Decimal:
-    if isinstance(value, bool) or not isinstance(value, (str, float, int)):
+    if isinstance(value, bool) or not isinstance(value, (str, float, int, Decimal)):
         raise TypeError("invalid ledger amount")
     result = Decimal(str(value))
     if not result.is_finite():

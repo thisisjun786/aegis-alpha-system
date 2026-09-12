@@ -24,6 +24,7 @@ import urllib.request
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Final, Protocol, Self
 from urllib.parse import quote, urlencode, urlsplit
@@ -246,7 +247,7 @@ class QverisResponse:
         return None
 
     def document(self) -> dict[str, object]:
-        """Decode the body as one strict UTF-8 JSON object."""
+        """Decode strict UTF-8 JSON with exact Decimal fractional numbers."""
 
         try:
             text = self.body.decode("utf-8")
@@ -257,6 +258,7 @@ class QverisResponse:
                 text,
                 object_pairs_hook=_reject_duplicate_keys,
                 parse_constant=_reject_nonfinite,
+                parse_float=Decimal,
             )
         except json.JSONDecodeError as error:
             raise QverisDocumentError("Qveris document is not valid JSON") from error
