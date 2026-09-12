@@ -192,11 +192,15 @@ def _identity(symbol: str, identities: Mapping[str, Mapping[str, str]]) -> Mappi
     }:
         raise ValueError("explicit instrument identity is required")
     exchange = symbol.rsplit(".", 1)[-1]
+    instrument_id = identity["instrument_id"]
     if (
         identity["venue"] != exchange
         or identity["currency"] != ("USD" if exchange == "US" else "KRW")
         or identity["instrument_type"] not in {"ETF", "Common Stock"}
-        or not identity["instrument_id"]
+        or type(instrument_id) is not str
+        or not instrument_id
+        or instrument_id != instrument_id.strip()
+        or not instrument_id.isprintable()
     ):
         raise ValueError("provider identity or currency differs")
     return identity
