@@ -21,6 +21,28 @@ if TYPE_CHECKING:
     from aegis_alpha.storage.workspace import Workspace
 
 
+def _supported_type(kind: pa.DataType) -> bool:
+    """Admit canonical scalar types and variable lists of those types only."""
+    import pyarrow as pa  # noqa: PLC0415
+
+    if pa.types.is_list(kind) or pa.types.is_large_list(kind):
+        return _supported_type(kind.value_type)
+    return (
+        pa.types.is_boolean(kind)
+        or pa.types.is_integer(kind)
+        or pa.types.is_float32(kind)
+        or pa.types.is_float64(kind)
+        or pa.types.is_string(kind)
+        or pa.types.is_large_string(kind)
+        or pa.types.is_binary(kind)
+        or pa.types.is_large_binary(kind)
+        or pa.types.is_date(kind)
+        or pa.types.is_time(kind)
+        or pa.types.is_timestamp(kind)
+        or (pa.types.is_decimal128(kind) and 0 <= kind.scale <= kind.precision)
+    )
+
+
 def ingest_arrow(  # noqa: PLR0913 -- explicit provenance and reader input
     workspace: Workspace,
     source_id: str,
@@ -47,6 +69,9 @@ def ingest_arrow(  # noqa: PLR0913 -- explicit provenance and reader input
         n.casefold() for n in original.names
     }:
         raise ValueError("ambiguous or reserved Arrow column")
+    for field in original:
+        if not _supported_type(field.type):
+            raise ValueError(f"unsupported Arrow source type for {field.name!r}: {field.type}")
     serialized = base64.b64encode(original.serialize().to_pybytes()).decode()
     op_id, request, reused = _prepare(
         workspace, source_id, sha256, "market", [table_name, serialized, metadata]
