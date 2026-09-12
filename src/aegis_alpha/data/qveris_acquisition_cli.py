@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901 -- exclusive CLI m
         else:
             if args.jobs is None:
                 raise ValueError("--jobs is required for plan and execution")  # noqa: TRY301
-            jobs = load_jobs(read_bytes(args.jobs))
+            jobs = load_jobs(read_bytes(args.jobs.absolute()))
             result = acquisition_plan(jobs, args.output_root)
             if args.execute:
                 if args.key_file is None:
