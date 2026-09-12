@@ -8,7 +8,9 @@ import uuid
 from pathlib import Path
 
 from aegis_alpha.data.descriptor_tree import DescriptorTree
-from aegis_alpha.storage.locks import private_directory, private_file
+from aegis_alpha.storage.locks import private_directory
+from aegis_alpha.storage.paths import private_source_file as private_file
+from aegis_alpha.storage.paths import same_private_file
 
 _SHA256_LENGTH = 64
 
@@ -16,7 +18,7 @@ _SHA256_LENGTH = 64
 def put_raw_file(root: Path, source_path: Path) -> tuple[str, str, int]:
     """Stream a private snapshot into raw storage without retaining its bytes in memory."""
     private_directory(root)
-    private_file(source_path)
+    admitted = private_file(source_path)
     temporary = "." + uuid.uuid4().hex + ".tmp"
     with DescriptorTree.open_path(root) as target:
         try:
@@ -26,6 +28,8 @@ def put_raw_file(root: Path, source_path: Path) -> tuple[str, str, int]:
                 target.binary_writer(temporary, exclusive=True) as destination,
             ):
                 before = os.fstat(source.fileno())
+                if not same_private_file(admitted, before):
+                    raise ValueError("raw snapshot changed before copying")
                 digest = hashlib.sha256()
                 size = 0
                 for chunk in iter(lambda: source.read(1024 * 1024), b""):
@@ -33,11 +37,7 @@ def put_raw_file(root: Path, source_path: Path) -> tuple[str, str, int]:
                     digest.update(chunk)
                     size += len(chunk)
                 after = os.fstat(source.fileno())
-                if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
-                    size,
-                    after.st_mtime_ns,
-                    after.st_ctime_ns,
-                ):
+                if before.st_size != size or not same_private_file(before, after):
                     raise ValueError("raw snapshot changed while copying")
                 destination.flush()
                 os.fsync(destination.fileno())

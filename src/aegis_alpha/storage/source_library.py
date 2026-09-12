@@ -17,7 +17,8 @@ from typing import TYPE_CHECKING, cast
 
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.storage import source_library_schema as schema
-from aegis_alpha.storage.locks import private_file
+from aegis_alpha.storage.paths import private_source_file as private_file
+from aegis_alpha.storage.paths import same_private_file
 from aegis_alpha.storage.source_library_digest import arrow_digest, sqlite_digest
 from aegis_alpha.storage.state import complete_operation, get_operation, prepare_operation
 
@@ -139,7 +140,7 @@ def import_sqlite(  # noqa: C901, PLR0912, PLR0915 -- one snapshot transaction b
             snapshot.open("w+b") as image,
         ):
             opened = os.fstat(handle.fileno())
-            if (info.st_dev, info.st_ino) != (opened.st_dev, opened.st_ino):
+            if not same_private_file(info, opened):
                 raise ValueError("SQLite snapshot changed before import")
             shutil.copyfileobj(handle, image)
             image.seek(0)
@@ -223,13 +224,7 @@ def import_sqlite(  # noqa: C901, PLR0912, PLR0915 -- one snapshot transaction b
                     }
                 )
             after = private_file(path)
-            if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (
-                after.st_dev,
-                after.st_ino,
-                after.st_size,
-                after.st_mtime_ns,
-                after.st_ctime_ns,
-            ):
+            if not same_private_file(info, after):
                 raise ValueError("SQLite snapshot changed during import")
             return _commit(workspace, source_id, sha256, store, op_id, request, tables)
         except BaseException:
