@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, Inexact, localcontext
 from typing import TYPE_CHECKING
 
 from aegis_alpha.data.qveris_contracts import credit_value
@@ -37,10 +37,18 @@ class InvocationBudget:
         amount = credit_value(quote)
         if self.reserved_calls >= self.max_calls:
             raise RuntimeError("INVOCATION_CALL_LIMIT: execute was not attempted")
-        if self.reserved_credits + amount > self.max_credits:
+        if amount > self.max_credits:
+            raise RuntimeError("INVOCATION_CREDIT_LIMIT: execute was not attempted")
+        try:
+            with localcontext() as arithmetic:
+                arithmetic.traps[Inexact] = True
+                total = self.reserved_credits + amount
+        except Inexact as error:
+            raise RuntimeError("INVOCATION_CREDIT_PRECISION: execute was not attempted") from error
+        if total > self.max_credits:
             raise RuntimeError("INVOCATION_CREDIT_LIMIT: execute was not attempted")
         self.reserved_calls += 1
-        self.reserved_credits += amount
+        self.reserved_credits = total
 
 
 class RequestBudgetPort:
