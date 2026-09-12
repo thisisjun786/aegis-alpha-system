@@ -31,7 +31,6 @@ if TYPE_CHECKING:
 
 _MAX_SOURCE_ID = 240
 _SHA_LENGTH = 64
-_MAX_READ_ROWS = 1000
 
 
 def _identity(source_id: str, digest: str) -> None:
@@ -314,38 +313,10 @@ def list_tables(workspace: Workspace, source_id: str) -> list[dict[str, object]]
 def read_table(
     workspace: Workspace, source_id: str, table_name: str, limit: int = 100
 ) -> dict[str, object]:
-    from aegis_alpha.storage.source_library_arrow import json_rows  # noqa: PLC0415
+    """Use the shared JSON-safe, byte-bounded inspection contract."""
+    from aegis_alpha.storage.source_reader import inspect_source  # noqa: PLC0415
 
-    if type(limit) is not int or not 1 <= limit <= _MAX_READ_ROWS:
-        raise ValueError("source read limit must be from 1 to 1000")
-    manifest = _visible(workspace, source_id)
-    table = next(
-        (t for t in cast("list[dict[str, object]]", manifest["tables"]) if t["name"] == table_name),
-        None,
-    )
-    if table is None:
-        raise ValueError("unknown source table")
-    columns = cast("list[str]", table["columns"])
-    conn = schema.connections(workspace)[str(manifest["store"])]
-    order = "_aas_ordinal"
-    query = (
-        "SELECT "
-        + ",".join(map(schema.quoted, columns))
-        + " FROM "
-        + schema.quoted(str(table["target"]))
-        + " ORDER BY "
-        + order
-        + " LIMIT ?"
-    )
-    cursor = conn.execute(query, [limit])
-    rows = json_rows(cursor, table)
-    return {
-        "source_id": source_id,
-        "table": table_name,
-        "columns": columns,
-        "rows": rows,
-        "source_only": True,
-    }
+    return dict(inspect_source(workspace, source_id, table_name, limit=limit))
 
 
 def verify_sources(workspace: Workspace) -> dict[str, object] | None:
