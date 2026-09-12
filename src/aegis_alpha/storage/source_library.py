@@ -7,10 +7,15 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
+import shutil
 import sqlite3
+from contextlib import ExitStack, closing
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, cast
 
+from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.storage import source_library_schema as schema
 from aegis_alpha.storage.locks import private_file
 from aegis_alpha.storage.source_library_digest import arrow_digest, sqlite_digest
@@ -123,94 +128,112 @@ def import_sqlite(  # noqa: C901, PLR0912, PLR0915 -- one snapshot transaction b
     info = private_file(path)
     if any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-journal")):
         raise ValueError("source requires a closed SQLite backup snapshot without WAL/journal")
-    with path.open("rb") as handle:
-        if hashlib.file_digest(handle, "sha256").hexdigest() != sha256:
-            raise ValueError("source sha256 mismatch")
-    op_id, request, reused = _prepare(workspace, source_id, sha256, store, None)
-    if reused:
-        return reused
-    destination = cast("sqlite3.Connection", schema.connections(workspace)[store])
-    origin = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
-    origin.execute("PRAGMA query_only=ON")
-    origin.execute("PRAGMA trusted_schema=OFF")
-    origin.execute("BEGIN")
-    tables: list[dict[str, object]] = []
-    try:
-        definitions = origin.execute(
-            "SELECT name,sql FROM sqlite_master WHERE type='table' "
-            "AND name NOT LIKE 'sqlite_%' ORDER BY name"
-        ).fetchall()
-        destination.execute("BEGIN TRANSACTION")
-        for name, ddl in definitions:
-            if "VIRTUAL TABLE" in (ddl or "").upper():
-                raise ValueError("virtual source tables are unsupported")
-            fields = origin.execute("PRAGMA table_xinfo(" + schema.quoted(name) + ")").fetchall()
-            if any(row[6] for row in fields):
-                raise ValueError("generated source columns are unsupported")
-            columns = [row[1] for row in fields]
-            if "_aas_ordinal" in {c.casefold() for c in columns}:
-                raise ValueError("reserved SQLite source column")
-            target = "sl_" + hashlib.sha256(schema.encoded([source_id, name]).encode()).hexdigest()
-            destination.execute(
-                "CREATE TABLE "
-                + schema.quoted(target)
-                + " (_aas_ordinal INTEGER PRIMARY KEY,"
-                + ",".join(schema.quoted(c) + " ANY" for c in columns)
-                + ") STRICT"
-            )
-            selection = ",".join(map(schema.quoted, columns))
-            source_rows = origin.execute("SELECT " + selection + " FROM " + schema.quoted(name))
-            count = 0
-            while batch := source_rows.fetchmany(10000):
-                destination.executemany(
-                    "INSERT INTO "
-                    + schema.quoted(target)
-                    + " VALUES ("
-                    + ",".join("?" for _ in range(len(columns) + 1))
-                    + ")",
-                    [(count + n, *row) for n, row in enumerate(batch)],
-                )
-                count += len(batch)
-            observed, digest = sqlite_digest(
-                destination.execute(
-                    "SELECT "
-                    + selection
-                    + " FROM "
-                    + schema.quoted(target)
-                    + " ORDER BY _aas_ordinal"
-                )
-            )
-            original_count, original_digest = sqlite_digest(
-                origin.execute("SELECT " + selection + " FROM " + schema.quoted(name))
-            )
-            if (observed, digest) != (original_count, original_digest) or count != observed:
-                raise ValueError("source SQLite reconciliation failed")
-            tables.append(
-                {
-                    "name": name,
-                    "target": target,
-                    "rows": count,
-                    "digest": digest,
-                    "columns": columns,
-                    "original_ddl": ddl,
-                    "format": "sqlite",
-                }
-            )
-        after = private_file(path)
-        if (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
+    with ExitStack() as resources:
+        directory = resources.enter_context(TemporaryDirectory(prefix="aas-sqlite-"))
+        snapshot = Path(directory) / "snapshot.sqlite3"
+        with (
+            DescriptorTree.open_path(path.parent) as tree,
+            tree.binary_reader(path.name, require_single_link=True) as handle,
+            snapshot.open("w+b") as image,
         ):
-            raise ValueError("SQLite snapshot changed during import")
-        return _commit(workspace, source_id, sha256, store, op_id, request, tables)
-    except BaseException:
-        if destination.in_transaction:
-            destination.rollback()
-        raise
-    finally:
-        origin.close()
+            opened = os.fstat(handle.fileno())
+            if (info.st_dev, info.st_ino) != (opened.st_dev, opened.st_ino):
+                raise ValueError("SQLite snapshot changed before import")
+            shutil.copyfileobj(handle, image)
+            image.seek(0)
+            if hashlib.file_digest(image, "sha256").hexdigest() != sha256:
+                raise ValueError("source sha256 mismatch")
+        op_id, request, reused = _prepare(workspace, source_id, sha256, store, None)
+        if reused:
+            return reused
+        destination = cast("sqlite3.Connection", schema.connections(workspace)[store])
+        # Only this private, verified byte image is immutable, never the caller's live path.
+        origin = resources.enter_context(
+            closing(sqlite3.connect(snapshot.as_uri() + "?mode=ro&immutable=1", uri=True))
+        )
+        origin.execute("PRAGMA query_only=ON")
+        origin.execute("PRAGMA trusted_schema=OFF")
+        origin.execute("BEGIN")
+        tables: list[dict[str, object]] = []
+        try:
+            definitions = origin.execute(
+                "SELECT name,sql FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+            destination.execute("BEGIN TRANSACTION")
+            for name, ddl in definitions:
+                if "VIRTUAL TABLE" in (ddl or "").upper():
+                    raise ValueError("virtual source tables are unsupported")
+                fields = origin.execute(
+                    "PRAGMA table_xinfo(" + schema.quoted(name) + ")"
+                ).fetchall()
+                if any(row[6] for row in fields):
+                    raise ValueError("generated source columns are unsupported")
+                columns = [row[1] for row in fields]
+                if "_aas_ordinal" in {c.casefold() for c in columns}:
+                    raise ValueError("reserved SQLite source column")
+                target = (
+                    "sl_" + hashlib.sha256(schema.encoded([source_id, name]).encode()).hexdigest()
+                )
+                destination.execute(
+                    "CREATE TABLE "
+                    + schema.quoted(target)
+                    + " (_aas_ordinal INTEGER PRIMARY KEY,"
+                    + ",".join(schema.quoted(c) + " ANY" for c in columns)
+                    + ") STRICT"
+                )
+                selection = ",".join(map(schema.quoted, columns))
+                source_rows = origin.execute("SELECT " + selection + " FROM " + schema.quoted(name))
+                count = 0
+                while batch := source_rows.fetchmany(10000):
+                    destination.executemany(
+                        "INSERT INTO "
+                        + schema.quoted(target)
+                        + " VALUES ("
+                        + ",".join("?" for _ in range(len(columns) + 1))
+                        + ")",
+                        [(count + n, *row) for n, row in enumerate(batch)],
+                    )
+                    count += len(batch)
+                observed, digest = sqlite_digest(
+                    destination.execute(
+                        "SELECT "
+                        + selection
+                        + " FROM "
+                        + schema.quoted(target)
+                        + " ORDER BY _aas_ordinal"
+                    )
+                )
+                original_count, original_digest = sqlite_digest(
+                    origin.execute("SELECT " + selection + " FROM " + schema.quoted(name))
+                )
+                if (observed, digest) != (original_count, original_digest) or count != observed:
+                    raise ValueError("source SQLite reconciliation failed")
+                tables.append(
+                    {
+                        "name": name,
+                        "target": target,
+                        "rows": count,
+                        "digest": digest,
+                        "columns": columns,
+                        "original_ddl": ddl,
+                        "format": "sqlite",
+                    }
+                )
+            after = private_file(path)
+            if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ):
+                raise ValueError("SQLite snapshot changed during import")
+            return _commit(workspace, source_id, sha256, store, op_id, request, tables)
+        except BaseException:
+            if destination.in_transaction:
+                destination.rollback()
+            raise
 
 
 def import_arrow(  # noqa: PLR0913 -- public provenance and reader inputs
