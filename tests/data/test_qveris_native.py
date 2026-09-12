@@ -7,14 +7,14 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from test_qveris_acquisition import FakeQveris
 
 from aegis_alpha.data.qveris import InvocationBudget
 from aegis_alpha.data.qveris_acquisition import acquire_jobs
 from aegis_alpha.data.qveris_client import QverisResponse
-from aegis_alpha.data.qveris_contracts import EOD_HISTORY_JSON_TOOL, QverisJob
+from aegis_alpha.data.qveris_contracts import EOD_HISTORY_JSON_TOOL, MAX_RESPONSE_BYTES, QverisJob
 from aegis_alpha.data.qveris_native import normalize_korean_price_history, read_completed_job
 from aegis_alpha.data.serialization import canonical_json_bytes
+from tests.data.test_qveris_acquisition import FakeQveris
 
 IDENTITY = {
     "123456.KO": {
@@ -40,11 +40,14 @@ class HistoryClient(FakeQveris):
             results = doc["results"]
             assert isinstance(results, list)
             results[0]["provider_id"] = "eodhd"
+            results[0]["params"][0]["description"] = "synthetic schema annotation " * 128
             return replace(response, body=canonical_json_bytes(doc))
         return response
 
 
-def complete(tmp_path: Path) -> tuple[Path, str, str]:
+def complete(
+    tmp_path: Path, *, max_response_bytes: int = MAX_RESPONSE_BYTES
+) -> tuple[Path, str, str]:
     job = QverisJob(
         "synthetic-history",
         EOD_HISTORY_JSON_TOOL,
@@ -55,10 +58,33 @@ def complete(tmp_path: Path) -> tuple[Path, str, str]:
             {"symbol": "123456.KO", "fmt": "json", "from": "2026-08-01", "order": "a"}
         ).decode(),
         date(2026, 9, 6),
+        max_response_bytes=max_response_bytes,
     )
     acquire_jobs((job,), tmp_path, HistoryClient(), budget=InvocationBudget(1, Decimal(3)))
     marker = tmp_path / "jobs" / job.fingerprint / "complete.json"
     return tmp_path, job.fingerprint, hashlib.sha256(marker.read_bytes()).hexdigest()
+
+
+def test_small_payload_limit_does_not_reject_generated_metadata(tmp_path: Path) -> None:
+    args = complete(tmp_path, max_response_bytes=1024)
+    page = tmp_path / "jobs" / args[1]
+    assert (page / "0000.raw").stat().st_size <= 1024  # noqa: PLR2004 -- explicit job cap
+    assert (page / "0000.intent.json").stat().st_size > 1024  # noqa: PLR2004 -- larger metadata
+    history = read_completed_job(*args)
+    assert len(history.rows) == 1
+
+
+def test_small_payload_limit_still_rejects_oversized_raw_pin(tmp_path: Path) -> None:
+    import json  # noqa: PLC0415 -- inspect the synthetic completion
+
+    root, fingerprint, _pin = complete(tmp_path, max_response_bytes=1024)
+    marker = root / "jobs" / fingerprint / "complete.json"
+    body = json.loads(marker.read_bytes())
+    body["files"][1]["size"] = 1025
+    raw = canonical_json_bytes(body)
+    marker.write_bytes(raw)
+    with pytest.raises(ValueError, match="invalid Qveris artifact pin"):
+        read_completed_job(root, fingerprint, hashlib.sha256(raw).hexdigest())
 
 
 def test_verified_rows_keep_raw_and_adjusted_fields_separate(tmp_path: Path) -> None:
@@ -113,9 +139,8 @@ def test_unknown_identity_and_wrong_venue_rejected(tmp_path: Path) -> None:
 
 
 def test_bulk_keeps_unknown_identity_in_quarantine(tmp_path: Path) -> None:
-    from test_qveris_acquisition import eod_job  # noqa: PLC0415 -- shared synthetic transport
-
     from aegis_alpha.data.qveris_native import normalize_bulk_prices  # noqa: PLC0415
+    from tests.data.test_qveris_acquisition import eod_job  # noqa: PLC0415 -- synthetic transport
 
     job = eod_job()
     acquire_jobs((job,), tmp_path, FakeQveris(), budget=InvocationBudget(1, Decimal(3)))

@@ -16,6 +16,7 @@ from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.data.qveris_contracts import (
     EOD_HISTORY_JSON_TOOL,
     EOD_TOOL,
+    MAX_RESPONSE_BYTES,
     QverisJob,
     credit_value,
     load_json,
@@ -103,13 +104,11 @@ def read_completed_job(  # noqa: C901, PLR0912, PLR0915 -- one complete evidence
             pin = object_value(value)
             path = prefix + "0000." + suffix
             size = pin.get("size")
-            if (
-                pin.get("path") != path
-                or type(size) is not int
-                or not 0 <= size <= job.max_response_bytes
-            ):
+            # Generated metadata follows the writer's bound, not the paid payload cap.
+            maximum = job.max_response_bytes if suffix == "raw" else MAX_RESPONSE_BYTES
+            if pin.get("path") != path or type(size) is not int or not 0 <= size <= maximum:
                 raise ValueError("invalid Qveris artifact pin")
-            content = _read(tree, path, job.max_response_bytes)
+            content = _read(tree, path, maximum)
             if len(content) != size or hashlib.sha256(content).hexdigest() != pin.get("sha256"):
                 raise ValueError("Qveris artifact hash differs")
             payloads[suffix] = content
