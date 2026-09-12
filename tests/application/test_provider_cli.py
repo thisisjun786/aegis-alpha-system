@@ -125,7 +125,7 @@ def test_inventory_does_not_claim_registry_domain_coverage(
     assert main(["providers"]) == 0
     result = json.loads(capsys.readouterr().out)
     providers = {item["provider"]: item for item in result["providers"]}
-    assert set(providers) == {"fmp", "norgate", "fred_alfred", "sec", "finimpulse"}
+    assert set(providers) == {"fmp", "norgate", "fred_alfred", "sec", "finimpulse", "qveris"}
     assert "transcript" not in providers["fmp"]["endpoints"]
     assert "13f_index" in providers["sec"]["endpoints"]
     assert all(item["live_verified"] is False for item in providers.values())

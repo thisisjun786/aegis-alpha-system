@@ -31,11 +31,15 @@ def test_cli_status_without_site_packages() -> None:
     assert status["capabilities"] == {
         "allocation_preview": True,
         "strategy_execution": False,
+        "aegis_etf_target_replay": True,
+        "research_proxy_returns": True,
+        "research_candidate_generation": True,
         "database_adapter": True,
         "provider_collection": True,
         "daily_collection": True,
         "compute_budget": True,
         "live_orders": False,
+        "etf_candidate_comparison": True,
     }
     assert status["runtime_dependencies"]["vibe_trading"] is False
 

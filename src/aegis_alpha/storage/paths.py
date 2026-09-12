@@ -29,6 +29,33 @@ def resolve_home(home: Path | None = None) -> Path:
     return Path(os.path.abspath(chosen.expanduser()))  # noqa: PTH100 -- normalize without following aliases
 
 
+def private_source_file(path: Path) -> os.stat_result:
+    """Admit source bytes under the existing private, outside-checkout policy."""
+    require_outside_checkout(path)
+    return private_file(path)
+
+
+def same_private_file(admitted: os.stat_result, observed: os.stat_result) -> bool:
+    """Bind a read to admitted identity and metadata, excluding read-driven atime."""
+    return os.path.samestat(admitted, observed) and (
+        admitted.st_uid,
+        admitted.st_gid,
+        admitted.st_mode,
+        admitted.st_nlink,
+        admitted.st_size,
+        admitted.st_mtime_ns,
+        admitted.st_ctime_ns,
+    ) == (
+        observed.st_uid,
+        observed.st_gid,
+        observed.st_mode,
+        observed.st_nlink,
+        observed.st_size,
+        observed.st_mtime_ns,
+        observed.st_ctime_ns,
+    )
+
+
 def _unique_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:

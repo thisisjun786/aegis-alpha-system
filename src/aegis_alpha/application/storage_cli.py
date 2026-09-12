@@ -29,6 +29,7 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
             command.add_argument("--output", type=Path)
         if name == "restore":
             command.add_argument("--backup", type=Path, required=True)
+    _source_parsers(sub)
     strategy = commands.add_parser("strategy", help="Manage the private strategy database")
     _home(strategy)
     sub = strategy.add_subparsers(dest="strategy_command", required=True)
@@ -58,6 +59,21 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
             reader.add_argument("--limit", type=int, default=100)
 
 
+def _source_parsers(sub: argparse._SubParsersAction) -> None:
+    for name in ("sources", "source-tables", "source-read", "source-import"):
+        command = sub.add_parser(name, help="Inspect or import the private source library")
+        _home(command)
+        if name in {"source-tables", "source-read"}:
+            command.add_argument("--source", required=True)
+        if name == "source-read":
+            command.add_argument("--table", required=True)
+            command.add_argument("--limit", type=int, default=100)
+        if name == "source-import":
+            command.add_argument("file", type=Path)
+            command.add_argument("--id", required=True)
+            command.add_argument("--sha256", required=True)
+
+
 def execute(args: argparse.Namespace) -> dict[str, object]:
     import sqlite3
 
@@ -83,14 +99,21 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         mutation = (
             (args.command == "strategy" and args.strategy_command == "import")
             or (args.command == "data" and args.data_command == "import")
-            or (args.command == "db" and args.db_command in {"recover", "quarantine"})
+            or (
+                args.command == "db"
+                and args.db_command in {"recover", "quarantine", "source-import"}
+            )
         )
         with open_workspace(
             home,
             writable=mutation,
             strategy_write=mutation,
             require_strategies=args.command == "strategy"
-            or (args.command == "db" and args.db_command in {"verify", "recover"}),
+            or (
+                args.command == "db"
+                and args.db_command
+                in {"verify", "recover", "sources", "source-tables", "source-read"}
+            ),
         ) as workspace:
             return _workspace_command(workspace, args)
     except (sqlite3.Error, duckdb.Error):
@@ -105,6 +128,8 @@ def _workspace_command(workspace: object, args: argparse.Namespace) -> dict[str,
     if args.command == "doctor" or (args.command == "db" and args.db_command == "status"):
         return workspace.doctor()
     if args.command == "db":
+        if args.db_command in {"sources", "source-tables", "source-read", "source-import"}:
+            return _source_command(workspace, args)
         if args.db_command == "verify":
             from aegis_alpha.storage.verification import verify_workspace
 
@@ -131,3 +156,20 @@ def _workspace_command(workspace: object, args: argparse.Namespace) -> dict[str,
     from aegis_alpha.storage.publication import execute_data
 
     return execute_data(workspace, args)
+
+
+def _source_command(workspace: object, args: argparse.Namespace) -> dict[str, object]:
+    from aegis_alpha.storage import source_library
+    from aegis_alpha.storage.workspace import Workspace
+
+    if not isinstance(workspace, Workspace):
+        raise TypeError("expected admitted workspace")
+    if args.db_command == "sources":
+        return {"sources": source_library.list_sources(workspace)}
+    if args.db_command == "source-tables":
+        return {"tables": source_library.list_tables(workspace, args.source)}
+    if args.db_command == "source-read":
+        from aegis_alpha.storage.source_reader import inspect_source
+
+        return dict(inspect_source(workspace, args.source, args.table, limit=args.limit))
+    return source_library.import_sqlite(workspace, args.file.absolute(), args.id, args.sha256)

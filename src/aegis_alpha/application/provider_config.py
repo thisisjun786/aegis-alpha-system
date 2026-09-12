@@ -19,6 +19,7 @@ _PROVIDER_KEYS = {
     "finimpulse": frozenset(
         {"FINIMPULSE_API_TOKEN", "AAS_FINIMPULSE_OWNER_APPROVAL_AUTHORITY_PATH"}
     ),
+    "qveris": frozenset(),
     "norgate": frozenset(),
 }
 _REQUIRED_OPTIONS = {
@@ -58,6 +59,9 @@ _REQUIRED_OPTIONS = {
             "budget_usd",
         }
     ),
+    "qveris": frozenset(
+        {"jobs", "jobs_sha256", "raw_store_root", "max_credits", "timeout_seconds"}
+    ),
     "norgate": frozenset({"dataset_id", "dataset_version"}),
 }
 _OPTIONAL_OPTIONS = {
@@ -65,12 +69,24 @@ _OPTIONAL_OPTIONS = {
     "fred_alfred": frozenset({"series", "observation_start"}),
     "sec": frozenset({"instrument_ids"}),
     "finimpulse": frozenset(),
+    "qveris": frozenset(),
     "norgate": frozenset(),
 }
 _TEXT_OPTIONS = frozenset(
-    {"snapshot_id", "budget_usd", "dataset_id", "dataset_version", "observation_start", "as_of"}
+    {
+        "snapshot_id",
+        "budget_usd",
+        "dataset_id",
+        "dataset_version",
+        "observation_start",
+        "as_of",
+        "max_credits",
+        "timeout_seconds",
+        "jobs_sha256",
+    }
 )
 _LIST_OPTIONS = frozenset({"series", "instrument_ids"})
+_QVERIS_MAX_TIMEOUT = 600
 _KEY = re.compile(r"[A-Z][A-Z0-9_]*")
 
 
@@ -93,6 +109,8 @@ class ProviderProfile:
             if self.provider == "fmp"
             else {"probe", "incremental", "backfill"}
         )
+        if self.provider == "qveris":
+            modes = {"daily", "backfill"}
         if self.provider == "norgate":
             modes = {"inspect"}
         if self.mode not in modes:
@@ -106,10 +124,33 @@ class ProviderProfile:
         if not isinstance(self.options, Mapping) or set(self.options) - allowed:
             raise ValueError("provider options contain unknown fields")
         _validate_options(self.options)
+        if self.provider == "qveris":
+            _validate_qveris_options(self.options)
         object.__setattr__(self, "options", MappingProxyType(dict(self.options)))
 
     def missing_options(self) -> tuple[str, ...]:
         return tuple(sorted(_REQUIRED_OPTIONS[self.provider] - self.options.keys()))
+
+
+def _validate_qveris_options(options: Mapping[str, str | tuple[str, ...]]) -> None:
+    from decimal import Decimal, InvalidOperation  # noqa: PLC0415 -- provider-specific validation
+
+    if (
+        "jobs_sha256" in options
+        and re.fullmatch(r"[0-9a-f]{64}", str(options["jobs_sha256"])) is None
+    ):
+        raise ValueError("Qveris jobs_sha256 must pin the exact job manifest")
+    try:
+        if "max_credits" in options:
+            credit_limit = Decimal(str(options["max_credits"]))
+            if not credit_limit.is_finite() or credit_limit < 0:
+                raise ValueError("invalid finite Qveris credit ceiling")
+        if "timeout_seconds" in options:
+            timeout = Decimal(str(options["timeout_seconds"]))
+            if not timeout.is_finite() or not 0 < timeout <= _QVERIS_MAX_TIMEOUT:
+                raise ValueError("Qveris timeout must be positive and at most 600 seconds")
+    except InvalidOperation:
+        raise ValueError("Qveris numeric options must be decimal values") from None
 
 
 def _validate_options(options: Mapping[str, str | tuple[str, ...]]) -> None:

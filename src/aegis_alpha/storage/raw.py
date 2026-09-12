@@ -9,8 +9,57 @@ from pathlib import Path
 
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.storage.locks import private_directory
+from aegis_alpha.storage.paths import private_source_file as private_file
+from aegis_alpha.storage.paths import same_private_file
 
 _SHA256_LENGTH = 64
+
+
+def put_raw_file(root: Path, source_path: Path) -> tuple[str, str, int]:
+    """Stream a private snapshot into raw storage without retaining its bytes in memory."""
+    private_directory(root)
+    admitted = private_file(source_path)
+    temporary = "." + uuid.uuid4().hex + ".tmp"
+    with DescriptorTree.open_path(root) as target:
+        try:
+            with (
+                DescriptorTree.open_path(source_path.parent) as origin,
+                origin.binary_reader(source_path.name, require_single_link=True) as source,
+                target.binary_writer(temporary, exclusive=True) as destination,
+            ):
+                before = os.fstat(source.fileno())
+                if not same_private_file(admitted, before):
+                    raise ValueError("raw snapshot changed before copying")
+                digest = hashlib.sha256()
+                size = 0
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    destination.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+                after = os.fstat(source.fileno())
+                if before.st_size != size or not same_private_file(before, after):
+                    raise ValueError("raw snapshot changed while copying")
+                destination.flush()
+                os.fsync(destination.fileno())
+            value = digest.hexdigest()
+            relative = value[:2] + "/" + value
+            target.mkdir(value[:2], exist_ok=True)
+            try:
+                os.link(
+                    temporary,
+                    relative,
+                    src_dir_fd=target.descriptor,
+                    dst_dir_fd=target.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                verify_raw(root, relative, value, size)
+            target.fsync_directory(value[:2])
+        finally:
+            if target.exists(temporary):
+                target.unlink(temporary)
+                target.fsync_directory()
+    return relative, value, size
 
 
 def put_raw(root: Path, payload: bytes) -> tuple[str, str, int]:
@@ -31,13 +80,17 @@ def put_raw(root: Path, payload: bytes) -> tuple[str, str, int]:
             os.fsync(handle.fileno())
         try:
             # link is atomic and fails if the final name already exists.
-            os.link(
-                temporary,
-                relative,
-                src_dir_fd=tree.descriptor,
-                dst_dir_fd=tree.descriptor,
-                follow_symlinks=False,
-            )
+            try:
+                os.link(
+                    temporary,
+                    relative,
+                    src_dir_fd=tree.descriptor,
+                    dst_dir_fd=tree.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                if tree.read_bytes(relative, max_bytes=len(payload)) != payload:
+                    raise ValueError("raw hash path contains different bytes") from None
             tree.fsync_directory(digest[:2])
         finally:
             tree.unlink(temporary)
