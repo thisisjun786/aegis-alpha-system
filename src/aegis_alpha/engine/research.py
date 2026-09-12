@@ -37,6 +37,11 @@ _DIRECTIONS: Final = ("maximize", "minimize")
 _METRIC_PAIR_LENGTH: Final = 2
 _TYPE_PAIR_LENGTH: Final = 2
 _ETF_INSTRUMENT_TYPE: Final = "ETF"
+_MAX_GENERATED_BYTES: Final = 64 * 1024 * 1024
+_MAX_GENERATED_INSTRUMENTS: Final = 100_000
+_OUTPUT_STRUCTURE_BYTES: Final = 1024
+_INSTRUMENT_STRUCTURE_BYTES: Final = 128
+_JSON_CHARACTER_BYTES: Final = 6
 
 Split = Literal["train", "validation", "test"]
 
@@ -491,8 +496,10 @@ def generate_trials(  # noqa: PLR0913 -- every split/cost/parent axis is an expl
 ) -> tuple[TrialSpec, ...]:
     """Cartesian-expand grid into deterministic, deduplicated TrialSpecs.
 
-    The grid size is checked against max_trials before any Cartesian
-    materialization; an oversized or empty grid never reaches itertools.product.
+    Before Cartesian materialization, enforce max_trials, 100,000 aggregate
+    instrument occurrences and a conservative 64-MiB UTF-8 JSON output bound.
+    The byte projection includes the CLI's indent=2 result envelope; it is an
+    upper bound, not an exact serialized-size quota or a process-memory limit.
     """
     if not isinstance(grid, ParameterGrid):
         raise ContractDefinitionError("grid must be a validated ParameterGrid")
@@ -510,6 +517,39 @@ def generate_trials(  # noqa: PLR0913 -- every split/cost/parent axis is an expl
     if total > max_candidates:
         raise ContractDefinitionError(
             f"grid would produce {total} candidates, exceeding max_trials={max_candidates}"
+        )
+    repetitions = total // len(grid.etf_universes)
+    instrument_count = repetitions * sum(len(universe) for universe in grid.etf_universes)
+    if instrument_count > _MAX_GENERATED_INSTRUMENTS:
+        raise ContractDefinitionError(
+            f"grid would produce {instrument_count} instrument occurrences, "
+            f"exceeding aggregate limit={_MAX_GENERATED_INSTRUMENTS}"
+        )
+    # With ensure_ascii=False, each character needs at most six UTF-8 JSON
+    # bytes (control escapes). IDs appear twice: universe and type pair.
+    # 128 bytes per instrument cover pair/list punctuation and indent=2
+    # whitespace at the CLI's nesting depth. 1024 bytes each cover the fixed
+    # result envelope and each trial's keys, hashes, dates, labels and layout.
+    # Count variable-width scalars separately, without serializing any trials.
+    scalar_bytes = (
+        _JSON_CHARACTER_BYTES * len(cost)
+        + len(str(seed_value))
+        + max(len(str(value)) for value in grid.momentum_horizons)
+        + max(len(str(value)) for value in grid.volatility_caps)
+    )
+    universe_bytes = sum(
+        _INSTRUMENT_STRUCTURE_BYTES + 2 * _JSON_CHARACTER_BYTES * len(instrument_id)
+        for universe in grid.etf_universes
+        for instrument_id in universe
+    )
+    projected_bytes = (
+        _OUTPUT_STRUCTURE_BYTES
+        + total * (_OUTPUT_STRUCTURE_BYTES + scalar_bytes)
+        + repetitions * universe_bytes
+    )
+    if projected_bytes > _MAX_GENERATED_BYTES:
+        raise ContractDefinitionError(
+            f"grid projected output exceeds aggregate byte limit={_MAX_GENERATED_BYTES}"
         )
     instrument_type_lookup = dict(grid.instrument_types)
     candidates: dict[str, TrialSpec] = {}
