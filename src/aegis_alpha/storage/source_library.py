@@ -129,7 +129,9 @@ def import_sqlite(  # noqa: C901, PLR0912, PLR0915 -- one snapshot transaction b
     if any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-journal")):
         raise ValueError("source requires a closed SQLite backup snapshot without WAL/journal")
     with ExitStack() as resources:
-        directory = resources.enter_context(TemporaryDirectory(prefix="aas-sqlite-"))
+        directory = resources.enter_context(
+            TemporaryDirectory(prefix="aas-sqlite-", dir=workspace.paths.runtime)
+        )
         snapshot = Path(directory) / "snapshot.sqlite3"
         with (
             DescriptorTree.open_path(path.parent) as tree,
