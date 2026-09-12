@@ -43,10 +43,9 @@ def ingest_arrow(  # noqa: PLR0913 -- explicit provenance and reader input
     original = reader.schema
     for name in original.names:
         schema.quoted(name)
-    if (
-        len({n.casefold() for n in original.names}) != len(original.names)
-        or "_aas_ordinal" in original.names
-    ):
+    if len({n.casefold() for n in original.names}) != len(original.names) or "_aas_ordinal" in {
+        n.casefold() for n in original.names
+    }:
         raise ValueError("ambiguous or reserved Arrow column")
     serialized = base64.b64encode(original.serialize().to_pybytes()).decode()
     op_id, request, reused = _prepare(

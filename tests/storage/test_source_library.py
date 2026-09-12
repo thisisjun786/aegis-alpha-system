@@ -249,6 +249,33 @@ def test_unknown_source_and_negative_limit_are_rejected(tmp_path: Path, home: Pa
             source_library.read_table(workspace, _SQLITE_SOURCE, _MIXED_TABLE, limit=0)
 
 
+@pytest.mark.parametrize("column", ["_AAS_ORDINAL", "_AaS_Ordinal", "_aas_ordinal"])
+def test_arrow_rejects_reserved_column_before_intent_when_case_varies(
+    home: Path, column: str
+) -> None:
+    # Given a source column whose values differ from the ingestion ordinals.
+    table = pa.table({column: [2, 1]})
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        before = workspace.market.execute(
+            "SELECT table_name FROM duckdb_tables() WHERE NOT temporary ORDER BY table_name"
+        ).fetchall()
+        # When the real importer receives a case variant of its reserved column.
+        with pytest.raises(ValueError, match="ambiguous or reserved Arrow column"):
+            source_library.import_arrow(
+                workspace, _ARROW_SOURCE, _provenance(_ARROW_SOURCE), _ARROW_TABLE, _reader(table)
+            )
+        # Then validation leaves no intent, source catalog, or target artifact.
+        assert workspace.state.execute("SELECT * FROM storage_operations").fetchall() == []
+        assert source_library.list_sources(workspace) == []
+        assert source_library.verify_sources(workspace) is None
+        assert (
+            workspace.market.execute(
+                "SELECT table_name FROM duckdb_tables() WHERE NOT temporary ORDER BY table_name"
+            ).fetchall()
+            == before
+        )
+
+
 def test_arrow_native_roundtrip(home: Path) -> None:
     table = _arrow_table()
     digest = _provenance(_ARROW_SOURCE)
