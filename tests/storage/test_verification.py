@@ -15,6 +15,7 @@ from aegis_alpha.storage import publication, state
 from aegis_alpha.storage.backup import backup, restore
 from aegis_alpha.storage.import_document import parse_import
 from aegis_alpha.storage.input_pins import register_convention
+from aegis_alpha.storage.sqlite import connect
 from aegis_alpha.storage.strategies import (
     LineageSpec,
     import_strategy,
@@ -477,7 +478,9 @@ _EVIDENCE_CORRUPTIONS = [
 ]
 
 
-def corrupt_closed_store(home: Path, store: str, table: str, mutation: str) -> None:
+def corrupt_closed_store(
+    home: Path, store: str, table: str, mutation: str, parameters: tuple[object, ...] = ()
+) -> None:
     connection = sqlite3.connect(home / (store + ".sqlite3"))
     try:
         schema_sql = "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
@@ -487,7 +490,7 @@ def corrupt_closed_store(home: Path, store: str, table: str, mutation: str) -> N
         ).fetchall()
         for name, _sql in triggers:
             connection.execute('DROP TRIGGER "' + name.replace('"', '""') + '"')
-        connection.execute(mutation)
+        connection.execute(mutation, parameters)
         for _name, sql in triggers:
             connection.execute(sql)
         connection.commit()
@@ -588,7 +591,7 @@ def test_load_rejects_resolved_edge_without_exact_parent(tmp_path: Path) -> None
             ).fetchone()[0]
             == 0
         )
-        with pytest.raises(ValueError, match="resolved parent missing"):
+        with pytest.raises(ValueError, match="stored lineage"):
             load_strategy(workspace.strategies, "synthetic-probe", "1", digest)
     assert evidence_snapshot(copied) == before
 
@@ -719,6 +722,225 @@ def test_valid_evidence_round_trip_keeps_immutable_status(tmp_path: Path, status
                     "SELECT request_hash,payload_hash FROM storage_operations"
                 ).fetchone()[:] == (digest, digest)
         assert evidence_snapshot(root) == before
+
+
+def sealed_child_with_parent(home: Path, source: Path, original_status: str) -> bytes:
+    initialize(home)
+    child = raw_bundle(contract())
+    parent = child.replace(b'"synthetic-probe"', b'"parent"')
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        if original_status == "resolved":
+            source.write_bytes(parent)
+            register_strategy(workspace, source, hashlib.sha256(parent).hexdigest(), "parent", "1")
+        source.write_bytes(child)
+        register_strategy(
+            workspace,
+            source,
+            hashlib.sha256(child).hexdigest(),
+            "synthetic-probe",
+            "1",
+            lineage=LineageSpec("parent", "1", "derived", " exact\n"),
+        )
+        if original_status == "unresolved":
+            source.write_bytes(parent)
+            register_strategy(workspace, source, hashlib.sha256(parent).hexdigest(), "parent", "1")
+        assert workspace.strategies is not None
+        assert verify_workspace(workspace)["verified"] is True
+    source.unlink()
+    return child
+
+
+@pytest.mark.parametrize("original_status", ["unresolved", "resolved"])
+@pytest.mark.parametrize("boundary", ["load", "verify", "backup", "restore"])
+def test_registration_status_cannot_be_forged_after_parent_arrival(
+    tmp_path: Path, original_status: str, boundary: str
+) -> None:
+    home = tmp_path / "original"
+    child = sealed_child_with_parent(home, tmp_path / "synthetic.json", original_status)
+    with open_workspace(home) as workspace:
+        assert workspace.strategies is not None
+        receipts = [
+            tuple(row) for row in workspace.strategies.execute("SELECT * FROM strategy_imports")
+        ]
+    original = evidence_snapshot(home)
+    copied = tmp_path / "copy"
+    if boundary == "restore":
+        backup(home, copied)
+    else:
+        shutil.copytree(home, copied)
+    forged = "resolved" if original_status == "unresolved" else "unresolved"
+    corrupt_closed_store(
+        copied,
+        "strategies",
+        "strategy_lineage",
+        "UPDATE strategy_lineage SET parent_status=?",
+        (forged,),
+    )
+    with open_workspace(copied) as workspace:
+        assert workspace.strategies is not None
+        assert [
+            tuple(row) for row in workspace.strategies.execute("SELECT * FROM strategy_imports")
+        ] == receipts
+        assert "\n".join(workspace.state.iterdump()) == original[0]
+    corrupt = evidence_snapshot(copied)
+    if boundary == "load":
+        with open_workspace(copied) as workspace:
+            assert workspace.strategies is not None
+            with pytest.raises(ValueError, match="stored lineage"):
+                load_strategy(
+                    workspace.strategies, "synthetic-probe", "1", hashlib.sha256(child).hexdigest()
+                )
+    elif boundary == "verify":
+        with open_workspace(copied) as workspace, pytest.raises(ValueError, match="stored lineage"):
+            verify_workspace(workspace)
+    elif boundary == "backup":
+        with pytest.raises(ValueError, match="stored lineage"):
+            backup(copied, tmp_path / "rejected-backup")
+        assert not (tmp_path / "rejected-backup").exists()
+    else:
+        manifest_path = copied / "backup.json"
+        manifest = json.loads(manifest_path.read_text())
+        raw = (copied / "strategies.sqlite3").read_bytes()
+        manifest["files"]["strategies.sqlite3"] = {
+            "size_bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+        manifest_path.write_text(json.dumps(manifest))
+        target = tmp_path / "rejected-restore"
+        with pytest.raises(ValueError, match="stored lineage"):
+            restore(copied, target)
+        assert (
+            json.loads((target / "installation.json").read_text())["phase"] == "restore-incomplete"
+        )
+    assert evidence_snapshot(copied) == corrupt
+    assert evidence_snapshot(home) == original
+
+
+@pytest.mark.parametrize("status", ["unresolved", "resolved"])
+@pytest.mark.parametrize("boundary", ["load", "retry", "recover", "verify", "backup", "restore"])
+def test_interim_unsealed_lineage_is_preserved_but_never_authenticated(
+    tmp_path: Path, status: str, boundary: str
+) -> None:
+    home = tmp_path / "original"
+    source = tmp_path / "synthetic.json"
+    raw = sealed_child_with_parent(home, source, status)
+    digest = hashlib.sha256(raw).hexdigest()
+    copied = tmp_path / "copy"
+    backup(home, copied)
+    document = {
+        "schema_version": "aas-strategy-import-request-v1",
+        "strategy_id": "synthetic-probe",
+        "version": "1",
+        "raw_sha256": digest,
+        "lineage": {
+            "parent_id": "parent",
+            "parent_version": "1",
+            "change_kind": "derived",
+            "reason": " exact\n",
+        },
+    }
+    legacy = hashlib.sha256(
+        json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+    corrupt_closed_store(
+        copied,
+        "strategies",
+        "strategy_imports",
+        "UPDATE strategy_imports SET request_hash=? WHERE strategy_id='synthetic-probe'",
+        (legacy,),
+    )
+    corrupt_closed_store(
+        copied,
+        "state",
+        "storage_operations",
+        "UPDATE storage_operations SET request_hash=?,phase='PREPARED',completed_at_us=NULL "
+        "WHERE target_id='synthetic-probe:1'",
+        (legacy,),
+    )
+    before = evidence_snapshot(copied)
+    if boundary in {"load", "retry", "recover", "verify"}:
+        with open_workspace(copied, writable=True, strategy_write=True) as workspace:
+            assert workspace.strategies is not None
+            if boundary == "load":
+                with pytest.raises(ValueError, match="unsealed"):
+                    load_strategy(workspace.strategies, "synthetic-probe", "1", digest)
+            elif boundary == "retry":
+                source.write_bytes(raw)
+                with pytest.raises(ValueError, match="unsealed"):
+                    register_strategy(
+                        workspace,
+                        source,
+                        digest,
+                        "synthetic-probe",
+                        "1",
+                        lineage=LineageSpec("parent", "1", "derived", " exact\n"),
+                    )
+            elif boundary == "recover":
+                with pytest.raises(ValueError, match="unsealed"):
+                    publication.recover_operations(workspace)
+            else:
+                with pytest.raises(ValueError, match="unsealed"):
+                    verify_workspace(workspace)
+    elif boundary == "backup":
+        with pytest.raises(ValueError, match="unsealed"):
+            backup(copied, tmp_path / "rejected-backup")
+    else:
+        manifest_path = copied / "backup.json"
+        manifest = json.loads(manifest_path.read_text())
+        for name in ("state.sqlite3", "strategies.sqlite3"):
+            payload = (copied / name).read_bytes()
+            manifest["files"][name] = {
+                "size_bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        manifest_path.write_text(json.dumps(manifest))
+        target = tmp_path / "rejected-restore"
+        with pytest.raises(ValueError, match="unsealed"):
+            restore(copied, target)
+        assert (
+            json.loads((target / "installation.json").read_text())["phase"] == "restore-incomplete"
+        )
+    assert evidence_snapshot(copied) == before
+
+
+@pytest.mark.parametrize("mutation", ["state-hash", "missing-intent"])
+def test_private_load_has_no_hidden_state_connection(tmp_path: Path, mutation: str) -> None:
+    home = tmp_path / "aas"
+    source = tmp_path / "synthetic.json"
+    raw = sealed_child_with_parent(home, source, "resolved")
+    digest = hashlib.sha256(raw).hexdigest()
+    corrupt_closed_store(
+        home,
+        "state",
+        "storage_operations",
+        "UPDATE storage_operations SET request_hash='"
+        + "0" * 64
+        + "' WHERE target_id='synthetic-probe:1'"
+        if mutation == "state-hash"
+        else "DELETE FROM storage_operations WHERE target_id='synthetic-probe:1'",
+    )
+    private = tmp_path / "only-private.sqlite3"
+    shutil.copy2(home / "strategies.sqlite3", private)
+    connection = connect(private, read_only=True)
+    try:
+        assert load_strategy(connection, "synthetic-probe", "1", digest).source_sha256 == digest
+    finally:
+        connection.close()
+    before = evidence_snapshot(home)
+    source.write_bytes(raw)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        with pytest.raises(ValueError, match="strategy"):
+            verify_workspace(workspace)
+        with pytest.raises(ValueError, match="strategy"):
+            register_strategy(
+                workspace,
+                source,
+                digest,
+                "synthetic-probe",
+                "1",
+                lineage=LineageSpec("parent", "1", "derived", " exact\n"),
+            )
+    assert evidence_snapshot(home) == before
 
 
 def test_verify_before_private_commit_keeps_missing_receipt_pending(tmp_path: Path) -> None:

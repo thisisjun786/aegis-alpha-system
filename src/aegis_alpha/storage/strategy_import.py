@@ -11,8 +11,9 @@ from aegis_alpha.engine.bundle import load_bundle
 from aegis_alpha.engine.requirements import derive_execution_definition
 from aegis_alpha.storage.strategies import (
     LineageSpec,
+    accept_strategy_request,
+    import_prepared_strategy,
     read_strategy_lineage,
-    strategy_request_hash,
     validate_strategy_import,
     verify_strategy_content,
 )
@@ -29,7 +30,6 @@ def register_strategy(  # noqa: PLR0913 -- preserve explicit bundle pins plus op
     lineage: LineageSpec | None = None,
 ) -> dict[str, object]:
     from aegis_alpha.storage.state import complete_operation, prepare_operation  # noqa: PLC0415
-    from aegis_alpha.storage.strategies import import_strategy  # noqa: PLC0415
 
     if workspace.strategies is None:
         raise ValueError("private strategy database is unavailable")
@@ -44,10 +44,22 @@ def register_strategy(  # noqa: PLR0913 -- preserve explicit bundle pins plus op
             (strategy_id + "\x00" + version + "\x00" + bundle.source_sha256).encode()
         ).hexdigest()
     )
-    # Keep the key independent of lineage so changed retries conflict with the same intent.
-    request_hash = strategy_request_hash(bundle, lineage)
-    # Reuse the private owner's checks before committing a new durable intent.
-    validate_strategy_import(workspace.strategies, bundle, operation_id, lineage=lineage)
+    # Look up acceptance before observing a fresh status; the stable key excludes lineage.
+    operation = workspace.state.execute(
+        "SELECT * FROM storage_operations WHERE operation_id=?", (operation_id,)
+    ).fetchone()
+    committed = operation["request_hash"] if operation is not None else None
+    # SELECT-only deterministic rejection precedes any new PREPARED intent.
+    _version_exists, receipt_exists = validate_strategy_import(
+        workspace.strategies, bundle, operation_id, lineage=lineage, request_hash=committed
+    )
+    if receipt_exists and operation is None:
+        raise ValueError("strategy receipt has no matching active import intent")
+    request_hash = accept_strategy_request(
+        workspace.strategies, bundle, lineage, request_hash=committed
+    )
+    # First durable acceptance: this snapshot becomes immutable at PREPARED COMMIT
+    # under workspace admission, even if private COMMIT happens after parent arrival.
     prepare_operation(
         workspace.state,
         operation_id=operation_id,
@@ -57,15 +69,19 @@ def register_strategy(  # noqa: PLR0913 -- preserve explicit bundle pins plus op
         expected_parent=None,
         payload_hash=bundle.source_sha256,
     )
-    result = import_strategy(
+    result = import_prepared_strategy(
         workspace.strategies,
         raw,
-        sha256,
-        strategy_id,
-        version,
+        bundle,
         operation_id,
+        request_hash=request_hash,
         lineage=lineage,
     )
+    operation = workspace.state.execute(
+        "SELECT * FROM storage_operations WHERE operation_id=?", (operation_id,)
+    ).fetchone()
+    if not verify_strategy_import(workspace, operation):
+        raise ValueError("strategy private commit has no matching receipt")
     complete_operation(workspace.state, operation_id, request_hash)
     return result
 
@@ -85,15 +101,15 @@ def verify_strategy_import(workspace: Workspace, operation: sqlite3.Row) -> bool
         marker["request_hash"] != operation["request_hash"]
         or marker["strategy_id"] + ":" + marker["version"] != operation["target_id"]
         or operation["expected_parent"] is not None
+        or operation["kind"] != "strategy_import"
     ):
         raise ValueError("strategy receipt does not match prepared operation")
     # Integrity and journal completion check content, not execution eligibility.
-    bundle = verify_strategy_content(
+    verify_strategy_content(
         workspace.strategies, marker["strategy_id"], marker["version"], operation["payload_hash"]
     )
-    lineage = read_strategy_lineage(workspace.strategies, marker["strategy_id"], marker["version"])
-    if strategy_request_hash(bundle, lineage) != operation["request_hash"]:
-        raise ValueError("strategy stored lineage does not match prepared operation")
+    # This hashes the actual row against EVERY receipt, including the marker above.
+    read_strategy_lineage(workspace.strategies, marker["strategy_id"], marker["version"])
     return True
 
 

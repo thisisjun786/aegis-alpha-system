@@ -40,47 +40,130 @@ class LineageSpec:
             raise ValueError("lineage reason must be a nonempty string")
 
 
-def strategy_request_hash(bundle: EngineBundle, lineage: LineageSpec | None) -> str:
-    """Pin caller evidence separately from raw bytes; retain v1 no-lineage receipts."""
+def strategy_request_hash(
+    bundle: EngineBundle, lineage: LineageSpec | None, *, parent_status: str | None = None
+) -> str:
+    """Seal the accepted status and exact caller bytes; no-lineage v1 stays raw SHA."""
+    return _request_hash(
+        (bundle.bundle_id, bundle.bundle_version, bundle.source_sha256), lineage, parent_status
+    )
+
+
+def _request_hash(
+    identity: tuple[str, str, str], lineage: LineageSpec | None, parent_status: str | None
+) -> str:
     if lineage is None:
-        return bundle.source_sha256
+        if parent_status is not None:
+            raise ValueError("no-lineage request cannot have parent status")
+        return identity[2]
+    if parent_status not in {"resolved", "unresolved"}:
+        raise ValueError("unsupported strategy lineage parent status")
     return content_sha256(
         {
-            "schema_version": "aas-strategy-import-request-v1",
-            "strategy_id": bundle.bundle_id,
-            "version": bundle.bundle_version,
-            "raw_sha256": bundle.source_sha256,
+            "schema_version": "aas-strategy-import-request-v2",
+            "strategy_id": identity[0],
+            "version": identity[1],
+            "raw_sha256": identity[2],
             "lineage": lineage,
+            "parent_status": parent_status,
         }
+    )
+
+
+def _committed_status(
+    bundle: EngineBundle, lineage: LineageSpec | None, request_hash: str
+) -> str | None:
+    # Decode the two-element commitment domain, never today's parent existence.
+    candidates = (None,) if lineage is None else ("resolved", "unresolved")
+    matches = [
+        status
+        for status in candidates
+        if strategy_request_hash(bundle, lineage, parent_status=status) == request_hash
+    ]
+    if len(matches) != 1:
+        raise ValueError("strategy operation identifies a different request or unsealed lineage")
+    return matches[0]
+
+
+def accept_strategy_request(
+    connection: sqlite3.Connection,
+    bundle: EngineBundle,
+    lineage: LineageSpec | None,
+    *,
+    request_hash: str | None = None,
+) -> str:
+    """Select fresh acceptance or replay a commitment, authenticating existing rows first."""
+    previous = connection.execute(
+        "SELECT 1 FROM strategy_versions WHERE strategy_id=? AND version=?",
+        (bundle.bundle_id, bundle.bundle_version),
+    ).fetchone()
+    status = None
+    if previous is not None:
+        stored, status = _read_lineage(connection, bundle.bundle_id, bundle.bundle_version)
+        if stored != lineage:
+            raise ValueError("strategy ID/version already contains different lineage")
+    if request_hash is not None:
+        accepted = _committed_status(bundle, lineage, request_hash)
+        if previous is not None and status != accepted:
+            raise ValueError("strategy stored lineage does not match accepted request")
+        status = accepted
+    elif previous is None and lineage is not None:
+        status = "resolved" if _parent_exists(connection, lineage) else "unresolved"
+    if lineage is not None:
+        _validate_lineage_cycle(connection, bundle.bundle_id, bundle.bundle_version, lineage)
+        if status == "resolved" and not _parent_exists(connection, lineage):
+            raise ValueError("strategy resolved parent missing")
+    return strategy_request_hash(bundle, lineage, parent_status=status)
+
+
+def _parent_exists(connection: sqlite3.Connection, lineage: LineageSpec) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM strategy_versions WHERE strategy_id=? AND version=?",
+            (lineage.parent_id, lineage.parent_version),
+        ).fetchone()
+        is not None
     )
 
 
 def read_strategy_lineage(
     connection: sqlite3.Connection, strategy_id: str, version: str
 ) -> LineageSpec | None:
-    """Reconstruct exact caller evidence, not the derived parent eligibility status."""
+    """Authenticate actual stored status against every private receipt, without state access."""
+    return _read_lineage(connection, strategy_id, version)[0]
+
+
+def _read_lineage(
+    connection: sqlite3.Connection, strategy_id: str, version: str
+) -> tuple[LineageSpec | None, str | None]:
     rows = connection.execute(
         "SELECT parent_strategy_id,parent_version,change_kind,reason,reason_hash,parent_status "
         "FROM strategy_lineage WHERE strategy_id=? AND version=?",
         (strategy_id, version),
     ).fetchall()
-    if not rows:
-        return None
-    if len(rows) != 1 or rows[0]["reason_hash"] != content_sha256(rows[0]["reason"]):
+    if len(rows) > 1 or (rows and rows[0]["reason_hash"] != content_sha256(rows[0]["reason"])):
         raise ValueError("strategy stored lineage evidence mismatch")
-    row = rows[0]
-    # Resolved is a stored assertion about one exact direct parent, not its eligibility.
-    # An unresolved edge stays valid even if its parent has since arrived.
-    if (
-        row["parent_status"] == "resolved"
-        and connection.execute(
-            "SELECT 1 FROM strategy_versions WHERE strategy_id=? AND version=?",
-            (row["parent_strategy_id"], row["parent_version"]),
-        ).fetchone()
-        is None
-    ):
+    lineage = LineageSpec(*tuple(rows[0])[:4]) if rows else None
+    status = rows[0]["parent_status"] if rows else None
+    raw = connection.execute(
+        "SELECT raw_sha256 FROM strategy_versions WHERE strategy_id=? AND version=?",
+        (strategy_id, version),
+    ).fetchone()
+    if raw is None:
+        raise ValueError("strategy ID/version is not registered")
+    expected = _request_hash((strategy_id, version, raw[0]), lineage, status)
+    receipts = connection.execute(
+        "SELECT request_hash FROM strategy_imports WHERE strategy_id=? AND version=?",
+        (strategy_id, version),
+    ).fetchall()
+    if not receipts or any(row[0] != expected for row in receipts):
+        raise ValueError(
+            "strategy stored lineage receipt mismatch or unsupported unsealed evidence"
+        )
+    # Only the direct parent's existence matters, never its execution eligibility.
+    if lineage is not None and status == "resolved" and not _parent_exists(connection, lineage):
         raise ValueError("strategy resolved parent missing")
-    return LineageSpec(*tuple(row)[:4])
+    return lineage, status
 
 
 def validate_strategy_import(
@@ -89,6 +172,7 @@ def validate_strategy_import(
     operation_id: str,
     *,
     lineage: LineageSpec | None = None,
+    request_hash: str | None = None,
 ) -> tuple[bool, bool]:
     """SELECT-only admission checks; return whether the version and receipt exist.
 
@@ -108,8 +192,7 @@ def validate_strategy_import(
         raise ValueError("strategy ID/version already contains different content")
     if previous is not None:
         verify_strategy_content(connection, strategy_id, version, bundle.source_sha256)
-        if read_strategy_lineage(connection, strategy_id, version) != lineage:
-            raise ValueError("strategy ID/version already contains different lineage")
+    accepted = accept_strategy_request(connection, bundle, lineage, request_hash=request_hash)
     receipt = connection.execute(
         "SELECT strategy_id,version,request_hash FROM strategy_imports WHERE operation_id=?",
         (operation_id,),
@@ -117,11 +200,9 @@ def validate_strategy_import(
     if receipt is not None and tuple(receipt) != (
         strategy_id,
         version,
-        strategy_request_hash(bundle, lineage),
+        accepted,
     ):
         raise ValueError("strategy operation ID already identifies a different import")
-    if previous is None and lineage is not None:
-        _validate_lineage_cycle(connection, strategy_id, version, lineage)
     return previous is not None, receipt is not None
 
 
@@ -136,12 +217,45 @@ def import_strategy(  # noqa: PLR0913, PLR0917 -- explicit external bundle pins
     lineage: LineageSpec | None = None,
 ) -> dict[str, object]:
     bundle = load_bundle(raw, expected_sha256, expected_id, expected_version)
+    return _write_import(connection, raw, bundle, operation_id, lineage=lineage)
+
+
+def import_prepared_strategy(  # noqa: PLR0913 -- raw pins plus journal commitment
+    connection: sqlite3.Connection,
+    raw: bytes,
+    bundle: EngineBundle,
+    operation_id: str,
+    *,
+    request_hash: str,
+    lineage: LineageSpec | None = None,
+) -> dict[str, object]:
+    """Internal journal handoff: consume the accepted commitment, not a status override."""
+    bundle = load_bundle(raw, bundle.source_sha256, bundle.bundle_id, bundle.bundle_version)
+    return _write_import(
+        connection, raw, bundle, operation_id, lineage=lineage, request_hash=request_hash
+    )
+
+
+def _write_import(  # noqa: PLR0913 -- one private writer for both admission paths
+    connection: sqlite3.Connection,
+    raw: bytes,
+    bundle: EngineBundle,
+    operation_id: str,
+    *,
+    lineage: LineageSpec | None,
+    request_hash: str | None = None,
+) -> dict[str, object]:
+    expected_id, expected_version = bundle.bundle_id, bundle.bundle_version
+    expected_sha256 = bundle.source_sha256
     contract = canonical_json_bytes(bundle.contract).decode()
-    request_hash = strategy_request_hash(bundle, lineage)
     with atomic(connection):
         version_exists, receipt_exists = validate_strategy_import(
-            connection, bundle, operation_id, lineage=lineage
+            connection, bundle, operation_id, lineage=lineage, request_hash=request_hash
         )
+        request_hash = accept_strategy_request(
+            connection, bundle, lineage, request_hash=request_hash
+        )
+        parent_status = _committed_status(bundle, lineage, request_hash)
         if not version_exists:
             connection.execute(
                 "INSERT INTO strategies VALUES (?,?,'active') ON CONFLICT(strategy_id) DO NOTHING",
@@ -175,7 +289,7 @@ def import_strategy(  # noqa: PLR0913, PLR0917 -- explicit external bundle pins
             )
             _requirements(connection, bundle)
             if lineage is not None:
-                _register_lineage(connection, expected_id, expected_version, lineage)
+                _register_lineage(connection, expected_id, expected_version, lineage, parent_status)
         if not receipt_exists:
             connection.execute(
                 "INSERT INTO strategy_imports VALUES (?,?,?,?,?)",
@@ -220,12 +334,12 @@ def _validate_lineage_cycle(
 
 
 def _register_lineage(
-    connection: sqlite3.Connection, strategy_id: str, version: str, lineage: LineageSpec
+    connection: sqlite3.Connection,
+    strategy_id: str,
+    version: str,
+    lineage: LineageSpec,
+    parent_status: str | None,
 ) -> None:
-    parent = connection.execute(
-        "SELECT 1 FROM strategy_versions WHERE strategy_id=? AND version=?",
-        (lineage.parent_id, lineage.parent_version),
-    ).fetchone()
     connection.execute(
         "INSERT INTO strategy_lineage VALUES (?,?,?,?,?,?,?,?)",
         (
@@ -236,7 +350,7 @@ def _register_lineage(
             lineage.change_kind,
             lineage.reason,
             content_sha256(lineage.reason),
-            "resolved" if parent is not None else "unresolved",
+            parent_status,
         ),
     )
 
@@ -258,13 +372,9 @@ def load_strategy(
     connection: sqlite3.Connection, strategy_id: str, version: str, expected_sha256: str
 ) -> EngineBundle:
     bundle = verify_strategy_content(connection, strategy_id, version, expected_sha256)
-    if connection.execute(
-        "SELECT 1 FROM strategy_lineage WHERE strategy_id=? AND version=? AND "
-        "parent_status='unresolved'",
-        (strategy_id, version),
-    ).fetchone():
+    _lineage, status = _read_lineage(connection, strategy_id, version)
+    if status == "unresolved":
         raise ValueError("strategy has unresolved parent lineage")
-    read_strategy_lineage(connection, strategy_id, version)
     return bundle
 
 

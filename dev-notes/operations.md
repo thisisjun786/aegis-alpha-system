@@ -46,6 +46,11 @@ aas data read --dataset ID --version VERSION --cutoff-us UTC_MICROSECONDS
 성공하지만 그 버전은 `unresolved`로 남고, 나중에 부모를 등록해도 바뀌지 않는다.
 바로잡으려면 새 자식 버전을 등록한다. state 작업이 PREPARED로 남은 채 커밋된 import는
 `aas db recover`가 저장 내용을 대조해 완료하며, 이 완료가 실행 자격을 뜻하지는 않는다.
+부모 상태는 첫 PREPARED 커밋 직전의 승인 시점에 v2 요청 해시로 고정한다. private 커밋 전에
+중단되어도 같은 입력의 재시도는 그 상태를 유지하며, 영수증이 없으면 recover는 pending으로 남긴다.
+계보 없는 v1은 그대로 지원한다. 상태를 봉인하지 않은 중간 개발 버전의 caller-only 계보 v1은
+원본을 보존하지만 조회·재봉인·검증·복구 완료·백업·ready 복원은 거부한다. 자동 변환은 없다.
+정확한 바이트 규약과 호환 한계는 [계보 프로토콜](design/strategy-lineage.md)에 있다.
 
 `strategy show`는 고정한 전략의 실행 정의를 JSON으로 출력하며 계산·기록을 하지 않는다.
 출력에는 자산·현금 ID, 역할별 입력 요구, 달력 규약, `required_convention_roles`,

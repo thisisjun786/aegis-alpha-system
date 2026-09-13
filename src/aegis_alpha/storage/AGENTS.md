@@ -15,18 +15,24 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   and reject unknown versions instead of implicitly adopting or upgrading files.
 - Backup takes SQLite snapshots and closes DuckDB after checkpoint while retaining
   installation admission. Restore targets a new root; secrets are excluded.
-- `strategy_import.register_strategy` is the only strategy write path: state
-  intent, `strategies.import_strategy`, then completion. The v1
+- `strategy_import.register_strategy` owns workspace strategy registration: state
+  intent, the shared private writer, then verified completion. Standalone
+  `strategies.import_strategy` retains private-store admission. The v1
   `strategy_requirements` rows are written from `legacy_requirement_rows` and
   keep their meaning. Reimport with identical bytes and lineage is idempotent;
   differing content or lineage fails. `db recover` completes a committed import
   whose state operation was left PREPARED by verifying stored content only; it
   grants no execution eligibility.
-- `strategies.LineageSpec` is optional and registered atomically with a new
-  version only. An exact registered parent gives `parent_status=resolved`;
-  otherwise `unresolved`, kept as supplied. Immutable rows are never patched:
-  a later parent registration does not resolve an earlier child, and corrected
-  lineage needs a new child version.
+- `strategies.LineageSpec` keeps four exact caller fields. The accepted direct
+  parent status is sealed by v2 state/private request hashes at first durable
+  acceptance, before PREPARED commits. Retry decodes that commitment, never
+  reselects from current existence. Reads authenticate actual status against
+  every private receipt before eligibility; load has no hidden state connection.
+  No-lineage v1 is unchanged. Interim caller-only lineage v1 is physically
+  preserved but rejects verified use/resealing. A later parent never promotes
+  an earlier child; corrected lineage needs a new version. The exact protocol,
+  compatibility limit and direct-parent policy are in
+  [strategy-lineage.md](../../../dev-notes/design/strategy-lineage.md).
 - `strategy_requirements.read_execution_definition` is SELECT-only. It loads
   the pinned bundle, checks stored rows against the derived definition, then
   validates optional `ConventionPin` bindings against `input_pins` on the

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from collections.abc import Iterator
 from dataclasses import replace
@@ -18,6 +19,7 @@ from aegis_alpha.storage.strategies import (
     initialize_strategies,
     list_strategies,
     load_strategy,
+    strategy_request_hash,
     validate_strategy_import,
 )
 from tests.engine.engine_support import contract, raw_bundle, strategy
@@ -331,7 +333,8 @@ def test_lineage_fk_missing_parent_and_cycle(store: sqlite3.Connection) -> None:
         ),
     )
     digest = _digest(_envelope("child", VERSION))
-    with pytest.raises(ValueError, match="unresolved parent"):
+    # Direct DDL insertion is not authenticated registration evidence.
+    with pytest.raises(ValueError, match="lineage"):
         load_strategy(store, "child", VERSION, digest)
 
 
@@ -361,7 +364,8 @@ def test_lineage_status_is_fixed_at_registration(
     request_hash = _digest(
         canonical_json_bytes(
             {
-                "schema_version": "aas-strategy-import-request-v1",
+                "schema_version": "aas-strategy-import-request-v2",
+                "parent_status": expected[-1],
                 "strategy_id": "child",
                 "version": "1",
                 "raw_sha256": _digest(raw),
@@ -426,6 +430,92 @@ def test_conflicting_lineage_never_changes_existing_evidence(
         with pytest.raises(ValueError, match="different lineage"):
             _import(store, raw, operation, lineage=other)
         assert "\n".join(store.iterdump()) == before
+
+
+def test_status_commitment_literal_vectors() -> None:
+    # Hash-algebra pins, not a claim that this synthetic contract hashes to a*64.
+    raw = _envelope("child", "1")
+    bundle = replace(load_bundle(raw, _digest(raw), "child", "1"), source_sha256="a" * 64)
+    lineage = LineageSpec("parent", "7", "derived", " exact\n")
+    document = {
+        "schema_version": "aas-strategy-import-request-v2",
+        "strategy_id": "child",
+        "version": "1",
+        "raw_sha256": "a" * 64,
+        "lineage": {
+            "parent_id": "parent",
+            "parent_version": "7",
+            "change_kind": "derived",
+            "reason": " exact\n",
+        },
+        "parent_status": "unresolved",
+    }
+
+    def independent(value: object) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+            ).encode()
+        ).hexdigest()
+
+    for status, expected in (
+        ("unresolved", "5cb4df616642f167342c946051fbac471d21b232cc99a4d383a150f4e0d6b79d"),
+        ("resolved", "264bdef280c2a0cf60794aee3aa0ef50c5da4e755bd56fe44fc1b738c7bf2c9f"),
+    ):
+        assert independent({**document, "parent_status": status}) == expected
+        assert strategy_request_hash(bundle, lineage, parent_status=status) == expected
+    changed = replace(lineage, reason=" exact\n ")
+    assert (
+        strategy_request_hash(bundle, changed, parent_status="unresolved")
+        == "15f96950fe815a02faa5ec8c4630fc412da1679bcc9feb34d751650d68a74504"
+    )
+    old = {key: value for key, value in document.items() if key != "parent_status"}
+    old["schema_version"] = "aas-strategy-import-request-v1"
+    assert independent(old) == "a469eccd2f87eb1e9cd02d6697f2bd2ce38350b7a344b862abe7604c4d6fa4fd"
+    assert (
+        independent(lineage.reason)
+        == "030019ad868b140268253350e32ff60b333b3428a25b5a4d7ed3c8e5ea2dce27"
+    )
+    assert (
+        "strategy-" + hashlib.sha256(("child\x001\x00" + "a" * 64).encode()).hexdigest()
+        == "strategy-a35b6c4bcbb03a071d4b715fafe2eebcceb3b037043fb8f1cdbd5dbafa5e3089"
+    )
+    assert strategy_request_hash(bundle, None) == "a" * 64
+    for status in (None, "unknown", ""):
+        with pytest.raises(ValueError, match="parent status"):
+            strategy_request_hash(bundle, lineage, parent_status=status)
+
+
+@pytest.mark.parametrize("lineage", [None, LineageSpec("parent", "7", "derived", "synthetic")])
+@pytest.mark.parametrize("mutation", ["missing", "extra-bad", "first-bad"])
+def test_load_and_retry_check_every_private_receipt(
+    store: sqlite3.Connection, lineage: LineageSpec | None, mutation: str
+) -> None:
+    raw = raw_bundle(contract())
+    _import(store, raw, "first", lineage=lineage)
+    _import(store, raw, "second", lineage=lineage)
+    triggers = store.execute(
+        "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='strategy_imports'"
+    ).fetchall()
+    for row in triggers:
+        store.execute('DROP TRIGGER "' + row[0] + '"')
+    if mutation == "missing":
+        store.execute("DELETE FROM strategy_imports")
+    else:
+        store.execute(
+            "UPDATE strategy_imports SET request_hash=? WHERE operation_id=?",
+            ("0" * 64, "second" if mutation == "extra-bad" else "first"),
+        )
+    for row in triggers:
+        store.execute(row[1])
+    store.commit()
+    before = tuple(store.iterdump())
+    with pytest.raises(ValueError, match="stored lineage"):
+        load_strategy(store, BUNDLE_ID, VERSION, _digest(raw))
+    for operation in ("first", "new"):
+        with pytest.raises(ValueError, match="stored lineage"):
+            _import(store, raw, operation, lineage=lineage)
+        assert tuple(store.iterdump()) == before
 
 
 def test_lineage_cannot_be_added_to_existing_version(store: sqlite3.Connection) -> None:

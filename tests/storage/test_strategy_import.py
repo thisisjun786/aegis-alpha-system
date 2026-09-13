@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
@@ -288,13 +289,16 @@ def test_lineage_registration_failure_rolls_back_then_retries(tmp_path: Path) ->
         )
 
 
-def _request_digest(digest: str, lineage: LineageSpec | None) -> str:
+def _request_digest(
+    digest: str, lineage: LineageSpec | None, parent_status: str = "unresolved"
+) -> str:
     if lineage is None:
         return digest
     return hashlib.sha256(
-        canonical_json_bytes(
+        json.dumps(
             {
-                "schema_version": "aas-strategy-import-request-v1",
+                "schema_version": "aas-strategy-import-request-v2",
+                "parent_status": parent_status,
                 "strategy_id": "synthetic-probe",
                 "version": "1",
                 "raw_sha256": digest,
@@ -304,8 +308,12 @@ def _request_digest(digest: str, lineage: LineageSpec | None) -> str:
                     "change_kind": lineage.change_kind,
                     "reason": lineage.reason,
                 },
-            }
-        )
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode()
     ).hexdigest()
 
 
@@ -338,7 +346,10 @@ def _interrupted_registration(
 
         def interrupt(connection: sqlite3.Connection, op_id: str, request_hash: str) -> None:
             assert connection is workspace.state
-            assert (op_id, request_hash) == (operation_id, _request_digest(digest, lineage))
+            assert (op_id, request_hash) == (
+                operation_id,
+                _request_digest(digest, lineage, parent_status),
+            )
             assert workspace.strategies is not None
             assert not workspace.strategies.in_transaction
             # An independent connection acknowledges the actual private COMMIT boundary.
@@ -649,6 +660,98 @@ def test_recovery_rejects_receipt_copied_from_another_committed_import(
             recover_operations(workspace)
         # Then the original intent remains PREPARED without journal changes.
         assert "\n".join(workspace.state.iterdump()) == before
+
+
+@pytest.mark.parametrize("interim", [False, True])
+def test_preprivate_retry_after_parent_arrival_uses_first_durable_acceptance(
+    tmp_path: Path, *, interim: bool
+) -> None:
+    home = tmp_path / "aas"
+    initialize(home)
+    raw = raw_bundle(contract())
+    digest = hashlib.sha256(raw).hexdigest()
+    lineage = LineageSpec("parent", "7", "derived", " exact\n")
+    source = tmp_path / "synthetic.json"
+    source.write_bytes(raw)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        assert workspace.strategies is not None
+        workspace.strategies.execute(
+            "CREATE TEMP TRIGGER interrupt BEFORE INSERT ON strategy_versions "
+            "BEGIN SELECT RAISE(ABORT,'before private commit'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="before private commit"):
+            register_strategy(workspace, source, digest, "synthetic-probe", "1", lineage=lineage)
+        operation = dict(workspace.state.execute("SELECT * FROM storage_operations").fetchone())
+        assert operation["request_hash"] == _request_digest(digest, lineage)
+        assert operation["expected_parent"] is None
+    if interim:
+        # Deliberately recreate interim caller-only evidence, never a migration.
+        from tests.storage.test_verification import corrupt_closed_store  # noqa: PLC0415
+
+        document = {
+            "schema_version": "aas-strategy-import-request-v1",
+            "strategy_id": "synthetic-probe",
+            "version": "1",
+            "raw_sha256": digest,
+            "lineage": {
+                "parent_id": "parent",
+                "parent_version": "7",
+                "change_kind": "derived",
+                "reason": " exact\n",
+            },
+        }
+        legacy = hashlib.sha256(
+            json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+        corrupt_closed_store(
+            home,
+            "state",
+            "storage_operations",
+            "UPDATE storage_operations SET request_hash=?",
+            (legacy,),
+        )
+        operation["request_hash"] = legacy
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        assert workspace.strategies is not None
+        parent = raw.replace(b'"synthetic-probe"', b'"parent"').replace(
+            b'"bundle_version":"1"', b'"bundle_version":"7"'
+        )
+        parent_file = tmp_path / "parent.json"
+        parent_file.write_bytes(parent)
+        register_strategy(workspace, parent_file, hashlib.sha256(parent).hexdigest(), "parent", "7")
+        before = (tuple(workspace.state.iterdump()), tuple(workspace.strategies.iterdump()))
+        assert recover_operations(workspace)["pending"] == [operation["operation_id"]]
+        assert (tuple(workspace.state.iterdump()), tuple(workspace.strategies.iterdump())) == before
+        if interim:
+            with pytest.raises(ValueError, match="unsealed lineage"):
+                register_strategy(
+                    workspace, source, digest, "synthetic-probe", "1", lineage=lineage
+                )
+            assert (
+                tuple(workspace.state.iterdump()),
+                tuple(workspace.strategies.iterdump()),
+            ) == before
+        else:
+            register_strategy(workspace, source, digest, "synthetic-probe", "1", lineage=lineage)
+            after = dict(
+                workspace.state.execute(
+                    "SELECT * FROM storage_operations WHERE operation_id=?",
+                    (operation["operation_id"],),
+                ).fetchone()
+            )
+            assert after == {
+                **operation,
+                "phase": "COMPLETED",
+                "completed_at_us": after["completed_at_us"],
+            }
+            assert (
+                workspace.strategies.execute(
+                    "SELECT parent_status FROM strategy_lineage"
+                ).fetchone()[0]
+                == "unresolved"
+            )
+            with pytest.raises(ValueError, match="unresolved parent"):
+                load_strategy(workspace.strategies, "synthetic-probe", "1", digest)
 
 
 def test_strategy_recovery_without_private_receipt_stays_pending(tmp_path: Path) -> None:
