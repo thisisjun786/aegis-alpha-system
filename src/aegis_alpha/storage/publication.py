@@ -304,9 +304,10 @@ def recover_operations(workspace: Workspace) -> dict[str, object]:
                 continue
             if marker[0] != operation["request_hash"]:
                 raise ValueError("strategy receipt does not match prepared operation")
-            from aegis_alpha.storage.strategies import load_strategy  # noqa: PLC0415
+            from aegis_alpha.storage.strategies import verify_strategy_content  # noqa: PLC0415
 
-            load_strategy(
+            # Journal completion verifies committed content, not execution eligibility.
+            verify_strategy_content(
                 workspace.strategies,
                 marker["strategy_id"],
                 marker["version"],

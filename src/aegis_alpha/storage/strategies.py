@@ -203,6 +203,20 @@ def list_strategies(connection: sqlite3.Connection) -> list[dict[str, object]]:
 def load_strategy(
     connection: sqlite3.Connection, strategy_id: str, version: str, expected_sha256: str
 ) -> EngineBundle:
+    bundle = verify_strategy_content(connection, strategy_id, version, expected_sha256)
+    if connection.execute(
+        "SELECT 1 FROM strategy_lineage WHERE strategy_id=? AND version=? AND "
+        "parent_status='unresolved'",
+        (strategy_id, version),
+    ).fetchone():
+        raise ValueError("strategy has unresolved parent lineage")
+    return bundle
+
+
+def verify_strategy_content(
+    connection: sqlite3.Connection, strategy_id: str, version: str, expected_sha256: str
+) -> EngineBundle:
+    """Verify persisted identity, raw bytes and contract, not execution eligibility."""
     row = connection.execute(
         "SELECT raw_bundle,raw_sha256,contract_json,contract_sha256 FROM strategy_versions "
         "WHERE strategy_id=? AND version=?",
@@ -212,12 +226,6 @@ def load_strategy(
         raise ValueError("strategy ID/version is not registered")
     if row["raw_sha256"] != expected_sha256:
         raise ValueError("strategy version hash does not match execution pin")
-    if connection.execute(
-        "SELECT 1 FROM strategy_lineage WHERE strategy_id=? AND version=? AND "
-        "parent_status='unresolved'",
-        (strategy_id, version),
-    ).fetchone():
-        raise ValueError("strategy has unresolved parent lineage")
     bundle = load_bundle(row["raw_bundle"], expected_sha256, strategy_id, version)
     if (
         bundle.contract_sha256 != row["contract_sha256"]
