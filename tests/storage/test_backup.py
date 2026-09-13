@@ -259,6 +259,13 @@ def test_corrupt_membership_backup_rejected_with_refreshed_outer_hashes(
         register(workspace, I1)
     root = Path(str(backup(home)["backup_root"]))
     with closing(sqlite3.connect(root / "state.sqlite3")) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        schema_query = (
+            "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master ORDER BY type,name"
+        )
+        original_schema = connection.execute(schema_query).fetchall()
+        trigger_sql = {name: sql for kind, name, _, _, sql in original_schema if kind == "trigger"}
         if fault == "member":
             connection.execute(
                 "INSERT INTO identity_assertions VALUES "
@@ -272,15 +279,20 @@ def test_corrupt_membership_backup_rejected_with_refreshed_outer_hashes(
             connection.execute("INSERT INTO instruments VALUES ('OTHER',NULL,'etf','X')")
             connection.execute("DROP TRIGGER immutable_identity_assertions_update")
             connection.execute("UPDATE identity_assertions SET instrument_id='OTHER'")
+            connection.execute(trigger_sql["immutable_identity_assertions_update"])
         elif fault == "interval":
             connection.execute("DROP TRIGGER immutable_identity_snapshot_members_update")
             connection.execute("UPDATE identity_snapshot_members SET known_to_us=36")
+            connection.execute(trigger_sql["immutable_identity_snapshot_members_update"])
         else:
             connection.execute(
                 "INSERT INTO source_files VALUES ('s','new-evidence',?,0)",
                 (hashlib.sha256(b"").hexdigest(),),
             )
         connection.commit()
+        assert connection.execute(schema_query).fetchall() == original_schema
+        assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     raw = (root / "state.sqlite3").read_bytes()
     manifest = json.loads((root / "backup.json").read_bytes())
     manifest["files"]["state.sqlite3"] = {
