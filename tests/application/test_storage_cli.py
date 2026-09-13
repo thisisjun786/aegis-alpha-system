@@ -5,13 +5,18 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
 
+from aegis_alpha.application import storage_cli
+from aegis_alpha.storage.input_pins import register_convention
 from aegis_alpha.storage.strategies import load_strategy
 from aegis_alpha.storage.workspace import open_workspace
 from tests.engine.engine_support import contract, raw_bundle
+from tests.engine.test_requirements import rich_contract
+from tests.storage.test_strategy_requirements import A, B
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -227,3 +232,255 @@ def test_source_reads_require_strategy_store_at_admission(
     assert "strategy database is missing" in result.stderr
     assert "Traceback" not in result.stderr
     assert run_cli("doctor", home=home).returncode == 0
+
+
+@pytest.fixture
+def show_home(tmp_path: Path) -> tuple[Path, dict[str, dict[str, str]]]:
+    home = tmp_path / "aas"
+    assert run_cli("init", home=home).returncode == 0
+    receipts = {}
+    for identity, value in (("synthetic-probe", contract()), ("synthetic-rich", rich_contract())):
+        document = json.loads(raw_bundle(value))
+        document["bundle_id"] = identity
+        payload = json.dumps(document).encode()
+        source = tmp_path / "bundle.json"
+        source.write_bytes(payload)
+        result = run_cli(
+            "strategy",
+            "import",
+            str(source),
+            "--id",
+            identity,
+            "--version",
+            "1",
+            "--sha256",
+            hashlib.sha256(payload).hexdigest(),
+            home=home,
+        )
+        assert result.returncode == 0, result.stderr
+        receipts[identity] = json.loads(result.stdout)
+        source.unlink()
+    return home, receipts
+
+
+def show_arguments(receipt: dict[str, str]) -> tuple[str, ...]:
+    return (
+        "strategy",
+        "show",
+        "--id",
+        receipt["strategy_id"],
+        "--version",
+        receipt["version"],
+        "--sha256",
+        receipt["raw_sha256"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("identity", "prices", "cash", "minimum"),
+    [
+        ("synthetic-probe", ["ASSET_A", "ASSET_B", "REF_X"], ["CASH_X"], 3),
+        ("synthetic-rich", ["ASSET_Z", "CANARY_ON", "REF_Y"], ["CASH_Y"], 8),
+    ],
+)
+def test_strategy_show_definition(
+    show_home: tuple[Path, dict[str, dict[str, str]]],
+    identity: str,
+    prices: list[str],
+    cash: list[str],
+    minimum: int,
+) -> None:
+    home, receipts = show_home
+    receipt = receipts[identity]
+    result = run_cli(*show_arguments(receipt), home=home)
+    assert result.returncode == 0, result.stderr
+    definition = json.loads(result.stdout)
+    assert (definition["bundle_id"], definition["bundle_version"]) == (identity, "1")
+    assert definition["source_sha256"] == receipt["raw_sha256"]
+    assert definition["contract_sha256"] == receipt["contract_sha256"]
+    assert definition["price_asset_ids"] == prices
+    assert definition["cash_asset_ids"] == cash
+    assert definition["input_requirements"][0]["minimum_observations"] == minimum
+    assert definition["input_requirements"][0]["basis"] is None
+    assert definition["unresolved_convention_roles"] == ["calendar", "basis", "cost", "execution"]
+    assert definition["executable"] is False
+    assert {"raw_bundle", "pack", "home", "paths"}.isdisjoint(definition)
+    assert str(home) not in result.stdout
+    assert run_cli(*show_arguments(receipt), home=home).stdout == result.stdout
+
+
+@pytest.mark.parametrize(
+    ("identity", "raw", "basis", "exit_code"),
+    [
+        ("synthetic-probe", A, "capital", 0),
+        ("synthetic-probe", B, "total_return", 0),
+        ("synthetic-rich", A, "capital", 0),
+        ("synthetic-rich", B, "total_return", 1),
+    ],
+)
+def test_strategy_show_registered_basis(
+    show_home: tuple[Path, dict[str, dict[str, str]]],
+    identity: str,
+    raw: bytes,
+    basis: str,
+    exit_code: int,
+) -> None:
+    home, receipts = show_home
+    with open_workspace(home, writable=True) as workspace:
+        pin = register_convention(
+            workspace.state, raw, expected_file_sha256=hashlib.sha256(raw).hexdigest()
+        )
+    document = home.parent / "requirements.json"
+    payload = json.dumps(
+        {
+            "schema_version": "aas-execution-requirements-v1",
+            "convention_bindings": [asdict(pin)],
+        }
+    ).encode()
+    document.write_bytes(payload)
+    before = {path.name: path.read_bytes() for path in home.glob("*.sqlite3")}
+    result = run_cli(
+        *show_arguments(receipts[identity]),
+        "--requirements",
+        str(document),
+        "--requirements-sha256",
+        hashlib.sha256(payload).hexdigest(),
+        home=home,
+    )
+    assert result.returncode == exit_code, result.stderr
+    if exit_code:
+        assert result.stdout == ""
+        assert isinstance(json.loads(result.stderr)["error"], str)
+    else:
+        definition = json.loads(result.stdout)
+        assert definition["input_requirements"][0]["basis"] == basis
+        assert definition["unresolved_convention_roles"] == ["calendar", "cost", "execution"]
+        assert definition["executable"] is False
+    assert {path.name: path.read_bytes() for path in home.glob("*.sqlite3")} == before
+
+
+@pytest.mark.parametrize("failure", ["hash", "requirements-only", "hash-only", "lineage"])
+def test_strategy_show_controlled_failure(
+    show_home: tuple[Path, dict[str, dict[str, str]]],
+    failure: str,
+) -> None:
+    home, receipts = show_home
+    receipt = receipts["synthetic-probe"]
+    extra = ()
+    if failure == "lineage":
+        source = home.parent / "child.json"
+        document = json.loads(raw_bundle(contract()))
+        document["bundle_id"] = "synthetic-child"
+        payload = json.dumps(document).encode()
+        source.write_bytes(payload)
+        result = run_cli(
+            "strategy",
+            "import",
+            str(source),
+            "--id",
+            "synthetic-child",
+            "--version",
+            "1",
+            "--sha256",
+            hashlib.sha256(payload).hexdigest(),
+            "--parent-id",
+            "absent-parent",
+            "--parent-version",
+            "7",
+            "--change-kind",
+            "derived",
+            "--reason",
+            "synthetic",
+            home=home,
+        )
+        assert result.returncode == 0, result.stderr
+        receipt = json.loads(result.stdout)
+        source.unlink()
+    elif failure == "hash":
+        receipt = {**receipt, "raw_sha256": "0" * 64}
+    elif failure == "requirements-only":
+        extra = ("--requirements", str(home.parent / "missing.json"))
+    else:
+        extra = ("--requirements-sha256", "0" * 64)
+    before = {path.name: path.read_bytes() for path in home.glob("*.sqlite3")}
+    result = run_cli(*show_arguments(receipt), *extra, home=home)
+    assert result.returncode == 1, result.stderr
+    assert result.stdout == ""
+    assert isinstance(json.loads(result.stderr)["error"], str)
+    assert str(home) not in result.stderr
+    assert {path.name: path.read_bytes() for path in home.glob("*.sqlite3")} == before
+
+
+_EMPTY_REQUIREMENTS = b'{"schema_version":"aas-execution-requirements-v1","convention_bindings":[]}'
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"{}",
+        b"[]",
+        b"null",
+        b"true",
+        b"\xff",
+        b"\x00",
+        b" " * (1024 * 1024 + 1),
+        b"[" * 2000,
+        _EMPTY_REQUIREMENTS.replace(b"v1", b"v2"),
+        _EMPTY_REQUIREMENTS.replace(b"[]", b"null"),
+        _EMPTY_REQUIREMENTS.replace(b"[]", b"{}"),
+        _EMPTY_REQUIREMENTS.replace(b"[]", b"[false]"),
+        _EMPTY_REQUIREMENTS.replace(b"[]", b"[{}]"),
+        _EMPTY_REQUIREMENTS.replace(b"[]", b"[NaN]"),
+        _EMPTY_REQUIREMENTS.replace(b"[]", b'[],"unknown":0'),
+        _EMPTY_REQUIREMENTS.replace(b"[]", b'[],"convention_bindings":[]'),
+        b"\xef\xbb\xbf" + _EMPTY_REQUIREMENTS,
+        *(
+            _EMPTY_REQUIREMENTS.decode().encode(encoding)
+            for encoding in (
+                "utf-16",
+                "utf-16-le",
+                "utf-16-be",
+                "utf-32",
+                "utf-32-le",
+                "utf-32-be",
+            )
+        ),
+        *(
+            _EMPTY_REQUIREMENTS.replace(b"[]", json.dumps([pin]).encode())
+            for pin in (
+                {"kind": "basis", "id": "a", "version": "1", "hash": "A" * 64},
+                {"kind": "basis", "id": "a", "version": "latest", "hash": "0" * 64},
+                {"kind": "basis", "id": 7, "version": "1", "hash": "0" * 64},
+                {"kind": "other", "id": "a", "version": "1", "hash": "0" * 64},
+                {"kind": "basis", "id": "a", "version": "1", "hash": "short"},
+                {"kind": "basis", "id": "a", "version": "1", "hash": "0" * 64, "payload": {}},
+            )
+        ),
+        _EMPTY_REQUIREMENTS.replace(
+            b"[]",
+            b'[{"kind":"basis","kind":"basis","id":"a","version":"1","hash":"' + b"0" * 64 + b'"}]',
+        ),
+    ],
+    ids=lambda payload: hashlib.sha256(payload).hexdigest()[:12],
+)
+def test_execution_requirements_reject_malformed(tmp_path: Path, payload: bytes) -> None:
+    source = tmp_path / "requirements.json"
+    source.write_bytes(payload)
+    with pytest.raises(ValueError, match="requirements"):
+        storage_cli._execution_bindings(  # noqa: SLF001 -- strict external document boundary
+            source, hashlib.sha256(payload).hexdigest()
+        )
+
+
+def test_execution_requirements_empty_and_transport_hash(tmp_path: Path) -> None:
+    source = tmp_path / "requirements.json"
+    source.write_bytes(_EMPTY_REQUIREMENTS)
+    digest = hashlib.sha256(_EMPTY_REQUIREMENTS).hexdigest()
+    assert storage_cli._execution_bindings(None, None) is None  # noqa: SLF001
+    assert storage_cli._execution_bindings(source, digest) == ()  # noqa: SLF001
+    for invalid in ("0" * 64, digest.upper(), "short"):
+        with pytest.raises(ValueError, match="requirements"):
+            storage_cli._execution_bindings(source, invalid)  # noqa: SLF001
+    source.unlink()
+    with pytest.raises(ValueError, match="requirements"):
+        storage_cli._execution_bindings(source, digest)  # noqa: SLF001
