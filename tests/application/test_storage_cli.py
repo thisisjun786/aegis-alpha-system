@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 from dataclasses import asdict
@@ -561,6 +562,129 @@ def test_execution_requirements_reject_malformed(tmp_path: Path, payload: bytes)
         storage_cli._execution_bindings(  # noqa: SLF001 -- strict external document boundary
             source, hashlib.sha256(payload).hexdigest()
         )
+
+
+def test_strategy_show_rejects_fifo_with_writer(
+    show_home: tuple[Path, dict[str, dict[str, str]]],
+) -> None:
+    home, receipts = show_home
+    source = home.parent / "requirements.fifo"
+    os.mkfifo(source)
+    before = {path.name: path.read_bytes() for path in home.glob("*.sqlite3")}
+    # The kernel open rendezvous synchronizes the real writer with the reader.
+    # Valid bytes plus EOF make the old blocking reader succeed, not time out.
+    writer_code = """
+import json, os, stat, sys
+fd = os.open(sys.argv[1], os.O_WRONLY)
+try:
+    count = os.write(fd, bytes.fromhex(sys.argv[2]))
+    print(json.dumps({"fifo": stat.S_ISFIFO(os.fstat(fd).st_mode), "written": count}))
+finally:
+    os.close(fd)
+"""
+    writer = subprocess.Popen(  # noqa: S603 -- real FIFO writer, synthetic bytes
+        [sys.executable, "-c", writer_code, str(source), _EMPTY_REQUIREMENTS.hex()],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        result = run_cli(
+            *show_arguments(receipts["synthetic-probe"]),
+            "--requirements",
+            str(source),
+            "--requirements-sha256",
+            hashlib.sha256(_EMPTY_REQUIREMENTS).hexdigest(),
+            home=home,
+        )
+        if result.returncode == 0:
+            # A successful old reader must have consumed the genuine writer's EOF.
+            out, err = writer.communicate(timeout=30)
+            assert writer.returncode == 0, err
+            assert json.loads(out) == {"fifo": True, "written": len(_EMPTY_REQUIREMENTS)}
+    finally:
+        if writer.poll() is None:
+            writer.kill()
+        writer.communicate(timeout=30)
+        source.unlink()
+    assert writer.returncode is not None
+    assert run_cli("doctor", home=home).returncode == 0
+    assert {path.name: path.read_bytes() for path in home.glob("*.sqlite3")} == before
+    assert result.returncode == 1, result.stdout
+    assert result.stdout == ""
+    assert isinstance(json.loads(result.stderr)["error"], str)
+
+
+@pytest.mark.parametrize(
+    "kind", ["fifo", "directory", "socket", "symlink", "ancestor-symlink", "hardlink"]
+)
+def test_strategy_show_requirements_filesystem_admission(
+    show_home: tuple[Path, dict[str, dict[str, str]]], kind: str
+) -> None:
+    home, receipts = show_home
+    regular = home.parent / "requirements.json"
+    regular.write_bytes(_EMPTY_REQUIREMENTS)
+    source = home.parent / "alias"
+    baseline = run_cli(*show_arguments(receipts["synthetic-probe"]), home=home)
+    assert baseline.returncode == 0, baseline.stderr
+    before = {path.name: path.read_bytes() for path in home.glob("*.sqlite3")}
+    with socket.socket(socket.AF_UNIX) as listener:
+        if kind == "fifo":
+            os.mkfifo(source)  # Deliberately no writer; timeout is a failure, never proof.
+        elif kind == "directory":
+            source.mkdir()
+        elif kind == "socket":
+            listener.bind(str(source))
+        elif kind == "symlink":
+            source.symlink_to(regular)
+        elif kind == "ancestor-symlink":
+            source.symlink_to(home.parent, target_is_directory=True)
+            source /= regular.name
+        else:
+            source.hardlink_to(regular)
+        result = run_cli(
+            *show_arguments(receipts["synthetic-probe"]),
+            "--requirements",
+            str(source),
+            "--requirements-sha256",
+            hashlib.sha256(_EMPTY_REQUIREMENTS).hexdigest(),
+            home=home,
+        )
+    if kind == "hardlink":
+        # External document readers allow hardlinks; do not invent a stricter policy.
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == baseline.stdout
+    else:
+        assert result.returncode == 1, result.stderr
+        assert result.stdout == ""
+        assert isinstance(json.loads(result.stderr)["error"], str)
+        assert str(home.parent) not in result.stderr
+    assert run_cli("doctor", home=home).returncode == 0
+    assert {path.name: path.read_bytes() for path in home.glob("*.sqlite3")} == before
+    assert regular.read_bytes() == _EMPTY_REQUIREMENTS
+
+
+def test_execution_requirements_exact_size_and_relative_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "requirements.json"
+    payload = _EMPTY_REQUIREMENTS.ljust(1024 * 1024, b" ")
+    source.write_bytes(payload)
+    monkeypatch.chdir(tmp_path)
+    assert (
+        storage_cli._execution_bindings(  # noqa: SLF001 -- real bounded transport
+            Path(source.name), hashlib.sha256(payload).hexdigest()
+        )
+        == ()
+    )
+    with pytest.raises(ValueError, match="requirements"):
+        storage_cli._execution_bindings(  # noqa: SLF001
+            source, hashlib.sha256(_EMPTY_REQUIREMENTS).hexdigest()
+        )
+    payload += b" "
+    source.write_bytes(payload)
+    with pytest.raises(ValueError, match="requirements"):
+        storage_cli._execution_bindings(source, hashlib.sha256(payload).hexdigest())  # noqa: SLF001
 
 
 def test_execution_requirements_empty_and_transport_hash(tmp_path: Path) -> None:

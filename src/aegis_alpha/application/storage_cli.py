@@ -239,6 +239,7 @@ def _execution_bindings(path: Path | None, sha256: str | None) -> tuple[Conventi
     import hashlib
     import re
 
+    from aegis_alpha.data.descriptor_tree import DescriptorTree, DescriptorTreeError
     from aegis_alpha.engine.codec import decode_json
 
     if (path is None) != (sha256 is None):
@@ -247,10 +248,14 @@ def _execution_bindings(path: Path | None, sha256: str | None) -> tuple[Conventi
         return None
     if sha256 is None or re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
         raise ValueError("requirements hash must be lowercase SHA-256 hex")
+    path = path.absolute()
     try:
-        with path.open("rb") as source:
+        with (
+            DescriptorTree.open_path(path.parent) as tree,
+            tree.binary_reader(path.name) as source,
+        ):
             raw = source.read(1024 * 1024 + 1)
-    except OSError:
+    except (OSError, DescriptorTreeError):
         raise ValueError("cannot read execution requirements document") from None
     if len(raw) > 1024 * 1024 or hashlib.sha256(raw).hexdigest() != sha256:
         raise ValueError("requirements exceeds 1 MiB or file hash does not match")
