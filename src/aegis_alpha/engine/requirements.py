@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import cast
 
@@ -14,6 +15,8 @@ from aegis_alpha.engine.models import (
     MacroSignalSpec,
     StaleGateSpec,
 )
+
+type LegacyRequirementRow = tuple[str, str, str, int, str, str, str, int, str, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +65,39 @@ class ExecutionDefinition:
     required_convention_roles: tuple[str, ...]
     unresolved_convention_roles: tuple[str, ...]
     executable: bool
+
+
+def legacy_requirement_rows(definition: ExecutionDefinition) -> Iterator[LegacyRequirementRow]:
+    """Project immutable v1 rows, not the richer execution-input requirements.
+
+    V1 stores the configured history cap and all macro signals (including derived
+    ones). Its explicit-input basis label does not resolve an execution basis.
+    """
+    yield (
+        definition.bundle_id,
+        definition.bundle_version,
+        "prices",
+        1,
+        "engine-price-v1",
+        "close",
+        "prices",
+        definition.calendar.history_observations,
+        "explicit-input",
+        "calendar_month_end",
+    )
+    for ordinal, signal in enumerate(definition.macro_signals, 1):
+        yield (
+            definition.bundle_id,
+            definition.bundle_version,
+            "macro",
+            ordinal,
+            "engine-macro-v1",
+            signal.series_id,
+            "macro_observations",
+            max(signal.lag_months, default=0),
+            "not_applicable",
+            "calendar_month_end",
+        )
 
 
 def derive_execution_definition(bundle: EngineBundle) -> ExecutionDefinition:

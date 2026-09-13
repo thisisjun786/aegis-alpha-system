@@ -7,6 +7,7 @@ import time
 
 from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.engine.bundle import EngineBundle, load_bundle
+from aegis_alpha.engine.requirements import derive_execution_definition, legacy_requirement_rows
 from aegis_alpha.storage.sqlite import initialize
 from aegis_alpha.storage.state import atomic
 from aegis_alpha.storage.strategy_schema import STRATEGY_DDL, STRATEGY_KIND
@@ -103,38 +104,10 @@ def import_strategy(  # noqa: PLR0913, PLR0917 -- explicit external bundle pins
 
 
 def _requirements(connection: sqlite3.Connection, bundle: EngineBundle) -> None:
-    contract = bundle.contract
-    connection.execute(
+    connection.executemany(
         "INSERT INTO strategy_requirements VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (
-            bundle.bundle_id,
-            bundle.bundle_version,
-            "prices",
-            1,
-            "engine-price-v1",
-            "close",
-            "prices",
-            contract.calendar.history_observations,
-            "explicit-input",
-            "calendar_month_end",
-        ),
+        legacy_requirement_rows(derive_execution_definition(bundle)),
     )
-    for ordinal, signal in enumerate(contract.macro_signals, 1):
-        connection.execute(
-            "INSERT INTO strategy_requirements VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (
-                bundle.bundle_id,
-                bundle.bundle_version,
-                "macro",
-                ordinal,
-                "engine-macro-v1",
-                signal.series_id,
-                "macro_observations",
-                max(signal.lag_months, default=0),
-                "not_applicable",
-                "calendar_month_end",
-            ),
-        )
 
 
 def list_strategies(connection: sqlite3.Connection) -> list[dict[str, object]]:
