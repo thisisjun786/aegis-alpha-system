@@ -19,6 +19,21 @@ macro points, derived inputs, and caller-supplied ensemble rows. The receipt
 records `bundle_id`, `bundle_version`, `source_sha256`, and `contract_sha256`.
 It never invents a strategy when configuration is missing.
 
+`requirements.derive_execution_definition(bundle)` turns a validated bundle into
+a frozen `ExecutionDefinition`: bundle identity and hashes, the actual price,
+defensive and cash asset IDs, `InputRequirement` entries for the `prices`,
+`macro`, `derived` and `membership` roles (one per macro signal and derived
+series) with minimum history and lag fields taken from the contract, the
+calendar and stale-gate conventions, and the required
+convention roles `calendar`, `basis`, `cost`, `execution`. The derivation is
+deterministic, touches no storage, and never resolves a convention pin. A bare
+bundle therefore reports every role unresolved and `executable=false`. That
+value means the definition is available for inspection; it does not mean the
+strategy has runnable bound input. `legacy_requirement_rows` projects the same
+definition onto the v1 stored requirement rows so their meaning stays fixed.
+Definition faults stay `ContractDefinitionError(reason)`; the application
+boundary maps them, this package does not.
+
 ## Capabilities
 
 The engine preserves scoring, horizon-keyed returns and moving-average ratios,

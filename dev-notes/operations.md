@@ -26,7 +26,12 @@ aas doctor
 
 ```bash
 aas strategy import /path/to/bundle.json --id ID --version VERSION --sha256 SHA256
+aas strategy import /path/to/child.json --id ID --version VERSION --sha256 SHA256 \
+  --parent-id PARENT_ID --parent-version PARENT_VERSION --change-kind KIND --reason REASON
 aas strategy list
+aas strategy show --id ID --version VERSION --sha256 SHA256
+aas strategy show --id ID --version VERSION --sha256 SHA256 \
+  --requirements /path/to/requirements.json --requirements-sha256 SHA256
 aas data datasets
 aas data import /path/to/typed-data.json --sha256 SHA256
 aas data inspect --dataset ID --version VERSION
@@ -35,6 +40,30 @@ aas data read --dataset ID --version VERSION --cutoff-us UTC_MICROSECONDS
 
 전략은 `engine.bundle`의 envelope를 검증하고 원문과 계약 해시를 저장한다. 원래 성과를
 추정해 채우지 않는다. 현재 bundle은 실행 계약이며 별도 원본 성과 입력 UI는 제공하지 않는다.
+같은 바이트와 같은 계보로 다시 import하면 그대로 성공하고, 내용이나 계보가 다르면 거부한다.
+계보 네 옵션은 모두 지정하거나 모두 생략한다. 부모가 아직 등록되지 않았어도 import는
+성공하지만 그 버전은 `unresolved`로 남고, 나중에 부모를 등록해도 바뀌지 않는다.
+바로잡으려면 새 자식 버전을 등록한다. state 작업이 PREPARED로 남은 채 커밋된 import는
+`aas db recover`가 저장 내용을 대조해 완료하며, 이 완료가 실행 자격을 뜻하지는 않는다.
+
+`strategy show`는 고정한 전략의 실행 정의를 JSON으로 출력하며 계산·기록을 하지 않는다.
+출력에는 자산·현금 ID, 역할별 입력 요구, 달력 규약, `required_convention_roles`,
+`unresolved_convention_roles`, `executable`이 있다. 결합 없이 조회하면 네 역할이 모두
+미해결이고 `executable=false`다. 원문 bundle이나 DB 경로는 출력하지 않는다.
+`--requirements`와 `--requirements-sha256`은 함께 지정한다. 파일은 1 MiB 이하의 BOM 없는
+UTF-8 JSON이며 `schema_version`은 `aas-execution-requirements-v1`, `convention_bindings`는
+`kind`·`id`·`version`·`hash`만 가진 pin 배열이다. 관례 본문을 인라인으로 넣을 수 없다.
+`--requirements-sha256`은 이 파일 바이트의 해시이고, pin의 `hash`는 등록된 관례 문서의
+정규화 전체 해시다. 두 값은 서로 다른 대상을 가리킨다. pin의 kind는 정의의 필수 역할에
+속해야 하며 중복될 수 없다. 의미를 해석하는 kind는 `basis`뿐이고, 등록된 관례와 호환될
+때만 가격 요구의 basis가 채워진다. 다른 역할의 pin은 무결성만 확인하며 미해결로 남고
+`executable`은 계속 false다. 잘못된 해시, 미등록 pin, `capital` 요구에 대한 `total_return`
+결합, 미해결 계보 버전은 종료 코드 1과 한 줄 오류로 끝난다.
+
+관례 문서 등록은 아직 CLI가 없다. Python에서 `with open_workspace(home, writable=True) as
+workspace:`로 admit한 뒤 `storage.input_pins.register_convention(workspace.state, raw,
+expected_file_sha256=...)`을 호출하면 반환된 `ConventionPin`의 `hash`가 위 pin 배열에 들어갈 값이다.
+`read_convention(workspace.state, pin)`은 정규화 문서 바이트를 돌려준다.
 `data import`의 스키마는 [import_document.py](../src/aegis_alpha/storage/import_document.py),
 도메인별 필드는 [market_schema.py](../src/aegis_alpha/storage/market_schema.py)에 있다.
 가격·재무·거시·기업행동·종목 상태·추정치·FX·calendar·feature를 typed 테이블로 저장한다.
