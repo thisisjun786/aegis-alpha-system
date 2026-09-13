@@ -520,13 +520,40 @@ def read_chain_rows(
     from actual counts and text lengths before fetching any delta. This is a
     conservative materialization estimate, not a process RSS or performance bound.
     An over-budget history raises ComputeResourceError, never a truncated success.
+    DuckDB limits are lowered before queries and remain lowered on success/error;
+    the caller still owns the connection. Tighter existing limits are never raised.
 
     Catalog visibility remains publication.read_dataset's responsibility. Each
     market delta is checked against its own marker, not the head's delta count.
     """
-    chain = generation_chain(connection, generation_id)
-    _admit_chain_memory(connection, chain, budget)
-    return tuple(MappingProxyType(row) for row in _verified_chain_rows(connection, chain))
+    import duckdb  # noqa: PLC0415 -- capacity errors at the budgeted query boundary
+
+    try:
+        _ = connection.execute(
+            "SET threads = least(current_setting('threads'), ?)", [budget.duckdb_threads]
+        )
+        # Compare the same rounded-down display precision on both sides. Leave a
+        # clearly tighter limit untouched; in the same display bucket conservatively
+        # use its lower bound, since the exact existing bytes are not exposed.
+        memory, budget_floor = cast(
+            "tuple[int, int]",
+            connection.execute(
+                """SELECT parse_formatted_bytes(current_setting('memory_limit')),
+                          parse_formatted_bytes(format_bytes(?))""",
+                [budget.duckdb_memory_limit_bytes],
+            ).fetchone(),
+        )
+        if memory >= budget_floor:
+            _ = connection.execute(
+                "SET memory_limit = ?", [f"{min(memory, budget.duckdb_memory_limit_bytes)}B"]
+            )
+        chain = generation_chain(connection, generation_id)
+        _admit_chain_memory(connection, chain, budget)
+        return tuple(MappingProxyType(row) for row in _verified_chain_rows(connection, chain))
+    except duckdb.OutOfMemoryException as error:
+        raise ComputeResourceError(
+            "DuckDB cannot execute chain read within admitted memory limits"
+        ) from error
 
 
 def _admit_chain_memory(
