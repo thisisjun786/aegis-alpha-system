@@ -63,6 +63,19 @@ CLI에 연결돼 있다. `modules/`는 각 모듈의 책임을 선언하며 전�
 `strategy import`는 `load_bundle`을 사용해 검증·저장하지만 전략 계산은 시작하지 않는다.
 새 전략 DB의 정리 중인 export를 원본으로 자동 채택하지 않는다.
 
+`engine/requirements.py`는 검증된 bundle에서 실행 정의(`ExecutionDefinition`)를 결정적으로
+도출한다. 실제 가격·방어·현금 자산 ID, 역할별 입력 요구(최소 이력·시차·파생 입력),
+달력·stale gate 규약, 그리고 필수 관례 역할 `calendar`·`basis`·`cost`·`execution`을
+담는다. 저장된 v1 `strategy_requirements` 행은 같은 도출의 투영이며 의미가 바뀌지 않는다.
+bundle 자체에는 가격 기준(basis)이 없으므로 모든 역할이 미해결이고 `executable=false`다.
+정의를 조회할 수 있다는 사실과 실행 가능한 결합 입력이 있다는 사실은 다르다.
+`storage/strategy_requirements.read_execution_definition`은 SELECT만 수행하며, 선택적
+`ConventionPin` 결합을 state DB의 등록 관례와 대조한다. 호환되는 basis pin만 가격 요구에
+반영되고 나머지 역할은 미해결로 남으며 `executable`은 여전히 false다. `capital` 요구에
+`total_return` 기준을 결합하면 거부한다. 관례 등록은 Python `register_convention`·
+`read_convention`만 제공하고 별도 CLI는 없다. 전략 계보는 새 버전 등록 시에만 선택적으로
+기록하며 등록된 부모가 없으면 `unresolved`로 남고 이후 부모 등록으로 바뀌지 않는다.
+
 ## 데이터와 DB
 
 신규 DB는 [0014](decisions/0014-local-embedded-databases.md)에 따라 **SQLite 두 파일과

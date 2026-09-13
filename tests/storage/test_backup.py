@@ -11,6 +11,7 @@ from aegis_alpha.storage import publication
 from aegis_alpha.storage.backup import backup, restore
 from aegis_alpha.storage.import_document import parse_import
 from aegis_alpha.storage.raw import put_raw_file
+from aegis_alpha.storage.strategies import LineageSpec, load_strategy
 from aegis_alpha.storage.strategy_import import register_strategy
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace, write_json
@@ -20,14 +21,14 @@ from tests.storage.test_publication import document
 _MIN_BACKUP_FILES = 5
 
 
-def seed_workspace(home: Path) -> None:
+def seed_workspace(home: Path, *, lineage: LineageSpec | None = None) -> None:
     initialize(home)
     payload = raw_bundle(contract())
     digest = hashlib.sha256(payload).hexdigest()
     source = home.parent / "synthetic-strategy.json"
     source.write_bytes(payload)
     with open_workspace(home, writable=True, strategy_write=True) as workspace:
-        register_strategy(workspace, source, digest, "synthetic-probe", "1")
+        register_strategy(workspace, source, digest, "synthetic-probe", "1", lineage=lineage)
         publication.publish_document(workspace, parse_import(document()))
 
 
@@ -73,6 +74,50 @@ def test_nonempty_backup_restore_preserves_identity_and_excludes_secrets(tmp_pat
         assert report["pending_operations"] == 0
         assert report["orphan_generations"] == []
         assert publication.read_dataset(workspace, "synthetic-prices", "1")["row_count"] == 1
+
+
+def test_unresolved_import_backup_restore_preserves_content_and_eligibility(tmp_path: Path) -> None:
+    # Given a completed import whose direct parent is legitimately absent.
+    home = tmp_path / "aas"
+    seed_workspace(home, lineage=LineageSpec("absent-parent", "7", "derived", "synthetic"))
+    with open_workspace(home) as workspace:
+        assert workspace.strategies is not None
+        original = "\n".join(workspace.strategies.iterdump())
+        state = "\n".join(workspace.state.iterdump())
+        digest = workspace.strategies.execute(
+            "SELECT raw_sha256 FROM strategy_versions"
+        ).fetchone()[0]
+    identity = json.loads((home / "installation.json").read_text())
+
+    # When the complete workspace is backed up and restored to a fresh root.
+    result = backup(home, tmp_path / "backup")
+    restored_home = tmp_path / "restored"
+    restored = restore(Path(str(result["backup_root"])), restored_home)
+
+    # Then immutable content/identities survive, without resolving or enabling the child.
+    assert result["backed_up"] is True
+    assert restored["restored"] is True
+    restored_identity = json.loads((restored_home / "installation.json").read_text())
+    assert restored_identity["installation_id"] == identity["installation_id"]
+    assert restored_identity["stores"] == identity["stores"]
+    assert restored_identity["deployment_id"] != identity["deployment_id"]
+    for root in (home, restored_home):
+        with open_workspace(root) as workspace:
+            assert workspace.strategies is not None
+            assert "\n".join(workspace.strategies.iterdump()) == original
+            assert "\n".join(workspace.state.iterdump()) == state
+            report = verify_workspace(workspace)
+            assert report == restored["verification"]
+            assert report["verified"] is True
+            assert report["strategy_versions"] == 1
+            assert (
+                workspace.strategies.execute(
+                    "SELECT parent_status FROM strategy_lineage"
+                ).fetchone()[0]
+                == "unresolved"
+            )
+            with pytest.raises(ValueError, match="unresolved parent lineage"):
+                load_strategy(workspace.strategies, "synthetic-probe", "1", digest)
 
 
 def test_backup_includes_wal_contents(tmp_path: Path) -> None:

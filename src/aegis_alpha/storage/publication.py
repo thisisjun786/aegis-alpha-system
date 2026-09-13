@@ -283,7 +283,6 @@ def read_dataset(workspace: Workspace, dataset_id: str, version: str) -> dict[st
 
 def recover_operations(workspace: Workspace) -> dict[str, object]:
     from aegis_alpha.storage.market import verify_generation  # noqa: PLC0415
-    from aegis_alpha.storage.state import complete_operation  # noqa: PLC0415
 
     recovered: list[str] = []
     pending: list[str] = []
@@ -293,26 +292,12 @@ def recover_operations(workspace: Workspace) -> dict[str, object]:
     ).fetchall()
     for operation in rows:
         op_id = operation["operation_id"]
-        if operation["kind"] == "strategy_import" and workspace.strategies is not None:
-            marker = workspace.strategies.execute(
-                "SELECT request_hash,strategy_id,version FROM strategy_imports "
-                "WHERE operation_id=?",
-                (op_id,),
-            ).fetchone()
-            if marker is None:
+        if operation["kind"] == "strategy_import":
+            from aegis_alpha.storage.strategy_import import recover_strategy_import  # noqa: PLC0415
+
+            if not recover_strategy_import(workspace, operation):
                 pending.append(op_id)
                 continue
-            if marker[0] != operation["request_hash"]:
-                raise ValueError("strategy receipt does not match prepared operation")
-            from aegis_alpha.storage.strategies import load_strategy  # noqa: PLC0415
-
-            load_strategy(
-                workspace.strategies,
-                marker["strategy_id"],
-                marker["version"],
-                marker["request_hash"],
-            )
-            complete_operation(workspace.state, op_id, operation["request_hash"])
         elif operation["kind"] == "source_import":
             from aegis_alpha.storage.source_library import recover_source  # noqa: PLC0415
 

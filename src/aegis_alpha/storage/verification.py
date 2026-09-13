@@ -6,9 +6,11 @@ import hashlib
 from typing import TYPE_CHECKING
 
 from aegis_alpha.data.descriptor_tree import DescriptorTree
+from aegis_alpha.storage.input_pins import ConventionPin, read_convention
 from aegis_alpha.storage.market import verify_generation
 from aegis_alpha.storage.raw import verify_raw
-from aegis_alpha.storage.strategies import load_strategy
+from aegis_alpha.storage.strategies import verify_strategy_content
+from aegis_alpha.storage.strategy_import import verify_strategy_imports
 
 if TYPE_CHECKING:
     from aegis_alpha.storage.workspace import Workspace
@@ -59,7 +61,12 @@ def verify_workspace(workspace: Workspace) -> dict[str, object]:  # noqa: C901, 
         "SELECT strategy_id,version,raw_sha256 FROM strategy_versions"
     ).fetchall()
     for strategy in strategies:
-        load_strategy(workspace.strategies, *strategy)
+        verify_strategy_content(workspace.strategies, *strategy)
+    verify_strategy_imports(workspace)
+    for convention in workspace.state.execute(
+        "SELECT kind,convention_id,version,content_hash FROM conventions"
+    ):
+        read_convention(workspace.state, ConventionPin(*convention))
     for row in workspace.state.execute(
         "SELECT run_id,relative_path,size_bytes,content_hash FROM artifacts"
     ):
