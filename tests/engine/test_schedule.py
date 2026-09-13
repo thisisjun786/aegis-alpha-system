@@ -91,16 +91,9 @@ def _schedule(
         "request_cutoff_us": _us("2026-04-01T20:00:00+00:00"),
         "explicit_decision_dates": None,
     }
-    return decision_slots(sessions, **_unsafe_options(options, changes))
-
-
-def _unsafe_options(
-    valid: ScheduleArguments,
-    changes: dict[str, object],
-) -> ScheduleArguments:
-    """Deliberately malformed fixture kwargs cross this unsafe boundary to the validator."""
-    merged: dict[str, object] = {**valid, **changes}
-    return cast("ScheduleArguments", cast("object", merged))
+    # Deliberately malformed fixture kwargs cross this unsafe boundary to the validator.
+    merged = cast("object", {**options, **changes})
+    return decision_slots(sessions, **cast("ScheduleArguments", merged))
 
 
 def test_three_month_holidays_preserve_actual_decisions_and_prior_signal_month() -> None:
