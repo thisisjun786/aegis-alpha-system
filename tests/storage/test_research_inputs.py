@@ -381,6 +381,389 @@ def test_reference_prices_cannot_enter_canonical_generation_chain(tmp_path: Path
         ).fetchall() == [("g1",)]
 
 
+def _register_domain(workspace: Workspace, path: Path, domain: str) -> dict[str, object]:
+    module = importlib.import_module("aegis_alpha.storage.research_inputs")
+    register = getattr(module, "register_" + domain + "_input", None)
+    assert callable(register), f"retained {domain} registration is unavailable"
+    result = register(workspace, path, hashlib.sha256(path.read_bytes()).hexdigest())
+    assert isinstance(result, dict)
+    return result
+
+
+def _hash_json(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+
+
+def _sessions_spec(workspace: Workspace, path: Path, fields: dict[str, object]) -> Path:
+    common = {
+        key: value
+        for key, value in _source_row().items()
+        if key
+        in {
+            "generation_id",
+            "record_id",
+            "revision_id",
+            "supersedes_revision_id",
+            "op",
+            "available_at_us",
+            "revision_known_at_us",
+            "ingested_at_us",
+            "source_snapshot_id",
+            "source_row_hash",
+        }
+    }
+    common.update(available_at_us=None, revision_known_at_us=None)
+    row = {
+        **common,
+        "calendar_id": "CAL",
+        "venue": "SYNTHETIC",
+        "session_date": "2020-01-02",
+        "open_at_us": 10,
+        "close_at_us": 20,
+        "status": "open",
+        "timezone_version": "synthetic-v1",
+        **fields,
+    }
+    natural = ["calendar_id", "venue", "session_date"]
+    row["record_id"] = _hash_json(
+        ["aas-record-v1", "calendar_sessions", [[k, row[k]] for k in natural]]
+    )
+    spec = _spec(workspace, path, [row])
+    body = json.loads(spec.read_bytes())
+    for key in ("price", "decimal_conversion", "calendar"):
+        del body[key]
+    body["schema_version"] = "aas-sessions-transform-v1"
+    body["dataset"] = {
+        "dataset_id": "sessions",
+        "version": "1",
+        "generation_id": "sessions",
+        "operation_id": "op-sessions",
+        "parent_id": None,
+    }
+    body["instruments"] = []
+    body["calendar"] = {
+        "calendar_id": "CAL",
+        "venue": "SYNTHETIC",
+        "timezone": "Etc/UTC",
+        "timezone_version": "synthetic-v1",
+    }
+    spec.write_text(json.dumps(body, indent=2))
+    return spec
+
+
+def _proxy_definition(source: dict[str, object]) -> dict[str, object]:
+    return {
+        "proxy_id": "PROXY",
+        "version": "v1",
+        "normalization": {"input_number": "decimal_string", "output": "ieee754_binary64"},
+        "transition": {
+            "donor_id": "DONOR",
+            "target_id": "TARGET",
+            "logical_exposure_id": "EXPOSURE",
+            "switch_decision_date": "2020-01-02",
+            "mode": "signal_only",
+            "donor_source": source,
+            "target_source": source,
+            "basis_ref": {"id": "basis", "version": "1", "sha256": "d" * 64},
+            "calendar_ref": {"id": "CAL", "version": "1", "sha256": "e" * 64},
+            "cost_ref": {"id": "cost", "version": "1", "sha256": "f" * 64},
+        },
+    }
+
+
+def _proxy_spec(
+    workspace: Workspace, path: Path, identity: tuple[str, str, str | float | None]
+) -> Path:
+    # The proxy definition pins donor/target inputs independently of its point table.
+    donor = _spec(workspace, path.with_name(path.stem + "-donor.sqlite3"), [_source_row()])
+    definition = _proxy_definition(json.loads(donor.read_bytes())["source"])
+    proxy_id, version, value = identity
+    definition.update(proxy_id=proxy_id, version=version)
+    if isinstance(value, float):
+        definition["normalization"] = {"input_number": "ieee_float", "output": "ieee754_binary64"}
+    transition = definition["transition"]
+    assert isinstance(transition, dict)
+    # Bundle hashes cover immutable inputs, not generated floating-point output.
+    inputs = [
+        transition[k]
+        for k in ("donor_source", "target_source", "basis_ref", "calendar_ref", "cost_ref")
+    ]
+    row = {
+        k: v
+        for k, v in _source_row().items()
+        if k
+        in {
+            "generation_id",
+            "record_id",
+            "revision_id",
+            "supersedes_revision_id",
+            "op",
+            "available_at_us",
+            "revision_known_at_us",
+            "ingested_at_us",
+            "source_snapshot_id",
+            "source_row_hash",
+        }
+    }
+    row.update(
+        contract_id=proxy_id,
+        contract_version=version,
+        contract_hash=_hash_json(definition),
+        input_bundle_hash=_hash_json(inputs),
+        instrument_id="EXPOSURE",
+        feature_at_us=20,
+        value=value,
+        value_state="missing" if value is None else "present",
+        available_at_us=None,
+        revision_known_at_us=None,
+    )
+    natural = [
+        "contract_id",
+        "contract_version",
+        "input_bundle_hash",
+        "instrument_id",
+        "feature_at_us",
+    ]
+    row["record_id"] = _hash_json(
+        ["aas-record-v1", "feature_values", [[k, row[k]] for k in natural]]
+    )
+    spec = _spec(workspace, path, [row])
+    body = json.loads(spec.read_bytes())
+    for key in ("price", "calendar", "decimal_conversion"):
+        del body[key]
+    body.update(
+        schema_version="aas-proxy-transform-v1",
+        proxy=definition,
+        instruments=[{"instrument_id": "EXPOSURE", "asset_type": "proxy", "venue": "SYNTHETIC"}],
+    )
+    body["dataset"] = {
+        "dataset_id": path.stem,
+        "version": "1",
+        "generation_id": path.stem,
+        "operation_id": "op-" + path.stem,
+        "parent_id": None,
+    }
+    spec.write_text(json.dumps(body, indent=2))
+    return spec
+
+
+def test_sessions_preserve_explicit_times_and_unknown_publication(tmp_path: Path) -> None:
+    # Given explicit source times, When registered, Then neither knowledge nor timezone is invented.
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        path = _sessions_spec(workspace, tmp_path / "sessions.sqlite3", {})
+        result = _register_domain(workspace, path, "sessions")
+        assert _register_domain(workspace, path, "sessions") == result
+        row = market.read_generation(workspace.market, "sessions")[0]
+        assert [
+            row[k] for k in ("session_date", "open_at_us", "close_at_us", "timezone_version")
+        ] == [date(2020, 1, 2), 10, 20, "synthetic-v1"]
+        assert row["available_at_us"] is row["revision_known_at_us"] is None
+        assert (
+            workspace.state.execute("SELECT publication_at_us FROM source_snapshots").fetchall()[0][
+                0
+            ]
+            is None
+        )
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        assert (workspace.paths.raw / digest[:2] / digest).read_bytes() == path.read_bytes()
+
+
+def test_proxy_versions_and_distinct_ids_preserve_contracts(tmp_path: Path) -> None:
+    # Given two versions and a second ID, When registered, Then each has its own immutable contract.
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        for name, identity in (
+            ("p1", ("PROXY", "v1", "0.1")),
+            ("p2", ("PROXY", "v2", "125.5")),
+            ("p3", ("OTHER", "v1", "0.1")),
+        ):
+            path = _proxy_spec(workspace, tmp_path / (name + ".sqlite3"), identity)
+            body = json.loads(path.read_bytes())
+            result = _register_domain(workspace, path, "proxy")
+            assert _register_domain(workspace, path, "proxy") == result
+            row = market.read_generation(workspace.market, name)[0]
+            assert (row["contract_id"], row["contract_version"], row["contract_hash"]) == (
+                *identity[:2],
+                _hash_json(body["proxy"]),
+            )
+            assert isinstance(row["value"], float)
+            assert row["value"].hex() == (
+                "0x1.f600000000000p+6" if name == "p2" else "0x1.999999999999ap-4"
+            )
+            contract = workspace.state.execute(
+                "SELECT definition, record_schema, content_hash FROM feature_contracts "
+                "WHERE name=? AND version=?",
+                identity[:2],
+            ).fetchone()
+            assert tuple(contract) == (
+                json.dumps(
+                    body["proxy"], sort_keys=True, separators=(",", ":"), ensure_ascii=False
+                ),
+                "aas-market-rowset-v1",
+                _hash_json(body["proxy"]),
+            )
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            spec_pin = workspace.state.execute(
+                "SELECT ref_id, ref_version, content_hash FROM feature_inputs "
+                "WHERE name=? AND version=? AND ref_kind='transform'",
+                identity[:2],
+            ).fetchone()
+            assert spec_pin is not None
+            assert tuple(spec_pin) == (digest, "aas-proxy-transform-v1", digest)
+        assert workspace.market.execute("SELECT count(*) FROM prices").fetchone() == (0,)
+
+
+@pytest.mark.parametrize(
+    "fault", ["switch", "time", "policy", "source", "execution", "held", "asset-type"]
+)
+def test_proxy_invalid_contracts_fail_before_publication(tmp_path: Path, fault: str) -> None:
+    # Given inadmissible proxy metadata, When registering, Then no generation appears.
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        path = _proxy_spec(workspace, tmp_path / "p1.sqlite3", ("PROXY", "v1", "0.1"))
+        body = json.loads(path.read_bytes())
+        match fault:
+            case "switch":
+                del body["proxy"]["transition"]["switch_decision_date"]
+            case "time":
+                del body["columns"]["feature_at_us"]
+            case "policy":
+                body["proxy"]["normalization"]["output"] = "decimal_exact"
+            case "source":
+                body["proxy"]["transition"]["donor_source"]["source_sha256"] = "0" * 64
+            case "execution":
+                body["price"] = {"price_role": "canonical"}
+            case "held":
+                body["proxy"]["transition"]["held"] = True
+            case "asset-type":
+                body["instruments"][0]["asset_type"] = "equity"
+        path.write_text(json.dumps(body))
+        with pytest.raises((ValueError, TypeError)):
+            _register_domain(workspace, path, "proxy")
+        assert workspace.market.execute("SELECT count(*) FROM market_generations").fetchone() == (
+            0,
+        )
+
+
+@pytest.mark.parametrize("fault", ["time", "timezone", "calendar"])
+def test_sessions_missing_sources_fail_before_publication(tmp_path: Path, fault: str) -> None:
+    # Given a missing time mapping or conflicting calendar, When registering, Then fail closed.
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        path = _sessions_spec(workspace, tmp_path / "sessions.sqlite3", {})
+        body = json.loads(path.read_bytes())
+        if fault == "time":
+            del body["columns"]["open_at_us"]
+        else:
+            body["calendar"]["timezone" if fault == "timezone" else "calendar_id"] = "INVALID"
+        path.write_text(json.dumps(body))
+        with pytest.raises((ValueError, TypeError)):
+            _register_domain(workspace, path, "sessions")
+        assert workspace.market.execute("SELECT count(*) FROM market_generations").fetchone() == (
+            0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"), [(None, None), (0.5, "0x1.0000000000000p-1"), ("1e-400", "0x0.0p+0")]
+)
+def test_proxy_numeric_policy_and_missingness(
+    tmp_path: Path, value: str | float | None, expected: str | None
+) -> None:
+    # Given declared original types, When admitted, Then binary64 and null policy is observable.
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        path = _proxy_spec(workspace, tmp_path / "points.sqlite3", ("PROXY", "v1", value))
+        _register_domain(workspace, path, "proxy")
+        row = market.read_generation(workspace.market, "points")[0]
+        stored = row["value"]
+        assert (stored.hex() if isinstance(stored, float) else stored) == expected
+        assert row["value_state"] == ("missing" if value is None else "present")
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "1e309", "not-a-number"])
+def test_proxy_nonfinite_and_malformed_values_rejected(tmp_path: Path, value: str) -> None:
+    # Given inadmissible source numbers, When converting, Then no generation is visible.
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        path = _proxy_spec(workspace, tmp_path / "points.sqlite3", ("PROXY", "v1", value))
+        with pytest.raises(ValueError, match="proxy"):
+            _register_domain(workspace, path, "proxy")
+        assert workspace.market.execute("SELECT count(*) FROM market_generations").fetchone() == (
+            0,
+        )
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"status": "closed", "open_at_us": None, "close_at_us": None},
+        {"open_at_us": None},
+        {"close_at_us": 10},
+        {"open_at_us": -1},
+    ],
+)
+def test_sessions_closed_nulls_and_invalid_times(tmp_path: Path, fields: dict[str, object]) -> None:
+    # Given explicit closed nulls or invalid open times, When registering, Then never fill them.
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        path = _sessions_spec(workspace, tmp_path / "sessions.sqlite3", fields)
+        if fields.get("status") == "closed":
+            _register_domain(workspace, path, "sessions")
+            row = market.read_generation(workspace.market, "sessions")[0]
+            assert row["open_at_us"] is row["close_at_us"] is None
+            assert row["status"] == "closed"
+        else:
+            with pytest.raises(ValueError, match="session status"):
+                _register_domain(workspace, path, "sessions")
+            assert workspace.market.execute(
+                "SELECT count(*) FROM market_generations"
+            ).fetchone() == (0,)
+
+
+def test_proxy_conflicting_same_key_definition_preserves_old_pin(tmp_path: Path) -> None:
+    # Given a committed contract, When a new definition reuses its key, Then the old pin survives.
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        first = _proxy_spec(workspace, tmp_path / "first.sqlite3", ("PROXY", "v1", "0.1"))
+        _register_domain(workspace, first, "proxy")
+        old = publication.read_dataset(workspace, "first", "1")
+        second = _proxy_spec(workspace, tmp_path / "second.sqlite3", ("PROXY", "v1", "125.5"))
+        with pytest.raises(ValueError, match="conflict"):
+            _register_domain(workspace, second, "proxy")
+        assert publication.read_dataset(workspace, "first", "1") == old
+        assert workspace.market.execute(
+            "SELECT generation_id FROM market_generations"
+        ).fetchall() == [("first",)]
+
+
+def test_proxy_instrument_cannot_be_registered_as_ohlc(tmp_path: Path) -> None:
+    # Given complete but synthetic OHLC, When labeled as a proxy, Then it cannot enter prices.
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        path = _spec(workspace, tmp_path / "proxy.sqlite3", [_source_row()])
+        _change(
+            path,
+            "instruments",
+            [{"instrument_id": "ASSET_A", "asset_type": "proxy", "venue": "SYNTHETIC"}],
+        )
+        with pytest.raises(ValueError, match="proxy"):
+            _register(workspace, path)
+        assert workspace.market.execute("SELECT count(*) FROM prices").fetchone() == (0,)
+
+
 def test_final_import_envelope_respects_byte_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
