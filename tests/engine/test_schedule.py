@@ -8,12 +8,12 @@ from datetime import UTC, date, datetime
 from typing import TypedDict, cast
 
 import pytest
-from engine_support import bundle, contract, raw_bundle
 
 from aegis_alpha.engine import load_bundle, sha256_bytes
 from aegis_alpha.engine.calendar import prior_calendar_month_end
 from aegis_alpha.engine.models import CalendarConventions
 from aegis_alpha.engine.schedule import DecisionSlot, Session, decision_slots
+from tests.engine.engine_support import bundle, contract, raw_bundle
 
 INT64_MAX = 9_223_372_036_854_775_807
 
@@ -91,8 +91,16 @@ def _schedule(
         "request_cutoff_us": _us("2026-04-01T20:00:00+00:00"),
         "explicit_decision_dates": None,
     }
-    # Deliberately untyped external mutations exercise the actual public boundary.
-    return decision_slots(sessions, **cast("ScheduleArguments", {**options, **changes}))
+    return decision_slots(sessions, **_unsafe_options(options, changes))
+
+
+def _unsafe_options(
+    valid: ScheduleArguments,
+    changes: dict[str, object],
+) -> ScheduleArguments:
+    """Deliberately malformed fixture kwargs cross this unsafe boundary to the validator."""
+    merged: dict[str, object] = {**valid, **changes}
+    return cast("ScheduleArguments", cast("object", merged))
 
 
 def test_three_month_holidays_preserve_actual_decisions_and_prior_signal_month() -> None:
