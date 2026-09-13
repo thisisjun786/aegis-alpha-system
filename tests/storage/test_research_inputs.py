@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from aegis_alpha.storage import market, publication, source_library
+from aegis_alpha.storage import import_document, market, publication, source_library
 from aegis_alpha.storage.workspace import initialize, open_workspace
 from tests.storage.test_publication import document
 
@@ -65,6 +65,46 @@ def registration_state(workspace: Workspace) -> dict[str, object]:
             if path.is_file()
         },
     }
+
+
+@pytest.mark.parametrize("kind", ["price", "sessions", "proxy"])
+def test_latest_destination_rejected_before_publication(tmp_path: Path, kind: str) -> None:
+    # Given a historical generic latest publication and otherwise valid retained sources.
+    home = tmp_path / "home"
+    _ = initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        historical = document().replace(b'"version": "1"', b'"version": "latest"')
+        historical = historical.replace(b'"revision_id": "r1"', b'"revision_id": "historical-r1"')
+        _ = publication.publish_document(workspace, import_document.parse_import(historical))
+        old = publication.read_dataset(workspace, "synthetic-prices", "latest")
+        path = registration_spec(
+            workspace, tmp_path / "source.sqlite3", "prices" if kind == "price" else kind
+        )
+        destination = {
+            "dataset_id": "candidate",
+            "version": "latest",
+            "generation_id": "candidate",
+            "operation_id": "op-candidate",
+            "parent_id": None,
+        }
+        _change(path, "dataset", destination)
+        before = registration_state(workspace)
+        # When admitting lowercase latest, Then no raw, contract, intent or market writes occur.
+        with pytest.raises(ValueError, match=r"version.*latest"):
+            _ = _register_domain(workspace, path, kind)
+        assert registration_state(workspace) == before
+        assert publication.read_dataset(workspace, "synthetic-prices", "latest") == old
+        assert market.read_generation(workspace.market, "synthetic-generation")[0][
+            "close"
+        ] == Decimal(11)
+        # The same retained sources really publish with an ordinary exact destination version.
+        _change(path, "dataset", {**destination, "version": "1"})
+        result = _register_domain(workspace, path, kind)
+        assert result["published"] is True
+        committed = registration_state(workspace)
+        assert _register_domain(workspace, path, kind) == result
+        assert registration_state(workspace) == committed
+        assert publication.read_dataset(workspace, "synthetic-prices", "latest") == old
 
 
 @pytest.mark.parametrize("kind", ["price", "sessions", "proxy"])

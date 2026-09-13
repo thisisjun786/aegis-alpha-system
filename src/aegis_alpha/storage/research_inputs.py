@@ -123,6 +123,8 @@ def _destination(value: object) -> dict[str, object]:
     for key, item in dataset.items():
         if key != "parent_id" or item is not None:
             _text(item)
+    if dataset["version"] == "latest":
+        raise ValueError("research destination version must be exact, not latest")
     return dataset
 
 

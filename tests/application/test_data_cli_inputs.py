@@ -76,6 +76,114 @@ def registration_source(root: Path, kind: str) -> tuple[Path, Path]:
 
 
 @pytest.mark.parametrize("kind", ["prices", "sessions", "proxy"])
+def test_latest_destination_has_no_publication(tmp_path: Path, kind: str) -> None:
+    # Given valid source/hash fixtures and an already committed publication.
+    home, path = registration_source(tmp_path, kind)
+    body = obj(decode_json(path.read_bytes()))
+    obj(body["dataset"])["version"] = "latest"
+    _ = path.write_text(json.dumps(body))
+    with open_workspace(home) as workspace:
+        before = registration_state(workspace)
+    # When the fresh native command admits latest, Then only a controlled error is returned.
+    result = run_cli(
+        "data",
+        "register-" + kind,
+        "--spec",
+        str(path),
+        "--sha256",
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+        home=home,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stdout == ""
+    error = obj(decode_json(result.stderr.encode()))["error"]
+    assert isinstance(error, str)
+    assert "version" in error
+    assert "latest" in error
+    assert len(result.stderr.encode()) < 1024  # noqa: PLR2004 -- bounded CLI diagnostic
+    with open_workspace(home) as workspace:
+        assert registration_state(workspace) == before
+
+
+@pytest.mark.parametrize("kind", ["prices", "sessions", "proxy"])
+@pytest.mark.parametrize("version", ["1", "Latest", "LATEST", "LaTeSt", "release/v1"])
+def test_exact_destination_versions_remain_pinnable(
+    tmp_path: Path, kind: str, version: str
+) -> None:
+    # Given opaque exact versions and IDs equal to the reserved version sentinel.
+    home, path = registration_source(tmp_path, kind)
+    _change(
+        path,
+        "dataset",
+        {
+            "dataset_id": "latest",
+            "version": version,
+            "generation_id": "latest",
+            "operation_id": "latest",
+            "parent_id": None,
+        },
+    )
+    result = hashed(home, "register-" + kind, path)
+    assert result["published"] is True
+    assert (result["dataset_id"], result["version"], result["generation_id"]) == (
+        "latest",
+        version,
+        "latest",
+    )
+    with open_workspace(home) as workspace:
+        committed = registration_state(workspace)
+    assert hashed(home, "register-" + kind, path) == result
+    # Construct the pin from actual catalog fields, then read the specialized data.
+    exact = GenerationPin(**pin(home, "latest", version))
+    assert (exact.dataset_id, exact.version, exact.generation_id) == ("latest", version, "latest")
+    with price_compute() as budget, open_workspace(home) as workspace:
+        assert budget is not None
+        if kind == "prices":
+            series = load_pinned_prices(
+                workspace,
+                PriceInputRequest(
+                    pin=exact,
+                    sessions_pin=None,
+                    instrument_ids=("ASSET_A",),
+                    session_dates=(DAY,),
+                    currency="USD",
+                    basis="unadjusted",
+                    price_role="canonical",
+                    calendar_id="synthetic-calendar",
+                    venue="SYNTHETIC",
+                    timezone_version="synthetic-v1",
+                ),
+                budget=budget,
+            )
+            rows = series.project_as_of(30, session_date=DAY).rows
+            assert len(rows) == 1
+            assert str(rows[0]["close"]) == "11.000000000000"
+        elif kind == "sessions":
+            rows = (
+                load_pinned_sessions(workspace, exact, budget=budget)
+                .project_as_of(30, mode="observed_snapshot_research")
+                .rows
+            )
+            assert len(rows) == 1
+            assert [rows[0][key] for key in ("session_date", "open_at_us", "close_at_us")] == [
+                date(2020, 1, 2),
+                10,
+                20,
+            ]
+        else:
+            rows = (
+                load_pinned_proxy(workspace, exact, budget=budget)
+                .project_as_of(30, mode="observed_snapshot_research")
+                .rows
+            )
+            assert len(rows) == 1
+            value = rows[0]["value"]
+            assert isinstance(value, float)
+            assert value.hex() == "0x1.999999999999ap-4"
+        assert registration_state(workspace) == committed
+
+
+@pytest.mark.parametrize("kind", ["prices", "sessions", "proxy"])
 @pytest.mark.parametrize(("encoding", "bom"), NON_UTF8_TRANSFORMS)
 def test_non_utf8_registration_has_no_publication(
     tmp_path: Path, kind: str, encoding: str, bom: bytes
