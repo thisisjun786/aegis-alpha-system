@@ -47,14 +47,24 @@ def test_price_budget_rechecks_headroom_after_waiting_for_shared_lease(
     monkeypatch.setenv("AAS_HOST_CPU_LIMIT", "20")
     monkeypatch.setenv("AAS_HOST_MEMORY_LIMIT_BYTES", str(512 * _MIB))
     monkeypatch.setenv("AAS_COMPUTE_LOCK_FILE", str(tmp_path / "compute.lock"))
-    probed = Event()
+    denied = Event()
     available = [256 * _MIB]
+    observations: list[int] = []
+    flock = compute_resources.fcntl.flock
+
+    def observe(fd: int, operation: int) -> None:
+        try:
+            flock(fd, operation)
+        except BlockingIOError:
+            denied.set()
+            raise
 
     def inspect(_pid: int = 0) -> VisibleLimits:
-        probed.set()
+        observations.append(available[0])
         return VisibleLimits(Fraction(4), available[0])
 
     monkeypatch.setattr(compute_resources, "inspect_visible_limits", inspect)
+    monkeypatch.setattr(compute_resources.fcntl, "flock", observe)
 
     def read_budget() -> int | None:
         with price_compute() as budget:
@@ -64,7 +74,9 @@ def test_price_budget_rechecks_headroom_after_waiting_for_shared_lease(
     with ThreadPoolExecutor(max_workers=1) as pool:
         with compute_lease(tmp_path / "compute.lock"):
             task = pool.submit(read_budget)
-            assert probed.wait(timeout=5)
+            assert denied.wait(timeout=5)
+            assert observations == [256 * _MIB]
             assert not task.done()
             available[0] = 64 * _MIB
         assert task.result(timeout=5) == 64 * _MIB
+    assert observations == [256 * _MIB, 64 * _MIB]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,15 @@ from aegis_alpha.storage.strategy_import import register_strategy
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace, write_json
 from tests.engine.engine_support import contract, raw_bundle
+from tests.storage.test_membership_pins import (
+    I1,
+    U1,
+    VECTORS,
+    evidence,
+    register,
+    source_evidence,
+    state_image,
+)
 from tests.storage.test_publication import document
 
 _MIN_BACKUP_FILES = 5
@@ -229,3 +239,132 @@ def test_streamed_source_archive_survives_backup_restore(tmp_path: Path) -> None
                 "FROM source_snapshots WHERE snapshot_id='local-copy'"
             ).fetchone()
         ) == (1, 2, None)
+
+
+def test_membership_backup_reconstructs_all_literal_vectors_without_originals(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "memberships"
+    initialize(home)
+    documents = tmp_path / "documents"
+    documents.mkdir()
+    pins = []
+    with open_workspace(home, writable=True) as workspace:
+        source_evidence(workspace)
+        for index, (raw, _, digest) in enumerate(VECTORS):
+            path = documents / f"{index}.json"
+            path.write_bytes(raw)
+            pin = register(workspace, path.read_bytes())
+            assert pin.content_hash == digest
+            pins.append(pin)
+            path.unlink()
+        # Closed, quarantined source evidence with no files is valid preservation,
+        # not source eligibility or execution readiness.
+        workspace.state.execute(
+            "INSERT INTO source_snapshots VALUES ('q','other',0,0,NULL,'quarantined')"
+        )
+        workspace.state.commit()
+        body = json.loads(U1)
+        body["universe_id"] = "quarantined"
+        body["members"][0]["source_snapshot_id"] = "q"
+        body["sources"] = [
+            {
+                "snapshot_id": "q",
+                "provider": "other",
+                "requested_at_us": 0,
+                "retrieved_at_us": 0,
+                "publication_at_us": None,
+                "status": "quarantined",
+                "files": [],
+            }
+        ]
+        register(workspace, json.dumps(body).encode())
+        before = state_image(workspace)
+    documents.rmdir()
+    root = Path(str(backup(home)["backup_root"]))
+    restored = tmp_path / "restored-memberships"
+    assert restore(root, restored)["restored"] is True
+    with open_workspace(restored) as workspace:
+        assert state_image(workspace) == before
+        for pin, (raw, _, digest) in zip(pins, VECTORS, strict=True):
+            actual = evidence(workspace, pin)
+            assert actual.canonical_bytes == raw
+            assert actual.pin.content_hash == digest
+        assert verify_workspace(workspace)["verified"] is True
+
+
+@pytest.mark.parametrize("fault", ["member", "join", "interval", "inventory"])
+def test_corrupt_membership_backup_rejected_with_refreshed_outer_hashes(
+    tmp_path: Path, fault: str
+) -> None:
+    home = tmp_path / "original"
+    initialize(home)
+    with open_workspace(home, writable=True) as workspace:
+        source_evidence(workspace)
+        register(workspace, I1)
+    root = Path(str(backup(home)["backup_root"]))
+    with closing(sqlite3.connect(root / "state.sqlite3")) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        schema_query = (
+            "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master ORDER BY type,name"
+        )
+        original_schema = connection.execute(schema_query).fetchall()
+        trigger_sql = {name: sql for kind, name, _, _, sql in original_schema if kind == "trigger"}
+        if fault == "member":
+            connection.execute(
+                "INSERT INTO identity_assertions VALUES "
+                "('b','ASSET_A','synthetic','ticker','A',0,25,35,'a','s',?)",
+                ("d" * 64,),
+            )
+            connection.execute(
+                "INSERT INTO identity_snapshot_members VALUES ('ids',1,'b',0,25,35,NULL)"
+            )
+        elif fault == "join":
+            connection.execute("INSERT INTO instruments VALUES ('OTHER',NULL,'etf','X')")
+            connection.execute("DROP TRIGGER immutable_identity_assertions_update")
+            connection.execute("UPDATE identity_assertions SET instrument_id='OTHER'")
+            connection.execute(trigger_sql["immutable_identity_assertions_update"])
+        elif fault == "interval":
+            connection.execute("DROP TRIGGER immutable_identity_snapshot_members_update")
+            connection.execute("UPDATE identity_snapshot_members SET known_to_us=36")
+            connection.execute(trigger_sql["immutable_identity_snapshot_members_update"])
+        else:
+            connection.execute(
+                "INSERT INTO source_files VALUES ('s','new-evidence',?,0)",
+                (hashlib.sha256(b"").hexdigest(),),
+            )
+        connection.commit()
+        assert connection.execute(schema_query).fetchall() == original_schema
+        assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    raw = (root / "state.sqlite3").read_bytes()
+    manifest = json.loads((root / "backup.json").read_bytes())
+    manifest["files"]["state.sqlite3"] = {
+        "size_bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    write_json(root / "backup.json", manifest)
+    before = (root / "state.sqlite3").read_bytes()
+    target = tmp_path / "rejected"
+    with pytest.raises(ValueError, match=r"membership.*mismatch"):
+        restore(root, target)
+    assert json.loads((target / "installation.json").read_bytes())["phase"] == "restore-incomplete"
+    assert (root / "state.sqlite3").read_bytes() == before
+
+
+def test_arbitrary_membership_header_blocks_backup_without_mutation(tmp_path: Path) -> None:
+    home = tmp_path / "old-store"
+    initialize(home)
+    with open_workspace(home, writable=True) as workspace:
+        workspace.state.execute(
+            "INSERT INTO identity_snapshots VALUES ('unverified',?,0)", ("b" * 64,)
+        )
+        workspace.state.commit()
+        before = state_image(workspace)
+    target = tmp_path / "must-not-exist"
+    with pytest.raises(ValueError, match=r"membership.*mismatch"):
+        backup(home, target)
+    assert not target.exists()
+    with open_workspace(home) as workspace:
+        assert state_image(workspace) == before

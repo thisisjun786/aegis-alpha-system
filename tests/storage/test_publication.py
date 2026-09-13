@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
 
-from aegis_alpha.storage import publication
+from aegis_alpha.compute_resources import ComputeBudget
+from aegis_alpha.storage import market, publication
 from aegis_alpha.storage.import_document import parse_import
 from aegis_alpha.storage.workspace import initialize, open_workspace
 
@@ -158,3 +161,50 @@ def test_markerless_operation_can_be_quarantined_without_delete(tmp_path: Path) 
             workspace.state.execute("SELECT phase FROM storage_operations").fetchone()[0]
             == "QUARANTINED"
         )
+
+
+def test_full_chain_count_is_not_head_catalog_delta_count(tmp_path: Path) -> None:
+    home = tmp_path / "aas"
+    initialize(home)
+    base = json.loads(document())
+    base["rows"].append({**base["rows"][0], "session_date": "2026-01-03", "close": "21"})
+    child = {
+        **base,
+        "version": "2",
+        "generation_id": "g2",
+        "operation_id": "op2",
+        "parent_id": "synthetic-generation",
+        "rows": [
+            {
+                **base["rows"][0],
+                "revision_id": "r2",
+                "op": "SUPERSEDE",
+                "supersedes_revision_id": "r1",
+                "close": "12",
+                "available_at_us": 40,
+                "revision_known_at_us": 40,
+            }
+        ],
+    }
+    with open_workspace(home, writable=True) as workspace:
+        publication.publish_document(workspace, parse_import(json.dumps(base).encode()))
+        publication.publish_document(workspace, parse_import(json.dumps(child).encode()))
+    with open_workspace(home) as workspace:
+        assert {
+            version: publication.read_dataset(workspace, "synthetic-prices", version)["row_count"]
+            for version in ("1", "2")
+        } == {"1": 2, "2": 1}
+        rows = market.read_chain_rows(
+            workspace.market, "g2", budget=ComputeBudget(Fraction(1), 64 * 1024 * 1024)
+        )
+    # The detached immutable history can be projected after workspace admission closes.
+    expected_chain_count = 3
+    assert len(rows) == expected_chain_count
+    assert {row["close"] for row in market.project_heads(rows, cutoff_us=30)} == {
+        Decimal(11),
+        Decimal(21),
+    }
+    assert {row["close"] for row in market.project_heads(rows, cutoff_us=40)} == {
+        Decimal(12),
+        Decimal(21),
+    }

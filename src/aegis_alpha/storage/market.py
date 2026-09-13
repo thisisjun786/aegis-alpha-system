@@ -7,10 +7,13 @@ import json
 import math
 import time
 import uuid
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, localcontext
+from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
 
+from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.storage.market_schema import COMMON, DDL, DOMAINS, NATURAL_KEYS
 
 if TYPE_CHECKING:
@@ -443,8 +446,15 @@ def verify_generation(
     connection: duckdb.DuckDBPyConnection, generation_id: str
 ) -> dict[str, object]:
     chain = generation_chain(connection, generation_id)
+    _ = _verified_chain_rows(connection, chain)
+    return chain[-1]
+
+
+def _verified_chain_rows(
+    connection: duckdb.DuckDBPyConnection, chain: list[dict[str, object]]
+) -> list[dict[str, object]]:
     parent_hash = None
-    prior = []
+    prior: list[dict[str, object]] = []
     expected_dataset = chain[-1]["dataset_id"]
     expected_domain = chain[-1]["domain"]
     for ordinal, marker in enumerate(chain, 1):
@@ -490,12 +500,143 @@ def verify_generation(
         ):
             raise ValueError("market generation logical hash/count mismatch")
         _validate_revisions(prior, rows)
-        prior.extend(rows)
+        prior.extend(sorted(rows, key=lambda row: str(row["record_id"])))
         parent_hash = chain_hash
-    return chain[-1]
+    return prior
 
 
-def read_generation(  # noqa: C901 -- ordered point-in-time revision replay
+def read_chain_rows(
+    connection: duckdb.DuckDBPyConnection,
+    generation_id: str,
+    *,
+    budget: ComputeBudget,
+) -> tuple[Mapping[str, object], ...]:
+    """Read every verified delta, oldest generation first, with immutable rows.
+
+    Call under workspace admission, as for read_generation. The caller supplies
+    its compute allocation; this function neither resolves host limits nor takes
+    a second compute lease. Admission reserves DuckDB's share of that allocation
+    and estimates Python rows, revision indexes, projection copies and hash buffers
+    from actual counts and text lengths before fetching any delta. This is a
+    conservative materialization estimate, not a process RSS or performance bound.
+    An over-budget history raises ComputeResourceError, never a truncated success.
+    DuckDB limits are lowered before queries and remain lowered on success/error;
+    the caller still owns the connection. Tighter existing limits are never raised.
+
+    Catalog visibility remains publication.read_dataset's responsibility. Each
+    market delta is checked against its own marker, not the head's delta count.
+    """
+    import duckdb  # noqa: PLC0415 -- capacity errors at the budgeted query boundary
+
+    try:
+        _ = connection.execute(
+            "SET threads = least(current_setting('threads'), ?)", [budget.duckdb_threads]
+        )
+        # Compare the same rounded-down display precision on both sides. Leave a
+        # clearly tighter limit untouched; in the same display bucket conservatively
+        # use its lower bound, since the exact existing bytes are not exposed.
+        memory, budget_floor = cast(
+            "tuple[int, int]",
+            connection.execute(
+                """SELECT parse_formatted_bytes(current_setting('memory_limit')),
+                          parse_formatted_bytes(format_bytes(?))""",
+                [budget.duckdb_memory_limit_bytes],
+            ).fetchone(),
+        )
+        if memory >= budget_floor:
+            _ = connection.execute(
+                "SET memory_limit = ?", [f"{min(memory, budget.duckdb_memory_limit_bytes)}B"]
+            )
+        chain = generation_chain(connection, generation_id)
+        _admit_chain_memory(connection, chain, budget)
+        return tuple(MappingProxyType(row) for row in _verified_chain_rows(connection, chain))
+    except duckdb.OutOfMemoryException as error:
+        raise ComputeResourceError(
+            "DuckDB cannot execute chain read within admitted memory limits"
+        ) from error
+
+
+def _admit_chain_memory(
+    connection: duckdb.DuckDBPyConnection,
+    chain: list[dict[str, object]],
+    budget: ComputeBudget,
+) -> None:
+    # Fixed row/cell allowances cover Python objects, maps, indexes and copies;
+    # text has room for four-byte Unicode plus simultaneous rowset encodings.
+    estimated_bytes = 64 * 1024
+    for marker in chain:
+        domain = str(marker["domain"])
+        if domain not in DOMAINS:
+            raise ValueError("invalid generation schema/chain sequence")
+        schema = COMMON + DOMAINS[domain]
+        text_lengths = " + ".join(
+            f'coalesce(length("{name}"), 0)'
+            for name, kind in schema
+            if kind.rstrip("?") == "VARCHAR"
+        )
+        count, characters = cast(
+            "tuple[int, int]",
+            connection.execute(
+                f'SELECT count(*), coalesce(sum({text_lengths}), 0) FROM "{domain}" '  # noqa: S608 -- code-owned schema
+                "WHERE generation_id=?",
+                [marker["generation_id"]],
+            ).fetchone(),
+        )
+        if count != marker["row_count"]:
+            raise ValueError("market generation logical hash/count mismatch")
+        estimated_bytes += 1024 + count * (1024 + 256 * len(schema)) + 32 * characters
+    available_bytes = budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes
+    if estimated_bytes > available_bytes:
+        raise ComputeResourceError(
+            f"full market chain memory estimate {estimated_bytes} exceeds "
+            f"admitted materialization budget {available_bytes} bytes"
+        )
+
+
+def _validate_cutoffs(cutoff_us: int | None, ingestion_cutoff_us: int | None) -> None:
+    for cutoff in (cutoff_us, ingestion_cutoff_us):
+        if cutoff is not None and (type(cutoff) is not int or cutoff < 0):
+            raise ValueError("cutoff must be UTC microseconds")
+
+
+def project_heads(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    cutoff_us: int | None = None,
+    ingestion_cutoff_us: int | None = None,
+) -> list[dict[str, object]]:
+    """Project a complete read_chain_rows history without mutating or limiting it.
+
+    Input order is generation order, not knowledge-time order. With a strict
+    cutoff, unknown knowledge is skipped; a known but unavailable superseding
+    revision removes its prior head. Reference prices are excluded only in this
+    strict mode. Without a cutoff this retains the legacy observed-head behavior.
+    """
+    _validate_cutoffs(cutoff_us, ingestion_cutoff_us)
+    heads: dict[str, Mapping[str, object]] = {}
+    for row in rows:
+        record_id = str(row["record_id"])
+        if (
+            ingestion_cutoff_us is not None
+            and cast("int", row["ingested_at_us"]) > ingestion_cutoff_us
+        ):
+            continue
+        if cutoff_us is not None:
+            known = row["revision_known_at_us"]
+            available = row["available_at_us"]
+            if known is None or cast("int", known) > cutoff_us:
+                continue
+            if available is None or cast("int", available) > cutoff_us:
+                if row["op"] != "ASSERT":
+                    _ = heads.pop(record_id, None)
+                continue
+            if row.get("price_role") == "reference":
+                continue
+        heads[record_id] = row
+    return [dict(heads[key]) for key in sorted(heads) if heads[key]["op"] != "TOMBSTONE"]
+
+
+def read_generation(
     connection: duckdb.DuckDBPyConnection,
     generation_id: str,
     *,
@@ -505,38 +646,7 @@ def read_generation(  # noqa: C901 -- ordered point-in-time revision replay
 ) -> list[dict[str, object]]:
     if type(limit) is not int or not 1 <= limit <= _MAX_READ_ROWS:
         raise ValueError("limit must be between 1 and 100000")
-    for cutoff in (cutoff_us, ingestion_cutoff_us):
-        if cutoff is not None and (type(cutoff) is not int or cutoff < 0):
-            raise ValueError("cutoff must be UTC microseconds")
-    verify_generation(connection, generation_id)
-    chain = generation_chain(connection, generation_id)
-    heads: dict[str, dict[str, object]] = {}
-    for marker in chain:
-        rows = _rows(connection, str(marker["domain"]), [str(marker["generation_id"])])
-        for row in sorted(
-            rows,
-            key=lambda r: (
-                str(r["record_id"]),
-                r["revision_known_at_us"] if r["revision_known_at_us"] is not None else 2**63,
-                str(r["revision_id"]),
-            ),
-        ):
-            record_id = str(row["record_id"])
-            if (
-                ingestion_cutoff_us is not None
-                and cast("int", row["ingested_at_us"]) > ingestion_cutoff_us
-            ):
-                continue
-            if cutoff_us is not None:
-                known = row["revision_known_at_us"]
-                available = row["available_at_us"]
-                if known is None or cast("int", known) > cutoff_us:
-                    continue
-                if available is None or cast("int", available) > cutoff_us:
-                    if row["op"] != "ASSERT":
-                        heads.pop(record_id, None)
-                    continue
-                if row.get("price_role") == "reference":
-                    continue
-            heads[str(row["record_id"])] = row
-    return [heads[key] for key in sorted(heads) if heads[key]["op"] != "TOMBSTONE"][:limit]
+    _validate_cutoffs(cutoff_us, ingestion_cutoff_us)
+    # Preserve the legacy interface without requiring a new compute allocation.
+    rows = _verified_chain_rows(connection, generation_chain(connection, generation_id))
+    return project_heads(rows, cutoff_us=cutoff_us, ingestion_cutoff_us=ingestion_cutoff_us)[:limit]

@@ -38,6 +38,34 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
         if name == "restore":
             command.add_argument("--backup", type=Path, required=True)
     _source_parsers(sub)
+    _strategy_parsers(commands)
+    data = commands.add_parser("data", help="Read and publish pinned local market generations")
+    _home(data)
+    sub = data.add_subparsers(dest="data_command", required=True)
+    _home(sub.add_parser("datasets"))
+    importer = sub.add_parser("import", help="Import a validated local typed data envelope")
+    _home(importer)
+    importer.add_argument("file", type=Path)
+    importer.add_argument("--sha256", required=True)
+    for name in ("register-prices", "register-sessions", "register-proxy", "read-prices"):
+        command = sub.add_parser(name, help="Use an exact versioned research input document")
+        _home(command)
+        command.add_argument(
+            "--request" if name == "read-prices" else "--spec", type=Path, required=True
+        )
+        command.add_argument("--sha256", required=True)
+    for name in ("inspect", "read"):
+        reader = sub.add_parser(name)
+        _home(reader)
+        reader.add_argument("--dataset", required=True)
+        reader.add_argument("--version", required=True)
+        if name == "read":
+            reader.add_argument("--cutoff-us", type=int)
+            reader.add_argument("--ingestion-cutoff-us", type=int)
+            reader.add_argument("--limit", type=int, default=100)
+
+
+def _strategy_parsers(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     strategy = commands.add_parser("strategy", help="Manage the private strategy database")
     _home(strategy)
     sub = strategy.add_subparsers(dest="strategy_command", required=True)
@@ -56,23 +84,6 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
         show.add_argument(f"--{option}", required=True)
     show.add_argument("--requirements", type=Path, help="Pinned execution-requirements JSON file")
     show.add_argument("--requirements-sha256", help="SHA-256 of exact requirements file bytes")
-    data = commands.add_parser("data", help="Read and publish pinned local market generations")
-    _home(data)
-    sub = data.add_subparsers(dest="data_command", required=True)
-    _home(sub.add_parser("datasets"))
-    importer = sub.add_parser("import", help="Import a validated local typed data envelope")
-    _home(importer)
-    importer.add_argument("file", type=Path)
-    importer.add_argument("--sha256", required=True)
-    for name in ("inspect", "read"):
-        reader = sub.add_parser(name)
-        _home(reader)
-        reader.add_argument("--dataset", required=True)
-        reader.add_argument("--version", required=True)
-        if name == "read":
-            reader.add_argument("--cutoff-us", type=int)
-            reader.add_argument("--ingestion-cutoff-us", type=int)
-            reader.add_argument("--limit", type=int, default=100)
 
 
 def _source_parsers(sub: argparse._SubParsersAction) -> None:
@@ -112,9 +123,28 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             from aegis_alpha.storage.backup import restore
 
             return restore(args.backup.absolute(), home)
+        if args.command == "data" and args.data_command == "read-prices":
+            from aegis_alpha.application.compute_cli import price_compute
+            from aegis_alpha.application.data_cli import read_price_input
+            from aegis_alpha.storage.locks import private_directory, storage_lock_targets
+            from aegis_alpha.storage.paths import load_paths
+
+            private_directory(home)
+            targets = storage_lock_targets(home, load_paths(home).stores())
+            with price_compute(excluded_locks=targets) as budget:
+                if budget is None:
+                    raise ValueError(
+                        "read-prices requires the explicit AAS compute budget environment"
+                    )
+                with open_workspace(home, require_strategies=False) as workspace:
+                    return read_price_input(workspace, args.request, args.sha256, budget=budget)
         mutation = (
             (args.command == "strategy" and args.strategy_command == "import")
-            or (args.command == "data" and args.data_command == "import")
+            or (
+                args.command == "data"
+                and args.data_command
+                in {"import", "register-prices", "register-sessions", "register-proxy"}
+            )
             or (
                 args.command == "db"
                 and args.db_command in {"recover", "quarantine", "source-import"}
@@ -125,6 +155,10 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             writable=mutation,
             strategy_write=mutation,
             require_strategies=args.command == "strategy"
+            or (
+                args.command == "data"
+                and args.data_command in {"register-prices", "register-sessions", "register-proxy"}
+            )
             or (
                 args.command == "db"
                 and args.db_command
@@ -159,9 +193,9 @@ def _workspace_command(workspace: object, args: argparse.Namespace) -> dict[str,
         return recover_operations(workspace)
     if args.command == "strategy":
         return _strategy_command(workspace, args)
-    from aegis_alpha.storage.publication import execute_data
+    from aegis_alpha.application.data_cli import execute_native_data
 
-    return execute_data(workspace, args)
+    return execute_native_data(workspace, args)
 
 
 def _strategy_command(workspace: Workspace, args: argparse.Namespace) -> dict[str, object]:

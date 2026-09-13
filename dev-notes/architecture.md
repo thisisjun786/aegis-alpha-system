@@ -111,6 +111,20 @@ universe·전략·시장 관례의 exact version/hash를 묶고, 각 의사결�
 내용 해시를 다시 계산한 뒤 제한된 크기로 읽는다. 다른 테이블 전체를 재검사하지 않는다.
 읽은 자료가 시점에 적합하거나 거래 가능한지는 별도 입력 계약이 판단한다.
 
+`storage/research_inputs`는 원본 자료실의 테이블을 해시로 고정한 변환 문서로만 시장
+generation에 게시한다. 문서가 원본 pin, 대상 dataset, 열 연결, 종목, 기준·통화·역할, 달력과
+숫자 변환 정책을 명시하고 원문은 `raw/`에 보존된다. 공통 revision 열은 원본에서 읽으며
+만들어 채우지 않는다. 십진 변환은 정확해야 하고 일부만 있는 OHLCV는 거부한다. 프록시 지수
+점은 `feature_values`에 DOUBLE로 저장하며 정의별 contract ID·버전과 입력 pin을
+`feature_contracts`·`feature_inputs`에 남긴다. 프록시는 실행 불가이고 체결 재원은 실제 ETF
+OHLC뿐이다. `storage/market_inputs`는 명시한 generation pin과 compute 예산으로 전체 revision
+chain을 준비하고 각 결정 시각을 그 chain에서 투영한다. strict PIT는 이후 revision, 알 수 없는
+인지 시각, 참조 가격을 제외한다. 명시한 observed snapshot 연구 모드는 인증되지 않은 채 남고
+strict 읽기를 바꾸지 않는다. coverage는 요청 격자 전체를 기록하며 잘린 이력을 성공으로
+돌려주지 않는다. 등록·조회 명령과 문서 필드는
+[operations](operations.md#원본-자료의-연구-입력-등록과-고정-조회)가 소유한다. 이 경로는
+원본의 진위나 PIT 자격을 인증하지 않으며 백테스트 입력으로 자동 승격하지 않는다.
+
 `engine/execution.py`는 외부의 목표 비중·시가·종가·거래일과 비용을 받아 일별 NAV와 체결
 원장을 계산한다. `aas backtest --input ... --sha256 ...`는 이지스의 ETF 양수 비중만
 허용한다. 파일 해시는 제출한 입력의 동일성을 확인하며, 입력 가격의 출처를 인증하지
