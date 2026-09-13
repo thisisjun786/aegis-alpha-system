@@ -214,6 +214,9 @@ def _read_price_input(workspace: Workspace, path: Path, sha256: str) -> dict[str
     if hashlib.sha256(raw).hexdigest() != sha256:
         raise ValueError("research request bytes do not match the expected SHA-256")
     raw.decode("utf-8")  # json.loads(bytes) also accepts UTF-16/32; this contract does not.
+    # BOM-less UTF-16/32 ASCII can decode as UTF-8 with NULs, then be autodetected as bytes.
+    if b"\x00" in raw:
+        raise ValueError("research request requires UTF-8 JSON without literal NUL bytes")
     body = _input_object(decode_json(raw), {"schema_version", "prices", "decision"})
     if body["schema_version"] != "aas-price-input-request-v1":
         raise ValueError("unsupported research request schema")

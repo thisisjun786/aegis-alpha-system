@@ -346,6 +346,35 @@ def rejected(home: Path, path: Path, raw: bytes) -> str:
     return error
 
 
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"])
+def test_bomless_non_utf8_request_is_rejected(
+    registered: tuple[Path, dict[str, Path]], tmp_path: Path, encoding: str
+) -> None:
+    # Given valid generated pins encoded without a BOM and hashed as their exact file bytes.
+    home, _ = registered
+    raw = json.dumps(request(home)).encode(encoding)
+    # When the real CLI admits the request, Then no encoding autodetection may reach the reader.
+    rejected(home, tmp_path / "request.json", raw)
+
+
+def test_escaped_utf8_request_preserves_values(
+    registered: tuple[Path, dict[str, Path]], tmp_path: Path
+) -> None:
+    # Given a valid UTF8 control and the same instrument expressed as a JSON Unicode escape.
+    home, _ = registered
+    body = request(home)
+    control = read(home, body)
+    path = tmp_path / "escaped.json"
+    path.write_bytes(json.dumps(body).encode().replace(b'"ASSET_A"', b'"\\u0041SSET_A"'))
+    # When reading the escaped UTF8 document, Then only its exact byte hash changes.
+    result = hashed(home, "read-prices", path)
+    assert at(result, "rows", 0, "close") == "11.000000000000"
+    assert at(result, "coverage", "expected_count") == 2  # noqa: PLR2004 -- two requested dates
+    assert at(result, "coverage", "present_count") == 1
+    assert result.pop("request_sha256") != control.pop("request_sha256")
+    assert result == control
+
+
 @pytest.mark.parametrize(
     "fault",
     [
