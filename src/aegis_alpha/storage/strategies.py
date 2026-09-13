@@ -35,6 +35,37 @@ class LineageSpec:
             raise ValueError("lineage reason must be a nonempty string")
 
 
+def strategy_request_hash(bundle: EngineBundle, lineage: LineageSpec | None) -> str:
+    """Pin caller evidence separately from raw bytes; retain v1 no-lineage receipts."""
+    if lineage is None:
+        return bundle.source_sha256
+    return content_sha256(
+        {
+            "schema_version": "aas-strategy-import-request-v1",
+            "strategy_id": bundle.bundle_id,
+            "version": bundle.bundle_version,
+            "raw_sha256": bundle.source_sha256,
+            "lineage": lineage,
+        }
+    )
+
+
+def read_strategy_lineage(
+    connection: sqlite3.Connection, strategy_id: str, version: str
+) -> LineageSpec | None:
+    """Reconstruct exact caller evidence, not the derived parent eligibility status."""
+    rows = connection.execute(
+        "SELECT parent_strategy_id,parent_version,change_kind,reason,reason_hash "
+        "FROM strategy_lineage WHERE strategy_id=? AND version=?",
+        (strategy_id, version),
+    ).fetchall()
+    if not rows:
+        return None
+    if len(rows) != 1 or rows[0]["reason_hash"] != content_sha256(rows[0]["reason"]):
+        raise ValueError("strategy stored lineage evidence mismatch")
+    return LineageSpec(*tuple(rows[0])[:4])
+
+
 def import_strategy(  # noqa: PLR0913, PLR0917 -- explicit external bundle pins
     connection: sqlite3.Connection,
     raw: bytes,
@@ -47,6 +78,7 @@ def import_strategy(  # noqa: PLR0913, PLR0917 -- explicit external bundle pins
 ) -> dict[str, object]:
     bundle = load_bundle(raw, expected_sha256, expected_id, expected_version)
     contract = canonical_json_bytes(bundle.contract).decode()
+    request_hash = strategy_request_hash(bundle, lineage)
     with atomic(connection):
         previous = connection.execute(
             "SELECT raw_sha256,contract_sha256,raw_bundle,contract_json FROM strategy_versions "
@@ -63,25 +95,7 @@ def import_strategy(  # noqa: PLR0913, PLR0917 -- explicit external bundle pins
             load_bundle(previous["raw_bundle"], expected_sha256, expected_id, expected_version)
             if previous["contract_json"] != contract:
                 raise ValueError("strategy parsed contract hash mismatch")
-            stored_lineage = connection.execute(
-                "SELECT parent_strategy_id,parent_version,change_kind,reason,reason_hash "
-                "FROM strategy_lineage WHERE strategy_id=? AND version=?",
-                (expected_id, expected_version),
-            ).fetchall()
-            wanted = (
-                []
-                if lineage is None
-                else [
-                    (
-                        lineage.parent_id,
-                        lineage.parent_version,
-                        lineage.change_kind,
-                        lineage.reason,
-                        content_sha256(lineage.reason),
-                    )
-                ]
-            )
-            if [tuple(row) for row in stored_lineage] != wanted:
+            if read_strategy_lineage(connection, expected_id, expected_version) != lineage:
                 raise ValueError("strategy ID/version already contains different lineage")
         receipt = connection.execute(
             "SELECT strategy_id,version,request_hash FROM strategy_imports WHERE operation_id=?",
@@ -90,7 +104,7 @@ def import_strategy(  # noqa: PLR0913, PLR0917 -- explicit external bundle pins
         if receipt is not None and tuple(receipt) != (
             expected_id,
             expected_version,
-            expected_sha256,
+            request_hash,
         ):
             raise ValueError("strategy operation ID already identifies a different import")
         if previous is None:
@@ -132,7 +146,7 @@ def import_strategy(  # noqa: PLR0913, PLR0917 -- explicit external bundle pins
                 "INSERT INTO strategy_imports VALUES (?,?,?,?,?)",
                 (
                     operation_id,
-                    expected_sha256,
+                    request_hash,
                     expected_id,
                     expected_version,
                     time.time_ns() // 1000,

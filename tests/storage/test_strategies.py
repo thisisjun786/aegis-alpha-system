@@ -265,6 +265,28 @@ def test_lineage_status_is_fixed_at_registration(
         "resolved" if parent_first else "unresolved",
     )
     assert tuple(store.execute("SELECT * FROM strategy_lineage").fetchone()) == expected
+    request_hash = _digest(
+        canonical_json_bytes(
+            {
+                "schema_version": "aas-strategy-import-request-v1",
+                "strategy_id": "child",
+                "version": "1",
+                "raw_sha256": _digest(raw),
+                "lineage": {
+                    "parent_id": "parent",
+                    "parent_version": "7",
+                    "change_kind": "derived",
+                    "reason": " synthetic reason\n",
+                },
+            }
+        )
+    )
+    assert tuple(
+        store.execute(
+            "SELECT request_hash,raw_sha256,contract_sha256 FROM strategy_imports "
+            "JOIN strategy_versions USING(strategy_id,version) WHERE operation_id='child-1'"
+        ).fetchone()
+    ) == (request_hash, _digest(raw), _digest(canonical_json_bytes(contract())))
     if not parent_first:
         with pytest.raises(ValueError, match="unresolved parent"):
             load_strategy(store, "child", "1", _digest(raw))

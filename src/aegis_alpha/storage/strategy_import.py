@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from pathlib import Path
 
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.engine.bundle import load_bundle
-from aegis_alpha.storage.strategies import LineageSpec
+from aegis_alpha.storage.strategies import (
+    LineageSpec,
+    read_strategy_lineage,
+    strategy_request_hash,
+    verify_strategy_content,
+)
 from aegis_alpha.storage.workspace import Workspace
 
 
@@ -34,11 +40,13 @@ def register_strategy(  # noqa: PLR0913 -- preserve explicit bundle pins plus op
             (strategy_id + "\x00" + version + "\x00" + bundle.source_sha256).encode()
         ).hexdigest()
     )
+    # Keep the key independent of lineage so changed retries conflict with the same intent.
+    request_hash = strategy_request_hash(bundle, lineage)
     prepare_operation(
         workspace.state,
         operation_id=operation_id,
         kind="strategy_import",
-        request_hash=bundle.source_sha256,
+        request_hash=request_hash,
         target_id=strategy_id + ":" + version,
         expected_parent=None,
         payload_hash=bundle.source_sha256,
@@ -52,5 +60,35 @@ def register_strategy(  # noqa: PLR0913 -- preserve explicit bundle pins plus op
         operation_id,
         lineage=lineage,
     )
-    complete_operation(workspace.state, operation_id, bundle.source_sha256)
+    complete_operation(workspace.state, operation_id, request_hash)
     return result
+
+
+def recover_strategy_import(workspace: Workspace, operation: sqlite3.Row) -> bool:
+    """Complete only a receipt whose stored bytes and lineage match its durable intent."""
+    from aegis_alpha.storage.state import complete_operation  # noqa: PLC0415
+
+    if workspace.strategies is None:
+        return False
+    op_id = operation["operation_id"]
+    marker = workspace.strategies.execute(
+        "SELECT request_hash,strategy_id,version FROM strategy_imports WHERE operation_id=?",
+        (op_id,),
+    ).fetchone()
+    if marker is None:
+        return False
+    if (
+        marker["request_hash"] != operation["request_hash"]
+        or marker["strategy_id"] + ":" + marker["version"] != operation["target_id"]
+        or operation["expected_parent"] is not None
+    ):
+        raise ValueError("strategy receipt does not match prepared operation")
+    # Journal completion verifies committed content, not execution eligibility.
+    bundle = verify_strategy_content(
+        workspace.strategies, marker["strategy_id"], marker["version"], operation["payload_hash"]
+    )
+    lineage = read_strategy_lineage(workspace.strategies, marker["strategy_id"], marker["version"])
+    if strategy_request_hash(bundle, lineage) != operation["request_hash"]:
+        raise ValueError("strategy stored lineage does not match prepared operation")
+    complete_operation(workspace.state, op_id, operation["request_hash"])
+    return True
