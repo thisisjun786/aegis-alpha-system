@@ -23,6 +23,7 @@ from aegis_alpha.engine.backtest_request import (
     BACKTEST_REQUEST_SCHEMA,
     PREPARE_REQUEST_SCHEMA,
     EnvelopeExport,
+    EnvelopeInputs,
     ParsedPrepareRequest,
     RequestProjection,
     export_envelope,
@@ -275,12 +276,14 @@ def emit(parsed: ParsedPrepareRequest, projection: RequestProjection) -> Envelop
     return export_envelope(
         parsed,
         projection=projection,
-        dates=DATES,
-        opens=({}, {"ASSET_A": 10.0}),
-        closes=({"ASSET_A": 10.0}, {"ASSET_A": 12.0}),
-        targets={DATES[0]: {"ASSET_A": 0.5}},
-        instrument_types={"ASSET_A": "ETF"},
-        source_pins=(),
+        inputs=EnvelopeInputs(
+            dates=DATES,
+            opens=({}, {"ASSET_A": 10.0}),
+            closes=({"ASSET_A": 10.0}, {"ASSET_A": 12.0}),
+            targets={DATES[0]: {"ASSET_A": 0.5}},
+            instrument_types={"ASSET_A": "ETF"},
+            source_pins=(),
+        ),
     )
 
 
@@ -905,12 +908,14 @@ def test_no_accounting_during_export_and_missing_sale_mark_deferred(
     exported = export_envelope(
         parsed,
         projection=projection,
-        dates=(*DATES, date(2026, 2, 3)),
-        opens=({}, {"ASSET_A": 10.0}, {}),
-        closes=({"ASSET_A": 10.0}, {"ASSET_A": 12.0}, {}),
-        targets={DATES[0]: {"ASSET_A": 0.5}, DATES[1]: {}},
-        instrument_types={"ASSET_A": "ETF"},
-        source_pins=(),
+        inputs=EnvelopeInputs(
+            dates=(*DATES, date(2026, 2, 3)),
+            opens=({}, {"ASSET_A": 10.0}, {}),
+            closes=({"ASSET_A": 10.0}, {"ASSET_A": 12.0}, {}),
+            targets={DATES[0]: {"ASSET_A": 0.5}, DATES[1]: {}},
+            instrument_types={"ASSET_A": "ETF"},
+            source_pins=(),
+        ),
     )
     with pytest.raises(ValueError, match="held or traded"):
         run_document(exported.canonical_bytes, exported.envelope_sha256)
@@ -937,7 +942,6 @@ def test_export_rejects_incompatible_outcomes(mutation: str) -> None:
     body, definition, docs = fixture()
     parsed, projection = project(body, definition, docs)
     args: Document = {
-        "projection": projection,
         "dates": DATES,
         "opens": ({}, {"ASSET_A": 10.0}),
         "closes": ({"ASSET_A": 10.0}, {"ASSET_A": 12.0}),
@@ -974,7 +978,18 @@ def test_export_rejects_incompatible_outcomes(mutation: str) -> None:
         }
         args["source_pins"] = (pin, pin)
     with pytest.raises(ValueError, match=r".+"):
-        export_envelope(parsed, **args)
+        export_envelope(
+            parsed,
+            projection=projection,
+            inputs=EnvelopeInputs(
+                dates=args["dates"],
+                opens=args["opens"],
+                closes=args["closes"],
+                targets=args["targets"],
+                instrument_types=args["instrument_types"],
+                source_pins=args["source_pins"],
+            ),
+        )
 
 
 _SUPERVISOR = r"""
@@ -1272,12 +1287,14 @@ def test_source_pins_sorted_without_digest_reinterpretation() -> None:
     exported = export_envelope(
         parsed,
         projection=projection,
-        dates=DATES,
-        opens=({}, {"ASSET_A": 10.0}),
-        closes=({"ASSET_A": 10.0}, {"ASSET_A": 12.0}),
-        targets={DATES[0]: {"ASSET_A": 0.5}},
-        instrument_types={"ASSET_A": "ETF", "REFERENCE_INDEX": "INDEX"},
-        source_pins=(second, first),
+        inputs=EnvelopeInputs(
+            dates=DATES,
+            opens=({}, {"ASSET_A": 10.0}),
+            closes=({"ASSET_A": 10.0}, {"ASSET_A": 12.0}),
+            targets={DATES[0]: {"ASSET_A": 0.5}},
+            instrument_types={"ASSET_A": "ETF", "REFERENCE_INDEX": "INDEX"},
+            source_pins=(second, first),
+        ),
     )
     assert json.loads(exported.canonical_bytes)["source_pins"] == [first, second]
     result = run_document(exported.canonical_bytes, exported.envelope_sha256)

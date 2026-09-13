@@ -1207,16 +1207,23 @@ def _export_targets(
     return normalized_targets
 
 
+@dataclass(frozen=True, slots=True)
+class EnvelopeInputs:
+    """Explicit export values; boundary validation remains with export_envelope."""
+
+    dates: tuple[date, ...]
+    opens: tuple[Mapping[str, float], ...]
+    closes: tuple[Mapping[str, float], ...]
+    targets: Mapping[date, Mapping[str, float]]
+    instrument_types: Mapping[str, str]
+    source_pins: tuple[Mapping[str, str], ...]
+
+
 def export_envelope(
     request: ParsedPrepareRequest,
     *,
     projection: RequestProjection,
-    dates: tuple[date, ...],
-    opens: tuple[Mapping[str, float], ...],
-    closes: tuple[Mapping[str, float], ...],
-    targets: Mapping[date, Mapping[str, float]],
-    instrument_types: Mapping[str, str],
-    source_pins: tuple[Mapping[str, str], ...],
+    inputs: EnvelopeInputs,
 ) -> EnvelopeExport:
     """Validate supplied outcomes/targets, without inferring holdings or doing fills."""
     # Recheck public detached evidence at export too; no private trust token or
@@ -1234,37 +1241,37 @@ def export_envelope(
         for key in _CONTENT_PROPERTIES
     ):
         raise ValueError("projection belongs to a different request")
-    _export_dates(body, dates, opens, closes)
+    _export_dates(body, inputs.dates, inputs.opens, inputs.closes)
     selected = {
         str(symbol)
         for row in _rows(body["price_inputs"])
         if _key(row["binding"])[0] == "execution_prices"
         for symbol in _array(row["instrument_ids"])
     }
-    opening, closing = _price_rows(opens, selected), _price_rows(closes, selected)
-    types = _object(instrument_types)
+    opening, closing = _price_rows(inputs.opens, selected), _price_rows(inputs.closes, selected)
+    types = _object(inputs.instrument_types)
     for symbol, kind in types.items():
         _text(symbol)
         if kind not in ("ETF", "INDEX", "SPOT"):
             raise ValueError("unsupported legacy instrument type")
-    normalized_targets = _export_targets(targets, dates, selected, types, opening)
+    normalized_targets = _export_targets(inputs.targets, inputs.dates, selected, types, opening)
     explicit = body["explicit_decision_dates"]
     if explicit is not None and set(normalized_targets) != set(_array(explicit)):
         raise ValueError("export must preserve exactly requested decision dates")
     account, envelope = _object(body["account"]), _object(body["envelope"])
-    if any(_day(flow["date"]) not in dates[1:] for flow in _rows(account["cashflows"])):
+    if any(_day(flow["date"]) not in inputs.dates[1:] for flow in _rows(account["cashflows"])):
         raise ValueError("cashflows must occur on supplied open sessions after baseline")
     result = {
         "schema_version": envelope["schema_version"],
         "module": "aegis",
         "instrument_types": types,
-        "dates": dates,
+        "dates": inputs.dates,
         "opens": opening,
         "closes": closing,
         "targets": normalized_targets,
         "initial_cash": account["initial_cash"],
         "cost": checked.execution_cost,
-        "source_pins": _source_pins(source_pins),
+        "source_pins": _source_pins(inputs.source_pins),
         "research_mode": envelope["research_mode"],
     }
     if envelope["schema_version"] == "aas-etf-backtest-v2":
