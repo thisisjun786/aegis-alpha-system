@@ -11,6 +11,8 @@ from pathlib import Path
 import pytest
 
 from aegis_alpha.application.compute_cli import price_compute
+from aegis_alpha.engine.codec import decode_json
+from aegis_alpha.storage.market import read_generation
 from aegis_alpha.storage.market_inputs import (
     GenerationPin,
     PriceInputRequest,
@@ -19,18 +21,111 @@ from aegis_alpha.storage.market_inputs import (
     load_pinned_sessions,
 )
 from aegis_alpha.storage.publication import json_value
+from aegis_alpha.storage.research_inputs import register_price_input
 from aegis_alpha.storage.workspace import initialize, open_workspace
 from tests.application.test_storage_cli import run_cli
 from tests.storage.test_research_inputs import (
+    NON_UTF8_TRANSFORMS,
     _change,
     _proxy_spec,
     _sessions_spec,
     _source_row,
     _spec,
+    registration_spec,
+    registration_state,
 )
 
 DAY = date(2026, 1, 2)
 PIN_FIELDS = ("dataset_id", "version", "generation_id", "chain_hash", "manifest_hash")
+
+
+def registration_source(root: Path, kind: str) -> tuple[Path, Path]:
+    """Prepare valid source pins alongside an existing publication, without registering the spec."""
+    home = root / "home"
+    _ = initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        seed = _spec(
+            workspace, root / "seed.sqlite3", [{**_source_row(), "revision_id": "seed-r1"}]
+        )
+        _ = register_price_input(workspace, seed, hashlib.sha256(seed.read_bytes()).hexdigest())
+        path = registration_spec(workspace, root / "source.sqlite3", kind)
+        _change(
+            path,
+            "dataset",
+            {
+                "dataset_id": "candidate",
+                "version": "1",
+                "generation_id": "candidate",
+                "operation_id": "op-candidate",
+                "parent_id": None,
+            },
+        )
+    return home, path
+
+
+@pytest.mark.parametrize("kind", ["prices", "sessions", "proxy"])
+@pytest.mark.parametrize(("encoding", "bom"), NON_UTF8_TRANSFORMS)
+def test_non_utf8_registration_has_no_publication(
+    tmp_path: Path, kind: str, encoding: str, bom: bytes
+) -> None:
+    # Given valid retained pins, an existing publication and an exact non-UTF8 file hash.
+    home, path = registration_source(tmp_path, kind)
+    raw = bom + path.read_text(encoding="utf-8").encode(encoding)
+    _ = path.write_bytes(raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    with open_workspace(home) as workspace:
+        before = registration_state(workspace)
+    # When the real native command registers it, Then only a controlled error is emitted.
+    result = run_cli("data", "register-" + kind, "--spec", str(path), "--sha256", digest, home=home)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stdout == ""
+    error = obj(decode_json(result.stderr.encode()))["error"]
+    assert isinstance(error, str)
+    assert "UTF-8" in error or "utf-8" in error
+    assert len(result.stderr.encode()) < 1024  # noqa: PLR2004 -- bounded CLI diagnostic
+    with open_workspace(home) as workspace:
+        assert registration_state(workspace) == before
+
+
+@pytest.mark.parametrize("kind", ["prices", "sessions", "proxy"])
+@pytest.mark.parametrize("escaped", [False, True])
+def test_utf8_registration_preserves_values_and_exact_hash(
+    tmp_path: Path, kind: str, *, escaped: bool
+) -> None:
+    # Given fresh UTF-8 specs with either literal or JSON-escaped non-ASCII provider text.
+    home, path = registration_source(tmp_path, kind)
+    body = obj(decode_json(path.read_bytes()))
+    body["provider"] = "synthetic-\u00e9"
+    raw = json.dumps(body, ensure_ascii=escaped).encode("utf-8")
+    _ = path.write_bytes(raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    # When registering through the real command, Then exact bytes and published values survive.
+    result = hashed(home, "register-" + kind, path)
+    assert result["published"] is True
+    assert result["transform_sha256"] == digest
+    assert result["source_pin"] == body["source"]
+    assert hashed(home, "register-" + kind, path) == result
+    with open_workspace(home) as workspace:
+        assert (workspace.paths.raw / digest[:2] / digest).read_bytes() == raw
+        row = read_generation(workspace.market, "candidate")[0]
+        assert (
+            workspace.state.execute(
+                "SELECT transform_hash FROM dataset_versions WHERE dataset_id='candidate'"
+            ).fetchone()[0]
+            == digest
+        )
+    match kind:
+        case "prices":
+            assert str(row["close"]) == "11.000000000000"
+        case "sessions":
+            assert [row[key] for key in ("open_at_us", "close_at_us")] == [10, 20]
+        case "proxy":
+            assert result["non_executable"] is True
+            value = row["value"]
+            assert isinstance(value, float)
+            assert value.hex() == "0x1.999999999999ap-4"
+        case _:
+            raise AssertionError(kind)
 
 
 def obj(value: object) -> dict[str, object]:

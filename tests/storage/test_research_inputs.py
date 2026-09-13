@@ -27,6 +27,87 @@ if TYPE_CHECKING:
 _RECORD = "5ed0dd479a146fe98960d7848d39b527f85b9ffeb0d151a2edf747b0f2611ac9"
 _NUMBERS = ("open", "high", "low", "close", "volume")
 _INEXACT_FLOAT = 0.1
+NON_UTF8_TRANSFORMS = [
+    pytest.param(encoding, bom, id=encoding + ("-bom" if bom else "-bomless"))
+    for encoding, marker in (
+        ("utf-16-le", b"\xff\xfe"),
+        ("utf-16-be", b"\xfe\xff"),
+        ("utf-32-le", b"\xff\xfe\x00\x00"),
+        ("utf-32-be", b"\x00\x00\xfe\xff"),
+    )
+    for bom in (marker, b"")
+]
+
+
+def registration_spec(workspace: Workspace, path: Path, kind: str) -> Path:
+    match kind:
+        case "prices":
+            return _spec(workspace, path, [_source_row()])
+        case "sessions":
+            return _sessions_spec(workspace, path, {})
+        case "proxy":
+            return _proxy_spec(workspace, path, ("PROXY", "v1", "0.1"))
+        case _:
+            raise AssertionError(kind)
+
+
+def registration_state(workspace: Workspace) -> dict[str, object]:
+    """Snapshot catalog/operations/contracts, market rows and immutable raw files."""
+    tables: list[tuple[str]] = workspace.market.execute("SHOW TABLES").fetchall()
+    return {
+        "state": "\n".join(workspace.state.iterdump()),
+        "market": {table: workspace.market.table(table).fetchall() for (table,) in tables},
+        "raw": {
+            str(path.relative_to(workspace.paths.raw)): hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+            for path in workspace.paths.raw.rglob("*")
+            if path.is_file()
+        },
+    }
+
+
+@pytest.mark.parametrize("kind", ["price", "sessions", "proxy"])
+@pytest.mark.parametrize(("encoding", "bom"), NON_UTF8_TRANSFORMS)
+def test_non_utf8_transform_rejected_before_publication(
+    tmp_path: Path, kind: str, encoding: str, bom: bytes
+) -> None:
+    # Given otherwise valid retained sources and the exact hash of each transport encoding.
+    home = tmp_path / "home"
+    _ = initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        path = registration_spec(
+            workspace, tmp_path / "source.sqlite3", "prices" if kind == "price" else kind
+        )
+        _ = path.write_bytes(bom + path.read_text(encoding="utf-8").encode(encoding))
+        before = registration_state(workspace)
+        # When registering, Then reject the encoding without changing any publication state.
+        with pytest.raises(ValueError, match=r"UTF-8|utf-8"):
+            _ = _register_domain(workspace, path, kind)
+        assert registration_state(workspace) == before
+
+
+@pytest.mark.parametrize("kind", ["price", "sessions", "proxy"])
+@pytest.mark.parametrize("fault", ["duplicate", "nonfinite"])
+def test_utf8_transform_keeps_strict_json_validation(tmp_path: Path, kind: str, fault: str) -> None:
+    # Given valid source pins but duplicate fields or nonfinite JSON in a UTF-8 spec.
+    home = tmp_path / "home"
+    _ = initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        path = registration_spec(
+            workspace, tmp_path / "source.sqlite3", "prices" if kind == "price" else kind
+        )
+        raw = path.read_bytes()
+        if fault == "duplicate":
+            raw = raw[:-1] + b',"provider":"synthetic"}'
+        else:
+            raw = raw.replace(b'"publication_at_us": null', b'"publication_at_us": NaN')
+        _ = path.write_bytes(raw)
+        before = registration_state(workspace)
+        # When decoding through the boundary, Then strict shared-codec validation still applies.
+        with pytest.raises(ValueError, match=r"duplicate|non-finite"):
+            _ = _register_domain(workspace, path, kind)
+        assert registration_state(workspace) == before
 
 
 def _register(workspace: Workspace, path: Path) -> dict[str, object]:

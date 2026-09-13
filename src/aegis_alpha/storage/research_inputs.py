@@ -171,6 +171,14 @@ def _check_size(size: int) -> None:
         raise ValueError("price transform exceeds bounded import size")
 
 
+def _decode_transform(raw: bytes) -> object:
+    _ = raw.decode("utf-8")  # The shared byte decoder also autodetects UTF-16/32.
+    # BOM-less UTF-16/32 ASCII can pass UTF-8 decoding but contains literal NULs.
+    if b"\x00" in raw:
+        raise ValueError("research transform requires UTF-8 JSON without literal NUL bytes")
+    return decode_json(raw)
+
+
 def register_price_input(workspace: Workspace, spec_path: Path, sha256: str) -> dict[str, object]:
     """Publish one explicit source delta while retaining exact transform provenance.
 
@@ -185,7 +193,7 @@ def register_price_input(workspace: Workspace, spec_path: Path, sha256: str) -> 
     digest = hashlib.sha256(raw).hexdigest()
     if digest != sha256:
         raise ValueError("price transform bytes do not match the expected SHA-256")
-    body = _object(decode_json(raw), _ROOT)
+    body = _object(_decode_transform(raw), _ROOT)
     if body["schema_version"] != "aas-price-transform-v1":
         raise ValueError("unsupported price transform schema")
     source = _object(
@@ -275,7 +283,7 @@ def _read_transform(path: Path, sha256: str, kind: str) -> _Transform:
         ("calendar_sessions", "calendar") if kind == "sessions" else ("feature_values", "proxy")
     )
     keys = (_ROOT - {"price", "calendar", "decimal_conversion"}) | {extra}
-    body = _object(decode_json(raw), keys)
+    body = _object(_decode_transform(raw), keys)
     if body["schema_version"] != "aas-" + kind + "-transform-v1":
         raise ValueError("unsupported research transform schema")
     fields = frozenset(name for name, _ in COMMON + DOMAINS[domain])
