@@ -125,6 +125,81 @@ def test_same_key_different_content_conflicts(tmp_path: Path) -> None:
         assert read_convention(ws.state, PIN_A) == A
 
 
+def test_ensemble_whole_document_and_bundle_roundtrip(tmp_path: Path) -> None:
+    from fractions import Fraction  # noqa: PLC0415
+
+    from aegis_alpha.compute_resources import ComputeBudget  # noqa: PLC0415
+    from aegis_alpha.storage.input_pins import (  # noqa: PLC0415 -- RED new APIs
+        read_definition,
+        read_input_bundle,
+        register_definition,
+        register_input_bundle,
+    )
+
+    budget = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
+    body = {
+        "schema": "aas-ensemble-membership-v1",
+        "hash_format": "aas-canonical-json-sha256-v1",
+        "id": "ensemble-synthetic",
+        "version": "1",
+        "membership_sha256": "d49f7463724d43b432ccca69a7f1471ba35ed0796c1455a3a82c2383fe689b1e",
+        "rows": [{"name": "synthetic", "weight": "1"}],
+    }
+    raw = json.dumps(body).encode()
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True) as ws:
+        pin = register_definition(
+            ws, raw, expected_file_sha256=hashlib.sha256(raw).hexdigest(), budget=budget
+        )
+        assert pin.hash == "576d214e5c0e2c734f974a27b5781d319bb7ca5c882a4978cb90b9808f0cb6e3"
+        assert json.loads(read_definition(ws, pin, budget=budget)) == body
+        binding = {
+            "role": "membership",
+            "ordinal": 0,
+            "ref_kind": "membership",
+            "ref_id": pin.id,
+            "ref_version": pin.version,
+            "hash": pin.hash,
+            "ref_schema": body["schema"],
+            "hash_format": body["hash_format"],
+        }
+        bundle = {
+            "schema": "aas-input-bundle-v1",
+            "hash_format": body["hash_format"],
+            "bundle_id": "complete-content",
+            "bindings": [binding],
+        }
+        raw_bundle = json.dumps(bundle).encode()
+        bundle_pin = register_input_bundle(
+            ws,
+            raw_bundle,
+            expected_file_sha256=hashlib.sha256(raw_bundle).hexdigest(),
+            budget=budget,
+        )
+        assert json.loads(read_input_bundle(ws, bundle_pin, budget=budget)) == bundle
+        for value in (True, -1, 1.0, 2**63):
+            binding["ordinal"] = value
+            malformed = json.dumps(bundle).encode()
+            with pytest.raises(ValueError, match=r"integer|ordinal"):
+                register_input_bundle(
+                    ws,
+                    malformed,
+                    expected_file_sha256=hashlib.sha256(malformed).hexdigest(),
+                    budget=budget,
+                )
+        binding["ordinal"] = 0
+        bundle["bindings"] = [binding, binding]
+        duplicate = json.dumps(bundle).encode()
+        with pytest.raises(ValueError, match="duplicate"):
+            register_input_bundle(
+                ws,
+                duplicate,
+                expected_file_sha256=hashlib.sha256(duplicate).hexdigest(),
+                budget=budget,
+            )
+
+
 _CHANGED = A.replace(b'"price_basis":"capital"', b'"price_basis":"total_return"')
 
 
@@ -580,3 +655,309 @@ def test_shipped_immutability_triggers_remain_enforced(tmp_path: Path, sql: str)
         ws.state.rollback()
         assert caught.value.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_TRIGGER
         assert read_convention(ws.state, PIN_A) == A
+
+
+def derived_document(workspace: object) -> bytes:
+    """Real price and macro publications; transport and legacy spec hashes stay distinct."""
+    from dataclasses import asdict  # noqa: PLC0415
+
+    from aegis_alpha.engine.models import DerivedInputBinding, DerivedSeriesSpec  # noqa: PLC0415
+    from aegis_alpha.storage.import_document import parse_import  # noqa: PLC0415
+    from aegis_alpha.storage.publication import publish_document  # noqa: PLC0415
+    from aegis_alpha.storage.workspace import Workspace  # noqa: PLC0415
+    from tests.storage.test_publication import document  # noqa: PLC0415
+
+    assert isinstance(workspace, Workspace)
+    publish_document(workspace, parse_import(document()))
+    macro = json.loads(document())
+    macro.update(
+        dataset_id="macro",
+        generation_id="macro-g",
+        operation_id="macro-op",
+        domain="macro_observations",
+        instruments=[],
+    )
+    macro["rows"] = [
+        {
+            "series_id": "SERIES",
+            "observation_period": "2026-01-02",
+            "unit": "USD",
+            "source_vintage_start": None,
+            "source_vintage_end": None,
+            "value": "2",
+            "value_state": "present",
+            "revision_id": "macro-r",
+            "supersedes_revision_id": None,
+            "op": "ASSERT",
+            "available_at_us": 20,
+            "revision_known_at_us": 20,
+            "ingested_at_us": 30,
+        }
+    ]
+    publish_document(workspace, parse_import(json.dumps(macro).encode()))
+    spec = DerivedSeriesSpec(
+        series_id="derived",
+        operation="trailing_sum_over_price",
+        trailing_months=2,
+        consumes_capital=True,
+        consumes_totalreturn=False,
+        input_bindings=(
+            DerivedInputBinding("synthetic-prices", "1", "ASSET_A", "price"),
+            DerivedInputBinding("macro", "1", "SERIES", "addend_a"),
+        ),
+        signal_lag_months=(0, 1),
+        signal_thresholds=(0.0, 1.0),
+        reference_provenance="synthetic",
+    )
+    inputs = []
+    for ordinal, binding in enumerate(spec.input_bindings):
+        row = workspace.state.execute(
+            "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash "
+            "FROM dataset_versions WHERE dataset_id=?",
+            (binding.dataset_id,),
+        ).fetchone()
+        pin = dict(
+            zip(
+                ("dataset_id", "version", "generation_id", "chain_hash", "manifest_hash"),
+                row,
+                strict=True,
+            )
+        )
+        inputs.append(
+            {
+                "ordinal": ordinal,
+                "field": binding.field,
+                "pin": {
+                    "ref_kind": "generation",
+                    "ref_id": pin["dataset_id"],
+                    "ref_version": pin["version"],
+                    "hash": pin["chain_hash"],
+                    "schema": "aas-generation-pin-v1",
+                    "hash_format": "aas-market-generation-chain-v1",
+                    "pin": pin,
+                },
+            }
+        )
+    return json.dumps(
+        {
+            "schema": "aas-derived-definition-v1",
+            "hash_format": "aas-canonical-json-sha256-v1",
+            "id": "derived",
+            "version": "1",
+            "definition": asdict(spec),
+            "inputs": list(reversed(inputs)),
+        }
+    ).encode()
+
+
+def test_complete_derived_definition_and_exact_children(tmp_path: Path) -> None:
+    from fractions import Fraction  # noqa: PLC0415
+
+    from aegis_alpha.compute_resources import ComputeBudget  # noqa: PLC0415
+    from aegis_alpha.storage.input_pins import read_definition, register_definition  # noqa: PLC0415
+
+    home = tmp_path / "home"
+    initialize(home)
+    budget = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
+    with open_workspace(home, writable=True) as ws:
+        raw = derived_document(ws)
+        pin = register_definition(
+            ws, raw, expected_file_sha256=hashlib.sha256(raw).hexdigest(), budget=budget
+        )
+        body = json.loads(raw)
+        body["inputs"].reverse()
+        expected = json.dumps(
+            body, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        ).encode()
+        assert pin.hash == hashlib.sha256(expected).hexdigest()
+        assert pin.hash != body["definition"]["canonical_sha256"]
+        assert read_definition(ws, pin, budget=budget) == expected
+        assert (
+            register_definition(ws, expected, expected_file_sha256=pin.hash, budget=budget) == pin
+        )
+        children = [
+            tuple(row)
+            for row in ws.state.execute(
+                "SELECT ordinal,ref_kind,ref_id,ref_version,content_hash "
+                "FROM feature_inputs ORDER BY ordinal"
+            )
+        ]
+        assert children == [
+            (entry["ordinal"], "generation", entry["pin"]["ref_id"], "1", entry["pin"]["hash"])
+            for entry in body["inputs"]
+        ]
+        before = "\n".join(ws.state.iterdump())
+        for path, value in (
+            ("trailing_months", True),
+            ("signal_lag_months", [False]),
+            ("signal_thresholds", [True]),
+            ("consumes_capital", 1),
+            ("canonical_sha256", "0" * 64),
+            ("extra", 1),
+        ):
+            invalid = json.loads(raw)
+            invalid["definition"][path] = value
+            malformed = json.dumps(invalid).encode()
+            with pytest.raises(ValueError, match=r"integer|number|bool|hash|fields"):
+                register_definition(
+                    ws,
+                    malformed,
+                    expected_file_sha256=hashlib.sha256(malformed).hexdigest(),
+                    budget=budget,
+                )
+            assert "\n".join(ws.state.iterdump()) == before
+        ws.state.execute(
+            "INSERT INTO feature_inputs VALUES ('derived','1',2,'generation','macro','1',?)",
+            (children[1][4],),
+        )
+        ws.state.commit()
+        corrupted = "\n".join(ws.state.iterdump())
+        for action in (
+            lambda: read_definition(ws, pin, budget=budget),
+            lambda: register_definition(
+                ws, raw, expected_file_sha256=hashlib.sha256(raw).hexdigest(), budget=budget
+            ),
+        ):
+            with pytest.raises(ValueError, match="child"):
+                action()
+            assert "\n".join(ws.state.iterdump()) == corrupted
+
+
+@pytest.mark.parametrize("weight", ["0", "-1", "NaN", "Infinity", "not-number", True, 1])
+def test_ensemble_malformed_weights_are_not_preserved(tmp_path: Path, weight: object) -> None:
+    from fractions import Fraction  # noqa: PLC0415
+
+    from aegis_alpha.compute_resources import ComputeBudget  # noqa: PLC0415
+    from aegis_alpha.storage.input_pins import register_definition  # noqa: PLC0415
+
+    home = tmp_path / "home"
+    initialize(home)
+    raw = json.dumps(
+        {
+            "schema": "aas-ensemble-membership-v1",
+            "hash_format": "aas-canonical-json-sha256-v1",
+            "id": "ensemble",
+            "version": "1",
+            "membership_sha256": "d49f7463724d43b432ccca69a7f1471ba35ed0796c1455a3a82c2383fe689b1e",
+            "rows": [{"name": "synthetic", "weight": weight}],
+        }
+    ).encode()
+    with open_workspace(home, writable=True) as ws:
+        before = "\n".join(ws.state.iterdump())
+        with pytest.raises(ValueError, match=r"positive|finite|text|Decimal"):
+            register_definition(
+                ws,
+                raw,
+                expected_file_sha256=hashlib.sha256(raw).hexdigest(),
+                budget=ComputeBudget(Fraction(1), 512 * 1024 * 1024),
+            )
+        assert "\n".join(ws.state.iterdump()) == before
+
+
+def test_membership_rounded_hash_does_not_replace_whole_document_hash(tmp_path: Path) -> None:
+    from fractions import Fraction  # noqa: PLC0415
+
+    from aegis_alpha.compute_resources import ComputeBudget  # noqa: PLC0415
+    from aegis_alpha.storage.input_pins import register_definition  # noqa: PLC0415
+
+    budget = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
+    home = tmp_path / "home"
+    initialize(home)
+    body = {
+        "schema": "aas-ensemble-membership-v1",
+        "hash_format": "aas-canonical-json-sha256-v1",
+        "id": "ensemble",
+        "version": "1",
+        "membership_sha256": "d49f7463724d43b432ccca69a7f1471ba35ed0796c1455a3a82c2383fe689b1e",
+        "rows": [{"name": "synthetic", "weight": "1"}],
+    }
+    with open_workspace(home, writable=True) as ws:
+        raw = json.dumps(body).encode()
+        pin = register_definition(
+            ws, raw, expected_file_sha256=hashlib.sha256(raw).hexdigest(), budget=budget
+        )
+        changed = raw.replace(b'"weight": "1"', b'"weight": "1.000000000001"')
+        with pytest.raises(ValueError, match="mismatch"):
+            register_definition(
+                ws, changed, expected_file_sha256=hashlib.sha256(changed).hexdigest(), budget=budget
+            )
+        changed = changed.replace(b'"version": "1"', b'"version": "2"')
+        other = register_definition(
+            ws, changed, expected_file_sha256=hashlib.sha256(changed).hexdigest(), budget=budget
+        )
+        assert other.hash != pin.hash
+
+
+def test_execution_conventions_remain_distinct_from_opaque_content(tmp_path: Path) -> None:
+    from dataclasses import asdict  # noqa: PLC0415
+
+    from aegis_alpha.engine.requirements import derive_execution_definition  # noqa: PLC0415
+    from aegis_alpha.storage.input_pins import read_execution_conventions  # noqa: PLC0415
+    from tests.engine.engine_support import bundle, contract  # noqa: PLC0415
+
+    definition = derive_execution_definition(bundle(contract()))
+    payloads = {
+        "basis": {"schema": "aas-basis-v1", "price_basis": "capital"},
+        "calendar": {
+            "schema": "aas-calendar-v1",
+            "calendar_id": "cal",
+            "venue": "X",
+            "timezone_version": "v1",
+            **asdict(definition.calendar),
+        },
+        "cost": {
+            "schema": "aas-cost-v1",
+            "model": "proportional_traded_notional",
+            "rate": 0,
+            "currency": "USD",
+        },
+        "execution": {
+            "schema": "aas-execution-v1",
+            "decision": "session_close",
+            "execution": "next_session_open",
+            "sizing": "fractional_long_only",
+            "cash": "implicit_residual",
+            "terminal": "mark_without_liquidation",
+            "cashflows": "session_open_before_rebalance_existing_cash_withdrawals",
+        },
+    }
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True) as ws:
+        pins = []
+        for kind, payload in payloads.items():
+            raw = _raw(kind=kind, id=kind, payload=payload)
+            pins.append(
+                register_convention(
+                    ws.state, raw, expected_file_sha256=hashlib.sha256(raw).hexdigest()
+                )
+            )
+        expected = tuple(
+            read_convention(ws.state, pin) for pin in sorted(pins, key=lambda pin: pin.kind)
+        )
+        assert read_execution_conventions(ws.state, tuple(pins), definition=definition) == expected
+        for kind, payload in (
+            ("cost", {**payloads["cost"], "rate": True}),
+            ("cost", {**payloads["cost"], "rate": -1}),
+            ("calendar", {**payloads["calendar"], "history_observations": 99}),
+            ("execution", {"schema": "opaque-v9"}),
+        ):
+            raw = _raw(
+                kind=kind,
+                id=hashlib.sha256(json.dumps(payload).encode()).hexdigest(),
+                payload=payload,
+            )
+            invalid = register_convention(
+                ws.state, raw, expected_file_sha256=hashlib.sha256(raw).hexdigest()
+            )
+            assert read_convention(ws.state, invalid)
+            with pytest.raises(ValueError, match=r"cost|number|calendar|execution"):
+                read_execution_conventions(
+                    ws.state,
+                    tuple(invalid if pin.kind == kind else pin for pin in pins),
+                    definition=definition,
+                )
+        with pytest.raises(ValueError, match="missing"):
+            read_execution_conventions(ws.state, tuple(pins[:-1]), definition=definition)
+        with pytest.raises(ValueError, match="unique"):
+            read_execution_conventions(ws.state, (*pins, pins[0]), definition=definition)

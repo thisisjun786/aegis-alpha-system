@@ -27,7 +27,7 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
     db = commands.add_parser("db", help="Manage local SQLite and DuckDB storage")
     _home(db)
     sub = db.add_subparsers(dest="db_command", required=True)
-    for name in ("status", "verify", "recover", "quarantine", "backup", "restore"):
+    for name in ("status", "verify", "recover", "quarantine", "backup", "restore", "run-install"):
         command = sub.add_parser(name)
         _home(command)
         if name == "quarantine":
@@ -35,6 +35,8 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
             command.add_argument("--reason", required=True)
         if name == "backup":
             command.add_argument("--output", type=Path)
+        if name == "run-install":
+            command.add_argument("--backup-output", type=Path)
         if name == "restore":
             command.add_argument("--backup", type=Path, required=True)
     _source_parsers(sub)
@@ -47,7 +49,14 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
     _home(importer)
     importer.add_argument("file", type=Path)
     importer.add_argument("--sha256", required=True)
-    for name in ("register-prices", "register-sessions", "register-proxy", "read-prices"):
+    for name in (
+        "register-prices",
+        "register-sessions",
+        "register-proxy",
+        "read-prices",
+        "convention-import",
+        "binding-import",
+    ):
         command = sub.add_parser(name, help="Use an exact versioned research input document")
         _home(command)
         command.add_argument(
@@ -113,10 +122,10 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
     try:
         if args.command == "init":
             return initialize(home)
-        if args.command == "db" and args.db_command == "backup":
-            from aegis_alpha.storage.backup import backup
-
-            return backup(home, args.output)
+        if args.command == "data" and args.data_command in {"convention-import", "binding-import"}:
+            return _pin_import(home, args)
+        if args.command == "db" and args.db_command in {"backup", "run-install"}:
+            return _maintenance(home, args)
         if args.command == "db" and args.db_command == "restore":
             if getattr(args, "home", None) is None:
                 raise ValueError("restore requires an explicit --home for a new directory")
@@ -170,6 +179,39 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("local database operation failed; run aas db verify") from None
 
 
+def _maintenance(home: Path, args: argparse.Namespace) -> dict[str, object]:
+    from aegis_alpha.storage.backup import backup
+    from aegis_alpha.storage.run_schema import install_run_schema
+
+    if args.db_command == "backup":
+        return backup(home, args.output)
+    return install_run_schema(home, backup_output=args.backup_output)
+
+
+def _pin_import(home: Path, args: argparse.Namespace) -> dict[str, object]:
+    from dataclasses import asdict
+
+    from aegis_alpha.application.compute_cli import price_compute
+    from aegis_alpha.application.data_cli import import_binding, read_pin_file
+    from aegis_alpha.storage.input_pins import register_convention
+    from aegis_alpha.storage.locks import private_directory, storage_lock_targets
+    from aegis_alpha.storage.paths import load_paths
+    from aegis_alpha.storage.workspace import open_workspace
+
+    raw = read_pin_file(args.spec, args.sha256)
+    if args.data_command == "convention-import":
+        with open_workspace(home, writable=True) as workspace:
+            pin = register_convention(workspace.state, raw, expected_file_sha256=args.sha256)
+            return {"registered": True, "pin": asdict(pin), "backtest_eligible": False}
+    private_directory(home)
+    targets = storage_lock_targets(home, load_paths(home).stores())
+    with price_compute(excluded_locks=targets) as budget:
+        if budget is None:
+            raise ValueError("binding-import requires the explicit AAS compute budget environment")
+        with open_workspace(home, writable=True) as workspace:
+            return import_binding(workspace, raw, args.sha256, budget=budget)
+
+
 def _workspace_command(workspace: object, args: argparse.Namespace) -> dict[str, object]:  # noqa: PLR0911 -- CLI routing
     from aegis_alpha.storage.workspace import Workspace
 
@@ -189,7 +231,10 @@ def _workspace_command(workspace: object, args: argparse.Namespace) -> dict[str,
 
             return quarantine(workspace, args.operation, args.reason)
         from aegis_alpha.storage.publication import recover_operations
+        from aegis_alpha.storage.run_schema import inspect_run_schema, require_run_schema
 
+        if inspect_run_schema(workspace).state == "partial":
+            require_run_schema(workspace)
         return recover_operations(workspace)
     if args.command == "strategy":
         return _strategy_command(workspace, args)

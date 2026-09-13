@@ -21,6 +21,7 @@ from aegis_alpha.storage.paths import (
     load_paths,
     read_json,
     resolve_home,
+    same_private_file,
 )
 
 if TYPE_CHECKING:
@@ -194,6 +195,38 @@ class Workspace:
     strategies: sqlite3.Connection | None
     market: duckdb.DuckDBPyConnection
     installation_id: str
+    market_resources: dict[str, object]
+
+    @contextmanager
+    def checkpointed_market(self) -> Iterator[None]:
+        """Close/copy/reopen the same verified market file under retained admission."""
+        info = _store_info(self.market)
+        self.market.execute("CHECKPOINT")
+        self.market.close()
+        admitted = self.paths.market.stat()
+        try:
+            yield
+        finally:
+            private_file(self.paths.market)
+            if not same_private_file(admitted, self.paths.market.stat()):
+                raise ValueError("market file changed during admitted maintenance")
+            connection = market_connect(self.paths.market, resources=self.market_resources)
+            try:
+                observed = self.paths.market.stat()
+                _verify_reopened_market(
+                    connection,
+                    info,
+                    (admitted.st_dev, admitted.st_ino),
+                    (observed.st_dev, observed.st_ino),
+                )
+            except BaseException:
+                connection.close()
+                raise
+            self.market = connection
+
+    def close_market(self) -> None:
+        """Close the current handle, including one reopened under maintenance."""
+        self.market.close()
 
     def doctor(self) -> dict[str, object]:
         return {
@@ -214,6 +247,16 @@ class Workspace:
             "scheduler_started": False,
             "provider_live_verification": False,
         }
+
+
+def _verify_reopened_market(
+    connection: duckdb.DuckDBPyConnection,
+    expected: dict[str, object],
+    admitted: tuple[int, int],
+    observed: tuple[int, int],
+) -> None:
+    if admitted != observed or _store_info(connection) != expected:
+        raise ValueError("market identity changed during admitted maintenance")
 
 
 @contextmanager
@@ -272,4 +315,9 @@ def open_workspace(  # noqa: C901 -- lifecycle of all three owned stores
         if strategies is not None:
             initialize_strategies(strategies, installation_id)
         validate_market(market, installation_id)
-        yield Workspace(paths, state, strategies, market, installation_id)
+        workspace = Workspace(
+            paths, state, strategies, market, installation_id, cast("dict[str, object]", resources)
+        )
+        # Maintenance may replace the closed handle, never its admission or file identity.
+        stack.callback(workspace.close_market)
+        yield workspace
