@@ -5,10 +5,15 @@ from __future__ import annotations
 import sqlite3
 import time
 from dataclasses import dataclass
+from operator import itemgetter
 
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
 from aegis_alpha.engine.bundle import EngineBundle, load_bundle
-from aegis_alpha.engine.requirements import derive_execution_definition, legacy_requirement_rows
+from aegis_alpha.engine.requirements import (
+    derive_execution_definition,
+    legacy_requirement_rows,
+    project_legacy_requirement_rows,
+)
 from aegis_alpha.storage.sqlite import initialize
 from aegis_alpha.storage.state import atomic
 from aegis_alpha.storage.strategy_schema import STRATEGY_DDL, STRATEGY_KIND
@@ -92,19 +97,17 @@ def validate_strategy_import(
     """
     strategy_id, version = bundle.bundle_id, bundle.bundle_version
     previous = connection.execute(
-        "SELECT raw_sha256,contract_sha256,raw_bundle,contract_json FROM strategy_versions "
+        "SELECT raw_sha256,contract_sha256 FROM strategy_versions "
         "WHERE strategy_id=? AND version=?",
         (strategy_id, version),
     ).fetchone()
-    if previous is not None and tuple(previous)[:2] != (
+    if previous is not None and tuple(previous) != (
         bundle.source_sha256,
         bundle.contract_sha256,
     ):
         raise ValueError("strategy ID/version already contains different content")
     if previous is not None:
-        load_bundle(previous["raw_bundle"], bundle.source_sha256, strategy_id, version)
-        if previous["contract_json"] != canonical_json_bytes(bundle.contract).decode():
-            raise ValueError("strategy parsed contract hash mismatch")
+        verify_strategy_content(connection, strategy_id, version, bundle.source_sha256)
         if read_strategy_lineage(connection, strategy_id, version) != lineage:
             raise ValueError("strategy ID/version already contains different lineage")
     receipt = connection.execute(
@@ -268,7 +271,7 @@ def load_strategy(
 def verify_strategy_content(
     connection: sqlite3.Connection, strategy_id: str, version: str, expected_sha256: str
 ) -> EngineBundle:
-    """Verify persisted identity, raw bytes and contract, not execution eligibility."""
+    """Verify persisted identity, bytes, contract and v1 rows, not execution eligibility."""
     row = connection.execute(
         "SELECT raw_bundle,raw_sha256,contract_json,contract_sha256 FROM strategy_versions "
         "WHERE strategy_id=? AND version=?",
@@ -284,4 +287,20 @@ def verify_strategy_content(
         or canonical_json_bytes(bundle.contract).decode() != row["contract_json"]
     ):
         raise ValueError("strategy parsed contract hash mismatch")
+    rows = connection.execute(
+        "SELECT strategy_id,version,role,ordinal,required_schema,required_field,domain,"
+        "warmup,basis,cadence FROM strategy_requirements WHERE strategy_id=? AND version=? "
+        "ORDER BY role,ordinal",
+        (strategy_id, version),
+    ).fetchall()
+    if [tuple(row) for row in rows] != sorted(
+        project_legacy_requirement_rows(
+            bundle.bundle_id,
+            bundle.bundle_version,
+            bundle.contract.calendar,
+            bundle.contract.macro_signals,
+        ),
+        key=itemgetter(2, 3),
+    ):
+        raise ValueError("stored strategy requirements do not match the execution definition")
     return bundle

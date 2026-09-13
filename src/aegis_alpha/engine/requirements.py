@@ -70,27 +70,42 @@ class ExecutionDefinition:
 
 
 def legacy_requirement_rows(definition: ExecutionDefinition) -> Iterator[LegacyRequirementRow]:
-    """Project immutable v1 rows, not the richer execution-input requirements.
+    """Project an execution definition onto the immutable v1 storage contract."""
+    yield from project_legacy_requirement_rows(
+        definition.bundle_id,
+        definition.bundle_version,
+        definition.calendar,
+        definition.macro_signals,
+    )
+
+
+def project_legacy_requirement_rows(
+    bundle_id: str,
+    bundle_version: str,
+    calendar: CalendarConventions,
+    macro_signals: tuple[MacroSignalSpec, ...],
+) -> Iterator[LegacyRequirementRow]:
+    """Project validated v1 content without current execution-definition admission.
 
     V1 stores the configured history cap and all macro signals (including derived
     ones). Its explicit-input basis label does not resolve an execution basis.
     """
     yield (
-        definition.bundle_id,
-        definition.bundle_version,
+        bundle_id,
+        bundle_version,
         "prices",
         1,
         "engine-price-v1",
         "close",
         "prices",
-        definition.calendar.history_observations,
+        calendar.history_observations,
         "explicit-input",
         "calendar_month_end",
     )
-    for ordinal, signal in enumerate(definition.macro_signals, 1):
+    for ordinal, signal in enumerate(macro_signals, 1):
         yield (
-            definition.bundle_id,
-            definition.bundle_version,
+            bundle_id,
+            bundle_version,
             "macro",
             ordinal,
             "engine-macro-v1",

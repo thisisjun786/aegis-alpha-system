@@ -8,19 +8,252 @@ from pathlib import Path
 
 import pytest
 
-from aegis_alpha.storage import publication
+from aegis_alpha.data.serialization import canonical_json_bytes
+from aegis_alpha.engine.bundle import load_bundle
+from aegis_alpha.engine.errors import ContractDefinitionError
+from aegis_alpha.storage import publication, state
 from aegis_alpha.storage.backup import backup, restore
 from aegis_alpha.storage.import_document import parse_import
 from aegis_alpha.storage.input_pins import register_convention
-from aegis_alpha.storage.strategies import LineageSpec, load_strategy
+from aegis_alpha.storage.strategies import (
+    LineageSpec,
+    import_strategy,
+    load_strategy,
+    validate_strategy_import,
+    verify_strategy_content,
+)
 from aegis_alpha.storage.strategy_import import register_strategy
+from aegis_alpha.storage.strategy_requirements import read_execution_definition
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace
 from tests.engine.engine_support import contract, raw_bundle
+from tests.engine.test_requirements import rich_contract, scoring_contract
 from tests.storage.test_backup import seed_workspace
 from tests.storage.test_input_pins import A
 from tests.storage.test_publication import document
-from tests.storage.test_strategy_import import _interrupted_registration
+from tests.storage.test_strategy_import import MACRO_ROWS, _interrupted_registration
+from tests.storage.test_strategy_requirements import select_only
+
+REQUIREMENT_CORRUPTIONS = [
+    pytest.param("UPDATE strategy_requirements SET warmup=9", id="altered"),
+    pytest.param("DELETE FROM strategy_requirements", id="deleted"),
+    pytest.param(
+        "INSERT INTO strategy_requirements SELECT strategy_id,version,'extra',ordinal,"
+        "required_schema,required_field,domain,warmup,basis,cadence "
+        "FROM strategy_requirements WHERE role='prices'",
+        id="extra",
+    ),
+]
+
+
+@pytest.mark.parametrize("mutation", REQUIREMENT_CORRUPTIONS)
+@pytest.mark.parametrize("boundary", ["content", "verify", "backup", "restore"])
+def test_persisted_requirement_corruption_rejected(
+    tmp_path: Path, mutation: str, boundary: str
+) -> None:
+    home = tmp_path / "original"
+    initialize(home)
+    raw = raw_bundle(rich_contract())
+    digest = hashlib.sha256(raw).hexdigest()
+    source = tmp_path / "synthetic.json"
+    source.write_bytes(raw)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        register_strategy(workspace, source, digest, "synthetic-probe", "1")
+        assert workspace.strategies is not None
+        assert [
+            tuple(row)
+            for row in workspace.strategies.execute(
+                "SELECT * FROM strategy_requirements ORDER BY role,ordinal"
+            )
+        ] == [
+            ("synthetic-probe", "1", *row)
+            for row in [
+                *MACRO_ROWS,
+                (
+                    "prices",
+                    1,
+                    "engine-price-v1",
+                    "close",
+                    "prices",
+                    8,
+                    "explicit-input",
+                    "calendar_month_end",
+                ),
+            ]
+        ]
+    source.unlink()
+    original = evidence_snapshot(home)
+    copied = tmp_path / "corrupt-copy"
+    shutil.copytree(home, copied)
+    corrupt_closed_store(copied, "strategies", "strategy_requirements", mutation)
+    before = evidence_snapshot(copied)
+    # The existing inspection boundary already rejects these same logical corruptions.
+    with open_workspace(copied) as workspace:
+        assert workspace.strategies is not None
+        with select_only(workspace.strategies), pytest.raises(ValueError, match="requirements"):
+            read_execution_definition(workspace.strategies, "synthetic-probe", "1", digest)
+    output = tmp_path / "backup"
+    target = tmp_path / "restored"
+    if boundary == "restore":
+        backup(home, output)
+        corrupt_closed_store(output, "strategies", "strategy_requirements", mutation)
+        manifest_path = output / "backup.json"
+        manifest = json.loads(manifest_path.read_text())
+        changed = (output / "strategies.sqlite3").read_bytes()
+        manifest["files"]["strategies.sqlite3"] = {
+            "size_bytes": len(changed),
+            "sha256": hashlib.sha256(changed).hexdigest(),
+        }
+        manifest_path.write_text(json.dumps(manifest))
+    if boundary == "backup":
+        with pytest.raises(ValueError, match="requirements"):
+            backup(copied, output)
+        assert not output.exists()
+    elif boundary == "restore":
+        with pytest.raises(ValueError, match="requirements"):
+            restore(output, target)
+        assert (
+            json.loads((target / "installation.json").read_text())["phase"] == "restore-incomplete"
+        )
+    else:
+        with open_workspace(copied) as workspace:
+            assert workspace.strategies is not None
+            if boundary == "content":
+                with (
+                    select_only(workspace.strategies),
+                    pytest.raises(ValueError, match="requirements"),
+                ):
+                    verify_strategy_content(workspace.strategies, "synthetic-probe", "1", digest)
+            else:
+                with pytest.raises(ValueError, match="requirements"):
+                    verify_workspace(workspace)
+    assert evidence_snapshot(copied) == before
+    assert evidence_snapshot(home) == original
+
+
+@pytest.mark.parametrize("mutation", REQUIREMENT_CORRUPTIONS)
+@pytest.mark.parametrize("boundary", ["retry", "private", "recovery"])
+def test_corrupt_requirements_cannot_complete_pending_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str, boundary: str
+) -> None:
+    home, digest, _operation_id = _interrupted_registration(tmp_path, monkeypatch, "none")
+    raw = raw_bundle(contract())
+    with open_workspace(home) as workspace:
+        assert workspace.strategies is not None
+        with select_only(workspace.strategies):
+            assert validate_strategy_import(
+                workspace.strategies, load_bundle(raw, digest, "synthetic-probe", "1"), "new-op"
+            ) == (True, False)
+    copied = tmp_path / "corrupt-copy"
+    shutil.copytree(home, copied)
+    corrupt_closed_store(copied, "strategies", "strategy_requirements", mutation)
+    before = evidence_snapshot(copied)
+    source = tmp_path / "retry.json"
+    source.write_bytes(raw)
+    with open_workspace(copied, writable=True, strategy_write=True) as workspace:
+        assert workspace.strategies is not None
+        if boundary == "retry":
+            with pytest.raises(ValueError, match="requirements"):
+                register_strategy(workspace, source, digest, "synthetic-probe", "1")
+        elif boundary == "private":
+            statements: list[str] = []
+            workspace.strategies.set_trace_callback(statements.append)
+            try:
+                with pytest.raises(ValueError, match="requirements"):
+                    import_strategy(
+                        workspace.strategies, raw, digest, "synthetic-probe", "1", "new-op"
+                    )
+            finally:
+                workspace.strategies.set_trace_callback(None)
+            assert statements[0] == "BEGIN IMMEDIATE"
+            assert statements[-1] == "ROLLBACK"
+        else:
+            with pytest.raises(ValueError, match="requirements"):
+                publication.recover_operations(workspace)
+    assert evidence_snapshot(copied) == before
+
+
+@pytest.mark.parametrize("consumer", ["offensive", "canary", "negative"])
+def test_stored_legacy_scoring_evidence_round_trips_without_execution_admission(
+    tmp_path: Path, consumer: str
+) -> None:
+    home = tmp_path / "legacy"
+    initialize(home)
+    value = scoring_contract(consumer, {"method": "return_rate", "horizon": 12})
+    raw = raw_bundle(value)
+    digest = hashlib.sha256(raw).hexdigest()
+    bundle = load_bundle(raw, digest, "synthetic-probe", "1")
+    expected = (
+        "synthetic-probe",
+        "1",
+        "prices",
+        1,
+        "engine-price-v1",
+        "close",
+        "prices",
+        3,
+        "explicit-input",
+        "calendar_month_end",
+    )
+    # Author a persisted v1 fixture, not an admitted ExecutionDefinition or a fake reader.
+    # These raw/contract/row values were writable before active-score-reference admission.
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        assert workspace.strategies is not None
+        state.prepare_operation(
+            workspace.state,
+            operation_id="legacy-op",
+            kind="strategy_import",
+            request_hash=digest,
+            target_id="synthetic-probe:1",
+            expected_parent=None,
+            payload_hash=digest,
+        )
+        with workspace.strategies:
+            workspace.strategies.execute(
+                "INSERT INTO strategies VALUES ('synthetic-probe','synthetic-probe','active')"
+            )
+            workspace.strategies.execute(
+                "INSERT INTO strategy_versions VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    "synthetic-probe",
+                    "1",
+                    raw,
+                    digest,
+                    canonical_json_bytes(value).decode(),
+                    bundle.contract_sha256,
+                    bundle.schema_version,
+                    value.contract_version,
+                    1,
+                ),
+            )
+            workspace.strategies.execute(
+                "INSERT INTO strategy_requirements VALUES (?,?,?,?,?,?,?,?,?,?)", expected
+            )
+            workspace.strategies.execute(
+                "INSERT INTO strategy_imports VALUES ('legacy-op',?,'synthetic-probe','1',1)",
+                (digest,),
+            )
+        state.complete_operation(workspace.state, "legacy-op", digest)
+    before = evidence_snapshot(home)
+    output, restored = tmp_path / "backup", tmp_path / "restored"
+    backup(home, output)
+    restore(output, restored)
+    for root in (home, restored):
+        with open_workspace(root) as workspace:
+            assert workspace.strategies is not None
+            assert verify_workspace(workspace)["verified"] is True
+            with select_only(workspace.strategies):
+                assert (
+                    verify_strategy_content(workspace.strategies, "synthetic-probe", "1", digest)
+                    == bundle
+                )
+                assert [
+                    tuple(row)
+                    for row in workspace.strategies.execute("SELECT * FROM strategy_requirements")
+                ] == [expected]
+                with pytest.raises(ContractDefinitionError):
+                    read_execution_definition(workspace.strategies, "synthetic-probe", "1", digest)
+        assert evidence_snapshot(root) == before
 
 
 def test_verify_workspace_reports_nonempty_logical_refs(tmp_path: Path) -> None:

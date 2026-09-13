@@ -5,12 +5,10 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import replace
-from operator import itemgetter
 
 from aegis_alpha.engine.requirements import (
     ExecutionDefinition,
     derive_execution_definition,
-    legacy_requirement_rows,
 )
 from aegis_alpha.storage.input_pins import ConventionPin, read_convention
 from aegis_alpha.storage.strategies import load_strategy
@@ -32,16 +30,6 @@ def read_execution_definition(  # noqa: PLR0913 -- exact strategy pin and explic
     for integrity only; their roles remain unresolved and never grant execution.
     """
     definition = derive_execution_definition(load_strategy(connection, id, version, sha256))
-    rows = connection.execute(
-        "SELECT strategy_id,version,role,ordinal,required_schema,required_field,domain,"
-        "warmup,basis,cadence FROM strategy_requirements WHERE strategy_id=? AND version=? "
-        "ORDER BY role,ordinal",
-        (id, version),
-    ).fetchall()
-    if [tuple(row) for row in rows] != sorted(
-        legacy_requirement_rows(definition), key=itemgetter(2, 3)
-    ):
-        raise ValueError("stored strategy requirements do not match the execution definition")
     if convention_bindings is None:
         return definition
     if not isinstance(convention_bindings, tuple):
