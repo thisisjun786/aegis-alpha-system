@@ -15,7 +15,7 @@ from aegis_alpha.storage.input_pins import register_convention
 from aegis_alpha.storage.strategies import load_strategy
 from aegis_alpha.storage.workspace import open_workspace
 from tests.engine.engine_support import contract, raw_bundle
-from tests.engine.test_requirements import rich_contract
+from tests.engine.test_requirements import rich_contract, scoring_contract
 from tests.storage.test_strategy_requirements import A, B
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -154,6 +154,57 @@ def test_strategy_lineage_cli_rejects_partial_flags(tmp_path: Path, mask: int) -
             == 0
         )
         assert workspace.state.execute("SELECT count(*) FROM storage_operations").fetchone()[0] == 0
+
+
+def test_invalid_scoring_cli_import_and_show_preserve_evidence(
+    show_home: tuple[Path, dict[str, dict[str, str]]],
+) -> None:
+    home, receipts = show_home
+    payload = json.loads(
+        raw_bundle(scoring_contract("offensive", {"method": "return_rate", "horizon": 12}))
+    )
+    payload["bundle_version"] = "2"
+    raw = json.dumps(payload).encode()
+    source = home.parent / "invalid.json"
+    source.write_bytes(raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    with open_workspace(home) as workspace:
+        assert workspace.strategies is not None
+        before = (tuple(workspace.state.iterdump()), tuple(workspace.strategies.iterdump()))
+    result = run_cli(
+        "strategy",
+        "import",
+        str(source),
+        "--id",
+        "synthetic-probe",
+        "--version",
+        "2",
+        "--sha256",
+        digest,
+        home=home,
+    )
+    assert result.returncode == 1, result.stderr
+    assert result.stdout == ""
+    assert isinstance(json.loads(result.stderr)["error"], str)
+    source.unlink()
+    result = run_cli(
+        "strategy",
+        "show",
+        "--id",
+        "synthetic-probe",
+        "--version",
+        "2",
+        "--sha256",
+        digest,
+        home=home,
+    )
+    assert result.returncode == 1, result.stderr
+    assert result.stdout == ""
+    assert isinstance(json.loads(result.stderr)["error"], str)
+    assert run_cli(*show_arguments(receipts["synthetic-probe"]), home=home).returncode == 0
+    with open_workspace(home) as workspace:
+        assert workspace.strategies is not None
+        assert (tuple(workspace.state.iterdump()), tuple(workspace.strategies.iterdump())) == before
 
 
 def test_restore_never_defaults_over_current_home(tmp_path: Path) -> None:

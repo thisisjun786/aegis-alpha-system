@@ -9,6 +9,7 @@ import pytest
 
 from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.engine import replay
+from aegis_alpha.engine.errors import ContractDefinitionError
 from aegis_alpha.engine.models import EngineContract
 from aegis_alpha.storage import state
 from aegis_alpha.storage.publication import recover_operations
@@ -17,7 +18,7 @@ from aegis_alpha.storage.strategies import LineageSpec, load_strategy
 from aegis_alpha.storage.strategy_import import register_strategy
 from aegis_alpha.storage.workspace import initialize, open_workspace
 from tests.engine.engine_support import contract, raw_bundle, request
-from tests.engine.test_requirements import rich_contract
+from tests.engine.test_requirements import rich_contract, scoring_contract
 
 MACRO_ROWS = [
     (
@@ -105,6 +106,29 @@ def test_registered_requirements_preserve_complete_v1_rows(
     assert [tuple(row) for row in rows] == expected
     assert (loaded.source_sha256, loaded.contract_sha256) == (digest, contract_digest)
     assert loaded.contract == value
+
+
+@pytest.mark.parametrize("consumer", ["offensive", "canary", "negative"])
+def test_invalid_scoring_rejected_before_durable_admission(tmp_path: Path, consumer: str) -> None:
+    home = tmp_path / "aas"
+    initialize(home)
+    source = tmp_path / "synthetic.json"
+    payload = raw_bundle(contract())
+    source.write_bytes(payload)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        register_strategy(
+            workspace, source, hashlib.sha256(payload).hexdigest(), "synthetic-probe", "1"
+        )
+        assert workspace.strategies is not None
+        before = (tuple(workspace.state.iterdump()), tuple(workspace.strategies.iterdump()))
+        invalid = raw_bundle(scoring_contract(consumer, {"method": "return_rate", "horizon": 12}))
+        invalid = invalid.replace(b'"bundle_version":"1"', b'"bundle_version":"2"')
+        source.write_bytes(invalid)
+        with pytest.raises(ContractDefinitionError):
+            register_strategy(
+                workspace, source, hashlib.sha256(invalid).hexdigest(), "synthetic-probe", "2"
+            )
+        assert (tuple(workspace.state.iterdump()), tuple(workspace.strategies.iterdump())) == before
 
 
 def test_registered_bundle_replays_after_original_file_removed(tmp_path: Path) -> None:

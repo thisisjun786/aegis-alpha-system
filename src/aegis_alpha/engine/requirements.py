@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import cast
 
 from aegis_alpha.engine.bundle import EngineBundle
+from aegis_alpha.engine.errors import ContractDefinitionError
 from aegis_alpha.engine.models import (
     CalendarConventions,
     DerivedInputBinding,
@@ -14,6 +15,7 @@ from aegis_alpha.engine.models import (
     FeatureMatrixSpec,
     MacroSignalSpec,
     StaleGateSpec,
+    StrategyRecord,
 )
 
 type LegacyRequirementRow = tuple[str, str, str, int, str, str, str, int, str, str]
@@ -100,6 +102,38 @@ def legacy_requirement_rows(definition: ExecutionDefinition) -> Iterator[LegacyR
         )
 
 
+def _validate_scoring_references(strategy: StrategyRecord, features: FeatureMatrixSpec) -> None:
+    # Config shape is already validated at ingress. Only active consumers need references.
+    consumers = [("offensive_config.scoring", strategy.offensive_config["scoring"])]
+    if any(cast("tuple[bool, ...]", strategy.canary_config["enabled"])):
+        consumers.append(("canary_config.scoring", strategy.canary_config["scoring"]))
+    for name, value in strategy.signals_config.items():
+        signal = cast("Mapping[str, object]", value)
+        if signal["kind"] == "negative_abs_momentum" and signal["enabled"] is True:
+            consumers.append((f"signals_config.{name}.scoring", signal["scoring"]))
+    for field, value in consumers:
+        scoring = cast("Mapping[str, object]", value)
+        method = scoring["method"]
+        if method == "return_rate":
+            reference = scoring["horizon"]
+            available = features.return_months
+            declaration = "return_months"
+        elif method == "moving_average":
+            reference = scoring["horizon"]
+            available = features.moving_average_months
+            declaration = "moving_average_months"
+        else:
+            # Runtime momentum lookup uses the name, not its otherwise required horizon.
+            reference = scoring["score_name"]
+            available = tuple(score.name for score in features.momentum_scores)
+            declaration = "momentum_scores"
+        if reference not in available:
+            raise ContractDefinitionError(
+                f"strategy {strategy.name!r} {field} references {reference!r} "
+                f"absent from feature_matrix.{declaration}"
+            )
+
+
 def derive_execution_definition(bundle: EngineBundle) -> ExecutionDefinition:
     """Derive deterministically without storage access or changing v1 stored rows.
 
@@ -107,10 +141,12 @@ def derive_execution_definition(bundle: EngineBundle) -> ExecutionDefinition:
     validation. In particular, this function never resolves a convention pin.
     """
     contract = bundle.contract
+    features = contract.feature_matrix
     prices: set[str] = set()
     assets: set[str] = set()
     cash: set[str] = set()
     for strategy in contract.pack:
+        _validate_scoring_references(strategy, features)
         # StrategyRecord validates and freezes these nested values at ingress.
         prices.update(cast("tuple[str, ...]", strategy.offensive_config["assets"]))
         prices.add(cast("str", strategy.offensive_config["reference_asset"]))
@@ -126,7 +162,6 @@ def derive_execution_definition(bundle: EngineBundle) -> ExecutionDefinition:
         assets.update(cast("tuple[str, ...]", strategy.defensive_config["assets"]))
         cash.add(strategy.cash_asset)
     assets.update(prices)
-    features = contract.feature_matrix
     minimum = max(
         (
             1,

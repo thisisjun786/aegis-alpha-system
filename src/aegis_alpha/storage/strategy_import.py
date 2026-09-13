@@ -8,6 +8,7 @@ from pathlib import Path
 
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.engine.bundle import load_bundle
+from aegis_alpha.engine.requirements import derive_execution_definition
 from aegis_alpha.storage.strategies import (
     LineageSpec,
     read_strategy_lineage,
@@ -34,6 +35,8 @@ def register_strategy(  # noqa: PLR0913 -- preserve explicit bundle pins plus op
     with DescriptorTree.open_path(file.parent) as tree:
         raw = tree.read_bytes(file.name, max_bytes=16 * 1024 * 1024)
     bundle = load_bundle(raw, sha256, strategy_id, version)
+    # Definition rejection must not leave a durable PREPARED intent behind.
+    derive_execution_definition(bundle)
     operation_id = (
         "strategy-"
         + hashlib.sha256(

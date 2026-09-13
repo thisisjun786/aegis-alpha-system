@@ -17,7 +17,11 @@ from aegis_alpha.engine.models import (
     MacroSignalSpec,
     MomentumScoreSpec,
 )
-from aegis_alpha.engine.requirements import InputRequirement, derive_execution_definition
+from aegis_alpha.engine.requirements import (
+    InputRequirement,
+    derive_execution_definition,
+    legacy_requirement_rows,
+)
 from tests.engine.engine_support import bundle, contract, raw_bundle, request, strategy
 
 
@@ -171,7 +175,16 @@ def test_pack_union_deduplicates_without_losing_cash_feature_role() -> None:
     first = contract()
     other = rich_contract().pack[0]
     other = replace(other, cash_asset="ASSET_A")
-    result = derive_execution_definition(bundle(replace(first, pack=(*first.pack, other))))
+    features = FeatureMatrixSpec(
+        momentum_scores=(MomentumScoreSpec("blend", (7, 3), (2.0, 1.0), 3.0),),
+        moving_average_months=(6,),
+        ma_window_includes_current_month=False,
+        return_months=(2, 7, 3),
+        includes_latest_price=True,
+    )
+    result = derive_execution_definition(
+        bundle(replace(first, pack=(*first.pack, other), feature_matrix=features))
+    )
     assert result.price_asset_ids == (
         "ASSET_A",
         "ASSET_B",
@@ -255,6 +268,133 @@ def test_missing_required_rule_is_rejected_at_parser(field: str) -> None:
     with pytest.raises(ContractDefinitionError) as caught:
         load_bundle(raw, sha256_bytes(raw), "synthetic-probe", "1")
     assert caught.value.reason == f"offensive_config requires explicit {field}"
+
+
+def scoring_contract(consumer: str, scoring: dict[str, object]) -> EngineContract:
+    """Place a literal score reference on one real consumer, without adding features."""
+    record = strategy()
+    if consumer == "offensive":
+        record = replace(record, offensive_config={**record.offensive_config, "scoring": scoring})
+    elif consumer == "canary":
+        record = replace(
+            record,
+            canary_config={
+                "canary_mode": "AND",
+                "assets": ["ASSET_A"],
+                "enabled": [True],
+                "scoring": scoring,
+            },
+        )
+    elif consumer == "negative":
+        record = replace(
+            record,
+            signals_config={
+                "negative": {
+                    "kind": "negative_abs_momentum",
+                    "enabled": True,
+                    "threshold": 1,
+                    "scoring": scoring,
+                }
+            },
+        )
+    else:
+        raise ValueError(consumer)
+    return replace(contract(), pack=(record,))
+
+
+@pytest.mark.parametrize("consumer", ["offensive", "canary", "negative"])
+@pytest.mark.parametrize(
+    "scoring",
+    [
+        pytest.param({"method": "return_rate", "horizon": 12}, id="return12"),
+        pytest.param({"method": "moving_average", "horizon": 12}, id="ma12"),
+        pytest.param(
+            {"method": "momentum_score", "horizon": 12, "score_name": "absent-score"},
+            id="absent-momentum",
+        ),
+    ],
+)
+def test_active_scoring_reference_must_be_declared(
+    consumer: str, scoring: dict[str, object]
+) -> None:
+    value = scoring_contract(consumer, scoring)
+    source = bundle(replace(value, calendar=replace(value.calendar, history_observations=13)))
+    # Loading remains legacy-compatible; only definition derivation rejects the reference.
+    assert source.contract.feature_matrix == FeatureMatrixSpec(
+        momentum_scores=(),
+        moving_average_months=(),
+        ma_window_includes_current_month=True,
+        return_months=(2,),
+        includes_latest_price=True,
+    )
+    with pytest.raises(ContractDefinitionError):
+        derive_execution_definition(source)
+
+
+@pytest.mark.parametrize("consumer", ["offensive", "canary", "negative"])
+@pytest.mark.parametrize(
+    "scoring",
+    [
+        pytest.param({"method": "return_rate", "horizon": 2}, id="return2"),
+        pytest.param({"method": "moving_average", "horizon": 2}, id="ma2"),
+        pytest.param(
+            {"method": "momentum_score", "horizon": 999, "score_name": "blend"},
+            id="momentum-horizon999",
+        ),
+    ],
+)
+def test_declared_scoring_references_preserve_projection_and_replay(
+    consumer: str, scoring: dict[str, object]
+) -> None:
+    value = replace(
+        scoring_contract(consumer, scoring),
+        feature_matrix=FeatureMatrixSpec(
+            momentum_scores=(MomentumScoreSpec("blend", (2,), (1.0,), 1.0),),
+            moving_average_months=(2,),
+            ma_window_includes_current_month=True,
+            return_months=(2,),
+            includes_latest_price=True,
+        ),
+    )
+    source = bundle(value)
+    result = derive_execution_definition(source)
+    assert result == replace(
+        derive_execution_definition(bundle(contract())),
+        source_sha256=source.source_sha256,
+        contract_sha256=source.contract_sha256,
+        feature_matrix=value.feature_matrix,
+    )
+    assert list(legacy_requirement_rows(result)) == [
+        (
+            "synthetic-probe",
+            "1",
+            "prices",
+            1,
+            "engine-price-v1",
+            "close",
+            "prices",
+            3,
+            "explicit-input",
+            "calendar_month_end",
+        )
+    ]
+    assert dict(replay(source, request()).ensemble) == {"ASSET_A": 1.0}
+    assert serialize_bundle(source) == raw_bundle(value)
+
+
+def test_disabled_scoring_consumers_need_no_reference_or_price() -> None:
+    record = replace(
+        strategy(),
+        canary_config={"canary_mode": "OR", "assets": ["UNSUPPLIED"], "enabled": [False]},
+        signals_config={"negative": {"kind": "negative_abs_momentum", "enabled": False}},
+    )
+    source = bundle(replace(contract(), pack=(record,)))
+    assert derive_execution_definition(source) == replace(
+        derive_execution_definition(bundle(contract())),
+        source_sha256=source.source_sha256,
+        contract_sha256=source.contract_sha256,
+    )
+    assert dict(replay(source, request()).ensemble) == {"ASSET_A": 1.0}
 
 
 def test_incompatible_derived_price_consumption_is_rejected() -> None:
