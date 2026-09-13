@@ -3,16 +3,15 @@
 from __future__ import annotations
 
 import json
-from dataclasses import FrozenInstanceError, asdict, replace
+from dataclasses import MISSING, FrozenInstanceError, asdict, fields, replace
 from datetime import UTC, date, datetime
-from typing import TypedDict, cast
+from typing import cast
 
 import pytest
 
 from aegis_alpha.engine import load_bundle, sha256_bytes
 from aegis_alpha.engine.calendar import prior_calendar_month_end
-from aegis_alpha.engine.models import CalendarConventions
-from aegis_alpha.engine.schedule import DecisionSlot, Session, decision_slots
+from aegis_alpha.engine.schedule import DecisionSlot, ScheduleRequest, Session, decision_slots
 from tests.engine.engine_support import bundle, contract, raw_bundle
 
 INT64_MAX = 9_223_372_036_854_775_807
@@ -63,16 +62,18 @@ SESSIONS = (
 )
 
 
-class ScheduleArguments(TypedDict):
-    calendar: CalendarConventions
-    calendar_id: str
-    venue: str
-    timezone_version: str
-    period_start: date
-    period_end: date
-    decision_latency_us: int
-    request_cutoff_us: int
-    explicit_decision_dates: tuple[date, ...] | None
+def _request() -> ScheduleRequest:
+    return ScheduleRequest(
+        calendar=bundle(contract()).contract.calendar,
+        calendar_id="synthetic-calendar",
+        venue="SYN",
+        timezone_version="synthetic-tz-v1",
+        period_start=date(2026, 1, 29),
+        period_end=date(2026, 3, 30),
+        decision_latency_us=4_000_000,
+        request_cutoff_us=_us("2026-04-01T20:00:00+00:00"),
+        explicit_decision_dates=None,
+    )
 
 
 def _schedule(
@@ -80,20 +81,38 @@ def _schedule(
     /,
     **changes: object,
 ) -> tuple[DecisionSlot, ...]:
-    options: ScheduleArguments = {
-        "calendar": bundle(contract()).contract.calendar,
-        "calendar_id": "synthetic-calendar",
-        "venue": "SYN",
-        "timezone_version": "synthetic-tz-v1",
-        "period_start": date(2026, 1, 29),
-        "period_end": date(2026, 3, 30),
-        "decision_latency_us": 4_000_000,
-        "request_cutoff_us": _us("2026-04-01T20:00:00+00:00"),
-        "explicit_decision_dates": None,
-    }
-    # Deliberately malformed fixture kwargs cross this unsafe boundary to the validator.
-    merged = cast("object", {**options, **changes})
-    return decision_slots(sessions, **cast("ScheduleArguments", merged))
+    # Malformed fixture values still cross the real request/function validation boundary.
+    return decision_slots(sessions, request=replace(_request(), **changes))
+
+
+def test_request_is_frozen_slotted_and_requires_all_explicit_fields() -> None:
+    request = _request()
+    assert tuple(field.name for field in fields(request)) == (
+        "calendar",
+        "calendar_id",
+        "venue",
+        "timezone_version",
+        "period_start",
+        "period_end",
+        "decision_latency_us",
+        "request_cutoff_us",
+        "explicit_decision_dates",
+    )
+    for field in fields(request):
+        assert field.default is MISSING
+        assert field.default_factory is MISSING
+        with pytest.raises(FrozenInstanceError):
+            setattr(request, field.name, None)
+    assert not hasattr(request, "__dict__")
+    assert decision_slots(SESSIONS, request=request) == _schedule()
+    assert replace(request, explicit_decision_dates=()).explicit_decision_dates == ()
+    assert request.explicit_decision_dates is None
+
+
+@pytest.mark.parametrize("bad", [None, True, (), {}])
+def test_schedule_requires_grouped_request_type(bad: object) -> None:
+    with pytest.raises(TypeError, match="ScheduleRequest"):
+        decision_slots(SESSIONS, request=cast("ScheduleRequest", bad))
 
 
 def test_three_month_holidays_preserve_actual_decisions_and_prior_signal_month() -> None:

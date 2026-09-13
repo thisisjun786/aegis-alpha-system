@@ -124,18 +124,25 @@ def _selected_dates(
     return explicit
 
 
-def decision_slots(  # noqa: PLR0913 -- explicit pinned calendar, period and cutoff contract.
+@dataclass(frozen=True, slots=True)
+class ScheduleRequest:
+    """Explicit calendar, period and cutoff inputs validated together with sessions."""
+
+    calendar: CalendarConventions
+    calendar_id: str
+    venue: str
+    timezone_version: str
+    period_start: date
+    period_end: date
+    decision_latency_us: int
+    request_cutoff_us: int
+    explicit_decision_dates: tuple[date, ...] | None
+
+
+def decision_slots(
     sessions: tuple[Session, ...],
     *,
-    calendar: CalendarConventions,
-    calendar_id: str,
-    venue: str,
-    timezone_version: str,
-    period_start: date,
-    period_end: date,
-    decision_latency_us: int,
-    request_cutoff_us: int,
-    explicit_decision_dates: tuple[date, ...] | None,
+    request: ScheduleRequest,
 ) -> tuple[DecisionSlot, ...]:
     """Schedule last-open monthly decisions within inclusive close valuation bounds.
 
@@ -145,13 +152,16 @@ def decision_slots(  # noqa: PLR0913 -- explicit pinned calendar, period and cut
     never clamped to the next open. The actual decision date is replay's as_of:
     its prior-calendar-month signal convention is not advanced to the fill month.
     """
-    if not isinstance(calendar, CalendarConventions):
+    if not isinstance(request, ScheduleRequest):
+        raise TypeError("request must be a ScheduleRequest")
+    if not isinstance(request.calendar, CalendarConventions):
         raise TypeError("calendar must be validated CalendarConventions")
     # Reuse the existing cadence/convention validator, not a parallel parser.
-    calendar.__post_init__()
-    start, end = _date(period_start), _date(period_end)
-    latency, ceiling = _microseconds(decision_latency_us), _microseconds(request_cutoff_us)
-    opened = _open_sessions(sessions, calendar_id, venue, timezone_version)
+    request.calendar.__post_init__()
+    start, end = _date(request.period_start), _date(request.period_end)
+    latency = _microseconds(request.decision_latency_us)
+    ceiling = _microseconds(request.request_cutoff_us)
+    opened = _open_sessions(sessions, request.calendar_id, request.venue, request.timezone_version)
     open_dates = {row.session_date for row in opened}
     if start >= end or start not in open_dates or end not in open_dates:
         raise ValueError("period requires two ordered supplied open-session date bounds")
@@ -163,7 +173,7 @@ def decision_slots(  # noqa: PLR0913 -- explicit pinned calendar, period and cut
         != (right.session_date.year, right.session_date.month)
     }
     slots: list[DecisionSlot] = []
-    for day in _selected_dates(explicit_decision_dates, eligible):
+    for day in _selected_dates(request.explicit_decision_dates, eligible):
         decision, execution = eligible[day]
         close = cast("int", decision.close_at_us)
         delayed = close + latency
