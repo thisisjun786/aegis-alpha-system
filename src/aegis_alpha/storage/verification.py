@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.storage.market import verify_generation
 from aegis_alpha.storage.raw import verify_raw
-from aegis_alpha.storage.strategies import load_strategy
+from aegis_alpha.storage.strategies import verify_strategy_content
 
 if TYPE_CHECKING:
     from aegis_alpha.storage.workspace import Workspace
@@ -59,7 +59,7 @@ def verify_workspace(workspace: Workspace) -> dict[str, object]:  # noqa: C901, 
         "SELECT strategy_id,version,raw_sha256 FROM strategy_versions"
     ).fetchall()
     for strategy in strategies:
-        load_strategy(workspace.strategies, *strategy)
+        verify_strategy_content(workspace.strategies, *strategy)
     for row in workspace.state.execute(
         "SELECT run_id,relative_path,size_bytes,content_hash FROM artifacts"
     ):
