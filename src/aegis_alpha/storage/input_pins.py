@@ -93,6 +93,9 @@ def _document(raw: bytes) -> tuple[ConventionPin, bytes]:
         raise ValueError("convention must be bytes of at most 1 MiB")
     if raw.startswith(b"\xef\xbb\xbf"):
         raise ValueError("convention UTF-8 must not have a BOM")
+    # Literal NUL is invalid JSON text and enables the decoder's UTF-16/32 detection.
+    if b"\x00" in raw:
+        raise ValueError("convention JSON text must not contain literal NUL bytes")
     try:
         raw.decode("utf-8", errors="strict")
         document = decode_json(raw)

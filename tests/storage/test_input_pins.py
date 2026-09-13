@@ -49,6 +49,49 @@ def test_register_and_read_exact_documents(tmp_path: Path) -> None:
         ) == (0, 0, 0, 0)
 
 
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"])
+def test_bomless_encoding_is_rejected_without_mutation(tmp_path: Path, encoding: str) -> None:
+    raw = A.decode("utf-8").encode(encoding)
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(raw.decode("utf-8", errors="strict"))
+    home = tmp_path / "aas"
+    initialize(home)
+    with open_workspace(home, writable=True) as ws:
+        assert _rows(ws.state) == []
+        assert ws.state.total_changes == 0
+        try:
+            register_convention(ws.state, raw, expected_file_sha256=hashlib.sha256(raw).hexdigest())
+        except ValueError as error:
+            rejection = type(error)
+        else:
+            rejection = None
+        assert (rejection, _rows(ws.state), ws.state.total_changes) == (ValueError, [], 0)
+
+
+def test_escaped_json_strings_retain_semantics(tmp_path: Path) -> None:
+    raw = (
+        b'{"schema":"aas-convention-v1","hash_format":"aas-canonical-json-sha256-v1",'
+        b'"kind":"cost","id":"synthetic-escapes","version":"1",'
+        b'"payload":{"schema":"synthetic-opaque-v1","text":"\\u0000\\n\\u00e9\\\\u0000"}}'
+    )
+    expected = (
+        b'{"hash_format":"aas-canonical-json-sha256-v1","id":"synthetic-escapes","kind":"cost",'
+        b'"payload":{"schema":"synthetic-opaque-v1","text":"\\u0000\\n\xc3\xa9\\\\u0000"},'
+        b'"schema":"aas-convention-v1","version":"1"}'
+    )
+    home = tmp_path / "aas"
+    initialize(home)
+    with open_workspace(home, writable=True) as ws:
+        pin = register_convention(
+            ws.state, raw, expected_file_sha256=hashlib.sha256(raw).hexdigest()
+        )
+        assert pin == ConventionPin(
+            "cost", "synthetic-escapes", "1", hashlib.sha256(expected).hexdigest()
+        )
+        assert read_convention(ws.state, pin) == expected
+        assert json.loads(read_convention(ws.state, pin))["payload"]["text"] == "\x00\né\\u0000"
+
+
 def test_wrong_file_hash(tmp_path: Path) -> None:
     home = tmp_path / "aas"
     initialize(home)
