@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from dataclasses import dataclass
 
-from aegis_alpha.data.serialization import canonical_json_bytes
+from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
 from aegis_alpha.engine.bundle import EngineBundle, load_bundle
 from aegis_alpha.engine.requirements import derive_execution_definition, legacy_requirement_rows
 from aegis_alpha.storage.sqlite import initialize
@@ -17,6 +18,23 @@ def initialize_strategies(connection: sqlite3.Connection, installation_id: str) 
     initialize(connection, installation_id, STRATEGY_KIND, STRATEGY_DDL)
 
 
+@dataclass(frozen=True, slots=True)
+class LineageSpec:
+    """Exact optional parent evidence supplied when a child version is first registered."""
+
+    parent_id: str
+    parent_version: str
+    change_kind: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        for value in (self.parent_id, self.parent_version, self.change_kind):
+            if not isinstance(value, str) or not value.strip() or value != value.strip():
+                raise ValueError("lineage identity fields must be nonempty trimmed strings")
+        if not isinstance(self.reason, str) or not self.reason.strip():
+            raise ValueError("lineage reason must be a nonempty string")
+
+
 def import_strategy(  # noqa: PLR0913, PLR0917 -- explicit external bundle pins
     connection: sqlite3.Connection,
     raw: bytes,
@@ -24,12 +42,14 @@ def import_strategy(  # noqa: PLR0913, PLR0917 -- explicit external bundle pins
     expected_id: str,
     expected_version: str,
     operation_id: str,
+    *,
+    lineage: LineageSpec | None = None,
 ) -> dict[str, object]:
     bundle = load_bundle(raw, expected_sha256, expected_id, expected_version)
     contract = canonical_json_bytes(bundle.contract).decode()
     with atomic(connection):
         previous = connection.execute(
-            "SELECT raw_sha256,contract_sha256,raw_bundle FROM strategy_versions "
+            "SELECT raw_sha256,contract_sha256,raw_bundle,contract_json FROM strategy_versions "
             "WHERE strategy_id=? "
             "AND version=?",
             (expected_id, expected_version),
@@ -41,6 +61,28 @@ def import_strategy(  # noqa: PLR0913, PLR0917 -- explicit external bundle pins
             raise ValueError("strategy ID/version already contains different content")
         if previous is not None:
             load_bundle(previous["raw_bundle"], expected_sha256, expected_id, expected_version)
+            if previous["contract_json"] != contract:
+                raise ValueError("strategy parsed contract hash mismatch")
+            stored_lineage = connection.execute(
+                "SELECT parent_strategy_id,parent_version,change_kind,reason,reason_hash "
+                "FROM strategy_lineage WHERE strategy_id=? AND version=?",
+                (expected_id, expected_version),
+            ).fetchall()
+            wanted = (
+                []
+                if lineage is None
+                else [
+                    (
+                        lineage.parent_id,
+                        lineage.parent_version,
+                        lineage.change_kind,
+                        lineage.reason,
+                        content_sha256(lineage.reason),
+                    )
+                ]
+            )
+            if [tuple(row) for row in stored_lineage] != wanted:
+                raise ValueError("strategy ID/version already contains different lineage")
         receipt = connection.execute(
             "SELECT strategy_id,version,request_hash FROM strategy_imports WHERE operation_id=?",
             (operation_id,),
@@ -83,6 +125,8 @@ def import_strategy(  # noqa: PLR0913, PLR0917 -- explicit external bundle pins
                 ),
             )
             _requirements(connection, bundle)
+            if lineage is not None:
+                _register_lineage(connection, expected_id, expected_version, lineage)
         if receipt is None:
             connection.execute(
                 "INSERT INTO strategy_imports VALUES (?,?,?,?,?)",
@@ -107,6 +151,39 @@ def _requirements(connection: sqlite3.Connection, bundle: EngineBundle) -> None:
     connection.executemany(
         "INSERT INTO strategy_requirements VALUES (?,?,?,?,?,?,?,?,?,?)",
         legacy_requirement_rows(derive_execution_definition(bundle)),
+    )
+
+
+def _register_lineage(
+    connection: sqlite3.Connection, strategy_id: str, version: str, lineage: LineageSpec
+) -> None:
+    # Include unresolved edges: registering a missing parent must not close a cycle.
+    cycle = connection.execute(
+        "WITH RECURSIVE walk(strategy_id,version) AS ("
+        "SELECT ?,? UNION SELECT l.parent_strategy_id,l.parent_version "
+        "FROM strategy_lineage l JOIN walk w "
+        "ON l.strategy_id=w.strategy_id AND l.version=w.version) "
+        "SELECT 1 FROM walk WHERE strategy_id=? AND version=?",
+        (lineage.parent_id, lineage.parent_version, strategy_id, version),
+    ).fetchone()
+    if cycle is not None:
+        raise ValueError("strategy lineage cycle")
+    parent = connection.execute(
+        "SELECT 1 FROM strategy_versions WHERE strategy_id=? AND version=?",
+        (lineage.parent_id, lineage.parent_version),
+    ).fetchone()
+    connection.execute(
+        "INSERT INTO strategy_lineage VALUES (?,?,?,?,?,?,?,?)",
+        (
+            strategy_id,
+            version,
+            lineage.parent_id,
+            lineage.parent_version,
+            lineage.change_kind,
+            lineage.reason,
+            content_sha256(lineage.reason),
+            "resolved" if parent is not None else "unresolved",
+        ),
     )
 
 

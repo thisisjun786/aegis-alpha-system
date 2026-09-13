@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import pytest
 from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.engine import replay
 from aegis_alpha.engine.models import EngineContract
-from aegis_alpha.storage.strategies import load_strategy
+from aegis_alpha.storage.strategies import LineageSpec, load_strategy
 from aegis_alpha.storage.strategy_import import register_strategy
 from aegis_alpha.storage.workspace import initialize, open_workspace
 from tests.engine.engine_support import contract, raw_bundle, request
@@ -121,3 +122,49 @@ def test_registered_bundle_replays_after_original_file_removed(tmp_path: Path) -
         assert result.source_sha256 == digest
         operations = workspace.state.execute("SELECT phase FROM storage_operations").fetchall()
         assert [row[0] for row in operations] == ["COMPLETED"]
+
+
+def test_lineage_registration_failure_rolls_back_then_retries(tmp_path: Path) -> None:
+    home = tmp_path / "aas"
+    initialize(home)
+    payload = raw_bundle(contract())
+    digest = hashlib.sha256(payload).hexdigest()
+    source = tmp_path / "synthetic.json"
+    source.write_bytes(payload)
+    lineage = LineageSpec("parent", "7", "derived", "synthetic")
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        assert workspace.strategies is not None
+        workspace.strategies.execute(
+            "CREATE TEMP TRIGGER fail_lineage BEFORE INSERT ON strategy_lineage "
+            "BEGIN SELECT RAISE(ABORT,'synthetic insertion failure'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="synthetic insertion failure"):
+            register_strategy(workspace, source, digest, "synthetic-probe", "1", lineage=lineage)
+        counts = workspace.strategies.execute(
+            "SELECT (SELECT count(*) FROM strategies),"
+            "(SELECT count(*) FROM strategy_versions),"
+            "(SELECT count(*) FROM strategy_sources),"
+            "(SELECT count(*) FROM strategy_requirements),"
+            "(SELECT count(*) FROM strategy_lineage),"
+            "(SELECT count(*) FROM strategy_imports)"
+        ).fetchone()
+        assert tuple(counts) == (0, 0, 0, 0, 0, 0)
+        assert [
+            row[0] for row in workspace.state.execute("SELECT phase FROM storage_operations")
+        ] == ["PREPARED"]
+        workspace.strategies.execute("DROP TRIGGER fail_lineage")
+        first = register_strategy(
+            workspace, source, digest, "synthetic-probe", "1", lineage=lineage
+        )
+        assert (
+            register_strategy(workspace, source, digest, "synthetic-probe", "1", lineage=lineage)
+            == first
+        )
+        with pytest.raises(ValueError, match="different lineage"):
+            register_strategy(workspace, source, digest, "synthetic-probe", "1")
+        assert [
+            row[0] for row in workspace.state.execute("SELECT phase FROM storage_operations")
+        ] == ["COMPLETED"]
+        assert (
+            workspace.strategies.execute("SELECT count(*) FROM strategy_imports").fetchone()[0] == 1
+        )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -7,6 +8,10 @@ import sys
 from pathlib import Path
 
 import pytest
+
+from aegis_alpha.storage.strategies import load_strategy
+from aegis_alpha.storage.workspace import open_workspace
+from tests.engine.engine_support import contract, raw_bundle
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -52,6 +57,98 @@ def test_explicit_nested_home_wins(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert explicit.exists()
     assert not env_home.exists()
+
+
+def test_strategy_lineage_cli_roundtrip(tmp_path: Path) -> None:
+    home = tmp_path / "aas"
+    source = tmp_path / "synthetic.json"
+    payload = raw_bundle(contract())
+    digest = hashlib.sha256(payload).hexdigest()
+    source.write_bytes(payload)
+    assert run_cli("init", home=home).returncode == 0
+    arguments = (
+        "strategy",
+        "import",
+        str(source),
+        "--id",
+        "synthetic-probe",
+        "--version",
+        "1",
+        "--sha256",
+        digest,
+        "--parent-id",
+        "synthetic-parent",
+        "--parent-version",
+        "7",
+        "--change-kind",
+        "derived",
+        "--reason",
+        " synthetic reason\n",
+    )
+    result = run_cli(*arguments, home=home)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["imported"] is True
+    again = run_cli(*arguments, home=home)
+    assert again.returncode == 0, again.stderr
+    assert again.stdout == result.stdout
+    with open_workspace(home) as workspace:
+        assert workspace.strategies is not None
+        rows = workspace.strategies.execute("SELECT * FROM strategy_lineage").fetchall()
+        assert [tuple(row) for row in rows] == [
+            (
+                "synthetic-probe",
+                "1",
+                "synthetic-parent",
+                "7",
+                "derived",
+                " synthetic reason\n",
+                hashlib.sha256(b'" synthetic reason\\n"').hexdigest(),
+                "unresolved",
+            )
+        ]
+        with pytest.raises(ValueError, match="unresolved parent"):
+            load_strategy(workspace.strategies, "synthetic-probe", "1", digest)
+        assert [
+            row[0] for row in workspace.state.execute("SELECT phase FROM storage_operations")
+        ] == ["COMPLETED"]
+
+
+@pytest.mark.parametrize("mask", range(1, 15))
+def test_strategy_lineage_cli_rejects_partial_flags(tmp_path: Path, mask: int) -> None:
+    home = tmp_path / "aas"
+    source = tmp_path / "synthetic.json"
+    payload = raw_bundle(contract())
+    source.write_bytes(payload)
+    assert run_cli("init", home=home).returncode == 0
+    options = [
+        ("--parent-id", "parent"),
+        ("--parent-version", "1"),
+        ("--change-kind", "derived"),
+        ("--reason", "synthetic"),
+    ]
+    flags = [value for index, pair in enumerate(options) if mask & (1 << index) for value in pair]
+    result = run_cli(
+        "strategy",
+        "import",
+        str(source),
+        "--id",
+        "synthetic-probe",
+        "--version",
+        "1",
+        "--sha256",
+        hashlib.sha256(payload).hexdigest(),
+        *flags,
+        home=home,
+    )
+    assert result.returncode == 1, result.stderr
+    assert "error" in json.loads(result.stderr)
+    with open_workspace(home) as workspace:
+        assert workspace.strategies is not None
+        assert (
+            workspace.strategies.execute("SELECT count(*) FROM strategy_versions").fetchone()[0]
+            == 0
+        )
+        assert workspace.state.execute("SELECT count(*) FROM storage_operations").fetchone()[0] == 0
 
 
 def test_restore_never_defaults_over_current_home(tmp_path: Path) -> None:

@@ -5,6 +5,10 @@ from __future__ import annotations
 # ruff: noqa: PLC0415 -- lazy imports keep preview/status dependency-free.
 import argparse
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from aegis_alpha.storage.strategies import LineageSpec
 
 
 def _home(parser: argparse.ArgumentParser) -> None:
@@ -40,6 +44,8 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
     importer.add_argument("--id", required=True)
     importer.add_argument("--version", required=True)
     importer.add_argument("--sha256", required=True)
+    for option in ("parent-id", "parent-version", "change-kind", "reason"):
+        importer.add_argument(f"--{option}", help="Optional lineage; supply all four fields")
     data = commands.add_parser("data", help="Read and publish pinned local market generations")
     _home(data)
     sub = data.add_subparsers(dest="data_command", required=True)
@@ -151,7 +157,12 @@ def _workspace_command(workspace: object, args: argparse.Namespace) -> dict[str,
         from aegis_alpha.storage.strategy_import import register_strategy
 
         return register_strategy(
-            workspace, args.file.absolute(), args.sha256, args.id, args.version
+            workspace,
+            args.file.absolute(),
+            args.sha256,
+            args.id,
+            args.version,
+            lineage=_strategy_lineage(args),
         )
     from aegis_alpha.storage.publication import execute_data
 
@@ -173,3 +184,12 @@ def _source_command(workspace: object, args: argparse.Namespace) -> dict[str, ob
 
         return dict(inspect_source(workspace, args.source, args.table, limit=args.limit))
     return source_library.import_sqlite(workspace, args.file.absolute(), args.id, args.sha256)
+
+
+def _strategy_lineage(args: argparse.Namespace) -> LineageSpec | None:
+    from aegis_alpha.storage.strategies import LineageSpec
+
+    fields = (args.parent_id, args.parent_version, args.change_kind, args.reason)
+    if fields.count(None) not in (0, len(fields)):
+        raise ValueError("lineage requires parent-id, parent-version, change-kind and reason")
+    return None if args.parent_id is None else LineageSpec(*fields)

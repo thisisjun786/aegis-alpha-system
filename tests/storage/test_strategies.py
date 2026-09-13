@@ -12,6 +12,7 @@ from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.engine import ENGINE_BUNDLE_SCHEMA_V1
 from aegis_alpha.storage.sqlite import connect
 from aegis_alpha.storage.strategies import (
+    LineageSpec,
     import_strategy,
     initialize_strategies,
     list_strategies,
@@ -41,14 +42,18 @@ def _envelope(bundle_id: str, version: str, value: object | None = None) -> byte
     )
 
 
-def _import(
+def _import(  # noqa: PLR0913 -- mirror explicit import pins and optional lineage
     connection: sqlite3.Connection,
     raw: bytes,
     operation_id: str,
     strategy_id: str = BUNDLE_ID,
     version: str = VERSION,
+    *,
+    lineage: LineageSpec | None = None,
 ) -> dict[str, object]:
-    return import_strategy(connection, raw, _digest(raw), strategy_id, version, operation_id)
+    return import_strategy(
+        connection, raw, _digest(raw), strategy_id, version, operation_id, lineage=lineage
+    )
 
 
 @pytest.fixture
@@ -235,3 +240,124 @@ def test_lineage_fk_missing_parent_and_cycle(store: sqlite3.Connection) -> None:
     digest = _digest(_envelope("child", VERSION))
     with pytest.raises(ValueError, match="unresolved parent"):
         load_strategy(store, "child", VERSION, digest)
+
+
+@pytest.mark.parametrize("parent_first", [True, False])
+def test_lineage_status_is_fixed_at_registration(
+    store: sqlite3.Connection, *, parent_first: bool
+) -> None:
+    parent = _envelope("parent", "7")
+    lineage = LineageSpec("parent", "7", "derived", " synthetic reason\n")
+    # A different registered parent version must not resolve the supplied version.
+    _import(store, _envelope("parent", "1"), "parent-1", "parent")
+    if parent_first:
+        _import(store, parent, "parent-7", "parent", "7")
+    raw = _envelope("child", "1")
+    first = _import(store, raw, "child-1", "child", lineage=lineage)
+    expected = (
+        "child",
+        "1",
+        "parent",
+        "7",
+        "derived",
+        " synthetic reason\n",
+        hashlib.sha256(b'" synthetic reason\\n"').hexdigest(),
+        "resolved" if parent_first else "unresolved",
+    )
+    assert tuple(store.execute("SELECT * FROM strategy_lineage").fetchone()) == expected
+    if not parent_first:
+        with pytest.raises(ValueError, match="unresolved parent"):
+            load_strategy(store, "child", "1", _digest(raw))
+        _import(store, parent, "parent-7", "parent", "7")
+    before = "\n".join(store.iterdump())
+    assert _import(store, raw, "child-1", "child", lineage=lineage) == first
+    assert "\n".join(store.iterdump()) == before
+    if parent_first:
+        assert load_strategy(store, "child", "1", _digest(raw)).bundle_version == "1"
+    else:
+        with pytest.raises(ValueError, match="unresolved parent"):
+            load_strategy(store, "child", "1", _digest(raw))
+    corrected = _envelope("child", "2")
+    _import(store, corrected, "child-2", "child", "2", lineage=lineage)
+    assert load_strategy(store, "child", "2", _digest(corrected)).bundle_version == "2"
+    assert [
+        tuple(row)
+        for row in store.execute(
+            "SELECT version,parent_status FROM strategy_lineage ORDER BY version"
+        )
+    ] == [("1", expected[-1]), ("2", "resolved")]
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        store.execute("UPDATE strategy_lineage SET parent_status='resolved'")
+    store.rollback()
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        None,
+        LineageSpec("other", "7", "derived", "synthetic"),
+        LineageSpec("parent", "8", "derived", "synthetic"),
+        LineageSpec("parent", "7", "correction", "synthetic"),
+        LineageSpec("parent", "7", "derived", "synthetic "),
+    ],
+)
+def test_conflicting_lineage_never_changes_existing_evidence(
+    store: sqlite3.Connection, other: LineageSpec | None
+) -> None:
+    raw = raw_bundle(contract())
+    _import(store, raw, "child", lineage=LineageSpec("parent", "7", "derived", "synthetic"))
+    before = "\n".join(store.iterdump())
+    for operation in ("child", "other-operation"):
+        with pytest.raises(ValueError, match="different lineage"):
+            _import(store, raw, operation, lineage=other)
+        assert "\n".join(store.iterdump()) == before
+
+
+def test_lineage_cannot_be_added_to_existing_version(store: sqlite3.Connection) -> None:
+    raw = raw_bundle(contract())
+    _import(store, raw, "original")
+    with pytest.raises(ValueError, match="different lineage"):
+        _import(store, raw, "other", lineage=LineageSpec("parent", "7", "derived", "synthetic"))
+    assert store.execute("SELECT count(*) FROM strategy_lineage").fetchone()[0] == 0
+    assert store.execute("SELECT count(*) FROM strategy_imports").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("depth", [0, 1, 3])
+def test_lineage_cycles_roll_back_the_new_version(store: sqlite3.Connection, depth: int) -> None:
+    for index in range(depth):
+        name, parent = str(index), str(index + 1)
+        _import(
+            store,
+            _envelope(name, "1"),
+            name,
+            name,
+            lineage=LineageSpec(parent, "1", "derived", "synthetic"),
+        )
+    name = str(depth)
+    before = "\n".join(store.iterdump())
+    with pytest.raises(ValueError, match="cycle"):
+        _import(
+            store,
+            _envelope(name, "1"),
+            name,
+            name,
+            lineage=LineageSpec("0", "1", "derived", "synthetic"),
+        )
+    assert "\n".join(store.iterdump()) == before
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        ("", "1", "derived", "reason"),
+        (" parent", "1", "derived", "reason"),
+        ("parent", "", "derived", "reason"),
+        ("parent", "1 ", "derived", "reason"),
+        ("parent", "1", " derived", "reason"),
+        ("parent", "1", "", "reason"),
+        ("parent", "1", "derived", " \n"),
+    ],
+)
+def test_lineage_spec_rejects_invalid_fields(fields: tuple[str, str, str, str]) -> None:
+    with pytest.raises(ValueError, match="lineage"):
+        LineageSpec(*fields)
