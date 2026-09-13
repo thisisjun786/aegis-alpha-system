@@ -40,7 +40,8 @@ aas data read --dataset ID --version VERSION --cutoff-us UTC_MICROSECONDS
 
 전략은 `engine.bundle`의 envelope를 검증하고 원문과 계약 해시를 저장한다. 원래 성과를
 추정해 채우지 않는다. 현재 bundle은 실행 계약이며 별도 원본 성과 입력 UI는 제공하지 않는다.
-같은 바이트와 같은 계보로 다시 import하면 그대로 성공하고, 내용이나 계보가 다르면 거부한다.
+같은 바이트와 같은 계보로 다시 import하면 현재 실행 정의 검증을 통과하는 bundle은
+그대로 성공하고, 내용이나 계보가 다르면 거부한다.
 계보 네 옵션은 모두 지정하거나 모두 생략한다. 부모가 아직 등록되지 않았어도 import는
 성공하지만 그 버전은 `unresolved`로 남고, 나중에 부모를 등록해도 바뀌지 않는다.
 바로잡으려면 새 자식 버전을 등록한다. state 작업이 PREPARED로 남은 채 커밋된 import는
