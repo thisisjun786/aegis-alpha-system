@@ -16,6 +16,7 @@ from aegis_alpha.application.data_config import default_config_path, load_data_c
 if TYPE_CHECKING:
     from sqlalchemy import Engine
 
+    from aegis_alpha.compute_resources import ComputeBudget
     from aegis_alpha.storage.market_inputs import PriceInputRequest
     from aegis_alpha.storage.workspace import Workspace
 
@@ -188,7 +189,9 @@ def _price_request(value: object) -> PriceInputRequest:
     )
 
 
-def _read_price_input(workspace: Workspace, path: Path, sha256: str) -> dict[str, object]:
+def read_price_input(
+    workspace: Workspace, path: Path, sha256: str, *, budget: ComputeBudget
+) -> dict[str, object]:
     """Read aas-price-input-request-v1, with no implicit pins, modes or decision cutoffs.
 
     Root requires schema_version, prices and decision. prices requires EVERY
@@ -232,35 +235,32 @@ def _read_price_input(workspace: Workspace, path: Path, sha256: str) -> dict[str
             "decision cutoffs require nonnegative integer microseconds or null ingestion"
         )
     day = _input_day(decision["session_date"])
-    with price_compute() as budget:
-        if budget is None:
-            raise ValueError("read-prices requires the explicit AAS compute budget environment")
-        projected = load_pinned_prices(workspace, request, budget=budget).project_as_of(
-            at_us, session_date=day, ingestion_cutoff_us=cutoff
-        )
-        result = {
-            "request_sha256": sha256,
-            "prices": json_value(asdict(request)),
-            "decision": decision,
-            "rows": json_value([dict(row) for row in projected.rows]),
-            "coverage": json_value(
-                {
-                    **asdict(projected.coverage),
-                    "expected_count": projected.coverage.expected_count,
-                    "present_count": projected.coverage.present_count,
-                    "complete": projected.coverage.complete,
-                }
-            ),
-            "backtest_eligible": False,
-        }
-        # Match cli.main's encoding, including its newline, before any stdout.
-        size = 1
-        encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
-        for chunk in encoder.iterencode(result):
-            size += len(chunk.encode("utf-8"))
-            if size > MAX_INSPECTION_BYTES:
-                raise ValueError("research input output exceeds inspection byte budget")
-        return result
+    projected = load_pinned_prices(workspace, request, budget=budget).project_as_of(
+        at_us, session_date=day, ingestion_cutoff_us=cutoff
+    )
+    result = {
+        "request_sha256": sha256,
+        "prices": json_value(asdict(request)),
+        "decision": decision,
+        "rows": json_value([dict(row) for row in projected.rows]),
+        "coverage": json_value(
+            {
+                **asdict(projected.coverage),
+                "expected_count": projected.coverage.expected_count,
+                "present_count": projected.coverage.present_count,
+                "complete": projected.coverage.complete,
+            }
+        ),
+        "backtest_eligible": False,
+    }
+    # Match cli.main's encoding, including its newline, before any stdout.
+    size = 1
+    encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
+    for chunk in encoder.iterencode(result):
+        size += len(chunk.encode("utf-8"))
+        if size > MAX_INSPECTION_BYTES:
+            raise ValueError("research input output exceeds inspection byte budget")
+    return result
 
 
 def execute_native_data(workspace: Workspace, args: argparse.Namespace) -> dict[str, object]:
@@ -307,8 +307,6 @@ def execute_native_data(workspace: Workspace, args: argparse.Namespace) -> dict[
             return register_sessions_input(workspace, args.spec, args.sha256)
         case "register-proxy":
             return register_proxy_input(workspace, args.spec, args.sha256)
-        case "read-prices":
-            return _read_price_input(workspace, args.request, args.sha256)
         case _:
             from aegis_alpha.storage.publication import execute_data
 

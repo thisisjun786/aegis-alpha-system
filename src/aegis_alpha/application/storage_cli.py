@@ -103,6 +103,21 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             from aegis_alpha.storage.backup import restore
 
             return restore(args.backup.absolute(), home)
+        if args.command == "data" and args.data_command == "read-prices":
+            from aegis_alpha.application.compute_cli import price_compute
+            from aegis_alpha.application.data_cli import read_price_input
+            from aegis_alpha.storage.locks import private_directory, storage_lock_targets
+            from aegis_alpha.storage.paths import load_paths
+
+            private_directory(home)
+            targets = storage_lock_targets(home, load_paths(home).stores())
+            with price_compute(excluded_locks=targets) as budget:
+                if budget is None:
+                    raise ValueError(
+                        "read-prices requires the explicit AAS compute budget environment"
+                    )
+                with open_workspace(home, require_strategies=False) as workspace:
+                    return read_price_input(workspace, args.request, args.sha256, budget=budget)
         mutation = (
             (args.command == "strategy" and args.strategy_command == "import")
             or (

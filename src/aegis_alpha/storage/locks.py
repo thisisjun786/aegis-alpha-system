@@ -74,10 +74,17 @@ def file_lock(path: Path) -> Iterator[None]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def storage_lock_targets(root: Path, stores: tuple[Path, ...]) -> tuple[Path, ...]:
+    """The exact ordered lock targets used for workspace admission."""
+    return (
+        root / ".storage.lock",
+        *(path.with_name(path.name + ".lock") for path in sorted(stores)),
+    )
+
+
 @contextmanager
 def storage_locks(root: Path, stores: tuple[Path, ...]) -> Iterator[None]:
     with ExitStack() as stack:
-        stack.enter_context(file_lock(root / ".storage.lock"))
-        for path in sorted(stores):
-            stack.enter_context(file_lock(path.with_name(path.name + ".lock")))
+        for path in storage_lock_targets(root, stores):
+            stack.enter_context(file_lock(path))
         yield

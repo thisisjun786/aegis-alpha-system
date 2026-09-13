@@ -4,6 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
+import select
+import shutil
+import subprocess
+import sys
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
 from datetime import date, timedelta
 from pathlib import Path
@@ -11,7 +19,9 @@ from pathlib import Path
 import pytest
 
 from aegis_alpha.application.compute_cli import price_compute
+from aegis_alpha.compute_resources import compute_lease
 from aegis_alpha.engine.codec import decode_json
+from aegis_alpha.storage.locks import file_lock
 from aegis_alpha.storage.market import read_generation
 from aegis_alpha.storage.market_inputs import (
     GenerationPin,
@@ -22,7 +32,7 @@ from aegis_alpha.storage.market_inputs import (
 )
 from aegis_alpha.storage.publication import json_value
 from aegis_alpha.storage.research_inputs import register_price_input
-from aegis_alpha.storage.workspace import initialize, open_workspace
+from aegis_alpha.storage.workspace import initialize, open_workspace, write_json
 from tests.application.test_storage_cli import run_cli
 from tests.storage.test_research_inputs import (
     NON_UTF8_TRANSFORMS,
@@ -551,6 +561,263 @@ def test_compute_admission_is_required_and_bounded(
             monkeypatch.delenv(key)
     error = rejected(home, tmp_path / "request.json", json.dumps(request(home)).encode())
     assert "budget" in error
+
+
+# The child forwards every real flock unchanged. Only a real denial pauses it;
+# pipes are created before launch, and timeouts are harness bounds, never oracles.
+_LOCK_OBSERVER = """
+import fcntl, json, os, sys
+from aegis_alpha.application.cli import main
+from aegis_alpha.storage import market, workspace
+
+ack, release = map(int, sys.argv[1:3])
+arguments = sys.argv[3:]
+flock = fcntl.flock
+held, acquisitions, settings = {}, [], []
+connections = []
+paused = False
+
+def send(value):
+    os.write(ack, (json.dumps(value) + '\\n').encode())
+
+def observe(fd, operation):
+    global paused
+    info = os.fstat(fd)
+    descriptor = {'fd': fd, 'identity': [info.st_dev, info.st_ino],
+                  'path': os.readlink('/proc/self/fd/' + str(fd))}
+    try:
+        result = flock(fd, operation)
+    except BlockingIOError:
+        if descriptor['path'] == os.environ['AAS_COMPUTE_LOCK_FILE'] and not paused:
+            paused = True
+            send({'event': 'compute_denied', 'descriptor': descriptor,
+                  'held': list(held.values())})
+            if os.read(release, 1) != b'R':
+                raise RuntimeError('observer release pipe closed')
+        raise
+    if operation & fcntl.LOCK_UN:
+        held.pop(fd, None)
+    else:
+        held[fd] = descriptor
+        acquisitions.append(descriptor)
+    return result
+
+connect = workspace.market_connect
+def observe_connect(*args, **kwargs):
+    connection = connect(*args, **kwargs)
+    connections.append(connection)
+    return connection
+
+sqlite_connect = workspace.sqlite.connect
+def observe_sqlite(*args, **kwargs):
+    connection = sqlite_connect(*args, **kwargs)
+    connections.append(connection)
+    return connection
+
+read_chain = market.read_chain_rows
+def observe_chain(connection, *args, **kwargs):
+    result = read_chain(connection, *args, **kwargs)
+    settings.append(connection.execute(
+        "SELECT current_setting('threads'), current_setting('memory_limit')"
+    ).fetchone())
+    return result
+
+fcntl.flock = observe
+workspace.market_connect = observe_connect
+workspace.sqlite.connect = observe_sqlite
+market.read_chain_rows = observe_chain
+code = main(arguments)
+closed = []
+for connection in connections:
+    try:
+        connection.execute('SELECT 1')
+    except Exception as error:
+        closed.append(type(error).__name__)
+    else:
+        closed.append(False)
+send({'event': 'completed', 'code': code, 'held': list(held.values()),
+      'acquisitions': acquisitions, 'settings': settings, 'closed': closed})
+raise SystemExit(code)
+"""
+
+
+@contextmanager
+def observed_read(home: Path, path: Path) -> Iterator[tuple[subprocess.Popen[str], int, int]]:
+    ack_read, ack_write = os.pipe()
+    release_read, release_write = os.pipe()
+    try:
+        with subprocess.Popen(  # noqa: S603 -- fixed observer, synthetic native command
+            [
+                sys.executable,
+                "-c",
+                _LOCK_OBSERVER,
+                str(ack_write),
+                str(release_read),
+                "data",
+                "read-prices",
+                "--request",
+                str(path),
+                "--sha256",
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            ],
+            env={**os.environ, "AAS_HOME": str(home)},
+            pass_fds=(ack_write, release_read),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ) as child:
+            try:
+                yield child, ack_read, release_write
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                child.communicate(timeout=10)
+                logging.getLogger(__name__).info(
+                    "Reaped observer: pid=%s exit=%s", child.pid, child.returncode
+                )
+    finally:
+        for fd in (ack_read, ack_write, release_read, release_write):
+            os.close(fd)
+
+
+def lock_event(fd: int) -> dict[str, object]:
+    assert select.select([fd], [], [], 30)[0], "child failed to acknowledge lock state"
+    raw = os.read(fd, 65536)
+    assert raw, "child exited without a lock-state acknowledgement"
+    event = obj(json.loads(raw))
+    logging.getLogger(__name__).info("Lock acknowledgement: %s", json.dumps(event, sort_keys=True))
+    return event
+
+
+def test_read_queues_before_workspace_and_uses_one_lease(
+    registered: tuple[Path, dict[str, Path]], tmp_path: Path
+) -> None:
+    home, _ = registered
+    path = tmp_path / "queued.json"
+    path.write_text(json.dumps(request(home)))
+    control = run_cli(
+        "data",
+        "read-prices",
+        "--request",
+        str(path),
+        "--sha256",
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+        home=home,
+    )
+    assert control.returncode == 0, control.stderr
+    lock = Path(os.environ["AAS_COMPUTE_LOCK_FILE"])
+    try:
+        with ExitStack() as holder:
+            holder.enter_context(compute_lease(lock))
+            with observed_read(home, path) as (child, ack, release):
+                event = lock_event(ack)
+                assert event["event"] == "compute_denied", event
+                doctor = run_cli("doctor", home=home)
+                logging.getLogger(__name__).info(
+                    "Queued doctor: exit=%s stdout=%s stderr=%s",
+                    doctor.returncode,
+                    doctor.stdout,
+                    doctor.stderr,
+                )
+                assert event["held"] == [], event
+                assert doctor.returncode == 0, doctor.stderr
+                holder.close()
+                assert os.write(release, b"R") == 1
+                done = lock_event(ack)
+                assert done["event"] == "completed", done
+                stdout, stderr = child.communicate(timeout=30)
+                assert child.returncode == 0, stderr
+        assert stdout == control.stdout
+        assert stderr == ""
+        result = obj(json.loads(stdout))
+        assert at(result, "rows", 0, "close") == "11.000000000000"
+        assert at(result, "coverage", "present_count") == 1
+        assert at(result, "coverage", "cells", 1, "reasons") == [
+            "missing_session",
+            "missing_price",
+            "missing_sell_open",
+        ]
+        acquisitions = done["acquisitions"]
+        assert isinstance(acquisitions, list)
+        assert [at(item, "path") for item in acquisitions].count(str(lock)) == 1
+        assert at(acquisitions, 0, "path") == str(lock)
+        assert done["held"] == []
+        assert done["closed"] == ["ProgrammingError", "ProgrammingError", "ConnectionException"]
+        settings = done["settings"]
+        assert isinstance(settings, list)
+        assert settings
+        runtime_memory_mb = 512
+        for threads, memory in settings:
+            assert threads == 1
+            number, unit = memory.split()
+            assert unit == "MiB"
+            assert 0 < float(number) * 1024**2 < runtime_memory_mb * 1000**2
+    finally:
+        assert ok(home, "doctor")["ready"] is True
+
+
+@pytest.mark.parametrize(
+    "target",
+    [".storage.lock", "state.sqlite3.lock", "strategies.sqlite3.lock", "market.duckdb.lock"],
+)
+@pytest.mark.parametrize("layout", ["default", "relocated"])
+def test_read_rejects_workspace_compute_alias_before_waiting(
+    registered: tuple[Path, dict[str, Path]],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    layout: str,
+) -> None:
+    home, _ = registered
+    if layout == "relocated":
+        home = Path(shutil.copytree(home, tmp_path / "relocated"))
+        config = obj(json.loads((home / "runtime.json").read_bytes()))
+        for store in ("state", "strategies", "market"):
+            old = home / str(obj(config["paths"])[store])
+            destination = tmp_path / ("external-" + old.name)
+            old.rename(destination)
+            obj(config["paths"])[store] = str(destination)
+        write_json(home / "runtime.json", config)
+    path = tmp_path / "alias.json"
+    path.write_text(json.dumps(request(home)))
+    lock = home / target
+    if layout == "relocated" and target != ".storage.lock":
+        lock = tmp_path / ("external-" + target)
+    monkeypatch.setenv("AAS_COMPUTE_LOCK_FILE", str(lock))
+    try:
+        with observed_read(home, path) as (child, ack, _release):
+            event = lock_event(ack)
+            assert event["event"] == "completed", event
+            stdout, stderr = child.communicate(timeout=30)
+            assert child.returncode == 1
+            assert stdout == ""
+            assert obj(json.loads(stderr))["error"]
+            logging.getLogger(__name__).info("Alias refusal: %s", stderr)
+            assert event["held"] == []
+            assert event["acquisitions"] == []
+            assert event["closed"] == []
+    finally:
+        assert ok(home, "doctor")["ready"] is True
+
+
+@pytest.mark.parametrize("target", [".storage.lock", "state.sqlite3.lock"])
+def test_read_storage_contention_remains_nonblocking(
+    registered: tuple[Path, dict[str, Path]], tmp_path: Path, target: str
+) -> None:
+    home, _ = registered
+    path = tmp_path / "busy.json"
+    path.write_text(json.dumps(request(home)))
+    with file_lock(home / target), observed_read(home, path) as (child, ack, _release):
+        event = lock_event(ack)
+        assert event["event"] == "completed", event
+        stdout, stderr = child.communicate(timeout=30)
+        assert child.returncode == 1
+        assert stdout == ""
+        assert "installation_busy:" in str(obj(json.loads(stderr))["error"])
+        assert event["held"] == []
+        assert event["closed"] == []
+        assert at(event, "acquisitions", 0, "path") == os.environ["AAS_COMPUTE_LOCK_FILE"]
+    assert ok(home, "doctor")["ready"] is True
 
 
 @pytest.mark.parametrize("kind", ["prices", "sessions", "proxy"])
