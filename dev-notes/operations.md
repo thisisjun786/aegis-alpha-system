@@ -81,6 +81,89 @@ DuckDB의 메모리 설정은 전체 Python 프로세스의 메모리 한도가 
 만드므로 자료 크기에 맞는 디스크 공간과 I/O 시간이 필요하다. 원본 자료 이전만으로
 기존 수집기나 예약 작업의 저장 위치가 바뀌지는 않는다.
 
+## 원본 자료의 연구 입력 등록과 고정 조회
+
+```bash
+aas data register-prices --spec /path/to/prices-transform.json --sha256 SHA256
+aas data register-sessions --spec /path/to/sessions-transform.json --sha256 SHA256
+aas data register-proxy --spec /path/to/proxy-transform.json --sha256 SHA256
+aas data read-prices --request /path/to/price-request.json --sha256 SHA256
+```
+
+원본 자료실의 테이블은 저절로 시장 generation이 되지 않는다. 세 등록 명령은 명시한 변환
+문서를 읽어 `db source-import`로 보존한 원본 테이블에서 새 generation을 게시한다. 문서는
+UTF-8 JSON이고 `--sha256`과 바이트가 다르면 거부한다. 스키마는 각각 `aas-price-transform-v1`,
+`aas-sessions-transform-v1`, `aas-proxy-transform-v1`이며 필드 검증은
+[research_inputs.py](../src/aegis_alpha/storage/research_inputs.py)가 소유한다.
+
+세 문서의 공통 필드는 `source`(source_id·source_sha256·table·table_digest), `dataset`
+(dataset_id·version·generation_id·operation_id·parent_id, 부모가 없으면 null), `columns`,
+`instruments`, `publication_at_us`(모르면 null), `provider`, `normalizer_version`이다.
+`columns`는 공통 revision 열(generation_id, record_id, revision_id, supersedes_revision_id,
+op, available_at_us, revision_known_at_us, ingested_at_us, source_snapshot_id,
+source_row_hash)과 도메인 열을 모두 서로 다른 원본 열에 연결해야 한다. 열이 빠지거나
+알 수 없는 키가 있으면 거부한다. revision 연결, record 식별자, 원본 행 해시는 원본 열에서
+읽는다. 오늘 날짜나 티커로 만들어 채우지 않는다. 변환 문서 원문은 `raw/` 아래에 해시로
+보존되고 카탈로그의 `transform_sha256`이 그 문서를 가리킨다. 같은 문서를 다시 제출하면
+같은 결과를 돌려준다. 게시된 generation의 수집 시각과 행 해시는 AAS가 새로 계산한 값이며
+원본의 값은 원본 자료실과 변환 문서로 추적한다.
+
+`register-prices`는 `price`(basis·currency·price_role), `calendar`(calendar_id·timezone·
+timezone_version), `decimal_conversion`을 추가로 요구한다. `decimal_conversion`은
+open·high·low·close·volume 각각이 원본에서 십진 문자열(`decimal_string`)인지 IEEE
+실수(`ieee_float`)인지 선언한다. 두 경우 모두 DECIMAL(38,12)로 정확히 표현돼야 하며
+자릿수 손실이나 범위 초과는 거부한다. 실수는 `Decimal.from_float`의 정확한 값으로 비교한다.
+원본 행의 basis·currency·price_role은 문서와 같아야 하고, 부모 generation과 기준이 다르면
+별도 dataset이다. OHLCV는 다섯 값이 모두 있고 `value_state`가 `present`이거나, 다섯 값이
+모두 null인 행 단위 결측이어야 한다. 일부만 있는 행은 거부하며 종가로 나머지를 채우지 않는다.
+`asset_type`이 `proxy`인 종목은 가격 테이블에 넣을 수 없다. 공급자의 조정 스냅샷은
+`price_role=reference`로 등록하고, 실행용 OHLC와 신호·참조 가격은 서로 다른 pin을 가진다.
+
+`register-sessions`는 `calendar`(calendar_id·venue·timezone·timezone_version)를 요구하고
+`instruments`는 빈 배열이어야 한다. timezone은 IANA 이름이다. 각 세션 행은 calendar_id,
+venue, session_date, open_at_us, close_at_us, status, timezone_version을 담는다. `open`
+상태는 0 이상이고 순서가 맞는 UTC 마이크로초 두 값이, `closed` 상태는 둘 다 null이 필요하다.
+세션 시각에서 공개 시각이나 수정 인지 시각을 추정하지 않는다.
+
+`register-proxy`는 외부에서 정의한 프록시 지수 점을 `feature_values`에 저장한다. `proxy`에는
+`proxy_id`, `version`, `normalization`, `transition`을 명시한다. `contract_id`는 제출한
+proxy_id, `contract_version`은 그 버전이다. 모든 정의가 하나의 ID를 공유하지 않는다. 정의와
+입력 pin은 `feature_contracts`·`feature_inputs`에 기록하며, 원본·열 연결·대상·정규화 버전이
+바뀌면 새 proxy 버전이 필요하다. `transition`은 donor_id, target_id, logical_exposure_id,
+switch_decision_date(YYYY-MM-DD), mode(`signal_only` 또는 `observed_instrument_switch`),
+donor_source·target_source(SourcePin), basis_ref·calendar_ref·cost_ref(id·version·sha256)를
+담는다. 참조 버전은 `latest`일 수 없다. `instruments`는 logical_exposure_id 하나이고
+`asset_type`은 `proxy`다. `feature_values.value`는 DOUBLE이므로 `normalization`이 입력 숫자
+형식과 `ieee754_binary64` 출력을 선언한다. 십진 문자열은 binary64로 반올림되고 원본 값은
+원본 자료실에 남는다. 이 저장을 Decimal 정확 저장으로 표시하지 않는다. 결과는
+`non_executable=true`다. 프록시 지수로 체결하지 않고, 보유 여부도 프록시나 요청 필드가 아니라
+실제 이전 체결에서 정한다. 체결 재원은 실제 ETF OHLC뿐이다.
+
+`read-prices`는 `aas-price-input-request-v1` 요청을 읽는다. `prices`에는 `pin`,
+`sessions_pin`, `identity_pin`, `universe_pin`(없으면 명시적 null), `instrument_ids`,
+`session_dates`, `currency`, `basis`, `price_role`, `calendar_id`, `venue`,
+`timezone_version`, `interval`(`1d`), `mode`가 모두 필요하다. pin은 `data inspect`가 돌려주는
+dataset_id·version·generation_id·chain_hash·manifest_hash다. `decision`은 `at_us`,
+`session_date`, `ingestion_cutoff_us`(없으면 null)다. 기본값이나 최신 head 대체는 없다.
+이 명령은 명시한 compute 환경(`AAS_HOST_CPU_LIMIT`, `AAS_HOST_MEMORY_LIMIT_BYTES`,
+`AAS_COMPUTE_LOCK_FILE`)이 있어야 실행된다. 요청 파일과 전체 출력은 각각 1 MiB 안이어야 하며
+넘치면 출력 없이 실패한다.
+
+`mode=strict_pit`은 결정 시각까지 공개 시각과 수정 인지 시각이 모두 알려진 revision만 반영하고
+참조 가격은 제외한다. 나중에 게시한 generation은 이전 pin의 결과를 바꾸지 않는다.
+`mode=observed_snapshot_research`는 고정한 참조 스냅샷을 경제 날짜로만 제한하는 연구용
+읽기다. `observed_snapshot_research` 사유가 붙고 인증되지 않으며 strict 읽기를 바꾸지 않는다.
+두 모드 모두 `backtest_eligible=false`, `coverage.certified=false`다. `coverage.cells`는
+요청한 종목과 날짜의 격자 전체를 기록하고 셀마다 `present`와 `reasons`(`missing_session`,
+`missing_price`, `missing_sell_open`, `future_session`, `unknown_price_evidence`,
+`reference_price` 등)를 남긴다. `identity_pin`·`universe_pin`이 null이면 `identity_unpinned`·
+`universe_unpinned`가 남는다. 잘린 이력을 성공으로 돌려주지 않고, 요청 격자나 이력이 compute
+메모리 예산을 넘으면 명시적으로 실패한다.
+
+등록과 조회는 원본 자료의 진위, 공급자 조정 기준, 거래 가능성을 인증하지 않는다.
+`data datasets`에 보이는 generation은 검증한 변환의 결과일 뿐이며 PIT 자격이나 백테스트
+입력으로 자동 승격되지 않는다.
+
 ## 검사·복구·백업
 
 ```bash

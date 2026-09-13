@@ -15,5 +15,16 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   and reject unknown versions instead of implicitly adopting or upgrading files.
 - Backup takes SQLite snapshots and closes DuckDB after checkpoint while retaining
   installation admission. Restore targets a new root; secrets are excluded.
+- `research_inputs` publishes a retained source table as a new generation only
+  through an exact hashed transform document (`aas-{price,sessions,proxy}-transform-v1`).
+  Every common revision field maps to a real source column; never fabricate
+  revision links, record identity or row hashes. Decimal admission is exact and
+  partial OHLCV rejects. Proxy points are DOUBLE `feature_values` under their own
+  contract ID/version and stay non-executable. The raw spec is provenance.
+- `market_inputs` reads pinned generations with explicit pins and a caller-owned
+  compute budget, replaying the full chain per decision. Strict PIT excludes later
+  revisions, unknown knowledge and reference prices; observed snapshot research is
+  explicit and uncertified. Coverage reports every requested cell. Nothing here
+  promotes a generation to PIT or backtest eligibility.
 - Tests use private synthetic local directories. Never use the operator's AAS home,
   provider credentials, existing private strategies, or recovered databases.
