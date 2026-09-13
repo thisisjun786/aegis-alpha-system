@@ -7,10 +7,11 @@ import json
 import sqlite3
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import asdict
+from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Never, cast
+from typing import TYPE_CHECKING, Never, cast, override
 
 import pytest
 
@@ -29,6 +30,8 @@ from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace
 
 if TYPE_CHECKING:
+    from _typeshed import SupportsLenAndGetItem
+
     from aegis_alpha.storage.workspace import Workspace
 
 I0 = (
@@ -707,16 +710,23 @@ def test_unverified_old_header_is_preserved_without_adoption(workspace: Workspac
     assert state_image(workspace) == before
 
 
-class SelectBoundary:
-    """Forward real SQLite, rejecting any result that materializes a non-scalar row."""
+class SelectBoundary(sqlite3.Connection):
+    """Observe the actual workspace connection only during membership admission."""
 
-    def __init__(self, connection: sqlite3.Connection) -> None:
-        self.connection = connection
-        self.scalars = 0
-        self.materialized = 0
+    observing: bool = False
+    scalars: int = 0
+    materialized: int = 0
 
-    def execute(self, sql: str, parameters: tuple[object, ...] = ()) -> sqlite3.Cursor:
-        cursor = self.connection.execute(sql, parameters)
+    @override
+    def execute(
+        self,
+        sql: str,
+        parameters: SupportsLenAndGetItem[object] | Mapping[str, object] = (),
+        /,
+    ) -> sqlite3.Cursor:
+        cursor = super().execute(sql, parameters)
+        if not self.observing:
+            return cursor
         names = [item[0] for item in cursor.description or ()]
         if any(
             name in {"instrument_id", "assertion_id", "provider", "relative_path", "ordinal"}
@@ -728,10 +738,20 @@ class SelectBoundary:
         return cursor
 
 
+@pytest.fixture
+def boundary_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Workspace]:
+    monkeypatch.setattr(sqlite3, "connect", partial(sqlite3.connect, factory=SelectBoundary))
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as current:
+        source_evidence(current)
+        yield current
+
+
 @pytest.mark.parametrize("fault", ["combined", "token", "path", "nul"])
 def test_prefetch_admission_counts_both_pins_and_provenance(
-    workspace: Workspace, fault: str
+    boundary_workspace: Workspace, fault: str
 ) -> None:
+    workspace = boundary_workspace
     identity = register(workspace, I1)
     universe = register(workspace, U1)
     assert isinstance(identity, IdentityPin)
@@ -762,15 +782,20 @@ def test_prefetch_admission_counts_both_pins_and_provenance(
     elif fault == "path":
         workspace.state.execute("DROP TRIGGER immutable_source_files_update")
         workspace.state.execute("UPDATE source_files SET relative_path=?", ("x" * 600000,))
-    boundary = SelectBoundary(workspace.state)
+    boundary = workspace.state
+    assert isinstance(boundary, SelectBoundary)
     before = state_image(workspace)
-    with pytest.raises(ComputeResourceError):
-        read_membership_pins(
-            cast("sqlite3.Connection", boundary),
-            identity,
-            universe,
-            max_materialization_bytes=allowance,
-        )
+    boundary.observing = True
+    try:
+        with pytest.raises(ComputeResourceError):
+            read_membership_pins(
+                boundary,
+                identity,
+                universe,
+                max_materialization_bytes=allowance,
+            )
+    finally:
+        boundary.observing = False
     assert boundary.scalars > 0
     assert boundary.materialized == 0
     assert state_image(workspace) == before
