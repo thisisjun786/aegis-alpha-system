@@ -78,6 +78,50 @@ def read_strategy_lineage(
     return LineageSpec(*tuple(row)[:4])
 
 
+def validate_strategy_import(
+    connection: sqlite3.Connection,
+    bundle: EngineBundle,
+    operation_id: str,
+    *,
+    lineage: LineageSpec | None = None,
+) -> tuple[bool, bool]:
+    """SELECT-only admission checks; return whether the version and receipt exist.
+
+    The private write repeats these checks inside its atomic transaction. A preflight
+    result is never authorization to skip revalidation after durable admission.
+    """
+    strategy_id, version = bundle.bundle_id, bundle.bundle_version
+    previous = connection.execute(
+        "SELECT raw_sha256,contract_sha256,raw_bundle,contract_json FROM strategy_versions "
+        "WHERE strategy_id=? AND version=?",
+        (strategy_id, version),
+    ).fetchone()
+    if previous is not None and tuple(previous)[:2] != (
+        bundle.source_sha256,
+        bundle.contract_sha256,
+    ):
+        raise ValueError("strategy ID/version already contains different content")
+    if previous is not None:
+        load_bundle(previous["raw_bundle"], bundle.source_sha256, strategy_id, version)
+        if previous["contract_json"] != canonical_json_bytes(bundle.contract).decode():
+            raise ValueError("strategy parsed contract hash mismatch")
+        if read_strategy_lineage(connection, strategy_id, version) != lineage:
+            raise ValueError("strategy ID/version already contains different lineage")
+    receipt = connection.execute(
+        "SELECT strategy_id,version,request_hash FROM strategy_imports WHERE operation_id=?",
+        (operation_id,),
+    ).fetchone()
+    if receipt is not None and tuple(receipt) != (
+        strategy_id,
+        version,
+        strategy_request_hash(bundle, lineage),
+    ):
+        raise ValueError("strategy operation ID already identifies a different import")
+    if previous is None and lineage is not None:
+        _validate_lineage_cycle(connection, strategy_id, version, lineage)
+    return previous is not None, receipt is not None
+
+
 def import_strategy(  # noqa: PLR0913, PLR0917 -- explicit external bundle pins
     connection: sqlite3.Connection,
     raw: bytes,
@@ -92,34 +136,10 @@ def import_strategy(  # noqa: PLR0913, PLR0917 -- explicit external bundle pins
     contract = canonical_json_bytes(bundle.contract).decode()
     request_hash = strategy_request_hash(bundle, lineage)
     with atomic(connection):
-        previous = connection.execute(
-            "SELECT raw_sha256,contract_sha256,raw_bundle,contract_json FROM strategy_versions "
-            "WHERE strategy_id=? "
-            "AND version=?",
-            (expected_id, expected_version),
-        ).fetchone()
-        if previous is not None and tuple(previous)[:2] != (
-            expected_sha256,
-            bundle.contract_sha256,
-        ):
-            raise ValueError("strategy ID/version already contains different content")
-        if previous is not None:
-            load_bundle(previous["raw_bundle"], expected_sha256, expected_id, expected_version)
-            if previous["contract_json"] != contract:
-                raise ValueError("strategy parsed contract hash mismatch")
-            if read_strategy_lineage(connection, expected_id, expected_version) != lineage:
-                raise ValueError("strategy ID/version already contains different lineage")
-        receipt = connection.execute(
-            "SELECT strategy_id,version,request_hash FROM strategy_imports WHERE operation_id=?",
-            (operation_id,),
-        ).fetchone()
-        if receipt is not None and tuple(receipt) != (
-            expected_id,
-            expected_version,
-            request_hash,
-        ):
-            raise ValueError("strategy operation ID already identifies a different import")
-        if previous is None:
+        version_exists, receipt_exists = validate_strategy_import(
+            connection, bundle, operation_id, lineage=lineage
+        )
+        if not version_exists:
             connection.execute(
                 "INSERT INTO strategies VALUES (?,?,'active') ON CONFLICT(strategy_id) DO NOTHING",
                 (expected_id, expected_id),
@@ -153,7 +173,7 @@ def import_strategy(  # noqa: PLR0913, PLR0917 -- explicit external bundle pins
             _requirements(connection, bundle)
             if lineage is not None:
                 _register_lineage(connection, expected_id, expected_version, lineage)
-        if receipt is None:
+        if not receipt_exists:
             connection.execute(
                 "INSERT INTO strategy_imports VALUES (?,?,?,?,?)",
                 (
@@ -180,7 +200,7 @@ def _requirements(connection: sqlite3.Connection, bundle: EngineBundle) -> None:
     )
 
 
-def _register_lineage(
+def _validate_lineage_cycle(
     connection: sqlite3.Connection, strategy_id: str, version: str, lineage: LineageSpec
 ) -> None:
     # Include unresolved edges: registering a missing parent must not close a cycle.
@@ -194,6 +214,11 @@ def _register_lineage(
     ).fetchone()
     if cycle is not None:
         raise ValueError("strategy lineage cycle")
+
+
+def _register_lineage(
+    connection: sqlite3.Connection, strategy_id: str, version: str, lineage: LineageSpec
+) -> None:
     parent = connection.execute(
         "SELECT 1 FROM strategy_versions WHERE strategy_id=? AND version=?",
         (lineage.parent_id, lineage.parent_version),

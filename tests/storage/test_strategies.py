@@ -10,6 +10,7 @@ import pytest
 
 from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.engine import ENGINE_BUNDLE_SCHEMA_V1
+from aegis_alpha.engine.bundle import load_bundle
 from aegis_alpha.storage.sqlite import connect
 from aegis_alpha.storage.strategies import (
     LineageSpec,
@@ -17,6 +18,7 @@ from aegis_alpha.storage.strategies import (
     initialize_strategies,
     list_strategies,
     load_strategy,
+    validate_strategy_import,
 )
 from tests.engine.engine_support import contract, raw_bundle, strategy
 
@@ -106,6 +108,97 @@ def test_import_list_load_preserves_raw_bytes_across_reopen(tmp_path: Path) -> N
         assert again.source_sha256 == digest
     finally:
         restored.close()
+
+
+def test_preflight_works_on_read_only_connection(tmp_path: Path, store: sqlite3.Connection) -> None:
+    raw = raw_bundle(contract())
+    bundle = load_bundle(raw, _digest(raw), BUNDLE_ID, VERSION)
+    lineage = LineageSpec("missing-parent", "7", "derived", " exact synthetic\n")
+    reader = connect(tmp_path / "strategies.sqlite3", read_only=True)
+    try:
+        before = tuple(reader.iterdump())
+        assert validate_strategy_import(reader, bundle, "op", lineage=lineage) == (False, False)
+        assert tuple(reader.iterdump()) == before
+        _import(store, raw, "op", lineage=lineage)
+        before = tuple(reader.iterdump())
+        assert validate_strategy_import(reader, bundle, "op", lineage=lineage) == (True, True)
+        assert validate_strategy_import(reader, bundle, "new-op", lineage=lineage) == (True, False)
+        with pytest.raises(ValueError, match="different lineage"):
+            validate_strategy_import(reader, bundle, "op")
+        assert tuple(reader.iterdump()) == before
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize("conflict", ["bytes", "lineage", "cycle", "receipt"])
+def test_private_import_revalidates_after_successful_preflight(
+    store: sqlite3.Connection, conflict: str
+) -> None:
+    raw = raw_bundle(contract())
+    bundle = load_bundle(raw, _digest(raw), BUNDLE_ID, VERSION)
+    lineage = LineageSpec("parent", "7", "derived", "synthetic")
+    assert validate_strategy_import(store, bundle, "op", lineage=lineage) == (False, False)
+    # Commit changed private state after preflight, using the real owner, not a stub.
+    if conflict == "bytes":
+        _import(store, raw + b"\n", "other-op", lineage=lineage)
+    elif conflict == "lineage":
+        _import(store, raw, "other-op")
+    elif conflict == "cycle":
+        _import(
+            store,
+            _envelope("parent", "7"),
+            "other-op",
+            "parent",
+            "7",
+            lineage=LineageSpec(BUNDLE_ID, VERSION, "derived", "synthetic"),
+        )
+    else:
+        _import(store, _envelope("parent", "7"), "op", "parent", "7")
+    before = tuple(store.iterdump())
+    statements: list[str] = []
+    store.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(
+            ValueError, match=r"different content|different lineage|cycle|different import"
+        ):
+            _import(store, raw, "op", lineage=lineage)
+    finally:
+        store.set_trace_callback(None)
+    assert statements[0] == "BEGIN IMMEDIATE"
+    assert statements[-1] == "ROLLBACK"
+    assert tuple(store.iterdump()) == before
+
+
+@pytest.mark.parametrize(
+    ("mutation", "value", "error"),
+    [
+        ("UPDATE strategy_versions SET raw_bundle=?", b"{}", "raw payload SHA-256"),
+        ("UPDATE strategy_versions SET raw_sha256=?", "0" * 64, "different content"),
+        ("UPDATE strategy_versions SET contract_json=?", "{}", "parsed contract hash"),
+        ("UPDATE strategy_versions SET contract_sha256=?", "0" * 64, "different content"),
+    ],
+)
+def test_preflight_preserves_existing_stored_content_checks(
+    store: sqlite3.Connection, mutation: str, value: str | bytes, error: str
+) -> None:
+    raw = raw_bundle(contract())
+    bundle = load_bundle(raw, _digest(raw), BUNDLE_ID, VERSION)
+    _import(store, raw, "op")
+    triggers = store.execute(
+        "SELECT name,sql FROM sqlite_master WHERE name IN "
+        "('strategy_versions_reject_update','immutable_strategy_versions_update')"
+    ).fetchall()
+    # Synthetic corruption; restore the exact schema before validating.
+    for trigger in triggers:
+        store.execute(f'DROP TRIGGER "{trigger["name"]}"')
+    store.execute(mutation, (value,))
+    for trigger in triggers:
+        store.execute(trigger["sql"])
+    store.commit()
+    before = tuple(store.iterdump())
+    with pytest.raises(ValueError, match=error):
+        validate_strategy_import(store, bundle, "new-op")
+    assert tuple(store.iterdump()) == before
 
 
 def test_same_id_version_hash_conflict_and_idempotent_reimport(store: sqlite3.Connection) -> None:

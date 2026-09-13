@@ -207,6 +207,46 @@ def test_invalid_scoring_cli_import_and_show_preserve_evidence(
         assert (tuple(workspace.state.iterdump()), tuple(workspace.strategies.iterdump())) == before
 
 
+def test_conflicting_strategy_bytes_leave_next_backup_healthy(tmp_path: Path) -> None:
+    home = tmp_path / "aas"
+    source = tmp_path / "synthetic.json"
+    payload = raw_bundle(contract())
+    source.write_bytes(payload)
+    assert run_cli("init", home=home).returncode == 0
+    arguments = ("strategy", "import", str(source), "--id", "synthetic-probe", "--version", "1")
+    result = run_cli(*arguments, "--sha256", hashlib.sha256(payload).hexdigest(), home=home)
+    assert result.returncode == 0, result.stderr
+    with open_workspace(home) as workspace:
+        assert workspace.strategies is not None
+        before = (tuple(workspace.state.iterdump()), tuple(workspace.strategies.iterdump()))
+    # Valid JSON, identical parsed contract, but genuinely different pinned bytes.
+    payload += b"\n"
+    source.write_bytes(payload)
+    result = run_cli(*arguments, "--sha256", hashlib.sha256(payload).hexdigest(), home=home)
+    assert result.returncode == 1, result.stderr
+    assert result.stdout == ""
+    assert isinstance(json.loads(result.stderr)["error"], str)
+    with open_workspace(home) as workspace:
+        assert workspace.strategies is not None
+        assert (tuple(workspace.state.iterdump()), tuple(workspace.strategies.iterdump())) == before
+        assert (
+            workspace.state.execute(
+                "SELECT count(*) FROM storage_operations WHERE phase='PREPARED'"
+            ).fetchone()[0]
+            == 0
+        )
+    output = tmp_path / "backup"
+    result = run_cli("db", "backup", "--output", str(output), home=home)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["backed_up"] is True
+    manifest = json.loads((output / "backup.json").read_text())
+    assert manifest["complete"] is True
+    assert manifest["logical"]["pending_operations"] == 0
+    with open_workspace(home) as workspace:
+        assert workspace.strategies is not None
+        assert (tuple(workspace.state.iterdump()), tuple(workspace.strategies.iterdump())) == before
+
+
 def test_restore_never_defaults_over_current_home(tmp_path: Path) -> None:
     result = run_cli("db", "restore", "--backup", str(tmp_path / "missing"), home=tmp_path / "aas")
     assert result.returncode == 1

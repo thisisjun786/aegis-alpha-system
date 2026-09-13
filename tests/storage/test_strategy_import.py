@@ -131,6 +131,97 @@ def test_invalid_scoring_rejected_before_durable_admission(tmp_path: Path, consu
         assert (tuple(workspace.state.iterdump()), tuple(workspace.strategies.iterdump())) == before
 
 
+@pytest.mark.parametrize(
+    "conflict",
+    [
+        "bytes",
+        "content",
+        "self-cycle",
+        "indirect-cycle",
+        "parent",
+        "version",
+        "kind",
+        "reason",
+        "removed",
+        "added",
+    ],
+)
+def test_deterministic_conflict_leaves_complete_stores_unchanged(
+    tmp_path: Path, conflict: str
+) -> None:
+    home = tmp_path / "aas"
+    initialize(home)
+    source = tmp_path / "synthetic.json"
+    payload = raw_bundle(contract())
+    lineage = LineageSpec("parent", "7", "derived", " synthetic reason\n")
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        assert workspace.strategies is not None
+        source.write_bytes(payload)
+        initial = None if conflict in {"bytes", "content", "added"} else lineage
+        register_strategy(
+            workspace,
+            source,
+            hashlib.sha256(payload).hexdigest(),
+            "synthetic-probe",
+            "1",
+            lineage=initial,
+        )
+        identity = "synthetic-probe"
+        retry = initial
+        if conflict == "bytes":
+            payload += b"\n"
+        elif conflict == "content":
+            value = contract()
+            payload = raw_bundle(
+                replace(value, pack=(replace(value.pack[0], description="other synthetic"),))
+            )
+        elif conflict in {"self-cycle", "indirect-cycle"}:
+            identity = "parent"
+            payload = payload.replace(b'"synthetic-probe"', b'"parent"').replace(
+                b'"bundle_version":"1"', b'"bundle_version":"7"'
+            )
+            retry = LineageSpec(
+                "parent" if conflict == "self-cycle" else "synthetic-probe",
+                "7" if conflict == "self-cycle" else "1",
+                "derived",
+                "synthetic",
+            )
+        elif conflict == "parent":
+            retry = replace(lineage, parent_id="other")
+        elif conflict == "version":
+            retry = replace(lineage, parent_version="8")
+        elif conflict == "kind":
+            retry = replace(lineage, change_kind="correction")
+        elif conflict == "reason":
+            retry = replace(lineage, reason="synthetic reason")
+        elif conflict == "removed":
+            retry = None
+        else:
+            retry = lineage
+        source.write_bytes(payload)
+        before = (tuple(workspace.state.iterdump()), tuple(workspace.strategies.iterdump()))
+        with pytest.raises(ValueError, match=r"different content|different lineage|lineage cycle"):
+            register_strategy(
+                workspace,
+                source,
+                hashlib.sha256(payload).hexdigest(),
+                identity,
+                "7" if identity == "parent" else "1",
+                lineage=retry,
+            )
+        assert (tuple(workspace.state.iterdump()), tuple(workspace.strategies.iterdump())) == before
+        assert (
+            workspace.state.execute(
+                "SELECT count(*) FROM storage_operations WHERE phase='PREPARED'"
+            ).fetchone()[0]
+            == 0
+        )
+    # Reopen both stores: the assertion is about committed evidence, not a local rollback.
+    with open_workspace(home) as workspace:
+        assert workspace.strategies is not None
+        assert (tuple(workspace.state.iterdump()), tuple(workspace.strategies.iterdump())) == before
+
+
 def test_registered_bundle_replays_after_original_file_removed(tmp_path: Path) -> None:
     home = tmp_path / "aas"
     initialize(home)
@@ -187,7 +278,7 @@ def test_lineage_registration_failure_rolls_back_then_retries(tmp_path: Path) ->
             register_strategy(workspace, source, digest, "synthetic-probe", "1", lineage=lineage)
             == first
         )
-        with pytest.raises(ValueError, match="different request"):
+        with pytest.raises(ValueError, match="different lineage"):
             register_strategy(workspace, source, digest, "synthetic-probe", "1")
         assert [
             row[0] for row in workspace.state.execute("SELECT phase FROM storage_operations")
@@ -283,6 +374,40 @@ def _interrupted_registration(
         )
     source.unlink()
     return home, digest, operation_id
+
+
+@pytest.mark.parametrize("parent_status", ["unresolved", "none", "resolved"])
+def test_identical_retry_after_private_commit_preserves_exact_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parent_status: str
+) -> None:
+    home, digest, operation_id = _interrupted_registration(tmp_path, monkeypatch, parent_status)
+    source = tmp_path / "retry.json"
+    source.write_bytes(raw_bundle(contract()))
+    lineage = (
+        None if parent_status == "none" else LineageSpec("parent", "7", "derived", "synthetic")
+    )
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        assert workspace.strategies is not None
+        before_private = tuple(workspace.strategies.iterdump())
+        before_operation = state.get_operation(workspace.state, operation_id)
+        assert before_operation is not None
+        result = register_strategy(
+            workspace, source, digest, "synthetic-probe", "1", lineage=lineage
+        )
+        assert tuple(workspace.strategies.iterdump()) == before_private
+        after = state.get_operation(workspace.state, operation_id)
+        assert after is not None
+        assert after == {
+            **before_operation,
+            "phase": "COMPLETED",
+            "completed_at_us": after["completed_at_us"],
+        }
+        before = (tuple(workspace.state.iterdump()), before_private)
+        assert (
+            register_strategy(workspace, source, digest, "synthetic-probe", "1", lineage=lineage)
+            == result
+        )
+        assert (tuple(workspace.state.iterdump()), tuple(workspace.strategies.iterdump())) == before
 
 
 @pytest.mark.parametrize("parent_status", ["unresolved", "none", "resolved"])

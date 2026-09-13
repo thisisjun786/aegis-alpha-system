@@ -13,6 +13,7 @@ from aegis_alpha.storage.strategies import (
     LineageSpec,
     read_strategy_lineage,
     strategy_request_hash,
+    validate_strategy_import,
     verify_strategy_content,
 )
 from aegis_alpha.storage.workspace import Workspace
@@ -45,6 +46,8 @@ def register_strategy(  # noqa: PLR0913 -- preserve explicit bundle pins plus op
     )
     # Keep the key independent of lineage so changed retries conflict with the same intent.
     request_hash = strategy_request_hash(bundle, lineage)
+    # Reuse the private owner's checks before committing a new durable intent.
+    validate_strategy_import(workspace.strategies, bundle, operation_id, lineage=lineage)
     prepare_operation(
         workspace.state,
         operation_id=operation_id,
