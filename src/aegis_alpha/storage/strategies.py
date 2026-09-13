@@ -55,7 +55,7 @@ def read_strategy_lineage(
 ) -> LineageSpec | None:
     """Reconstruct exact caller evidence, not the derived parent eligibility status."""
     rows = connection.execute(
-        "SELECT parent_strategy_id,parent_version,change_kind,reason,reason_hash "
+        "SELECT parent_strategy_id,parent_version,change_kind,reason,reason_hash,parent_status "
         "FROM strategy_lineage WHERE strategy_id=? AND version=?",
         (strategy_id, version),
     ).fetchall()
@@ -63,7 +63,19 @@ def read_strategy_lineage(
         return None
     if len(rows) != 1 or rows[0]["reason_hash"] != content_sha256(rows[0]["reason"]):
         raise ValueError("strategy stored lineage evidence mismatch")
-    return LineageSpec(*tuple(rows[0])[:4])
+    row = rows[0]
+    # Resolved is a stored assertion about one exact direct parent, not its eligibility.
+    # An unresolved edge stays valid even if its parent has since arrived.
+    if (
+        row["parent_status"] == "resolved"
+        and connection.execute(
+            "SELECT 1 FROM strategy_versions WHERE strategy_id=? AND version=?",
+            (row["parent_strategy_id"], row["parent_version"]),
+        ).fetchone()
+        is None
+    ):
+        raise ValueError("strategy resolved parent missing")
+    return LineageSpec(*tuple(row)[:4])
 
 
 def import_strategy(  # noqa: PLR0913, PLR0917 -- explicit external bundle pins
@@ -224,6 +236,7 @@ def load_strategy(
         (strategy_id, version),
     ).fetchone():
         raise ValueError("strategy has unresolved parent lineage")
+    read_strategy_lineage(connection, strategy_id, version)
     return bundle
 
 

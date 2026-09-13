@@ -64,10 +64,8 @@ def register_strategy(  # noqa: PLR0913 -- preserve explicit bundle pins plus op
     return result
 
 
-def recover_strategy_import(workspace: Workspace, operation: sqlite3.Row) -> bool:
-    """Complete only a receipt whose stored bytes and lineage match its durable intent."""
-    from aegis_alpha.storage.state import complete_operation  # noqa: PLC0415
-
+def verify_strategy_import(workspace: Workspace, operation: sqlite3.Row) -> bool:
+    """SELECT-only receipt/intent/content check; an absent private commit stays pending."""
     if workspace.strategies is None:
         return False
     op_id = operation["operation_id"]
@@ -83,12 +81,47 @@ def recover_strategy_import(workspace: Workspace, operation: sqlite3.Row) -> boo
         or operation["expected_parent"] is not None
     ):
         raise ValueError("strategy receipt does not match prepared operation")
-    # Journal completion verifies committed content, not execution eligibility.
+    # Integrity and journal completion check content, not execution eligibility.
     bundle = verify_strategy_content(
         workspace.strategies, marker["strategy_id"], marker["version"], operation["payload_hash"]
     )
     lineage = read_strategy_lineage(workspace.strategies, marker["strategy_id"], marker["version"])
     if strategy_request_hash(bundle, lineage) != operation["request_hash"]:
         raise ValueError("strategy stored lineage does not match prepared operation")
-    complete_operation(workspace.state, op_id, operation["request_hash"])
+    return True
+
+
+def verify_strategy_imports(workspace: Workspace) -> None:
+    """Check both directions of the private evidence/journal graph without recovery."""
+    if workspace.strategies is None:
+        raise ValueError("private strategy database is unavailable")
+    operations = {
+        row["operation_id"]: row
+        for row in workspace.state.execute(
+            "SELECT * FROM storage_operations WHERE kind='strategy_import'"
+        )
+    }
+    for marker in workspace.strategies.execute("SELECT operation_id FROM strategy_imports"):
+        operation = operations.get(marker["operation_id"])
+        if operation is None or operation["phase"] not in {"PREPARED", "COMPLETED"}:
+            raise ValueError("strategy receipt has no matching active import intent")
+    for operation in operations.values():
+        committed = verify_strategy_import(workspace, operation)
+        if not committed and operation["phase"] == "COMPLETED":
+            raise ValueError("completed strategy intent has no private receipt")
+    if workspace.strategies.execute(
+        "SELECT 1 FROM strategy_versions v WHERE NOT EXISTS "
+        "(SELECT 1 FROM strategy_imports i "
+        "WHERE i.strategy_id=v.strategy_id AND i.version=v.version)"
+    ).fetchone():
+        raise ValueError("strategy version has no private import receipt")
+
+
+def recover_strategy_import(workspace: Workspace, operation: sqlite3.Row) -> bool:
+    """Complete only a receipt whose stored bytes and lineage match its durable intent."""
+    from aegis_alpha.storage.state import complete_operation  # noqa: PLC0415
+
+    if not verify_strategy_import(workspace, operation):
+        return False
+    complete_operation(workspace.state, operation["operation_id"], operation["request_hash"])
     return True
