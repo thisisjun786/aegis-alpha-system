@@ -25,6 +25,11 @@ from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.engine.codec import decode_json
 from aegis_alpha.storage import market
+from aegis_alpha.storage.membership_pins import (
+    IdentityPin,
+    UniversePin,
+    read_membership_pins,
+)
 
 if TYPE_CHECKING:
     from aegis_alpha.storage.workspace import Workspace
@@ -61,30 +66,6 @@ class GenerationPin:
             _digest(value)
         if self.version == "latest":
             raise ValueError("generation version must be exact, not latest")
-
-
-@dataclass(frozen=True, slots=True)
-class IdentityPin:
-    snapshot_id: str
-    content_hash: str
-
-    def __post_init__(self) -> None:
-        _text(self.snapshot_id)
-        _digest(self.content_hash)
-
-
-@dataclass(frozen=True, slots=True)
-class UniversePin:
-    universe_id: str
-    version: str
-    content_hash: str
-
-    def __post_init__(self) -> None:
-        _text(self.universe_id)
-        _text(self.version)
-        _digest(self.content_hash)
-        if self.version == "latest":
-            raise ValueError("universe version must be exact")
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,66 +397,17 @@ def load_pinned_sessions(
 def _members(
     workspace: Workspace, request: PriceInputRequest, budget: ComputeBudget
 ) -> tuple[History, History]:
-    queries: list[tuple[str, tuple[str, ...]]] = []
-    if request.identity_pin is not None:
-        pin = request.identity_pin
-        found = workspace.state.execute(
-            "SELECT content_hash FROM identity_snapshots WHERE snapshot_id=?", (pin.snapshot_id,)
-        ).fetchone()
-        if found is None or found[0] != pin.content_hash:
-            raise ValueError("identity snapshot pin mismatch")
-        queries.append(
-            (
-                (
-                    "SELECT a.instrument_id, m.valid_from_us, m.valid_to_us, m.known_from_us, "
-                    "m.known_to_us FROM identity_snapshot_members m JOIN identity_assertions a "
-                    "USING(assertion_id) WHERE m.snapshot_id=?"
-                ),
-                (pin.snapshot_id,),
-            )
-        )
-    else:
-        queries.append(("SELECT instrument_id FROM instruments WHERE 0", ()))
-    if request.universe_pin is not None:
-        universe = request.universe_pin
-        found = workspace.state.execute(
-            "SELECT content_hash FROM universe_versions WHERE universe_id=? AND version=?",
-            (universe.universe_id, universe.version),
-        ).fetchone()
-        if found is None or found[0] != universe.content_hash or universe.version == "latest":
-            raise ValueError("universe version pin mismatch")
-        queries.append(
-            (
-                (
-                    "SELECT instrument_id, valid_from_us, valid_to_us, known_from_us, known_to_us "
-                    "FROM universe_members WHERE universe_id=? AND version=?"
-                ),
-                (universe.universe_id, universe.version),
-            )
-        )
-    else:
-        queries.append(("SELECT instrument_id FROM instruments WHERE 0", ()))
-    result = []
-    allowance = (budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes) // 8
-    for sql, parameters in queries:
-        count = workspace.state.execute(
-            "SELECT count(*) FROM (" + sql + ")",  # noqa: S608 -- fixed queries above
-            parameters,
-        ).fetchone()[0]
-        # Include variable-width identifiers before fetching, not a truncated LIMIT read.
-        characters = workspace.state.execute(
-            "SELECT coalesce(sum(length(instrument_id)),0) FROM (" + sql + ")",  # noqa: S608 -- fixed queries above
-            parameters,
-        ).fetchone()[0]
-        allowance -= count * 2048 + characters * 32
-        if allowance < 0:
-            raise ComputeResourceError(
-                "identity/universe history exceeds admitted materialization budget"
-            )
-        result.append(
-            tuple(MappingProxyType(dict(row)) for row in workspace.state.execute(sql, parameters))
-        )
-    return result[0], result[1]
+    verified = read_membership_pins(
+        workspace.state,
+        request.identity_pin,
+        request.universe_pin,
+        max_materialization_bytes=(budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes)
+        // 8,
+    )
+    return (
+        verified.identity.members if verified.identity is not None else (),
+        verified.universe.members if verified.universe is not None else (),
+    )
 
 
 def _active(members: History, instrument: str, economic_us: int, decision_us: int) -> bool:

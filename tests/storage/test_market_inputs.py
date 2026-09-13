@@ -474,30 +474,33 @@ def test_identity_and_universe_temporal_pins_filter_without_latest(
     stored: Workspace, kind: str
 ) -> None:
     # Given native immutable projected memberships, not today's ticker membership.
-    source = stored.state.execute("SELECT snapshot_id FROM source_snapshots LIMIT 1").fetchone()[0]
-    if kind == "identity":
-        stored.state.execute(
-            "INSERT INTO identity_assertions VALUES "
-            "('a','ASSET_A','synthetic','ticker','A',0,25,0,NULL,?,?)",
-            (source, "a" * 64),
-        )
-        stored.state.execute("INSERT INTO identity_snapshots VALUES ('ids',?,0)", ("b" * 64,))
-        stored.state.execute("INSERT INTO identity_snapshot_members VALUES ('ids',0,'a',0,25,0,35)")
-        changes = {"identity_pin": api().IdentityPin("ids", "b" * 64)}
-        reason = "identity_unavailable"
-    else:
-        stored.state.execute("INSERT INTO universe_versions VALUES ('u','1',?)", ("c" * 64,))
-        stored.state.execute(
-            "INSERT INTO universe_members VALUES ('u','1','ASSET_A',0,25,0,35,?)", (source,)
-        )
-        changes = {"universe_pin": api().UniversePin("u", "1", "c" * 64)}
-        reason = "outside_universe"
+    from tests.storage.test_membership_pins import candidate  # noqa: PLC0415
+
+    changes = {kind + "_pin": candidate(stored, kind)}
+    reason = "identity_unavailable" if kind == "identity" else "outside_universe"
     series = api().load_pinned_prices(stored, request(stored, **changes), budget=BUDGET)
     # When crossing the exclusive knowledge end, Then the prepared membership governs.
     assert series.project_as_of(30, session_date=DAY).rows[0]["close"] == Decimal(11)
     result = series.project_as_of(35, session_date=DAY)
     assert result.rows == ()
     assert reason in result.coverage.cells[0].reasons
+
+
+@pytest.mark.parametrize("kind", ["identity", "universe"])
+def test_same_membership_pin_rejects_legal_insert(stored: Workspace, kind: str) -> None:
+    from tests.storage.test_membership_pins import candidate, legal_insert  # noqa: PLC0415
+
+    exact = candidate(stored, kind)
+    req = request(stored, **{kind + "_pin": exact})
+    detached = api().load_pinned_prices(stored, req, budget=BUDGET)
+    assert detached.project_as_of(30, session_date=DAY).rows[0]["close"] == Decimal(11)
+    assert detached.project_as_of(40, session_date=DAY).rows == ()
+    legal_insert(stored, kind)
+    stored.state.commit()
+    assert stored.state.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert detached.project_as_of(40, session_date=DAY).rows == ()
+    with pytest.raises(ValueError, match=r"membership.*mismatch"):
+        api().load_pinned_prices(stored, req, budget=BUDGET)
 
 
 def test_ancestor_catalog_is_checked_against_its_own_delta(

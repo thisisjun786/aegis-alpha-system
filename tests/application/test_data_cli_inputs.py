@@ -21,6 +21,7 @@ import pytest
 from aegis_alpha.application.compute_cli import price_compute
 from aegis_alpha.compute_resources import compute_lease
 from aegis_alpha.engine.codec import decode_json
+from aegis_alpha.storage.backup import backup, restore
 from aegis_alpha.storage.locks import file_lock
 from aegis_alpha.storage.market import read_generation
 from aegis_alpha.storage.market_inputs import (
@@ -34,6 +35,7 @@ from aegis_alpha.storage.publication import json_value
 from aegis_alpha.storage.research_inputs import register_price_input
 from aegis_alpha.storage.workspace import initialize, open_workspace, write_json
 from tests.application.test_storage_cli import run_cli
+from tests.storage.test_membership_pins import candidate, legal_insert, state_image
 from tests.storage.test_research_inputs import (
     NON_UTF8_TRANSFORMS,
     _change,
@@ -416,6 +418,50 @@ def test_incompatible_request_fails_closed(
         target = obj(target[key])
     target[location[-1]] = value
     rejected(home, tmp_path / "request.json", json.dumps(body).encode())
+
+
+@pytest.mark.parametrize("kind", ["identity", "universe"])
+def test_registered_membership_temporal_cli_backup_and_mutation(
+    registered: tuple[Path, dict[str, Path]],
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    original, _ = registered
+    home = Path(shutil.copytree(original, tmp_path / "membership"))
+    with open_workspace(home, writable=True) as workspace:
+        exact = candidate(workspace, kind)
+    body = request(home)
+    obj(body["prices"])[kind + "_pin"] = asdict(exact)
+    selected = read(home, body)
+    assert at(selected, "rows", 0, "close") == "11.000000000000"
+    assert at(selected, "coverage", "cells", 0, "reasons") == []
+    assert at(selected, "coverage", "cells", 1, "reasons") == [
+        "missing_session",
+        "missing_price",
+        "missing_sell_open",
+    ]
+    assert at(selected, "coverage", "certified") is False
+    obj(body["decision"])["at_us"] = 35
+    excluded = read(home, body)
+    assert excluded["rows"] == []
+    assert at(excluded, "coverage", "cells", 0, "reasons") == [
+        "identity_unavailable" if kind == "identity" else "outside_universe"
+    ]
+    backup_root = Path(str(backup(home)["backup_root"]))
+    restored = tmp_path / "membership-restored"
+    restore(backup_root, restored)
+    assert read(restored, body) == excluded
+    obj(body["decision"])["at_us"] = 30
+    assert read(restored, body) == selected
+    with open_workspace(restored, writable=True) as workspace:
+        legal_insert(workspace, kind)
+        workspace.state.commit()
+        before = state_image(workspace)
+    error = rejected(restored, tmp_path / "mutated.json", json.dumps(body).encode())
+    assert "membership" in error
+    assert "mismatch" in error
+    with open_workspace(restored) as workspace:
+        assert state_image(workspace) == before
 
 
 @pytest.mark.parametrize("field", ["pin", "sessions_pin", "identity_pin", "universe_pin", "mode"])

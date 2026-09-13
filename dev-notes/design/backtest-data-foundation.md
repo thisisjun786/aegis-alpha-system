@@ -119,6 +119,8 @@ assertion ID와 당시 투영한 유효·지식 구간이 함께 고정돼 hash�
 과거 assertion이나 snapshot의 known_to를 바꾸지 않는다. 구간 중첩 검사는 raw 주장 전체가
 아니라 해당 snapshot의 해결된 투영에 적용하며 충돌한 원본 주장은 미해결 상태로 보존한다.
 유니버스 정정도 새 universe version을 만들고 이전 membership 구간을 수정하지 않는다.
+구현된 두 문서의 정확한 bytes·hash 형식과 등록·검증 API는
+[membership pins](membership-pins.md)가 소유한다.
 
 ## strategies.sqlite3: 독립 비공개 정본
 

@@ -7,6 +7,11 @@ from typing import TYPE_CHECKING
 
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.storage.market import verify_generation
+from aegis_alpha.storage.membership_pins import (
+    IdentityPin,
+    UniversePin,
+    read_membership_pins,
+)
 from aegis_alpha.storage.raw import verify_raw
 from aegis_alpha.storage.strategies import load_strategy
 
@@ -22,6 +27,35 @@ def verify_workspace(workspace: Workspace) -> dict[str, object]:  # noqa: C901, 
             raise ValueError("SQLite integrity check failed")
         if connection.execute("PRAGMA foreign_key_check").fetchall():
             raise ValueError("SQLite foreign key check failed")
+    # Bound variable-width header enumeration before handing each exact pin to
+    # the shared aggregate/content verifier. A root alone cannot exceed 1 MiB.
+    for sql in (
+        "SELECT EXISTS(SELECT 1 FROM identity_snapshots WHERE length(CAST(snapshot_id AS BLOB))>?)",
+        (
+            "SELECT EXISTS(SELECT 1 FROM universe_versions "
+            "WHERE length(CAST(universe_id AS BLOB))+length(CAST(version AS BLOB))>?)"
+        ),
+    ):
+        if workspace.state.execute(sql, (1024 * 1024,)).fetchone()[0]:
+            raise ValueError("membership root exceeds document byte limit")
+    for header in workspace.state.execute(
+        "SELECT snapshot_id,content_hash FROM identity_snapshots"
+    ):
+        read_membership_pins(
+            workspace.state,
+            IdentityPin(*header),
+            None,
+            max_materialization_bytes=64 * 1024 * 1024,
+        )
+    for header in workspace.state.execute(
+        "SELECT universe_id,version,content_hash FROM universe_versions"
+    ):
+        read_membership_pins(
+            workspace.state,
+            None,
+            UniversePin(*header),
+            max_materialization_bytes=64 * 1024 * 1024,
+        )
     versions = workspace.state.execute(
         "SELECT dataset_id,version,generation_id,chain_hash,row_count,manifest_hash "
         "FROM dataset_versions WHERE status='committed'"
