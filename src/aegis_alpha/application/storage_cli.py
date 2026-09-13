@@ -48,6 +48,13 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
     _home(importer)
     importer.add_argument("file", type=Path)
     importer.add_argument("--sha256", required=True)
+    for name in ("register-prices", "register-sessions", "register-proxy", "read-prices"):
+        command = sub.add_parser(name, help="Use an exact versioned research input document")
+        _home(command)
+        command.add_argument(
+            "--request" if name == "read-prices" else "--spec", type=Path, required=True
+        )
+        command.add_argument("--sha256", required=True)
     for name in ("inspect", "read"):
         reader = sub.add_parser(name)
         _home(reader)
@@ -98,7 +105,11 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             return restore(args.backup.absolute(), home)
         mutation = (
             (args.command == "strategy" and args.strategy_command == "import")
-            or (args.command == "data" and args.data_command == "import")
+            or (
+                args.command == "data"
+                and args.data_command
+                in {"import", "register-prices", "register-sessions", "register-proxy"}
+            )
             or (
                 args.command == "db"
                 and args.db_command in {"recover", "quarantine", "source-import"}
@@ -109,6 +120,10 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             writable=mutation,
             strategy_write=mutation,
             require_strategies=args.command == "strategy"
+            or (
+                args.command == "data"
+                and args.data_command in {"register-prices", "register-sessions", "register-proxy"}
+            )
             or (
                 args.command == "db"
                 and args.db_command
@@ -153,9 +168,9 @@ def _workspace_command(workspace: object, args: argparse.Namespace) -> dict[str,
         return register_strategy(
             workspace, args.file.absolute(), args.sha256, args.id, args.version
         )
-    from aegis_alpha.storage.publication import execute_data
+    from aegis_alpha.application.data_cli import execute_native_data
 
-    return execute_data(workspace, args)
+    return execute_native_data(workspace, args)
 
 
 def _source_command(workspace: object, args: argparse.Namespace) -> dict[str, object]:
