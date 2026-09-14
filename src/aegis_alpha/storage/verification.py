@@ -16,7 +16,7 @@ from aegis_alpha.storage.input_pins import (
     read_definition,
     read_input_bundle,
 )
-from aegis_alpha.storage.market import read_chain_rows, verify_generation
+from aegis_alpha.storage.market import verify_generation
 from aegis_alpha.storage.membership_pins import (
     IdentityPin,
     UniversePin,
@@ -151,7 +151,7 @@ def _verify_input_documents(workspace: Workspace) -> None:
     from aegis_alpha.storage.backtest_requests import (  # noqa: PLC0415 -- optional content owner
         read_backtest_request,
     )
-    from aegis_alpha.storage.market_inputs import verify_proxy_content  # noqa: PLC0415
+    from aegis_alpha.storage.market_inputs import verify_proxy_publications  # noqa: PLC0415
 
     status = inspect_run_schema(workspace)
     budget = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
@@ -161,28 +161,9 @@ def _verify_input_documents(workspace: Workspace) -> None:
     ):
         if row[3] in schemas:
             read_definition(workspace, DefinitionPin(schemas[row[3]], *row[:3]), budget=budget)
-        elif row[3] == "aas-market-rowset-v1":
-            generations = workspace.market.execute(
-                "SELECT DISTINCT generation_id FROM feature_values "
-                "WHERE contract_id=? AND contract_version=?",
-                [row[0], row[1]],
-            ).fetchall()
-            if not generations:
-                raise ValueError("proxy definition has no retained feature generation")
-            for generation in generations:
-                history = read_chain_rows(
-                    workspace.market,
-                    generation[0],
-                    budget=ComputeBudget(budget.cpu_limit, budget.memory_limit_bytes // 2),
-                )
-                referenced = tuple(
-                    point
-                    for point in history
-                    if (point["contract_id"], point["contract_version"]) == (row[0], row[1])
-                )
-                verify_proxy_content(workspace, referenced, budget=budget)
-        else:
+        elif row[3] != "aas-market-rowset-v1":
             raise ValueError("unsupported feature definition schema")
+    verify_proxy_publications(workspace, budget=budget)
     for row in workspace.state.execute("SELECT bundle_id,content_hash FROM input_bundles"):
         pin = InputBundleRef(*row)
         read_input_bundle(workspace, pin, budget=budget)

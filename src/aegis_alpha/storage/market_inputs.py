@@ -24,7 +24,7 @@ from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.engine.codec import decode_json
 from aegis_alpha.storage import market
-from aegis_alpha.storage.import_document import parse_import
+from aegis_alpha.storage.import_document import ImportDocument, parse_import
 from aegis_alpha.storage.membership_pins import (
     IdentityPin,
     UniversePin,
@@ -661,12 +661,6 @@ def _proxy_publication(
             for key in ("dataset_id", "version", "generation_id", "chain_hash", "manifest_hash")
         )
     )
-    history = _load(
-        workspace,
-        pin,
-        ComputeBudget(budget.cpu_limit, budget.memory_limit_bytes // 2),
-        "feature_values",
-    )
     marker = market.marker_for(workspace.market, pin.generation_id)
     document = parse_import(_raw_payload(workspace, pin.manifest_hash, budget))
     if (
@@ -686,6 +680,42 @@ def _proxy_publication(
         )
     ):
         raise ValueError("proxy transform conflicts with publication evidence")
+    return _proxy_publication_delta(workspace, pin, document, budget)
+
+
+def _proxy_publication_delta(
+    workspace: Workspace, pin: GenerationPin, document: ImportDocument, budget: ComputeBudget
+) -> History:
+    """Match the whole referencing delta to its sealed import, before selecting rows."""
+    history = _load(
+        workspace,
+        pin,
+        ComputeBudget(budget.cpu_limit, budget.memory_limit_bytes // 2),
+        "feature_values",
+    )
+    marker = market.marker_for(workspace.market, pin.generation_id)
+    catalog = workspace.state.execute(
+        "SELECT transform_hash,normalizer_version FROM dataset_versions WHERE generation_id=?",
+        (pin.generation_id,),
+    ).fetchone()
+    if document.body["transform_sha256"] != catalog["transform_hash"]:
+        raise ValueError("proxy transform/catalog mismatch with publication evidence")
+    if (
+        document.sha256 != pin.manifest_hash
+        or document.body["normalizer_version"] != catalog["normalizer_version"]
+        or any(
+            document.body[key] != marker[key]
+            for key in (
+                "dataset_id",
+                "version",
+                "generation_id",
+                "operation_id",
+                "parent_id",
+                "domain",
+            )
+        )
+    ):
+        raise ValueError("proxy catalog conflicts with publication evidence")
     operation = workspace.state.execute(
         "SELECT kind,phase,request_hash,payload_hash,target_id,expected_parent,created_at_us "
         "FROM storage_operations WHERE operation_id=?",
@@ -709,6 +739,44 @@ def _proxy_publication(
     if sorted(expected, key=lambda row: str(row["record_id"])) != list(delta):
         raise ValueError("proxy rows conflict with publication evidence")
     return delta
+
+
+def verify_proxy_publications(workspace: Workspace, *, budget: ComputeBudget) -> None:
+    """Discover referencing rows from sealed imports, never mutable feature identities."""
+    contracts: set[tuple[str, str]] = {
+        (row[0], row[1])
+        for row in workspace.state.execute(
+            "SELECT name,version FROM feature_contracts WHERE record_schema='aas-market-rowset-v1'"
+        )
+    }
+    if not contracts:
+        return
+    retained: set[tuple[str, str]] = set()
+    for catalog in workspace.state.execute(
+        "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash "
+        "FROM dataset_versions WHERE status='committed'"
+    ):
+        pin = GenerationPin(*catalog)
+        marker = market.marker_for(workspace.market, pin.generation_id)
+        if marker["domain"] != "feature_values":
+            continue
+        # The marker's original request is independent of both live row fields
+        # and catalog transform pointers. _load below also checks the manifest.
+        document = parse_import(_raw_payload(workspace, str(marker["request_hash"]), budget))
+        referenced = contracts.intersection(
+            (row["contract_id"], row["contract_version"]) for row in document.rows
+        )
+        if not referenced:
+            continue
+        delta = _proxy_publication_delta(workspace, pin, document, budget)
+        for identity in sorted(referenced):
+            rows = tuple(
+                row for row in delta if (row["contract_id"], row["contract_version"]) == identity
+            )
+            verify_proxy_content(workspace, rows, budget=budget)
+        retained.update(referenced)
+    if contracts - retained:
+        raise ValueError("proxy definition has no retained feature generation")
 
 
 def _verify_proxy_catalog(workspace: Workspace, generation: str, transform_hash: str) -> None:
