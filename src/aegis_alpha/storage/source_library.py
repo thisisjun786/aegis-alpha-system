@@ -311,6 +311,71 @@ def list_tables(workspace: Workspace, source_id: str) -> list[dict[str, object]]
     return cast("list[dict[str, object]]", _visible(workspace, source_id)["tables"])
 
 
+def _admit_source_metadata(workspace: Workspace, max_materialization_bytes: int) -> int:
+    # list_sources fetches all markers before visibility filtering; _marker also
+    # fetches store_kind. Charge every field, including NULs and UTF-8 bytes;
+    # SQLite's nullable source_id primary key must not hide a whole row's size.
+    connections = schema.connections(workspace)
+    estimated = 0
+    for kind, conn in connections.items():
+        size = "+".join(
+            "coalesce(octet_length(encode(" + field + ")),0)"
+            if kind == "market"
+            else "coalesce(length(CAST(" + field + " AS BLOB)),0)"
+            for field in (
+                "source_id",
+                "operation_id",
+                "request_hash",
+                "source_sha256",
+                "store_kind",
+                "manifest_json",
+            )
+        )
+        aggregate = cast(
+            "tuple[int]",
+            conn.execute(
+                "SELECT count(*)*2048+coalesce(sum(32*("
+                + size
+                + ")),0) FROM source_library_commits"
+            ).fetchone(),
+        )
+        estimated += aggregate[0]
+        if estimated > max_materialization_bytes:
+            raise ComputeResourceError("source metadata exceeds materialization budget")
+    # Only now may operation IDs enter Python. get_operation materializes all
+    # eight text fields even when list_sources subsequently ignores the source.
+    # Scope this to referenced intents, not every operation in the installation.
+    operation_size = "+".join(
+        "coalesce(length(CAST(" + field + " AS BLOB)),0)"
+        for field in (
+            "operation_id",
+            "kind",
+            "request_hash",
+            "target_id",
+            "expected_parent",
+            "payload_hash",
+            "phase",
+            "failure_reason",
+        )
+    )
+    for conn in connections.values():
+        for (operation_id,) in conn.execute(
+            "SELECT operation_id FROM source_library_commits"
+        ).fetchall():
+            aggregate = workspace.state.execute(
+                "SELECT 2048+32*(" + operation_size + ") FROM storage_operations "
+                "WHERE operation_id=?",
+                (operation_id,),
+            ).fetchone()
+            if aggregate is not None:
+                estimated += aggregate[0]
+                if estimated > max_materialization_bytes:
+                    raise ComputeResourceError(
+                        "source operation metadata exceeds materialization budget"
+                    )
+    return estimated
+
+
 def admit_source_table(
     workspace: Workspace, source_id: str, table_name: str, *, max_materialization_bytes: int
 ) -> None:
@@ -323,24 +388,7 @@ def admit_source_table(
     if not schema.ensure(workspace):
         raise ValueError("native input requires retained source evidence")
     connections = schema.connections(workspace)
-    estimated = 0
-    for kind, conn in connections.items():
-        size = (
-            "octet_length(encode(manifest_json))"
-            if kind == "market"
-            else "length(CAST(manifest_json AS BLOB))"
-        )
-        aggregate = cast(
-            "tuple[int]",
-            conn.execute(
-                "SELECT count(*)*2048+coalesce(sum(32*("
-                + size
-                + ")),0) FROM source_library_commits"
-            ).fetchone(),
-        )
-        estimated += aggregate[0]
-    if estimated > max_materialization_bytes:
-        raise ComputeResourceError("source manifests exceed materialization budget")
+    estimated = _admit_source_metadata(workspace, max_materialization_bytes)
     marker = _marker(workspace, source_id)
     if marker is None:
         raise ValueError("native input requires retained source evidence")

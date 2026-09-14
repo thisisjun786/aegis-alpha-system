@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import tracemalloc
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from decimal import Decimal
+from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -15,7 +17,7 @@ import duckdb
 import pyarrow as pa
 import pytest
 
-from aegis_alpha.compute_resources import ComputeResourceError
+from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.storage import market, publication
 from aegis_alpha.storage.backup import backup, restore
 from aegis_alpha.storage.import_document import parse_import
@@ -249,6 +251,223 @@ def test_native_source_budget_precedes_cell_materialization(stored: Workspace) -
     with pytest.raises(ComputeResourceError, match="source table"):
         api().admit_native_input(
             stored, selected, expected_schema="aas-price-transform-v1", budget=BUDGET
+        )
+
+
+METADATA_BUDGET = ComputeBudget(Fraction(1), 8 * 1024 * 1024)
+OVERSIZED_METADATA_BYTES = 16 * 1024 * 1024
+
+
+def seed_metadata_budget(workspace: Workspace, root: Path, store: str) -> str:
+    seed_native(workspace, root)
+    if store == "strategies":
+        return "synthetic-prices"
+    row = {**_source_row(), "revision_id": "arrow-r1"}
+    arrow = pa.Table.from_pylist(
+        [row],
+        schema=pa.schema(
+            [(key, pa.int64() if type(value) is int else pa.string()) for key, value in row.items()]
+        ),
+    )
+    digest = _hash_json(row)
+    imported = import_arrow(workspace, "arrow", digest, "bars", arrow.to_reader())
+    table = cast("list[dict[str, object]]", imported["tables"])[0]
+    body = json.loads(transform_path(workspace, pin(workspace)).read_bytes())
+    body["source"] = {
+        "source_id": "arrow",
+        "source_sha256": digest,
+        "table": "bars",
+        "table_digest": table["digest"],
+    }
+    body["dataset"].update(
+        dataset_id="arrow-prices", generation_id="arrow-prices", operation_id="arrow-prices"
+    )
+    raw = json.dumps(body).encode()
+    path = root / "arrow.json"
+    path.write_bytes(raw)
+    register_price_input(workspace, path, hashlib.sha256(raw).hexdigest())
+    return "arrow-prices"
+
+
+@contextmanager
+def metadata_allocation_bound(
+    workspace: Workspace, max_bytes: int = METADATA_BUDGET.memory_limit_bytes
+) -> Iterator[None]:
+    assert workspace.strategies is not None
+    with select_only(workspace.state), select_only(workspace.strategies):
+        tracemalloc.start()
+        try:
+            yield
+        finally:
+            _, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+        assert peak < max_bytes
+
+
+@pytest.mark.parametrize("store", ["strategies", "market"])
+@pytest.mark.parametrize("selected_field", [False, True])
+@pytest.mark.parametrize(
+    "field",
+    ["source_id", "operation_id", "request_hash", "source_sha256", "store_kind", "manifest_json"],
+)
+def test_source_marker_metadata_budget(
+    tmp_path: Path, store: str, field: str, *, selected_field: bool
+) -> None:
+    home = tmp_path / "home"
+    # Arrow's real column scan needs more DuckDB working memory than SQLite's.
+    budget = ComputeBudget(Fraction(1), 32 * 1024 * 1024) if store == "market" else METADATA_BUDGET
+    size = 4 * 1024 * 1024 if store == "market" else OVERSIZED_METADATA_BYTES
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        dataset = seed_metadata_budget(workspace, tmp_path, store)
+        selected = pin(workspace, dataset if selected_field else "synthetic-prices")
+        affected = "arrow" if store == "market" else ("source1" if selected_field else "sessions")
+    with open_workspace(home) as workspace, metadata_allocation_bound(workspace, size // 2):
+        expected = api().admit_native_input(
+            workspace, selected, expected_schema="aas-price-transform-v1", budget=budget
+        )
+        assert expected.source_pins[0].source_id == (affected if selected_field else "source1")
+    # Whitespace keeps JSON valid; NUL + multibyte text exercises byte, not text length.
+    value = " " * size if field == "manifest_json" else "\x00" + "\u00e9" * (size // 2)
+    assignment = "=? || manifest_json" if field == "manifest_json" else "=?"
+    mutation = " ".join(
+        ("UPDATE source_library_commits SET", quoted(field), assignment, "WHERE source_id=?")
+    )
+    if store == "market":
+        with duckdb.connect(str(home / "market.duckdb")) as connection:
+            before = connection.execute(
+                "SELECT sql FROM duckdb_tables() ORDER BY table_name"
+            ).fetchall()
+            connection.execute(mutation, [value, affected])
+            assert (
+                connection.execute("SELECT sql FROM duckdb_tables() ORDER BY table_name").fetchall()
+                == before
+            )
+    else:
+        corrupt_closed_store(home, store, "source_library_commits", mutation, (value, affected))
+    del value
+    with open_workspace(home) as workspace, metadata_allocation_bound(workspace, size // 2):
+        # Universal content and the exact selected publication pin remain intact.
+        assert (
+            api().verify_sealed_publication(workspace, selected.generation_id, budget=budget)
+            == expected.history
+        )
+        with pytest.raises(ComputeResourceError, match=r"source .*materialization budget"):
+            api().admit_native_input(
+                workspace, selected, expected_schema="aas-price-transform-v1", budget=budget
+            )
+
+
+def test_null_source_identity_cannot_hide_metadata_budget(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        seed_native(workspace, tmp_path)
+        selected = pin(workspace)
+    with open_workspace(home) as workspace, metadata_allocation_bound(workspace):
+        assert api().admit_native_input(
+            workspace, selected, expected_schema="aas-price-transform-v1", budget=METADATA_BUDGET
+        )
+    # SQLite's VARCHAR PRIMARY KEY permits NULL. It must not null out the
+    # row's entire size expression and hide other materialized fields from SUM.
+    corrupt_closed_store(
+        home,
+        "strategies",
+        "source_library_commits",
+        "UPDATE source_library_commits SET source_id=NULL,operation_id=? "
+        "WHERE source_id='sessions'",
+        ("X" * OVERSIZED_METADATA_BYTES,),
+    )
+    with (
+        open_workspace(home) as workspace,
+        metadata_allocation_bound(workspace),
+        pytest.raises(ComputeResourceError, match=r"source .*materialization budget"),
+    ):
+        api().admit_native_input(
+            workspace,
+            selected,
+            expected_schema="aas-price-transform-v1",
+            budget=METADATA_BUDGET,
+        )
+
+
+@pytest.mark.parametrize("selected_field", [False, True])
+@pytest.mark.parametrize(
+    "field",
+    ["kind", "request_hash", "target_id", "expected_parent", "payload_hash", "failure_reason"],
+)
+def test_source_operation_metadata_budget(
+    tmp_path: Path, field: str, *, selected_field: bool
+) -> None:
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        seed_native(workspace, tmp_path)
+        selected = pin(workspace)
+    with open_workspace(home) as workspace, metadata_allocation_bound(workspace):
+        expected = api().admit_native_input(
+            workspace, selected, expected_schema="aas-price-transform-v1", budget=METADATA_BUDGET
+        )
+    # SQLite length(TEXT) stops at NUL: retain the real 64-character hash CHECK.
+    value = "a" * 64 + "\x00" + "X" * OVERSIZED_METADATA_BYTES
+    corrupt_closed_store(
+        home,
+        "state",
+        "storage_operations",
+        " ".join(
+            (
+                "UPDATE storage_operations SET",
+                quoted(field),
+                "=? WHERE kind='source_import' AND target_id=?",
+            )
+        ),
+        (value, "source1" if selected_field else "sessions"),
+    )
+    del value
+    with open_workspace(home) as workspace, metadata_allocation_bound(workspace):
+        assert (
+            api().verify_sealed_publication(
+                workspace, selected.generation_id, budget=METADATA_BUDGET
+            )
+            == expected.history
+        )
+        with pytest.raises(ComputeResourceError, match=r"source .*materialization budget"):
+            api().admit_native_input(
+                workspace,
+                selected,
+                expected_schema="aas-price-transform-v1",
+                budget=METADATA_BUDGET,
+            )
+
+
+@pytest.mark.parametrize("target", ["g1", "sessions"])
+def test_unfetched_native_operation_metadata_stays_bounded(tmp_path: Path, target: str) -> None:
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        seed_native(workspace, tmp_path)
+        selected = pin(workspace)
+    with open_workspace(home) as workspace, metadata_allocation_bound(workspace):
+        expected = api().admit_native_input(
+            workspace, selected, expected_schema="aas-price-transform-v1", budget=METADATA_BUDGET
+        )
+    corrupt_closed_store(
+        home,
+        "state",
+        "storage_operations",
+        "UPDATE storage_operations SET failure_reason=? "
+        "WHERE kind='market_publish' AND target_id=?",
+        ("X" * OVERSIZED_METADATA_BYTES, target),
+    )
+    with open_workspace(home) as workspace, metadata_allocation_bound(workspace):
+        assert (
+            api().admit_native_input(
+                workspace,
+                selected,
+                expected_schema="aas-price-transform-v1",
+                budget=METADATA_BUDGET,
+            )
+            == expected
         )
 
 
