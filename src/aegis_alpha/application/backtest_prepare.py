@@ -1045,11 +1045,6 @@ def _schedule(
         selected[day] = slot
     if explicit is not None and set(selected) != set(explicit):
         raise ValueError("explicit decision has no eligible pinned session pair")
-    # Validate even an intentionally empty schedule and all supplied session values.
-    decision_slots(
-        _sessions(history, visibility, visibility.ceiling),
-        request=replace(request, explicit_decision_dates=()),
-    )
     return tuple(selected[day] for day in sorted(selected))
 
 
@@ -1090,7 +1085,8 @@ def _target_memberships(
     targets: Mapping[date, Mapping[str, float]],
     slots: tuple[DecisionSlot, ...],
     prices: tuple[_Prices, ...],
-    sessions: tuple[Session, ...],
+    sessions: History,
+    visibility: _Visibility,
 ) -> None:
     selected = {
         instrument: item.series
@@ -1098,21 +1094,21 @@ def _target_memberships(
         if item.role == "execution_prices"
         for instrument in item.series.request.instrument_ids
     }
-    opens = {
-        session.session_date: cast("int", session.open_at_us)
-        for session in sessions
-        if session.status == "open"
-    }
     for slot in slots:
+        # Economic validity uses the execution open admitted at this cutoff,
+        # independently of membership knowledge and later outcome revisions.
+        opening = next(
+            cast("int", session.open_at_us)
+            for session in _sessions(sessions, visibility, slot.cutoff_us)
+            if session.session_date == slot.execution_date
+        )
         for instrument in targets[slot.decision_date]:
             if instrument not in selected:
                 raise ValueError("target is not an explicitly selected instrument")
             series = selected[instrument]
-            if not _active(
-                series.identities, instrument, opens[slot.execution_date], slot.cutoff_us
-            ):
+            if not _active(series.identities, instrument, opening, slot.cutoff_us):
                 raise ValueError("selected target identity unavailable at decision")
-            if not _active(series.universe, instrument, opens[slot.execution_date], slot.cutoff_us):
+            if not _active(series.universe, instrument, opening, slot.cutoff_us):
                 raise ValueError("selected target outside pinned universe at decision")
 
 
@@ -1177,6 +1173,22 @@ def prepare_backtest(
     )
     grid = _sessions(sessions, visibility, visibility.ceiling)
     slots = _schedule(sessions, visibility, schedule)
+    dates = tuple(
+        session.session_date
+        for session in grid
+        if session.status == "open"
+        and schedule.period_start <= session.session_date <= schedule.period_end
+    )
+    # Legacy accounting fills on the next grid date, including all-cash targets.
+    # Reject an unrepresentable slot rather than rewriting either calendar.
+    next_open = dict(pairwise(dates))
+    for slot in slots:
+        if next_open.get(slot.decision_date) != slot.execution_date:
+            message = f"incompatible outcome calendar projection: decision {slot.decision_date} "
+            message += f"requires next open {slot.execution_date}, "
+            raise ValueError(message + f"projected {next_open.get(slot.decision_date)}")
+    # Validate even an intentionally empty schedule and all supplied session values.
+    decision_slots(grid, request=replace(schedule, explicit_decision_dates=()))
     _complete_calendar(grid, visibility.history_start, schedule.period_end)
     membership = _membership(loader, bundle)
     prices = _prices(loader, body, calendar, sessions)
@@ -1185,12 +1197,6 @@ def prepare_backtest(
     _execution_selection(prices, proxies, definition)
     decisions, features = _decisions(
         bundle, definition, slots, visibility, (membership, prices, auxiliary, proxies)
-    )
-    dates = tuple(
-        session.session_date
-        for session in grid
-        if session.status == "open"
-        and schedule.period_start <= session.session_date <= schedule.period_end
     )
     opening, closing = _outcomes(prices, dates, visibility)
     sources = tuple(
@@ -1208,7 +1214,7 @@ def prepare_backtest(
         _types(workspace, prices),
         sources,
     )
-    _target_memberships(inputs.targets, slots, prices, grid)
+    _target_memberships(inputs.targets, slots, prices, sessions, visibility)
     envelope = export_envelope(request.parsed, projection=projection, inputs=inputs)
     if environment_identity() != environment:
         raise ValueError("calculation context changed during preparation")

@@ -44,6 +44,9 @@ from aegis_alpha.storage.import_document import parse_import
 from aegis_alpha.storage.input_pins import register_convention, register_definition
 from aegis_alpha.storage.market_schema import NATURAL_KEYS
 from aegis_alpha.storage.membership_pins import (
+    IdentityPin,
+    UniversePin,
+    read_membership_pins,
     register_identity_snapshot,
     register_universe_version,
 )
@@ -1170,6 +1173,360 @@ def test_known_revisions_and_retractions_respect_explicit_ingestion(
                 prepare(workspace, body)
         body["cutoff"]["ingestion_cutoff_us"] = limit
         assert prepare(workspace, body).targets == first.targets
+
+
+def calendar_revision(
+    workspace: Workspace, root: Path, body: Document, day: date, changes: Document
+) -> None:
+    original = next(row for row in session_rows() if row["session_date"] == day.isoformat())
+    native(
+        workspace,
+        root,
+        "calendar-correction",
+        [
+            {
+                **original,
+                "revision_id": "calendar-correction",
+                "op": "SUPERSEDE",
+                "supersedes_revision_id": "sessions:" + original["revision_id"],
+                "revision_known_at_us": micros(date(2026, 3, 30)),
+                "available_at_us": micros(date(2026, 3, 30)),
+                "ingested_at_us": micros(date(2026, 4, 1)),
+                **changes,
+            }
+        ],
+        destination={
+            "dataset_id": "sessions",
+            "version": "2",
+            "generation_id": "calendar-correction",
+            "operation_id": "op-calendar-correction",
+            "parent_id": "sessions",
+        },
+    )
+    replace_pin(body, "sessions", generation_pin(workspace, "sessions", "2"))
+
+
+def incompatible_calendar(workspace: Workspace, root: Path, body: Document, change: str) -> None:
+    if change == "insert-open":
+        inserted = date(2026, 1, 30)
+        rows = price_rows(signal=False)
+        rows.extend(
+            row_identity(
+                {
+                    **row,
+                    "session_date": inserted.isoformat(),
+                    "bar_end_us": micros(inserted),
+                    "available_at_us": micros(inserted),
+                    "revision_known_at_us": micros(inserted),
+                },
+                "prices",
+            )
+            for row in price_rows(signal=False)
+            if row["session_date"] == "2026-02-02"
+        )
+        alternate_prices(workspace, root, body, "execution_prices", rows)
+        calendar_revision(
+            workspace,
+            root,
+            body,
+            inserted,
+            {"status": "open", "open_at_us": micros(inserted, 9), "close_at_us": micros(inserted)},
+        )
+    else:
+        calendar_revision(
+            workspace,
+            root,
+            body,
+            date(2026, 2, 2) if change == "close-execution" else date(2026, 1, 29),
+            {"status": "closed", "open_at_us": None, "close_at_us": None},
+        )
+
+
+def reject_export_and_accounting(frame: FrameType, event: str, argument: object) -> None:
+    reject_accounting(frame, event, argument)
+    if (
+        event == "call"
+        and frame.f_globals.get("__name__") == "aegis_alpha.engine.backtest_request"
+        and frame.f_code.co_name == "export_envelope"
+    ):
+        raise AssertionError("incompatible calendar reached export")
+
+
+@pytest.mark.parametrize("change", ["close-execution", "insert-open", "close-decision"])
+@pytest.mark.parametrize("all_cash", [False, True])
+def test_incompatible_outcome_calendar_rejects_before_export(
+    tmp_path: Path, change: str, *, all_cash: bool
+) -> None:
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        body = stored_request(workspace, tmp_path)
+        if all_cash:
+            second_recipe(workspace, tmp_path, body)
+        body["explicit_decision_dates"] = ["2026-01-29"]
+        baseline = prepare(workspace, body)
+        assert [(slot.decision_date, slot.execution_date) for slot in baseline.slots] == [
+            (date(2026, 1, 29), date(2026, 2, 2))
+        ]
+        result = cast(
+            "Document",
+            run_document(baseline.envelope.canonical_bytes, baseline.envelope.envelope_sha256),
+        )["result"]
+        assert [(fill["decision_date"], fill["execution_date"]) for fill in result["fills"]] == (
+            [] if all_cash else [("2026-01-29", "2026-02-02")]
+        )
+        assert baseline.targets == {date(2026, 1, 29): {} if all_cash else {"ASSET_A": 1.0}}
+        incompatible_calendar(workspace, tmp_path, body, change)
+        before = registration_state(workspace)
+        assert workspace.strategies is not None
+        strategies = tuple(workspace.strategies.iterdump())
+        connections = (workspace.state, workspace.strategies)
+        for connection in connections:
+            connection.set_authorizer(select_only)
+        sys.setprofile(reject_export_and_accounting)
+        try:
+            with pytest.raises(ValueError, match=r"incompatible.*calendar|calendar.*incompatible"):
+                prepare(workspace, body)
+        finally:
+            sys.setprofile(None)
+            for connection in connections:
+                connection.set_authorizer(None)
+        assert registration_state(workspace) == before
+        assert tuple(workspace.strategies.iterdump()) == strategies
+
+
+@pytest.mark.parametrize("change", ["close-execution", "insert-open"])
+def test_empty_schedule_preserves_revised_outcome_calendar(tmp_path: Path, change: str) -> None:
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        body = stored_request(workspace, tmp_path)
+        body["explicit_decision_dates"] = []
+        incompatible_calendar(workspace, tmp_path, body, change)
+        prepared = prepare(workspace, body)
+        assert prepared.slots == prepared.decisions == ()
+        assert prepared.targets == {}
+        dates = json.loads(prepared.envelope.canonical_bytes)["dates"]
+        assert dates == (
+            ["2026-01-29", "2026-02-26", "2026-03-02", "2026-03-30"]
+            if change == "close-execution"
+            else [
+                "2026-01-29",
+                "2026-01-30",
+                "2026-02-02",
+                "2026-02-26",
+                "2026-03-02",
+                "2026-03-30",
+            ]
+        )
+    result = cast(
+        "Document",
+        run_document(prepared.envelope.canonical_bytes, prepared.envelope.envelope_sha256),
+    )["result"]
+    assert result["fills"] == []
+    assert [row["date"] for row in result["nav"]] == dates
+    assert result["nav"][-1]["equity"] == pytest.approx(100)
+
+
+def target_membership_interval(
+    workspace: Workspace, body: Document, role: str, interval: Document
+) -> None:
+    identity = next(ref["pin"] for ref in body["refs"] if ref["ref_kind"] == "identity")
+    universe = next(ref["pin"] for ref in body["refs"] if ref["ref_kind"] == "universe")
+    verified = read_membership_pins(
+        workspace.state,
+        IdentityPin(**identity),
+        UniversePin(**universe),
+        max_materialization_bytes=BUDGET.memory_limit_bytes,
+    )
+    stored = verified.identity if role == "identity" else verified.universe
+    assert stored is not None
+    doc = json.loads(stored.canonical_bytes)
+    for member in doc["members"]:
+        if member.get("instrument_id", member.get("assertion_id")) == "ASSET_A":
+            member.update(interval)
+    if role == "identity":
+        doc["snapshot_id"] = "execution-interval"
+        pin = register_identity_snapshot(
+            workspace.state,
+            canonical_json_bytes(doc),
+            expected_file_sha256=digest(doc),
+            created_at_us=1,
+        )
+    else:
+        doc["version"] = "execution-interval"
+        pin = register_universe_version(
+            workspace.state, canonical_json_bytes(doc), expected_file_sha256=digest(doc)
+        )
+    replace_pin(body, role, asdict(pin))
+
+
+@pytest.mark.parametrize("role", ["identity", "universe"])
+@pytest.mark.parametrize("revised_hour", [7, 11])
+def test_target_membership_uses_decision_local_execution_open(
+    tmp_path: Path, role: str, revised_hour: int
+) -> None:
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        body = stored_request(workspace, tmp_path)
+        body["explicit_decision_dates"] = ["2026-01-29"]
+        # Original execution is 09:00. Expiry at 08:00 excludes it; 10:00 admits it.
+        # A later revision to 07:00/11:00 must not reverse either decision.
+        earlier_hour = 7
+        expiry_hour = 8 if revised_hour == earlier_hour else 10
+        target_membership_interval(
+            workspace, body, role, {"valid_to_us": micros(date(2026, 2, 2), expiry_hour)}
+        )
+        baseline = None
+        if revised_hour == earlier_hour:
+            with pytest.raises(ValueError, match="selected target"):
+                prepare(workspace, body)
+        else:
+            baseline = prepare(workspace, body)
+        calendar_revision(
+            workspace,
+            tmp_path,
+            body,
+            date(2026, 2, 2),
+            {"open_at_us": micros(date(2026, 2, 2), revised_hour)},
+        )
+        before = registration_state(workspace)
+        if revised_hour == earlier_hour:
+            with pytest.raises(ValueError, match="selected target"):
+                prepare(workspace, body)
+        else:
+            prepared = prepare(workspace, body)
+            assert baseline is not None
+            assert prepared.slots == baseline.slots
+            assert prepared.decisions == baseline.decisions
+            assert prepared.targets == {date(2026, 1, 29): {"ASSET_A": 1.0}}
+            result = cast(
+                "Document",
+                run_document(prepared.envelope.canonical_bytes, prepared.envelope.envelope_sha256),
+            )["result"]
+            assert [(row["decision_date"], row["execution_date"]) for row in result["fills"]] == [
+                ("2026-01-29", "2026-02-02")
+            ]
+            assert result["nav"][-1]["equity"] == pytest.approx(80)
+        assert registration_state(workspace) == before
+
+
+@pytest.mark.parametrize("role", ["identity", "universe"])
+@pytest.mark.parametrize("offset_us", [-1, 0, 1])
+def test_membership_knowledge_visibility_is_not_execution_economic_time(
+    tmp_path: Path, role: str, offset_us: int
+) -> None:
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        body = stored_request(workspace, tmp_path)
+        body["explicit_decision_dates"] = ["2026-01-29"]
+        cutoff = micros(date(2026, 1, 29))
+        target_membership_interval(
+            workspace,
+            body,
+            role,
+            {"known_from_us": cutoff + offset_us, "valid_to_us": micros(date(2026, 2, 2), 10)},
+        )
+        if offset_us > 0:
+            with pytest.raises(ValueError, match="insufficient eligible buckets"):
+                prepare(workspace, body)
+        else:
+            assert prepare(workspace, body).targets == {date(2026, 1, 29): {"ASSET_A": 1.0}}
+
+
+@pytest.mark.parametrize("offset_us", [-1, 0, 1])
+def test_execution_session_revision_respects_exact_cutoff_and_ingestion(
+    tmp_path: Path, offset_us: int, publication_clock: list[int]
+) -> None:
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        body = stored_request(workspace, tmp_path)
+        body["explicit_decision_dates"] = ["2026-01-29"]
+        target_membership_interval(
+            workspace, body, "universe", {"valid_to_us": micros(date(2026, 2, 2), 10)}
+        )
+        baseline = prepare(workspace, body)
+        ingestion_before = publication_clock[0] // 1000
+        publication_clock[0] += 1000
+        cutoff = micros(date(2026, 1, 29))
+        calendar_revision(
+            workspace,
+            tmp_path,
+            body,
+            date(2026, 2, 2),
+            {
+                "open_at_us": micros(date(2026, 2, 2), 11),
+                "available_at_us": cutoff + offset_us,
+                "revision_known_at_us": cutoff + offset_us,
+            },
+        )
+        if offset_us <= 0:
+            with pytest.raises(ValueError, match="selected target outside pinned universe"):
+                prepare(workspace, body)
+        else:
+            assert prepare(workspace, body).targets == baseline.targets
+        body["cutoff"]["ingestion_cutoff_us"] = ingestion_before
+        assert prepare(workspace, body).targets == baseline.targets
+        body["cutoff"]["ingestion_cutoff_us"] = ingestion_before + 1
+        if offset_us <= 0:
+            with pytest.raises(ValueError, match="selected target outside pinned universe"):
+                prepare(workspace, body)
+        else:
+            assert prepare(workspace, body).targets == baseline.targets
+
+
+def test_compatible_inserted_outcome_session_keeps_fill_and_all_dates(tmp_path: Path) -> None:
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        body = stored_request(workspace, tmp_path)
+        body["explicit_decision_dates"] = ["2026-01-29"]
+        baseline = prepare(workspace, body)
+        inserted = date(2026, 2, 3)
+        rows = price_rows(signal=False)
+        rows.extend(
+            row_identity(
+                {**row, "session_date": inserted.isoformat(), "bar_end_us": micros(inserted)},
+                "prices",
+            )
+            for row in price_rows(signal=False)
+            if row["session_date"] == "2026-02-02"
+        )
+        alternate_prices(workspace, tmp_path, body, "execution_prices", rows)
+        calendar_revision(
+            workspace,
+            tmp_path,
+            body,
+            inserted,
+            {"status": "open", "open_at_us": micros(inserted, 9), "close_at_us": micros(inserted)},
+        )
+        prepared = prepare(workspace, body)
+        assert prepared.slots == baseline.slots
+        assert prepared.decisions == baseline.decisions
+        assert prepared.features == baseline.features
+        assert prepared.targets == baseline.targets
+        assert prepared.request_hash != baseline.request_hash
+        assert json.loads(prepared.envelope.canonical_bytes)["dates"] == [
+            "2026-01-29",
+            "2026-02-02",
+            "2026-02-03",
+            "2026-02-26",
+            "2026-03-02",
+            "2026-03-30",
+        ]
+    result = cast(
+        "Document",
+        run_document(prepared.envelope.canonical_bytes, prepared.envelope.envelope_sha256),
+    )["result"]
+    assert [
+        (row["decision_date"], row["execution_date"], row["shares"]) for row in result["fills"]
+    ] == [("2026-01-29", "2026-02-02", 100 / 15)]
+    assert [row["date"] for row in result["nav"]] == [
+        "2026-01-29",
+        "2026-02-02",
+        "2026-02-03",
+        "2026-02-26",
+        "2026-03-02",
+        "2026-03-30",
+    ]
+    assert result["nav"][-1]["equity"] == pytest.approx(80)
 
 
 def test_calendar_future_revision_does_not_rewrite_signal_eligibility(tmp_path: Path) -> None:
