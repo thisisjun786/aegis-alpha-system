@@ -154,7 +154,7 @@ def test_ensemble_whole_document_and_bundle_roundtrip(tmp_path: Path) -> None:
         )
         assert pin.hash == "576d214e5c0e2c734f974a27b5781d319bb7ca5c882a4978cb90b9808f0cb6e3"
         assert json.loads(read_definition(ws, pin, budget=budget)) == body
-        binding = {
+        binding: dict[str, object] = {
             "role": "membership",
             "ordinal": 0,
             "ref_kind": "membership",
