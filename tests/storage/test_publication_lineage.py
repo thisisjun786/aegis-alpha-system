@@ -18,7 +18,7 @@ import pyarrow as pa
 import pytest
 
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
-from aegis_alpha.storage import market, publication
+from aegis_alpha.storage import market, publication, source_library_schema
 from aegis_alpha.storage.backup import backup, restore
 from aegis_alpha.storage.import_document import parse_import
 from aegis_alpha.storage.raw import put_raw
@@ -302,6 +302,145 @@ def metadata_allocation_bound(
             _, peak = tracemalloc.get_traced_memory()
             tracemalloc.stop()
         assert peak < max_bytes
+
+
+def receipt_inventory(home: Path) -> dict[str, str]:
+    files = [*home.glob("*.sqlite3"), *home.glob("*.duckdb"), *(home / "raw").rglob("*")]
+    result = {}
+    for path in files:
+        if path.is_file():
+            with path.open("rb") as stream:
+                result[str(path.relative_to(home))] = hashlib.file_digest(
+                    stream, "sha256"
+                ).hexdigest()
+    return result
+
+
+@pytest.mark.parametrize("store", ["state", "strategies", "market"])
+@pytest.mark.parametrize("fault", ["checksum", "extra-row"])
+def test_native_schema_receipt_budget(tmp_path: Path, store: str, fault: str) -> None:
+    home = tmp_path / "home"
+    # DuckDB needs native working memory to inspect its 16 MiB stored value.
+    # The Python result bound remains 8 MiB, independently of that engine limit.
+    budget = ComputeBudget(Fraction(1), 128 * 1024 * 1024) if store == "market" else METADATA_BUDGET
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        seed_native(workspace, tmp_path)
+        selected = pin(workspace)
+    with open_workspace(home) as workspace, metadata_allocation_bound(workspace):
+        expected = api().admit_native_input(
+            workspace, selected, expected_schema="aas-price-transform-v1", budget=budget
+        )
+        assert expected.source_pins[0].source_id == "source1"
+    mutation = (
+        "UPDATE source_library_schema SET checksum=?"
+        if fault == "checksum"
+        else "INSERT INTO source_library_schema VALUES (2,?)"
+    )
+    value = "X" * OVERSIZED_METADATA_BYTES
+    if store == "market":
+        with duckdb.connect(str(home / "market.duckdb")) as connection:
+            before = connection.execute(
+                "SELECT sql FROM duckdb_tables() ORDER BY table_name"
+            ).fetchall()
+            connection.execute(mutation, [value])
+            assert (
+                connection.execute("SELECT sql FROM duckdb_tables() ORDER BY table_name").fetchall()
+                == before
+            )
+    else:
+        corrupt_closed_store(home, store, "source_library_schema", mutation, (value,))
+    del value
+    before_files = receipt_inventory(home)
+    with open_workspace(home) as workspace, metadata_allocation_bound(workspace):
+        assert pin(workspace) == selected
+        assert (
+            api().verify_sealed_publication(workspace, selected.generation_id, budget=budget)
+            == expected.history
+        )
+        with pytest.raises(ValueError, match="source-library schema/checksum"):
+            api().admit_native_input(
+                workspace, selected, expected_schema="aas-price-transform-v1", budget=budget
+            )
+    assert receipt_inventory(home) == before_files
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "duckdb"])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing",
+        "version",
+        "extra-row",
+        "empty",
+        "prefix",
+        "suffix",
+        "nul-suffix",
+        "nul-prefix",
+        "nonascii",
+        "uppercase",
+        "many-rows",
+    ],
+)
+def test_schema_receipt_exact_bounded_validation(backend: str, fault: str) -> None:
+    connection = sqlite3.connect(":memory:") if backend == "sqlite" else duckdb.connect()
+    with closing(connection):
+        assert not source_library_schema.admit(connection, create=False)
+        assert source_library_schema.admit(connection, create=True)
+        original = connection.execute(
+            "SELECT version,checksum FROM source_library_schema"
+        ).fetchall()
+        assert source_library_schema.admit(connection, create=False)
+        assert source_library_schema.admit(connection, create=True)
+        assert (
+            connection.execute("SELECT version,checksum FROM source_library_schema").fetchall()
+            == original
+        )
+        version, checksum = original[0]
+        if fault == "missing":
+            connection.execute("DELETE FROM source_library_schema")
+        elif fault == "version":
+            connection.execute("UPDATE source_library_schema SET version=?", [version + 1])
+        elif fault == "extra-row":
+            connection.execute(
+                "INSERT INTO source_library_schema VALUES (?,?)", [version + 1, checksum]
+            )
+        elif fault == "many-rows":
+            connection.execute(
+                "WITH RECURSIVE versions(v) AS (SELECT 2 UNION ALL "
+                "SELECT v+1 FROM versions WHERE v<8192) "
+                "INSERT INTO source_library_schema SELECT v,? FROM versions",
+                [checksum],
+            )
+        else:
+            values = {
+                "empty": "",
+                "prefix": checksum[:-1],
+                "suffix": checksum + "X",
+                "nul-suffix": checksum + "\x00",
+                "nul-prefix": "\x00" + checksum,
+                "nonascii": checksum[:-2] + "\u00e9",
+                "uppercase": checksum.upper(),
+            }
+            connection.execute("UPDATE source_library_schema SET checksum=?", [values[fault]])
+        connection.commit()
+        tracemalloc.start()
+        try:
+            for create in (False, True):
+                with pytest.raises(ValueError, match="source-library schema/checksum"):
+                    source_library_schema.admit(connection, create=create)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert peak < 256 * 1024
+
+
+def test_schema_receipt_sqlite_blob_is_not_text() -> None:
+    with closing(sqlite3.connect(":memory:")) as connection:
+        assert source_library_schema.admit(connection, create=True)
+        connection.execute("UPDATE source_library_schema SET checksum=CAST(checksum AS BLOB)")
+        with pytest.raises(ValueError, match="source-library schema/checksum"):
+            source_library_schema.admit(connection, create=False)
 
 
 @pytest.mark.parametrize("store", ["strategies", "market"])
