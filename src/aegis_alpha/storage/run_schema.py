@@ -112,10 +112,11 @@ def _local_state(workspace: Workspace) -> bool:
     rows = workspace.state.execute(
         "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE sql IS NOT NULL"
     ).fetchall()
+    reserved_names = {name for _, name in _STATE_OBJECTS}
     owned = {
         (row[0], row[1]): row[3]
         for row in rows
-        if row[2].lower() in _STATE_TABLES or (row[0], row[1].lower()) in _STATE_OBJECTS
+        if row[2].lower() in _STATE_TABLES or row[1].lower() in reserved_names
     }
     if not owned:
         return False

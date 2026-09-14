@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import select
@@ -283,6 +284,70 @@ def test_case_insensitive_owned_name_collision_precedes_backup(tmp_path: Path, s
     assert not (tmp_path / "forbidden-backup").exists()
     with open_workspace(home) as workspace:
         assert "\n".join(workspace.state.iterdump()) == before
+
+
+def _tree_snapshot(root: Path) -> dict[str, str | None]:
+    return {
+        str(path.relative_to(root)): (
+            hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+        )
+        for path in root.rglob("*")
+    }
+
+
+@pytest.mark.parametrize(
+    "ddl",
+    [
+        "CREATE TABLE run_details_request_hash(unrelated TEXT)",
+        "CREATE TABLE RUN_DETAILS_REQUEST_HASH(unrelated TEXT)",
+        "CREATE INDEX backtest_requests ON issuers(name)",
+        "CREATE INDEX BACKTEST_REQUESTS ON issuers(name)",
+    ],
+    ids=[
+        "table-index-name",
+        "table-index-name-ascii-case",
+        "index-table-name",
+        "index-table-name-ascii-case",
+    ],
+)
+def test_native_cross_type_name_collision_leaves_all_stores_unchanged(
+    tmp_path: Path, ddl: str
+) -> None:
+    from tests.application.test_storage_cli import run_cli  # noqa: PLC0415
+
+    home = tmp_path / "home"
+    initialized = run_cli("init", home=home)
+    assert initialized.returncode == 0, initialized.stderr
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    output = backups / "pre-install"
+    with open_workspace(home, writable=True) as workspace:
+        workspace.state.execute(ddl)
+        workspace.state.commit()
+        state_before = "\n".join(workspace.state.iterdump())
+        assert workspace.strategies is not None
+        private_before = "\n".join(workspace.strategies.iterdump())
+        assert workspace.state.execute("SELECT * FROM storage_operations").fetchall() == []
+    # Closed-store bytes plus all directory entries cover state/private/market,
+    # raw files, default and explicit backups, and any new SQLite journal files.
+    before = _tree_snapshot(tmp_path)
+    rejected = run_cli("db", "run-install", "--backup-output", str(output), home=home)
+    after = _tree_snapshot(tmp_path)
+    with open_workspace(home) as workspace:
+        state_after = "\n".join(workspace.state.iterdump())
+        assert workspace.strategies is not None
+        private_after = "\n".join(workspace.strategies.iterdump())
+        operations = workspace.state.execute("SELECT * FROM storage_operations").fetchall()
+    assert rejected.returncode == 1, rejected.stdout
+    assert rejected.stdout == ""
+    assert (after, state_after, private_after, operations) == (
+        before,
+        state_before,
+        private_before,
+        [],
+    )
+    assert not output.exists()
+    assert json.loads(rejected.stderr)["error"].split(":", 1)[0] == "run_schema_invalid"
 
 
 def test_native_interruption_between_stores_and_explicit_retry(tmp_path: Path) -> None:
