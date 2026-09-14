@@ -12,6 +12,7 @@ from aegis_alpha.storage.state import atomic, complete_operation, get_operation,
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from aegis_alpha.compute_resources import ComputeBudget
     from aegis_alpha.storage.workspace import Workspace
 
 _STATE_TABLES = {
@@ -239,7 +240,9 @@ def _install_market(workspace: Workspace) -> None:
     _local_market(workspace)
 
 
-def install_run_schema(home: Path, *, backup_output: Path | None = None) -> dict[str, object]:
+def install_run_schema(
+    home: Path, *, backup_output: Path | None = None, budget: ComputeBudget | None = None
+) -> dict[str, object]:
     from aegis_alpha.storage.backup import (  # noqa: PLC0415 -- backup verifies this schema
         backup_workspace,
     )
@@ -258,7 +261,7 @@ def install_run_schema(home: Path, *, backup_output: Path | None = None) -> dict
                 "run_schema_incomplete", "stop running analyses and recover unrelated operations"
             )
         if status.state == "absent":
-            backup_workspace(workspace, backup_output)
+            backup_workspace(workspace, backup_output, budget=budget)
             intent = _intent(workspace)
             prepare_operation(
                 workspace.state,

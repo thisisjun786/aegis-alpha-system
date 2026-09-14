@@ -17,6 +17,7 @@ from aegis_alpha.storage.strategies import load_strategy
 from aegis_alpha.storage.workspace import open_workspace
 from tests.engine.engine_support import contract, raw_bundle
 from tests.engine.test_requirements import rich_contract, scoring_contract
+from tests.storage.test_publication import document
 from tests.storage.test_strategy_requirements import A, B
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -32,6 +33,64 @@ def run_cli(*args: str, home: Path) -> subprocess.CompletedProcess[str]:
         check=False,
         timeout=30,
     )
+
+
+def test_configured_budget_verifies_backs_up_restores_and_installs_large_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    assert run_cli("init", home=home).returncode == 0
+    source = tmp_path / "large-import.json"
+    raw = document() + b" " * (4 * 1024 * 1024)
+    source.write_bytes(raw)
+    imported = run_cli(
+        "data", "import", str(source), "--sha256", hashlib.sha256(raw).hexdigest(), home=home
+    )
+    assert imported.returncode == 0, imported.stderr
+    for name in ("AAS_CPU_LIMIT", "AAS_HOST_CPU_LIMIT"):
+        monkeypatch.setenv(name, "1")
+    for name in ("AAS_MEMORY_LIMIT_BYTES", "AAS_HOST_MEMORY_LIMIT_BYTES"):
+        monkeypatch.setenv(name, str(1024 * 1024 * 1024))
+    monkeypatch.setenv("AAS_COMPUTE_LOCK_FILE", str(tmp_path / "compute.lock"))
+    checked = run_cli("db", "verify", home=home)
+    assert checked.returncode == 0, checked.stderr
+    verification = json.loads(checked.stdout)
+    archive = tmp_path / "archive"
+    saved = run_cli("db", "backup", "--output", str(archive), home=home)
+    assert saved.returncode == 0, saved.stderr
+    restored = run_cli(
+        "--home", str(tmp_path / "restored"), "db", "restore", "--backup", str(archive), home=home
+    )
+    assert restored.returncode == 0, restored.stderr
+    assert json.loads(restored.stdout)["verification"] == verification
+    installed = run_cli(
+        "db", "run-install", "--backup-output", str(tmp_path / "before-run-schema"), home=home
+    )
+    assert installed.returncode == 0, installed.stderr
+    assert json.loads(installed.stdout)["state"] == "complete"
+
+
+@pytest.mark.parametrize("command", ["verify", "backup", "restore", "run-install"])
+def test_maintenance_compute_lock_alias_rejected_before_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    home = tmp_path / "home"
+    assert run_cli("init", home=home).returncode == 0
+    target = tmp_path / "new-home" if command == "restore" else home
+    for name in ("AAS_CPU_LIMIT", "AAS_HOST_CPU_LIMIT"):
+        monkeypatch.setenv(name, "1")
+    for name in ("AAS_MEMORY_LIMIT_BYTES", "AAS_HOST_MEMORY_LIMIT_BYTES"):
+        monkeypatch.setenv(name, str(1024 * 1024 * 1024))
+    monkeypatch.setenv("AAS_COMPUTE_LOCK_FILE", str(target / ".storage.lock"))
+    args = ["--home", str(target), "db", command]
+    if command == "restore":
+        args.extend(["--backup", str(tmp_path / "absent-archive")])
+    result = run_cli(*args, home=home)
+    assert result.returncode == 1
+    assert "compute lock aliases" in result.stderr
+    if command == "restore":
+        assert not target.exists()
+    assert not any((home / "backups").iterdir())
 
 
 def test_init_doctor_repeat_without_database_server(tmp_path: Path) -> None:

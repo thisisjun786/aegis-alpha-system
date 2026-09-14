@@ -484,9 +484,13 @@ def verify_sealed_publication(
     """
     _admit_publication_chain(workspace, generation_id, budget)
     history = market.read_chain_rows(workspace.market, generation_id, budget=budget)
+    deltas: dict[str, list[Row]] = {}
+    for row in history:
+        deltas.setdefault(str(row["generation_id"]), []).append(row)
     for marker in market.generation_chain(workspace.market, generation_id):
         _verify_catalog(workspace, marker)
-        _sealed_publication(workspace, marker, history, budget)
+        delta = tuple(deltas.get(str(marker["generation_id"]), ()))
+        _sealed_publication(workspace, marker, delta, budget)
     return history
 
 

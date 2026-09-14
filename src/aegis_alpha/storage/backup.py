@@ -7,13 +7,16 @@ import os
 import sqlite3
 import uuid
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.storage.locks import private_directory, private_file
 from aegis_alpha.storage.paths import DEFAULT_PATHS, load_paths, read_json, resolve_home
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import Workspace, open_workspace, write_json
+
+if TYPE_CHECKING:
+    from aegis_alpha.compute_resources import ComputeBudget
 
 _MANIFEST = "backup.json"
 
@@ -70,14 +73,18 @@ def _copy_tree(source: Path, target: Path, files: dict[str, object], prefix: str
             files[prefix + name] = _copy_file(child, target / name)
 
 
-def backup(home: Path, output: Path | None = None) -> dict[str, object]:
+def backup(
+    home: Path, output: Path | None = None, *, budget: ComputeBudget | None = None
+) -> dict[str, object]:
     with open_workspace(home, writable=True) as workspace:
-        return backup_workspace(workspace, output)
+        return backup_workspace(workspace, output, budget=budget)
 
 
-def backup_workspace(workspace: Workspace, output: Path | None = None) -> dict[str, object]:
+def backup_workspace(
+    workspace: Workspace, output: Path | None = None, *, budget: ComputeBudget | None = None
+) -> dict[str, object]:
     """Back up within an existing maintenance lifetime; never reacquire workspace locks."""
-    verification = verify_workspace(workspace)
+    verification = verify_workspace(workspace, budget=budget)
     if verification["pending_operations"] or verification["orphan_generations"]:
         raise ValueError("backup requires recovered operations and no orphan generations")
     if workspace.state.execute("SELECT 1 FROM runs WHERE status='RUNNING'").fetchone():
@@ -190,7 +197,9 @@ def _validated_manifest(root: Path) -> dict[str, object]:
     return manifest
 
 
-def restore(backup_root: Path, new_home: Path) -> dict[str, object]:
+def restore(
+    backup_root: Path, new_home: Path, *, budget: ComputeBudget | None = None
+) -> dict[str, object]:
     backup_root = resolve_home(backup_root)
     new_home = resolve_home(new_home)
     if new_home.exists() or new_home.is_symlink():
@@ -211,7 +220,7 @@ def restore(backup_root: Path, new_home: Path) -> dict[str, object]:
         private_directory(new_home / name, create=True)
     try:
         with open_workspace(new_home, validating_restore=True) as workspace:
-            verification = verify_workspace(workspace)
+            verification = verify_workspace(workspace, budget=budget)
             if verification != manifest["logical"]:
                 raise ValueError("restored logical verification differs from backup")  # noqa: TRY301 -- persist failed restore receipt
     except BaseException:

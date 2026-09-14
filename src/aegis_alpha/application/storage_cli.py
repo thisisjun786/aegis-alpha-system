@@ -124,14 +124,13 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             return initialize(home)
         if args.command == "data" and args.data_command in {"convention-import", "binding-import"}:
             return _pin_import(home, args)
-        if args.command == "db" and args.db_command in {"backup", "run-install"}:
+        if args.command == "db" and args.db_command in {
+            "verify",
+            "backup",
+            "restore",
+            "run-install",
+        }:
             return _maintenance(home, args)
-        if args.command == "db" and args.db_command == "restore":
-            if getattr(args, "home", None) is None:
-                raise ValueError("restore requires an explicit --home for a new directory")
-            from aegis_alpha.storage.backup import restore
-
-            return restore(args.backup.absolute(), home)
         if args.command == "data" and args.data_command == "read-prices":
             from aegis_alpha.application.compute_cli import price_compute
             from aegis_alpha.application.data_cli import read_price_input
@@ -180,12 +179,32 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
 
 
 def _maintenance(home: Path, args: argparse.Namespace) -> dict[str, object]:
-    from aegis_alpha.storage.backup import backup
+    from aegis_alpha.application.compute_cli import price_compute
+    from aegis_alpha.storage.backup import backup, restore
+    from aegis_alpha.storage.locks import private_directory, storage_lock_targets
+    from aegis_alpha.storage.paths import DEFAULT_PATHS, load_paths
     from aegis_alpha.storage.run_schema import install_run_schema
+    from aegis_alpha.storage.verification import verify_workspace
+    from aegis_alpha.storage.workspace import open_workspace
 
-    if args.db_command == "backup":
-        return backup(home, args.output)
-    return install_run_schema(home, backup_output=args.backup_output)
+    if args.db_command == "restore":
+        if getattr(args, "home", None) is None:
+            raise ValueError("restore requires an explicit --home for a new directory")
+        # Portable backups restore the three stores to their canonical paths.
+        stores = tuple(home / DEFAULT_PATHS[name] for name in ("state", "strategies", "market"))
+    else:
+        private_directory(home)
+        stores = load_paths(home).stores()
+    # Acquire the compute lease before workspace admission, as other bulk readers do.
+    with price_compute(excluded_locks=storage_lock_targets(home, stores)) as budget:
+        if args.db_command == "backup":
+            return backup(home, args.output, budget=budget)
+        if args.db_command == "restore":
+            return restore(args.backup.absolute(), home, budget=budget)
+        if args.db_command == "run-install":
+            return install_run_schema(home, backup_output=args.backup_output, budget=budget)
+        with open_workspace(home) as workspace:
+            return verify_workspace(workspace, budget=budget)
 
 
 def _pin_import(home: Path, args: argparse.Namespace) -> dict[str, object]:

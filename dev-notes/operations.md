@@ -209,6 +209,14 @@ aas db backup --output /path/to/new-backup
 aas --home /path/to/new-home db restore --backup /path/to/new-backup
 ```
 
+`db verify`, `db backup`, `db restore`, `db run-install`도 설정된 공유 계산 예산을 사용한다.
+CLI는 저장소 잠금을 잡기 전에 계산 lease를 확보한다. Python 호출자는 검증·백업·복원과
+run-schema 설치 함수의 `budget=`에 자신이 확보한 `ComputeBudget`을 넘긴다. 설정이나
+인자를 생략하면 기존 직렬 기본 예산을 유지한다. import의 파일 크기 상한과 검증의 메모리
+상한은 별개이므로 큰 문서나 긴 이력에는 더 큰 명시적 예산이 필요할 수 있다. 복원에도
+백업을 검증할 때 충분했던 예산을 제공해야 한다. 예산을 늘려도 게시물·원본·행·의도 검사를
+생략하지 않으며, 검증 결과나 백업의 논리 보고서 형식은 바뀌지 않는다.
+
 파일 간 저장은 state의 PREPARED 의도, 대상 DB commit, 최종 카탈로그 순서다. `recover`는
 완료 marker·요청·원본·논리 해시를 대조해 게시만 재개한다. 공급자 호출을 다시 하지 않는다.
 marker가 없는 작업은 pending으로 남긴다. 재개하지 않을 작업은 명시적 `quarantine`으로

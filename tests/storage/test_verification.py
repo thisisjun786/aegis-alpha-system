@@ -5,17 +5,20 @@ import json
 import shutil
 import sqlite3
 from contextlib import closing
+from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
+from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
+from aegis_alpha.data.descriptor_tree import DescriptorTreeError
 from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.engine.bundle import load_bundle
 from aegis_alpha.engine.errors import ContractDefinitionError
-from aegis_alpha.storage import publication, state
+from aegis_alpha.storage import publication, state, verification
 from aegis_alpha.storage.backup import backup, restore
-from aegis_alpha.storage.import_document import parse_import
+from aegis_alpha.storage.import_document import parse_import, read_import
 from aegis_alpha.storage.input_pins import register_convention
 from aegis_alpha.storage.sqlite import connect
 from aegis_alpha.storage.strategies import (
@@ -40,8 +43,95 @@ from tests.storage.test_strategy_import import MACRO_ROWS, _interrupted_registra
 from tests.storage.test_strategy_requirements import select_only
 
 if TYPE_CHECKING:
-    from aegis_alpha.storage.market_inputs import GenerationPin
+    from aegis_alpha.storage.market_inputs import GenerationPin, History
     from aegis_alpha.storage.workspace import Workspace
+
+
+def test_admitted_manifest_uses_caller_verification_budget(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    initialize(home)
+    raw = document() + b" " * (4 * 1024 * 1024)
+    source = tmp_path / "import.json"
+    source.write_bytes(raw)
+    admitted = read_import(source, hashlib.sha256(raw).hexdigest())
+    budget = ComputeBudget(Fraction(1), 1024 * 1024 * 1024)
+    with open_workspace(home, writable=True) as workspace:
+        publication.publish_document(workspace, admitted)
+    with open_workspace(home) as workspace:
+        with pytest.raises(DescriptorTreeError, match="size cap"):
+            verify_workspace(workspace)
+        verified = verify_workspace(workspace, budget=budget)
+        assert verified["verified"] is True
+        assert verified["dataset_versions"] == 1
+    archive = tmp_path / "archive"
+    assert backup(home, archive, budget=budget)["backed_up"] is True
+    restored = restore(archive, tmp_path / "restored", budget=budget)
+    assert restored["verification"] == verified
+
+
+def test_verify_visits_committed_leaf_chains_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    initialize(home)
+    generations = ("generation-1", "generation-2", "generation-3")
+    with open_workspace(home, writable=True) as workspace:
+        for index, generation in enumerate(generations):
+            body = json.loads(document())
+            body.update(
+                version=str(index + 1),
+                generation_id=generation,
+                operation_id="operation-" + generation,
+                parent_id=generations[index - 1] if index else None,
+            )
+            body["rows"][0]["session_date"] = f"2026-01-{index + 2:02}"
+            publication.publish_document(workspace, parse_import(canonical_json_bytes(body)))
+        body = json.loads(document())
+        body.update(dataset_id="other", generation_id="other", operation_id="other")
+        body["rows"][0]["session_date"] = "2026-02-01"
+        publication.publish_document(workspace, parse_import(canonical_json_bytes(body)))
+        calls: list[str] = []
+        actual = verification.verify_sealed_publication
+
+        def counted(workspace: Workspace, generation_id: str, *, budget: ComputeBudget) -> History:
+            calls.append(generation_id)
+            return actual(workspace, generation_id, budget=budget)
+
+        monkeypatch.setattr(verification, "verify_sealed_publication", counted)
+        report = verify_workspace(workspace)
+        assert report["dataset_versions"] == len((*generations, "other"))
+        assert sorted(calls) == [generations[-1], "other"]
+
+
+def test_oversized_catalog_parent_rejects_before_materialization(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True) as workspace:
+        publication.publish_document(workspace, parse_import(document()))
+        child = json.loads(document())
+        child.update(
+            version="2",
+            generation_id="child",
+            operation_id="child",
+            parent_id="synthetic-generation",
+        )
+        child["rows"][0]["session_date"] = "2026-01-03"
+        publication.publish_document(workspace, parse_import(canonical_json_bytes(child)))
+    parent = "x" * (1024 * 1024)
+    corrupt_closed_store(
+        home,
+        "state",
+        "dataset_versions",
+        "UPDATE dataset_versions SET generation_id="
+        "CASE WHEN sequence=1 THEN ? ELSE generation_id END, "
+        "parent_generation_id=CASE WHEN sequence=2 THEN ? ELSE parent_generation_id END",
+        (parent, parent),
+    )
+    with (
+        open_workspace(home) as workspace,
+        pytest.raises(ComputeResourceError, match="publication catalog"),
+    ):
+        verify_workspace(workspace)
 
 
 def test_valid_mixed_proxy_publications_verify_without_mutation(tmp_path: Path) -> None:

@@ -16,6 +16,7 @@ from aegis_alpha.storage.input_pins import (
     read_definition,
     read_input_bundle,
 )
+from aegis_alpha.storage.market import generation_chain
 from aegis_alpha.storage.market_inputs import verify_sealed_publication
 from aegis_alpha.storage.membership_pins import (
     IdentityPin,
@@ -31,7 +32,11 @@ if TYPE_CHECKING:
     from aegis_alpha.storage.workspace import Workspace
 
 
-def verify_workspace(workspace: Workspace) -> dict[str, object]:  # noqa: C901, PLR0912 -- full cross-store verification boundary
+def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification boundary
+    workspace: Workspace, *, budget: ComputeBudget | None = None
+) -> dict[str, object]:
+    """Verify under a caller-owned allocation, retaining the serial default when omitted."""
+    budget = budget or ComputeBudget(Fraction(1), 512 * 1024 * 1024)
     if workspace.strategies is None:
         raise ValueError("strategy store is required for complete verification")
     for connection in (workspace.state, workspace.strategies):
@@ -68,19 +73,28 @@ def verify_workspace(workspace: Workspace) -> dict[str, object]:  # noqa: C901, 
             UniversePin(*header),
             max_materialization_bytes=64 * 1024 * 1024,
         )
-    budget = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
     size = workspace.state.execute(
         "SELECT count(*)*2048 + coalesce(sum(32*(length(dataset_id)+length(version)+"
-        "length(generation_id))),0) FROM dataset_versions WHERE status='committed'"
+        "length(generation_id)+coalesce(length(parent_generation_id),0))),0) "
+        "FROM dataset_versions WHERE status='committed'"
     ).fetchone()[0]
     if size > budget.memory_limit_bytes // 8:
         raise ComputeResourceError("publication catalog exceeds materialization budget")
     versions = workspace.state.execute(
-        "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash "
+        "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash,parent_generation_id "
         "FROM dataset_versions WHERE status='committed'"
     ).fetchall()
-    for version in versions:
-        verify_sealed_publication(workspace, version["generation_id"], budget=budget)
+    committed = {version["generation_id"] for version in versions}
+    parents = {version["parent_generation_id"] for version in versions}
+    covered: set[str] = set()
+    for generation in sorted(committed - parents):
+        verify_sealed_publication(workspace, generation, budget=budget)
+        covered.update(
+            str(marker["generation_id"])
+            for marker in generation_chain(workspace.market, generation)
+        )
+    if covered != committed:
+        raise ValueError("committed publications are not covered by verified leaf chains")
     for source in workspace.state.execute(
         "SELECT relative_path,byte_hash,size_bytes FROM source_files"
     ):
@@ -97,7 +111,7 @@ def verify_workspace(workspace: Workspace) -> dict[str, object]:  # noqa: C901, 
         "SELECT kind,convention_id,version,content_hash FROM conventions"
     ):
         read_convention(workspace.state, ConventionPin(*convention))
-    _verify_input_documents(workspace)
+    _verify_input_documents(workspace, budget)
     for row in workspace.state.execute(
         "SELECT run_id,relative_path,size_bytes,content_hash FROM artifacts"
     ):
@@ -133,14 +147,13 @@ def verify_workspace(workspace: Workspace) -> dict[str, object]:  # noqa: C901, 
     return report
 
 
-def _verify_input_documents(workspace: Workspace) -> None:
+def _verify_input_documents(workspace: Workspace, budget: ComputeBudget) -> None:
     from aegis_alpha.storage.backtest_requests import (  # noqa: PLC0415 -- optional content owner
         read_backtest_request,
     )
     from aegis_alpha.storage.market_inputs import verify_proxy_publications  # noqa: PLC0415
 
     status = inspect_run_schema(workspace)
-    budget = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
     schemas = {"aas-derived-definition-v1": "derived", "aas-ensemble-membership-v1": "membership"}
     for row in workspace.state.execute(
         "SELECT name,version,content_hash,record_schema FROM feature_contracts"
