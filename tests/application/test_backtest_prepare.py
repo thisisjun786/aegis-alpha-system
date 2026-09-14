@@ -1006,9 +1006,27 @@ def test_sale_only_missing_open_is_left_to_real_accounting(tmp_path: Path) -> No
 def test_installed_inventory_and_actual_decimal_context(tmp_path: Path) -> None:
     package = Path(__file__).resolve().parents[2] / "src" / "aegis_alpha"
     observed = {"aegis_alpha.engine." + path.stem for path in (package / "engine").glob("*.py")}
+    assert tuple(sorted(set(CALCULATION_MODULES))) == CALCULATION_MODULES
     assert set(CALCULATION_MODULES) == observed | {
+        "aegis_alpha.application.backtest_prepare",
         "aegis_alpha.data.serialization",
         "aegis_alpha.data.canonical_records",
+        "aegis_alpha.storage.import_document",
+        "aegis_alpha.storage.input_pins",
+        "aegis_alpha.storage.market",
+        "aegis_alpha.storage.market_inputs",
+        "aegis_alpha.storage.market_schema",
+        "aegis_alpha.storage.membership_pins",
+        "aegis_alpha.storage.research_inputs",
+        "aegis_alpha.storage.rowset",
+        "aegis_alpha.storage.source_library",
+        "aegis_alpha.storage.source_library_digest",
+        "aegis_alpha.storage.source_library_schema",
+        "aegis_alpha.storage.source_reader",
+        "aegis_alpha.storage.state",
+        "aegis_alpha.storage.strategies",
+        "aegis_alpha.storage.strategy_import",
+        "aegis_alpha.storage.strategy_requirements",
     }
     inventory = [
         {

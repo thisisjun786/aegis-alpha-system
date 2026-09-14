@@ -86,9 +86,11 @@ __all__ = [
 ]
 
 _J = "aas-canonical-json-sha256-v1"
-# Explicit shipped calculation inventory. Adding an engine module requires updating
-# this reviewed list, not discovering user files, mtimes or a wildcard at runtime.
+# Closed preparation interpretation/admission inventory plus engine calculation sources.
+# New semantic owners require review of this list, not runtime import/glob discovery.
+# Hash exact installed bytes, including this fixed source text, never its emitted digest.
 CALCULATION_MODULES = (
+    "aegis_alpha.application.backtest_prepare",
     "aegis_alpha.data.canonical_records",
     "aegis_alpha.data.serialization",
     "aegis_alpha.engine.__init__",
@@ -116,6 +118,22 @@ CALCULATION_MODULES = (
     "aegis_alpha.engine.schedule",
     "aegis_alpha.engine.signals",
     "aegis_alpha.engine.strategy_config",
+    "aegis_alpha.storage.import_document",
+    "aegis_alpha.storage.input_pins",
+    "aegis_alpha.storage.market",
+    "aegis_alpha.storage.market_inputs",
+    "aegis_alpha.storage.market_schema",
+    "aegis_alpha.storage.membership_pins",
+    "aegis_alpha.storage.research_inputs",
+    "aegis_alpha.storage.rowset",
+    "aegis_alpha.storage.source_library",
+    "aegis_alpha.storage.source_library_digest",
+    "aegis_alpha.storage.source_library_schema",
+    "aegis_alpha.storage.source_reader",
+    "aegis_alpha.storage.state",
+    "aegis_alpha.storage.strategies",
+    "aegis_alpha.storage.strategy_import",
+    "aegis_alpha.storage.strategy_requirements",
 )
 
 type Row = Mapping[str, object]

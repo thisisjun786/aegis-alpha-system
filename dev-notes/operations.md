@@ -445,6 +445,19 @@ compute 환경이 없으면 `None`을 yield한다. 아래 실습 5단계가 이 
 정체성이고, `engine.backtest_request`의 `request_projection`·`export_envelope`는 저장소 없이
 순수 투영·내보내기만 맡는다.
 
+계산 소스 정체성은 `backtest_prepare.CALCULATION_MODULES`에 명시된 44개 모듈의
+설치된 정확한 바이트를 해시한다. 엔진과 두 데이터 직렬화 helper뿐 아니라 준비의 해석·입력
+승인을 담당하는 application·storage 모듈을 포함한다. 런타임 import 탐색이나 패키지 전체
+해시는 아니며, 선택된 파일의 주석 변경도 정체성을 바꾼다. 이전 27개 범위로 생성한 정규
+요청 P·pin·artifact는 수정하지 않고 원래 정체성으로 읽는다. 새 준비의 소스 해시와
+`request_hash`는 의도적으로 달라지지만, 같은 입력·동작의 기존 봉투와 회계 결과는 그대로다.
+
+이 정체성은 안정된 설치 소스와 지원 런타임을 전제로 하며 전체 소프트웨어 공급망의 해시가
+아니다. 순수 엔진과 달리 준비 경로는 DuckDB·SQLite 및 선택적 Arrow 소스의 PyArrow를
+사용한다. 이 외부 driver·의존성 버전은 닫힌 환경 v1에 포함되지 않으므로 임의 버전 간
+재현성을 보장하지 않는다. 의존성 정체성이 필요하면 별도의 버전된 환경 계약이 필요하며,
+v1 필드에 조용히 추가하지 않는다.
+
 ### 저장소 checkout 실습
 
 아래는 설치된 앱의 사용 절차가 아니라 저장소 checkout에서 공개 합성 fixture로 전체 흐름을
