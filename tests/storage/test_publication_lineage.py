@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sqlite3
+import stat
+import time
 import tracemalloc
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from decimal import Decimal
 from fractions import Fraction
+from itertools import count
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -78,12 +82,105 @@ def seed_native(workspace: Workspace, root: Path) -> None:
     _register_domain(workspace, path, "sessions")
 
 
+NATIVE_SEED_TIME_NS = 1_780_272_000_000_000_000  # 2026-06-01 UTC, not a business-date cutoff.
+
+
+@pytest.fixture(scope="module")
+def native_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    root = tmp_path_factory.mktemp("native-template")
+    # Preserve ordered ingestion events without depending on the first caller's clock.
+    ticks = count(NATIVE_SEED_TIME_NS, 1000)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(time, "time_ns", lambda: next(ticks))
+        initialize(root / "home")
+        with open_workspace(root / "home", writable=True, strategy_write=True) as workspace:
+            seed_native(workspace, root)
+            workspace.state.commit()
+            assert workspace.strategies is not None
+            workspace.strategies.commit()
+            workspace.market.execute("CHECKPOINT")
+    # Source helpers and every workspace connection have closed before any copy.
+    assert not any(path.name.endswith(("-wal", "-shm", ".wal")) for path in root.rglob("*"))
+    return root
+
+
+def copy_native(template: Path, root: Path) -> Path:
+    # Include incoming SQLite/JSON files as well as all retained stores and raw bytes.
+    # Ordinary copy2 files preserve private modes but never share writable inodes.
+    shutil.copytree(template, root, dirs_exist_ok=True)
+    return root / "home"
+
+
 @pytest.fixture
-def stored(tmp_path: Path) -> Iterator[Workspace]:
-    initialize(tmp_path / "home")
-    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        seed_native(workspace, tmp_path)
+def copied_native(native_template: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    # Later publications are ordered after the template, independently in every case.
+    ticks = count(NATIVE_SEED_TIME_NS + 1_000_000_000, 1000)
+    monkeypatch.setattr(time, "time_ns", lambda: next(ticks))
+    return copy_native(native_template, tmp_path)
+
+
+@pytest.fixture
+def stored(copied_native: Path) -> Iterator[Workspace]:
+    with open_workspace(copied_native, writable=True, strategy_write=True) as workspace:
         yield workspace
+
+
+def native_files(root: Path) -> dict[Path, tuple[int, bytes | None]]:
+    return {
+        path.relative_to(root): (
+            path.stat().st_mode,
+            path.read_bytes() if path.is_file() else None,
+        )
+        for path in (root, *root.rglob("*"))
+    }
+
+
+def test_native_copies_isolate_corruption(native_template: Path, tmp_path: Path) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    first_home = copy_native(native_template, first)
+    second_home = copy_native(native_template, second)
+    original = native_files(native_template)
+    assert native_files(first) == native_files(second) == original
+    for relative, (_, content) in original.items():
+        infos = [(root / relative).lstat() for root in (native_template, first, second)]
+        assert len({(info.st_dev, info.st_ino) for info in infos}) == len(infos)
+        if content is not None:
+            assert all(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 for info in infos)
+        else:
+            assert all(stat.S_ISDIR(info.st_mode) for info in infos)
+    with open_workspace(first_home, writable=True, strategy_write=True) as workspace:
+        expected = request(workspace)
+        assert expected.pin.generation_id == "g1"
+        assert expected.sessions_pin is not None
+        assert expected.sessions_pin.generation_id == "sessions"
+        damaged = workspace.paths.raw / expected.pin.manifest_hash[:2] / expected.pin.manifest_hash
+        damaged.write_bytes(damaged.read_bytes() + b" ")
+        with pytest.raises(ValueError, match="hash mismatch"):
+            api().load_pinned_prices(workspace, expected, budget=BUDGET)
+        with pytest.raises(ValueError, match="hash mismatch"):
+            api().verify_sealed_publication(workspace, expected.pin.generation_id, budget=BUDGET)
+    assert native_files(native_template) == native_files(second) == original
+    for home in (native_template / "home", second_home):
+        # Writable admission removes empty SQLite WAL/SHM on close; readers stay SELECT-only.
+        with open_workspace(home, writable=True, strategy_write=True) as workspace:
+            assert workspace.strategies is not None
+            with select_only(workspace.state), select_only(workspace.strategies):
+                assert request(workspace) == expected
+                loaded = api().load_pinned_prices(workspace, expected, budget=BUDGET)
+                assert loaded.project_as_of(30, session_date=DAY).rows[0]["close"] == Decimal(11)
+                sessions = api().load_pinned_sessions(
+                    workspace, expected.sessions_pin, budget=BUDGET
+                )
+                assert len(sessions.history) == 1
+                admitted = api().admit_native_input(
+                    workspace,
+                    expected.sessions_pin,
+                    expected_schema="aas-sessions-transform-v1",
+                    budget=BUDGET,
+                )
+                assert [source.source_id for source in admitted.source_pins] == ["sessions"]
+                assert verify_workspace(workspace)["verified"]
+    assert native_files(native_template) == native_files(second) == original
 
 
 def revise(workspace: Workspace, root: Path) -> None:
@@ -318,14 +415,12 @@ def receipt_inventory(home: Path) -> dict[str, str]:
 
 @pytest.mark.parametrize("store", ["state", "strategies", "market"])
 @pytest.mark.parametrize("fault", ["checksum", "extra-row"])
-def test_native_schema_receipt_budget(tmp_path: Path, store: str, fault: str) -> None:
-    home = tmp_path / "home"
+def test_native_schema_receipt_budget(copied_native: Path, store: str, fault: str) -> None:
+    home = copied_native
     # DuckDB needs native working memory to inspect its 16 MiB stored value.
     # The Python result bound remains 8 MiB, independently of that engine limit.
     budget = ComputeBudget(Fraction(1), 128 * 1024 * 1024) if store == "market" else METADATA_BUDGET
-    initialize(home)
     with open_workspace(home, writable=True, strategy_write=True) as workspace:
-        seed_native(workspace, tmp_path)
         selected = pin(workspace)
     with open_workspace(home) as workspace, metadata_allocation_bound(workspace):
         expected = api().admit_native_input(
@@ -497,11 +592,9 @@ def test_source_marker_metadata_budget(
             )
 
 
-def test_null_source_identity_cannot_hide_metadata_budget(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    initialize(home)
+def test_null_source_identity_cannot_hide_metadata_budget(copied_native: Path) -> None:
+    home = copied_native
     with open_workspace(home, writable=True, strategy_write=True) as workspace:
-        seed_native(workspace, tmp_path)
         selected = pin(workspace)
     with open_workspace(home) as workspace, metadata_allocation_bound(workspace):
         assert api().admit_native_input(
@@ -536,12 +629,10 @@ def test_null_source_identity_cannot_hide_metadata_budget(tmp_path: Path) -> Non
     ["kind", "request_hash", "target_id", "expected_parent", "payload_hash", "failure_reason"],
 )
 def test_source_operation_metadata_budget(
-    tmp_path: Path, field: str, *, selected_field: bool
+    copied_native: Path, field: str, *, selected_field: bool
 ) -> None:
-    home = tmp_path / "home"
-    initialize(home)
+    home = copied_native
     with open_workspace(home, writable=True, strategy_write=True) as workspace:
-        seed_native(workspace, tmp_path)
         selected = pin(workspace)
     with open_workspace(home) as workspace, metadata_allocation_bound(workspace):
         expected = api().admit_native_input(
@@ -580,11 +671,11 @@ def test_source_operation_metadata_budget(
 
 
 @pytest.mark.parametrize("target", ["g1", "sessions"])
-def test_unfetched_native_operation_metadata_stays_bounded(tmp_path: Path, target: str) -> None:
-    home = tmp_path / "home"
-    initialize(home)
+def test_unfetched_native_operation_metadata_stays_bounded(
+    copied_native: Path, target: str
+) -> None:
+    home = copied_native
     with open_workspace(home, writable=True, strategy_write=True) as workspace:
-        seed_native(workspace, tmp_path)
         selected = pin(workspace)
     with open_workspace(home) as workspace, metadata_allocation_bound(workspace):
         expected = api().admit_native_input(
@@ -744,12 +835,10 @@ def rehash_rows(home: Path, kind: str, revision: str) -> None:
 @pytest.mark.parametrize("kind", ["price", "sessions"])
 @pytest.mark.parametrize("revision", ["1", "2"])
 def test_rehashed_ancestor_and_head_attacks_reject_integrity_backup_restore(
-    tmp_path: Path, kind: str, revision: str
+    tmp_path: Path, copied_native: Path, kind: str, revision: str
 ) -> None:
-    home = tmp_path / "home"
-    initialize(home)
+    home = copied_native
     with open_workspace(home, writable=True, strategy_write=True) as workspace:
-        seed_native(workspace, tmp_path)
         revise(workspace, tmp_path)
     archive = tmp_path / "backup"
     backup(home, archive)
@@ -774,12 +863,10 @@ def test_rehashed_ancestor_and_head_attacks_reject_integrity_backup_restore(
 @pytest.mark.parametrize("fault", ["missing-transform", "corrupt-transform", "source-row"])
 @pytest.mark.parametrize("kind", ["price", "sessions"])
 def test_honestly_rehashed_backup_does_not_certify_native_retention(
-    tmp_path: Path, fault: str, kind: str
+    tmp_path: Path, copied_native: Path, fault: str, kind: str
 ) -> None:
-    home = tmp_path / "home"
-    initialize(home)
+    home = copied_native
     with open_workspace(home, writable=True, strategy_write=True) as workspace:
-        seed_native(workspace, tmp_path)
         selected = pin(workspace, "synthetic-prices" if kind == "price" else "sessions")
         path = transform_path(workspace, selected).relative_to(home)
         body = json.loads((home / path).read_bytes())
@@ -825,12 +912,10 @@ def test_honestly_rehashed_backup_does_not_certify_native_retention(
     ["catalog-transform", "catalog-normalizer", "catalog-manifest", "intent", "source-link"],
 )
 def test_sealed_references_reject_honestly_rehashed_backups(
-    tmp_path: Path, kind: str, fault: str
+    tmp_path: Path, copied_native: Path, kind: str, fault: str
 ) -> None:
-    home = tmp_path / "home"
-    initialize(home)
+    home = copied_native
     with open_workspace(home, writable=True, strategy_write=True) as workspace:
-        seed_native(workspace, tmp_path)
         selected = pin(workspace, "synthetic-prices" if kind == "price" else "sessions")
     archive = tmp_path / "backup"
     backup(home, archive)
