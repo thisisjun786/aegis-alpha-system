@@ -6,7 +6,7 @@ import hashlib
 from fractions import Fraction
 from typing import TYPE_CHECKING
 
-from aegis_alpha.compute_resources import ComputeBudget
+from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.storage.input_pins import (
     ConventionPin,
@@ -16,7 +16,7 @@ from aegis_alpha.storage.input_pins import (
     read_definition,
     read_input_bundle,
 )
-from aegis_alpha.storage.market import verify_generation
+from aegis_alpha.storage.market_inputs import verify_sealed_publication
 from aegis_alpha.storage.membership_pins import (
     IdentityPin,
     UniversePin,
@@ -68,33 +68,19 @@ def verify_workspace(workspace: Workspace) -> dict[str, object]:  # noqa: C901, 
             UniversePin(*header),
             max_materialization_bytes=64 * 1024 * 1024,
         )
+    budget = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
+    size = workspace.state.execute(
+        "SELECT count(*)*2048 + coalesce(sum(32*(length(dataset_id)+length(version)+"
+        "length(generation_id))),0) FROM dataset_versions WHERE status='committed'"
+    ).fetchone()[0]
+    if size > budget.memory_limit_bytes // 8:
+        raise ComputeResourceError("publication catalog exceeds materialization budget")
     versions = workspace.state.execute(
-        "SELECT dataset_id,version,generation_id,chain_hash,row_count,manifest_hash "
+        "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash "
         "FROM dataset_versions WHERE status='committed'"
     ).fetchall()
     for version in versions:
-        marker = verify_generation(workspace.market, version["generation_id"])
-        for field in ("dataset_id", "version", "chain_hash", "row_count"):
-            if marker[field] != version[field]:
-                raise ValueError("market generation/catalog mismatch")
-        operation = workspace.state.execute(
-            "SELECT phase,request_hash,target_id,expected_parent FROM storage_operations "
-            "WHERE operation_id=?",
-            (marker["operation_id"],),
-        ).fetchone()
-        if operation is None or tuple(operation) != (
-            "COMPLETED",
-            marker["request_hash"],
-            marker["generation_id"],
-            marker["parent_id"],
-        ):
-            raise ValueError("committed generation has no matching completed intent")
-        sources = workspace.state.execute(
-            "SELECT source_snapshot_id FROM dataset_sources WHERE dataset_id=? AND version=?",
-            (version["dataset_id"], version["version"]),
-        ).fetchall()
-        if not sources:
-            raise ValueError("committed dataset has no source lineage")
+        verify_sealed_publication(workspace, version["generation_id"], budget=budget)
     for source in workspace.state.execute(
         "SELECT relative_path,byte_hash,size_bytes FROM source_files"
     ):

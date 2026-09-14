@@ -15,6 +15,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, cast
 
+from aegis_alpha.compute_resources import ComputeResourceError
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.storage import source_library_schema as schema
 from aegis_alpha.storage.paths import private_source_file as private_file
@@ -308,6 +309,67 @@ def _visible(workspace: Workspace, source_id: str) -> dict[str, object]:
 
 def list_tables(workspace: Workspace, source_id: str) -> list[dict[str, object]]:
     return cast("list[dict[str, object]]", _visible(workspace, source_id)["tables"])
+
+
+def admit_source_table(
+    workspace: Workspace, source_id: str, table_name: str, *, max_materialization_bytes: int
+) -> None:
+    """Bound the existing source reader's metadata and complete table before it fetches.
+
+    This SELECT-only capacity check is not content authentication: resolve_source
+    remains the owner of exact SourcePin/intent/marker/table digest verification.
+    Account for all columns, including unmapped variable-width source evidence.
+    """
+    if not schema.ensure(workspace):
+        raise ValueError("native input requires retained source evidence")
+    connections = schema.connections(workspace)
+    estimated = 0
+    for kind, conn in connections.items():
+        size = (
+            "octet_length(encode(manifest_json))"
+            if kind == "market"
+            else "length(CAST(manifest_json AS BLOB))"
+        )
+        aggregate = cast(
+            "tuple[int]",
+            conn.execute(
+                "SELECT count(*)*2048+coalesce(sum(32*("
+                + size
+                + ")),0) FROM source_library_commits"
+            ).fetchone(),
+        )
+        estimated += aggregate[0]
+    if estimated > max_materialization_bytes:
+        raise ComputeResourceError("source manifests exceed materialization budget")
+    marker = _marker(workspace, source_id)
+    if marker is None:
+        raise ValueError("native input requires retained source evidence")
+    manifest = json.loads(str(marker[4]))
+    tables = [table for table in manifest["tables"] if table["name"] == table_name]
+    if len(tables) != 1:
+        raise ValueError("native input requires one retained source table")
+    table = tables[0]
+    kind = str(marker[3])
+    sizes = [
+        "coalesce(octet_length(encode(CAST(" + schema.quoted(column) + " AS VARCHAR))),0)"
+        if kind == "market"
+        else "coalesce(length(CAST(" + schema.quoted(column) + " AS BLOB)),0)"
+        for column in table["columns"]
+    ]
+    count, size = cast(
+        "tuple[int, int]",
+        connections[kind]
+        .execute(
+            "SELECT count(*),coalesce(sum("
+            + "+".join(sizes)
+            + "),0) FROM "
+            + schema.quoted(table["target"])
+        )
+        .fetchone(),
+    )
+    estimated += count * (2048 + 512 * len(sizes)) + 32 * size
+    if estimated > max_materialization_bytes:
+        raise ComputeResourceError("source table exceeds materialization budget")
 
 
 def read_table(

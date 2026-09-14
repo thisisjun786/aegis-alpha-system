@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.engine.codec import decode_json
@@ -41,6 +42,7 @@ from aegis_alpha.storage.market import generation_chain, normalize_rows
 from aegis_alpha.storage.market_schema import COMMON, DOMAINS
 from aegis_alpha.storage.publication import publish_document
 from aegis_alpha.storage.raw import put_raw
+from aegis_alpha.storage.source_library import admit_source_table
 from aegis_alpha.storage.source_reader import SourcePin, iter_source_rows, resolve_source
 
 if TYPE_CHECKING:
@@ -195,6 +197,20 @@ def register_price_input(workspace: Workspace, spec_path: Path, sha256: str) -> 
     digest = hashlib.sha256(raw).hexdigest()
     if digest != sha256:
         raise ValueError("price transform bytes do not match the expected SHA-256")
+    document, source = _price_document(workspace, raw)
+    put_raw(workspace.paths.raw, raw)
+    # The market validator's magnitude arithmetic also needs full storage precision.
+    with localcontext() as context:
+        context.prec = 50
+        return {
+            **publish_document(workspace, document),
+            "transform_sha256": digest,
+            "source_pin": source,
+        }
+
+
+def _price_document(workspace: Workspace, raw: bytes) -> tuple[ImportDocument, dict[str, object]]:
+    digest = hashlib.sha256(raw).hexdigest()
     body = _object(_decode_transform(raw), _ROOT)
     if body["schema_version"] != "aas-price-transform-v1":
         raise ValueError("unsupported price transform schema")
@@ -248,15 +264,7 @@ def register_price_input(workspace: Workspace, spec_path: Path, sha256: str) -> 
     _check_size(len(payload))
     document = parse_import(payload)
     _check_price_parent(workspace, dataset["parent_id"], price)
-    put_raw(workspace.paths.raw, raw)
-    # The market validator's magnitude arithmetic also needs full storage precision.
-    with localcontext() as context:
-        context.prec = 50
-        return {
-            **publish_document(workspace, document),
-            "transform_sha256": digest,
-            "source_pin": source,
-        }
+    return document, source
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,6 +289,10 @@ def _read_transform(path: Path, sha256: str, kind: str) -> _Transform:
         raw = tree.read_bytes(path.name, max_bytes=_MAX_BYTES)
     if hashlib.sha256(raw).hexdigest() != sha256:
         raise ValueError("transform bytes do not match the expected SHA-256")
+    return _parse_transform(raw, sha256, kind)
+
+
+def _parse_transform(raw: bytes, sha256: str, kind: str) -> _Transform:
     domain, extra = (
         ("calendar_sessions", "calendar") if kind == "sessions" else ("feature_values", "proxy")
     )
@@ -355,6 +367,16 @@ def register_sessions_input(
     The exact raw transform preserves timezone and original source lineage.
     """
     transform = _read_transform(spec_path, sha256, "sessions")
+    document = _sessions_document(workspace, transform)
+    put_raw(workspace.paths.raw, transform.raw)
+    return {
+        **publish_document(workspace, document),
+        "transform_sha256": sha256,
+        "source_pin": transform.body["source"],
+    }
+
+
+def _sessions_document(workspace: Workspace, transform: _Transform) -> ImportDocument:
     calendar = _object(
         transform.body["calendar"],
         frozenset({"calendar_id", "venue", "timezone", "timezone_version"}),
@@ -380,13 +402,39 @@ def register_sessions_input(
                 raise ValueError(
                     "session status requires explicit ordered source times or closed nulls"
                 )
-    document = _input_document(transform, rows)
-    put_raw(workspace.paths.raw, transform.raw)
-    return {
-        **publish_document(workspace, document),
-        "transform_sha256": sha256,
-        "source_pin": transform.body["source"],
-    }
+    return _input_document(transform, rows)
+
+
+def native_input_document(
+    workspace: Workspace, raw: bytes, *, expected_schema: str, budget: ComputeBudget
+) -> tuple[ImportDocument, SourcePin]:
+    """Reconstruct a native publication and its source pin without publishing.
+
+    This is explicit native admission, not generic import classification. Size
+    aggregates precede source resolution/digest/row materialization. Both readers
+    and writers use the same transform parsers and normalization below.
+    """
+    available = budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes
+    if len(raw) * 32 > available:
+        raise ComputeResourceError("native transform exceeds materialization budget")
+    body = _decode_transform(raw)
+    if (
+        expected_schema not in {"aas-price-transform-v1", "aas-sessions-transform-v1"}
+        or not isinstance(body, dict)
+        or body.get("schema_version") != expected_schema
+    ):
+        raise ValueError("native input does not match expected transform schema")
+    source = _source_pin(body.get("source"))
+    admit_source_table(
+        workspace,
+        source.source_id,
+        source.table,
+        max_materialization_bytes=available - len(raw) * 32,
+    )
+    if expected_schema == "aas-price-transform-v1":
+        return _price_document(workspace, raw)[0], source
+    transform = _parse_transform(raw, hashlib.sha256(raw).hexdigest(), "sessions")
+    return _sessions_document(workspace, transform), source
 
 
 def _double(value: object, policy: str) -> float | None:
