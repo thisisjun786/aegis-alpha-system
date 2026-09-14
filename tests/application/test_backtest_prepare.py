@@ -44,6 +44,11 @@ from aegis_alpha.engine.models import (
 from aegis_alpha.storage import publication
 from aegis_alpha.storage.import_document import parse_import
 from aegis_alpha.storage.input_pins import register_convention, register_definition
+from aegis_alpha.storage.market_inputs import (
+    PinnedPriceSeries,
+    PriceInputRequest,
+    load_pinned_prices,
+)
 from aegis_alpha.storage.market_schema import NATURAL_KEYS
 from aegis_alpha.storage.membership_pins import (
     IdentityPin,
@@ -438,6 +443,60 @@ def test_copied_requests_isolate_native_integrity(
         )
         assert result["result"]["nav"][-1]["equity"] == pytest.approx(80)
     assert fixture_files(template) == fixture_files(second) == original
+
+
+@pytest.mark.parametrize("history_end", [date(2026, 2, 26), date(2026, 4, 1)])
+def test_short_preparation_reuses_long_calendar_with_bounded_price_coverage(
+    tmp_path: Path, copied_request: Document, monkeypatch: pytest.MonkeyPatch, history_end: date
+) -> None:
+    captured: list[PriceInputRequest] = []
+
+    def inspect_request(
+        workspace: Workspace, request: PriceInputRequest, *, budget: ComputeBudget
+    ) -> PinnedPriceSeries:
+        captured.append(request)
+        return load_pinned_prices(workspace, request, budget=budget)
+
+    monkeypatch.setattr(
+        "aegis_alpha.application.backtest_prepare.load_pinned_prices", inspect_request
+    )
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        body = copied_request
+        body["history"]["end"] = history_end.isoformat()
+        baseline = prepare(workspace, body)
+        captured.clear()
+        rows = session_rows()
+        closed = next(row for row in rows if row["status"] == "closed")
+        first = date(2024, 11, 28)
+        rows.extend(
+            row_identity(
+                {**closed, "session_date": (first + timedelta(days=i)).isoformat()},
+                "calendar_sessions",
+            )
+            for i in range((DAYS[0] - first).days)
+        )
+        native(workspace, tmp_path, "long-sessions", rows)
+        replace_pin(body, "sessions", generation_pin(workspace, "long-sessions"))
+        prepared = prepare(workspace, body)
+        assert prepared.slots == baseline.slots
+        assert prepared.targets == baseline.targets
+        assert (
+            run_document(prepared.envelope.canonical_bytes, prepared.envelope.envelope_sha256)[
+                "result"
+            ]
+            == run_document(baseline.envelope.canonical_bytes, baseline.envelope.envelope_sha256)[
+                "result"
+            ]
+        )
+        assert prepared.request_hash != baseline.request_hash
+        assert len(captured) == len(body["price_inputs"])
+        expected_end = date(2026, 3, 30) if history_end == date(2026, 2, 26) else date(2026, 4, 1)
+        expected = tuple(
+            date(2025, 11, 28) + timedelta(days=i)
+            for i in range((expected_end - date(2025, 11, 28)).days + 1)
+        )
+        assert all(request.session_dates == expected for request in captured)
+        assert date(2026, 1, 30) in expected  # Preserve declared closed-day coverage.
 
 
 def test_native_preparation_literal_targets_and_repeatability(tmp_path: Path) -> None:

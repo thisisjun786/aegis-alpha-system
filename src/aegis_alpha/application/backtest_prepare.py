@@ -597,7 +597,12 @@ def _prices(loader: _Loader, body: Row, calendar: Row, sessions: History) -> tup
             if member is not None
         ),
     )
-    grid = tuple(sorted({_day(row["session_date"]) for row in sessions}))
+    history, period = _row(body["history"]), _row(body["period"])
+    start = _day(history["start"])  # Request validation places this before period.start.
+    end = max(_day(history["end"]), _day(period["end"]))
+    grid = tuple(
+        sorted({day for row in sessions if start <= (day := _day(row["session_date"])) <= end})
+    )
     result = []
     for selection in _rows(body["price_inputs"]):
         pin = _generation(_selection_ref(selection, loader.bindings))
