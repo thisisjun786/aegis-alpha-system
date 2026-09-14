@@ -524,8 +524,10 @@ EOF
 rm -rf "$LAB"
 ```
 
-한 실행에서 관측한 값이다. store ID·등록 시각·원본 SQLite 바이트가 실행마다 달라지므로
-해시는 예시이고, 날짜·비중·NAV·체결은 fixture가 고정한 독립 기대값이다.
+한 실행에서 관측한 값이다. 전략 store ID와 identity 등록 시각이 실행마다 달라지므로
+`request_sha256`·`request_hash`·`preparation.sha256`은 예시이고, 날짜·비중·NAV·체결은
+fixture가 고정한 독립 기대값이다. 봉투 바이트에는 그 값이 들어가지 않아 두 실행에서
+같은 `envelope.sha256`을 관측했다.
 
 - 2단계 영수증: `request_sha256=40ce893b…def9`, `request_hash=3f2b4821…564a`,
   `envelope.sha256=a30a6dd4…be4f`, `preparation.sha256=b20b060e…98a3`, `certified=false`.
