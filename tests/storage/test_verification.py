@@ -4,7 +4,9 @@ import hashlib
 import json
 import shutil
 import sqlite3
+from contextlib import closing
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -31,9 +33,32 @@ from tests.engine.engine_support import contract, raw_bundle
 from tests.engine.test_requirements import rich_contract, scoring_contract
 from tests.storage.test_backup import seed_workspace
 from tests.storage.test_input_pins import A
+from tests.storage.test_market_inputs import BUDGET, mixed_proxy_publications, pin
 from tests.storage.test_publication import document
+from tests.storage.test_research_inputs import _hash_json
 from tests.storage.test_strategy_import import MACRO_ROWS, _interrupted_registration
 from tests.storage.test_strategy_requirements import select_only
+
+if TYPE_CHECKING:
+    from aegis_alpha.storage.market_inputs import GenerationPin
+    from aegis_alpha.storage.workspace import Workspace
+
+
+def test_valid_mixed_proxy_publications_verify_without_mutation(tmp_path: Path) -> None:
+    from aegis_alpha.storage.market import read_chain_rows  # noqa: PLC0415
+
+    home = tmp_path / "proxy-home"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        _, mixed = mixed_proxy_publications(workspace, tmp_path)
+        rows = read_chain_rows(workspace.market, mixed.generation_id, budget=BUDGET)
+        assert [row["contract_version"] for row in rows] == ["v1", "v2"]
+        before = "\n".join(workspace.state.iterdump())
+        report = verify_workspace(workspace)
+        assert report["verified"] is True
+        assert report["dataset_versions"] == len(rows)
+        assert "\n".join(workspace.state.iterdump()) == before
+
 
 REQUIREMENT_CORRUPTIONS = [
     pytest.param("UPDATE strategy_requirements SET warmup=9", id="altered"),
@@ -499,6 +524,385 @@ def corrupt_closed_store(
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         connection.close()
+
+
+def corrupt_proxy(home: Path, fault: str) -> None:
+    """Alter only a disposable store; keep its schemas and outer integrity valid."""
+    if fault.startswith("child-"):
+        corrupt_closed_store(
+            home,
+            "state",
+            "feature_inputs",
+            "UPDATE feature_inputs SET content_hash=? WHERE name='PROXY' AND version='v2' "
+            "AND ordinal=?",
+            ("0" * 64, int(fault.removeprefix("child-"))),
+        )
+    elif fault == "ordinal":
+        corrupt_closed_store(
+            home,
+            "state",
+            "feature_inputs",
+            "UPDATE feature_inputs SET ordinal=8 WHERE name='PROXY' AND version='v2' AND ordinal=5",
+        )
+    elif fault == "definition":
+        corrupt_closed_store(
+            home,
+            "state",
+            "feature_contracts",
+            "UPDATE feature_contracts SET definition='{}' WHERE name='PROXY' AND version='v2'",
+        )
+    elif fault in {"raw-transform", "repinned-transform"}:
+        with closing(sqlite3.connect(home / "state.sqlite3")) as connection:
+            digest = connection.execute(
+                "SELECT ref_id FROM feature_inputs WHERE name='PROXY' AND version='v2' "
+                "AND ordinal=5"
+            ).fetchone()[0]
+        raw_path = home / "raw" / digest[:2] / digest
+        transform = json.loads(raw_path.read_bytes())
+        # The same null source columns produce the same points, but the immutable
+        # publication independently pins the ORIGINAL mapping/transform bytes.
+        columns = transform["columns"]
+        columns["available_at_us"], columns["revision_known_at_us"] = (
+            columns["revision_known_at_us"],
+            columns["available_at_us"],
+        )
+        raw = json.dumps(transform).encode()
+        if fault == "raw-transform":
+            raw_path.write_bytes(raw)
+        else:
+            from aegis_alpha.storage.raw import put_raw  # noqa: PLC0415
+
+            _, changed_hash, _ = put_raw(home / "raw", raw)
+            corrupt_closed_store(
+                home,
+                "state",
+                "feature_inputs",
+                "UPDATE feature_inputs SET ref_id=?,content_hash=? "
+                "WHERE name='PROXY' AND version='v2' AND ordinal=5",
+                (changed_hash, changed_hash),
+            )
+            corrupt_closed_store(
+                home,
+                "state",
+                "dataset_versions",
+                "UPDATE dataset_versions SET transform_hash=? WHERE generation_id='proxy2'",
+                (changed_hash,),
+            )
+    elif fault.startswith("catalog-"):
+        column = fault.removeprefix("catalog-")
+        assert column in {"manifest_hash", "transform_hash", "normalizer_version"}
+        corrupt_closed_store(
+            home,
+            "state",
+            "dataset_versions",
+            f"UPDATE dataset_versions SET {column}=? WHERE generation_id='proxy2'",  # noqa: S608 -- fixed allowlist
+            ("0" * 64,),
+        )
+    else:
+        corrupt_proxy_market(home, fault)
+
+
+def corrupt_proxy_market(home: Path, fault: str) -> None:
+    import duckdb  # noqa: PLC0415
+
+    from aegis_alpha.storage import market  # noqa: PLC0415
+
+    with duckdb.connect(str(home / "market.duckdb")) as connection:
+        if fault == "marker":
+            connection.execute(
+                "UPDATE market_generations SET request_hash=? WHERE generation_id='proxy2'",
+                ["0" * 64],
+            )
+            return
+        column = fault.removeprefix("row-")
+        assert column in {"contract_hash", "input_bundle_hash", "contract_version", "instrument_id"}
+        rows = [
+            dict(row)
+            for row in market.read_chain_rows(connection, "proxy2", budget=BUDGET)
+            if row["generation_id"] == "proxy2"
+        ]
+        rows[0][column] = "0" * 64
+        connection.execute(
+            f"UPDATE feature_values SET {column}=? WHERE generation_id='proxy2'",  # noqa: S608 -- fixed allowlist
+            [rows[0][column]],
+        )
+        marker = market.marker_for(connection, "proxy2")
+        delta_hash = market._delta_hash("feature_values", rows)  # noqa: SLF001 -- rehash physical corruption, not an expected-value oracle
+        chain_hash = _hash_json(
+            [
+                marker["record_schema"],
+                market.marker_for(connection, "proxy1")["chain_hash"],
+                marker["dataset_id"],
+                marker["version"],
+                marker["generation_id"],
+                marker["domain"],
+                delta_hash,
+                marker["parent_id"],
+                marker["operation_id"],
+                marker["request_hash"],
+                marker["row_count"],
+            ]
+        )
+        connection.execute(
+            "UPDATE market_generations SET delta_hash=?,chain_hash=? WHERE generation_id='proxy2'",
+            [delta_hash, chain_hash],
+        )
+        assert market.verify_generation(connection, "proxy2")["chain_hash"] == chain_hash
+    corrupt_closed_store(
+        home,
+        "state",
+        "dataset_versions",
+        "UPDATE dataset_versions SET chain_hash=? WHERE generation_id='proxy2'",
+        (chain_hash,),
+    )
+
+
+@pytest.mark.parametrize(
+    ("fault", "error"),
+    [
+        *(("child-" + str(ordinal), "inputs mismatch") for ordinal in range(6)),
+        ("ordinal", "inputs mismatch"),
+        ("definition", "contract.*corrupt"),
+        ("raw-transform", "transform hash mismatch"),
+        ("repinned-transform", "publication evidence"),
+        ("catalog-manifest_hash", "catalog"),
+        ("catalog-transform_hash", "transform/catalog"),
+        ("catalog-normalizer_version", "publication evidence"),
+        ("marker", "logical hash/count"),
+        ("row-contract_hash", "publication evidence"),
+        ("row-input_bundle_hash", "publication evidence"),
+        ("row-contract_version", "publication evidence"),
+        ("row-instrument_id", "publication evidence"),
+    ],
+)
+def test_proxy_corruption_blocks_verify_backup_and_rehashed_restore(
+    tmp_path: Path,
+    fault: str,
+    error: str,
+) -> None:
+    home = tmp_path / "original"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        mixed_proxy_publications(workspace, tmp_path)
+    original = evidence_snapshot(home)
+    copied = tmp_path / "corrupt-copy"
+    shutil.copytree(home, copied)
+    corrupt_proxy(copied, fault)
+    with open_workspace(copied) as workspace, pytest.raises(ValueError, match=error):
+        verify_workspace(workspace)
+    output = tmp_path / "rejected-backup"
+    with pytest.raises(ValueError, match=error):
+        backup(copied, output)
+    assert not output.exists()
+
+    archive = tmp_path / "backup"
+    backup(home, archive)
+    corrupt_proxy(archive, fault)
+    manifest_path = archive / "backup.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    # Recompute all outer hashes, including a deliberately added replacement spec.
+    files = set(manifest["files"]) | {
+        path.relative_to(archive).as_posix()
+        for path in (archive / "raw").rglob("*")
+        if path.is_file()
+    }
+    for relative in files:
+        raw = (archive / relative).read_bytes()
+        manifest["files"][relative] = {
+            "size_bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    manifest_path.write_text(json.dumps(manifest))
+    target = tmp_path / "rejected-restore"
+    with pytest.raises(ValueError, match=error):
+        restore(archive, target)
+    assert json.loads((target / "installation.json").read_bytes())["phase"] == "restore-incomplete"
+    assert evidence_snapshot(home) == original
+
+
+def generic_proxy_copy(workspace: Workspace, *, extra_generic: bool = False) -> GenerationPin:
+    """Copy v1's sealed import without changing either native publication."""
+    origin = pin(workspace, "proxy", "1")
+    body = json.loads(
+        (workspace.paths.raw / origin.manifest_hash[:2] / origin.manifest_hash).read_bytes()
+    )
+    body.update(dataset_id="copy", generation_id="copy", operation_id="op-copy")
+    body["rows"][0]["revision_id"] = "copy-revision"
+    if extra_generic:
+        body["rows"].append(
+            {
+                **{key: value for key, value in body["rows"][0].items() if key != "record_id"},
+                "contract_id": "GENERIC",
+            }
+        )
+    publication.publish_document(workspace, parse_import(canonical_json_bytes(body)))
+    return pin(workspace, "copy")
+
+
+def corrupt_generic_proxy_copy(home: Path, field: str) -> None:
+    import duckdb  # noqa: PLC0415
+
+    from aegis_alpha.storage import market  # noqa: PLC0415
+
+    assert field in {"contract_id", "contract_version"}
+    with duckdb.connect(str(home / "market.duckdb")) as connection:
+        schema = connection.execute(
+            "SELECT sql FROM duckdb_tables() ORDER BY table_name"
+        ).fetchall()
+        native = market.read_chain_rows(connection, "proxy2", budget=BUDGET)
+        rows = [dict(row) for row in market.read_chain_rows(connection, "copy", budget=BUDGET)]
+        rows[0][field] = "UNREGISTERED"
+        del rows[0]["record_id"]
+        rows = market.normalize_rows("feature_values", "copy", rows)
+        connection.execute(
+            f"UPDATE feature_values SET {field}=?,record_id=? WHERE generation_id='copy'",  # noqa: S608 -- asserted allowlist
+            [rows[0][field], rows[0]["record_id"]],
+        )
+        marker = market.marker_for(connection, "copy")
+        delta_hash = market._delta_hash("feature_values", rows)  # noqa: SLF001 -- self-consistent attack, not acceptance oracle
+        chain_hash = _hash_json(
+            [
+                marker["record_schema"],
+                None,
+                marker["dataset_id"],
+                marker["version"],
+                marker["generation_id"],
+                marker["domain"],
+                delta_hash,
+                marker["parent_id"],
+                marker["operation_id"],
+                marker["request_hash"],
+                marker["row_count"],
+            ]
+        )
+        connection.execute(
+            "UPDATE market_generations SET delta_hash=?,chain_hash=? WHERE generation_id='copy'",
+            [delta_hash, chain_hash],
+        )
+        assert market.verify_generation(connection, "copy")["chain_hash"] == chain_hash
+        assert market.read_chain_rows(connection, "proxy2", budget=BUDGET) == native
+        assert (
+            connection.execute("SELECT sql FROM duckdb_tables() ORDER BY table_name").fetchall()
+            == schema
+        )
+    corrupt_closed_store(
+        home,
+        "state",
+        "dataset_versions",
+        "UPDATE dataset_versions SET chain_hash=? WHERE generation_id='copy'",
+        (chain_hash,),
+    )
+
+
+def proxy_market_snapshot(home: Path) -> tuple[list[tuple[object, ...]], ...]:
+    with open_workspace(home) as workspace:
+        return (
+            workspace.market.execute(
+                "SELECT * FROM feature_values ORDER BY generation_id,record_id"
+            ).fetchall(),
+            workspace.market.execute(
+                "SELECT * FROM market_generations ORDER BY generation_id"
+            ).fetchall(),
+        )
+
+
+def rehash_backup_inventory(archive: Path) -> None:
+    manifest_path = archive / "backup.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    for relative in manifest["files"]:
+        raw = (archive / relative).read_bytes()
+        manifest["files"][relative] = {
+            "size_bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    manifest_path.write_text(json.dumps(manifest))
+
+
+@pytest.mark.parametrize("field", ["contract_id", "contract_version"])
+@pytest.mark.parametrize("boundary", ["verify", "backup", "restore"])
+def test_generic_proxy_copy_identity_cannot_escape_verification(
+    tmp_path: Path, field: str, boundary: str
+) -> None:
+    home = tmp_path / "original"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        mixed_proxy_publications(workspace, tmp_path)
+        generic_proxy_copy(workspace)
+        assert verify_workspace(workspace)["verified"] is True
+    original = evidence_snapshot(home)
+    corrupted = tmp_path / "corrupted"
+    if boundary == "restore":
+        backup(home, corrupted)
+    else:
+        shutil.copytree(home, corrupted)
+    sealed = {
+        path.relative_to(corrupted): path.read_bytes()
+        for path in (corrupted / "raw").rglob("*")
+        if path.is_file()
+    }
+    corrupt_generic_proxy_copy(corrupted, field)
+    before = evidence_snapshot(corrupted)
+    market_before = proxy_market_snapshot(corrupted)
+    assert before != original
+    assert all((corrupted / path).read_bytes() == raw for path, raw in sealed.items())
+    target = tmp_path / "rejected"
+    if boundary == "verify":
+        with (
+            open_workspace(corrupted) as workspace,
+            pytest.raises(ValueError, match="publication evidence"),
+        ):
+            verify_workspace(workspace)
+    elif boundary == "backup":
+        with pytest.raises(ValueError, match="publication evidence"):
+            backup(corrupted, target)
+    else:
+        rehash_backup_inventory(corrupted)
+        with pytest.raises(ValueError, match="publication evidence"):
+            restore(corrupted, target)
+    if boundary == "restore":
+        assert (
+            json.loads((target / "installation.json").read_bytes())["phase"] == "restore-incomplete"
+        )
+    else:
+        assert not target.exists()
+    assert evidence_snapshot(corrupted) == before
+    assert proxy_market_snapshot(corrupted) == market_before
+    assert all((corrupted / path).read_bytes() == raw for path, raw in sealed.items())
+    assert evidence_snapshot(home) == original
+
+
+@pytest.mark.parametrize("extra_generic", [False, True])
+def test_generic_proxy_copy_preserves_publications_and_old_pins(
+    tmp_path: Path, *, extra_generic: bool
+) -> None:
+    from aegis_alpha.storage.market import read_chain_rows  # noqa: PLC0415
+    from aegis_alpha.storage.market_inputs import load_pinned_proxy  # noqa: PLC0415
+
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        old_pin, mixed_pin = mixed_proxy_publications(workspace, tmp_path)
+        copy_pin = generic_proxy_copy(workspace, extra_generic=extra_generic)
+        old = load_pinned_proxy(workspace, old_pin, budget=BUDGET)
+        history = read_chain_rows(workspace.market, mixed_pin.generation_id, budget=BUDGET)
+        copied = read_chain_rows(workspace.market, copy_pin.generation_id, budget=BUDGET)
+        assert verify_workspace(workspace)["verified"] is True
+    before = evidence_snapshot(home)
+    archive, target = tmp_path / "backup", tmp_path / "restored"
+    backup(home, archive)
+    restore(archive, target)
+    assert evidence_snapshot(target) == evidence_snapshot(home) == before
+    with open_workspace(target) as workspace:
+        assert load_pinned_proxy(workspace, old_pin, budget=BUDGET) == old
+        value = old.history[0]["value"]
+        assert isinstance(value, float)
+        assert value.hex() == "0x1.999999999999ap-4"
+        assert read_chain_rows(workspace.market, mixed_pin.generation_id, budget=BUDGET) == history
+        assert read_chain_rows(workspace.market, copy_pin.generation_id, budget=BUDGET) == copied
+        with pytest.raises(ValueError, match=r"proxy.*conflict"):
+            load_pinned_proxy(workspace, mixed_pin, budget=BUDGET)
+        if not extra_generic:
+            assert load_pinned_proxy(workspace, copy_pin, budget=BUDGET).non_executable is True
 
 
 def evidence_snapshot(home: Path) -> tuple[str, str]:
