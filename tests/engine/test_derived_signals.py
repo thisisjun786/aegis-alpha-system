@@ -202,7 +202,7 @@ def test_replay_knowledge_does_not_shift_prior_year_signal_buckets(
         "post_cutoff": knowledge + timedelta(days=1),
         "stale": knowledge - timedelta(days=51),
     }[state]
-    observations = dict.fromkeys(("macro", "price", "addend_a"), knowledge)
+    observations: dict[str, date] = dict.fromkeys(("macro", "price", "addend_a"), knowledge)
     observations[evidence] = observed
     spec = derived_spec()
     value = replace(
