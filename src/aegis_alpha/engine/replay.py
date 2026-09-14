@@ -44,8 +44,11 @@ class ReplayReceipt:
     master_switch: Mapping[str, bool]
 
 
-def replay(bundle: EngineBundle, request: ReplayRequest) -> ReplayReceipt:
-    """Execute Score→Select→Switch→Dynamic→Ratio or raise ReplayBlockedError first."""
+def replay(
+    bundle: EngineBundle, request: ReplayRequest, *, knowledge_as_of: date | None = None
+) -> ReplayReceipt:
+    """Evaluate at request.as_of, guarding evidence at the optional knowledge date."""
+    cutoff = knowledge_as_of or request.as_of
     reject_as_of_mismatch(replay_as_of=request.as_of, fixture_as_of=request.fixture_as_of)
     contract = bundle.contract
     if {spec.series_id for spec in contract.derived_series} & set(request.macro):
@@ -58,10 +61,12 @@ def replay(bundle: EngineBundle, request: ReplayRequest) -> ReplayReceipt:
             f"unsupported calendar.signal_date {contract.calendar.signal_date!r}",
         )
     signal_date = prior_calendar_month_end(request.as_of)
+    # These owners already separate economic signal_date from evidence as_of;
+    # derive_history forwards the latter as derive_series's knowledge_as_of.
     derived = derive_history(
         contract.derived_series,
         inputs=request.derived_inputs,
-        as_of=request.as_of,
+        as_of=cutoff,
         gates=contract.stale_gates,
         signal_date=signal_date,
     )
@@ -79,6 +84,7 @@ def replay(bundle: EngineBundle, request: ReplayRequest) -> ReplayReceipt:
             drop_before_day=contract.calendar.current_month_drop_before_day,
             history_observations=contract.calendar.history_observations,
         ),
+        knowledge_as_of=cutoff,
     )
     per_strategy: dict[str, Mapping[str, float]] = {}
     flags: dict[str, Mapping[str, bool]] = {}
@@ -90,7 +96,7 @@ def replay(bundle: EngineBundle, request: ReplayRequest) -> ReplayReceipt:
             features=features,
             signal_date=signal_date,
             specs=contract.macro_signals,
-            as_of=request.as_of,
+            as_of=cutoff,
             gates=contract.stale_gates,
         )
         per_strategy[strategy.name] = allocate(strategy, features, snapshot)

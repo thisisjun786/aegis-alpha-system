@@ -32,6 +32,7 @@ from aegis_alpha.application.backtest_prepare import (
 from aegis_alpha.compute_resources import ComputeBudget
 from aegis_alpha.data.descriptor_tree import DescriptorTreeError
 from aegis_alpha.data.serialization import canonical_json_bytes
+from aegis_alpha.engine.errors import BlockReason, ReplayBlockedError
 from aegis_alpha.engine.models import (
     DerivedInputBinding,
     DerivedSeriesSpec,
@@ -281,7 +282,9 @@ def memberships(workspace: Workspace) -> tuple[Document, Document]:
     return asdict(ip), asdict(up)
 
 
-def stored_request(workspace: Workspace, root: Path) -> Document:
+def stored_request(
+    workspace: Workspace, root: Path, *, signal_known_at_us: int | None = None
+) -> Document:
     body, _, conventions = fixture()
     raw = raw_bundle(contract())
     path = root / "strategy.json"
@@ -297,7 +300,14 @@ def stored_request(workspace: Workspace, root: Path) -> Document:
         raw_sha256=registered["raw_sha256"],
         contract_sha256=registered["contract_sha256"],
     )
-    native(workspace, root, "signal", price_rows(signal=True))
+    signal_rows = price_rows(signal=True)
+    if signal_known_at_us is not None:
+        for row in signal_rows:
+            if row["session_date"] <= "2026-01-29":
+                row.update(
+                    available_at_us=signal_known_at_us, revision_known_at_us=signal_known_at_us
+                )
+    native(workspace, root, "signal", signal_rows)
     native(workspace, root, "outcomes", price_rows(signal=False))
     native(workspace, root, "sessions", session_rows())
     ip, up = memberships(workspace)
@@ -403,6 +413,152 @@ def test_native_preparation_literal_targets_and_repeatability(tmp_path: Path) ->
         ]
 
 
+@pytest.mark.parametrize("latency_hours", [24, 72])
+def test_admitted_publication_after_decision_midnight(tmp_path: Path, latency_hours: int) -> None:
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        body = stored_request(workspace, tmp_path)
+        body["decision_latency_us"] = latency_hours * 60 * 60 * 1_000_000
+        body["explicit_decision_dates"] = ["2026-01-29"]
+        cutoff = micros(DAYS[2]) + body["decision_latency_us"]
+        known = cutoff - 7 * 60 * 60 * 1_000_000
+        rows = price_rows(signal=True)
+        for row in rows:
+            if row["session_date"] == "2026-01-29":
+                row.update(available_at_us=known, revision_known_at_us=known)
+        alternate_prices(workspace, tmp_path, body, "signal_prices", rows)
+        before = registration_state(workspace)
+        assert workspace.strategies is not None
+        connections = (workspace.state, workspace.strategies)
+        traces: list[str] = []
+        for connection in connections:
+            connection.set_authorizer(select_only)
+            connection.set_trace_callback(traces.append)
+        sys.setprofile(reject_accounting)
+        try:
+            prepared = prepare(workspace, body)
+            assert prepared == prepare(workspace, body)
+        finally:
+            sys.setprofile(None)
+            for connection in connections:
+                connection.set_authorizer(None)
+                connection.set_trace_callback(None)
+        assert registration_state(workspace) == before
+        assert traces
+        assert all(sql.lstrip().upper().startswith(("SELECT", "WITH")) for sql in traces)
+        assert prepared.targets == {date(2026, 1, 29): {"ASSET_A": 1.0}}
+        assert [
+            (slot.decision_date, slot.execution_date, slot.cutoff_us) for slot in prepared.slots
+        ] == [(date(2026, 1, 29), date(2026, 2, 2), cutoff)]
+        assert [receipt.as_of for receipt in prepared.decisions] == [date(2026, 1, 29)]
+        assert {
+            key: row.returns[2] for key, row in prepared.features[DAYS[2]].items()
+        } == pytest.approx({"ASSET_A": 0.5, "ASSET_B": 0.1, "REF_X": 0.0})
+        assert all(row.as_of == date(2026, 1, 29) for row in prepared.features[DAYS[2]].values())
+    result = cast(
+        "Document",
+        run_document(prepared.envelope.canonical_bytes, prepared.envelope.envelope_sha256),
+    )
+    assert result["result"]["fills"] == [
+        {
+            "decision_date": "2026-01-29",
+            "execution_date": "2026-02-02",
+            "symbol": "ASSET_A",
+            "shares": 100 / 15,
+            "price": 15.0,
+            "fee": 0.0,
+        }
+    ]
+    assert result["result"]["nav"][-1]["equity"] == pytest.approx(80)
+
+
+@pytest.mark.parametrize("field", ["available_at_us", "revision_known_at_us"])
+@pytest.mark.parametrize("offset_us", [-1, 0, 1])
+def test_exact_publication_cutoff_precedes_date_level_engine_guard(
+    tmp_path: Path, field: str, offset_us: int
+) -> None:
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        body = stored_request(workspace, tmp_path)
+        body["decision_latency_us"] = 24 * 60 * 60 * 1_000_000
+        body["explicit_decision_dates"] = ["2026-01-29"]
+        cutoff = micros(date(2026, 1, 30))
+        rows = price_rows(signal=True)
+        for row in rows:
+            if row["session_date"] == "2026-01-29":
+                row.update(available_at_us=cutoff - 1, revision_known_at_us=cutoff - 1)
+                row[field] = cutoff + offset_us
+        alternate_prices(workspace, tmp_path, body, "signal_prices", rows)
+        before = registration_state(workspace)
+        if offset_us > 0:
+            with pytest.raises(ValueError, match="insufficient eligible buckets"):
+                prepare(workspace, body)
+        else:
+            prepared = prepare(workspace, body)
+            assert prepared.targets == {DAYS[2]: {"ASSET_A": 1.0}}
+            assert prepared.features[DAYS[2]]["ASSET_A"].returns[2] == pytest.approx(0.5)
+        assert registration_state(workspace) == before
+
+
+@pytest.mark.parametrize("latency_hours", [24, 72])
+def test_late_native_price_and_macro_derived_preserve_prior_month_signals(
+    tmp_path: Path, latency_hours: int
+) -> None:
+    known = micros(DAYS[2]) + (latency_hours - 7) * 60 * 60 * 1_000_000
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        body = stored_request(workspace, tmp_path, signal_known_at_us=known)
+        second_recipe(workspace, tmp_path, body, macro_known_at_us=known)
+        body["decision_latency_us"] = latency_hours * 60 * 60 * 1_000_000
+        body["explicit_decision_dates"] = ["2026-01-29"]
+        before = registration_state(workspace)
+        prepared = prepare(workspace, body)
+        assert registration_state(workspace) == before
+        assert prepared.targets == {DAYS[2]: {}}
+        assert prepared.decisions[0].as_of == DAYS[2]
+        assert prepared.decisions[0].signals["synthetic-choice"] == {"MACRO": True, "YIELD": True}
+        assert prepared.decisions[0].ensemble == {"CASH_X": 1.0}
+        # December FLOW/ASSET_A = 0.6/12 = 0.05; January would be 3/15 = 0.2.
+        assert {
+            key: row.ma_ratios[2] for key, row in prepared.features[DAYS[2]].items()
+        } == pytest.approx({"ASSET_A": 10 / 9, "ASSET_B": 22 / 21, "REF_X": 1.0})
+    result = cast(
+        "Document",
+        run_document(prepared.envelope.canonical_bytes, prepared.envelope.envelope_sha256),
+    )
+    assert result["result"]["fills"] == []
+    assert result["result"]["nav"][-1]["equity"] == pytest.approx(100)
+
+
+def test_latency_ages_price_evidence_instead_of_refreshing_it(tmp_path: Path) -> None:
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        body = stored_request(workspace, tmp_path)
+        value = contract()
+        value = replace(value, stale_gates=replace(value.stale_gates, price_stale_after_days=1))
+        doc = json.loads(raw_bundle(value))
+        doc["bundle_version"] = "stale"
+        raw = canonical_json_bytes(doc)
+        path = tmp_path / "stale-strategy.json"
+        path.write_bytes(raw)
+        registered = register_strategy(
+            workspace, path, hashlib.sha256(raw).hexdigest(), "synthetic-probe", "stale"
+        )
+        body["strategy"].update(
+            version="stale",
+            raw_sha256=registered["raw_sha256"],
+            contract_sha256=registered["contract_sha256"],
+        )
+        body["explicit_decision_dates"] = ["2026-01-29"]
+        assert prepare(workspace, body).targets == {DAYS[2]: {"ASSET_A": 1.0}}
+        body["decision_latency_us"] = 48 * 60 * 60 * 1_000_000
+        before = registration_state(workspace)
+        with pytest.raises(ReplayBlockedError) as blocked:
+            prepare(workspace, body)
+        assert blocked.value.reason == BlockReason.STALE_PRICE
+        assert registration_state(workspace) == before
+
+
 def replace_pin(body: Document, role: str, pin: Document, ordinal: int = 0) -> None:
     binding = next(
         item for item in body["bindings"] if (item["role"], item["ordinal"]) == (role, ordinal)
@@ -438,7 +594,7 @@ def alternate_prices(
     replace_pin(body, role, generation_pin(workspace, name))
 
 
-def macro_generation(workspace: Workspace) -> None:
+def macro_generation(workspace: Workspace, *, known_at_us: int | None = None) -> None:
     common = {
         key: value
         for key, value in session_rows()[0].items()
@@ -462,8 +618,12 @@ def macro_generation(workspace: Workspace) -> None:
             "source_vintage_end": None,
             "value": value,
             "value_state": "present",
-            "available_at_us": micros(date.fromisoformat(day)),
-            "revision_known_at_us": micros(date.fromisoformat(day)),
+            "available_at_us": known_at_us
+            if known_at_us is not None and day == "2025-12-31"
+            else micros(date.fromisoformat(day)),
+            "revision_known_at_us": known_at_us
+            if known_at_us is not None and day == "2025-12-31"
+            else micros(date.fromisoformat(day)),
             "ingested_at_us": micros(DAYS[-1]),
             "revision_id": series + day,
         }
@@ -490,8 +650,10 @@ def macro_generation(workspace: Workspace) -> None:
     publication.publish_document(workspace, parse_import(raw))
 
 
-def second_recipe(workspace: Workspace, root: Path, body: Document) -> None:
-    macro_generation(workspace)
+def second_recipe(
+    workspace: Workspace, root: Path, body: Document, *, macro_known_at_us: int | None = None
+) -> None:
+    macro_generation(workspace, known_at_us=macro_known_at_us)
     derived = DerivedSeriesSpec(
         series_id="YIELD",
         operation="trailing_sum_over_price",

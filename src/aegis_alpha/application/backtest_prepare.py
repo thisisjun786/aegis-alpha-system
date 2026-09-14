@@ -770,13 +770,14 @@ def _check_derived_domain(domain: str, history: History, series: str, field_name
 
 
 def _aux_points(
-    item: _Auxiliary, visibility: _Visibility, cutoff: int
+    item: _Auxiliary, visibility: _Visibility, slot: DecisionSlot
 ) -> tuple[tuple[date, float, date], ...]:
+    cutoff = slot.cutoff_us
     result = []
     rows = (
         visibility.project(item.history, cutoff)
         if item.prices is None
-        else _eligible_prices(item.prices, visibility, cutoff, _utc_day(cutoff))
+        else _eligible_prices(item.prices, visibility, cutoff, slot.decision_date)
     )
     for row in rows:
         identity = row["series_id"] if item.domain == "macro_observations" else row["instrument_id"]
@@ -793,7 +794,7 @@ def _aux_points(
         if (
             not visibility.history_start
             <= economic
-            <= min(visibility.history_end, _utc_day(cutoff))
+            <= min(visibility.history_end, slot.decision_date)
         ):
             continue
         value = _number(row["close" if item.domain == "prices" else "value"])
@@ -804,13 +805,13 @@ def _aux_points(
 
 
 def _aux_inputs(
-    items: tuple[_Auxiliary, ...], visibility: _Visibility, cutoff: int
+    items: tuple[_Auxiliary, ...], visibility: _Visibility, slot: DecisionSlot
 ) -> tuple[dict[str, tuple[MacroPoint, ...]], dict[str, Mapping[str, object]]]:
     macro: dict[str, tuple[MacroPoint, ...]] = {}
     fields: dict[str, dict[str, object]] = {}
     identities: dict[str, dict[str, tuple[str, str]]] = {}
     for item in items:
-        points = _aux_points(item, visibility, cutoff)
+        points = _aux_points(item, visibility, slot)
         if item.field == "value":
             macro[item.name] = tuple(MacroPoint(*point) for point in points)
         else:
@@ -1263,7 +1264,8 @@ def _decisions(
             {proxy.logical: _proxy_points(proxy, visibility, slot.cutoff_us) for proxy in proxies}
         )
         _warmup(definition, points, slot, visibility)
-        macro, derived = _aux_inputs(auxiliary, visibility, slot.cutoff_us)
+        macro, derived = _aux_inputs(auxiliary, visibility, slot)
+        knowledge_as_of = _utc_day(slot.cutoff_us)
         features[slot.decision_date] = build_feature_matrix(
             points,
             FeatureBuildRequest(
@@ -1273,6 +1275,7 @@ def _decisions(
                 definition.calendar.current_month_drop_before_day,
                 definition.calendar.history_observations,
             ),
+            knowledge_as_of=knowledge_as_of,
         )
         receipts.append(
             replay(
@@ -1280,6 +1283,7 @@ def _decisions(
                 ReplayRequest(
                     slot.decision_date, slot.decision_date, points, macro, derived, membership
                 ),
+                knowledge_as_of=knowledge_as_of,
             )
         )
     return tuple(receipts), features
