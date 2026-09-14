@@ -109,14 +109,15 @@ def _sql(value: str) -> str:
 
 
 def _local_state(workspace: Workspace) -> bool:
-    rows = workspace.state.execute(
-        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE sql IS NOT NULL"
-    ).fetchall()
-    reserved_names = {name for _, name in _STATE_OBJECTS}
+    # SQLite folds ASCII identifiers only; Python lower() also folds e.g. U+212A.
     owned = {
-        (row[0], row[1]): row[3]
-        for row in rows
-        if row[2].lower() in _STATE_TABLES or row[1].lower() in reserved_names
+        (row[0], row[1]): row[2]
+        for _, name in _STATE_OBJECTS
+        for row in workspace.state.execute(
+            "SELECT type,name,sql FROM sqlite_schema WHERE sql IS NOT NULL AND "
+            "(name = ? COLLATE NOCASE OR (? AND tbl_name = ? COLLATE NOCASE))",
+            (name, name in _STATE_TABLES, name),
+        )
     }
     if not owned:
         return False

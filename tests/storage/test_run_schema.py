@@ -350,6 +350,67 @@ def test_native_cross_type_name_collision_leaves_all_stores_unchanged(
     assert json.loads(rejected.stderr)["error"].split(":", 1)[0] == "run_schema_invalid"
 
 
+@pytest.mark.parametrize(
+    "ddl",
+    [
+        'CREATE INDEX "bac\u212atest_requests" ON issuers(name);',
+        (
+            'CREATE TABLE "bac\u212atest_requests"(unrelated TEXT);'
+            "INSERT INTO \"bac\u212atest_requests\" VALUES ('preserved');"
+            'CREATE INDEX foreign_probe ON "bac\u212atest_requests"(unrelated);'
+        ),
+    ],
+    ids=["occupied-name", "owning-table"],
+)
+def test_native_sqlite_distinct_unicode_objects_survive_install_and_restore(
+    tmp_path: Path, ddl: str
+) -> None:
+    from aegis_alpha.storage.run_schema import inspect_run_schema  # noqa: PLC0415
+    from tests.application.test_storage_cli import run_cli  # noqa: PLC0415
+
+    home = tmp_path / "home"
+    initialized = run_cli("init", home=home)
+    assert initialized.returncode == 0, initialized.stderr
+    foreign_name = "bac\u212atest_requests"
+    catalog_query = "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name=? OR tbl_name=?"
+    with open_workspace(home, writable=True) as workspace:
+        workspace.state.executescript(ddl)
+        foreign_before = workspace.state.execute(
+            catalog_query, (foreign_name, foreign_name)
+        ).fetchall()
+        state_before = "\n".join(workspace.state.iterdump())
+    pre = tmp_path / "pre"
+    installed = run_cli("db", "run-install", "--backup-output", str(pre), home=home)
+    assert installed.returncode == 0, installed.stderr
+    assert json.loads(installed.stdout)["state"] == "complete"
+    with open_workspace(home, writable=True) as workspace:
+        assert (
+            workspace.state.execute(catalog_query, (foreign_name, foreign_name)).fetchall()
+            == foreign_before
+        )
+        assert inspect_run_schema(workspace).state == "complete"
+        state_complete = "\n".join(workspace.state.iterdump())
+    before_retry = _tree_snapshot(tmp_path)
+    retried = run_cli("db", "run-install", home=home)
+    assert retried.returncode == 0, retried.stderr
+    assert retried.stdout == installed.stdout
+    assert _tree_snapshot(tmp_path) == before_retry
+    old = tmp_path / "old"
+    restore(pre, old)
+    with open_workspace(old) as workspace:
+        assert inspect_run_schema(workspace).state == "absent"
+        assert "\n".join(workspace.state.iterdump()) == state_before
+    complete = tmp_path / "complete"
+    backup(home, complete)
+    fresh = tmp_path / "fresh"
+    restore(complete, fresh)
+    with open_workspace(fresh) as workspace:
+        assert inspect_run_schema(workspace).state == "complete"
+        assert "\n".join(workspace.state.iterdump()) == state_complete
+    verified = run_cli("db", "verify", home=fresh)
+    assert verified.returncode == 0, verified.stderr
+
+
 def test_native_interruption_between_stores_and_explicit_retry(tmp_path: Path) -> None:
     from aegis_alpha.storage.run_schema import inspect_run_schema  # noqa: PLC0415
     from aegis_alpha.storage.state import get_operation  # noqa: PLC0415
