@@ -10,6 +10,7 @@ from aegis_alpha.application import (
     compute_cli,
     data_cli,
     etf_cli,
+    prepare_cli,
     provider_cli,
     proxy_cli,
     research_cli,
@@ -35,6 +36,7 @@ def _parser() -> argparse.ArgumentParser:
     data_cli.add_commands(commands)
     provider_cli.add_commands(commands)
     backtest_cli.add_commands(commands)
+    prepare_cli.add_commands(commands)
     proxy_cli.add_commands(commands)
     research_cli.add_commands(commands)
     etf_cli.add_commands(commands)
@@ -82,6 +84,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912 -- explic
                 result = compute_cli.compute_status()
             case "backtest":
                 result = backtest_cli.execute(args)
+            case "prepare":
+                result = prepare_cli.execute(args)
             case "proxy":
                 result = proxy_cli.execute(args)
             case "research":
