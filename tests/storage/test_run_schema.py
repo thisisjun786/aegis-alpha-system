@@ -4,10 +4,12 @@ import hashlib
 import json
 import os
 import select
+import shutil
 import signal
 import sqlite3
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import duckdb
@@ -478,3 +480,129 @@ def test_one_admission_spans_closed_market_backup_and_install(
     monkeypatch.setattr(run_schema, "_install_state", state)
     assert run_schema.install_run_schema(home)["state"] == "complete"
     assert phases == ["closed_market_copy", "reopened_market_install"]
+
+
+def _native_close_boundary(
+    home: Path, arguments: tuple[str, ...], replace: Callable[[], None]
+) -> subprocess.CompletedProcess[bytes]:
+    from tests.application.test_storage_cli import run_cli  # noqa: PLC0415
+
+    ack_read, ack_write = os.pipe()
+    release_read, release_write = os.pipe()
+    observer = """
+import os, sys
+import duckdb
+from aegis_alpha.application.cli import main
+from aegis_alpha.storage import workspace
+ack, release = map(int, sys.argv[1:3])
+original = workspace.market_connect
+class Observed:
+    def __init__(self, connection):
+        self.connection = connection
+        self.closed = False
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+    def close(self):
+        self.connection.close()
+        if not self.closed:
+            self.closed = True
+            try:
+                self.connection.execute('SELECT 1')
+            except duckdb.ConnectionException:
+                pass
+            else:
+                raise AssertionError('real market connection is still open')
+            os.write(ack, b'MARKET_CLOSED')
+            if os.read(release, 1) != b'R':
+                raise RuntimeError('release closed')
+def connect(*args, **kwargs):
+    workspace.market_connect = original
+    return Observed(original(*args, **kwargs))
+workspace.market_connect = connect
+raise SystemExit(main(sys.argv[3:]))
+"""
+    try:
+        with subprocess.Popen(  # noqa: S603 -- native CLI with real-close acknowledgement
+            [
+                sys.executable,
+                "-c",
+                observer,
+                str(ack_write),
+                str(release_read),
+                "--home",
+                str(home),
+                *arguments,
+            ],
+            pass_fds=(ack_write, release_read),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ) as child:
+            try:
+                assert select.select([ack_read], [], [], 30)[0], "missing close acknowledgement"
+                assert os.read(ack_read, 64) == b"MARKET_CLOSED"
+                busy = run_cli("doctor", home=home)
+                assert busy.returncode == 1
+                assert "installation_busy" in json.loads(busy.stderr)["error"]
+                replace()
+                os.write(release_write, b"R")
+                stdout, stderr = child.communicate(timeout=30)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.communicate(timeout=30)
+            return subprocess.CompletedProcess(child.args, child.returncode, stdout, stderr)
+    finally:
+        for descriptor in (ack_read, ack_write, release_read, release_write):
+            os.close(descriptor)
+
+
+@pytest.mark.parametrize("operation", ["backup", "run-install"])
+@pytest.mark.parametrize("replacement", ["older", "clone"])
+def test_native_real_close_replacement_cannot_complete_backup_or_start_install(
+    tmp_path: Path, operation: str, replacement: str
+) -> None:
+    from aegis_alpha.storage.import_document import parse_import  # noqa: PLC0415
+    from aegis_alpha.storage.publication import publish_document  # noqa: PLC0415
+    from aegis_alpha.storage.run_schema import inspect_run_schema  # noqa: PLC0415
+    from tests.storage.test_publication import document  # noqa: PLC0415
+
+    home, old, output = tmp_path / "home", tmp_path / "old", tmp_path / "output"
+    initialize(home)
+    backup(home, old)
+    path, incoming = home / "market.duckdb", tmp_path / "incoming.duckdb"
+    with open_workspace(home, writable=True) as workspace:
+        publish_document(workspace, parse_import(document()))
+        info = workspace.market.execute("SELECT * FROM store_info").fetchall()
+        before_state = "\n".join(workspace.state.iterdump())
+    before = _tree_snapshot(home)
+    admitted = path.stat()
+    observed = []
+
+    def replace() -> None:
+        shutil.copyfile(old / "market.duckdb" if replacement == "older" else path, incoming)
+        incoming.chmod(0o600)
+        observed.append((incoming.stat(), incoming.read_bytes()))
+        incoming.replace(path)
+
+    option = "--output" if operation == "backup" else "--backup-output"
+    result = _native_close_boundary(home, ("db", operation, option, str(output)), replace)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert result.stdout == b""
+    assert "market file changed" in json.loads(result.stderr)["error"]
+    assert len(observed) == 1
+    foreign, payload = observed[0]
+    assert not os.path.samestat(admitted, foreign)
+    assert os.path.samestat(foreign, path.stat())
+    assert path.read_bytes() == payload
+    assert not (output / "backup.json").exists()
+    after = _tree_snapshot(home)
+    assert {k: v for k, v in after.items() if k != path.name} == {
+        k: v for k, v in before.items() if k != path.name
+    }
+    with open_workspace(home) as workspace:
+        assert "\n".join(workspace.state.iterdump()) == before_state
+        assert inspect_run_schema(workspace).state == "absent"
+        assert workspace.market.execute("SELECT * FROM store_info").fetchall() == info
+        assert workspace.market.execute("SELECT count(*) FROM market_generations").fetchone() == (
+            0 if replacement == "older" else 1,
+        )
