@@ -1015,6 +1015,28 @@ def _complete_calendar(sessions: tuple[Session, ...], start: date, end: date) ->
         raise ValueError("incomplete pinned calendar: missing session declaration")
 
 
+def _complete_automatic_months(
+    sessions: tuple[Session, ...], request: ScheduleRequest, resolved: set[tuple[int, int]]
+) -> None:
+    # The outcome projection identifies months needing an explanation, never
+    # the dates/cutoffs of historical slots. Only local evidence resolves them.
+    outcome_opens = tuple(
+        session.session_date
+        for session in sessions
+        if session.status == "open"
+        and request.period_start <= session.session_date <= request.period_end
+    )
+    required = {
+        (left.year, left.month)
+        for left, right in pairwise(outcome_opens)
+        if (left.year, left.month) != (right.year, right.month)
+    }
+    if missing := required - resolved:
+        raise ValueError(
+            f"incomplete decision-local calendar for automatic months: {sorted(missing)}"
+        )
+
+
 def _schedule(
     history: History, visibility: _Visibility, request: ScheduleRequest
 ) -> tuple[DecisionSlot, ...]:
@@ -1029,6 +1051,7 @@ def _schedule(
         }
     )
     selected: dict[date, DecisionSlot] = {}
+    resolved_months: set[tuple[int, int]] = set()
     explicit = request.explicit_decision_dates
     for day, close in candidates:
         if explicit is not None and day not in explicit:
@@ -1036,6 +1059,23 @@ def _schedule(
         cutoff = min(visibility.ceiling, close + request.decision_latency_us)
         grid = _sessions(history, visibility, cutoff)
         opens = tuple(session for session in grid if session.status == "open")
+        if not any(
+            session.session_date == day and session.close_at_us == close for session in opens
+        ):
+            continue
+        month = (day.year, day.month)
+        # A later admitted candidate supersedes earlier completeness evidence in
+        # its month. Unmatched historical/future revisions cannot erase that proof.
+        resolved_months.discard(month)
+        # Omission needs affirmative daily declarations through the endpoint;
+        # an absent successor alone may just be unavailable calendar evidence.
+        if (
+            explicit is None
+            and not any(day < session.session_date <= request.period_end for session in opens)
+            and sum(day <= session.session_date <= request.period_end for session in grid)
+            == (request.period_end - day).days + 1
+        ):
+            resolved_months.add(month)
         pair = next(
             (
                 (left, right)
@@ -1050,9 +1090,7 @@ def _schedule(
         if (left.session_date.year, left.session_date.month) == (
             right.session_date.year,
             right.session_date.month,
-        ):
-            continue
-        if right.session_date > request.period_end:
+        ) or right.session_date > request.period_end:
             continue
         _complete_calendar(grid, visibility.history_start, right.session_date)
         (slot,) = decision_slots(
@@ -1061,8 +1099,13 @@ def _schedule(
         if day in selected and selected[day] != slot:
             raise ValueError("ambiguous decision-local session revisions")
         selected[day] = slot
+        resolved_months.add(month)
     if explicit is not None and set(selected) != set(explicit):
         raise ValueError("explicit decision has no eligible pinned session pair")
+    if explicit is None:
+        _complete_automatic_months(
+            _sessions(history, visibility, visibility.ceiling), request, resolved_months
+        )
     return tuple(selected[day] for day in sorted(selected))
 
 
