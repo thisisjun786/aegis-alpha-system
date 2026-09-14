@@ -17,6 +17,7 @@ from aegis_alpha.storage.strategy_import import register_strategy
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace, write_json
 from tests.engine.engine_support import contract, raw_bundle
+from tests.storage.test_market_inputs import BUDGET, mixed_proxy_publications
 from tests.storage.test_membership_pins import (
     I1,
     U1,
@@ -128,6 +129,33 @@ def test_unresolved_import_backup_restore_preserves_content_and_eligibility(tmp_
             )
             with pytest.raises(ValueError, match="unresolved parent lineage"):
                 load_strategy(workspace.strategies, "synthetic-probe", "1", digest)
+
+
+def test_mixed_proxy_backup_restore_preserves_exact_pins(tmp_path: Path) -> None:
+    from aegis_alpha.storage.market import read_chain_rows  # noqa: PLC0415
+    from aegis_alpha.storage.market_inputs import load_pinned_proxy  # noqa: PLC0415
+
+    home = tmp_path / "proxy-home"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        old_pin, mixed_pin = mixed_proxy_publications(workspace, tmp_path)
+        old = load_pinned_proxy(workspace, old_pin, budget=BUDGET)
+        history = read_chain_rows(workspace.market, mixed_pin.generation_id, budget=BUDGET)
+        before = "\n".join(workspace.state.iterdump())
+    for source in tmp_path.glob("*.sqlite3"):
+        source.unlink()
+    for spec in tmp_path.glob("*.json"):
+        spec.unlink()
+    root = Path(str(backup(home, tmp_path / "backup")["backup_root"]))
+    target = tmp_path / "restored"
+    assert restore(root, target)["restored"] is True
+    with open_workspace(target) as workspace:
+        assert "\n".join(workspace.state.iterdump()) == before
+        assert read_chain_rows(workspace.market, mixed_pin.generation_id, budget=BUDGET) == history
+        assert load_pinned_proxy(workspace, old_pin, budget=BUDGET) == old
+        with pytest.raises(ValueError, match=r"proxy.*conflict"):
+            load_pinned_proxy(workspace, mixed_pin, budget=BUDGET)
+        assert verify_workspace(workspace)["verified"] is True
 
 
 def test_backup_includes_wal_contents(tmp_path: Path) -> None:
