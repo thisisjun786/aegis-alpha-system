@@ -516,7 +516,8 @@ uv run --no-sync aas --home "$LAB/home" prepare --request "$LAB/missing-membersh
 echo "exit=$MISSING_EXIT"
 cat "$LAB/missing.stderr"
 test "$MISSING_EXIT" -eq 1
-test ! -e "$LAB/missing.json" && test ! -e "$LAB/missing.json.preparation.json"
+test ! -e "$LAB/missing.json"
+test ! -e "$LAB/missing.json.preparation.json"
 ls "$LAB"
 
 # 5. 같은 요청을 Python API로 준비한다. 호출자가 lease를 먼저 잡고 그 budget을 넘긴다.
