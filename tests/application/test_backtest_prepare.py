@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -357,6 +359,87 @@ def stored_request(
     return body
 
 
+@pytest.fixture(scope="module")
+def stored_template(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, bytes]:
+    root = tmp_path_factory.mktemp("stored-template")
+    # Module fixtures precede the function-scoped clock. Seed at the same explicit
+    # ingestion event without depending on which test first requests the template.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(time, "time_ns", lambda: micros(date(2026, 6, 1)) * 1000)
+        _ = initialize(root / "home")
+        with open_workspace(root / "home", writable=True, strategy_write=True) as workspace:
+            body = stored_request(workspace, root)
+            workspace.state.commit()
+            assert workspace.strategies is not None
+            workspace.strategies.commit()
+            _ = workspace.market.execute("CHECKPOINT")
+    # All source-import and workspace handles are closed before any ordinary copy.
+    assert not any(path.name.endswith(("-wal", "-shm", ".wal")) for path in root.rglob("*"))
+    return root, canonical_json_bytes(body)
+
+
+def copy_request(template: tuple[Path, bytes], root: Path) -> Document:
+    source, raw = template
+    # Include incoming transforms used by proxy_recipe as well as the entire home.
+    # copy2 preserves private modes; copytree creates new regular files, not links.
+    _ = shutil.copytree(source, root, dirs_exist_ok=True)
+    return cast("Document", json.loads(raw))
+
+
+@pytest.fixture
+def copied_request(stored_template: tuple[Path, bytes], tmp_path: Path) -> Document:
+    return copy_request(stored_template, tmp_path)
+
+
+def fixture_files(root: Path) -> dict[Path, bytes]:
+    return {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+
+def test_copied_requests_isolate_native_integrity(
+    stored_template: tuple[Path, bytes], copied_request: Document, tmp_path: Path
+) -> None:
+    template, raw = stored_template
+    second = tmp_path / "second"
+    second_body = copy_request(stored_template, second)
+    original = fixture_files(template)
+    for relative, content in original.items():
+        paths = (template / relative, tmp_path / relative, second / relative)
+        infos = [path.lstat() for path in paths]
+        assert all(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 for info in infos)
+        assert len({(info.st_dev, info.st_ino) for info in infos}) == len(paths)
+        assert len({stat.S_IMODE(info.st_mode) for info in infos}) == 1
+        assert all(path.read_bytes() == content for path in paths)
+    for directory in (path for path in template.rglob("*") if path.is_dir()):
+        relative = directory.relative_to(template)
+        assert (tmp_path / relative).stat().st_mode == directory.stat().st_mode
+        assert (second / relative).stat().st_mode == directory.stat().st_mode
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        transform_hash = str(
+            workspace.state.execute(
+                "SELECT transform_hash FROM dataset_versions WHERE dataset_id='signal'"
+            ).fetchone()[0]
+        )
+        retained = workspace.paths.raw / transform_hash[:2] / transform_hash
+        _ = retained.write_bytes(retained.read_bytes() + b" ")
+        with pytest.raises(ValueError, match="pinned transform hash mismatch"):
+            _ = prepare(workspace, copied_request)
+    copied_request["account"]["initial_cash"] = 999
+    assert canonical_json_bytes(second_body) == raw
+    assert fixture_files(template) == fixture_files(second) == original
+    for root, body in ((template, cast("Document", json.loads(raw))), (second, second_body)):
+        # Writable SQLite handles remove their empty WAL/SHM on close; read-only
+        # handles leave those sidecars behind even though preparation is SELECT-only.
+        with open_workspace(root / "home", writable=True, strategy_write=True) as workspace:
+            prepared = prepare(workspace, body)
+        assert prepared.targets == {DAYS[2]: {"ASSET_A": 1.0}, DAYS[4]: {"ASSET_B": 1.0}}
+        result = cast(
+            "Document",
+            run_document(prepared.envelope.canonical_bytes, prepared.envelope.envelope_sha256),
+        )
+        assert result["result"]["nav"][-1]["equity"] == pytest.approx(80)
+    assert fixture_files(template) == fixture_files(second) == original
+
+
 def test_native_preparation_literal_targets_and_repeatability(tmp_path: Path) -> None:
     initialize(tmp_path / "home")
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
@@ -417,10 +500,11 @@ def test_native_preparation_literal_targets_and_repeatability(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize("latency_hours", [24, 72])
-def test_admitted_publication_after_decision_midnight(tmp_path: Path, latency_hours: int) -> None:
-    initialize(tmp_path / "home")
+def test_admitted_publication_after_decision_midnight(
+    tmp_path: Path, latency_hours: int, copied_request: Document
+) -> None:
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
+        body = copied_request
         body["decision_latency_us"] = latency_hours * 60 * 60 * 1_000_000
         body["explicit_decision_dates"] = ["2026-01-29"]
         cutoff = micros(DAYS[2]) + body["decision_latency_us"]
@@ -478,11 +562,10 @@ def test_admitted_publication_after_decision_midnight(tmp_path: Path, latency_ho
 @pytest.mark.parametrize("field", ["available_at_us", "revision_known_at_us"])
 @pytest.mark.parametrize("offset_us", [-1, 0, 1])
 def test_exact_publication_cutoff_precedes_date_level_engine_guard(
-    tmp_path: Path, field: str, offset_us: int
+    tmp_path: Path, field: str, offset_us: int, copied_request: Document
 ) -> None:
-    initialize(tmp_path / "home")
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
+        body = copied_request
         body["decision_latency_us"] = 24 * 60 * 60 * 1_000_000
         body["explicit_decision_dates"] = ["2026-01-29"]
         cutoff = micros(date(2026, 1, 30))
@@ -533,10 +616,11 @@ def test_late_native_price_and_macro_derived_preserve_prior_month_signals(
     assert result["result"]["nav"][-1]["equity"] == pytest.approx(100)
 
 
-def test_latency_ages_price_evidence_instead_of_refreshing_it(tmp_path: Path) -> None:
-    initialize(tmp_path / "home")
+def test_latency_ages_price_evidence_instead_of_refreshing_it(
+    tmp_path: Path, copied_request: Document
+) -> None:
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
+        body = copied_request
         value = contract()
         value = replace(value, stale_gates=replace(value.stale_gates, price_stale_after_days=1))
         doc = json.loads(raw_bundle(value))
@@ -735,10 +819,11 @@ def second_recipe(
     body["derived_inputs"] = [{"binding": key, "series_id": "YIELD"}]
 
 
-def test_independent_macro_derived_recipe_switches_and_residual_cash(tmp_path: Path) -> None:
-    initialize(tmp_path / "home")
+def test_independent_macro_derived_recipe_switches_and_residual_cash(
+    tmp_path: Path, copied_request: Document
+) -> None:
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
+        body = copied_request
         second_recipe(workspace, tmp_path, body)
         prepared = prepare(workspace, body)
         assert prepared.targets == {DAYS[2]: {}, DAYS[4]: {"ASSET_B": 0.5}}
@@ -806,10 +891,11 @@ def select_only(
     )
 
 
-def test_select_only_no_accounting_and_deeply_detached(tmp_path: Path) -> None:
-    initialize(tmp_path / "home")
+def test_select_only_no_accounting_and_deeply_detached(
+    tmp_path: Path, copied_request: Document
+) -> None:
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
+        body = copied_request
         before = registration_state(workspace)
         assert workspace.strategies is not None
         strategies = tuple(workspace.strategies.iterdump())
@@ -872,10 +958,9 @@ def test_select_only_no_accounting_and_deeply_detached(tmp_path: Path) -> None:
         "membership",
     ],
 )
-def test_distinct_admission_failures(tmp_path: Path, fault: str) -> None:
-    initialize(tmp_path / "home")
+def test_distinct_admission_failures(tmp_path: Path, fault: str, copied_request: Document) -> None:
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
+        body = copied_request
         expected = corrupt_request(workspace, tmp_path, body, fault)
         before = registration_state(workspace)
         with pytest.raises((ValueError, TypeError), match=expected):
@@ -986,10 +1071,11 @@ def corrupt_membership(workspace: Workspace, body: Document) -> str:
     return "membership"
 
 
-def test_sale_only_missing_open_is_left_to_real_accounting(tmp_path: Path) -> None:
-    initialize(tmp_path / "home")
+def test_sale_only_missing_open_is_left_to_real_accounting(
+    tmp_path: Path, copied_request: Document
+) -> None:
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
+        body = copied_request
         rows = [
             row
             for row in price_rows(signal=False)
@@ -1003,7 +1089,9 @@ def test_sale_only_missing_open_is_left_to_real_accounting(tmp_path: Path) -> No
         run_document(prepared.envelope.canonical_bytes, prepared.envelope.envelope_sha256)
 
 
-def test_installed_inventory_and_actual_decimal_context(tmp_path: Path) -> None:
+def test_installed_inventory_and_actual_decimal_context(
+    tmp_path: Path, copied_request: Document
+) -> None:
     package = Path(__file__).resolve().parents[2] / "src" / "aegis_alpha"
     observed = {"aegis_alpha.engine." + path.stem for path in (package / "engine").glob("*.py")}
     assert tuple(sorted(set(CALCULATION_MODULES))) == CALCULATION_MODULES
@@ -1042,9 +1130,8 @@ def test_installed_inventory_and_actual_decimal_context(tmp_path: Path) -> None:
     assert calculation_identity()["calculation_source_hash"] == digest(
         {"schema": "aas-calculation-sources-v1", "hash_format": J, "files": inventory}
     )
-    initialize(tmp_path / "home")
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
+        body = copied_request
         first = prepare(workspace, body)
         context = environment_identity()
         with localcontext() as decimal:
@@ -1055,10 +1142,9 @@ def test_installed_inventory_and_actual_decimal_context(tmp_path: Path) -> None:
         assert environment_identity() == context
 
 
-def test_fresh_process_without_incoming_files(tmp_path: Path) -> None:
-    initialize(tmp_path / "home")
+def test_fresh_process_without_incoming_files(tmp_path: Path, copied_request: Document) -> None:
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
+        body = copied_request
         first = prepare(workspace, body)
     for path in tmp_path.iterdir():
         if path.is_file():
@@ -1273,11 +1359,10 @@ def reject_export_and_accounting(frame: FrameType, event: str, argument: object)
 @pytest.mark.parametrize("change", ["close-execution", "insert-open", "close-decision"])
 @pytest.mark.parametrize("all_cash", [False, True])
 def test_incompatible_outcome_calendar_rejects_before_export(
-    tmp_path: Path, change: str, *, all_cash: bool
+    tmp_path: Path, change: str, copied_request: Document, *, all_cash: bool
 ) -> None:
-    initialize(tmp_path / "home")
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
+        body = copied_request
         if all_cash:
             second_recipe(workspace, tmp_path, body)
         body["explicit_decision_dates"] = ["2026-01-29"]
@@ -1313,10 +1398,11 @@ def test_incompatible_outcome_calendar_rejects_before_export(
 
 
 @pytest.mark.parametrize("change", ["close-execution", "insert-open"])
-def test_empty_schedule_preserves_revised_outcome_calendar(tmp_path: Path, change: str) -> None:
-    initialize(tmp_path / "home")
+def test_empty_schedule_preserves_revised_outcome_calendar(
+    tmp_path: Path, change: str, copied_request: Document
+) -> None:
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
+        body = copied_request
         body["explicit_decision_dates"] = []
         incompatible_calendar(workspace, tmp_path, body, change)
         prepared = prepare(workspace, body)
@@ -1380,11 +1466,10 @@ def target_membership_interval(
 @pytest.mark.parametrize("role", ["identity", "universe"])
 @pytest.mark.parametrize("revised_hour", [7, 11])
 def test_target_membership_uses_decision_local_execution_open(
-    tmp_path: Path, role: str, revised_hour: int
+    tmp_path: Path, role: str, revised_hour: int, copied_request: Document
 ) -> None:
-    initialize(tmp_path / "home")
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
+        body = copied_request
         body["explicit_decision_dates"] = ["2026-01-29"]
         # Original execution is 09:00. Expiry at 08:00 excludes it; 10:00 admits it.
         # A later revision to 07:00/11:00 must not reverse either decision.
@@ -1430,11 +1515,10 @@ def test_target_membership_uses_decision_local_execution_open(
 @pytest.mark.parametrize("role", ["identity", "universe"])
 @pytest.mark.parametrize("offset_us", [-1, 0, 1])
 def test_membership_knowledge_visibility_is_not_execution_economic_time(
-    tmp_path: Path, role: str, offset_us: int
+    tmp_path: Path, role: str, offset_us: int, copied_request: Document
 ) -> None:
-    initialize(tmp_path / "home")
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
+        body = copied_request
         body["explicit_decision_dates"] = ["2026-01-29"]
         cutoff = micros(date(2026, 1, 29))
         target_membership_interval(
@@ -1491,10 +1575,11 @@ def test_execution_session_revision_respects_exact_cutoff_and_ingestion(
             assert prepare(workspace, body).targets == baseline.targets
 
 
-def test_compatible_inserted_outcome_session_keeps_fill_and_all_dates(tmp_path: Path) -> None:
-    initialize(tmp_path / "home")
+def test_compatible_inserted_outcome_session_keeps_fill_and_all_dates(
+    tmp_path: Path, copied_request: Document
+) -> None:
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
+        body = copied_request
         body["explicit_decision_dates"] = ["2026-01-29"]
         baseline = prepare(workspace, body)
         inserted = date(2026, 2, 3)
@@ -1547,10 +1632,11 @@ def test_compatible_inserted_outcome_session_keeps_fill_and_all_dates(tmp_path: 
     assert result["nav"][-1]["equity"] == pytest.approx(80)
 
 
-def test_calendar_future_revision_does_not_rewrite_signal_eligibility(tmp_path: Path) -> None:
-    initialize(tmp_path / "home")
+def test_calendar_future_revision_does_not_rewrite_signal_eligibility(
+    tmp_path: Path, copied_request: Document
+) -> None:
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
+        body = copied_request
         first = prepare(workspace, body)
         original = session_rows()[0]
         row = {
@@ -1597,10 +1683,11 @@ def test_calendar_future_revision_does_not_rewrite_signal_eligibility(tmp_path: 
         "universe",
     ],
 )
-def test_declared_inputs_and_calendar_eligibility(tmp_path: Path, fault: str) -> None:
-    initialize(tmp_path / "home")
+def test_declared_inputs_and_calendar_eligibility(
+    tmp_path: Path, fault: str, copied_request: Document
+) -> None:
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
+        body = copied_request
         if fault.startswith(("macro", "derived")):
             second_recipe(workspace, tmp_path, body)
         expected = modify_declarations(workspace, tmp_path, body, fault)
@@ -1695,11 +1782,10 @@ def modify_calendar_inputs(workspace: Workspace, root: Path, body: Document, fau
 
 @pytest.mark.parametrize("dataset", ["signal", "sessions"])
 def test_selected_native_evidence_cannot_fall_back_to_opaque_publication(
-    tmp_path: Path, dataset: str
+    tmp_path: Path, dataset: str, copied_request: Document
 ) -> None:
-    initialize(tmp_path / "home")
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
+        body = copied_request
         digest_value = workspace.state.execute(
             "SELECT transform_hash FROM dataset_versions WHERE dataset_id=?", (dataset,)
         ).fetchone()[0]
@@ -1711,10 +1797,11 @@ def test_selected_native_evidence_cannot_fall_back_to_opaque_publication(
         assert registration_state(workspace) == before
 
 
-def test_empty_explicit_schedule_and_v2_cashflow_are_not_defaults(tmp_path: Path) -> None:
-    initialize(tmp_path / "home")
+def test_empty_explicit_schedule_and_v2_cashflow_are_not_defaults(
+    tmp_path: Path, copied_request: Document
+) -> None:
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
+        body = copied_request
         body["explicit_decision_dates"] = []
         body["envelope"]["schema_version"] = "aas-etf-backtest-v2"
         body["account"]["cashflows"] = [{"date": DAYS[3].isoformat(), "amount": 20}]
@@ -1861,11 +1948,10 @@ def publish_proxy(
 
 @pytest.mark.parametrize("held", [True, False])
 def test_actual_proxy_donor_target_accounting_without_inferred_holdings(
-    tmp_path: Path, *, held: bool
+    tmp_path: Path, copied_request: Document, *, held: bool
 ) -> None:
-    initialize(tmp_path / "home")
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
+        body = copied_request
         proxy_recipe(workspace, tmp_path, body)
         if not held:
             body["explicit_decision_dates"] = [DAYS[4].isoformat()]
@@ -1972,10 +2058,11 @@ def test_proxy_future_suffix_and_ingestion_cutoff_are_decision_local(
 
 
 @pytest.mark.parametrize("fault", ["convention", "source", "selected", "sale-open"])
-def test_proxy_pin_agreement_and_sale_only_accounting(tmp_path: Path, fault: str) -> None:
-    initialize(tmp_path / "home")
+def test_proxy_pin_agreement_and_sale_only_accounting(
+    tmp_path: Path, fault: str, copied_request: Document
+) -> None:
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
+        body = copied_request
         if fault == "sale-open":
             rows = [
                 row
