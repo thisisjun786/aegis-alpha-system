@@ -13,6 +13,7 @@
 | [0013](0013-first-install-workspace.md) | accepted | 로컬 사용자 저장소, 단일 앱·선택적 컨테이너 설치와 백업 |
 | [0014](0014-local-embedded-databases.md) | accepted | SQLite 상태·비공개 전략, DuckDB 시장 저장·분석; 0010의 저장 기술 대체 |
 | [0015](0015-research-engine-product-boundary.md) | accepted | 외부 도구용 데이터·연구 엔진 목표, 현재 진입점과 미구현 연결의 구분 |
+| [0016](0016-maintenance-admission-budget.md) | accepted | 유지보수 명령의 호출자 소유 승인 경계, 바이트 인지·배치 단위·측정된 확장 계수 |
 
 일부 범위만 대체된 결정은 유지되는 계약 때문에 accepted로 남기고, 해당 문서에 날짜와
 대체 결정·범위를 기록한다. accepted는 설계 채택을 뜻하며 기능 구현 완료를 뜻하지 않는다.
