@@ -34,11 +34,13 @@ if TYPE_CHECKING:
 _MAX_SOURCE_ID = 240
 _SHA_LENGTH = 64
 # Both digests consume a table in BATCH_ROWS units, so the live set is one
-# canonical batch rather than the whole table. Measured on this tree:
-# sqlite_digest retains at most 4.33x the bytes of the row it is encoding, and
-# arrow_digest about 1.26x a batch plus roughly 8 bytes per cell. These carry
-# margin over those observations.
-_DIGEST_BYTE_FACTOR = 8
+# canonical batch rather than the whole table. Measured on this tree, the worst
+# sqlite_digest case is escape-heavy text: a megabyte of NUL characters becomes
+# six-character escapes and peaks at 13.5x its bytes, against 4.5x for quotes or
+# backslashes, 4.33x for a blob and 2.25x for plain ASCII. arrow_digest retains
+# about 1.26x a batch plus roughly 8 bytes per cell. These carry margin over
+# those observations.
+_DIGEST_BYTE_FACTOR = 32
 _DIGEST_CELL_BYTES = 64
 
 
@@ -281,21 +283,31 @@ def _admit_source_batch(
             "coalesce(length(CAST(" + schema.quoted(name) + " AS BLOB)),0)" for name in columns
         ]
         divide = "/"
-    rows, size = cast(
-        "tuple[int, int]",
+    # Project only the bucket and the row width. SELECT * would carry every source
+    # column into the grouping, and a column literally named like the bucket would
+    # silently regroup the charge. Combine each batch's own row and byte terms
+    # before taking the maximum, because the widest batch and the fullest batch
+    # need not be the same one.
+    charge = cast(
+        "tuple[int]",
         conn.execute(
-            "SELECT coalesce(max(n),0),coalesce(max(b),0) FROM ("
-            "SELECT count(*) AS n, sum(" + "+".join(widths) + ") AS b FROM ("
-            "SELECT *, (row_number() OVER (ORDER BY _aas_ordinal) - 1) "
+            "SELECT coalesce(max("
+            + str(_DIGEST_CELL_BYTES * len(columns))
+            + "*n+"
+            + str(_DIGEST_BYTE_FACTOR)
+            + "*b),0) FROM (SELECT count(*) AS n, coalesce(sum(w),0) AS b FROM ("
+            "SELECT (row_number() OVER (ORDER BY _aas_ordinal) - 1) "
             + divide
             + " "
             + str(BATCH_ROWS)
-            + " AS _aas_batch FROM "
+            + " AS g, "
+            + "+".join(widths)
+            + " AS w FROM "
             + schema.quoted(str(table["target"]))
-            + ") GROUP BY _aas_batch)"
+            + ") GROUP BY g)"
         ).fetchone(),
-    )
-    if _DIGEST_BYTE_FACTOR * size + _DIGEST_CELL_BYTES * rows * len(columns) > allowance:
+    )[0]
+    if charge > allowance:
         raise ComputeResourceError("source table batch exceeds materialization budget")
 
 
@@ -494,12 +506,15 @@ def read_table(
 
 
 def verify_sources(
-    workspace: Workspace, *, budget: ComputeBudget | None = None
+    workspace: Workspace, *, budget: ComputeBudget | None = None, reserved: int = 0
 ) -> dict[str, object] | None:
+    """Verify retained sources. reserved is what the caller still holds live."""
     if not schema.ensure(workspace):
         return None
     budget = budget or ComputeBudget(Fraction(1), 512 * 1024 * 1024)
-    allowance = budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes
+    allowance = budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes - reserved
+    if allowance <= 0:
+        raise ComputeResourceError("retained verification state leaves no source budget")
     # Metadata stays live while every table is verified, so table admission gets
     # only what is left. This replaces the earlier unadmitted marker fetch.
     remaining = allowance - _admit_source_metadata(workspace, allowance)

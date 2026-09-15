@@ -118,6 +118,7 @@ CALCULATION_MODULES = (
     "aegis_alpha.engine.schedule",
     "aegis_alpha.engine.signals",
     "aegis_alpha.engine.strategy_config",
+    "aegis_alpha.engine.tolerance",
     "aegis_alpha.storage.import_document",
     "aegis_alpha.storage.input_pins",
     "aegis_alpha.storage.market",

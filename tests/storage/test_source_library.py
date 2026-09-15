@@ -529,6 +529,74 @@ def test_source_verification_rejects_before_any_digest_read(
             source_library.verify_sources(workspace, budget=_budget(16 * 1024 * 1024))
 
 
+def test_admission_groups_by_the_generated_bucket_not_a_source_column(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A source column named like the bucket must not regroup the charge."""
+    source = tmp_path / "bucket-name.sqlite3"
+    connection = sqlite3.connect(source)
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("CREATE TABLE rows(_aas_batch INTEGER, payload BLOB)")
+        connection.executemany(
+            "INSERT INTO rows VALUES (?,?)", [(index, b"p" * 1000) for index in range(4)]
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    source.chmod(_PRIVATE_FILE)
+    digest = _digest(source)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        source_library.import_sqlite(workspace, source, "bucket-name", digest)
+    monkeypatch.setattr(source_library, "BATCH_ROWS", 4)
+    # One batch of four rows, each a thousand-byte payload plus a one-byte bucket
+    # value, over two columns. Grouping by the source column would instead see four
+    # single-row batches and charge a quarter of this.
+    exact = 32 * 4 * 1001 + 64 * 4 * 2
+    with open_workspace(home) as workspace:
+        private = workspace.strategies
+        assert isinstance(private, sqlite3.Connection)
+        table = source_library.list_tables(workspace, "bucket-name")[0]
+        columns = cast("list[str]", table["columns"])
+        source_library._admit_source_batch(  # noqa: SLF001
+            private, table, "strategies", columns, exact
+        )
+        with pytest.raises(ComputeResourceError, match="source table batch"):
+            source_library._admit_source_batch(  # noqa: SLF001
+                private, table, "strategies", columns, exact - 1
+            )
+
+
+def test_admission_uses_each_batch_combined_charge(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The widest batch and the fullest batch need not be the same one."""
+    source = tmp_path / "combined.sqlite3"
+    payloads = [b"x"] * 100 + [b"y" * 100_000]
+    digest = _blob_source(source, payloads)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        source_library.import_sqlite(workspace, source, "combined", digest)
+    monkeypatch.setattr(source_library, "BATCH_ROWS", 100)
+    # Batch one holds a hundred tiny rows and batch two the single large row.
+    # Taking the row count and the byte total from different batches would invent
+    # a heavier batch than either of the two that exist.
+    exact = 32 * 100_000 + 64 * 1 * 1
+    inflated = 32 * 100_000 + 64 * 100 * 1
+    assert exact < inflated
+    with open_workspace(home) as workspace:
+        private = workspace.strategies
+        assert isinstance(private, sqlite3.Connection)
+        table = source_library.list_tables(workspace, "combined")[0]
+        columns = cast("list[str]", table["columns"])
+        source_library._admit_source_batch(  # noqa: SLF001
+            private, table, "strategies", columns, exact
+        )
+        with pytest.raises(ComputeResourceError, match="source table batch"):
+            source_library._admit_source_batch(  # noqa: SLF001
+                private, table, "strategies", columns, exact - 1
+            )
+
+
 def test_sqlite_source_verifies_without_pyarrow(
     tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -32,10 +32,31 @@ if TYPE_CHECKING:
     from aegis_alpha.storage.workspace import Workspace
 
 
-def _admit_retained(row: object, allowance: int, message: str) -> None:
-    """Charge a collection that stays live across later steps before fetching it."""
-    if cast("tuple[int]", row)[0] > allowance // 8:
+def _verify_membership(workspace: Workspace, allowance: int) -> None:
+    """Reconstruct every stored membership document under the caller's allowance."""
+    for header in workspace.state.execute(
+        "SELECT snapshot_id,content_hash FROM identity_snapshots"
+    ):
+        read_membership_pins(
+            workspace.state, IdentityPin(*header), None, max_materialization_bytes=allowance
+        )
+    for header in workspace.state.execute(
+        "SELECT universe_id,version,content_hash FROM universe_versions"
+    ):
+        read_membership_pins(
+            workspace.state, None, UniversePin(*header), max_materialization_bytes=allowance
+        )
+
+
+def _admit_retained(row: object, allowance: int, message: str) -> int:
+    """Charge a collection that stays live across later steps, before fetching it.
+
+    Returns the charge so the caller can keep reserving it while it is held.
+    """
+    charge = cast("tuple[int]", row)[0]
+    if charge > allowance // 8:
         raise ComputeResourceError(message)
+    return charge
 
 
 def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification boundary
@@ -64,24 +85,7 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
     ):
         if workspace.state.execute(sql, (1024 * 1024,)).fetchone()[0]:
             raise ValueError("membership root exceeds document byte limit")
-    for header in workspace.state.execute(
-        "SELECT snapshot_id,content_hash FROM identity_snapshots"
-    ):
-        read_membership_pins(
-            workspace.state,
-            IdentityPin(*header),
-            None,
-            max_materialization_bytes=allowance,
-        )
-    for header in workspace.state.execute(
-        "SELECT universe_id,version,content_hash FROM universe_versions"
-    ):
-        read_membership_pins(
-            workspace.state,
-            None,
-            UniversePin(*header),
-            max_materialization_bytes=allowance,
-        )
+    _verify_membership(workspace, allowance)
     size = workspace.state.execute(
         "SELECT count(*)*2048 + coalesce(sum(32*(length(dataset_id)+length(version)+"
         "length(generation_id)+coalesce(length(parent_generation_id),0))),0) "
@@ -89,6 +93,8 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
     ).fetchone()[0]
     if size > allowance // 8:
         raise ComputeResourceError("publication catalog exceeds materialization budget")
+    # The catalog rows stay live through every later step, so reserve them.
+    live = size
     versions = workspace.state.execute(
         "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash,parent_generation_id "
         "FROM dataset_versions WHERE status='committed'"
@@ -111,20 +117,24 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
             workspace.paths.raw, source["relative_path"], source["byte_hash"], source["size_bytes"]
         )
     # This list stays live while every strategy is verified, so charge it first.
+    # Held only while the strategies below are verified, then released.
     _admit_retained(
         workspace.strategies.execute(
             "SELECT count(*)*2048 + coalesce(sum(32*(length(CAST(strategy_id AS BLOB))+"
             "length(CAST(version AS BLOB))+length(CAST(raw_sha256 AS BLOB)))),0) "
             "FROM strategy_versions"
         ).fetchone(),
-        allowance,
+        allowance - live,
         "strategy catalog exceeds materialization budget",
     )
     strategies = workspace.strategies.execute(
         "SELECT strategy_id,version,raw_sha256 FROM strategy_versions"
     ).fetchall()
+    strategy_versions = len(strategies)
     for strategy in strategies:
         verify_strategy_content(workspace.strategies, *strategy)
+    # Only the count is needed from here on, so this charge is released.
+    del strategies
     verify_strategy_imports(workspace)
     for convention in workspace.state.execute(
         "SELECT kind,convention_id,version,content_hash FROM conventions"
@@ -151,13 +161,13 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
     ).fetchone()[0]
     # market_generations is DuckDB, so the SQLite length(CAST(... AS BLOB)) form
     # does not apply; encode() gives the byte width of each identifier.
-    _admit_retained(
+    live += _admit_retained(
         workspace.market.execute(
             "SELECT count(*)*2048 + "
             "coalesce(sum(32*coalesce(octet_length(encode(generation_id)),0)),0) "
             "FROM market_generations"
         ).fetchone(),
-        allowance,
+        allowance - live,
         "market generation catalog exceeds materialization budget",
     )
     untracked = workspace.market.execute("SELECT generation_id FROM market_generations").fetchall()
@@ -165,13 +175,15 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
     report: dict[str, object] = {
         "verified": True,
         "dataset_versions": len(versions),
-        "strategy_versions": len(strategies),
+        "strategy_versions": strategy_versions,
         "pending_operations": pending,
         "orphan_generations": [row[0] for row in untracked if row[0] not in visible],
     }
     from aegis_alpha.storage.source_library import verify_sources  # noqa: PLC0415
 
-    sources = verify_sources(workspace, budget=budget)
+    # The catalog and generation lists are still held, so source verification is
+    # admitted against what is left rather than the whole allowance.
+    sources = verify_sources(workspace, budget=budget, reserved=live)
     if sources is not None:
         report["source_library"] = sources
     return report

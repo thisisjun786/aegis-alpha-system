@@ -19,9 +19,9 @@ from typing import cast
 
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
 from aegis_alpha.engine.codec import decode_json
-from aegis_alpha.engine.execution import LONG_ONLY_SUM_TOLERANCE
 from aegis_alpha.engine.models import ENGINE_CONTRACT_VERSION_V1
 from aegis_alpha.engine.requirements import ExecutionDefinition
+from aegis_alpha.engine.tolerance import long_only_sum_tolerance
 
 type FrozenJSON = (
     bool | int | float | str | tuple[FrozenJSON, ...] | Mapping[str, FrozenJSON] | None
@@ -1202,7 +1202,7 @@ def _export_targets(
                 raise ValueError("selected buy requires its next-session open")
             numbers.append(weight)
             parsed_weights[symbol] = weight
-        if math.fsum(numbers) > 1 + LONG_ONLY_SUM_TOLERANCE:
+        if math.fsum(numbers) > 1 + long_only_sum_tolerance(len(numbers)):
             raise ValueError("target weights must sum to at most one")
         normalized_targets[day.isoformat()] = parsed_weights
     return normalized_targets

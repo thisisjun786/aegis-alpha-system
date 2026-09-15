@@ -35,6 +35,7 @@ from aegis_alpha.engine.backtest_request import (
 from aegis_alpha.engine.ensemble import EnsembleMembership
 from aegis_alpha.engine.membership import MembershipRow, membership_hash
 from aegis_alpha.engine.requirements import ExecutionDefinition, derive_execution_definition
+from aegis_alpha.engine.tolerance import long_only_sum_tolerance
 from tests.engine.engine_support import bundle, contract
 from tests.engine.test_requirements import rich_contract
 
@@ -1339,6 +1340,25 @@ def test_target_sum_above_the_shared_tolerance_is_still_rejected() -> None:
     body, definition, docs = fixture()
     parsed, projection = project(body, definition, docs)
     targets = {"ASSET_A": 0.5, "ASSET_B": 0.5 + 2e-12}
-    assert math.fsum(targets.values()) > 1 + execution.LONG_ONLY_SUM_TOLERANCE
+    assert math.fsum(targets.values()) > 1 + long_only_sum_tolerance(len(targets))
     with pytest.raises(ValueError, match="sum to at most one"):
         export_envelope(parsed, projection=projection, inputs=_two_asset_inputs(targets))
+
+
+def test_export_rejects_what_replay_cannot_absorb() -> None:
+    """Export must not accept an overshoot the self-financing check would refuse."""
+    body, definition, docs = fixture()
+    parsed, projection = project(body, definition, docs)
+    # A relative overshoot equal to the accounting tolerance leaves no room for the
+    # rounding that follows it, so an envelope carrying it failed replay after a
+    # successful export. The accepted boundary now scales with the weight count.
+    targets = {"ASSET_A": 0.5, "ASSET_B": 0.5 + 1e-12}
+    assert math.fsum(targets.values()) > 1 + long_only_sum_tolerance(len(targets))
+    with pytest.raises(ValueError, match="sum to at most one"):
+        export_envelope(parsed, projection=projection, inputs=_two_asset_inputs(targets))
+
+
+def test_accepted_overshoot_stays_inside_the_self_financing_tolerance() -> None:
+    """Whatever export admits, replay must still be able to absorb."""
+    for count in (2, 10, 100, 1000):
+        assert long_only_sum_tolerance(count) < execution._VALUE_RELATIVE_TOLERANCE  # noqa: SLF001
