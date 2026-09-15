@@ -13,7 +13,7 @@ import re
 import stat
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path, PurePosixPath
 from threading import Event
@@ -93,6 +93,24 @@ class ComputeBudget:
     def available_bytes(self) -> int:
         """Materialization bytes outside DuckDB that are not already held live."""
         return self.memory_limit_bytes - self.duckdb_memory_limit_bytes - self.reserved_bytes
+
+    def component(self, divisor: int) -> ComputeBudget:
+        """Carve a sub-allocation out of what is not already held live.
+
+        What the caller retains is removed from the pool before it is divided,
+        rather than charged again against every smaller slice. Charging it each
+        time rejects work the caller can actually afford: with a 512 MiB
+        allocation holding 80 MiB, a halved slice would be left owing more than
+        its whole non-DuckDB share. With nothing retained this is the plain
+        division it replaces.
+        """
+        if type(divisor) is not int or divisor < 1:
+            raise ComputeResourceError("component divisor must be a positive integer")
+        return replace(
+            self,
+            memory_limit_bytes=(self.memory_limit_bytes - self.reserved_bytes) // divisor,
+            reserved_bytes=0,
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {

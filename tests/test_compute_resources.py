@@ -332,12 +332,19 @@ def test_a_reserve_reduces_only_the_materialization_allowance() -> None:
     assert held.duckdb_threads == budget.duckdb_threads
 
 
-def test_a_component_split_keeps_the_reserve() -> None:
-    """Halving an allocation must not quietly drop what the caller still holds."""
-    held = replace(ComputeBudget(Fraction(1), 512 * 1024 * 1024), reserved_bytes=12_096)
-    component = replace(held, memory_limit_bytes=held.memory_limit_bytes // 2)
-    assert component.reserved_bytes == held.reserved_bytes
-    assert component.available_bytes < held.available_bytes
+def test_a_component_split_divides_what_is_not_held() -> None:
+    """A split must not charge retained bytes again against each smaller slice."""
+    plain = ComputeBudget(Fraction(1), 64 * 1024 * 1024)
+    # With nothing retained this is the plain division it replaces.
+    assert plain.component(2).memory_limit_bytes == plain.memory_limit_bytes // 2
+    assert plain.component(2).available_bytes == plain.available_bytes // 2
+    # A large allocation holding 80 MiB still has 48 MiB free, so a halved slice
+    # must remain usable. Charging the reserve again would leave it owing more
+    # than its whole non-DuckDB share.
+    held = replace(ComputeBudget(Fraction(1), 512 * 1024 * 1024), reserved_bytes=80 * 1024 * 1024)
+    assert held.available_bytes == 48 * 1024 * 1024
+    assert held.component(2).available_bytes > 0
+    assert held.component(2).reserved_bytes == 0
 
 
 def test_a_reserve_that_leaves_no_allowance_is_refused() -> None:
