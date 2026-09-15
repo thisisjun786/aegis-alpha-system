@@ -429,6 +429,14 @@ def _verify_binding(workspace: Workspace, binding: InputBinding, budget: Compute
             max_materialization_bytes=budget.available_bytes,
         )
     elif kind.startswith("convention:"):
+        # read_convention decodes and re-canonicalizes the whole stored document,
+        # so charge its bytes before reading rather than after materializing them.
+        stored = workspace.state.execute(
+            "SELECT coalesce(length(CAST(payload AS BLOB)),0) FROM conventions "
+            "WHERE kind=? AND convention_id=? AND version=?",
+            (kind.removeprefix("convention:"), identity, version),
+        ).fetchone()
+        _admit_bytes(stored[0] if stored is not None else 0, budget)
         read_convention(
             workspace.state,
             ConventionPin(kind.removeprefix("convention:"), identity, version, digest),

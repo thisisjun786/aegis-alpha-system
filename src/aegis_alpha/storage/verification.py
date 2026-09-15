@@ -68,6 +68,17 @@ def _verify_artifacts(workspace: Workspace) -> None:
                 raise ValueError("run artifact hash/size mismatch")
 
 
+def _admit_document(row: object, allowance: int, message: str) -> None:
+    """Charge a document that is materialized, checked, then released.
+
+    One of these is live at a time, so it is compared with the whole remaining
+    allowance. Reusing the collection rule here would add an unrelated eightfold
+    restriction and refuse documents that comfortably fit.
+    """
+    if cast("tuple[int]", row)[0] > allowance:
+        raise ComputeResourceError(message)
+
+
 def _admit_retained(row: object, allowance: int, message: str) -> int:
     """Charge a collection that stays live across later steps, before fetching it.
 
@@ -151,7 +162,7 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
     )
     # Content verification fetches one stored bundle and its contract at a time, so
     # charge the largest of those before any of them is read.
-    _admit_retained(
+    _admit_document(
         workspace.strategies.execute(
             "SELECT coalesce(max(2048 + 32*(length(CAST(raw_bundle AS BLOB))+"
             "length(CAST(contract_json AS BLOB)))),0) FROM strategy_versions"
@@ -169,7 +180,7 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
     del strategies
     verify_strategy_imports(workspace)
     # read_convention decodes and re-canonicalizes one whole document at a time.
-    _admit_retained(
+    _admit_document(
         workspace.state.execute(
             "SELECT coalesce(max(2048 + 128*length(CAST(payload AS BLOB))),0) FROM conventions"
         ).fetchone(),
@@ -238,7 +249,7 @@ def _verify_input_documents(workspace: Workspace, budget: ComputeBudget) -> None
         read_input_bundle(workspace, pin, budget=budget)
     if status.state == "complete":
         # Each stored request is decoded and canonicalized whole before comparison.
-        _admit_retained(
+        _admit_document(
             workspace.state.execute(
                 "SELECT coalesce(max(2048 + 128*length(CAST(request_bytes AS BLOB))),0) "
                 "FROM backtest_requests"
