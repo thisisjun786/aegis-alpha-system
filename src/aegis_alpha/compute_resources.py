@@ -109,10 +109,11 @@ class ComputeBudget:
         """
         if type(divisor) is not int or divisor < 1:
             raise ComputeResourceError("component divisor must be a positive integer")
-        # available_bytes is a quarter of memory_limit_bytes, so scale back up.
+        # Take the integer share first: scaling a rounded-down quarter back up keeps
+        # the slice exactly at its share, where dividing afterwards can add a byte.
         return replace(
             self,
-            memory_limit_bytes=4 * self.available_bytes // divisor,
+            memory_limit_bytes=4 * (self.available_bytes // divisor),
             reserved_bytes=0,
         )
 

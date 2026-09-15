@@ -149,6 +149,16 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
         held.available_bytes,
         "strategy catalog exceeds materialization budget",
     )
+    # Content verification fetches one stored bundle and its contract at a time, so
+    # charge the largest of those before any of them is read.
+    _admit_retained(
+        workspace.strategies.execute(
+            "SELECT coalesce(max(2048 + 32*(length(CAST(raw_bundle AS BLOB))+"
+            "length(CAST(contract_json AS BLOB)))),0) FROM strategy_versions"
+        ).fetchone(),
+        held.available_bytes,
+        "strategy payload exceeds materialization budget",
+    )
     strategies = workspace.strategies.execute(
         "SELECT strategy_id,version,raw_sha256 FROM strategy_versions"
     ).fetchall()
@@ -158,6 +168,14 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
     # Only the count is needed from here on, so this charge is released.
     del strategies
     verify_strategy_imports(workspace)
+    # read_convention decodes and re-canonicalizes one whole document at a time.
+    _admit_retained(
+        workspace.state.execute(
+            "SELECT coalesce(max(2048 + 128*length(CAST(payload AS BLOB))),0) FROM conventions"
+        ).fetchone(),
+        held.available_bytes,
+        "convention document exceeds materialization budget",
+    )
     for convention in workspace.state.execute(
         "SELECT kind,convention_id,version,content_hash FROM conventions"
     ):
@@ -219,6 +237,15 @@ def _verify_input_documents(workspace: Workspace, budget: ComputeBudget) -> None
         pin = InputBundleRef(*row)
         read_input_bundle(workspace, pin, budget=budget)
     if status.state == "complete":
+        # Each stored request is decoded and canonicalized whole before comparison.
+        _admit_retained(
+            workspace.state.execute(
+                "SELECT coalesce(max(2048 + 128*length(CAST(request_bytes AS BLOB))),0) "
+                "FROM backtest_requests"
+            ).fetchone(),
+            budget.available_bytes,
+            "backtest request exceeds materialization budget",
+        )
         for row in workspace.state.execute(
             "SELECT r.bundle_id,b.content_hash,r.request_hash FROM backtest_requests r "
             "JOIN input_bundles b ON b.bundle_id=r.bundle_id"
