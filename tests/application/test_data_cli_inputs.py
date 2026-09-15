@@ -796,7 +796,9 @@ raise SystemExit(code)
 
 
 @contextmanager
-def observed_read(home: Path, path: Path) -> Iterator[tuple[subprocess.Popen[str], int, int]]:
+def observed_read(
+    home: Path, path: Path, *, command: str = "read-prices"
+) -> Iterator[tuple[subprocess.Popen[str], int, int]]:
     ack_read, ack_write = os.pipe()
     release_read, release_write = os.pipe()
     try:
@@ -808,8 +810,8 @@ def observed_read(home: Path, path: Path) -> Iterator[tuple[subprocess.Popen[str
                 str(ack_write),
                 str(release_read),
                 "data",
-                "read-prices",
-                "--request",
+                command,
+                "--request" if command == "read-prices" else "--spec",
                 str(path),
                 "--sha256",
                 hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -1017,3 +1019,72 @@ def test_invalid_registration_has_no_publication(
     assert result.stdout == ""
     assert json.loads(result.stderr)["error"]
     assert ok(home, "data", "datasets") == before
+
+
+@pytest.mark.parametrize("command", ["convention-import", "binding-import"])
+@pytest.mark.parametrize("kind", ["fifo", "symlink", "directory", "bad_hash", "duplicate", "utf16"])
+def test_pin_import_descriptor_and_transport_rejection(
+    tmp_path: Path, command: str, kind: str
+) -> None:
+    home = tmp_path / "pins"
+    ok(home, "init")
+    path = tmp_path / "spec"
+    raw = (
+        b'{"schema":"aas-input-bundle-v1","hash_format":"aas-canonical-json-sha256-v1",'
+        b'"bundle_id":"b","bindings":[]}'
+    )
+    if kind == "fifo":
+        os.mkfifo(path)
+    elif kind == "symlink":
+        target = tmp_path / "target"
+        target.write_bytes(raw)
+        path.symlink_to(target)
+    elif kind == "directory":
+        path.mkdir()
+    else:
+        if kind == "duplicate":
+            raw = raw.replace(b'"bindings":[]', b'"bindings":[],"bindings":[]')
+        elif kind == "utf16":
+            raw = raw.decode().encode("utf-16")
+        path.write_bytes(raw)
+    digest = "0" * 64 if kind == "bad_hash" else hashlib.sha256(raw).hexdigest()
+    with open_workspace(home) as workspace:
+        before = state_image(workspace)
+    result = run_cli("data", command, "--spec", str(path), "--sha256", digest, home=home)
+    assert result.returncode == 1, result.stderr
+    assert result.stdout == ""
+    assert json.loads(result.stderr)["error"]
+    with open_workspace(home) as workspace:
+        assert state_image(workspace) == before
+    assert ok(home, "doctor")["ready"] is True
+
+
+def test_binding_import_queues_without_workspace_locks(tmp_path: Path) -> None:
+    home = tmp_path / "pins"
+    ok(home, "init")
+    path = tmp_path / "bundle.json"
+    path.write_text(
+        '{"schema":"aas-input-bundle-v1","hash_format":"aas-canonical-json-sha256-v1","bundle_id":"b","bindings":[]}'
+    )
+    lock = Path(os.environ["AAS_COMPUTE_LOCK_FILE"])
+    with ExitStack() as holder:
+        holder.enter_context(compute_lease(lock))
+        with observed_read(home, path, command="binding-import") as (child, ack, release):
+            event = lock_event(ack)
+            assert event["event"] == "compute_denied"
+            assert event["held"] == []
+            assert ok(home, "doctor")["ready"] is True
+            holder.close()
+            assert os.write(release, b"R") == 1
+            done = lock_event(ack)
+            assert done["event"] == "completed"
+            stdout, stderr = child.communicate(timeout=30)
+            assert child.returncode == 0, stderr
+            assert json.loads(stdout)["registered"] is True
+            assert json.loads(stdout)["backtest_eligible"] is False
+            assert done["held"] == []
+            acquisitions = done["acquisitions"]
+            assert isinstance(acquisitions, list)
+            assert [at(item, "path") for item in acquisitions].count(str(lock)) == 1
+            assert at(acquisitions, 0, "path") == str(lock)
+    assert ok(home, "doctor")["ready"] is True

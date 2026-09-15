@@ -54,7 +54,14 @@ def admit(connection: sqlite3.Connection | duckdb.DuckDBPyConnection, *, create:
         except BaseException:
             connection.execute("ROLLBACK")
             raise
-    rows = connection.execute("SELECT version,checksum FROM source_library_schema").fetchall()
+    # Two rows suffice to reject duplicates; never fetch an unbounded checksum.
+    # HEX measures every byte (including NUL/UTF-8) on both engines. Return the
+    # original value, not a prefix, so the exact Python comparison stays intact.
+    rows = connection.execute(
+        """SELECT version,CASE WHEN length(hex(checksum))=? THEN checksum END
+        FROM source_library_schema LIMIT 2""",
+        [2 * len(_CHECKSUM.encode())],
+    ).fetchall()
     if [tuple(row) for row in rows] != [(_VERSION, _CHECKSUM)]:
         raise ValueError("unsupported source-library schema/checksum")
     return True

@@ -12,11 +12,11 @@ Absent pins and unverified catalogs remain reasons, not inferred certification.
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
+from decimal import localcontext
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, assert_never
 
@@ -25,11 +25,14 @@ from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.engine.codec import decode_json
 from aegis_alpha.storage import market
+from aegis_alpha.storage.import_document import ImportDocument, parse_import
 from aegis_alpha.storage.membership_pins import (
     IdentityPin,
     UniversePin,
     read_membership_pins,
 )
+from aegis_alpha.storage.research_inputs import native_input_document
+from aegis_alpha.storage.source_reader import SourcePin
 
 if TYPE_CHECKING:
     from aegis_alpha.storage.workspace import Workspace
@@ -37,6 +40,8 @@ if TYPE_CHECKING:
 type Row = Mapping[str, object]
 type History = tuple[Row, ...]
 type ReaderMode = Literal["strict_pit", "observed_snapshot_research"]
+
+_PROXY_REFS = ("donor_source", "target_source", "basis_ref", "calendar_ref", "cost_ref")
 
 
 def _text(value: object) -> None:
@@ -311,44 +316,55 @@ def _transform(
         "SELECT transform_hash FROM dataset_versions WHERE generation_id=?", (generation,)
     ).fetchone()
     digest = str(catalog[0])
-    _digest(digest)
-    # JSON objects can cost much more than encoded bytes; bound before reading.
-    with DescriptorTree.open_path(workspace.paths.raw) as tree:
-        payload = tree.read_bytes(
-            digest[:2] + "/" + digest,
-            max_bytes=(budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes) // 256,
-        )
-    if hashlib.sha256(payload).hexdigest() != digest:
-        raise ValueError("pinned transform hash mismatch")
-    body = decode_json(payload)
+    body = decode_json(_raw_payload(workspace, digest, budget))
     if not isinstance(body, dict):
         raise TypeError("pinned transform must be an object")
     return digest, body
 
 
+def _raw_payload(workspace: Workspace, digest: str, budget: ComputeBudget) -> bytes:
+    _digest(digest)
+    # JSON objects can cost much more than encoded bytes; bound before reading.
+    with DescriptorTree.open_path(workspace.paths.raw) as tree:
+        payload = tree.read_bytes(
+            digest[:2] + "/" + digest,
+            max_bytes=(budget.available_bytes) // 32,
+        )
+    if hashlib.sha256(payload).hexdigest() != digest:
+        raise ValueError("pinned transform hash mismatch")
+    return payload
+
+
+def _verify_catalog(workspace: Workspace, marker: Row) -> None:
+    catalog = workspace.state.execute(
+        "SELECT 1 FROM dataset_versions WHERE status='committed' AND dataset_id=? "
+        "AND version=? AND generation_id=? AND chain_hash=? AND manifest_hash=? "
+        "AND row_count=? AND parent_generation_id IS ? AND sequence=? AND record_schema=?",
+        tuple(
+            marker[key]
+            for key in (
+                "dataset_id",
+                "version",
+                "generation_id",
+                "chain_hash",
+                "request_hash",
+                "row_count",
+                "parent_id",
+                "sequence",
+                "record_schema",
+            )
+        ),
+    ).fetchone()
+    if catalog is None:
+        raise ValueError("catalog and market generation disagree")
+
+
 def _load(workspace: Workspace, pin: GenerationPin, budget: ComputeBudget, domain: str) -> History:
     # Admit before any full materialization. read_dataset performs an unbounded
     # rehash; reuse its catalog/marker contract here after the bounded chain read.
-    history = market.read_chain_rows(workspace.market, pin.generation_id, budget=budget)
+    history = verify_sealed_publication(workspace, pin.generation_id, budget=budget)
     chain = market.generation_chain(workspace.market, pin.generation_id)
     for marker in chain:
-        catalog = workspace.state.execute(
-            "SELECT * FROM dataset_versions WHERE generation_id=? AND status='committed'",
-            (marker["generation_id"],),
-        ).fetchone()
-        pairs = {
-            "dataset_id": "dataset_id",
-            "version": "version",
-            "generation_id": "generation_id",
-            "chain_hash": "chain_hash",
-            "manifest_hash": "request_hash",
-            "row_count": "row_count",
-            "parent_generation_id": "parent_id",
-            "sequence": "sequence",
-            "record_schema": "record_schema",
-        }
-        if catalog is None or any(catalog[left] != marker[right] for left, right in pairs.items()):
-            raise ValueError("catalog and market generation disagree")
         if marker["domain"] != domain or marker["dataset_id"] != pin.dataset_id:
             raise ValueError("pin has incompatible dataset/domain")
     head = chain[-1]
@@ -361,6 +377,164 @@ def _load(workspace: Workspace, pin: GenerationPin, budget: ComputeBudget, domai
     ):
         raise ValueError("exact generation pin does not match catalog/marker")
     return history
+
+
+def _publication_source(workspace: Workspace, document: ImportDocument) -> None:
+    digest = document.sha256
+    sources = workspace.state.execute(
+        "SELECT count(*),sum(source_snapshot_id=?) FROM dataset_sources "
+        "WHERE dataset_id=? AND version=?",
+        (document.source_id, document.body["dataset_id"], document.body["version"]),
+    ).fetchone()
+    files = workspace.state.execute(
+        "SELECT count(*),sum(relative_path=? AND byte_hash=? AND size_bytes=?) "
+        "FROM source_files WHERE snapshot_id=?",
+        (digest[:2] + "/" + digest, digest, len(document.payload), document.source_id),
+    ).fetchone()
+    source = workspace.state.execute(
+        "SELECT 1 FROM source_snapshots WHERE snapshot_id=? AND provider=? "
+        "AND publication_at_us IS ? AND status='raw_verified'",
+        (document.source_id, document.body["provider"], document.body["publication_at_us"]),
+    ).fetchone()
+    if tuple(sources) != (1, 1) or tuple(files) != (1, 1) or source is None:
+        raise ValueError("publication source lineage conflicts with sealed import")
+
+
+def _sealed_publication(
+    workspace: Workspace, marker: Row, history: History, budget: ComputeBudget
+) -> ImportDocument:
+    """Authenticate existing v1 commitments; opaque transforms require no retained preimage."""
+    document = parse_import(_raw_payload(workspace, str(marker["request_hash"]), budget))
+    catalog = workspace.state.execute(
+        "SELECT 1 FROM dataset_versions WHERE generation_id=? "
+        "AND transform_hash=? AND normalizer_version=?",
+        (
+            marker["generation_id"],
+            document.body["transform_sha256"],
+            document.body["normalizer_version"],
+        ),
+    ).fetchone()
+    if catalog is None or any(
+        document.body[key] != marker[key]
+        for key in ("dataset_id", "version", "generation_id", "operation_id", "parent_id", "domain")
+    ):
+        raise ValueError("transform/catalog conflicts with publication evidence")
+    operation = workspace.state.execute(
+        "SELECT created_at_us FROM storage_operations WHERE operation_id=? "
+        "AND kind='market_publish' AND phase='COMPLETED' AND request_hash=? "
+        "AND payload_hash=? AND target_id=? AND expected_parent IS ?",
+        (
+            marker["operation_id"],
+            document.sha256,
+            document.sha256,
+            marker["generation_id"],
+            marker["parent_id"],
+        ),
+    ).fetchone()
+    if operation is None:
+        raise ValueError("publication has no matching completed intent")
+    _publication_source(workspace, document)
+    with localcontext() as context:
+        context.prec = 50
+        expected = market.normalize_rows(
+            str(marker["domain"]),
+            str(marker["generation_id"]),
+            [{**row, "ingested_at_us": operation["created_at_us"]} for row in document.rows],
+        )
+    delta = [row for row in history if row["generation_id"] == marker["generation_id"]]
+    if sorted(expected, key=lambda row: str(row["record_id"])) != delta:
+        raise ValueError("rows conflict with publication evidence")
+    return document
+
+
+def _admit_publication_chain(
+    workspace: Workspace, generation_id: str, budget: ComputeBudget
+) -> None:
+    """Admit variable-width marker identities before the market owner builds its chain."""
+    current: object = generation_id
+    seen: set[object] = set()
+    estimated = 0
+    while current is not None:
+        if current in seen:
+            raise ValueError("market generation cycle")
+        size = workspace.market.execute(
+            "SELECT 2048+32*(length(generation_id)+length(dataset_id)+length(version)+"
+            "coalesce(length(parent_id),0)+length(domain)+length(record_schema)+"
+            "length(operation_id)+length(request_hash)+length(delta_hash)+length(chain_hash)) "
+            "FROM market_generations WHERE generation_id=?",
+            [current],
+        ).fetchone()
+        if size is None:
+            raise ValueError("market generation does not exist")
+        estimated += size[0]
+        if estimated > (budget.available_bytes) // 8:
+            raise ComputeResourceError("publication chain exceeds materialization budget")
+        seen.add(current)
+        current = market.marker_for(workspace.market, str(current))["parent_id"]
+
+
+def verify_sealed_publication(
+    workspace: Workspace, generation_id: str, *, budget: ComputeBudget
+) -> History:
+    """Verify an exact generation and every retained sealed delta, with bounded materialization.
+
+    SELECT-only apart from the market owner's connection resource limits. This proves
+    content/intent/catalog/row and opaque transform-hash equality, not an unrecorded
+    native registration route, provider authority or execution eligibility.
+    """
+    _admit_publication_chain(workspace, generation_id, budget)
+    history = market.read_chain_rows(workspace.market, generation_id, budget=budget)
+    deltas: dict[str, list[Row]] = {}
+    for row in history:
+        deltas.setdefault(str(row["generation_id"]), []).append(row)
+    for marker in market.generation_chain(workspace.market, generation_id):
+        _verify_catalog(workspace, marker)
+        delta = tuple(deltas.get(str(marker["generation_id"]), ()))
+        _sealed_publication(workspace, marker, delta, budget)
+    return history
+
+
+@dataclass(frozen=True, slots=True)
+class NativeInputAdmission:
+    history: History
+    source_pins: tuple[SourcePin, ...]
+
+
+def admit_native_input(
+    workspace: Workspace, pin: GenerationPin, *, expected_schema: str, budget: ComputeBudget
+) -> NativeInputAdmission:
+    """Require retained native price/session evidence, never fall back to opaque content.
+
+    The caller declares its purpose with aas-price-transform-v1 or
+    aas-sessions-transform-v1. Reconstruct every delta through the registration
+    owner's parser and retained source table, in addition to sealed integrity.
+    Return detached history and unique native SourcePins in first-revision order,
+    so consumers need no application-local provenance parser.
+    No provider authority, PIT eligibility or executable readiness is conferred.
+    """
+    domains = {"aas-price-transform-v1": "prices", "aas-sessions-transform-v1": "calendar_sessions"}
+    if expected_schema not in domains:
+        raise ValueError("unsupported native input transform schema")
+    # Halve the allocation for one component while carrying the caller's reserve;
+    # a fresh ComputeBudget would silently reset it to zero.
+    component = replace(budget, memory_limit_bytes=budget.memory_limit_bytes // 2)
+    history = _load(workspace, pin, component, domains[expected_schema])
+    sources: dict[SourcePin, None] = {}
+    for marker in market.generation_chain(workspace.market, pin.generation_id):
+        catalog = workspace.state.execute(
+            "SELECT transform_hash FROM dataset_versions WHERE generation_id=?",
+            (marker["generation_id"],),
+        ).fetchone()
+        document, source = native_input_document(
+            workspace,
+            _raw_payload(workspace, catalog[0], component),
+            expected_schema=expected_schema,
+            budget=component,
+        )
+        if document.sha256 != marker["request_hash"]:
+            raise ValueError("native transform/source conflicts with publication evidence")
+        sources[source] = None
+    return NativeInputAdmission(history, tuple(sources))
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,8 +575,7 @@ def _members(
         workspace.state,
         request.identity_pin,
         request.universe_pin,
-        max_materialization_bytes=(budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes)
-        // 8,
+        max_materialization_bytes=(budget.available_bytes) // 8,
     )
     return (
         verified.identity.members if verified.identity is not None else (),
@@ -535,21 +708,21 @@ def load_pinned_prices(
     No provider/identity/universe/authority certification is inferred from hashes.
     """
     cells = len(request.instrument_ids) * len(request.session_dates)
-    if cells * 2048 > (budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes) // 8:
+    if cells * 2048 > (budget.available_bytes) // 8:
         raise ComputeResourceError(
             "requested coverage grid exceeds admitted materialization budget"
         )
-    history = _load(
+    history = admit_native_input(
         workspace,
         request.pin,
-        ComputeBudget(budget.cpu_limit, budget.memory_limit_bytes // 2),
-        "prices",
-    )
+        expected_schema="aas-price-transform-v1",
+        budget=replace(budget, memory_limit_bytes=budget.memory_limit_bytes // 2),
+    ).history
     sessions = (
         load_pinned_sessions(
             workspace,
             request.sessions_pin,
-            budget=ComputeBudget(budget.cpu_limit, budget.memory_limit_bytes // 4),
+            budget=replace(budget, memory_limit_bytes=budget.memory_limit_bytes // 4),
         )
         if request.sessions_pin
         else None
@@ -625,63 +798,188 @@ def load_pinned_proxy(
     history = _load(
         workspace,
         pin,
-        ComputeBudget(budget.cpu_limit, budget.memory_limit_bytes // 2),
+        replace(budget, memory_limit_bytes=budget.memory_limit_bytes // 2),
         "feature_values",
     )
+    definition = verify_proxy_content(workspace, history, budget=budget)
+    return PinnedProxySeries(pin, history, definition)
+
+
+def _proxy_publication(
+    workspace: Workspace, transform_hash: str, transform: dict[str, object], budget: ComputeBudget
+) -> History:
+    """Authenticate the transform pointer with the independently sealed import bytes."""
+    destination = transform.get("dataset")
+    if not isinstance(destination, dict):
+        raise TypeError("proxy transform lacks publication identity")
+    catalog = workspace.state.execute(
+        "SELECT * FROM dataset_versions WHERE generation_id=? AND status='committed'",
+        (destination.get("generation_id"),),
+    ).fetchone()
+    if catalog is None or catalog["transform_hash"] != transform_hash:
+        raise ValueError("proxy transform/catalog mismatch")
+    pin = GenerationPin(
+        *(
+            catalog[key]
+            for key in ("dataset_id", "version", "generation_id", "chain_hash", "manifest_hash")
+        )
+    )
+    marker = market.marker_for(workspace.market, pin.generation_id)
+    document = parse_import(_raw_payload(workspace, pin.manifest_hash, budget))
+    if (
+        document.sha256 != pin.manifest_hash
+        or destination
+        != {
+            key: marker[key]
+            for key in ("dataset_id", "version", "generation_id", "operation_id", "parent_id")
+        }
+        or any(document.body[key] != value for key, value in destination.items())
+        or document.body["domain"] != "feature_values"
+        or document.body["transform_sha256"] != transform_hash
+        or document.body["normalizer_version"] != catalog["normalizer_version"]
+        or any(
+            document.body.get(key) != transform.get(key)
+            for key in ("provider", "publication_at_us", "normalizer_version", "instruments")
+        )
+    ):
+        raise ValueError("proxy transform conflicts with publication evidence")
+    return _proxy_publication_delta(workspace, pin, document, budget)
+
+
+def _proxy_publication_delta(
+    workspace: Workspace, pin: GenerationPin, document: ImportDocument, budget: ComputeBudget
+) -> History:
+    """Match the whole referencing delta to its sealed import, before selecting rows."""
+    history = _load(
+        workspace,
+        pin,
+        replace(budget, memory_limit_bytes=budget.memory_limit_bytes // 2),
+        "feature_values",
+    )
+    if document.sha256 != pin.manifest_hash:
+        raise ValueError("proxy catalog conflicts with publication evidence")
+    return tuple(row for row in history if row["generation_id"] == pin.generation_id)
+
+
+def verify_proxy_publications(workspace: Workspace, *, budget: ComputeBudget) -> None:
+    """Discover referencing rows from sealed imports, never mutable feature identities."""
+    contracts: set[tuple[str, str]] = {
+        (row[0], row[1])
+        for row in workspace.state.execute(
+            "SELECT name,version FROM feature_contracts WHERE record_schema='aas-market-rowset-v1'"
+        )
+    }
+    if not contracts:
+        return
+    retained: set[tuple[str, str]] = set()
+    for catalog in workspace.state.execute(
+        "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash "
+        "FROM dataset_versions WHERE status='committed'"
+    ):
+        pin = GenerationPin(*catalog)
+        marker = market.marker_for(workspace.market, pin.generation_id)
+        if marker["domain"] != "feature_values":
+            continue
+        # The marker's original request is independent of both live row fields
+        # and catalog transform pointers. _load below also checks the manifest.
+        document = parse_import(_raw_payload(workspace, str(marker["request_hash"]), budget))
+        referenced = contracts.intersection(
+            (row["contract_id"], row["contract_version"]) for row in document.rows
+        )
+        if not referenced:
+            continue
+        delta = _proxy_publication_delta(workspace, pin, document, budget)
+        for identity in sorted(referenced):
+            rows = tuple(
+                row for row in delta if (row["contract_id"], row["contract_version"]) == identity
+            )
+            verify_proxy_content(workspace, rows, budget=budget)
+        retained.update(referenced)
+    if contracts - retained:
+        raise ValueError("proxy definition has no retained feature generation")
+
+
+def _verify_proxy_catalog(workspace: Workspace, generation: str, transform_hash: str) -> None:
+    _verify_catalog(workspace, market.marker_for(workspace.market, generation))
+    catalog = workspace.state.execute(
+        "SELECT transform_hash FROM dataset_versions WHERE generation_id=?", (generation,)
+    ).fetchone()
+    if catalog[0] != transform_hash:
+        raise ValueError("proxy transform/catalog mismatch")
+
+
+def verify_proxy_content(workspace: Workspace, history: History, *, budget: ComputeBudget) -> str:
+    """Verify one definition, its publication and the supplied referencing revisions.
+
+    Integrity callers supply only that definition's rows, even in mixed histories.
+    The specialized reader supplies its entire pinned history, retaining its
+    single-definition compatibility restriction. Neither path changes stored data.
+    """
     first = history[0]
     size = workspace.state.execute(
         "SELECT length(CAST(definition AS BLOB)) FROM feature_contracts WHERE name=? AND version=?",
         (first["contract_id"], first["contract_version"]),
     ).fetchone()
-    if (
-        size is not None
-        and size[0] * 256 > budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes
-    ):
+    if size is not None and size[0] * 256 > budget.available_bytes:
         raise ComputeResourceError("proxy contract exceeds admitted materialization budget")
     contract = workspace.state.execute(
-        "SELECT definition, content_hash FROM feature_contracts WHERE name=? AND version=?",
+        "SELECT definition, content_hash, record_schema FROM feature_contracts "
+        "WHERE name=? AND version=?",
         (first["contract_id"], first["contract_version"]),
     ).fetchone()
     if (
         contract is None
+        or contract["record_schema"] != "aas-market-rowset-v1"
         or hashlib.sha256(contract["definition"].encode()).hexdigest() != contract["content_hash"]
     ):
         raise ValueError("proxy feature contract is absent or corrupt")
-    definition = json.loads(contract["definition"])
-    transform_hash, transform = _transform(workspace, pin.generation_id, budget)
+    definition = decode_json(contract["definition"].encode())
     if (
-        transform.get("proxy") != definition
+        not isinstance(definition, dict)
+        or canonical_json_bytes(definition).decode() != contract["definition"]
+        or definition.get("proxy_id") != first["contract_id"]
+        or definition.get("version") != first["contract_version"]
+    ):
+        raise ValueError("proxy feature contract identity mismatch")
+    registered = workspace.state.execute(
+        "SELECT ordinal, ref_kind, ref_id, ref_version, content_hash FROM feature_inputs "
+        "WHERE name=? AND version=? ORDER BY ordinal",
+        (first["contract_id"], first["contract_version"]),
+    ).fetchall()
+    if len(registered) != len(_PROXY_REFS) + 1:
+        raise ValueError("proxy feature inputs mismatch")
+    transform_hash = registered[-1]["ref_id"]
+    transition = definition["transition"]
+    bundle = [transition[key] for key in _PROXY_REFS]
+    digest = hashlib.sha256(canonical_json_bytes(bundle)).hexdigest()
+    inputs = [
+        (
+            key + ":" + source["table"],
+            source["source_id"],
+            source["source_sha256"],
+            source["table_digest"],
+        )
+        for key in ("donor_source", "target_source")
+        for source in (transition[key],)
+    ]
+    inputs.extend(
+        (key, ref["id"], ref["version"], ref["sha256"])
+        for key in ("basis_ref", "calendar_ref", "cost_ref")
+        for ref in (transition[key],)
+    )
+    inputs.append(("transform", transform_hash, "aas-proxy-transform-v1", transform_hash))
+    if [tuple(row) for row in registered] != [
+        (ordinal, *item) for ordinal, item in enumerate(inputs)
+    ]:
+        raise ValueError("proxy feature inputs mismatch")
+    transform = decode_json(_raw_payload(workspace, transform_hash, budget))
+    if (
+        not isinstance(transform, dict)
+        or transform.get("proxy") != definition
         or transform.get("schema_version") != "aas-proxy-transform-v1"
     ):
         raise ValueError("proxy transform conflicts with feature contract")
-    transition = definition["transition"]
-    bundle = [
-        transition[key]
-        for key in ("donor_source", "target_source", "basis_ref", "calendar_ref", "cost_ref")
-    ]
-    digest = hashlib.sha256(canonical_json_bytes(bundle)).hexdigest()
-    inputs = []
-    for key in ("donor_source", "target_source"):
-        source = transition[key]
-        inputs.append(
-            (
-                key + ":" + source["table"],
-                source["source_id"],
-                source["source_sha256"],
-                source["table_digest"],
-            )
-        )
-    for key in ("basis_ref", "calendar_ref", "cost_ref"):
-        ref = transition[key]
-        inputs.append((key, ref["id"], ref["version"], ref["sha256"]))
-    inputs.append(("transform", transform_hash, "aas-proxy-transform-v1", transform_hash))
-    registered = workspace.state.execute(
-        "SELECT ref_kind, ref_id, ref_version, content_hash FROM feature_inputs "
-        "WHERE name=? AND version=? ORDER BY ordinal",
-        (definition["proxy_id"], definition["version"]),
-    ).fetchall()
-    if [tuple(row) for row in registered] != inputs:
-        raise ValueError("proxy feature inputs mismatch")
+    delta = _proxy_publication(workspace, transform_hash, transform, budget)
     expected = {
         "contract_id": definition["proxy_id"],
         "contract_version": definition["version"],
@@ -689,12 +987,14 @@ def load_pinned_proxy(
         "input_bundle_hash": digest,
         "instrument_id": transition["logical_exposure_id"],
     }
-    if any(row[key] != value for row in history for key, value in expected.items()):
+    if any(row[key] != value for row in (*delta, *history) for key, value in expected.items()):
         raise ValueError("proxy points conflict with pinned definition/inputs")
+    for generation in dict.fromkeys(str(row["generation_id"]) for row in history):
+        _verify_proxy_catalog(workspace, generation, transform_hash)
     identity = workspace.state.execute(
         "SELECT asset_type FROM instruments WHERE instrument_id=?",
         (transition["logical_exposure_id"],),
     ).fetchone()
     if identity is None or identity[0] != "proxy":
         raise ValueError("proxy requires a non-executable logical exposure identity")
-    return PinnedProxySeries(pin, history, contract["definition"])
+    return contract["definition"]

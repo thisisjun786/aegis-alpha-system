@@ -11,15 +11,17 @@ import os
 import shutil
 import sqlite3
 from contextlib import ExitStack, closing
+from fractions import Fraction
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, cast
 
+from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.storage import source_library_schema as schema
 from aegis_alpha.storage.paths import private_source_file as private_file
 from aegis_alpha.storage.paths import same_private_file
-from aegis_alpha.storage.source_library_digest import arrow_digest, sqlite_digest
+from aegis_alpha.storage.source_library_digest import BATCH_ROWS, arrow_digest, sqlite_digest
 from aegis_alpha.storage.state import complete_operation, get_operation, prepare_operation
 
 if TYPE_CHECKING:
@@ -31,6 +33,15 @@ if TYPE_CHECKING:
 
 _MAX_SOURCE_ID = 240
 _SHA_LENGTH = 64
+# Both digests consume a table in BATCH_ROWS units, so the live set is one
+# canonical batch rather than the whole table. Measured on this tree, the worst
+# sqlite_digest case is escape-heavy text: a megabyte of NUL characters becomes
+# six-character escapes and peaks at 13.5x its bytes, against 4.5x for quotes or
+# backslashes, 4.33x for a blob and 2.25x for plain ASCII. arrow_digest retains
+# about 1.26x a batch plus roughly 8 bytes per cell. These carry margin over
+# those observations.
+_DIGEST_BYTE_FACTOR = 32
+_DIGEST_CELL_BYTES = 64
 
 
 def _identity(source_id: str, digest: str) -> None:
@@ -246,12 +257,74 @@ def import_arrow(  # noqa: PLR0913 -- public provenance and reader inputs
     return ingest_arrow(workspace, source_id, sha256, table_name, reader, metadata=metadata)
 
 
-def _verify_manifest(workspace: Workspace, manifest: dict[str, object]) -> None:
-    import pyarrow as pa  # noqa: PLC0415
+def _admit_source_batch(
+    conn: sqlite3.Connection | duckdb.DuckDBPyConnection,
+    table: dict[str, object],
+    store: str,
+    columns: list[str],
+    allowance: int,
+) -> None:
+    """Bound the largest canonical batch before either digest reads the table.
 
+    Variable-width values are charged in bytes because retained SQLite columns are
+    declared ANY, so one cell can hold an arbitrary blob and a per-cell constant
+    would not bound it. The maximum batch is preflighted rather than the first,
+    since a large value placed after the first batch would otherwise pass.
+    """
+    if store == "market":
+        widths = [
+            "coalesce(octet_length(encode(CAST(" + schema.quoted(name) + " AS VARCHAR))),0)"
+            for name in columns
+        ]
+        # DuckDB division is fractional; integer division keeps real batch groups.
+        divide = "//"
+    else:
+        widths = [
+            "coalesce(length(CAST(" + schema.quoted(name) + " AS BLOB)),0)" for name in columns
+        ]
+        divide = "/"
+    # Project only the bucket and the row width. SELECT * would carry every source
+    # column into the grouping, and a column literally named like the bucket would
+    # silently regroup the charge. Combine each batch's own row and byte terms
+    # before taking the maximum, because the widest batch and the fullest batch
+    # need not be the same one.
+    charge = cast(
+        "tuple[int]",
+        conn.execute(
+            "SELECT coalesce(max("
+            + str(_DIGEST_CELL_BYTES * len(columns))
+            + "*n+"
+            + str(_DIGEST_BYTE_FACTOR)
+            + "*b),0) FROM (SELECT count(*) AS n, coalesce(sum(w),0) AS b FROM ("
+            "SELECT (row_number() OVER (ORDER BY _aas_ordinal) - 1) "
+            + divide
+            + " "
+            + str(BATCH_ROWS)
+            + " AS g, "
+            + "+".join(widths)
+            + " AS w FROM "
+            + schema.quoted(str(table["target"]))
+            + ") GROUP BY g)"
+        ).fetchone(),
+    )[0]
+    if charge > allowance:
+        raise ComputeResourceError("source table batch exceeds materialization budget")
+
+
+def _verify_manifest(
+    workspace: Workspace, manifest: dict[str, object], allowance: int | None = None
+) -> None:
+    """Verify retained content. Callers that own a compute allocation pass it here.
+
+    The import and recovery callers admit their own input at their own boundary and
+    intentionally pass no allowance; charging them would reject a legitimate large
+    sparse import. Budgeting the recovery command is a separate change.
+    """
     conn = schema.connections(workspace)[str(manifest["store"])]
     for table in cast("list[dict[str, object]]", manifest["tables"]):
         columns = cast("list[str]", table["columns"])
+        if allowance is not None:
+            _admit_source_batch(conn, table, str(manifest["store"]), columns, allowance)
         order = "_aas_ordinal"
         query = (
             "SELECT "
@@ -264,6 +337,10 @@ def _verify_manifest(workspace: Workspace, manifest: dict[str, object]) -> None:
         if table["format"] == "sqlite":
             observed = sqlite_digest(cast("sqlite3.Connection", conn).execute(query))
         else:
+            # Only the Arrow path needs pyarrow. A default installation omits it,
+            # so importing it for a SQLite source would break maintenance there.
+            import pyarrow as pa  # noqa: PLC0415
+
             original = pa.ipc.read_schema(
                 pa.BufferReader(base64.b64decode(str(table["arrow_schema"])))
             )
@@ -310,6 +387,115 @@ def list_tables(workspace: Workspace, source_id: str) -> list[dict[str, object]]
     return cast("list[dict[str, object]]", _visible(workspace, source_id)["tables"])
 
 
+def _admit_source_metadata(workspace: Workspace, max_materialization_bytes: int) -> int:
+    # list_sources fetches all markers before visibility filtering; _marker also
+    # fetches store_kind. Charge every field, including NULs and UTF-8 bytes;
+    # SQLite's nullable source_id primary key must not hide a whole row's size.
+    connections = schema.connections(workspace)
+    estimated = 0
+    for kind, conn in connections.items():
+        size = "+".join(
+            "coalesce(octet_length(encode(" + field + ")),0)"
+            if kind == "market"
+            else "coalesce(length(CAST(" + field + " AS BLOB)),0)"
+            for field in (
+                "source_id",
+                "operation_id",
+                "request_hash",
+                "source_sha256",
+                "store_kind",
+                "manifest_json",
+            )
+        )
+        aggregate = cast(
+            "tuple[int]",
+            conn.execute(
+                "SELECT count(*)*2048+coalesce(sum(32*("
+                + size
+                + ")),0) FROM source_library_commits"
+            ).fetchone(),
+        )
+        estimated += aggregate[0]
+        if estimated > max_materialization_bytes:
+            raise ComputeResourceError("source metadata exceeds materialization budget")
+    # Only now may operation IDs enter Python. get_operation materializes all
+    # eight text fields even when list_sources subsequently ignores the source.
+    # Scope this to referenced intents, not every operation in the installation.
+    operation_size = "+".join(
+        "coalesce(length(CAST(" + field + " AS BLOB)),0)"
+        for field in (
+            "operation_id",
+            "kind",
+            "request_hash",
+            "target_id",
+            "expected_parent",
+            "payload_hash",
+            "phase",
+            "failure_reason",
+        )
+    )
+    for conn in connections.values():
+        for (operation_id,) in conn.execute(
+            "SELECT operation_id FROM source_library_commits"
+        ).fetchall():
+            aggregate = workspace.state.execute(
+                "SELECT 2048+32*(" + operation_size + ") FROM storage_operations "
+                "WHERE operation_id=?",
+                (operation_id,),
+            ).fetchone()
+            if aggregate is not None:
+                estimated += aggregate[0]
+                if estimated > max_materialization_bytes:
+                    raise ComputeResourceError(
+                        "source operation metadata exceeds materialization budget"
+                    )
+    return estimated
+
+
+def admit_source_table(
+    workspace: Workspace, source_id: str, table_name: str, *, max_materialization_bytes: int
+) -> None:
+    """Bound the existing source reader's metadata and complete table before it fetches.
+
+    This SELECT-only capacity check is not content authentication: resolve_source
+    remains the owner of exact SourcePin/intent/marker/table digest verification.
+    Account for all columns, including unmapped variable-width source evidence.
+    """
+    if not schema.ensure(workspace):
+        raise ValueError("native input requires retained source evidence")
+    connections = schema.connections(workspace)
+    estimated = _admit_source_metadata(workspace, max_materialization_bytes)
+    marker = _marker(workspace, source_id)
+    if marker is None:
+        raise ValueError("native input requires retained source evidence")
+    manifest = json.loads(str(marker[4]))
+    tables = [table for table in manifest["tables"] if table["name"] == table_name]
+    if len(tables) != 1:
+        raise ValueError("native input requires one retained source table")
+    table = tables[0]
+    kind = str(marker[3])
+    sizes = [
+        "coalesce(octet_length(encode(CAST(" + schema.quoted(column) + " AS VARCHAR))),0)"
+        if kind == "market"
+        else "coalesce(length(CAST(" + schema.quoted(column) + " AS BLOB)),0)"
+        for column in table["columns"]
+    ]
+    count, size = cast(
+        "tuple[int, int]",
+        connections[kind]
+        .execute(
+            "SELECT count(*),coalesce(sum("
+            + "+".join(sizes)
+            + "),0) FROM "
+            + schema.quoted(table["target"])
+        )
+        .fetchone(),
+    )
+    estimated += count * (2048 + 512 * len(sizes)) + 32 * size
+    if estimated > max_materialization_bytes:
+        raise ComputeResourceError("source table exceeds materialization budget")
+
+
 def read_table(
     workspace: Workspace, source_id: str, table_name: str, limit: int = 100
 ) -> dict[str, object]:
@@ -319,9 +505,19 @@ def read_table(
     return dict(inspect_source(workspace, source_id, table_name, limit=limit))
 
 
-def verify_sources(workspace: Workspace) -> dict[str, object] | None:
+def verify_sources(
+    workspace: Workspace, *, budget: ComputeBudget | None = None
+) -> dict[str, object] | None:
+    """Verify retained sources within whatever the caller's budget still allows."""
     if not schema.ensure(workspace):
         return None
+    budget = budget or ComputeBudget(Fraction(1), 512 * 1024 * 1024)
+    allowance = budget.available_bytes
+    # Metadata stays live while every table is verified, so table admission gets
+    # only what is left. This replaces the earlier unadmitted marker fetch.
+    remaining = allowance - _admit_source_metadata(workspace, allowance)
+    if remaining <= 0:
+        raise ComputeResourceError("source metadata leaves no verification budget")
     total = tables = sources = 0
     for conn in schema.connections(workspace).values():
         for row in conn.execute(
@@ -337,7 +533,7 @@ def verify_sources(workspace: Workspace) -> dict[str, object] | None:
             ) != ("source_import", row[2], row[0], row[3]):
                 raise ValueError("source marker/intent mismatch")
             manifest = json.loads(row[4])
-            _verify_manifest(workspace, manifest)
+            _verify_manifest(workspace, manifest, remaining)
             if operation["phase"] == "COMPLETED":
                 sources += 1
                 tables += len(manifest["tables"])

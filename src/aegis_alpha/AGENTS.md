@@ -8,10 +8,10 @@ the package root has no legacy persistence facade.
 
 | Owner | Responsibility |
 | --- | --- |
-| `application/` | CLI, strict allocation inputs, portfolio composition, data/provider adapters |
+| `application/` | CLI, strict allocation inputs, portfolio composition, SELECT-only stored-input preparation (`backtest_prepare.py`, `prepare_cli.py`), data/provider adapters |
 | `modules/` | Aegis, Alpha and Hedge responsibilities |
-| `engine/` | Versioned external bundles, generic signals, allocation and receipts |
-| `storage/` | Current embedded SQLite/DuckDB installation, private strategy store, typed market history, recovery |
+| `engine/` | Versioned external bundles, generic signals, allocation and receipts; pure prepare-request schema/projection/envelope export and decision scheduling |
+| `storage/` | Current embedded SQLite/DuckDB installation, private strategy store, typed market history, convention/definition/membership pins, run add-on schema, recovery |
 | `data/` | Provider acquisition, immutable files, pinned catalog reads |
 | `identity/` | Issuer/instrument/identifier facts and provider mappings |
 | `metadata/` | Catalog, feature contracts, installation and validated adoption |

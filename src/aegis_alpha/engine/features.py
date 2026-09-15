@@ -69,10 +69,15 @@ class AssetFeatures:
 def build_feature_matrix(
     prices: Mapping[str, Sequence[PricePoint]],
     request: FeatureBuildRequest,
+    *,
+    knowledge_as_of: date | None = None,
 ) -> dict[str, AssetFeatures]:
+    """Select economic buckets at evaluation_date; guard evidence at knowledge_as_of."""
+    cutoff = knowledge_as_of or request.evaluation_date
     window = _history_window(
         prices,
         evaluation_date=request.evaluation_date,
+        knowledge_as_of=cutoff,
         length=request.history_observations,
         drop_before_day=request.drop_before_day,
     )
@@ -90,7 +95,7 @@ def build_feature_matrix(
             )
         reject_stale(
             observation_date=latest.observed_on,
-            as_of=request.evaluation_date,
+            as_of=cutoff,
             gates=request.gates,
             kind=ObservationKind.PRICE,
         )
@@ -125,6 +130,7 @@ def _history_window(
     prices: Mapping[str, Sequence[PricePoint]],
     *,
     evaluation_date: date,
+    knowledge_as_of: date,
     length: int,
     drop_before_day: int,
 ) -> dict[str, tuple[PricePoint, ...]]:
@@ -135,7 +141,7 @@ def _history_window(
         for point in sorted(series, key=lambda item: item.as_of):
             if point.as_of > evaluation_date:
                 continue
-            reject_post_cutoff(observation_date=point.observed_on, as_of=evaluation_date)
+            reject_post_cutoff(observation_date=point.observed_on, as_of=knowledge_as_of)
             eligible.append(point)
         monthly = _month_end_snap(eligible)
         if (

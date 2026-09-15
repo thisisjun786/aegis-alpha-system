@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+from collections.abc import Callable
 from pathlib import Path
 
+import duckdb
 import pytest
 
 from aegis_alpha.storage.locks import file_lock
@@ -153,3 +156,191 @@ def test_unowned_sqlite_not_adopted_or_reconfigured(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="unowned"):
         initialize(home)
     assert path.read_bytes() == before
+
+
+class MarketCloseBoundary:
+    """Delegate DB behavior unchanged; invoke a fault only after the real close."""
+
+    def __init__(self, connection: duckdb.DuckDBPyConnection, boundary: Callable[[], None]) -> None:
+        self.connection = connection
+        self.boundary = boundary
+        self.closed = False
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.connection, name)
+
+    def close(self) -> None:
+        self.connection.close()
+        if not self.closed:
+            self.closed = True
+            with pytest.raises(duckdb.ConnectionException):
+                self.connection.execute("SELECT 1")
+            self.boundary()
+
+
+@pytest.mark.parametrize("replacement", ["older", "clone"])
+@pytest.mark.parametrize("boundary", ["before_maintenance", "real_close"])
+def test_backup_rejects_same_store_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replacement: str, boundary: str
+) -> None:
+    from aegis_alpha.storage.backup import backup, backup_workspace  # noqa: PLC0415
+    from aegis_alpha.storage.import_document import parse_import  # noqa: PLC0415
+    from aegis_alpha.storage.publication import publish_document  # noqa: PLC0415
+    from aegis_alpha.storage.verification import verify_workspace  # noqa: PLC0415
+    from tests.storage.test_publication import document  # noqa: PLC0415
+
+    home, old, output = tmp_path / "home", tmp_path / "old", tmp_path / "output"
+    initialize(home)
+    backup(home, old)
+    path = home / "market.duckdb"
+    incoming = tmp_path / "incoming.duckdb"
+    with open_workspace(home, writable=True) as workspace:
+        publish_document(workspace, parse_import(document()))
+        assert verify_workspace(workspace)["dataset_versions"] == 1
+        workspace.market.execute("CHECKPOINT")
+        shutil.copyfile(old / "market.duckdb" if replacement == "older" else path, incoming)
+        incoming.chmod(0o600)
+        retained = path.stat()
+        foreign = incoming.stat()
+        original_info = workspace.market.execute("SELECT * FROM store_info").fetchall()
+        before = "\n".join(workspace.state.iterdump())
+        payload = incoming.read_bytes()
+        swaps = []
+
+        def replace() -> None:
+            incoming.replace(path)
+            swaps.append(path.stat().st_ino)
+            assert swaps == [foreign.st_ino]
+            for lock in (".storage.lock", "market.duckdb.lock"):
+                with pytest.raises(RuntimeError, match="installation_busy"), file_lock(home / lock):
+                    pytest.fail("maintenance released admission")
+
+        if boundary == "before_maintenance":
+            replace()
+        elif boundary == "real_close":
+            monkeypatch.setattr(workspace, "market", MarketCloseBoundary(workspace.market, replace))
+        with pytest.raises(ValueError, match=r"market .*changed"):
+            backup_workspace(workspace, output)
+        assert swaps == [foreign.st_ino]
+        assert "\n".join(workspace.state.iterdump()) == before
+        assert not (output / "backup.json").exists()
+    assert (path.stat().st_dev, path.stat().st_ino) == (foreign.st_dev, foreign.st_ino)
+    assert path.stat().st_ino != retained.st_ino
+    assert path.read_bytes() == payload
+    with open_workspace(home) as workspace:
+        assert workspace.market.execute("SELECT * FROM store_info").fetchall() == original_info
+        if replacement == "older":
+            with pytest.raises(ValueError, match="market generation does not exist"):
+                verify_workspace(workspace)
+        else:
+            assert verify_workspace(workspace)["dataset_versions"] == 1
+
+
+def test_copy_interval_replacement_is_not_reopened(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    initialize(home)
+    incoming = tmp_path / "incoming.duckdb"
+    with open_workspace(home, writable=True) as workspace:
+        original = workspace.market
+        original.execute("CHECKPOINT")
+        shutil.copyfile(workspace.paths.market, incoming)
+        incoming.chmod(0o600)
+        foreign = incoming.stat()
+        payload = incoming.read_bytes()
+        with (
+            pytest.raises(ValueError, match="market file changed"),
+            workspace.checkpointed_market(),
+        ):
+            incoming.replace(workspace.paths.market)
+        assert workspace.market is original
+        assert os.path.samestat(foreign, workspace.paths.market.stat())
+        assert workspace.paths.market.read_bytes() == payload
+
+
+@pytest.mark.parametrize("boundary", ["admission", "reopen"])
+def test_connection_boundary_replacement_is_not_adopted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    from aegis_alpha.storage import workspace as owner  # noqa: PLC0415
+
+    home, incoming = tmp_path / "home", tmp_path / "incoming.duckdb"
+    initialize(home)
+    path = home / "market.duckdb"
+    shutil.copyfile(path, incoming)
+    incoming.chmod(0o600)
+    payload, foreign = incoming.read_bytes(), incoming.stat()
+    connect_market = owner.market_connect
+    opened = []
+
+    def connect_and_replace(
+        path: Path, *, read_only: bool = False, resources: dict[str, object] | None = None
+    ) -> duckdb.DuckDBPyConnection:
+        connection = connect_market(path, read_only=read_only, resources=resources)
+        opened.append(connection)
+        incoming.replace(path)
+        return connection
+
+    if boundary == "admission":
+        monkeypatch.setattr(owner, "market_connect", connect_and_replace)
+        with pytest.raises(ValueError, match="market file changed"), open_workspace(home):
+            pytest.fail("replacement admitted")
+    else:
+        with open_workspace(home, writable=True) as workspace:
+            monkeypatch.setattr(owner, "market_connect", connect_and_replace)
+            with (
+                pytest.raises(ValueError, match="market file changed"),
+                workspace.checkpointed_market(),
+            ):
+                pass
+    assert len(opened) == 1
+    with pytest.raises(duckdb.ConnectionException):
+        opened[0].execute("SELECT 1")
+    assert os.path.samestat(foreign, path.stat())
+    assert path.read_bytes() == payload
+
+
+def test_maintenance_retains_initial_store_identity(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True) as workspace:
+        workspace.market.execute("UPDATE store_info SET store_id='foreign'")
+        with (
+            pytest.raises(ValueError, match="market identity changed"),
+            workspace.checkpointed_market(),
+        ):
+            pytest.fail("changed store identity admitted")
+        assert workspace.market.execute("SELECT store_id FROM store_info").fetchone() == (
+            "foreign",
+        )
+
+
+def test_same_file_maintenance_reopens_after_copy_error_with_resources(tmp_path: Path) -> None:
+    from aegis_alpha.storage.backup import backup_workspace  # noqa: PLC0415
+
+    home = tmp_path / "home"
+    initialize(home)
+    runtime = json.loads((home / "runtime.json").read_text())
+    runtime["resources"] = {"threads": 1, "memory_limit": "256MB"}
+    write_json(home / "runtime.json", runtime)
+    with open_workspace(home, writable=True) as workspace:
+        original = workspace.market
+        admitted = workspace.paths.market.stat()
+        info = original.execute("SELECT * FROM store_info").fetchall()
+        settings = original.execute(
+            "SELECT current_setting('threads'), current_setting('memory_limit'), "
+            "current_setting('enable_external_access')"
+        ).fetchone()
+        with pytest.raises(RuntimeError, match="copy failed"), workspace.checkpointed_market():
+            raise RuntimeError("copy failed")
+        assert workspace.market is not original
+        assert os.path.samestat(admitted, workspace.paths.market.stat())
+        assert workspace.market.execute("SELECT * FROM store_info").fetchall() == info
+        assert (
+            workspace.market.execute(
+                "SELECT current_setting('threads'), current_setting('memory_limit'), "
+                "current_setting('enable_external_access')"
+            ).fetchone()
+            == settings
+        )
+        assert backup_workspace(workspace, tmp_path / "backup")["backed_up"] is True
+        assert os.path.samestat(admitted, workspace.paths.market.stat())

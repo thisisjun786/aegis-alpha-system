@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from itertools import pairwise
 
+from aegis_alpha.engine.tolerance import long_only_sum_tolerance
+
 _REBALANCE_BISECTIONS = 64
 _VALUE_RELATIVE_TOLERANCE = 1e-12
 _MINIMUM_SESSIONS = 2
@@ -190,7 +192,7 @@ def _validate_targets(
                 msg = "long-only target weights must sum to at most one"
                 raise ValueError(msg)
             values.append(parsed)
-        if math.fsum(values) > 1:
+        if math.fsum(values) > 1 + long_only_sum_tolerance(len(values)):
             msg = "long-only target weights must sum to at most one"
             raise ValueError(msg)
 
