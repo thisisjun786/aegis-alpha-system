@@ -6,13 +6,16 @@ from __future__ import annotations
 import base64
 import hashlib
 import sqlite3
+import sys
 from decimal import Decimal
+from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import pyarrow as pa
 import pytest
 
+from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.storage import source_library
 from aegis_alpha.storage import source_library_digest as source_digest
 from aegis_alpha.storage.backup import backup, restore
@@ -469,3 +472,72 @@ def test_source_library_survives_backup_restore(tmp_path: Path, home: Path) -> N
         assert isinstance(verification, dict)
         assert verification["source_library"] == before_verify
         assert workspace.doctor()["strategy_versions"] == 0
+
+
+def _blob_source(path: Path, payloads: list[bytes]) -> str:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("CREATE TABLE payloads(payload BLOB)")
+        connection.executemany(
+            "INSERT INTO payloads VALUES (?)", [(payload,) for payload in payloads]
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    path.chmod(_PRIVATE_FILE)
+    return _digest(path)
+
+
+def _budget(total: int) -> ComputeBudget:
+    return ComputeBudget(Fraction(1), total)
+
+
+def test_source_verification_admits_the_largest_batch_not_the_first(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A large cell placed after the first batch must still be charged."""
+    source = tmp_path / "late-blob.sqlite3"
+    digest = _blob_source(source, [b"\x00", b"\x00", b"z" * (1024 * 1024)])
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        source_library.import_sqlite(workspace, source, "late-blob", digest)
+    # Two tiny rows land in the first batch and the megabyte payload in the second,
+    # so an implementation that measured only the first batch would admit this.
+    monkeypatch.setattr(source_library, "BATCH_ROWS", 2)
+    with open_workspace(home) as workspace:
+        with pytest.raises(ComputeResourceError, match="source table batch"):
+            source_library.verify_sources(workspace, budget=_budget(16 * 1024 * 1024))
+        report = source_library.verify_sources(workspace, budget=_budget(256 * 1024 * 1024))
+    assert report == {"sources": 1, "tables": 1, "rows": 3}
+
+
+def test_source_verification_rejects_before_any_digest_read(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An over-budget table is refused before the digest encodes a single row."""
+    source = tmp_path / "wide-blob.sqlite3"
+    digest = _blob_source(source, [b"z" * (1024 * 1024)])
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        source_library.import_sqlite(workspace, source, "wide-blob", digest)
+
+    def unexpected(_rows: object) -> tuple[int, str]:
+        raise AssertionError("digest ran before admission rejected the table")
+
+    with open_workspace(home) as workspace:
+        monkeypatch.setattr(source_library, "sqlite_digest", unexpected)
+        with pytest.raises(ComputeResourceError, match="source table batch"):
+            source_library.verify_sources(workspace, budget=_budget(16 * 1024 * 1024))
+
+
+def test_sqlite_source_verifies_without_pyarrow(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A default installation ships no pyarrow, so a SQLite source must not need it."""
+    source = tmp_path / "private-snapshot.sqlite3"
+    digest = _write_sqlite(source)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        source_library.import_sqlite(workspace, source, _SQLITE_SOURCE, digest)
+    with open_workspace(home) as workspace:
+        monkeypatch.setitem(sys.modules, "pyarrow", None)
+        report = source_library.verify_sources(workspace)
+    assert report == {"sources": 1, "tables": 2, "rows": 4}

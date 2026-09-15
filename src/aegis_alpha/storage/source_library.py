@@ -11,16 +11,17 @@ import os
 import shutil
 import sqlite3
 from contextlib import ExitStack, closing
+from fractions import Fraction
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, cast
 
-from aegis_alpha.compute_resources import ComputeResourceError
+from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.storage import source_library_schema as schema
 from aegis_alpha.storage.paths import private_source_file as private_file
 from aegis_alpha.storage.paths import same_private_file
-from aegis_alpha.storage.source_library_digest import arrow_digest, sqlite_digest
+from aegis_alpha.storage.source_library_digest import BATCH_ROWS, arrow_digest, sqlite_digest
 from aegis_alpha.storage.state import complete_operation, get_operation, prepare_operation
 
 if TYPE_CHECKING:
@@ -32,6 +33,13 @@ if TYPE_CHECKING:
 
 _MAX_SOURCE_ID = 240
 _SHA_LENGTH = 64
+# Both digests consume a table in BATCH_ROWS units, so the live set is one
+# canonical batch rather than the whole table. Measured on this tree:
+# sqlite_digest retains at most 4.33x the bytes of the row it is encoding, and
+# arrow_digest about 1.26x a batch plus roughly 8 bytes per cell. These carry
+# margin over those observations.
+_DIGEST_BYTE_FACTOR = 8
+_DIGEST_CELL_BYTES = 64
 
 
 def _identity(source_id: str, digest: str) -> None:
@@ -247,12 +255,64 @@ def import_arrow(  # noqa: PLR0913 -- public provenance and reader inputs
     return ingest_arrow(workspace, source_id, sha256, table_name, reader, metadata=metadata)
 
 
-def _verify_manifest(workspace: Workspace, manifest: dict[str, object]) -> None:
-    import pyarrow as pa  # noqa: PLC0415
+def _admit_source_batch(
+    conn: sqlite3.Connection | duckdb.DuckDBPyConnection,
+    table: dict[str, object],
+    store: str,
+    columns: list[str],
+    allowance: int,
+) -> None:
+    """Bound the largest canonical batch before either digest reads the table.
 
+    Variable-width values are charged in bytes because retained SQLite columns are
+    declared ANY, so one cell can hold an arbitrary blob and a per-cell constant
+    would not bound it. The maximum batch is preflighted rather than the first,
+    since a large value placed after the first batch would otherwise pass.
+    """
+    if store == "market":
+        widths = [
+            "coalesce(octet_length(encode(CAST(" + schema.quoted(name) + " AS VARCHAR))),0)"
+            for name in columns
+        ]
+        # DuckDB division is fractional; integer division keeps real batch groups.
+        divide = "//"
+    else:
+        widths = [
+            "coalesce(length(CAST(" + schema.quoted(name) + " AS BLOB)),0)" for name in columns
+        ]
+        divide = "/"
+    rows, size = cast(
+        "tuple[int, int]",
+        conn.execute(
+            "SELECT coalesce(max(n),0),coalesce(max(b),0) FROM ("
+            "SELECT count(*) AS n, sum(" + "+".join(widths) + ") AS b FROM ("
+            "SELECT *, (row_number() OVER (ORDER BY _aas_ordinal) - 1) "
+            + divide
+            + " "
+            + str(BATCH_ROWS)
+            + " AS _aas_batch FROM "
+            + schema.quoted(str(table["target"]))
+            + ") GROUP BY _aas_batch)"
+        ).fetchone(),
+    )
+    if _DIGEST_BYTE_FACTOR * size + _DIGEST_CELL_BYTES * rows * len(columns) > allowance:
+        raise ComputeResourceError("source table batch exceeds materialization budget")
+
+
+def _verify_manifest(
+    workspace: Workspace, manifest: dict[str, object], allowance: int | None = None
+) -> None:
+    """Verify retained content. Callers that own a compute allocation pass it here.
+
+    The import and recovery callers admit their own input at their own boundary and
+    intentionally pass no allowance; charging them would reject a legitimate large
+    sparse import. Budgeting the recovery command is a separate change.
+    """
     conn = schema.connections(workspace)[str(manifest["store"])]
     for table in cast("list[dict[str, object]]", manifest["tables"]):
         columns = cast("list[str]", table["columns"])
+        if allowance is not None:
+            _admit_source_batch(conn, table, str(manifest["store"]), columns, allowance)
         order = "_aas_ordinal"
         query = (
             "SELECT "
@@ -265,6 +325,10 @@ def _verify_manifest(workspace: Workspace, manifest: dict[str, object]) -> None:
         if table["format"] == "sqlite":
             observed = sqlite_digest(cast("sqlite3.Connection", conn).execute(query))
         else:
+            # Only the Arrow path needs pyarrow. A default installation omits it,
+            # so importing it for a SQLite source would break maintenance there.
+            import pyarrow as pa  # noqa: PLC0415
+
             original = pa.ipc.read_schema(
                 pa.BufferReader(base64.b64decode(str(table["arrow_schema"])))
             )
@@ -429,9 +493,18 @@ def read_table(
     return dict(inspect_source(workspace, source_id, table_name, limit=limit))
 
 
-def verify_sources(workspace: Workspace) -> dict[str, object] | None:
+def verify_sources(
+    workspace: Workspace, *, budget: ComputeBudget | None = None
+) -> dict[str, object] | None:
     if not schema.ensure(workspace):
         return None
+    budget = budget or ComputeBudget(Fraction(1), 512 * 1024 * 1024)
+    allowance = budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes
+    # Metadata stays live while every table is verified, so table admission gets
+    # only what is left. This replaces the earlier unadmitted marker fetch.
+    remaining = allowance - _admit_source_metadata(workspace, allowance)
+    if remaining <= 0:
+        raise ComputeResourceError("source metadata leaves no verification budget")
     total = tables = sources = 0
     for conn in schema.connections(workspace).values():
         for row in conn.execute(
@@ -447,7 +520,7 @@ def verify_sources(workspace: Workspace) -> dict[str, object] | None:
             ) != ("source_import", row[2], row[0], row[3]):
                 raise ValueError("source marker/intent mismatch")
             manifest = json.loads(row[4])
-            _verify_manifest(workspace, manifest)
+            _verify_manifest(workspace, manifest, remaining)
             if operation["phase"] == "COMPLETED":
                 sources += 1
                 tables += len(manifest["tables"])

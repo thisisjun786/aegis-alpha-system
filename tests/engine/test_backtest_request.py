@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import operator
 import subprocess
 import sys
@@ -1300,3 +1301,44 @@ def test_source_pins_sorted_without_digest_reinterpretation() -> None:
     result = run_document(exported.canonical_bytes, exported.envelope_sha256)
     assert result["source_pins"] == [first, second]
     assert result["source_pins_verified"] is False
+
+
+def _two_asset_inputs(targets: dict[str, float]) -> EnvelopeInputs:
+    prices = {"ASSET_A": 10.0, "ASSET_B": 10.0}
+    return EnvelopeInputs(
+        dates=DATES,
+        opens=({}, dict(prices)),
+        closes=(dict(prices), {"ASSET_A": 12.0, "ASSET_B": 12.0}),
+        targets={DATES[0]: targets},
+        instrument_types={"ASSET_A": "ETF", "ASSET_B": "ETF"},
+        source_pins=(),
+    )
+
+
+def test_fully_invested_target_one_ulp_above_one_exports_and_replays() -> None:
+    """Normalized ensemble weights can exceed one by a single binary64 ULP."""
+    body, definition, docs = fixture()
+    parsed, projection = project(body, definition, docs)
+    targets = {"ASSET_A": 0.5, "ASSET_B": 0.5 + 2**-52}
+    # This is exactly the input the previous strict comparison rejected.
+    assert math.fsum(targets.values()) == 1 + 2**-52
+    assert math.fsum(targets.values()) > 1
+    exported = export_envelope(parsed, projection=projection, inputs=_two_asset_inputs(targets))
+    # Replay has to accept the same bytes, or the rejection only moves downstream.
+    replayed = run_document(exported.canonical_bytes, exported.envelope_sha256)
+    # Replay buys both assets and invests the whole account, which is what a target
+    # summing to one means; the extra ULP shows up as fractional shares, not a refusal.
+    result = cast("dict[str, Any]", replayed["result"])
+    assert [fill["symbol"] for fill in result["fills"]] == ["ASSET_A", "ASSET_B"]
+    assert result["nav"][-1]["cash"] == 0.0
+    assert result["nav"][-1]["equity"] > 0
+
+
+def test_target_sum_above_the_shared_tolerance_is_still_rejected() -> None:
+    """The tolerance admits rounding, not a real overweight."""
+    body, definition, docs = fixture()
+    parsed, projection = project(body, definition, docs)
+    targets = {"ASSET_A": 0.5, "ASSET_B": 0.5 + 2e-12}
+    assert math.fsum(targets.values()) > 1 + execution.LONG_ONLY_SUM_TOLERANCE
+    with pytest.raises(ValueError, match="sum to at most one"):
+        export_envelope(parsed, projection=projection, inputs=_two_asset_inputs(targets))

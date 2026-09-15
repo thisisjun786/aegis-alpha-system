@@ -1461,3 +1461,34 @@ def test_verify_before_private_commit_keeps_missing_receipt_pending(tmp_path: Pa
         assert report["strategy_versions"] == 0
         assert report["pending_operations"] == 1
     assert evidence_snapshot(home) == before
+
+
+def test_membership_verification_uses_the_caller_allowance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fixed 64 MiB allowance ignored callers whose allocation was smaller."""
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True) as workspace:
+        workspace.state.execute("INSERT INTO identity_snapshots VALUES ('probe',?,0)", ("b" * 64,))
+        workspace.state.commit()
+    seen: list[int] = []
+
+    def capture(
+        _connection: object,
+        _identity: object,
+        _universe: object,
+        *,
+        max_materialization_bytes: int,
+    ) -> None:
+        seen.append(max_materialization_bytes)
+        raise ComputeResourceError("synthetic membership refusal")
+
+    budget = ComputeBudget(Fraction(1), 8 * 1024 * 1024)
+    allowance = budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes
+    assert allowance < 64 * 1024 * 1024
+    with open_workspace(home) as workspace:
+        monkeypatch.setattr(verification, "read_membership_pins", capture)
+        with pytest.raises(ComputeResourceError, match="synthetic membership refusal"):
+            verify_workspace(workspace, budget=budget)
+    assert seen == [allowance]

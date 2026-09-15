@@ -18,6 +18,11 @@ from itertools import pairwise
 
 _REBALANCE_BISECTIONS = 64
 _VALUE_RELATIVE_TOLERANCE = 1e-12
+# A fully invested normalized target can sum to 1 + 2**-52 in binary64, and the
+# self-financing check below already tolerates the same relative amount, so the
+# pre-check must not be stricter than the invariant it guards. Shared with the
+# export site so one envelope cannot pass export and then fail replay.
+LONG_ONLY_SUM_TOLERANCE = _VALUE_RELATIVE_TOLERANCE
 _MINIMUM_SESSIONS = 2
 
 
@@ -190,7 +195,7 @@ def _validate_targets(
                 msg = "long-only target weights must sum to at most one"
                 raise ValueError(msg)
             values.append(parsed)
-        if math.fsum(values) > 1:
+        if math.fsum(values) > 1 + LONG_ONLY_SUM_TOLERANCE:
             msg = "long-only target weights must sum to at most one"
             raise ValueError(msg)
 

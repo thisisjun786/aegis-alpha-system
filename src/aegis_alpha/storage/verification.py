@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from fractions import Fraction
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.descriptor_tree import DescriptorTree
@@ -32,11 +32,20 @@ if TYPE_CHECKING:
     from aegis_alpha.storage.workspace import Workspace
 
 
+def _admit_retained(row: object, allowance: int, message: str) -> None:
+    """Charge a collection that stays live across later steps before fetching it."""
+    if cast("tuple[int]", row)[0] > allowance // 8:
+        raise ComputeResourceError(message)
+
+
 def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification boundary
     workspace: Workspace, *, budget: ComputeBudget | None = None
 ) -> dict[str, object]:
     """Verify under a caller-owned allocation, retaining the serial default when omitted."""
     budget = budget or ComputeBudget(Fraction(1), 512 * 1024 * 1024)
+    # Every step below charges against the same non-DuckDB allowance. DuckDB's own
+    # share is bounded separately by the connection limit derived from this budget.
+    allowance = budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes
     if workspace.strategies is None:
         raise ValueError("strategy store is required for complete verification")
     for connection in (workspace.state, workspace.strategies):
@@ -62,7 +71,7 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
             workspace.state,
             IdentityPin(*header),
             None,
-            max_materialization_bytes=64 * 1024 * 1024,
+            max_materialization_bytes=allowance,
         )
     for header in workspace.state.execute(
         "SELECT universe_id,version,content_hash FROM universe_versions"
@@ -71,14 +80,14 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
             workspace.state,
             None,
             UniversePin(*header),
-            max_materialization_bytes=64 * 1024 * 1024,
+            max_materialization_bytes=allowance,
         )
     size = workspace.state.execute(
         "SELECT count(*)*2048 + coalesce(sum(32*(length(dataset_id)+length(version)+"
         "length(generation_id)+coalesce(length(parent_generation_id),0))),0) "
         "FROM dataset_versions WHERE status='committed'"
     ).fetchone()[0]
-    if size > budget.memory_limit_bytes // 8:
+    if size > allowance // 8:
         raise ComputeResourceError("publication catalog exceeds materialization budget")
     versions = workspace.state.execute(
         "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash,parent_generation_id "
@@ -101,6 +110,16 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
         verify_raw(
             workspace.paths.raw, source["relative_path"], source["byte_hash"], source["size_bytes"]
         )
+    # This list stays live while every strategy is verified, so charge it first.
+    _admit_retained(
+        workspace.strategies.execute(
+            "SELECT count(*)*2048 + coalesce(sum(32*(length(CAST(strategy_id AS BLOB))+"
+            "length(CAST(version AS BLOB))+length(CAST(raw_sha256 AS BLOB)))),0) "
+            "FROM strategy_versions"
+        ).fetchone(),
+        allowance,
+        "strategy catalog exceeds materialization budget",
+    )
     strategies = workspace.strategies.execute(
         "SELECT strategy_id,version,raw_sha256 FROM strategy_versions"
     ).fetchall()
@@ -130,6 +149,17 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
     pending = workspace.state.execute(
         "SELECT count(*) FROM storage_operations WHERE phase='PREPARED'"
     ).fetchone()[0]
+    # market_generations is DuckDB, so the SQLite length(CAST(... AS BLOB)) form
+    # does not apply; encode() gives the byte width of each identifier.
+    _admit_retained(
+        workspace.market.execute(
+            "SELECT count(*)*2048 + "
+            "coalesce(sum(32*coalesce(octet_length(encode(generation_id)),0)),0) "
+            "FROM market_generations"
+        ).fetchone(),
+        allowance,
+        "market generation catalog exceeds materialization budget",
+    )
     untracked = workspace.market.execute("SELECT generation_id FROM market_generations").fetchall()
     visible = {row["generation_id"] for row in versions}
     report: dict[str, object] = {
@@ -141,7 +171,7 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
     }
     from aegis_alpha.storage.source_library import verify_sources  # noqa: PLC0415
 
-    sources = verify_sources(workspace)
+    sources = verify_sources(workspace, budget=budget)
     if sources is not None:
         report["source_library"] = sources
     return report
