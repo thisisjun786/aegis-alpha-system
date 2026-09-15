@@ -9,6 +9,7 @@ import multiprocessing
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 from threading import Event, Thread
@@ -320,3 +321,27 @@ def test_broad_mount_keeps_ancestor_limits_visible(capacity: tuple[dict[str, str
         mountinfo.read_text() + f"2 0 0:31 /slice/job {nested} rw - cgroup2 cgroup rw\n"
     )
     assert resolve_compute_budget(env).cpu_limit == Fraction(3, 2)
+
+
+def test_a_reserve_reduces_only_the_materialization_allowance() -> None:
+    """Reserving held bytes must not move the engine share."""
+    budget = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
+    held = replace(budget, reserved_bytes=12_096)
+    assert held.available_bytes == budget.available_bytes - 12_096
+    assert held.duckdb_memory_limit_bytes == budget.duckdb_memory_limit_bytes
+    assert held.duckdb_threads == budget.duckdb_threads
+
+
+def test_a_component_split_keeps_the_reserve() -> None:
+    """Halving an allocation must not quietly drop what the caller still holds."""
+    held = replace(ComputeBudget(Fraction(1), 512 * 1024 * 1024), reserved_bytes=12_096)
+    component = replace(held, memory_limit_bytes=held.memory_limit_bytes // 2)
+    assert component.reserved_bytes == held.reserved_bytes
+    assert component.available_bytes < held.available_bytes
+
+
+def test_a_reserve_that_leaves_no_allowance_is_refused() -> None:
+    """Admitting nothing is a configuration error, not a silent success."""
+    budget = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
+    with pytest.raises(ComputeResourceError, match="no materialization allowance"):
+        replace(budget, reserved_bytes=budget.available_bytes)

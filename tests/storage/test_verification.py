@@ -1488,13 +1488,18 @@ def test_retained_catalog_reserves_budget_for_later_steps(
         monkeypatch.setattr(verification, "verify_sealed_publication", capture_publication)
         monkeypatch.setattr(verification, "_verify_input_documents", capture_documents)
         report = verify_workspace(workspace)
+        # An incoming reserve must be added to, never replaced.
+        carried = ComputeBudget(Fraction(1), 512 * 1024 * 1024, reserved_bytes=1024 * 1024)
+        verify_workspace(workspace, budget=carried)
     assert report["verified"] is True
-    # Publication and input-document verification each ran once and each saw the
-    # same non-zero reserve, which is the retained publication catalog.
-    reserved_steps = 2
-    assert len(seen) == reserved_steps
-    assert len(set(seen)) == 1
-    assert seen[0] > 0
+    # Two runs, each admitting publication and input-document verification against
+    # the same non-zero reserve: the retained publication catalog.
+    observations = 4
+    assert len(seen) == observations
+    assert seen[0] == seen[1] > 0
+    assert seen[2] == seen[3]
+    # The caller's own reserve is added to, not replaced.
+    assert seen[2] - seen[0] == carried.reserved_bytes
 
 
 def test_membership_verification_uses_the_caller_allowance(

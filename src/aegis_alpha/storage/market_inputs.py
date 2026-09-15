@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from decimal import localcontext
 from types import MappingProxyType
@@ -515,7 +515,9 @@ def admit_native_input(
     domains = {"aas-price-transform-v1": "prices", "aas-sessions-transform-v1": "calendar_sessions"}
     if expected_schema not in domains:
         raise ValueError("unsupported native input transform schema")
-    component = ComputeBudget(budget.cpu_limit, budget.memory_limit_bytes // 2)
+    # Halve the allocation for one component while carrying the caller's reserve;
+    # a fresh ComputeBudget would silently reset it to zero.
+    component = replace(budget, memory_limit_bytes=budget.memory_limit_bytes // 2)
     history = _load(workspace, pin, component, domains[expected_schema])
     sources: dict[SourcePin, None] = {}
     for marker in market.generation_chain(workspace.market, pin.generation_id):
@@ -714,13 +716,13 @@ def load_pinned_prices(
         workspace,
         request.pin,
         expected_schema="aas-price-transform-v1",
-        budget=ComputeBudget(budget.cpu_limit, budget.memory_limit_bytes // 2),
+        budget=replace(budget, memory_limit_bytes=budget.memory_limit_bytes // 2),
     ).history
     sessions = (
         load_pinned_sessions(
             workspace,
             request.sessions_pin,
-            budget=ComputeBudget(budget.cpu_limit, budget.memory_limit_bytes // 4),
+            budget=replace(budget, memory_limit_bytes=budget.memory_limit_bytes // 4),
         )
         if request.sessions_pin
         else None
@@ -796,7 +798,7 @@ def load_pinned_proxy(
     history = _load(
         workspace,
         pin,
-        ComputeBudget(budget.cpu_limit, budget.memory_limit_bytes // 2),
+        replace(budget, memory_limit_bytes=budget.memory_limit_bytes // 2),
         "feature_values",
     )
     definition = verify_proxy_content(workspace, history, budget=budget)
@@ -851,7 +853,7 @@ def _proxy_publication_delta(
     history = _load(
         workspace,
         pin,
-        ComputeBudget(budget.cpu_limit, budget.memory_limit_bytes // 2),
+        replace(budget, memory_limit_bytes=budget.memory_limit_bytes // 2),
         "feature_values",
     )
     if document.sha256 != pin.manifest_hash:

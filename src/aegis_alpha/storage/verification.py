@@ -49,6 +49,25 @@ def _verify_membership(workspace: Workspace, allowance: int) -> None:
         )
 
 
+def _verify_artifacts(workspace: Workspace) -> None:
+    """Re-hash every recorded run artifact in bounded chunks."""
+    for row in workspace.state.execute(
+        "SELECT run_id,relative_path,size_bytes,content_hash FROM artifacts"
+    ):
+        relative = row["run_id"] + "/" + row["relative_path"]
+        with (
+            DescriptorTree.open_path(workspace.paths.runs) as tree,
+            tree.binary_reader(relative, require_single_link=True) as source,
+        ):
+            hasher = hashlib.sha256()
+            observed = 0
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                hasher.update(chunk)
+                observed += len(chunk)
+            if hasher.hexdigest() != row["content_hash"] or observed != row["size_bytes"]:
+                raise ValueError("run artifact hash/size mismatch")
+
+
 def _admit_retained(row: object, allowance: int, message: str) -> int:
     """Charge a collection that stays live across later steps, before fetching it.
 
@@ -95,8 +114,9 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
     if size > allowance // 8:
         raise ComputeResourceError("publication catalog exceeds materialization budget")
     # The catalog rows stay live through every later step, so every later step is
-    # admitted against what is left rather than the whole allowance.
-    held = replace(budget, reserved_bytes=size)
+    # admitted against what is left rather than the whole allowance. Accumulate onto
+    # whatever the caller already reserved instead of replacing it.
+    held = replace(budget, reserved_bytes=budget.reserved_bytes + size)
     versions = workspace.state.execute(
         "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash,parent_generation_id "
         "FROM dataset_versions WHERE status='committed'"
@@ -143,27 +163,13 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
     ):
         read_convention(workspace.state, ConventionPin(*convention))
     _verify_input_documents(workspace, held)
-    for row in workspace.state.execute(
-        "SELECT run_id,relative_path,size_bytes,content_hash FROM artifacts"
-    ):
-        relative = row["run_id"] + "/" + row["relative_path"]
-        with (
-            DescriptorTree.open_path(workspace.paths.runs) as tree,
-            tree.binary_reader(relative, require_single_link=True) as source,
-        ):
-            hasher = hashlib.sha256()
-            size = 0
-            for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                hasher.update(chunk)
-                size += len(chunk)
-            if hasher.hexdigest() != row["content_hash"] or size != row["size_bytes"]:
-                raise ValueError("run artifact hash/size mismatch")
+    _verify_artifacts(workspace)
     pending = workspace.state.execute(
         "SELECT count(*) FROM storage_operations WHERE phase='PREPARED'"
     ).fetchone()[0]
     # market_generations is DuckDB, so the SQLite length(CAST(... AS BLOB)) form
     # does not apply; encode() gives the byte width of each identifier.
-    _admit_retained(
+    generations = _admit_retained(
         workspace.market.execute(
             "SELECT count(*)*2048 + "
             "coalesce(sum(32*coalesce(octet_length(encode(generation_id)),0)),0) "
@@ -173,6 +179,8 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
         "market generation catalog exceeds materialization budget",
     )
     untracked = workspace.market.execute("SELECT generation_id FROM market_generations").fetchall()
+    # This list is still live while sources are verified below, so reserve it too.
+    held = replace(held, reserved_bytes=held.reserved_bytes + generations)
     visible = {row["generation_id"] for row in versions}
     report: dict[str, object] = {
         "verified": True,
