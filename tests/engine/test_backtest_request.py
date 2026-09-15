@@ -1360,5 +1360,19 @@ def test_export_rejects_what_replay_cannot_absorb() -> None:
 
 def test_accepted_overshoot_stays_inside_the_self_financing_tolerance() -> None:
     """Whatever export admits, replay must still be able to absorb."""
-    for count in (2, 10, 100, 1000):
+    for count in (2, 10, 100, 1000, 5000, 100_000):
         assert long_only_sum_tolerance(count) < execution._VALUE_RELATIVE_TOLERANCE  # noqa: SLF001
+
+
+def test_zero_weight_padding_cannot_widen_the_accepted_band() -> None:
+    """The entry count is caller-supplied, so it must not buy a wider tolerance."""
+    body, definition, docs = fixture()
+    parsed, projection = project(body, definition, docs)
+    # Thousands of zero weights contribute no rounding but inflate the count. Left
+    # unbounded the scaled tolerance passes 1e-12, and such an envelope exported
+    # successfully and then failed replay with a self-financing error.
+    padded = {"ASSET_A": 0.5, "ASSET_B": 0.5 + 1e-12}
+    padded.update({f"PAD_{index}": 0.0 for index in range(4998)})
+    assert long_only_sum_tolerance(len(padded)) < execution._VALUE_RELATIVE_TOLERANCE  # noqa: SLF001
+    with pytest.raises(ValueError, match="sum to at most one"):
+        export_envelope(parsed, projection=projection, inputs=_two_asset_inputs(padded))
