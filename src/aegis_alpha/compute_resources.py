@@ -97,18 +97,22 @@ class ComputeBudget:
     def component(self, divisor: int) -> ComputeBudget:
         """Carve a sub-allocation out of what is not already held live.
 
-        What the caller retains is removed from the pool before it is divided,
-        rather than charged again against every smaller slice. Charging it each
-        time rejects work the caller can actually afford: with a 512 MiB
-        allocation holding 80 MiB, a halved slice would be left owing more than
-        its whole non-DuckDB share. With nothing retained this is the plain
-        division it replaces.
+        The slice is sized from the free materialization allowance rather than from
+        total memory, so what the caller retains is accounted once here instead of
+        being charged again inside every slice. Subtracting retention from total
+        memory first would pass only a quarter of it through to the Python share,
+        letting a slice materialize bytes the caller is still holding.
+
+        With nothing retained this reproduces the plain division it replaces. When
+        too little is free the slice falls below the hash-worker floor and is
+        refused, which is the honest answer to having nothing to work with.
         """
         if type(divisor) is not int or divisor < 1:
             raise ComputeResourceError("component divisor must be a positive integer")
+        # available_bytes is a quarter of memory_limit_bytes, so scale back up.
         return replace(
             self,
-            memory_limit_bytes=(self.memory_limit_bytes - self.reserved_bytes) // divisor,
+            memory_limit_bytes=4 * self.available_bytes // divisor,
             reserved_bytes=0,
         )
 

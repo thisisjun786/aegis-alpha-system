@@ -343,8 +343,13 @@ def test_a_component_split_divides_what_is_not_held() -> None:
     # than its whole non-DuckDB share.
     held = replace(ComputeBudget(Fraction(1), 512 * 1024 * 1024), reserved_bytes=80 * 1024 * 1024)
     assert held.available_bytes == 48 * 1024 * 1024
-    assert held.component(2).available_bytes > 0
     assert held.component(2).reserved_bytes == 0
+    # A slice can never exceed its share of what the caller actually has free.
+    assert 0 < held.component(2).available_bytes <= held.available_bytes // 2
+    # Nearly everything retained leaves nothing to divide, and the floor refuses it.
+    starved = replace(held, reserved_bytes=held.available_bytes + held.reserved_bytes - 1)
+    with pytest.raises(ComputeResourceError, match="bounded hash worker"):
+        starved.component(2)
 
 
 def test_a_reserve_that_leaves_no_allowance_is_refused() -> None:
