@@ -470,7 +470,7 @@ class _Loader:
 
     def retain(self, name: str, value: object) -> None:
         self.charge += len(canonical_json_bytes(value)) * 32
-        if self.charge > self.budget.memory_limit_bytes - self.budget.duckdb_memory_limit_bytes:
+        if self.charge > self.budget.available_bytes:
             raise ComputeResourceError("prepared histories exceed aggregate materialization budget")
         self.evidence.append({"name": name, "value": value})
 
@@ -507,8 +507,7 @@ class _Loader:
                 self.workspace,
                 pin.source_id,
                 pin.table,
-                max_materialization_bytes=self.budget.memory_limit_bytes
-                - self.budget.duckdb_memory_limit_bytes,
+                max_materialization_bytes=self.budget.available_bytes,
             )
             resolve_source(self.workspace, pin)
             self.sources[pin] = None
@@ -524,8 +523,7 @@ class _Loader:
         with DescriptorTree.open_path(self.workspace.paths.raw) as tree:
             raw = tree.read_bytes(
                 digest[:2] + "/" + digest,
-                max_bytes=(self.budget.memory_limit_bytes - self.budget.duckdb_memory_limit_bytes)
-                // 32,
+                max_bytes=(self.budget.available_bytes) // 32,
             )
         if hashlib.sha256(raw).hexdigest() != digest:
             raise ValueError("proxy transform content changed")
@@ -585,10 +583,7 @@ def _prices(loader: _Loader, body: Row, calendar: Row, sessions: History) -> tup
         loader.workspace.state,
         identity,
         universe,
-        max_materialization_bytes=(
-            loader.budget.memory_limit_bytes - loader.budget.duckdb_memory_limit_bytes
-        )
-        // 8,
+        max_materialization_bytes=(loader.budget.available_bytes) // 8,
     )
     loader.retain(
         "memberships",

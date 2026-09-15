@@ -1463,6 +1463,40 @@ def test_verify_before_private_commit_keeps_missing_receipt_pending(tmp_path: Pa
     assert evidence_snapshot(home) == before
 
 
+def test_retained_catalog_reserves_budget_for_later_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Steps that run while the catalog is held must see it reserved."""
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True) as workspace:
+        publication.publish_document(workspace, parse_import(document()))
+    actual = verification.verify_sealed_publication
+    seen: list[int] = []
+
+    def capture_publication(
+        inner: Workspace, generation_id: str, *, budget: ComputeBudget
+    ) -> object:
+        seen.append(budget.reserved_bytes)
+        return actual(inner, generation_id, budget=budget)
+
+    def capture_documents(inner: Workspace, budget: ComputeBudget) -> None:
+        del inner
+        seen.append(budget.reserved_bytes)
+
+    with open_workspace(home) as workspace:
+        monkeypatch.setattr(verification, "verify_sealed_publication", capture_publication)
+        monkeypatch.setattr(verification, "_verify_input_documents", capture_documents)
+        report = verify_workspace(workspace)
+    assert report["verified"] is True
+    # Publication and input-document verification each ran once and each saw the
+    # same non-zero reserve, which is the retained publication catalog.
+    reserved_steps = 2
+    assert len(seen) == reserved_steps
+    assert len(set(seen)) == 1
+    assert seen[0] > 0
+
+
 def test_membership_verification_uses_the_caller_allowance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1485,7 +1519,7 @@ def test_membership_verification_uses_the_caller_allowance(
         raise ComputeResourceError("synthetic membership refusal")
 
     budget = ComputeBudget(Fraction(1), 8 * 1024 * 1024)
-    allowance = budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes
+    allowance = budget.available_bytes
     assert allowance < 64 * 1024 * 1024
     with open_workspace(home) as workspace:
         monkeypatch.setattr(verification, "read_membership_pins", capture)

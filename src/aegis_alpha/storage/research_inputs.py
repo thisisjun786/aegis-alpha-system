@@ -414,7 +414,7 @@ def native_input_document(
     aggregates precede source resolution/digest/row materialization. Both readers
     and writers use the same transform parsers and normalization below.
     """
-    available = budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes
+    available = budget.available_bytes
     if len(raw) * 32 > available:
         raise ComputeResourceError("native transform exceeds materialization budget")
     body = _decode_transform(raw)

@@ -585,7 +585,7 @@ def _admit_chain_memory(
         if count != marker["row_count"]:
             raise ValueError("market generation logical hash/count mismatch")
         estimated_bytes += 1024 + count * (1024 + 256 * len(schema)) + 32 * characters
-    available_bytes = budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes
+    available_bytes = budget.available_bytes
     if estimated_bytes > available_bytes:
         raise ComputeResourceError(
             f"full market chain memory estimate {estimated_bytes} exceeds "

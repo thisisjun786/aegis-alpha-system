@@ -328,7 +328,7 @@ def _raw_payload(workspace: Workspace, digest: str, budget: ComputeBudget) -> by
     with DescriptorTree.open_path(workspace.paths.raw) as tree:
         payload = tree.read_bytes(
             digest[:2] + "/" + digest,
-            max_bytes=(budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes) // 32,
+            max_bytes=(budget.available_bytes) // 32,
         )
     if hashlib.sha256(payload).hexdigest() != digest:
         raise ValueError("pinned transform hash mismatch")
@@ -467,7 +467,7 @@ def _admit_publication_chain(
         if size is None:
             raise ValueError("market generation does not exist")
         estimated += size[0]
-        if estimated > (budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes) // 8:
+        if estimated > (budget.available_bytes) // 8:
             raise ComputeResourceError("publication chain exceeds materialization budget")
         seen.add(current)
         current = market.marker_for(workspace.market, str(current))["parent_id"]
@@ -573,8 +573,7 @@ def _members(
         workspace.state,
         request.identity_pin,
         request.universe_pin,
-        max_materialization_bytes=(budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes)
-        // 8,
+        max_materialization_bytes=(budget.available_bytes) // 8,
     )
     return (
         verified.identity.members if verified.identity is not None else (),
@@ -707,7 +706,7 @@ def load_pinned_prices(
     No provider/identity/universe/authority certification is inferred from hashes.
     """
     cells = len(request.instrument_ids) * len(request.session_dates)
-    if cells * 2048 > (budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes) // 8:
+    if cells * 2048 > (budget.available_bytes) // 8:
         raise ComputeResourceError(
             "requested coverage grid exceeds admitted materialization budget"
         )
@@ -919,10 +918,7 @@ def verify_proxy_content(workspace: Workspace, history: History, *, budget: Comp
         "SELECT length(CAST(definition AS BLOB)) FROM feature_contracts WHERE name=? AND version=?",
         (first["contract_id"], first["contract_version"]),
     ).fetchone()
-    if (
-        size is not None
-        and size[0] * 256 > budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes
-    ):
+    if size is not None and size[0] * 256 > budget.available_bytes:
         raise ComputeResourceError("proxy contract exceeds admitted materialization budget")
     contract = workspace.state.execute(
         "SELECT definition, content_hash, record_schema FROM feature_contracts "

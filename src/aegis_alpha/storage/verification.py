@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from fractions import Fraction
 from typing import TYPE_CHECKING, cast
 
@@ -66,7 +67,7 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
     budget = budget or ComputeBudget(Fraction(1), 512 * 1024 * 1024)
     # Every step below charges against the same non-DuckDB allowance. DuckDB's own
     # share is bounded separately by the connection limit derived from this budget.
-    allowance = budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes
+    allowance = budget.available_bytes
     if workspace.strategies is None:
         raise ValueError("strategy store is required for complete verification")
     for connection in (workspace.state, workspace.strategies):
@@ -93,8 +94,9 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
     ).fetchone()[0]
     if size > allowance // 8:
         raise ComputeResourceError("publication catalog exceeds materialization budget")
-    # The catalog rows stay live through every later step, so reserve them.
-    live = size
+    # The catalog rows stay live through every later step, so every later step is
+    # admitted against what is left rather than the whole allowance.
+    held = replace(budget, reserved_bytes=size)
     versions = workspace.state.execute(
         "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash,parent_generation_id "
         "FROM dataset_versions WHERE status='committed'"
@@ -103,7 +105,7 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
     parents = {version["parent_generation_id"] for version in versions}
     covered: set[str] = set()
     for generation in sorted(committed - parents):
-        verify_sealed_publication(workspace, generation, budget=budget)
+        verify_sealed_publication(workspace, generation, budget=held)
         covered.update(
             str(marker["generation_id"])
             for marker in generation_chain(workspace.market, generation)
@@ -124,7 +126,7 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
             "length(CAST(version AS BLOB))+length(CAST(raw_sha256 AS BLOB)))),0) "
             "FROM strategy_versions"
         ).fetchone(),
-        allowance - live,
+        held.available_bytes,
         "strategy catalog exceeds materialization budget",
     )
     strategies = workspace.strategies.execute(
@@ -140,7 +142,7 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
         "SELECT kind,convention_id,version,content_hash FROM conventions"
     ):
         read_convention(workspace.state, ConventionPin(*convention))
-    _verify_input_documents(workspace, budget)
+    _verify_input_documents(workspace, held)
     for row in workspace.state.execute(
         "SELECT run_id,relative_path,size_bytes,content_hash FROM artifacts"
     ):
@@ -161,13 +163,13 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
     ).fetchone()[0]
     # market_generations is DuckDB, so the SQLite length(CAST(... AS BLOB)) form
     # does not apply; encode() gives the byte width of each identifier.
-    live += _admit_retained(
+    _admit_retained(
         workspace.market.execute(
             "SELECT count(*)*2048 + "
             "coalesce(sum(32*coalesce(octet_length(encode(generation_id)),0)),0) "
             "FROM market_generations"
         ).fetchone(),
-        allowance - live,
+        held.available_bytes,
         "market generation catalog exceeds materialization budget",
     )
     untracked = workspace.market.execute("SELECT generation_id FROM market_generations").fetchall()
@@ -183,7 +185,7 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
 
     # The catalog and generation lists are still held, so source verification is
     # admitted against what is left rather than the whole allowance.
-    sources = verify_sources(workspace, budget=budget, reserved=live)
+    sources = verify_sources(workspace, budget=held)
     if sources is not None:
         report["source_library"] = sources
     return report

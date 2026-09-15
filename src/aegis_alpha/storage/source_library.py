@@ -506,15 +506,13 @@ def read_table(
 
 
 def verify_sources(
-    workspace: Workspace, *, budget: ComputeBudget | None = None, reserved: int = 0
+    workspace: Workspace, *, budget: ComputeBudget | None = None
 ) -> dict[str, object] | None:
-    """Verify retained sources. reserved is what the caller still holds live."""
+    """Verify retained sources within whatever the caller's budget still allows."""
     if not schema.ensure(workspace):
         return None
     budget = budget or ComputeBudget(Fraction(1), 512 * 1024 * 1024)
-    allowance = budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes - reserved
-    if allowance <= 0:
-        raise ComputeResourceError("retained verification state leaves no source budget")
+    allowance = budget.available_bytes
     # Metadata stays live while every table is verified, so table admission gets
     # only what is left. This replaces the earlier unadmitted marker fetch.
     remaining = allowance - _admit_source_metadata(workspace, allowance)

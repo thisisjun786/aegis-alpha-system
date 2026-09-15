@@ -52,6 +52,10 @@ class ComputeBudget:
     cpu_limit: Fraction
     memory_limit_bytes: int
     memory_headroom_bytes: int | None = None
+    # What the caller already holds live in Python across the work being admitted.
+    # It reduces the materialization allowance without moving DuckDB's own share,
+    # so a step can never charge against bytes an earlier step is still using.
+    reserved_bytes: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.cpu_limit, Fraction) or self.cpu_limit <= 0:
@@ -63,6 +67,10 @@ class ComputeBudget:
             or self.memory_headroom_bytes < self.memory_limit_bytes
         ):
             raise ComputeResourceError("memory headroom must cover the compute allocation")
+        if type(self.reserved_bytes) is not int or self.reserved_bytes < 0:
+            raise ComputeResourceError("reserved bytes must be a non-negative integer")
+        if self.reserved_bytes >= self.memory_limit_bytes - self.duckdb_memory_limit_bytes:
+            raise ComputeResourceError("retained state leaves no materialization allowance")
 
     @property
     def hash_workers(self) -> int:
@@ -80,6 +88,11 @@ class ComputeBudget:
     def duckdb_memory_limit_bytes(self) -> int:
         # Leave space for Python/Arrow and file buffers outside DuckDB's allocator.
         return self.memory_limit_bytes * 3 // 4
+
+    @property
+    def available_bytes(self) -> int:
+        """Materialization bytes outside DuckDB that are not already held live."""
+        return self.memory_limit_bytes - self.duckdb_memory_limit_bytes - self.reserved_bytes
 
     def to_dict(self) -> dict[str, object]:
         return {

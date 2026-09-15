@@ -252,10 +252,7 @@ def _incoming(raw: bytes, expected: str) -> dict[str, object]:
 
 
 def _admit_bytes(size: int, budget: ComputeBudget) -> None:
-    if (
-        size > _MAX_BYTES
-        or size * 128 + 65536 > budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes
-    ):
+    if size > _MAX_BYTES or size * 128 + 65536 > budget.available_bytes:
         raise ComputeResourceError("pin document exceeds admitted materialization budget")
 
 
@@ -429,7 +426,7 @@ def _verify_binding(workspace: Workspace, binding: InputBinding, budget: Compute
             workspace.state,
             IdentityPin(identity, digest) if kind == "identity" else None,
             UniversePin(identity, version, digest) if kind == "universe" else None,
-            max_materialization_bytes=budget.memory_limit_bytes - budget.duckdb_memory_limit_bytes,
+            max_materialization_bytes=budget.available_bytes,
         )
     elif kind.startswith("convention:"):
         read_convention(
