@@ -68,6 +68,50 @@ def _verify_artifacts(workspace: Workspace) -> None:
                 raise ValueError("run artifact hash/size mismatch")
 
 
+def _verify_runs(workspace: Workspace, budget: ComputeBudget) -> list[str]:
+    """Check both directions between successful runs and their result markers.
+
+    A run that is still open, or one that ended without a result, is reported rather
+    than raised: those are the states recovery exists to resolve, and failing here
+    would block backup on exactly the workspace that needs one.
+    """
+    _admit_document(
+        workspace.state.execute(
+            "SELECT coalesce(count(*)*2048 + sum(128*length(CAST(run_id AS BLOB))),0) FROM runs"
+        ).fetchone(),
+        budget.available_bytes,
+        "run catalog exceeds materialization budget",
+    )
+    markers = {
+        row[0]: (row[1], row[2])
+        for row in workspace.market.execute(
+            "SELECT run_id,operation_id,manifest_hash FROM result_commits"
+        ).fetchall()
+    }
+    recorded = {
+        row[0]: (row[1], row[2])
+        for row in workspace.state.execute("SELECT run_id,status,result_hash FROM runs")
+    }
+    for run_id, (status, result_hash) in recorded.items():
+        if status != "SUCCESS":
+            continue
+        marker = markers.get(run_id)
+        if marker is None or marker[1] != result_hash:
+            raise ValueError("successful run has no matching result marker")
+        phase = workspace.state.execute(
+            "SELECT phase FROM storage_operations WHERE operation_id=?", (marker[0],)
+        ).fetchone()
+        if phase is None or phase[0] != "COMPLETED":
+            raise ValueError("successful run has no completed operation")
+    unfinished = []
+    for run_id in sorted(markers):
+        if run_id not in recorded:
+            raise ValueError("result marker has no run record")
+        if recorded[run_id][0] != "SUCCESS":
+            unfinished.append(run_id)
+    return unfinished
+
+
 def _admit_document(row: object, allowance: int, message: str) -> None:
     """Charge a document that is materialized, checked, then released.
 
@@ -193,6 +237,7 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
         read_convention(workspace.state, ConventionPin(*convention))
     _verify_input_documents(workspace, held)
     _verify_artifacts(workspace)
+    unfinished_runs = _verify_runs(workspace, held)
     pending = workspace.state.execute(
         "SELECT count(*) FROM storage_operations WHERE phase='PREPARED'"
     ).fetchone()[0]
@@ -218,6 +263,8 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
         "pending_operations": pending,
         "orphan_generations": [row[0] for row in untracked if row[0] not in visible],
     }
+    if unfinished_runs:
+        report["unfinished_runs"] = unfinished_runs
     from aegis_alpha.storage.source_library import verify_sources  # noqa: PLC0415
 
     # The catalog and generation lists are still held, so source verification is
