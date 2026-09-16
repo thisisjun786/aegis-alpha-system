@@ -5,13 +5,14 @@ import json
 import subprocess
 import sys
 from dataclasses import replace
+from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
 from typing import cast
 
 import pytest
 
-from aegis_alpha.compute_resources import ComputeBudget
+from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.storage.backtest_requests import register_backtest_request
 from aegis_alpha.storage.backup import backup
 from aegis_alpha.storage.input_pins import register_input_bundle
@@ -23,14 +24,16 @@ from aegis_alpha.storage.runs import (
     RunStorageError,
     RunStrategyPin,
     _ordered,
+    _seal,
     commit_run,
     fail_run,
     list_runs,
     open_run,
     read_run,
+    recover_run,
 )
 from aegis_alpha.storage.verification import verify_workspace
-from aegis_alpha.storage.workspace import initialize, open_workspace
+from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
 
 BUDGET = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
 HASH_FORMAT = "aas-canonical-json-sha256-v1"
@@ -405,3 +408,250 @@ def test_a_tampered_artifact_refuses_to_read_back(tmp_path: Path) -> None:
             read_run(workspace, "run-1", budget=BUDGET)
         with pytest.raises(ValueError, match="run artifact hash/size mismatch"):
             verify_workspace(workspace, budget=BUDGET)
+
+
+TIGHT = replace(
+    BUDGET, reserved_bytes=BUDGET.memory_limit_bytes - BUDGET.duckdb_memory_limit_bytes - 1
+)
+UNIT_NAV: list[dict[str, object]] = [
+    {"date": "2024-01-02", "unit_value": 1.0, "units": 1000.0, "external_flow": 0.0},
+    {"date": "2024-01-03", "unit_value": 1.02, "units": 1000.0, "external_flow": 500.0},
+]
+
+
+def cashflow(nav: list[dict[str, object]], unit_nav: list[dict[str, object]]) -> bytes:
+    return canonical(
+        {
+            "module": "aegis",
+            "result": {
+                "account": {"nav": nav, "fills": FILLS},
+                "unit_nav": unit_nav,
+                "cashflows": [{"date": "2024-01-03", "amount": 500.0}],
+            },
+        }
+    )
+
+
+def interrupt(monkeypatch: pytest.MonkeyPatch, target: str) -> None:
+    monkeypatch.setattr(
+        "aegis_alpha.storage.runs." + target,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("interrupted")),
+    )
+
+
+def committed_run(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Leave a run whose market marker is committed but whose state record is not."""
+    with open_workspace(home, writable=True) as workspace:
+        handle = open_run(workspace, intent("run-1"))
+        interrupt(monkeypatch, "_finish")
+        with pytest.raises(RuntimeError, match="interrupted"):
+            commit_run(workspace, handle, RunResult(RESULT), budget=BUDGET)
+    monkeypatch.undo()
+
+
+def alter_market(home: Path, statement: str, parameters: list[object]) -> None:
+    with open_workspace(home, writable=True) as workspace:
+        workspace.market.execute("BEGIN TRANSACTION")
+        workspace.market.execute(statement, parameters)
+        workspace.market.execute("COMMIT")
+
+
+@pytest.mark.parametrize(
+    ("statement", "parameters"),
+    [
+        ("UPDATE result_commits SET table_hashes=?", ["not json"]),
+        ("UPDATE equity_points SET equity=? WHERE ordinal=0", [Decimal("1.5")]),
+    ],
+)
+def test_corrupted_results_end_the_run_instead_of_blocking_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, statement: str, parameters: list[object]
+) -> None:
+    home = prepared(tmp_path / "home")
+    committed_run(home, monkeypatch)
+    alter_market(home, statement, parameters)
+    with open_workspace(home, writable=True) as workspace:
+        assert recover_operations(workspace)["recovered"] == ["run:run-1"]
+    assert observed(home, "run-1") == ("QUARANTINED", "QUARANTINED")
+    # A corrupted result must not hold backup hostage forever.
+    assert backup(home, tmp_path / "backup")["backup_root"] == str(tmp_path / "backup")
+
+
+def test_a_refused_materialization_leaves_the_run_open_instead_of_quarantining_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = prepared(tmp_path / "home")
+    committed_run(home, monkeypatch)
+    with open_workspace(home, writable=True) as workspace:
+        operation = workspace.state.execute(
+            "SELECT * FROM storage_operations WHERE target_id='run-1'"
+        ).fetchone()
+        with pytest.raises(ComputeResourceError):
+            recover_run(workspace, operation, budget=TIGHT)
+    # Having no room to work says nothing about the stored result.
+    assert observed(home, "run-1") == ("RUNNING", "PREPARED")
+    with open_workspace(home, writable=True) as workspace:
+        assert recover_operations(workspace)["recovered"] == ["run:run-1"]
+    assert observed(home, "run-1") == ("SUCCESS", "COMPLETED")
+
+
+def test_reading_and_verifying_refuse_to_materialize_beyond_the_allowance(
+    tmp_path: Path,
+) -> None:
+    home = prepared(tmp_path / "home")
+    with open_workspace(home, writable=True) as workspace:
+        commit_run(
+            workspace, open_run(workspace, intent("run-1")), RunResult(RESULT), budget=BUDGET
+        )
+    with open_workspace(home) as workspace:
+        with pytest.raises(ComputeResourceError):
+            read_run(workspace, "run-1", budget=TIGHT)
+        with pytest.raises(ComputeResourceError):
+            verify_workspace(workspace, budget=TIGHT)
+
+
+def test_an_intent_from_another_run_cannot_end_this_one(tmp_path: Path) -> None:
+    home = prepared(tmp_path / "home")
+    with open_workspace(home, writable=True) as workspace:
+        first = open_run(workspace, intent("run-1"))
+        second = open_run(workspace, intent("run-2"))
+        borrowed = replace(second, operation_id=first.operation_id)
+        with pytest.raises(RunStorageError, match="does not belong to this run"):
+            fail_run(workspace, borrowed, "wrong run")
+    assert observed(home, "run-1") == ("RUNNING", "PREPARED")
+    assert observed(home, "run-2") == ("RUNNING", "PREPARED")
+
+
+def test_an_identical_retry_resumes_instead_of_failing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = prepared(tmp_path / "home")
+    with open_workspace(home, writable=True) as workspace:
+        first = open_run(workspace, intent("run-1"))
+        assert open_run(workspace, intent("run-1")) == first
+        with pytest.raises(RunStorageError, match="different or finished run"):
+            open_run(workspace, replace(intent("run-1"), reason="a different question"))
+        interrupt(monkeypatch, "_finish")
+        with pytest.raises(RuntimeError, match="interrupted"):
+            commit_run(workspace, first, RunResult(RESULT), budget=BUDGET)
+        monkeypatch.undo()
+        committed = commit_run(workspace, first, RunResult(RESULT), budget=BUDGET)
+    assert committed["status"] == "SUCCESS"
+    with open_workspace(home) as workspace:
+        assert (
+            read_run(workspace, "run-1", budget=BUDGET)["result_hash"] == committed["result_hash"]
+        )
+
+
+def test_a_sealed_artifact_is_never_replaced_by_different_bytes(tmp_path: Path) -> None:
+    home = prepared(tmp_path / "home")
+    with open_workspace(home, writable=True) as workspace:
+        handle = open_run(workspace, intent("run-1"))
+        commit_run(workspace, handle, RunResult(RESULT), budget=BUDGET)
+        with pytest.raises(RunStorageError, match="already holds different bytes"):
+            _seal(workspace, "run-1", "backtest.json", backtest(NAV, FILLS[:1]))
+
+
+def test_an_interrupted_seal_still_leaves_a_discoverable_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = prepared(tmp_path / "home")
+    sealed: list[str] = []
+    original = _seal
+
+    def once(workspace: Workspace, run_id: str, name: str, raw: bytes) -> str:
+        if sealed:
+            raise RuntimeError("interrupted between seals")
+        sealed.append(name)
+        return original(workspace, run_id, name, raw)
+
+    monkeypatch.setattr("aegis_alpha.storage.runs._seal", once)
+    with (
+        open_workspace(home, writable=True) as workspace,
+        pytest.raises(RuntimeError, match="between seals"),
+    ):
+        open_run(workspace, intent("run-1"))
+    monkeypatch.undo()
+    assert sealed == ["envelope.json"]
+    assert observed(home, "run-1") == ("RUNNING", "PREPARED")
+    with open_workspace(home, writable=True) as workspace:
+        assert recover_operations(workspace)["recovered"] == ["run:run-1"]
+    assert observed(home, "run-1") == ("INTERRUPTED", "QUARANTINED")
+
+
+def test_metrics_do_not_depend_on_the_supplied_array_order(tmp_path: Path) -> None:
+    home = prepared(tmp_path / "home")
+    with open_workspace(home, writable=True) as workspace:
+        forward = commit_run(
+            workspace, open_run(workspace, intent("run-1")), RunResult(RESULT), budget=BUDGET
+        )
+        reversed_document = backtest(list(reversed(NAV)), list(reversed(FILLS)))
+        backward = commit_run(
+            workspace,
+            open_run(workspace, intent("run-2")),
+            RunResult(reversed_document),
+            budget=BUDGET,
+        )
+    assert forward["metrics"] == backward["metrics"] == METRICS
+
+
+def test_an_unrepresentable_return_is_recorded_as_unsupported_not_as_a_number(
+    tmp_path: Path,
+) -> None:
+    home = prepared(tmp_path / "home")
+    extreme: list[dict[str, object]] = [
+        {"date": "2024-01-02", "equity": 1e-12, "cash": 0.0},
+        {"date": "2024-01-03", "equity": 1e25, "cash": 0.0},
+    ]
+    with open_workspace(home, writable=True) as workspace:
+        committed = commit_run(
+            workspace,
+            open_run(workspace, intent("run-1")),
+            RunResult(backtest(extreme, [])),
+            budget=BUDGET,
+        )
+    metrics = cast("dict[str, dict[str, object]]", committed["metrics"])
+    assert metrics["total_return"] == {"value": None, "value_state": "unsupported"}
+    assert metrics["final_equity"]["value_state"] == "present"
+
+
+def test_a_cashflow_result_measures_return_without_the_contributions(tmp_path: Path) -> None:
+    home = prepared(tmp_path / "home")
+    with open_workspace(home, writable=True) as workspace:
+        committed = commit_run(
+            workspace,
+            open_run(workspace, intent("run-1")),
+            RunResult(cashflow(NAV, UNIT_NAV)),
+            budget=BUDGET,
+        )
+    metrics = cast("dict[str, dict[str, object]]", committed["metrics"])
+    # The account grew 10 percent, but 500 of that arrived as a contribution. The unit
+    # values are what the strategy actually earned.
+    assert metrics["final_equity"]["value"] == "1100.000000000000"
+    assert metrics["total_return"] == {"value": "0.020000000000", "value_state": "present"}
+    with open_workspace(home) as workspace:
+        assert read_run(workspace, "run-1", budget=BUDGET)["table_counts"] == COUNTS
+
+
+def test_an_unsupported_result_contract_is_refused_before_it_is_sealed(tmp_path: Path) -> None:
+    home = prepared(tmp_path / "home")
+    with open_workspace(home, writable=True) as workspace:
+        handle = open_run(workspace, intent("run-1"))
+        unsupported = canonical({"module": "aegis", "result": {"positions": []}})
+        with pytest.raises(RunStorageError, match="unsupported backtest result contract"):
+            commit_run(workspace, handle, RunResult(unsupported), budget=BUDGET)
+        assert not (workspace.paths.runs / "run-1" / "backtest.json").exists()
+    assert observed(home, "run-1") == ("RUNNING", "PREPARED")
+
+
+def test_verification_rejects_a_successful_run_whose_stored_rows_changed(tmp_path: Path) -> None:
+    home = prepared(tmp_path / "home")
+    with open_workspace(home, writable=True) as workspace:
+        commit_run(
+            workspace, open_run(workspace, intent("run-1")), RunResult(RESULT), budget=BUDGET
+        )
+    alter_market(home, "UPDATE equity_points SET cash=? WHERE ordinal=0", [Decimal("7.5")])
+    with open_workspace(home) as workspace:
+        with pytest.raises(ValueError, match="disagree with the sealed evidence"):
+            verify_workspace(workspace, budget=BUDGET)
+        with pytest.raises(ValueError, match="disagree with the sealed evidence"):
+            read_run(workspace, "run-1", budget=BUDGET)

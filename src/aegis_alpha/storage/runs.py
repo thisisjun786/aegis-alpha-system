@@ -51,11 +51,17 @@ _SHA_LENGTH = 64
 # stores already use for their own documents, before anything is read.
 _DOCUMENT_OVERHEAD = 2048
 _DOCUMENT_EXPANSION = 128
+# One stored result row becomes a Python dict, a tagged rowset encoding and a sort
+# key, all live at once, on top of its own measured text.
+_ROW_OVERHEAD = 512
+_ROW_COPIES = 4
 # An explicit context: an ambient one can carry traps or exponent limits that turn
 # an ordinary projection into an exception.
 _DECIMAL = Context(prec=38, rounding=ROUND_HALF_EVEN, Emin=-999999, Emax=999999, clamp=0, traps=[])
 _QUANTUM = Decimal("1e-12")
-_DECIMAL_LIMIT = Decimal(10) ** 26
+# A literal, not arithmetic: an exponentiation here would be evaluated in whatever
+# context the importing process happens to have installed.
+_DECIMAL_LIMIT = Decimal("1e26")
 # Hashed row shapes exclude run_id and ordinal: the first is fresh per run and the
 # second is a storage ordering detail, so including either would make the same
 # calculation hash differently.
@@ -162,7 +168,12 @@ def _decimal12(value: object) -> Decimal:
     exact = Decimal(repr(number))
     if exact.copy_abs() >= _DECIMAL_LIMIT:
         raise RunStorageError("result value exceeds DECIMAL(38,12)")
-    return _DECIMAL.quantize(exact, _QUANTUM)
+    projected = _DECIMAL.quantize(exact, _QUANTUM)
+    if not projected.is_finite():
+        # The context traps nothing, so an unrepresentable result arrives as NaN
+        # rather than as an exception. Refuse it before anything durable is written.
+        raise RunStorageError("result value has no DECIMAL(38,12) projection")
+    return projected
 
 
 def _finite(value: object) -> float:
@@ -198,6 +209,37 @@ def _mapping(value: object, field: str) -> dict[str, object]:
     return value
 
 
+def account_evidence(document: dict[str, object]) -> tuple[dict[str, object], list[object] | None]:
+    """Locate the account evidence under either replay contract, or refuse the document.
+
+    replay_next_open returns nav and fills directly. The cashflow replay nests the same
+    account under "account" and adds contribution-neutral unit values. Anything else is
+    an unsupported result contract and is refused before a durable write.
+    """
+    result = _mapping(document.get("result"), "result")
+    if "account" in result:
+        return _mapping(result["account"], "account"), _sequence(result.get("unit_nav"), "unit_nav")
+    if "nav" in result:
+        return result, None
+    raise RunStorageError("unsupported backtest result contract")
+
+
+def _by_date(rows: list[object], field: str, label: str) -> list[dict[str, object]]:
+    """Order dated entries by their session, then by their own content.
+
+    The supplied array order decides nothing: a caller that reverses its nav must not
+    change which entry opens and which closes the period.
+    """
+    entries = [_mapping(row, label) for row in rows]
+    return sorted(
+        entries,
+        key=lambda entry: (
+            _comparable(_session_us(entry.get(field))),
+            tuple(_comparable(entry[key]) for key in sorted(entry)),
+        ),
+    )
+
+
 def project_result_rows(backtest_bytes: bytes, envelope_bytes: bytes) -> dict[str, list[dict]]:
     """Derive stored result rows from the sealed bytes, deterministically.
 
@@ -207,31 +249,27 @@ def project_result_rows(backtest_bytes: bytes, envelope_bytes: bytes) -> dict[st
     document = _mapping(json.loads(backtest_bytes), "backtest result")
     envelope = _mapping(json.loads(envelope_bytes), "envelope")
     module = _text(document.get("module"), "module")
-    result = _mapping(document.get("result"), "result")
-    equity: list[dict[str, object]] = []
-    for row in _sequence(result.get("nav"), "nav"):
-        entry = _mapping(row, "nav entry")
-        equity.append(
-            {
-                "module": module,
-                "at_us": _session_us(entry.get("date")),
-                "equity": _decimal12(entry.get("equity")),
-                "cash": _decimal12(entry.get("cash")),
-            }
-        )
-    trades: list[dict[str, object]] = []
-    for row in _sequence(result.get("fills"), "fills"):
-        fill = _mapping(row, "fill")
-        trades.append(
-            {
-                "module": module,
-                "at_us": _session_us(fill.get("execution_date")),
-                "instrument_id": _text(fill.get("symbol"), "fill symbol"),
-                "quantity": _decimal12(fill.get("shares")),
-                "price": _decimal12(fill.get("price")),
-                "cost": _decimal12(fill.get("fee")),
-            }
-        )
+    account, _unit_nav = account_evidence(document)
+    equity: list[dict[str, object]] = [
+        {
+            "module": module,
+            "at_us": _session_us(entry.get("date")),
+            "equity": _decimal12(entry.get("equity")),
+            "cash": _decimal12(entry.get("cash")),
+        }
+        for entry in _by_date(_sequence(account.get("nav"), "nav"), "date", "nav entry")
+    ]
+    trades: list[dict[str, object]] = [
+        {
+            "module": module,
+            "at_us": _session_us(fill.get("execution_date")),
+            "instrument_id": _text(fill.get("symbol"), "fill symbol"),
+            "quantity": _decimal12(fill.get("shares")),
+            "price": _decimal12(fill.get("price")),
+            "cost": _decimal12(fill.get("fee")),
+        }
+        for fill in _by_date(_sequence(account.get("fills"), "fills"), "execution_date", "fill")
+    ]
     weights: list[dict[str, object]] = []
     for day, targets in sorted(_mapping(envelope.get("targets"), "targets").items()):
         for symbol, weight in sorted(_mapping(targets, "target weights").items()):
@@ -259,33 +297,45 @@ def project_metrics(backtest_bytes: bytes) -> dict[str, tuple[Decimal | None, st
     left out, so a reader can tell an absent metric from an absent reason. sharpe and
     sortino need a pinned risk-free reference that the run does not carry, so they are
     always recorded not collected.
+
+    When the document carries external cashflows the account return is not the
+    strategy return, so total_return reads the engine contribution-neutral unit values
+    whenever they are present.
     """
-    result = _mapping(
-        _mapping(json.loads(backtest_bytes), "backtest result").get("result"), "result"
-    )
-    nav = _sequence(result.get("nav"), "nav")
+    document = _mapping(json.loads(backtest_bytes), "backtest result")
+    account, unit_nav = account_evidence(document)
     metrics: dict[str, tuple[Decimal | None, str]] = {
         "sharpe": (None, "not_collected"),
         "sortino": (None, "not_collected"),
     }
+    nav = _by_date(_sequence(account.get("nav"), "nav"), "date", "nav entry")
     if not nav:
         return {**metrics, "final_equity": (None, "missing"), "total_return": (None, "missing")}
-    opening = _decimal12(_mapping(nav[0], "nav entry").get("equity"))
-    final = _decimal12(_mapping(nav[-1], "nav entry").get("equity"))
-    metrics["final_equity"] = (final, "present")
-    if opening == 0:
-        # A return measured against a zero opening equity is undefined, not zero.
-        metrics["total_return"] = (None, "unsupported")
+    metrics["final_equity"] = (_decimal12(nav[-1].get("equity")), "present")
+    if unit_nav is None:
+        metrics["total_return"] = _change([entry.get("equity") for entry in nav])
     else:
-        # Every step stays inside the explicit context. An ambient subtraction could
-        # round at a different precision and make recovery disagree with commit.
-        metrics["total_return"] = (
-            _DECIMAL.quantize(
-                _DECIMAL.subtract(_DECIMAL.divide(final, opening), Decimal(1)), _QUANTUM
-            ),
-            "present",
-        )
+        units = _by_date(unit_nav, "date", "unit nav entry")
+        metrics["total_return"] = _change([entry.get("unit_value") for entry in units])
     return metrics
+
+
+def _change(series: list[object]) -> tuple[Decimal | None, str]:
+    """Return the closing-over-opening change, or the reason it is not defined."""
+    if not series:
+        return (None, "missing")
+    opening, final = _decimal12(series[0]), _decimal12(series[-1])
+    if opening == 0:
+        # A change measured against a zero opening value is undefined, not zero.
+        return (None, "unsupported")
+    # Every step stays inside the explicit context. An ambient subtraction could round
+    # at a different precision and make recovery disagree with commit.
+    change = _DECIMAL.quantize(
+        _DECIMAL.subtract(_DECIMAL.divide(final, opening), Decimal(1)), _QUANTUM
+    )
+    # The context traps nothing, so an unrepresentable ratio arrives as NaN, not as an
+    # exception, and would otherwise be committed as a successful metric.
+    return (change, "present") if change.is_finite() else (None, "unsupported")
 
 
 def _sequence(value: object, field: str) -> list[object]:
@@ -315,19 +365,28 @@ def manifest_hash(request_hash: str, artifacts: dict[str, str], receipts: tuple)
 
 
 def _seal(workspace: Workspace, run_id: str, name: str, raw: bytes) -> str:
-    """Write one artifact exclusively, fsync it and its directory, then re-read it."""
+    """Write one artifact exclusively, fsync it and its directory, then re-read it.
+
+    A repeat with identical bytes is the same seal, not a conflict, so an interrupted
+    open or commit is resumed by comparison. Different bytes under a name that is
+    already sealed are refused; a sealed artifact is never replaced.
+    """
     relative = run_id + "/" + name
     with DescriptorTree.open_path(workspace.paths.runs) as tree:
         tree.mkdir(run_id, exist_ok=True)
-        with tree.binary_writer(relative, exclusive=True) as handle:
-            handle.write(raw)
-            handle.flush()
-            os.fsync(handle.fileno())
-        tree.fsync_directory(run_id)
+        # The new directory entry itself lives in the parent, so the parent is synced
+        # too. Syncing only the new directory would leave it unreachable after a loss.
+        tree.fsync_directory()
+        if not tree.exists(relative):
+            with tree.binary_writer(relative, exclusive=True) as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            tree.fsync_directory(run_id)
         with tree.binary_reader(relative, require_single_link=True) as handle:
             stored = handle.read(len(raw) + 1)
     if stored != raw:
-        raise RunStorageError("sealed run artifact changed while being written")
+        raise RunStorageError("a sealed run artifact already holds different bytes")
     return hashlib.sha256(raw).hexdigest()
 
 
@@ -343,6 +402,78 @@ def _artifact_digest(workspace: Workspace, run_id: str, name: str) -> tuple[str,
             digest.update(chunk)
             size += len(chunk)
     return digest.hexdigest(), size
+
+
+def _pin_rows(pins: tuple[RunStrategyPin, ...]) -> list[tuple[object, ...]]:
+    return [
+        (
+            _text(pin.module, "pin module"),
+            pin.ordinal,
+            _text(pin.store_id, "pin store_id"),
+            _text(pin.strategy_id, "pin strategy_id"),
+            _text(pin.version, "pin version"),
+            _digest(pin.raw_hash, "pin raw_hash"),
+            _digest(pin.contract_hash, "pin contract_hash"),
+        )
+        for pin in sorted(pins, key=lambda pin: (pin.module, pin.ordinal))
+    ]
+
+
+def _require_same_intent(
+    workspace: Workspace, intent: RunIntent, run_id: str, request_hash: str
+) -> None:
+    """Accept an identical reopen; refuse a different request under the same name.
+
+    The state rows are immutable, so a retry can only be a comparison. A run that has
+    already ended is not reopened at all.
+    """
+    existing = workspace.state.execute(
+        "SELECT r.bundle_id,r.engine_hash,r.environment_hash,r.reason,r.status,r.prior_run_id,"
+        "d.request_hash FROM runs r LEFT JOIN run_details d ON d.run_id=r.run_id "
+        "WHERE r.run_id=?",
+        (run_id,),
+    ).fetchone()
+    stored_pins = [
+        tuple(row)
+        for row in workspace.state.execute(
+            "SELECT module,ordinal,strategy_store_id,strategy_id,version,raw_hash,contract_hash "
+            "FROM run_strategies WHERE run_id=? ORDER BY module,ordinal",
+            (run_id,),
+        )
+    ]
+    if (
+        existing["status"] != "RUNNING"
+        or existing["bundle_id"] != intent.bundle_id
+        or existing["engine_hash"] != intent.engine_hash
+        or existing["environment_hash"] != intent.environment_hash
+        or existing["reason"] != intent.reason
+        or existing["prior_run_id"] != intent.prior_run_id
+        or existing["request_hash"] != request_hash
+        or stored_pins != _pin_rows(intent.strategy_pins)
+    ):
+        raise RunStorageError("run ID already identifies a different or finished run")
+
+
+@dataclass(frozen=True, slots=True)
+class _DurableIntent:
+    """The run intent exactly as prepare_operation records it."""
+
+    operation_id: str
+    request_hash: str
+    target_id: str
+    expected_parent: str | None
+    payload_hash: str
+
+    def prepare(self, connection: sqlite3.Connection) -> None:
+        prepare_operation(
+            connection,
+            operation_id=self.operation_id,
+            kind=RUN_OPERATION_KIND,
+            request_hash=self.request_hash,
+            target_id=self.target_id,
+            expected_parent=self.expected_parent,
+            payload_hash=self.payload_hash,
+        )
 
 
 def open_run(workspace: Workspace, intent: RunIntent) -> RunHandle:
@@ -362,6 +493,35 @@ def open_run(workspace: Workspace, intent: RunIntent) -> RunHandle:
     _text(run_id, "run_id")
     envelope_sha256 = hashlib.sha256(intent.envelope_bytes).hexdigest()
     operation_id = "run:" + run_id
+    durable = _DurableIntent(
+        operation_id=operation_id,
+        request_hash=request_hash,
+        target_id=run_id,
+        expected_parent=intent.prior_run_id,
+        payload_hash=envelope_sha256,
+    )
+    if workspace.state.execute("SELECT 1 FROM runs WHERE run_id=?", (run_id,)).fetchone():
+        # A resumed open: prepare_operation refuses a different or quarantined intent
+        # under the same ID, and the run rows are compared rather than rewritten.
+        _require_same_intent(workspace, intent, run_id, request_hash)
+        durable.prepare(workspace.state)
+    else:
+        _open_intent(workspace, intent, durable)
+    # The intent is durable now, so a crash during sealing leaves a discoverable run.
+    sealed_envelope = _seal(workspace, run_id, _ENVELOPE, intent.envelope_bytes)
+    sealed_preparation = _seal(workspace, run_id, _PREPARATION, intent.preparation_bytes)
+    return RunHandle(
+        run_id=run_id,
+        operation_id=operation_id,
+        request_hash=request_hash,
+        envelope_sha256=sealed_envelope,
+        preparation_sha256=sealed_preparation,
+    )
+
+
+def _open_intent(workspace: Workspace, intent: RunIntent, durable: _DurableIntent) -> None:
+    """Transaction A: the run, its request, its pins and its intent, or none of them."""
+    run_id = durable.target_id
     now = time.time_ns() // 1000
     with atomic(workspace.state):
         workspace.state.execute(
@@ -381,49 +541,45 @@ def open_run(workspace: Workspace, intent: RunIntent) -> RunHandle:
         workspace.state.execute(
             "INSERT INTO run_details(run_id,request_hash,prior_run_id,request_schema) "
             "VALUES (?,?,?,'aas-backtest-request-v1')",
-            (run_id, request_hash, intent.prior_run_id),
+            (run_id, durable.request_hash, intent.prior_run_id),
         )
-        for pin in intent.strategy_pins:
+        for pin in _pin_rows(intent.strategy_pins):
             workspace.state.execute(
                 "INSERT INTO run_strategies(run_id,module,ordinal,strategy_store_id,strategy_id,"
                 "version,raw_hash,contract_hash) VALUES (?,?,?,?,?,?,?,?)",
-                (
-                    run_id,
-                    _text(pin.module, "pin module"),
-                    pin.ordinal,
-                    _text(pin.store_id, "pin store_id"),
-                    _text(pin.strategy_id, "pin strategy_id"),
-                    _text(pin.version, "pin version"),
-                    _digest(pin.raw_hash, "pin raw_hash"),
-                    _digest(pin.contract_hash, "pin contract_hash"),
-                ),
+                (run_id, *pin),
             )
         workspace.state.execute(
             "INSERT INTO run_events(run_id,sequence,known_at_us,kind,reason) VALUES (?,1,?,?,?)",
             (run_id, now, "started", intent.reason),
         )
-        prepare_operation(
-            workspace.state,
-            operation_id=operation_id,
-            kind=RUN_OPERATION_KIND,
-            request_hash=request_hash,
-            target_id=run_id,
-            expected_parent=intent.prior_run_id,
-            payload_hash=envelope_sha256,
-        )
-    # The intent is durable now, so a crash during sealing leaves a discoverable run.
-    sealed_envelope = _seal(workspace, run_id, _ENVELOPE, intent.envelope_bytes)
-    sealed_preparation = _seal(workspace, run_id, _PREPARATION, intent.preparation_bytes)
-    return RunHandle(
-        run_id=run_id,
-        operation_id=operation_id,
-        request_hash=request_hash,
-        envelope_sha256=sealed_envelope,
-        preparation_sha256=sealed_preparation,
+        durable.prepare(workspace.state)
+
+
+def _admit(budget: ComputeBudget | None, needed: int, message: str) -> None:
+    """Charge a materialization before it happens, never after it is in memory."""
+    if budget is not None and needed > budget.available_bytes:
+        raise ComputeResourceError(message)
+
+
+def _marker(
+    workspace: Workspace, run_id: str, budget: ComputeBudget | None = None
+) -> dict[str, object] | None:
+    """Read the market commit marker, charged for its own variable width first."""
+    measured = workspace.market.execute(
+        "SELECT coalesce(sum(coalesce(octet_length(encode(operation_id)),0)"
+        "+coalesce(octet_length(encode(request_hash)),0)"
+        "+coalesce(octet_length(encode(manifest_hash)),0)"
+        "+coalesce(octet_length(encode(table_hashes)),0)"
+        "+coalesce(octet_length(encode(table_counts)),0)),0) "
+        "FROM result_commits WHERE run_id=?",
+        [run_id],
+    ).fetchone()
+    _admit(
+        budget,
+        _DOCUMENT_OVERHEAD + _DOCUMENT_EXPANSION * (0 if measured is None else int(measured[0])),
+        "result marker exceeds materialization budget",
     )
-
-
-def _marker(workspace: Workspace, run_id: str) -> dict[str, object] | None:
     row = workspace.market.execute(
         "SELECT run_id,operation_id,request_hash,manifest_hash,table_hashes,table_counts "
         "FROM result_commits WHERE run_id=?",
@@ -439,12 +595,6 @@ def _marker(workspace: Workspace, run_id: str) -> dict[str, object] | None:
         "table_hashes": json.loads(row[4]),
         "table_counts": json.loads(row[5]),
     }
-
-
-def _admit(budget: ComputeBudget | None, needed: int, message: str) -> None:
-    """Charge a materialization before it happens, never after it is in memory."""
-    if budget is not None and needed > budget.available_bytes:
-        raise ComputeResourceError(message)
 
 
 def _read_sealed(workspace: Workspace, run_id: str, name: str) -> bytes:
@@ -470,8 +620,8 @@ def _ordered(name: str, rows: list[dict[str, object]]) -> list[tuple[int, dict[s
     """Number rows zero-based inside each module under a total order.
 
     The declared keys are not unique on their own: signals repeat a date and an
-    instrument. Every remaining field breaks the tie, so shuffling the caller's
-    input cannot move an ordinal.
+    instrument. Every remaining field breaks the tie, so shuffling the caller's input
+    cannot move an ordinal.
     """
     fields = (*_ORDER_KEYS[name], *(field for field, _kind in _ROW_SCHEMAS[name]))
     grouped: dict[str, list[dict[str, object]]] = {}
@@ -490,6 +640,8 @@ def _ordered(name: str, rows: list[dict[str, object]]) -> list[tuple[int, dict[s
 class _Derived:
     """Everything a commit needs, derived only from evidence already on disk."""
 
+    run_id: str
+    request_hash: str
     module: str
     artifacts: dict[str, str]
     sizes: dict[str, int]
@@ -518,6 +670,8 @@ def _derive(
     hashes, counts = table_receipts(rows)
     document = _mapping(json.loads(backtest_bytes), "backtest result")
     return _Derived(
+        run_id=run_id,
+        request_hash=request_hash,
         module=_text(document.get("module"), "module"),
         artifacts=artifacts,
         sizes=sizes,
@@ -534,7 +688,31 @@ def _normalized(value: object) -> object:
     return _DECIMAL.quantize(value, _QUANTUM) if isinstance(value, Decimal) else value
 
 
-def _stored_rows(workspace: Workspace, run_id: str) -> dict[str, list[dict[str, object]]]:
+def _row_charge(workspace: Workspace, run_id: str) -> int:
+    """Measure what the stored rows will occupy in Python, before fetching any of them."""
+    total = 0
+    for name in sorted(_ROW_SCHEMAS):
+        widths = " + ".join(
+            'coalesce(octet_length(encode("' + field + '")),0)'
+            for field, kind in _ROW_SCHEMAS[name]
+            if kind == "text"
+        )
+        measure = (
+            f"SELECT count(*)*{_ROW_OVERHEAD} + coalesce(sum({widths}),0) "  # noqa: S608
+            f'FROM "{name}" WHERE run_id=?'
+        )
+        measured = workspace.market.execute(measure, [run_id]).fetchone()
+        total += 0 if measured is None else int(measured[0])
+    # The rows, their rowset encodings and the sort storage are all live at once.
+    return total * _ROW_COPIES
+
+
+def _stored_rows(
+    workspace: Workspace, run_id: str, budget: ComputeBudget | None = None
+) -> dict[str, list[dict[str, object]]]:
+    _admit(
+        budget, _row_charge(workspace, run_id), "stored result rows exceed materialization budget"
+    )
     stored: dict[str, list[dict[str, object]]] = {}
     for name in sorted(_ROW_SCHEMAS):
         fields = tuple(field for field, _kind in _ROW_SCHEMAS[name])
@@ -557,23 +735,37 @@ def _require_open(workspace: Workspace, handle: RunHandle) -> None:
     ).fetchone()
     if row is None or row[0] != "RUNNING" or row[1] != handle.request_hash:
         raise RunStorageError("run is not open under this handle")
+    _require_own_intent(workspace, handle.run_id, handle.operation_id, phase="PREPARED")
     operation = get_operation(workspace.state, handle.operation_id)
-    if (
-        operation is None
-        or operation["phase"] != "PREPARED"
-        or operation["kind"] != RUN_OPERATION_KIND
-        or operation["target_id"] != handle.run_id
-        or operation["request_hash"] != handle.request_hash
-    ):
+    if operation is None or operation["request_hash"] != handle.request_hash:
         raise RunStorageError("run has no prepared intent under this handle")
 
 
-def _require_marker_match(
-    marker: dict[str, object], operation_id: str, request_hash: str, derived: _Derived
-) -> None:
+def _require_own_intent(
+    workspace: Workspace, run_id: str, operation_id: str, *, phase: str | None = None
+) -> dict[str, object] | None:
+    """Refuse an intent that names a different run.
+
+    Without this a handle assembled from one run's ID and another run's operation would
+    end the wrong intent, leaving that run RUNNING and invisible to the recovery scan.
+    """
+    operation = get_operation(workspace.state, operation_id)
+    if operation is None:
+        if phase is not None:
+            raise RunStorageError("run has no prepared intent under this handle")
+        return None
+    if operation["kind"] != RUN_OPERATION_KIND or operation["target_id"] != run_id:
+        raise RunStorageError("operation does not belong to this run")
+    if phase is not None and operation["phase"] != phase:
+        raise RunStorageError("run intent is not in phase " + phase)
+    return operation
+
+
+def _require_marker_match(marker: dict[str, object], operation_id: str, derived: _Derived) -> None:
     if (
-        marker["operation_id"] != operation_id
-        or marker["request_hash"] != request_hash
+        marker["run_id"] != derived.run_id
+        or marker["operation_id"] != operation_id
+        or marker["request_hash"] != derived.request_hash
         or marker["manifest_hash"] != derived.manifest
         or marker["table_hashes"] != derived.hashes
         or marker["table_counts"] != derived.counts
@@ -581,13 +773,11 @@ def _require_marker_match(
         raise RunStorageError("stored result marker disagrees with the sealed evidence")
 
 
-def _write_marker(
-    workspace: Workspace, run_id: str, operation_id: str, request_hash: str, derived: _Derived
-) -> None:
+def _write_marker(workspace: Workspace, derived: _Derived, operation_id: str) -> None:
     """Commit the verifiable target in one market transaction, or leave nothing."""
-    existing = _marker(workspace, run_id)
+    existing = _marker(workspace, derived.run_id)
     if existing is not None:
-        _require_marker_match(existing, operation_id, request_hash, derived)
+        _require_marker_match(existing, operation_id, derived)
         return
     workspace.market.execute("BEGIN TRANSACTION")
     try:
@@ -595,9 +785,9 @@ def _write_marker(
             "INSERT INTO result_commits(run_id,operation_id,request_hash,manifest_hash,"
             "table_hashes,table_counts) VALUES (?,?,?,?,?,?)",
             [
-                run_id,
+                derived.run_id,
                 operation_id,
-                request_hash,
+                derived.request_hash,
                 derived.manifest,
                 canonical_json_bytes(derived.hashes).decode(),
                 canonical_json_bytes(derived.counts).decode(),
@@ -614,7 +804,10 @@ def _write_marker(
             statement = f'INSERT INTO "{name}"({columns}) VALUES ({marks})'  # noqa: S608
             workspace.market.executemany(
                 statement,
-                [[run_id, ordinal, *(row[field] for field in fields)] for ordinal, row in payload],
+                [
+                    [derived.run_id, ordinal, *(row[field] for field in fields)]
+                    for ordinal, row in payload
+                ],
             )
         workspace.market.execute("COMMIT")
     except BaseException:
@@ -643,10 +836,15 @@ def _metric_payload(
 
 
 def _finish(
-    workspace: Workspace, run_id: str, operation_id: str, request_hash: str, derived: _Derived
+    workspace: Workspace,
+    derived: _Derived,
+    operation_id: str,
+    *,
+    budget: ComputeBudget | None = None,
 ) -> dict[str, object]:
     """Record the receipts and end the run SUCCESS, only after the marker verifies."""
-    hashes, counts = table_receipts(_stored_rows(workspace, run_id))
+    run_id = derived.run_id
+    hashes, counts = table_receipts(_stored_rows(workspace, run_id, budget))
     if hashes != derived.hashes or counts != derived.counts:
         raise RunStorageError("stored result rows disagree with the sealed evidence")
     now = time.time_ns() // 1000
@@ -683,7 +881,7 @@ def _finish(
         ).rowcount
         if updated != 1:
             raise RunStorageError("run was no longer open when its result was recorded")
-        complete_operation(workspace.state, operation_id, request_hash)
+        complete_operation(workspace.state, operation_id, derived.request_hash)
     return {
         "run_id": run_id,
         "status": "SUCCESS",
@@ -699,16 +897,12 @@ def _finish(
 
 
 def _terminate(
-    workspace: Workspace,
-    run_id: str,
-    operation_id: str,
-    *,
-    status: str,
-    reason: str,
+    workspace: Workspace, run_id: str, operation_id: str, *, status: str, reason: str
 ) -> dict[str, object]:
     """End a run and its intent together so neither can outlive the other."""
     now = time.time_ns() // 1000
     with atomic(workspace.state):
+        operation = _require_own_intent(workspace, run_id, operation_id)
         current = workspace.state.execute(
             "SELECT status FROM runs WHERE run_id=?", (run_id,)
         ).fetchone()
@@ -722,7 +916,6 @@ def _terminate(
                 (status, now, run_id),
             )
             final = status
-        operation = get_operation(workspace.state, operation_id)
         if operation is not None and operation["phase"] == "PREPARED":
             # A generic quarantine would leave the run RUNNING and invisible to the
             # PREPARED-only scan, so the run and the intent end in the same transaction.
@@ -742,6 +935,9 @@ def commit_run(
     if workspace.state.in_transaction:
         raise RunStorageError("commit_run cannot run inside another state transaction")
     _require_open(workspace, handle)
+    # The result contract is checked against an unsealed copy first: an unsupported
+    # document must be refused before it becomes a durable artifact.
+    account_evidence(_mapping(json.loads(result.backtest_bytes), "backtest result"))
     _seal(workspace, handle.run_id, _BACKTEST, result.backtest_bytes)
     derived = _derive(workspace, handle.run_id, handle.request_hash, budget)
     if (
@@ -749,8 +945,8 @@ def commit_run(
         or derived.artifacts[_PREPARATION] != handle.preparation_sha256
     ):
         raise RunStorageError("sealed run inputs changed after the run was opened")
-    _write_marker(workspace, handle.run_id, handle.operation_id, handle.request_hash, derived)
-    return _finish(workspace, handle.run_id, handle.operation_id, handle.request_hash, derived)
+    _write_marker(workspace, derived, handle.operation_id)
+    return _finish(workspace, derived, handle.operation_id, budget=budget)
 
 
 def fail_run(workspace: Workspace, handle: RunHandle, reason: str) -> dict[str, object]:
@@ -758,6 +954,7 @@ def fail_run(workspace: Workspace, handle: RunHandle, reason: str) -> dict[str, 
     require_run_schema(workspace)
     if workspace.state.in_transaction:
         raise RunStorageError("fail_run cannot run inside another state transaction")
+    _require_open(workspace, handle)
     if _marker(workspace, handle.run_id) is not None:
         # Ending it here would strand transaction B: recovery can only finish a run
         # that is still RUNNING.
@@ -769,6 +966,63 @@ def fail_run(workspace: Workspace, handle: RunHandle, reason: str) -> dict[str, 
         status="FAILED",
         reason=_text(reason, "reason"),
     )
+
+
+def _recorded_metrics(workspace: Workspace, run_id: str) -> dict[str, dict[str, object]]:
+    return {
+        row["metric"]: {
+            "value": row["value"],
+            "value_state": row["value_state"],
+            "benchmark_ref": row["benchmark_ref"],
+            "risk_free_ref": row["risk_free_ref"],
+            "cost_ref": row["cost_ref"],
+            "comparison_condition_hash": row["comparison_condition_hash"],
+        }
+        for row in workspace.state.execute(
+            "SELECT metric,value,value_state,benchmark_ref,risk_free_ref,cost_ref,"
+            "comparison_condition_hash FROM run_metrics WHERE run_id=? AND definition_version=? "
+            "ORDER BY metric",
+            (run_id, METRIC_DEFINITION_VERSION),
+        )
+    }
+
+
+def verify_run(
+    workspace: Workspace, run_id: str, request_hash: str, *, budget: ComputeBudget | None = None
+) -> _Derived:
+    """Re-derive one successful run and refuse it unless every record still agrees."""
+    operation = workspace.state.execute(
+        "SELECT operation_id,phase,target_id,kind,request_hash FROM storage_operations "
+        "WHERE kind=? AND target_id=?",
+        (RUN_OPERATION_KIND, run_id),
+    ).fetchone()
+    if operation is None or operation["phase"] != "COMPLETED":
+        raise RunStorageError("successful run has no completed intent")
+    if operation["request_hash"] != request_hash:
+        raise RunStorageError("run intent names a different request")
+    marker = _marker(workspace, run_id, budget)
+    if marker is None:
+        raise RunStorageError("successful run has no result marker")
+    derived = _derive(workspace, run_id, request_hash, budget)
+    _require_marker_match(marker, operation["operation_id"], derived)
+    hashes, counts = table_receipts(_stored_rows(workspace, run_id, budget))
+    if hashes != derived.hashes or counts != derived.counts:
+        raise RunStorageError("stored result rows disagree with the sealed evidence")
+    recorded = {
+        artifact["relative_path"]: (artifact["size_bytes"], artifact["content_hash"])
+        for artifact in workspace.state.execute(
+            "SELECT relative_path,size_bytes,content_hash FROM artifacts WHERE run_id=?",
+            (run_id,),
+        )
+    }
+    if recorded != {name: (derived.sizes[name], derived.artifacts[name]) for name in _ARTIFACTS}:
+        raise RunStorageError("recorded artifacts disagree with the files on disk")
+    if {
+        name: {"value": entry["value"], "value_state": entry["value_state"]}
+        for name, entry in _recorded_metrics(workspace, run_id).items()
+    } != _metric_payload(derived.metrics):
+        raise RunStorageError("recorded metrics disagree with the sealed evidence")
+    return derived
 
 
 def read_run(
@@ -786,52 +1040,9 @@ def read_run(
         raise RunStorageError("no such run")
     if row["status"] != "SUCCESS":
         raise RunStorageError("run has no readable result: " + row["status"])
-    operation = workspace.state.execute(
-        "SELECT operation_id,phase FROM storage_operations WHERE kind=? AND target_id=?",
-        (RUN_OPERATION_KIND, run_id),
-    ).fetchone()
-    if operation is None or operation["phase"] != "COMPLETED":
-        raise RunStorageError("successful run has no completed intent")
-    marker = _marker(workspace, run_id)
-    if marker is None:
-        raise RunStorageError("successful run has no result marker")
-    derived = _derive(workspace, run_id, row["request_hash"], budget)
-    _require_marker_match(marker, operation["operation_id"], row["request_hash"], derived)
+    derived = verify_run(workspace, run_id, row["request_hash"], budget=budget)
     if derived.manifest != row["result_hash"]:
         raise RunStorageError("recorded result hash disagrees with the sealed evidence")
-    hashes, counts = table_receipts(_stored_rows(workspace, run_id))
-    if hashes != derived.hashes or counts != derived.counts:
-        raise RunStorageError("stored result rows disagree with the sealed evidence")
-    recorded = {
-        artifact["relative_path"]: (artifact["size_bytes"], artifact["content_hash"])
-        for artifact in workspace.state.execute(
-            "SELECT relative_path,size_bytes,content_hash FROM artifacts WHERE run_id=?",
-            (run_id,),
-        )
-    }
-    if recorded != {name: (derived.sizes[name], derived.artifacts[name]) for name in _ARTIFACTS}:
-        raise RunStorageError("recorded artifacts disagree with the files on disk")
-    metrics = {
-        row["metric"]: {
-            "value": row["value"],
-            "value_state": row["value_state"],
-            "benchmark_ref": row["benchmark_ref"],
-            "risk_free_ref": row["risk_free_ref"],
-            "cost_ref": row["cost_ref"],
-            "comparison_condition_hash": row["comparison_condition_hash"],
-        }
-        for row in workspace.state.execute(
-            "SELECT metric,value,value_state,benchmark_ref,risk_free_ref,cost_ref,"
-            "comparison_condition_hash FROM run_metrics WHERE run_id=? AND definition_version=? "
-            "ORDER BY metric",
-            (run_id, METRIC_DEFINITION_VERSION),
-        )
-    }
-    if {
-        name: {"value": entry["value"], "value_state": entry["value_state"]}
-        for name, entry in metrics.items()
-    } != _metric_payload(derived.metrics):
-        raise RunStorageError("recorded metrics disagree with the sealed evidence")
     return {
         "run_id": run_id,
         "status": row["status"],
@@ -849,7 +1060,7 @@ def read_run(
         "artifact_sizes": derived.sizes,
         "table_hashes": derived.hashes,
         "table_counts": derived.counts,
-        "metrics": metrics,
+        "metrics": _recorded_metrics(workspace, run_id),
         # Stored research evidence. Nothing here admits a strategy to execution.
         "research_only": True,
         "strategy_pins": [
@@ -874,6 +1085,11 @@ def list_runs(workspace: Workspace) -> list[dict[str, object]]:
     ]
 
 
+def _quarantine_run(workspace: Workspace, run_id: str, operation_id: str, reason: str) -> bool:
+    _terminate(workspace, run_id, operation_id, status="QUARANTINED", reason=reason)
+    return True
+
+
 def recover_run(
     workspace: Workspace, operation: sqlite3.Row, *, budget: ComputeBudget | None = None
 ) -> bool:
@@ -885,39 +1101,32 @@ def recover_run(
     if row is None:
         return False
     if row[0] != "RUNNING":
-        _terminate(
-            workspace,
-            run_id,
-            operation_id,
-            status=row[0],
-            reason="run already ended",
-        )
-        return True
-    if _marker(workspace, run_id) is None:
-        # Absence cannot separate an unfinished calculation from a rolled-back commit,
-        # so the run ends conservatively and nothing on disk is reused or overwritten.
-        _terminate(
-            workspace,
-            run_id,
-            operation_id,
-            status="INTERRUPTED",
-            reason="no result marker",
-        )
+        _terminate(workspace, run_id, operation_id, status=row[0], reason="run already ended")
         return True
     try:
-        derived = _derive(workspace, run_id, request_hash, budget)
-        marker = _marker(workspace, run_id)
-        if marker is None:
-            raise RunStorageError("result marker disappeared during recovery")
-        _require_marker_match(marker, operation_id, request_hash, derived)
+        marker = _marker(workspace, run_id, budget)
+        derived = None if marker is None else _derive(workspace, run_id, request_hash, budget)
+        if marker is not None and derived is not None:
+            _require_marker_match(marker, operation_id, derived)
+    except ComputeResourceError:
+        # Refusing to materialize describes this machine, not the stored result. The
+        # run stays open so a recovery with room to work can still finish it.
+        raise
     except (ValueError, OSError):
-        _terminate(
-            workspace,
-            run_id,
-            operation_id,
-            status="QUARANTINED",
-            reason="result marker disagrees with the sealed evidence",
+        return _quarantine_run(
+            workspace, run_id, operation_id, "result marker disagrees with the sealed evidence"
         )
+    if derived is None:
+        # Absence cannot separate an unfinished calculation from a rolled-back commit,
+        # so the run ends conservatively and nothing on disk is reused or overwritten.
+        _terminate(workspace, run_id, operation_id, status="INTERRUPTED", reason="no result marker")
         return True
-    _finish(workspace, run_id, operation_id, request_hash, derived)
+    try:
+        _finish(workspace, derived, operation_id, budget=budget)
+    except ComputeResourceError:
+        raise
+    except (ValueError, OSError):
+        return _quarantine_run(
+            workspace, run_id, operation_id, "stored result rows disagree with the sealed evidence"
+        )
     return True
