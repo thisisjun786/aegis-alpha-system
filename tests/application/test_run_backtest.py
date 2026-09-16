@@ -18,6 +18,7 @@ import pytest
 from aegis_alpha.application import run_backtest as run_module
 from aegis_alpha.application.cli import main
 from aegis_alpha.application.run_backtest import RunBacktestRequest, run_backtest
+from aegis_alpha.compute_resources import ComputeBudget
 from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.storage.run_schema import inspect_run_schema
 from aegis_alpha.storage.runs import RunStorageError, list_runs, read_run
@@ -386,6 +387,41 @@ def test_cli_rejects_an_unknown_run_id(case: tuple[Path, Path]) -> None:
     assert result.returncode == 1
     assert not result.stdout
     assert "no such run" in json.loads(result.stderr)["error"]
+
+
+def test_later_stages_reserve_what_preparation_keeps_live(
+    case: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stage that runs beside a resident preparation must not get the full allowance."""
+    home, request = case
+    _cli(home, "db", "run-install")
+    genuine_open = run_module._open  # noqa: SLF001 -- stage budget observation point
+    genuine_record = run_module._record  # noqa: SLF001 -- stage budget observation point
+    seen: dict[str, int] = {}
+
+    def watched_open(root: Path, prepared: object, wanted: object, budget: ComputeBudget) -> object:
+        prepared_any = cast("Any", prepared)
+        seen["held"] = len(prepared_any.envelope.canonical_bytes) + len(prepared_any.provenance)
+        seen["open"] = budget.reserved_bytes
+        return genuine_open(root, cast("Any", prepared), cast("Any", wanted), budget)
+
+    def watched_record(
+        root: Path, opened: object, result: object, request_hash: str, budget: ComputeBudget
+    ) -> object:
+        seen["result"] = len(cast("Any", result).backtest_bytes)
+        seen["record"] = budget.reserved_bytes
+        return genuine_record(root, cast("Any", opened), cast("Any", result), request_hash, budget)
+
+    monkeypatch.setattr(run_module, "_open", watched_open)
+    monkeypatch.setattr(run_module, "_record", watched_record)
+    receipt = _api(home, request)
+
+    assert receipt["run"]["status"] == "SUCCESS"
+    assert seen["held"] > 0
+    assert seen["result"] > 0
+    # Stage A and B run beside the preparation; the commit also runs beside the result.
+    assert seen["open"] == seen["held"]
+    assert seen["record"] == seen["held"] + seen["result"]
 
 
 @pytest.mark.parametrize("cleanup_error", [TypeError, OSError])

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -202,6 +202,19 @@ def _prepare(home: Path, request: PrepareRequest, budget: ComputeBudget) -> Prep
         return prepare_backtest(workspace, request, budget=budget)
 
 
+def _retaining(budget: ComputeBudget, *held: bytes) -> ComputeBudget:
+    """Charge what this command keeps live against what a later stage may materialize.
+
+    The prepared envelope and provenance stay referenced until the receipt is built, and
+    the accounting response stays referenced until the result is sealed. Handing a later
+    stage the unchanged allowance would let two materializations that each fit exceed the
+    allocation together, which is the same reservation storage makes when one projection
+    stays live beside another. `ComputeBudget` refuses a reservation that leaves no
+    allowance at all, so a run too large for this host stops before that stage runs.
+    """
+    return replace(budget, reserved_bytes=budget.reserved_bytes + sum(len(item) for item in held))
+
+
 def _open(
     home: Path, prepared: PreparedBacktest, request: RunBacktestRequest, budget: ComputeBudget
 ) -> _Opened:
@@ -340,7 +353,9 @@ def _staged(
             exported = seal_outputs(
                 tree, output.name, prepared.envelope.canonical_bytes, prepared.provenance
             )
-    opened = _open(home, prepared, request, budget)
+    # Everything from here on runs beside a resident PreparedBacktest.
+    retained = _retaining(budget, prepared.envelope.canonical_bytes, prepared.provenance)
+    opened = _open(home, prepared, request, retained)
     try:
         # Stage B. No storage lock and no state transaction is held across this call.
         response = run_document(
@@ -354,7 +369,13 @@ def _staged(
         )
         raise
     try:
-        recorded = _record(home, opened, result, prepared.request_hash, budget)
+        recorded = _record(
+            home,
+            opened,
+            result,
+            prepared.request_hash,
+            _retaining(retained, result.backtest_bytes),
+        )
     except BaseException as error:
         error.add_note(
             "run " + _abandon(home, opened.handle, "result was not recorded: " + _describe(error))
