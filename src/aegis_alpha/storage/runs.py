@@ -515,11 +515,13 @@ def _require_recorded_provenance(
     compares what is stored rather than trusting what was validated at open time.
     """
     row = workspace.state.execute(
-        "SELECT bundle_id,engine_hash,environment_hash FROM runs WHERE run_id=?",
+        "SELECT bundle_id,engine_hash,environment_hash,result_hash FROM runs WHERE run_id=?",
         (derived.run_id,),
     ).fetchone()
     if row is None:
         raise RunStorageError("run record is missing")
+    if row["result_hash"] != derived.manifest:
+        raise RunStorageError("recorded result hash disagrees with the sealed evidence")
     engine, environment, strategy = _sealed_identities(
         _sealed_request(workspace, row["bundle_id"], derived.request_hash, budget)
     )
@@ -649,6 +651,13 @@ def open_run(
         # rollback would erase this run while its sealed files stayed on disk.
         raise RunStorageError("open_run cannot run inside another state transaction")
     request_hash = _digest(_text(intent.request_hash, "request_hash"), "request_hash")
+    # Both sidecars are decoded below, so they are charged before either json.loads.
+    _admit(
+        budget,
+        _DOCUMENT_OVERHEAD
+        + _DOCUMENT_EXPANSION * (len(intent.envelope_bytes) + len(intent.preparation_bytes)),
+        "run inputs exceed materialization budget",
+    )
     request = _sealed_request(workspace, intent.bundle_id, request_hash, budget)
     module = _envelope_module(_mapping(json.loads(intent.envelope_bytes), "envelope"))
     _require_sealed_provenance(intent, request, module)
@@ -1388,8 +1397,6 @@ def read_run(
     if row["status"] != "SUCCESS":
         raise RunStorageError("run has no readable result: " + row["status"])
     derived = verify_run(workspace, run_id, row["request_hash"], budget=budget)
-    if derived.manifest != row["result_hash"]:
-        raise RunStorageError("recorded result hash disagrees with the sealed evidence")
     return {
         "run_id": run_id,
         "status": row["status"],

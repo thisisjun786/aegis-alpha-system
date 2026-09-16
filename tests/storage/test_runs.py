@@ -1143,3 +1143,33 @@ def test_provenance_rewritten_while_running_is_refused(tmp_path: Path) -> None:
             read_run(workspace, "run-1", budget=BUDGET)
         with pytest.raises(ValueError, match="engine identity disagrees"):
             verify_workspace(workspace, budget=BUDGET)
+
+
+def test_a_corrupted_result_hash_fails_verification_not_only_reads(tmp_path: Path) -> None:
+    fx = prepared(tmp_path)
+    with open_workspace(fx.home, writable=True) as workspace:
+        commit_run(
+            workspace, open_run(workspace, intent(fx, "run-1")), RunResult(RESULT), budget=BUDGET
+        )
+    with open_workspace(fx.home, writable=True) as workspace:
+        workspace.state.execute("PRAGMA writable_schema=ON")
+        workspace.state.execute("DROP TRIGGER completed_run")
+        workspace.state.execute("PRAGMA writable_schema=OFF")
+        workspace.state.execute("UPDATE runs SET result_hash=? WHERE run_id=?", ("0" * 64, "run-1"))
+        workspace.state.commit()
+    with open_workspace(fx.home) as workspace:
+        # Verification must refuse it too, or backup certifies what read_run rejects.
+        with pytest.raises(ValueError, match="result hash disagrees"):
+            verify_workspace(workspace, budget=BUDGET)
+        with pytest.raises(RunStorageError, match="result hash disagrees"):
+            read_run(workspace, "run-1", budget=BUDGET)
+
+
+def test_oversized_run_inputs_are_refused_before_decoding(tmp_path: Path) -> None:
+    fx = prepared(tmp_path)
+    with (
+        open_workspace(fx.home, writable=True) as workspace,
+        pytest.raises(ComputeResourceError, match="run inputs exceed"),
+    ):
+        open_run(workspace, intent(fx, "run-1"), budget=TIGHT)
+    assert observed(fx.home, "run-1") == (None, None)
