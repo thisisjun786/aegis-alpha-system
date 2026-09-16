@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
 from engine_support import DAY, GATES, bundle, contract, request, strategy
 
+from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.engine import (
     AssetFeatures,
     EnsembleMembership,
@@ -28,6 +29,7 @@ from aegis_alpha.engine import (
     replay,
 )
 from aegis_alpha.engine.calendar import lag_month
+from aegis_alpha.engine.errors import BlockReason
 
 
 def feature(asset: str, score: float) -> AssetFeatures:
@@ -228,3 +230,75 @@ def test_nonfinite_computed_features_cannot_reach_allocation() -> None:
 def test_calendar_horizon_is_bounded_without_an_unbounded_loop() -> None:
     with pytest.raises(ReplayBlockedError, match="supported dates"):
         lag_month(DAY, 10**100)
+
+
+@pytest.mark.parametrize(
+    ("decision", "knowledge", "drop", "latest"),
+    [
+        (date(2026, 1, 29), date(2026, 2, 1), 1, date(2026, 1, 29)),
+        (date(2025, 12, 31), date(2026, 1, 2), 1, date(2025, 12, 31)),
+        (date(2026, 1, 1), date(2026, 1, 16), 15, date(2025, 12, 31)),
+        (date(2026, 1, 29), date(2026, 1, 28), 1, date(2026, 1, 29)),
+    ],
+)
+def test_knowledge_date_never_selects_economic_price_buckets(
+    decision: date, knowledge: date, drop: int, latest: date
+) -> None:
+    dates = (lag_month(latest, 2), lag_month(latest, 1), latest)
+    points = tuple(
+        PricePoint(day, close, knowledge) for day, close in zip(dates, (10, 12, 15), strict=True)
+    )
+    # Both a dropped current month and future economic prices would change the score.
+    if latest < decision:
+        points += (PricePoint(decision, 999, knowledge),)
+    points += (PricePoint(decision + timedelta(days=1), 9999, knowledge),)
+    build = FeatureBuildRequest(contract().feature_matrix, decision, GATES, drop, 3)
+    before = canonical_json_bytes(build)
+    row = build_feature_matrix({"A": points}, build, knowledge_as_of=knowledge)["A"]
+    assert (row.as_of, row.latest_price, row.returns) == (latest, 15, {2: 0.5})
+    assert canonical_json_bytes(build) == before
+    assert all(point.observed_on == knowledge for point in points)
+
+
+@pytest.mark.parametrize("reason", [BlockReason.POST_CUTOFF, BlockReason.STALE_PRICE])
+def test_explicit_knowledge_retains_price_guards(reason: BlockReason) -> None:
+    inputs = request()
+    knowledge = DAY + timedelta(days=1)
+    observed = (
+        knowledge + timedelta(days=1)
+        if reason == BlockReason.POST_CUTOFF
+        else DAY - timedelta(days=50)
+    )
+    prices = {
+        name: tuple(replace(point, observed_on=observed) for point in points)
+        for name, points in inputs.prices.items()
+    }
+    if reason == BlockReason.STALE_PRICE:
+        assert replay(bundle(contract()), replace(inputs, prices=prices)).ensemble == {
+            "ASSET_A": 1.0
+        }
+    with pytest.raises(ReplayBlockedError) as blocked:
+        replay(bundle(contract()), replace(inputs, prices=prices), knowledge_as_of=knowledge)
+    assert blocked.value.reason == reason
+
+
+def test_default_knowledge_preserves_request_receipt_and_feature_bytes() -> None:
+    source, inputs = bundle(contract()), request()
+    original = canonical_json_bytes(inputs)
+    receipt = replay(source, inputs)
+    assert receipt.as_of == DAY
+    assert receipt.ensemble == {"ASSET_A": 1.0}
+    assert canonical_json_bytes(receipt) == canonical_json_bytes(
+        replay(source, inputs, knowledge_as_of=None)
+    )
+    assert canonical_json_bytes(receipt) == canonical_json_bytes(
+        replay(source, inputs, knowledge_as_of=DAY)
+    )
+    assert canonical_json_bytes(inputs) == original
+    build = FeatureBuildRequest(contract().feature_matrix, DAY, GATES, 1, 3)
+    assert build_feature_matrix(inputs.prices, build) == build_feature_matrix(
+        inputs.prices, build, knowledge_as_of=DAY
+    )
+    with pytest.raises(ReplayBlockedError) as blocked:
+        replay(source, replace(inputs, fixture_as_of=DAY - timedelta(days=1)), knowledge_as_of=DAY)
+    assert blocked.value.reason == BlockReason.AS_OF_MISMATCH

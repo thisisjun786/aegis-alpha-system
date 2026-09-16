@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
-from engine_support import DAY, GATES, strategy
+from engine_support import DAY, GATES, bundle, contract, request, strategy
 
 from aegis_alpha.engine import (
     DerivedCashflows,
@@ -17,7 +17,9 @@ from aegis_alpha.engine import (
     ReplayBlockedError,
     derive_series,
     evaluate_signals,
+    replay,
 )
+from aegis_alpha.engine.errors import BlockReason
 
 
 def derived_spec(*, plus: bool = False) -> DerivedSeriesSpec:
@@ -186,3 +188,72 @@ def test_last_business_day_derived_price_feeds_calendar_month_signal() -> None:
     result = replay(bundle(value), inputs)
     assert result.signals["synthetic-choice"] == {"caller_yield": False}
     assert result.ensemble == {"ASSET_A": 1.0}
+
+
+@pytest.mark.parametrize("evidence", ["macro", "price", "addend_a"])
+@pytest.mark.parametrize("state", ["admitted", "post_cutoff", "stale"])
+def test_replay_knowledge_does_not_shift_prior_year_signal_buckets(
+    evidence: str, state: str
+) -> None:
+    decision, knowledge = date(2025, 12, 31), date(2026, 1, 2)
+    signal = date(2025, 11, 30)
+    observed = {
+        "admitted": knowledge,
+        "post_cutoff": knowledge + timedelta(days=1),
+        "stale": knowledge - timedelta(days=51),
+    }[state]
+    observations: dict[str, date] = dict.fromkeys(("macro", "price", "addend_a"), knowledge)
+    observations[evidence] = observed
+    spec = derived_spec()
+    value = replace(
+        contract(),
+        derived_series=(spec,),
+        macro_signals=(
+            MacroSignalSpec("caller_macro", (0,), "EXACT", "LT", (1.0,)),
+            MacroSignalSpec("caller_yield", (0,), "EXACT", "LT", (0.3,)),
+        ),
+    )
+    base = request()
+    inputs = replace(
+        base,
+        as_of=decision,
+        fixture_as_of=decision,
+        prices={
+            name: tuple(
+                replace(point, as_of=day, observed_on=decision)
+                for point, day in zip(points, (date(2025, 10, 31), signal, decision), strict=True)
+            )
+            for name, points in base.prices.items()
+        },
+        macro={
+            "caller_macro": (
+                MacroPoint(signal, 2, observations["macro"]),
+                MacroPoint(decision, 0, knowledge),
+            )
+        },
+        derived_inputs={
+            "caller_yield": {
+                "fields": {
+                    "price": ((signal, 10, observations["price"]), (decision, 100, knowledge)),
+                    "addend_a": ((signal, 4, observations["addend_a"]), (decision, -4, knowledge)),
+                },
+                "identities": cashflows().identities,
+            }
+        },
+    )
+    if state != "admitted":
+        with pytest.raises(ReplayBlockedError) as blocked:
+            replay(bundle(value), inputs, knowledge_as_of=knowledge)
+        assert blocked.value.reason == (
+            BlockReason.POST_CUTOFF if state == "post_cutoff" else BlockReason.STALE_MACRO
+        )
+        return
+    result = replay(bundle(value), inputs, knowledge_as_of=knowledge)
+    assert result.as_of == decision
+    # November: 4/10 = 0.4 and macro=2; December bait would switch both to cash.
+    assert result.signals["synthetic-choice"] == {"caller_macro": False, "caller_yield": False}
+    assert result.master_switch == {"synthetic-choice": False}
+    assert result.ensemble == {"ASSET_A": 1.0}
+    with pytest.raises(ReplayBlockedError) as blocked:
+        replay(bundle(value), inputs)
+    assert blocked.value.reason == BlockReason.POST_CUTOFF

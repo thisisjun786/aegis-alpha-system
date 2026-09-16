@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.util
 import json
@@ -424,6 +425,103 @@ def test_transform_calendar_is_checked_without_sessions_pin(stored: Workspace) -
         api().load_pinned_prices(
             stored, request(stored, sessions_pin=None, calendar_id="OTHER"), budget=BUDGET
         )
+
+
+def mixed_proxy_publications(workspace: Workspace, root: Path) -> tuple[GenerationPin, ...]:
+    """Publish real versioned source/spec fixtures under one parent-linked dataset."""
+    pins = []
+    for version, value in (("1", "0.1"), ("2", "125.5")):
+        path = _proxy_spec(
+            workspace, root / f"proxy{version}.sqlite3", ("PROXY", "v" + version, value)
+        )
+        _change(
+            path,
+            "dataset",
+            {
+                "dataset_id": "proxy",
+                "version": version,
+                "generation_id": "proxy" + version,
+                "operation_id": "op-proxy" + version,
+                "parent_id": None if version == "1" else "proxy1",
+            },
+        )
+        _register_domain(workspace, path, "proxy")
+        pins.append(pin(workspace, "proxy", version))
+    return tuple(pins)
+
+
+def test_mixed_proxy_history_rejects_specialized_read_without_changing_old_pin(
+    tmp_path: Path,
+) -> None:
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        old_pin, mixed_pin = mixed_proxy_publications(workspace, tmp_path)
+        old = api().load_pinned_proxy(workspace, old_pin, budget=BUDGET)
+        assert [row["contract_version"] for row in old.history] == ["v1"]
+        assert old.history[0]["value"].hex() == "0x1.999999999999ap-4"
+        assert old.non_executable is True
+        with pytest.raises(ValueError, match=r"proxy.*conflict"):
+            api().load_pinned_proxy(workspace, mixed_pin, budget=BUDGET)
+        assert api().load_pinned_proxy(workspace, old_pin, budget=BUDGET) == old
+
+
+def test_native_proxy_registrar_rejects_empty_source_publication(tmp_path: Path) -> None:
+    from aegis_alpha.storage import source_library  # noqa: PLC0415
+
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        path = _proxy_spec(workspace, tmp_path / "proxy.sqlite3", ("PROXY", "v1", "0.1"))
+        empty = tmp_path / "empty.sqlite3"
+        empty.write_bytes((tmp_path / "proxy.sqlite3").read_bytes())
+        empty.chmod(0o600)
+        with closing(sqlite3.connect(empty)) as connection:
+            connection.execute("DELETE FROM bars")
+            connection.commit()
+        digest = hashlib.sha256(empty.read_bytes()).hexdigest()
+        source_library.import_sqlite(workspace, empty, "empty", digest)
+        table = source_library.list_tables(workspace, "empty")[0]
+        _change(
+            path,
+            "source",
+            {
+                "source_id": "empty",
+                "source_sha256": digest,
+                "table": "bars",
+                "table_digest": table["digest"],
+            },
+        )
+        with pytest.raises(ValueError, match="nonempty array"):
+            _register_domain(workspace, path, "proxy")
+        assert workspace.state.execute("SELECT * FROM feature_contracts").fetchall() == []
+        assert workspace.market.execute("SELECT * FROM market_generations").fetchall() == []
+
+
+def test_proxy_referenced_publication_keeps_its_transform_linkage(tmp_path: Path) -> None:
+    from aegis_alpha.data.serialization import canonical_json_bytes  # noqa: PLC0415
+    from aegis_alpha.storage.import_document import parse_import  # noqa: PLC0415
+    from aegis_alpha.storage.verification import verify_workspace  # noqa: PLC0415
+
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        path = _proxy_spec(workspace, tmp_path / "proxy.sqlite3", ("PROXY", "v1", "0.1"))
+        _register_domain(workspace, path, "proxy")
+        origin = pin(workspace, "proxy")
+        raw = workspace.paths.raw / origin.manifest_hash[:2] / origin.manifest_hash
+        body = json.loads(raw.read_bytes())
+        body.update(dataset_id="proxy-copy", generation_id="proxy-copy", operation_id="op-copy")
+        body["rows"][0]["revision_id"] = "copy-r1"
+        publication.publish_document(workspace, parse_import(canonical_json_bytes(body)))
+        exact = pin(workspace, "proxy-copy")
+        assert api().load_pinned_proxy(workspace, exact, budget=BUDGET).non_executable is True
+        workspace.state.execute("DROP TRIGGER immutable_dataset_versions_update")
+        workspace.state.execute(
+            "UPDATE dataset_versions SET transform_hash=? WHERE generation_id='proxy-copy'",
+            ("0" * 64,),
+        )
+        with pytest.raises(ValueError, match="transform"):
+            api().load_pinned_proxy(workspace, exact, budget=BUDGET)
+        with pytest.raises(ValueError, match="transform"):
+            verify_workspace(workspace)
 
 
 def test_proxy_contract_inputs_are_verified(stored: Workspace, tmp_path: Path) -> None:

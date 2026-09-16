@@ -14,7 +14,8 @@ AAS의 목표는 외부 앱과 에이전트가 사용하는 데이터·연구 �
 | `aas preview` | `application/portfolio.py`의 명시적 세 모듈 비중 합성 | 모듈별 전략 실행·DB 읽기·주문 |
 | `engine.load_bundle` / `engine.replay` | 외부 bundle 검증과 호출자가 주입한 입력 계산 | DB에서 전략·시장 입력 자동 선택 |
 | `aas backtest` | 명시한 ETF 목표 비중의 다음 거래일 시가 체결·비용·NAV 계산 | 원본 전략 규칙 자동 해석·제출 가격의 출처 및 시점 인증 |
-| `aas init/doctor/db/strategy/data` | `storage/`의 내장 DB 설치·등록·조회·복구 | 등록 전략을 실행하고 전체 결과를 확정하는 경로 |
+| `aas prepare` | 등록 전략과 고정 pin에서 판단별 목표 비중을 계산해 `aas backtest` 봉투와 출처 sidecar로 내보내기 (SELECT만) | 체결·NAV 계산, run·요청 등록, 결과 저장·복원, 원본 자료의 PIT 인증 |
+| `aas init/doctor/db/strategy/data` | `storage/`의 내장 DB 설치·등록·조회·복구, 관례·pin 문서 등록, run 추가 스키마 설치 | 회계 결과를 run으로 확정·복원하는 경로 |
 | `aas providers/collect` | 기존 공급자·예산·실행 영수증 도구 | 수집기의 내장 DB 이식·스케줄러 자동 활성화 |
 
 외부 도구는 현재 Python 계산 API 또는 CLI를 재사용할 수 있다. 모든 저장·수집 기능이
@@ -72,9 +73,22 @@ bundle 자체에는 가격 기준(basis)이 없으므로 모든 역할이 미해
 `storage/strategy_requirements.read_execution_definition`은 SELECT만 수행하며, 선택적
 `ConventionPin` 결합을 state DB의 등록 관례와 대조한다. 호환되는 basis pin만 가격 요구에
 반영되고 나머지 역할은 미해결로 남으며 `executable`은 여전히 false다. `capital` 요구에
-`total_return` 기준을 결합하면 거부한다. 관례 등록은 Python `register_convention`·
-`read_convention`만 제공하고 별도 CLI는 없다. 전략 계보는 새 버전 등록 시에만 선택적으로
+`total_return` 기준을 결합하면 거부한다. 관례 등록은 `aas data convention-import`와 Python
+`register_convention`·`read_convention`이 맡는다. 전략 계보는 새 버전 등록 시에만 선택적으로
 기록하며 등록된 부모가 없으면 `unresolved`로 남고 이후 부모 등록으로 바뀌지 않는다.
+
+`application/backtest_prepare.py`는 `strategy show`와 같은 SELECT-only 경로로 등록 전략을
+읽고, 요청이 고정한 관례·세션·가격·identity·universe·membership과 조건부 거시·파생·프록시
+pin을 실제 저장 소유자에서 검증한 뒤 판단 슬롯마다 `engine.replay`를 호출한다.
+`engine/schedule.py`가 pin된 세션과 지연·지식 상한에서 판단·체결 쌍을 만들고,
+`engine/backtest_request.py`가 요청 스키마, 의미 투영 해시(`request_hash`), 기존 봉투
+내보내기를 소유한다. 엔진은 저장소·DuckDB·환경을 import하지 않고 application이 계산 소스
+해시와 Python·Decimal 컨텍스트 정체성을 넘긴다. 결과는 `aas backtest`가 읽는 봉투와
+`aas-prepared-backtest-v1` 출처 문서이며 `certified=false`다. 이 경로는 체결을 계산하거나
+run·요청을 등록하지 않는다. `storage/input_pins.py`·`membership_pins.py`는 관례·정의·
+identity·universe·입력 묶음 문서를 불변으로 등록·재해시하고, `storage/run_schema.py`와
+`backtest_requests.py`는 후속 run 소비자를 위한 추가 스키마와 정규 요청 바이트 저장 API다.
+요청 형식·등록 순서·실행 조건은 [operations](operations.md#저장한-전략과-입력의-준비)가 소유한다.
 
 ## 데이터와 DB
 
@@ -85,7 +99,7 @@ DuckDB 한 파일**을 기본으로 사용한다. PostgreSQL과 Parquet를 기�
 
 ```text
 목표 연결: 외부 앱·에이전트
-  → AAS의 데이터·연구 요청 경계 (전체 연결 미구현)
+  → AAS의 데이터·연구 요청 경계 (준비·봉투 회계까지 연결, run 확정 미구현)
   → 공통 reader · 계산 엔진 · 소유자별 writer
       ├─ state.sqlite3: identity·catalog·권한·작업·입력 pin·실행 영수증
       ├─ strategies.sqlite3: 별도 비공개 전략 원문·버전·계보·원래 성과
@@ -98,7 +112,8 @@ universe·전략·시장 관례의 exact version/hash를 묶고, 각 의사결�
 조회해야 한다. DuckDB 파일의 물리 hash와 dataset의 논리 내용 hash를 구분한다.
 공통 transaction이 없는 파일 간 저장은 durable intent와 대상 완료 영수증을 대조해 확정한다.
 내장 저장 경로는 `storage/`와 CLI `init`·`doctor`·`db`·`strategy`·`data`에 연결돼 있다.
-전체 백테스트 입력 조합과 공급자 수집기의 전환은 별도로 검증한다.
+저장 전략과 고정 입력의 조합·계산은 `aas prepare`까지 연결됐고, 회계 결과의 run 확정과
+공급자 수집기의 전환은 별도로 검증한다.
 
 `storage/source_library`는 기존 전략·연구·시장 자료를 조회할 수 있는 원본 자료실이다.
 원본 SQLite의 테이블은 비공개 SQLite에, 명시적으로 전달한 Arrow 자료는 DuckDB에

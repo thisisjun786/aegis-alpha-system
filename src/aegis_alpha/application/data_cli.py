@@ -263,6 +263,58 @@ def read_price_input(
     return result
 
 
+def read_pin_file(path: Path, sha256: str) -> bytes:
+    """Descriptor-safe bounded admission before acquiring workspace ownership."""
+    import re
+
+    from aegis_alpha.data.descriptor_tree import DescriptorTree, DescriptorTreeError
+    from aegis_alpha.storage.input_pins import decode_pin_document
+
+    if re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
+        raise ValueError("pin file hash must be lowercase SHA-256")
+    path = path.absolute()
+    try:
+        with DescriptorTree.open_path(path.parent) as tree:
+            raw = tree.read_bytes(path.name, max_bytes=1024 * 1024)
+    except (OSError, DescriptorTreeError) as error:
+        raise ValueError("cannot read bounded regular pin document") from error
+    if hashlib.sha256(raw).hexdigest() != sha256:
+        raise ValueError("pin incoming file hash mismatch")
+    decode_pin_document(raw)
+    return raw
+
+
+def import_binding(
+    workspace: Workspace, raw: bytes, sha256: str, *, budget: ComputeBudget
+) -> dict[str, object]:
+    import time
+
+    from aegis_alpha.storage.input_pins import (
+        decode_pin_document,
+        register_definition,
+        register_input_bundle,
+    )
+    from aegis_alpha.storage.membership_pins import (
+        register_identity_snapshot,
+        register_universe_version,
+    )
+
+    schema = decode_pin_document(raw).get("schema")
+    if schema == "aas-identity-snapshot-v1":
+        pin = register_identity_snapshot(
+            workspace.state, raw, expected_file_sha256=sha256, created_at_us=time.time_ns() // 1000
+        )
+    elif schema == "aas-universe-version-v1":
+        pin = register_universe_version(workspace.state, raw, expected_file_sha256=sha256)
+    elif schema in ("aas-derived-definition-v1", "aas-ensemble-membership-v1"):
+        pin = register_definition(workspace, raw, expected_file_sha256=sha256, budget=budget)
+    elif schema == "aas-input-bundle-v1":
+        pin = register_input_bundle(workspace, raw, expected_file_sha256=sha256, budget=budget)
+    else:
+        raise ValueError("unsupported binding import schema")
+    return {"registered": True, "pin": asdict(pin), "backtest_eligible": False}
+
+
 def execute_native_data(workspace: Workspace, args: argparse.Namespace) -> dict[str, object]:
     """Delegate exact aas-{price,sessions,proxy}-transform-v1 specs to their sole owner.
 

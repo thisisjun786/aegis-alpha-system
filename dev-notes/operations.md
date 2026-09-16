@@ -66,10 +66,10 @@ UTF-8 JSON이며 `schema_version`은 `aas-execution-requirements-v1`, `conventio
 `executable`은 계속 false다. 잘못된 해시, 미등록 pin, `capital` 요구에 대한 `total_return`
 결합, 미해결 계보 버전은 종료 코드 1과 한 줄 오류로 끝난다.
 
-관례 문서 등록은 아직 CLI가 없다. Python에서 `with open_workspace(home, writable=True) as
-workspace:`로 admit한 뒤 `storage.input_pins.register_convention(workspace.state, raw,
-expected_file_sha256=...)`을 호출하면 반환된 `ConventionPin`의 `hash`가 위 pin 배열에 들어갈 값이다.
-`read_convention(workspace.state, pin)`은 정규화 문서 바이트를 돌려준다.
+관례 문서는 `aas data convention-import --spec FILE --sha256 SHA256`으로 등록한다. 반환된
+`pin`의 `hash`가 위 pin 배열과 [준비 요청](#저장한-전략과-입력의-준비)에 들어갈 값이다.
+Python에서는 `storage.input_pins.register_convention(workspace.state, raw,
+expected_file_sha256=...)`과 `read_convention(workspace.state, pin)`이 같은 등록·조회를 맡는다.
 `data import`의 스키마는 [import_document.py](../src/aegis_alpha/storage/import_document.py),
 도메인별 필드는 [market_schema.py](../src/aegis_alpha/storage/market_schema.py)에 있다.
 가격·재무·거시·기업행동·종목 상태·추정치·FX·calendar·feature를 typed 테이블로 저장한다.
@@ -209,6 +209,14 @@ aas db backup --output /path/to/new-backup
 aas --home /path/to/new-home db restore --backup /path/to/new-backup
 ```
 
+`db verify`, `db backup`, `db restore`, `db run-install`도 설정된 공유 계산 예산을 사용한다.
+CLI는 저장소 잠금을 잡기 전에 계산 lease를 확보한다. Python 호출자는 검증·백업·복원과
+run-schema 설치 함수의 `budget=`에 자신이 확보한 `ComputeBudget`을 넘긴다. 설정이나
+인자를 생략하면 기존 직렬 기본 예산을 유지한다. import의 파일 크기 상한과 검증의 메모리
+상한은 별개이므로 큰 문서나 긴 이력에는 더 큰 명시적 예산이 필요할 수 있다. 복원에도
+백업을 검증할 때 충분했던 예산을 제공해야 한다. 예산을 늘려도 게시물·원본·행·의도 검사를
+생략하지 않으며, 검증 결과나 백업의 논리 보고서 형식은 바뀌지 않는다.
+
 파일 간 저장은 state의 PREPARED 의도, 대상 DB commit, 최종 카탈로그 순서다. `recover`는
 완료 marker·요청·원본·논리 해시를 대조해 게시만 재개한다. 공급자 호출을 다시 하지 않는다.
 marker가 없는 작업은 pending으로 남긴다. 재개하지 않을 작업은 명시적 `quarantine`으로
@@ -268,6 +276,325 @@ v2의 `result.account`에는 기존 형식의 계좌 NAV·체결 내역이 담�
 `result.cashflows`는 검증한 입력 내역이며 `cashflow_convention`은 처리 순서를 설명한다.
 원본 전략의 현금 흐름·시점·자료 검증은 별도로 필요하다. v1은 기존 응답을 유지하고
 `cashflows` 필드를 받지 않는다.
+
+## 저장한 전략과 입력의 준비
+
+```bash
+aas data convention-import --spec /path/to/convention.json --sha256 SHA256
+aas data binding-import --spec /path/to/pin-document.json --sha256 SHA256
+aas prepare --request /path/to/prepare-request.json --sha256 SHA256 --output /path/to/new/envelope.json
+aas backtest --input /path/to/new/envelope.json --sha256 <prepare가 돌려준 envelope.sha256>
+aas db run-install [--backup-output /path/to/new-backup]
+```
+
+`aas prepare`는 등록된 전략과 고정한 입력만 읽어 각 의사결정 시점의 목표 비중을 계산하고,
+기존 `aas backtest`가 읽는 봉투(`aas-etf-backtest-v1`/`v2`)로 내보낸다. 체결·NAV 계산,
+run 등록, 결과 저장은 하지 않는다. 봉투 회계는 별도 `aas backtest` 호출이며, run·결과의
+정식 저장·검증·복원은 아직 연결되지 않은 후속 작업이다. `db run-install`은 그 후속 소비자가
+쓸 state·market 추가 스키마를 백업 후 설치할 뿐이고 `prepare`에는 필요 없다.
+
+### 준비 요청 문서
+
+요청은 `aas-prepare-request-v1` JSON이며 최상위 키는 `schema`, `hash_format`
+(`aas-canonical-json-sha256-v1`), `strategy`, `bindings`, `refs`, `price_inputs`,
+`macro_inputs`, `derived_inputs`, `proxy_rules`, `period`, `history`, `cutoff`,
+`decision_latency_us`, `explicit_decision_dates`, `account`, `comparison`, `envelope`,
+`metadata`다. 모든 키가 필수이고 알 수 없는 키·중복 키·bool을 숫자로 쓴 값은 거부한다.
+기계용 JSON Schema는 [backtest_request.py](../src/aegis_alpha/engine/backtest_request.py)의
+`PREPARE_REQUEST_SCHEMA`가 정본이다. 인라인 가격·전략·기본 관례는 받지 않는다.
+
+- `strategy`: `strategy_store_id`(전략 DB의 `store_id`), `strategy_id`, `version`,
+  `raw_sha256`, `contract_sha256`, 고정값 `schema=aas-engine-bundle-v1`,
+  `contract_version=aas-engine-v1`, `raw_hash_format=aas-sha256-bytes-v1`,
+  `contract_hash_format=aas-canonical-json-sha256-v1`. `raw_sha256`·`contract_sha256`과
+  `strategy_id`·`version`은 `strategy import`가 돌려준 값과 정확히 같아야 하며 `latest`는
+  버전이 아니다. `strategy_store_id`는 import 응답이 아니라 설치의 `installation.json`에
+  적힌 `strategies` store의 `store_id`다.
+- `bindings`: 역할별 참조 목록. 각 항목은 `role`, `ordinal`, `ref_kind`, `ref_id`,
+  `ref_version`, `hash`, `ref_schema`, `hash_format`이다. 필수 역할은 `signal_prices`,
+  `execution_prices`, `sessions`, `identity`, `universe`, `membership`, `calendar`, `basis`,
+  `cost`, `execution`이고, `macro`·`derived`·`proxy`는 전략 정의가 요구할 때만, `benchmark`·
+  `risk_free`·`fx`는 0 또는 1개다. 여러 개를 허용하는 역할은 `signal_prices`·`execution_prices`·
+  `macro`·`derived`·`proxy`뿐이며 ordinal은 역할 안에서 0부터 연속이다.
+- `refs`: bindings가 가리키는 참조 서술자. `ref_kind`, `ref_id`, `ref_version`, `hash`,
+  `schema`, `hash_format`, `pin`을 담고 같은 서술자를 두 번 넣으면 거부한다.
+  `generation`의 pin은 `data inspect`가 돌려주는 `dataset_id`·`version`·`generation_id`·
+  `chain_hash`·`manifest_hash`, `identity`는 `snapshot_id`·`content_hash`, `universe`는
+  `universe_id`·`version`·`content_hash`, `derived`·`membership`·`convention:<kind>`는
+  `kind`·`id`·`version`·`hash`다. binding의 `hash`는 그 pin의 `chain_hash`, `content_hash`,
+  또는 문서 전체 해시와 같아야 한다.
+- `price_inputs`: `signal_prices`·`execution_prices` binding마다 하나씩. `binding`(`role`·
+  `ordinal`), 정렬된 `instrument_ids`, `currency`, `basis`(`unadjusted`·`split_adjusted`·
+  `total_return`), `price_role`(`canonical`·`reference`), `interval=1d`. 신호 가격은 basis
+  관례와 맞아야 하고 체결 가격은 `unadjusted`·`canonical`이어야 한다.
+- `macro_inputs`(`binding`·`series_id`·`unit`), `derived_inputs`(`binding`·`series_id`),
+  `proxy_rules`(`binding`·`logical_exposure_id`): 전략 정의의 요구를 빠짐없이 채워야 하며
+  요구하지 않은 입력을 조용히 무시하지 않는다.
+- `period`(`start`·`end`)는 기준 종가일과 최종 평가 종가일, `history`(`start`·`end`)는
+  신호·거시·파생 관측 구간이다. `history.start <= period.start < period.end`이고
+  `history.end`는 모든 의사결정일을 덮어야 한다.
+- `cutoff`: `mode`(`strict_pit` 또는 `observed_snapshot_research`), 필수 `knowledge_cutoff_us`,
+  `ingestion_cutoff_us`(제한 없음은 null). `decision_latency_us`는 종가 이후 판단 지연이다.
+- `explicit_decision_dates`는 null(자동 월말 판단) 또는 날짜 배열이다. 빈 배열은 판단 없음을 뜻한다.
+- `account`: `currency`, 양수 `initial_cash`, `cashflows`. v1 봉투는 빈 배열, v2는
+  날짜별 입출금 배열이다. `comparison`의 `benchmark`·`risk_free`·`fx`는 null이거나 해당
+  관례 binding의 `{role, ordinal: 0}`이다. `envelope`는 `schema_version`과 `research_mode`
+  (`synthetic` 또는 `observed_etf_research`), `metadata.created_at_us`는 null 허용이다.
+
+세 해시는 서로 다른 대상이다. `--sha256`은 요청 파일 바이트 그대로의 SHA-256이다.
+출력의 `request_hash`는 `metadata`를 뺀 정규화 의미 투영(`aas-backtest-request-v1`)의
+해시이며 엔진 계산 소스 해시, Python·Decimal 컨텍스트 정체성, 관례 전체·payload 해시를
+포함한다. 같은 내용에서 들여쓰기·키 순서·`created_at_us`를 바꿔도 같고, cutoff·pin·ordinal·
+비용을 바꾸면 달라진다. `envelope.sha256`은 내보낸 봉투 바이트의 해시이고 `request_hash`에
+들어가지 않는다.
+
+### 등록 선행 조건
+
+준비는 저장된 pin만 읽는다. 원본 파일은 등록 뒤 지워도 된다. 새 설치에서 필요한 등록은
+다음과 같고, 어느 하나가 빠지면 `prepare`는 기본값이나 최신 head 대체 없이 거부한다.
+
+1. `aas strategy import`: 전략 bundle. 반환된 `raw_sha256`·`contract_sha256`과
+   `installation.json`의 전략 store ID가 `strategy`에 들어간다.
+2. `aas db source-import`와 `aas data register-prices`/`register-sessions`: 신호 가격
+   generation(예: `split_adjusted`·`reference`), 체결 가격 generation(`unadjusted`·`canonical`),
+   세션 달력 generation. 각 `data inspect --dataset ID --version VERSION` 출력이 `generation`
+   pin이다. `aas data import`로 게시한 typed generation도 같은 pin 형식이지만, 신호·체결
+   가격과 세션 입력으로 고를 수 있는 generation은 `register-prices`/`register-sessions`의
+   native transform으로 게시하고 원본 `source-import`와 보존 테이블이 남아 있는 것뿐이다.
+   준비는 이 generation마다 native transform 문서와 보존 원본을 다시 대조해 admission하며,
+   내용이 불투명한 generic 게시는 그 선행 조건을 대신하지 못한다. `macro` 입력의 generic
+   게시는 5번 항목대로 계속 지원한다.
+3. `aas data binding-import`: `aas-identity-snapshot-v1`, `aas-universe-version-v1`,
+   `aas-ensemble-membership-v1` 문서. 문서 스키마에 따라 identity snapshot, universe version,
+   정의(derived·membership) 또는 `aas-input-bundle-v1` 묶음을 등록하고 `pin`을 돌려준다.
+   identity·universe 문서의 정확한 바이트 규약은 [membership pins](design/membership-pins.md),
+   derived·membership·bundle 문서는 [input_pins.py](../src/aegis_alpha/storage/input_pins.py)가
+   소유한다. 이 명령은 `read-prices`와 같은 명시한 compute 환경이 필요하다.
+4. `aas data convention-import`: `calendar`, `basis`, `cost`, `execution` 관례 문서 각각.
+   `benchmark`·`risk_free`·`fx`는 요청에서 참조할 때만 등록한다. `calendar` payload의 여덟
+   달력 필드는 전략 정의와 같아야 하고, `cost`는 `proportional_traded_notional`의 명시한
+   `rate`, `execution`은 현재 루프(종가 판단·다음 시가 체결·소수 롱온리·현금 잔여) 문자 그대로다.
+5. 조건부 입력: 정의가 거시 시계열을 요구하면 `data import`로 `macro_observations`
+   generation을, 파생 시계열을 요구하면 `aas-derived-definition-v1` 문서를 `binding-import`로,
+   프록시 노출을 쓰면 `data register-proxy`를 등록하고 각각 `macro`·`derived`·`proxy` binding으로
+   묶는다. 프록시는 기존 전환 정의로만 실제 종목에 대응하며 여전히 체결 재원이 아니다.
+
+등록 응답의 `backtest_eligible=false`는 그대로다. 등록은 원본의 진위·PIT 자격·거래 가능성을
+인증하지 않는다.
+
+### 실행 조건과 출력
+
+`prepare`는 `read-prices`와 같은 compute 환경(`AAS_HOST_CPU_LIMIT`,
+`AAS_HOST_MEMORY_LIMIT_BYTES`, `AAS_COMPUTE_LOCK_FILE`; 선택적으로 `AAS_CPU_LIMIT`·
+`AAS_MEMORY_LIMIT_BYTES`)이 있어야 실행되며, 없으면 기본 예산 없이 종료 코드 1로 끝난다.
+lock 파일이 설치의 저장 잠금과 같은 경로면 거부한다. 요청 파일은 1 MiB 이하의 일반 파일이어야
+하고 symlink·FIFO·디렉터리·`..` 경로는 거부한다. `--output`과 `<output>.preparation.json`은
+둘 다 새 파일이어야 하며 어떤 종류의 기존 경로도 덮어쓰지 않는다. 봉투는 64 MiB 안이다.
+
+준비는 설치를 읽기 전용으로 열고 SELECT만 수행한다. 등록·run·bundle 기록을 남기지 않고
+`engine.execution`을 호출하지 않으며, 같은 설치에서 같은 요청을 다시 준비하면 같은 봉투와
+같은 `request_hash`를 낸다. 성공 응답은 `prepared=true`, `request_sha256`, `request_hash`,
+`envelope.path`·`envelope.sha256`, `preparation.path`·`preparation.sha256`, `certified=false`다.
+두 파일은 fsync 후 다시 읽어 바이트와 파일 정체성을 대조한 뒤에만 응답한다.
+
+`<output>.preparation.json`은 `aas-prepared-backtest-v1` 문서로 `request_hash`, 의미 투영
+전체(`request`), `envelope_sha256`, 실행 정의, 읽은 관례 문서, 실제로 읽은 저장 입력의
+증거(`stored_inputs`), `source_pins`, 판단·체결 슬롯, 각 판단의 replay 영수증, feature 값,
+`certified=false`를 담는다. 봉투 자체에는 이 출처가 들어가지 않는다.
+
+실패는 stdout 없이 stderr 한 줄 `{"error": ...}`와 종료 코드 1이다. 봉투를 쓴 뒤 sidecar나
+fsync 단계에서 실패하면 이미 쓴 파일이 검사용으로 남는다. 그 파일은 성공 영수증이 아니며
+재시도는 같은 경로를 덮어쓰지 않으므로 새 경로를 쓰거나 직접 정리한다.
+
+### 시점 규칙
+
+의사결정일은 세션 종가의 경제 날짜이고, 지식 시점은 별도로 정한다. 각 슬롯의 cutoff는
+`min(knowledge_cutoff_us, 종가 시각 + decision_latency_us)`이며 종가 이후, 다음 시가 이전이어야
+한다. 신호·거시·파생 관측은 그 cutoff까지 공개·수정 인지된 revision만 반영하고 stale 검사도
+cutoff의 UTC 날짜를 기준으로 한다. `ingestion_cutoff_us`가 있으면 그 시각까지 AAS가 수집한
+revision만 재생한다. 나중에 게시한 generation·revision은 같은 pin의 과거 판단을 바꾸지 않는다.
+두 모드 모두 cutoff 이후로 알려진 공개 시각(`available_at_us`)이나 수정 인지 시각
+(`revision_known_at_us`)을 가진 revision은 거부한다. `strict_pit`은 여기에 더해 두 시각이
+모두 알려진 행만 반영하고 참조 가격을 제외한다. `observed_snapshot_research`는 공개 시각을
+모르는 스냅샷 행을 경제 날짜 기준으로 미인증 상태로 받아들이는 연구 모드이며, 모르는
+시각을 수집 시각에서 추론하지 않는다. `ingestion_cutoff_us`는 두 모드에서 같은 별도 제한이다.
+두 모드 모두 `certified=false`다.
+
+체결 결과 가격은 `period` 안의 모든 open 세션에서 따로 읽는다. 판단일의 다음 시가가 봉투의
+날짜 격자와 다르면(나중에 안 달력 수정이 그 세션을 없애거나 더 이른 시가를 넣은 경우)
+`incompatible outcome calendar projection`으로 내보내기 전에 거부한다. 체결·격자를 조용히
+옮기지 않는다. 매수 종목의 시가가 없거나 이력 버킷이 부족하거나 pin된 달력이 불완전해도
+거부한다. 매도만 남은 종목의 시가 누락은 준비가 아니라 `aas backtest` 회계에서 거부한다.
+
+### 봉투 회계와 Python API
+
+`aas backtest --input ENVELOPE --sha256 <envelope.sha256>`는 새 프로세스에서 봉투를 읽어
+NAV·체결을 계산한다. 응답의 `source_pins_verified`·`point_in_time_verified`·`live_orders`는
+계속 false다. 회계 결과는 stdout의 JSON 응답 하나이며 명령이 결과 파일을 저장하지 않는다.
+아래 실습의 `tee "$LAB/backtest.json"`처럼 셸 리디렉션으로 남기는 사본은 run 보존이 아니다.
+run 등록·결과 확정·복원은 아직 없다.
+
+같은 준비를 Python에서 호출할 수 있다.
+[backtest_prepare.py](../src/aegis_alpha/application/backtest_prepare.py)의
+`parse_prepare_request(raw: bytes) -> ParsedPrepareRequest`, `PrepareRequest(parsed)`,
+`prepare_backtest(workspace, request, *, budget: ComputeBudget) -> PreparedBacktest`가
+공개 진입점이다. `prepare_backtest`는 compute lease를 잡지 않으므로 호출자가 먼저 lease를
+소유하고, 그 lease가 준 `compute_resources.ComputeBudget`을 넘긴 뒤
+`storage.workspace.open_workspace(home)`으로 읽기 전용 설치를 연다. CLI가 쓰는 같은 순서는
+[prepare_cli.py](../src/aegis_alpha/application/prepare_cli.py)에 있다.
+`application.compute_cli.price_compute(excluded_locks=storage_lock_targets(home,
+load_paths(home).stores()))`가 compute 환경을 검증하고 lease를 잡은 뒤 budget을 yield하며,
+compute 환경이 없으면 `None`을 yield한다. 아래 실습 5단계가 이 순서를 그대로 쓴다.
+`PreparedBacktest`는 `request`, `definition`, `slots`, `decisions`, `features`,
+`inputs`, `projection`, `envelope`(`canonical_bytes`·`envelope_sha256`), `provenance`(sidecar
+바이트), `targets`, `request_hash`, `certified=False`를 가진다. 봉투 바이트는
+`application.backtest_cli.run_document(canonical_bytes, envelope_sha256)`로 회계에 넘긴다.
+`calculation_identity()`·`environment_identity()`는 `request_hash`에 들어가는 엔진·환경
+정체성이고, `engine.backtest_request`의 `request_projection`·`export_envelope`는 저장소 없이
+순수 투영·내보내기만 맡는다.
+
+계산 소스 정체성은 `backtest_prepare.CALCULATION_MODULES`에 명시된 44개 모듈의
+설치된 정확한 바이트를 해시한다. 엔진과 두 데이터 직렬화 helper뿐 아니라 준비의 해석·입력
+승인을 담당하는 application·storage 모듈을 포함한다. 런타임 import 탐색이나 패키지 전체
+해시는 아니며, 선택된 파일의 주석 변경도 정체성을 바꾼다. 이전 27개 범위로 생성한 정규
+요청 P·pin·artifact는 수정하지 않고 원래 정체성으로 읽는다. 새 준비의 소스 해시와
+`request_hash`는 의도적으로 달라지지만, 같은 입력·동작의 기존 봉투와 회계 결과는 그대로다.
+
+이 정체성은 안정된 설치 소스와 지원 런타임을 전제로 하며 전체 소프트웨어 공급망의 해시가
+아니다. 순수 엔진과 달리 준비 경로는 DuckDB·SQLite 및 선택적 Arrow 소스의 PyArrow를
+사용한다. 이 외부 driver·의존성 버전은 닫힌 환경 v1에 포함되지 않으므로 임의 버전 간
+재현성을 보장하지 않는다. 의존성 정체성이 필요하면 별도의 버전된 환경 계약이 필요하며,
+v1 필드에 조용히 추가하지 않는다.
+
+### 저장소 checkout 실습
+
+아래는 설치된 앱의 사용 절차가 아니라 저장소 checkout에서 공개 합성 fixture로 전체 흐름을
+확인하는 실습이다. `uv sync --locked --dev`로 준비한 환경이 필요하며, 이 환경에는 `legacy`
+추가 의존성이 함께 들어 있다. `tests.application.test_prepare_cli.register_fixture`는 테스트
+helper이지 설치되는 공개 API가 아니다. helper는 seed 설치에서 합성 문서를 뽑은 뒤 시험
+대상 home에 대해 `init`, `strategy import`, `db source-import` 3회, `data register-prices` 2회,
+`data register-sessions`, `data inspect` 3회, `data binding-import` 3회, `data convention-import`
+4회를 실제 CLI로 실행하고 `request.json`을 쓴 뒤 `incoming/` 원본 파일을 지운다.
+
+```bash
+set -euo pipefail
+LAB="$(mktemp -d /var/tmp/aas-prepare-lab-XXXXXX)"
+export AAS_HOST_CPU_LIMIT=1 AAS_HOST_MEMORY_LIMIT_BYTES=1073741824 \
+  AAS_CPU_LIMIT=1 AAS_MEMORY_LIMIT_BYTES=1073741824 \
+  AAS_COMPUTE_LOCK_FILE="$LAB/compute.lock"
+
+# 1. 합성 fixture를 실제 CLI 명령으로 등록한다 (테스트 helper, 설치된 공개 API가 아니다).
+uv run --no-sync python - "$LAB" <<'EOF'
+import json, subprocess, sys
+from pathlib import Path
+from tests.application.test_prepare_cli import register_fixture
+
+root = Path(sys.argv[1])
+home = root / "home"
+
+def cli(*args):
+    print("$ aas --home", home, *args, file=sys.stderr)
+    result = subprocess.run(
+        [sys.executable, "-m", "aegis_alpha", "--home", str(home), *args],
+        text=True, capture_output=True, check=False, timeout=120,
+    )
+    if result.returncode != 0:
+        raise SystemExit(result.stderr)
+    return json.loads(result.stdout)
+
+home, request = register_fixture(root, cli)
+print(json.dumps({"home": str(home), "request": str(request)}))
+EOF
+ls "$LAB"
+
+# 2. 원본 파일 없이 저장된 pin만으로 준비한다.
+uv run --no-sync aas --home "$LAB/home" prepare --request "$LAB/request.json" \
+  --sha256 "$(sha256sum "$LAB/request.json" | cut -d' ' -f1)" \
+  --output "$LAB/envelope.json" | tee "$LAB/prepare-receipt.json"
+
+# 3. 반환된 봉투 해시로 새 CLI 프로세스에서 회계를 실행한다.
+ENVELOPE_SHA256="$(uv run --no-sync python -c \
+  'import json,sys;print(json.load(open(sys.argv[1]))["envelope"]["sha256"])' "$LAB/prepare-receipt.json")"
+uv run --no-sync aas backtest --input "$LAB/envelope.json" --sha256 "$ENVELOPE_SHA256" \
+  | tee "$LAB/backtest.json"
+
+# 4. 필수 pin이 빠진 요청은 기본값 없이 거부된다.
+uv run --no-sync python - "$LAB" <<'EOF'
+import json, sys
+from pathlib import Path
+from aegis_alpha.data.serialization import canonical_json_bytes
+
+root = Path(sys.argv[1])
+body = json.loads((root / "request.json").read_bytes())
+body["bindings"] = [row for row in body["bindings"] if row["role"] != "membership"]
+body["refs"] = [row for row in body["refs"] if row["ref_kind"] != "membership"]
+(root / "missing-membership.json").write_bytes(canonical_json_bytes(body))
+EOF
+MISSING_EXIT=0
+uv run --no-sync aas --home "$LAB/home" prepare --request "$LAB/missing-membership.json" \
+  --sha256 "$(sha256sum "$LAB/missing-membership.json" | cut -d' ' -f1)" \
+  --output "$LAB/missing.json" 2>"$LAB/missing.stderr" || MISSING_EXIT=$?
+echo "exit=$MISSING_EXIT"
+cat "$LAB/missing.stderr"
+test "$MISSING_EXIT" -eq 1
+test ! -e "$LAB/missing.json"
+test ! -e "$LAB/missing.json.preparation.json"
+ls "$LAB"
+
+# 5. 같은 요청을 Python API로 준비한다. 호출자가 lease를 먼저 잡고 그 budget을 넘긴다.
+uv run --no-sync python - "$LAB" <<'EOF'
+import hashlib, json, sys
+from pathlib import Path
+from aegis_alpha.application.backtest_prepare import (
+    PrepareRequest, parse_prepare_request, prepare_backtest)
+from aegis_alpha.application.compute_cli import price_compute
+from aegis_alpha.storage.locks import storage_lock_targets
+from aegis_alpha.storage.paths import load_paths
+from aegis_alpha.storage.workspace import open_workspace
+
+root = Path(sys.argv[1])
+home = root / "home"
+request = PrepareRequest(parse_prepare_request((root / "request.json").read_bytes()))
+targets = storage_lock_targets(home, load_paths(home).stores())
+with price_compute(excluded_locks=targets) as budget:
+    if budget is None:
+        raise SystemExit("prepare requires the explicit AAS compute budget environment")
+    with open_workspace(home) as workspace:
+        prepared = prepare_backtest(workspace, request, budget=budget)
+print(json.dumps({
+    "request_hash": prepared.request_hash,
+    "envelope_sha256": prepared.envelope.envelope_sha256,
+    "provenance_sha256": hashlib.sha256(prepared.provenance).hexdigest(),
+    "slots": [[s.decision_date.isoformat(), s.execution_date.isoformat()] for s in prepared.slots],
+    "targets": {day.isoformat(): dict(rows) for day, rows in prepared.targets.items()},
+    "certified": prepared.certified,
+}, indent=1))
+EOF
+rm -rf "$LAB"
+```
+
+한 실행에서 관측한 값이다. 전략 store ID와 identity 등록 시각이 실행마다 달라지므로
+`request_sha256`·`request_hash`·`preparation.sha256`은 예시이고, 날짜·비중·NAV·체결은
+fixture가 고정한 독립 기대값이다. 봉투 바이트에는 그 값이 들어가지 않아 두 실행에서
+같은 `envelope.sha256`을 관측했다.
+
+- 2단계 영수증: `request_sha256=40ce893b…def9`, `request_hash=3f2b4821…564a`,
+  `envelope.sha256=a30a6dd4…be4f`, `preparation.sha256=b20b060e…98a3`, `certified=false`.
+  `$LAB/incoming/`은 이미 없다.
+- 3단계 회계: NAV 날짜 `2026-01-29, 02-02, 02-26, 03-02, 03-30`에 equity
+  `100, 100, 80, 80, 80`, 체결은 `01-29→02-02 ASSET_A 100/15주 @15`,
+  `02-26→03-02 ASSET_A -100/15주 @12`, `02-26→03-02 ASSET_B 4주 @20`, 수수료 0,
+  `source_pins_verified=false`, `point_in_time_verified=false`, `live_orders=false`.
+  독립 계산: 1월 29일 수익률 ASSET_A 0.5 > ASSET_B 0.1이라 A 전량, 2월 2일 시가 15에
+  100/15주, 2월 26일 종가 12로 80, 3월 2일 A 매도 후 B를 시가 20에 4주, 3월 30일 종가 20으로 80.
+- 4단계: `missing.stderr`에 `{"error": "missing required executable bindings"}`, `exit=1`,
+  `missing.json`과 그 sidecar는 만들어지지 않는다. 블록의 `test`가 이 둘을 확인하고, 다른
+  종료 코드나 남은 파일이 있으면 `set -e`로 실습이 그 자리에서 끝난다.
+- 5단계: 같은 `request_hash`·`envelope_sha256`·`provenance_sha256`, 슬롯
+  `[2026-01-29, 2026-02-02]`·`[2026-02-26, 2026-03-02]`, 목표 `{2026-01-29: {ASSET_A: 1.0},
+  2026-02-26: {ASSET_B: 1.0}}`, `certified=false`.
+
+이 실습은 합성 자료의 흐름 확인이며 실제 자료의 출처·PIT 자격·전략 성과를 인증하지 않는다.
 
 ## 명시한 ETF 연구 후보 생성
 
@@ -404,9 +731,13 @@ docker compose run --rm aas doctor
 
 `aas providers`와 기존 수집기는 유지되지만 일부는 아직 PostgreSQL/Parquet adapter를 쓴다.
 이 경로는 `uv tool install '.[legacy]'` 또는 개발 환경과 명시한 이전 설정이 필요하다.
+`storage.source_library.import_arrow`의 Arrow 적재도 같은 추가 의존성의 PyArrow를 쓴다.
+위 준비 실습은 그 의존성이 들어 있는 잠긴 개발 환경에서 확인했으며, 기본 설치만으로
+같은 흐름이 도는지는 따로 검증하지 않았다. 의존성 목록은 `pyproject.toml`과 `uv.lock`이 정본이다.
 기존 DB 명령은 `aas legacy-db`, publication 조회는 `aas legacy-data`로 구분한다.
 이 도구를 새 `state.sqlite3`에 연결하거나 실제 보관 데이터를 자동 채택하지 않는다.
 `docker-compose.data.yml`과 이전 설치 실행기는 이 전환 경로이며 새 설치 절차가 아니다.
 
 라이브 공급자 검증·기존 DB 이전·스케줄러 활성화·실주문은 위 오프라인 설치 검사의 범위에
-포함되지 않는다. CLI preview는 합성 비중 계산이고 전체 백테스트는 아직 별도 구현이다.
+포함되지 않는다. CLI preview는 합성 비중 계산이고, `prepare`와 `backtest`는 저장한 입력의
+준비와 명시한 봉투의 회계까지다. run 저장·결과 확정·복원은 아직 별도 구현이다.

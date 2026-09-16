@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import uuid
@@ -21,6 +22,7 @@ from aegis_alpha.storage.paths import (
     load_paths,
     read_json,
     resolve_home,
+    same_private_file,
 )
 
 if TYPE_CHECKING:
@@ -194,6 +196,51 @@ class Workspace:
     strategies: sqlite3.Connection | None
     market: duckdb.DuckDBPyConnection
     installation_id: str
+    market_resources: dict[str, object]
+    _market_identity: tuple[Path, int, int]
+    _market_info: dict[str, object]
+
+    def _market_file(self) -> os.stat_result:
+        observed = private_file(self.paths.market)
+        if (self.paths.market, observed.st_dev, observed.st_ino) != self._market_identity:
+            raise ValueError("market file changed during admitted maintenance")
+        return observed
+
+    @contextmanager
+    def checkpointed_market(self) -> Iterator[None]:
+        """Close/copy/reopen the same verified market file under retained admission."""
+        _ = self._market_file()
+        if _store_info(self.market) != self._market_info:
+            raise ValueError("market identity changed during admitted maintenance")
+        self.market.execute("CHECKPOINT")
+        # Checkpoint legitimately changes metadata, but never the admitted file identity.
+        admitted = self._market_file()
+        self.market.close()
+        # In particular, do not bless a replacement installed by the real close boundary.
+        if not same_private_file(admitted, self._market_file()):
+            raise ValueError("market file changed during admitted maintenance")
+        try:
+            yield
+        finally:
+            if not same_private_file(admitted, self._market_file()):
+                raise ValueError("market file changed during admitted maintenance")
+            connection = market_connect(self.paths.market, resources=self.market_resources)
+            try:
+                observed = self._market_file()
+                _verify_reopened_market(
+                    connection,
+                    self._market_info,
+                    (admitted.st_dev, admitted.st_ino),
+                    (observed.st_dev, observed.st_ino),
+                )
+            except BaseException:
+                connection.close()
+                raise
+            self.market = connection
+
+    def close_market(self) -> None:
+        """Close the current handle, including one reopened under maintenance."""
+        self.market.close()
 
     def doctor(self) -> dict[str, object]:
         return {
@@ -214,6 +261,16 @@ class Workspace:
             "scheduler_started": False,
             "provider_live_verification": False,
         }
+
+
+def _verify_reopened_market(
+    connection: duckdb.DuckDBPyConnection,
+    expected: dict[str, object],
+    admitted: tuple[int, int],
+    observed: tuple[int, int],
+) -> None:
+    if admitted != observed or _store_info(connection) != expected:
+        raise ValueError("market identity changed during admitted maintenance")
 
 
 @contextmanager
@@ -253,10 +310,14 @@ def open_workspace(  # noqa: C901 -- lifecycle of all three owned stores
             stack.callback(strategies.close)
         elif require_strategies or strategy_write:
             raise ValueError("strategy database is missing")
+        admitted_market = private_file(paths.market)
         market = market_connect(
             paths.market, read_only=not writable, resources=cast("dict[str, object]", resources)
         )
         stack.callback(market.close)
+        observed_market = private_file(paths.market)
+        if not os.path.samestat(admitted_market, observed_market):
+            raise ValueError("market file changed during workspace admission")
         for kind, connection in (("state", state), ("strategies", strategies), ("market", market)):
             if connection is None:
                 continue
@@ -272,4 +333,16 @@ def open_workspace(  # noqa: C901 -- lifecycle of all three owned stores
         if strategies is not None:
             initialize_strategies(strategies, installation_id)
         validate_market(market, installation_id)
-        yield Workspace(paths, state, strategies, market, installation_id)
+        workspace = Workspace(
+            paths,
+            state,
+            strategies,
+            market,
+            installation_id,
+            cast("dict[str, object]", resources),
+            (paths.market, admitted_market.st_dev, admitted_market.st_ino),
+            cast("dict[str, object]", expected["market"]),
+        )
+        # Maintenance may replace the closed handle, never its admission or file identity.
+        stack.callback(workspace.close_market)
+        yield workspace

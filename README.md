@@ -2,7 +2,8 @@
 
 AAS는 외부 앱과 에이전트가 사용하는 데이터·투자 연구 엔진을 목표로 한다. AAS가 데이터와
 계산을 제공하고 외부 도구가 화면과 작업 진행을 맡는다. 현재는 범용 계산 Python API와
-데이터·전략 저장 및 비중 합성 CLI를 제공하며, 수집기는 전환 중인 PostgreSQL 저장 경로를 사용한다.
+데이터·전략 저장, 저장 입력의 백테스트 준비, 비중 합성 CLI를 제공하며, 수집기는 전환 중인
+PostgreSQL 저장 경로를 사용한다.
 공개 레포에는 범용 엔진과 입력·저장 계약을 두고, 전략 정의와 사용자 데이터는 별도 비공개 저장소에서 관리한다.
 라이선스는 Apache-2.0이다.
 
@@ -62,17 +63,24 @@ aas --home /path/to/new-home db restore --backup /path/to/new-backup
 
 `aas preview --input examples/portfolio-preview.json`은 합성 모듈 비중을 결합한다.
 `aegis_alpha.engine.load_bundle`과 `replay`는 명시한 외부 전략과 검증한 입력을 계산하는
-Python API다. CLI 전체 백테스트·상시 앱·실주문은 아직 구현 전이다.
+Python API다. `aas prepare --request FILE --sha256 SHA256 --output ENVELOPE`는 등록한
+전략과 고정한 관례·세션·가격·membership pin만 읽어 판단별 목표 비중을 `aas backtest` 봉투와
+출처 sidecar로 내보내며, 체결 계산과 run 등록은 하지 않는다. 봉투 회계는 `aas backtest`가
+맡는다. run 저장·결과 확정, 상시 앱, 실주문은 아직 구현 전이다.
+요청 형식과 등록 선행 조건은 [운영 안내](dev-notes/operations.md#저장한-전략과-입력의-준비)에 있다.
 
 이지스·알파·헷지는 자산배분·개별 종목·방어 배분의 연구 영역이다. 현재 preview 입력은
 세 모듈을 모두 명시해야 하지만, 각 모듈이 전략을 실행하는 것은 아니다. 전략 등록은
-bundle을 검증·저장하며 실행을 시작하지 않는다. 내장 데이터 조회와 전략 계산·결과 저장의
-통합 경로 및 HTTP/MCP 서버는 제공하지 않는다. [제품 경계 결정](dev-notes/decisions/0015-research-engine-product-boundary.md)에
+bundle을 검증·저장하며 실행을 시작하지 않는다. 준비와 회계 결과를 run으로 저장·확정하는
+경로와 HTTP/MCP 서버는 제공하지 않는다. [제품 경계 결정](dev-notes/decisions/0015-research-engine-product-boundary.md)에
 목표와 현재 구현의 차이를 기록했다.
 
-기존 공급자 수집기는 전환 중이다. `legacy-db`·`legacy-data`와 해당 수집기를 쓸 때만
-`legacy` 추가 의존성 및 명시한 이전 DB 설정이 필요하다. 새 기본 설치에는 PostgreSQL
-드라이버·Alembic·PyArrow를 설치하지 않는다. 수집기 이식 후 전환용 경로를 제거한다.
+기존 공급자 수집기는 전환 중이다. `legacy-db`·`legacy-data`와 해당 수집기, 그리고
+`storage.source_library.import_arrow`의 Arrow 적재는 `legacy` 추가 의존성이 필요하다.
+새 기본 설치에는 PostgreSQL 드라이버·Alembic·PyArrow를 설치하지 않는다. 위 준비 흐름은
+`uv sync --locked --dev`의 잠긴 개발 환경(같은 패키지 포함)에서 확인했고, 기본 설치만으로
+같은 흐름을 검증하지는 않았다. 의존성은 `pyproject.toml`과 `uv.lock`이 정본이다.
+수집기 이식 후 전환용 경로를 제거한다.
 
 Docker는 앱 하나를 포장하는 선택사항이다. 기본 Compose에는 DB 서비스가 없다.
 컨테이너 사용 절차는 [운영 안내](dev-notes/operations.md)를 따른다.
