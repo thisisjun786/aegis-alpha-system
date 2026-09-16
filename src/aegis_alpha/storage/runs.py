@@ -61,6 +61,9 @@ _ADDON_FIELDS = frozenset({"decision_at_us"})
 # decodes caller-controlled documents with the checks switched off.
 _DEFAULT_MEMORY_BYTES = 512 * 1024 * 1024
 # A run identifier becomes a directory name under the runs root.
+# A reason is stored twice and read back on every verification, so it is bounded
+# rather than left to the caller.
+_MAX_REASON_BYTES = 4096
 _RUN_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}")
 # One stored result row becomes a Python dict, a tagged rowset encoding and a sort
 # key, all live at once, on top of its own measured text.
@@ -505,6 +508,24 @@ def _sealed_identities(request: dict[str, object]) -> tuple[str, str, tuple[str,
     )
 
 
+def _inputs_hash(bundle_id: str, envelope_sha256: str, preparation_sha256: str) -> str:
+    """The durable intent names the bundle and both sealed inputs.
+
+    storage_operations guards its identity columns with a trigger, so this is the only
+    immutable copy of the bundle a run was opened against: runs.bundle_id stays writable
+    while the run is RUNNING and two bundles can register the same canonical request.
+    """
+    return content_sha256(
+        {
+            "schema": _INPUTS_SCHEMA,
+            "hash_format": _HASH_FORMAT,
+            "bundle_id": bundle_id,
+            "envelope_sha256": envelope_sha256,
+            "preparation_sha256": preparation_sha256,
+        }
+    )
+
+
 def _require_recorded_provenance(
     workspace: Workspace, derived: _Derived, budget: ComputeBudget | None
 ) -> None:
@@ -522,8 +543,20 @@ def _require_recorded_provenance(
         raise RunStorageError("run record is missing")
     if row["result_hash"] != derived.manifest:
         raise RunStorageError("recorded result hash disagrees with the sealed evidence")
+    operation = workspace.state.execute(
+        "SELECT payload_hash FROM storage_operations WHERE kind=? AND target_id=?",
+        (RUN_OPERATION_KIND, derived.run_id),
+    ).fetchone()
+    expected_inputs = _inputs_hash(
+        row["bundle_id"], derived.artifacts[_ENVELOPE], derived.artifacts[_PREPARATION]
+    )
+    if operation is None or operation["payload_hash"] != expected_inputs:
+        raise RunStorageError("recorded bundle or sealed inputs disagree with the durable intent")
+    # The projection stays live while the request is decoded beside it.
     engine, environment, strategy = _sealed_identities(
-        _sealed_request(workspace, row["bundle_id"], derived.request_hash, budget)
+        _sealed_request(
+            workspace, row["bundle_id"], derived.request_hash, _reserved(budget, derived)
+        )
     )
     if (row["engine_hash"], row["environment_hash"]) != (engine, environment):
         raise RunStorageError("recorded engine identity disagrees with the registered request")
@@ -688,6 +721,8 @@ def open_run(
     _require_linked_inputs(intent.envelope_bytes, intent.preparation_bytes, request_hash)
     _require_admitted_pins(workspace, intent.strategy_pins)
     run_id = intent.run_id or "run-" + uuid.uuid4().hex
+    if len(_text(intent.reason, "reason").encode()) > _MAX_REASON_BYTES:
+        raise RunStorageError("reason is too large to record")
     if intent.prior_run_id == run_id:
         # The self-referencing foreign key would accept the new row as its own parent.
         raise RunStorageError("a run cannot be its own predecessor")
@@ -705,14 +740,7 @@ def open_run(
         # Both sealed inputs are named in the immutable intent. Committing only the
         # envelope would let a retry after an interrupted seal substitute a different
         # preparation under the same accepted run.
-        payload_hash=content_sha256(
-            {
-                "schema": _INPUTS_SCHEMA,
-                "hash_format": _HASH_FORMAT,
-                "envelope_sha256": envelope_sha256,
-                "preparation_sha256": preparation_sha256,
-            }
-        ),
+        payload_hash=_inputs_hash(intent.bundle_id, envelope_sha256, preparation_sha256),
     )
     if workspace.state.execute("SELECT 1 FROM runs WHERE run_id=?", (run_id,)).fetchone():
         # A resumed open: prepare_operation refuses a different or quarantined intent

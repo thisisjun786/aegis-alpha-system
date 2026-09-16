@@ -1209,3 +1209,39 @@ def test_metadata_rewritten_while_running_is_refused(
             read_run(workspace, "run-2", budget=BUDGET)
         with pytest.raises(ValueError, match="metadata disagrees with its opening evidence"):
             verify_workspace(workspace, budget=BUDGET)
+
+
+def test_an_unbounded_reason_is_refused(tmp_path: Path) -> None:
+    fx = prepared(tmp_path)
+    with (
+        open_workspace(fx.home, writable=True) as workspace,
+        pytest.raises(RunStorageError, match="reason is too large"),
+    ):
+        open_run(workspace, replace(intent(fx, "run-1"), reason="x" * 5000))
+    assert observed(fx.home, "run-1") == (None, None)
+
+
+def test_a_rewritten_bundle_identity_is_refused(tmp_path: Path) -> None:
+    fx = prepared(tmp_path)
+    with open_workspace(fx.home, writable=True) as workspace:
+        handle = open_run(workspace, intent(fx, "run-1"))
+        # bundle_id stays writable while the run is RUNNING and has no copy in runs,
+        # so the durable intent is the only immutable record of it.
+        columns = [
+            row[1]
+            for row in workspace.state.execute("PRAGMA table_info(input_bundles)")
+            if row[1] != "bundle_id"
+        ]
+        listed = ",".join(columns)
+        workspace.state.execute(
+            "INSERT INTO input_bundles(bundle_id," + listed + ") "  # noqa: S608
+            "SELECT 'b-other'," + listed + " FROM input_bundles WHERE bundle_id='b-empty'"
+        )
+        workspace.state.execute("UPDATE runs SET bundle_id='b-other' WHERE run_id='run-1'")
+        workspace.state.commit()
+        commit_run(workspace, handle, RunResult(RESULT), budget=BUDGET)
+    with (
+        open_workspace(fx.home) as workspace,
+        pytest.raises(RunStorageError, match="disagree with the durable intent"),
+    ):
+        read_run(workspace, "run-1", budget=BUDGET)
