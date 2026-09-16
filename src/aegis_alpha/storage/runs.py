@@ -303,6 +303,11 @@ def project_result_rows(backtest_bytes: bytes, envelope_bytes: bytes) -> dict[st
         }
         for entry in _by_date(_sequence(account.get("nav"), "nav"), "date", "nav entry")
     ]
+    for fill in _by_date(_sequence(account.get("fills"), "fills"), "execution_date", "fill"):
+        if _session_us(fill.get("decision_date")) >= _session_us(fill.get("execution_date")):
+            # The engine decides on a close and fills on a later open. A fill that does
+            # not follow its decision would corrupt the trade chronology.
+            raise RunStorageError("a fill must execute after the decision that produced it")
     trades: list[dict[str, object]] = [
         {
             "module": module,

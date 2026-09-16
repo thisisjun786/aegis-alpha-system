@@ -1245,3 +1245,22 @@ def test_a_rewritten_bundle_identity_is_refused(tmp_path: Path) -> None:
         pytest.raises(RunStorageError, match="disagree with the durable intent"),
     ):
         read_run(workspace, "run-1", budget=BUDGET)
+
+
+def test_a_fill_that_precedes_its_decision_is_refused(tmp_path: Path) -> None:
+    fx = prepared(tmp_path)
+    impossible: list[dict[str, object]] = [
+        {
+            "decision_date": "2024-01-03",
+            "execution_date": "2024-01-02",
+            "symbol": "AAA",
+            "shares": 1.0,
+            "price": 1.0,
+            "fee": 0.0,
+        }
+    ]
+    with open_workspace(fx.home, writable=True) as workspace:
+        handle = open_run(workspace, intent(fx, "run-1"))
+        with pytest.raises(RunStorageError, match="must execute after the decision"):
+            commit_run(workspace, handle, RunResult(backtest(NAV, impossible)), budget=BUDGET)
+        assert not (workspace.paths.runs / "run-1" / "backtest.json").exists()
