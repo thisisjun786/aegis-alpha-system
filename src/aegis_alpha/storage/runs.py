@@ -486,6 +486,57 @@ def _sealed_request(
     return _mapping(json.loads(row[0]), "backtest request")
 
 
+def _sealed_identities(request: dict[str, object]) -> tuple[str, str, tuple[str, ...]]:
+    """The engine, environment and strategy identities the request already seals."""
+    sealed = _mapping(request.get("strategy"), "request strategy")
+    return (
+        content_sha256(_mapping(request.get("engine"), "request engine")),
+        content_sha256(_mapping(request.get("environment"), "request environment")),
+        (
+            _text(sealed.get("strategy_store_id"), "request strategy store"),
+            _text(sealed.get("strategy_id"), "request strategy_id"),
+            _text(sealed.get("version"), "request strategy version"),
+            _digest(_text(sealed.get("raw_sha256"), "request raw_sha256"), "request raw_sha256"),
+            _digest(
+                _text(sealed.get("contract_sha256"), "request contract_sha256"),
+                "request contract_sha256",
+            ),
+        ),
+    )
+
+
+def _require_recorded_provenance(
+    workspace: Workspace, derived: _Derived, budget: ComputeBudget | None
+) -> None:
+    """Re-authenticate the stored provenance against the request that sealed it.
+
+    completed_run only freezes a run once it stops being RUNNING, so the identity
+    columns can be rewritten between open_run and commit_run. Verification therefore
+    compares what is stored rather than trusting what was validated at open time.
+    """
+    row = workspace.state.execute(
+        "SELECT bundle_id,engine_hash,environment_hash FROM runs WHERE run_id=?",
+        (derived.run_id,),
+    ).fetchone()
+    if row is None:
+        raise RunStorageError("run record is missing")
+    engine, environment, strategy = _sealed_identities(
+        _sealed_request(workspace, row["bundle_id"], derived.request_hash, budget)
+    )
+    if (row["engine_hash"], row["environment_hash"]) != (engine, environment):
+        raise RunStorageError("recorded engine identity disagrees with the registered request")
+    pins = [
+        tuple(pin)
+        for pin in workspace.state.execute(
+            "SELECT module,ordinal,strategy_store_id,strategy_id,version,raw_hash,contract_hash "
+            "FROM run_strategies WHERE run_id=? ORDER BY module,ordinal",
+            (derived.run_id,),
+        )
+    ]
+    if pins != [(derived.module, 0, *strategy)]:
+        raise RunStorageError("recorded strategy pins disagree with the registered request")
+
+
 def _require_sealed_provenance(intent: RunIntent, request: dict[str, object], module: str) -> None:
     """Refuse provenance the registered request does not already seal.
 
@@ -493,23 +544,11 @@ def _require_sealed_provenance(intent: RunIntent, request: dict[str, object], mo
     immutable provenance. The request already seals all three, so accepting whatever a
     caller passes would let a successful run describe a calculation nobody performed.
     """
-    for field, supplied in (
-        ("engine", intent.engine_hash),
-        ("environment", intent.environment_hash),
-    ):
-        if content_sha256(_mapping(request.get(field), "request " + field)) != supplied:
-            raise RunStorageError(field + "_hash does not match the registered request")
-    sealed = _mapping(request.get("strategy"), "request strategy")
-    expected = (
-        _text(sealed.get("strategy_store_id"), "request strategy store"),
-        _text(sealed.get("strategy_id"), "request strategy_id"),
-        _text(sealed.get("version"), "request strategy version"),
-        _digest(_text(sealed.get("raw_sha256"), "request raw_sha256"), "request raw_sha256"),
-        _digest(
-            _text(sealed.get("contract_sha256"), "request contract_sha256"),
-            "request contract_sha256",
-        ),
-    )
+    engine, environment, expected = _sealed_identities(request)
+    if intent.engine_hash != engine:
+        raise RunStorageError("engine_hash does not match the registered request")
+    if intent.environment_hash != environment:
+        raise RunStorageError("environment_hash does not match the registered request")
     pins = _pin_rows(intent.strategy_pins)
     if len(pins) != 1 or tuple(pins[0][2:]) != expected:
         raise RunStorageError("strategy pins do not match the registered request")
@@ -1329,6 +1368,7 @@ def verify_run(
         (derived.module, _MANIFEST_SCHEMA, derived.manifest, sum(derived.counts.values()))
     ]:
         raise RunStorageError("recorded module manifest disagrees with the sealed evidence")
+    _require_recorded_provenance(workspace, derived, budget)
     return derived
 
 

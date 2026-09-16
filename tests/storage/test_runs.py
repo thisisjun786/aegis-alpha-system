@@ -1127,3 +1127,19 @@ def test_an_orphan_trade_decision_row_is_refused(tmp_path: Path) -> None:
             read_run(workspace, "run-1", budget=BUDGET)
         with pytest.raises(ValueError, match="trade decision rows disagree"):
             verify_workspace(workspace, budget=BUDGET)
+
+
+def test_provenance_rewritten_while_running_is_refused(tmp_path: Path) -> None:
+    fx = prepared(tmp_path)
+    with open_workspace(fx.home, writable=True) as workspace:
+        handle = open_run(workspace, intent(fx, "run-1"))
+        # completed_run only freezes a run once it stops being RUNNING, so the identity
+        # columns really are writable at this point.
+        workspace.state.execute("UPDATE runs SET engine_hash=? WHERE run_id=?", ("e" * 64, "run-1"))
+        workspace.state.commit()
+        commit_run(workspace, handle, RunResult(RESULT), budget=BUDGET)
+    with open_workspace(fx.home) as workspace:
+        with pytest.raises(RunStorageError, match="engine identity disagrees"):
+            read_run(workspace, "run-1", budget=BUDGET)
+        with pytest.raises(ValueError, match="engine identity disagrees"):
+            verify_workspace(workspace, budget=BUDGET)
