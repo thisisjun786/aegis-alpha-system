@@ -238,14 +238,19 @@ def _bundle_id(explicit: str | None, bindings: object, request_hash: str) -> str
     )
 
 
-def _intent(opening: _Opening, request: RunBacktestRequest, bundle_id: str) -> RunIntent:
+def _intent(
+    opening: _Opening,
+    request: RunBacktestRequest,
+    bundle_id: str,
+    projected: dict[str, object],
+) -> RunIntent:
     """Fill every RunIntent field from the request this run is about to register.
 
     The engine and environment hashes come from the projected canonical request rather
     than from the identity objects themselves: storage hashes exactly those decoded
-    members, and a differently normalized copy would be refused at open time.
+    members, and a differently normalized copy would be refused at open time. The
+    projection is decoded once by the caller and passed in, never decoded twice.
     """
-    projected = _object(decode_json(opening.projection_bytes), "projected request")
     envelope = _object(decode_json(opening.envelope_bytes), "envelope")
     strategy = opening.strategy
     return RunIntent(
@@ -288,7 +293,10 @@ def _prepare(home: Path, raw: bytes, budget: ComputeBudget) -> PreparedBacktest:
         # its install command instead of failing at the first durable write.
         require_run_schema(workspace)
         request = PrepareRequest(parse_prepare_request(raw))
-        return prepare_backtest(workspace, request, budget=budget)
+        # The bytes and the graph they expand into stay live for the whole preparation,
+        # so the readers below see an allowance that already excludes them. Measured on
+        # the serialized form, which is what can be measured; the expansion is not.
+        return prepare_backtest(workspace, request, budget=_retaining(budget, raw))
 
 
 def _retaining(budget: ComputeBudget, *held: bytes) -> ComputeBudget:
@@ -362,7 +370,8 @@ def _open(
             expected_request_hash=opening.request_hash,
             budget=budget,
         )
-        handle = open_run(workspace, _intent(opening, request, bundle.bundle_id), budget=budget)
+        intent = _intent(opening, request, bundle.bundle_id, projected)
+        handle = open_run(workspace, intent, budget=budget)
         return _Opened(handle, bundle, _installation(workspace))
 
 
