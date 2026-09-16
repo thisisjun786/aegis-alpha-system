@@ -1173,3 +1173,39 @@ def test_oversized_run_inputs_are_refused_before_decoding(tmp_path: Path) -> Non
     ):
         open_run(workspace, intent(fx, "run-1"), budget=TIGHT)
     assert observed(fx.home, "run-1") == (None, None)
+
+
+def test_a_run_cannot_be_its_own_predecessor(tmp_path: Path) -> None:
+    fx = prepared(tmp_path)
+    with (
+        open_workspace(fx.home, writable=True) as workspace,
+        pytest.raises(RunStorageError, match="its own predecessor"),
+    ):
+        open_run(workspace, intent(fx, "run-1", prior_run_id="run-1"))
+    assert observed(fx.home, "run-1") == (None, None)
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [("reason", "invented"), ("created_at_us", 1), ("prior_run_id", None)],
+)
+def test_metadata_rewritten_while_running_is_refused(
+    tmp_path: Path, column: str, value: object
+) -> None:
+    fx = prepared(tmp_path)
+    with open_workspace(fx.home, writable=True) as workspace:
+        first = open_run(workspace, intent(fx, "run-1"))
+        commit_run(workspace, first, RunResult(RESULT), budget=BUDGET)
+        handle = open_run(workspace, intent(fx, "run-2", prior_run_id="run-1"))
+        # completed_run leaves these columns writable while the run is RUNNING.
+        workspace.state.execute(
+            "UPDATE runs SET " + column + "=? WHERE run_id=?",  # noqa: S608
+            (value, "run-2"),
+        )
+        workspace.state.commit()
+        commit_run(workspace, handle, RunResult(RESULT), budget=BUDGET)
+    with open_workspace(fx.home) as workspace:
+        with pytest.raises(RunStorageError, match="metadata disagrees with its opening evidence"):
+            read_run(workspace, "run-2", budget=BUDGET)
+        with pytest.raises(ValueError, match="metadata disagrees with its opening evidence"):
+            verify_workspace(workspace, budget=BUDGET)

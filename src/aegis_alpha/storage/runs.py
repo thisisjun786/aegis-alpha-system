@@ -537,6 +537,26 @@ def _require_recorded_provenance(
     ]
     if pins != [(derived.module, 0, *strategy)]:
         raise RunStorageError("recorded strategy pins disagree with the registered request")
+    _require_recorded_metadata(workspace, derived.run_id)
+
+
+def _require_recorded_metadata(workspace: Workspace, run_id: str) -> None:
+    """Compare the columns completed_run leaves writable with their immutable copies.
+
+    prior_run_id, reason and created_at_us can all be rewritten while a run is RUNNING.
+    run_details and the started event recorded the same values under immutable triggers
+    at open time, so read_run cannot return lineage, a reason or a time nobody recorded.
+    """
+    row = workspace.state.execute(
+        "SELECT r.prior_run_id,r.reason,r.created_at_us,d.prior_run_id,e.reason,e.known_at_us "
+        "FROM runs r JOIN run_details d ON d.run_id=r.run_id "
+        "JOIN run_events e ON e.run_id=r.run_id AND e.sequence=1 WHERE r.run_id=?",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        raise RunStorageError("run record is missing its opening evidence")
+    if tuple(row)[:3] != tuple(row)[3:]:
+        raise RunStorageError("recorded run metadata disagrees with its opening evidence")
 
 
 def _require_sealed_provenance(intent: RunIntent, request: dict[str, object], module: str) -> None:
@@ -651,14 +671,16 @@ def open_run(
         # rollback would erase this run while its sealed files stayed on disk.
         raise RunStorageError("open_run cannot run inside another state transaction")
     request_hash = _digest(_text(intent.request_hash, "request_hash"), "request_hash")
-    # Both sidecars are decoded below, so they are charged before either json.loads.
-    _admit(
-        budget,
-        _DOCUMENT_OVERHEAD
-        + _DOCUMENT_EXPANSION * (len(intent.envelope_bytes) + len(intent.preparation_bytes)),
-        "run inputs exceed materialization budget",
+    # Both sidecars are decoded below and stay live while the request is decoded
+    # beside them, so they are charged first and then reserved rather than compared
+    # twice against the same allowance.
+    inputs = _DOCUMENT_OVERHEAD + _DOCUMENT_EXPANSION * (
+        len(intent.envelope_bytes) + len(intent.preparation_bytes)
     )
-    request = _sealed_request(workspace, intent.bundle_id, request_hash, budget)
+    _admit(budget, inputs, "run inputs exceed materialization budget")
+    held = _allowance(budget)
+    held = replace(held, reserved_bytes=held.reserved_bytes + inputs)
+    request = _sealed_request(workspace, intent.bundle_id, request_hash, held)
     module = _envelope_module(_mapping(json.loads(intent.envelope_bytes), "envelope"))
     _require_sealed_provenance(intent, request, module)
     # Checked before anything durable happens, so a preparation that belongs to another
@@ -666,6 +688,9 @@ def open_run(
     _require_linked_inputs(intent.envelope_bytes, intent.preparation_bytes, request_hash)
     _require_admitted_pins(workspace, intent.strategy_pins)
     run_id = intent.run_id or "run-" + uuid.uuid4().hex
+    if intent.prior_run_id == run_id:
+        # The self-referencing foreign key would accept the new row as its own parent.
+        raise RunStorageError("a run cannot be its own predecessor")
     if not _RUN_ID.fullmatch(_text(run_id, "run_id")):
         # This becomes a directory name under the runs root.
         raise RunStorageError("run_id must be a plain identifier")
