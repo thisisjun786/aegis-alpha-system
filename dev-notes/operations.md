@@ -812,4 +812,5 @@ docker compose run --rm aas doctor
 
 라이브 공급자 검증·기존 DB 이전·스케줄러 활성화·실주문은 위 오프라인 설치 검사의 범위에
 포함되지 않는다. CLI preview는 합성 비중 계산이고, `prepare`와 `backtest`는 저장한 입력의
-준비와 명시한 봉투의 회계까지다. run 저장·결과 확정·복원은 아직 별도 구현이다.
+준비와 명시한 봉투의 회계까지다. 그 둘을 이어 run으로 확정하고 다시 읽는 것은 `aas run`이며
+`aas db run-install`이 필요하다. 결과 복원은 아직 별도 구현이다.

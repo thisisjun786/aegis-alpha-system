@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sqlite3
 from dataclasses import dataclass, replace
 from importlib import import_module
@@ -75,6 +76,11 @@ _HASH_FORMAT = "aas-canonical-json-sha256-v1"
 # A failure reason is stored and read back on every verification, so what an arbitrary
 # exception carries is bounded here rather than written through at whatever length.
 _MAX_REASON_CHARS = 512
+# The run store bounds a recorded reason and accepts only a plain identifier as a run
+# name, because both become durable. Checked here too so a caller's mistake is refused
+# before stage A registers anything, not after.
+_MAX_REASON_BYTES = 4096
+_RUN_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}")
 # A sealed document is decoded whole before it is used, so it is charged at the same
 # expansion the run store already charges for decoding one of its own artifacts.
 _DOCUMENT_EXPANSION = 128
@@ -109,6 +115,10 @@ class RunBacktestRequest:
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise ValueError(name + " must be nonempty text when supplied")
+        if len(self.reason.encode()) > _MAX_REASON_BYTES:
+            raise ValueError("reason is too large to record")
+        if self.run_id is not None and not _RUN_ID.fullmatch(self.run_id):
+            raise ValueError("run_id must be a plain identifier")
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,6 +328,17 @@ def _open(
         }
     )
     with open_workspace(home, writable=True) as workspace:
+        # Registration is durable and a bundle name binds one request for good, so the
+        # run-only fields are checked first. open_run cannot run inside another
+        # transaction, so stage A cannot be one atomic write; refusing a predecessor
+        # nobody recorded is what keeps a bad run field from stranding a registration.
+        if (
+            request.prior_run_id is not None
+            and not workspace.state.execute(
+                "SELECT 1 FROM runs WHERE run_id=?", (request.prior_run_id,)
+            ).fetchone()
+        ):
+            raise ValueError("prior_run_id names no recorded run")
         bundle = register_input_bundle(
             workspace,
             document,
@@ -482,6 +503,10 @@ def _staged(
             "run " + _abandon(home, opened.handle, "result was not recorded: " + _describe(error))
         )
         raise
+    # The run is stored. Both documents the receipt reports are decoded from the sealed
+    # bytes, so the charge is made before either is expanded; a refusal here leaves a
+    # readable SUCCESS run rather than a wrong receipt.
+    _admit(retained, len(result.backtest_bytes) + len(carried.envelope_bytes))
     sealed = _object(decode_json(result.backtest_bytes), "sealed backtest result")
     return _receipt(request, carried, opened, _Outcome(sealed, recorded, exported))
 

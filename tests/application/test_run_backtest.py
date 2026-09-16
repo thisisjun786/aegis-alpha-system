@@ -459,6 +459,33 @@ def test_an_export_cannot_target_the_managed_runs_directory(case: tuple[Path, Pa
     assert _statuses(home) == []
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("run_id", "not a plain identifier", "plain identifier"),
+        ("reason", "x" * 5000, "too large"),
+        ("prior_run_id", "run-never-recorded", "no recorded run"),
+    ],
+)
+def test_a_bad_run_field_registers_nothing(
+    case: tuple[Path, Path], field: str, value: str, reason: str
+) -> None:
+    """A run-only field must be refused before stage A binds a bundle name for good."""
+    home, request = case
+    _cli(home, "db", "run-install")
+    option = "--" + field.replace("_", "-")
+    result = run_cli(*_arguments(request, option, value), home=home)
+    assert result.returncode == 1
+    assert not result.stdout
+    assert reason in json.loads(result.stderr)["error"]
+    assert _statuses(home) == []
+    with open_workspace(home) as workspace:
+        registered = workspace.state.execute("SELECT count(*) FROM backtest_requests").fetchone()
+        bundles = workspace.state.execute("SELECT count(*) FROM input_bundles").fetchone()
+    assert registered[0] == 0
+    assert bundles[0] == 0
+
+
 @pytest.mark.parametrize("cleanup_error", [TypeError, OSError])
 def test_cli_failure_reports_what_happened_to_the_run(
     case: tuple[Path, Path],
