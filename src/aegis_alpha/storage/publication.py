@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, cast
 
 from aegis_alpha.storage.import_document import ImportDocument, parse_import, read_import
 from aegis_alpha.storage.raw import put_raw, verify_raw
-from aegis_alpha.storage.runs import RUN_OPERATION_KIND
 
 if TYPE_CHECKING:
     import sqlite3
@@ -285,6 +284,8 @@ def read_dataset(workspace: Workspace, dataset_id: str, version: str) -> dict[st
 
 
 def recover_operations(workspace: Workspace) -> dict[str, object]:
+    from aegis_alpha.storage.runs import RUN_OPERATION_KIND  # noqa: PLC0415
+
     recovered: list[str] = []
     pending: list[str] = []
     rows = workspace.state.execute(
@@ -370,6 +371,7 @@ def execute_data(workspace: Workspace, args: argparse.Namespace) -> dict[str, ob
 
 
 def quarantine(workspace: Workspace, operation_id: str, reason: str) -> dict[str, object]:
+    from aegis_alpha.storage.runs import RUN_OPERATION_KIND  # noqa: PLC0415
     from aegis_alpha.storage.state import get_operation, quarantine_operation  # noqa: PLC0415
 
     intent = get_operation(workspace.state, operation_id)
