@@ -419,6 +419,9 @@ def metadata_allocation_bound(
         watcher = _PeakWatcher()
         # Restore rather than clear: another tool may own the profile hook, and
         # this context manager must not silently disable it.
+        # It is displaced for the duration of the window, which is deliberate:
+        # chaining to it instead would run two hooks per event and double the
+        # observer effect this measurement is trying to keep small.
         previous = sys.getprofile()
         tracemalloc.start()
         sys.setprofile(watcher)
