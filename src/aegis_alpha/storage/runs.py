@@ -215,7 +215,12 @@ def _session_us(value: object) -> int:
     """
     if not isinstance(value, str):
         raise RunStorageError("result dates must be ISO text")
-    return calendar.timegm(date.fromisoformat(value).timetuple()) * 1_000_000
+    stamp = calendar.timegm(date.fromisoformat(value).timetuple()) * 1_000_000
+    if stamp < 0:
+        # The stored columns are constrained non-negative, and that constraint must be
+        # met before sealing rather than at the insert, when the artifact is immutable.
+        raise RunStorageError("result dates before 1970 are not storable")
+    return stamp
 
 
 def _text(value: object, field: str) -> str:
@@ -234,6 +239,11 @@ def _mapping(value: object, field: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise RunStorageError(f"{field} must be an object")
     return value
+
+
+def _envelope_module(envelope: dict[str, object]) -> str:
+    """The module the sealed envelope was exported for; every run row carries it."""
+    return _text(envelope.get("module"), "envelope module")
 
 
 def account_evidence(document: dict[str, object]) -> tuple[dict[str, object], list[object] | None]:
@@ -276,8 +286,7 @@ def project_result_rows(backtest_bytes: bytes, envelope_bytes: bytes) -> dict[st
     document = _mapping(json.loads(backtest_bytes), "backtest result")
     envelope = _mapping(json.loads(envelope_bytes), "envelope")
     module = _text(document.get("module"), "module")
-    declared = envelope.get("module")
-    if declared is not None and declared != module:
+    if _envelope_module(envelope) != module:
         # The envelope supplies the target weights. A result produced by a different
         # module must not be recorded against them.
         raise RunStorageError("result module conflicts with the envelope module")
@@ -477,7 +486,7 @@ def _sealed_request(
     return _mapping(json.loads(row[0]), "backtest request")
 
 
-def _require_sealed_provenance(intent: RunIntent, request: dict[str, object]) -> None:
+def _require_sealed_provenance(intent: RunIntent, request: dict[str, object], module: str) -> None:
     """Refuse provenance the registered request does not already seal.
 
     read_run returns the engine, environment and strategy identities as the run
@@ -504,6 +513,10 @@ def _require_sealed_provenance(intent: RunIntent, request: dict[str, object]) ->
     pins = _pin_rows(intent.strategy_pins)
     if len(pins) != 1 or tuple(pins[0][2:]) != expected:
         raise RunStorageError("strategy pins do not match the registered request")
+    if (pins[0][0], pins[0][1]) != (module, 0):
+        # run_strategies is keyed on (run_id, module, ordinal). A pin filed under
+        # another module would make read_run report provenance the manifest contradicts.
+        raise RunStorageError("strategy pin is not placed on the run module")
 
 
 def _require_admitted_pins(workspace: Workspace, pins: tuple[RunStrategyPin, ...]) -> None:
@@ -598,7 +611,8 @@ def open_run(
         raise RunStorageError("open_run cannot run inside another state transaction")
     request_hash = _digest(_text(intent.request_hash, "request_hash"), "request_hash")
     request = _sealed_request(workspace, intent.bundle_id, request_hash, budget)
-    _require_sealed_provenance(intent, request)
+    module = _envelope_module(_mapping(json.loads(intent.envelope_bytes), "envelope"))
+    _require_sealed_provenance(intent, request, module)
     # Checked before anything durable happens, so a preparation that belongs to another
     # request or another envelope is never sealed under this run.
     _require_linked_inputs(intent.envelope_bytes, intent.preparation_bytes, request_hash)
@@ -933,6 +947,13 @@ def _stored_rows(
             {field: _normalized(row[index]) for index, field in enumerate(fields)}
             for row in workspace.market.execute(statement, [run_id]).fetchall()
         ]
+    # An inner join hides an add-on row whose ordinal has no trade, so the add-on is
+    # counted against the table it annotates rather than only followed into it.
+    orphans = workspace.market.execute(
+        "SELECT count(*) FROM result_trade_decisions WHERE run_id=?", [run_id]
+    ).fetchone()
+    if orphans is not None and int(orphans[0]) != len(stored["simulated_trades"]):
+        raise RunStorageError("trade decision rows disagree with the stored trades")
     return stored
 
 

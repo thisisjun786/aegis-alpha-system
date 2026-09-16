@@ -82,7 +82,9 @@ BUNDLE = canonical(
         "bindings": [],
     }
 )
-ENVELOPE = canonical({"targets": {"2024-01-02": {"AAA": 1.0}, "2024-01-03": {"AAA": 0.5}}})
+ENVELOPE = canonical(
+    {"module": "aegis", "targets": {"2024-01-02": {"AAA": 1.0}, "2024-01-03": {"AAA": 0.5}}}
+)
 ENVELOPE_SHA256 = hashlib.sha256(ENVELOPE).hexdigest()
 NAV: list[dict[str, object]] = [
     {"date": "2024-01-02", "equity": 1000.0, "cash": 0.0},
@@ -818,7 +820,7 @@ def test_a_preparation_from_another_request_is_never_sealed(tmp_path: Path) -> N
         with pytest.raises(RunStorageError, match="preparation request names different evidence"):
             open_run(workspace, replace(intent(fx, "run-1"), preparation_bytes=foreign))
         assert not (workspace.paths.runs / "run-1").exists()
-        other = canonical({"targets": {"2024-01-02": {"ZZZ": 1.0}}})
+        other = canonical({"module": "aegis", "targets": {"2024-01-02": {"ZZZ": 1.0}}})
         with pytest.raises(RunStorageError, match="preparation envelope names different evidence"):
             open_run(
                 workspace,
@@ -833,7 +835,7 @@ def test_a_preparation_from_another_request_is_never_sealed(tmp_path: Path) -> N
 def test_a_result_computed_from_another_envelope_is_refused(tmp_path: Path) -> None:
     fx = prepared(tmp_path)
     home = fx.home
-    other = canonical({"targets": {"2024-01-02": {"ZZZ": 1.0}}})
+    other = canonical({"module": "aegis", "targets": {"2024-01-02": {"ZZZ": 1.0}}})
     mismatched = canonical(
         {
             "module": "aegis",
@@ -1075,3 +1077,53 @@ def test_recovery_charges_its_reads_without_a_caller_budget(
     assert seen != []
     # The CLI hands down no budget, so recovery supplies one rather than read unchecked.
     assert None not in seen
+
+
+def test_a_pin_filed_under_another_module_is_refused(tmp_path: Path) -> None:
+    fx = prepared(tmp_path)
+    with open_workspace(fx.home, writable=True) as workspace:
+        for misplaced in (replace(fx.pin, module="hedge"), replace(fx.pin, ordinal=99)):
+            with pytest.raises(RunStorageError, match="not placed on the run module"):
+                open_run(workspace, intent(fx, "run-1", pins=(misplaced,)))
+    assert observed(fx.home, "run-1") == (None, None)
+
+
+def test_a_date_the_columns_cannot_hold_is_refused_before_sealing(tmp_path: Path) -> None:
+    fx = prepared(tmp_path)
+    ancient: list[dict[str, object]] = [
+        {
+            "decision_date": "1969-12-30",
+            "execution_date": "1969-12-31",
+            "symbol": "AAA",
+            "shares": 1.0,
+            "price": 1.0,
+            "fee": 0.0,
+        }
+    ]
+    with open_workspace(fx.home, writable=True) as workspace:
+        handle = open_run(workspace, intent(fx, "run-1"))
+        with pytest.raises(RunStorageError, match="before 1970 are not storable"):
+            commit_run(workspace, handle, RunResult(backtest(NAV, ancient)), budget=BUDGET)
+        # The constraint is met before sealing, so a corrected result can still commit.
+        assert not (workspace.paths.runs / "run-1" / "backtest.json").exists()
+        assert (
+            commit_run(workspace, handle, RunResult(RESULT), budget=BUDGET)["status"] == "SUCCESS"
+        )
+
+
+def test_an_orphan_trade_decision_row_is_refused(tmp_path: Path) -> None:
+    fx = prepared(tmp_path)
+    with open_workspace(fx.home, writable=True) as workspace:
+        commit_run(
+            workspace, open_run(workspace, intent(fx, "run-1")), RunResult(RESULT), budget=BUDGET
+        )
+    alter_market(
+        fx.home,
+        "INSERT INTO result_trade_decisions(run_id,module,ordinal,decision_at_us) VALUES (?,?,?,?)",
+        ["run-1", "aegis", 99, 0],
+    )
+    with open_workspace(fx.home) as workspace:
+        with pytest.raises(RunStorageError, match="trade decision rows disagree"):
+            read_run(workspace, "run-1", budget=BUDGET)
+        with pytest.raises(ValueError, match="trade decision rows disagree"):
+            verify_workspace(workspace, budget=BUDGET)
