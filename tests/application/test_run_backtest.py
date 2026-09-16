@@ -20,6 +20,7 @@ from aegis_alpha.application.cli import main
 from aegis_alpha.application.run_backtest import RunBacktestRequest, run_backtest
 from aegis_alpha.compute_resources import ComputeBudget
 from aegis_alpha.data.serialization import canonical_json_bytes
+from aegis_alpha.storage.paths import load_paths
 from aegis_alpha.storage.run_schema import inspect_run_schema
 from aegis_alpha.storage.runs import RunStorageError, list_runs, read_run
 from aegis_alpha.storage.workspace import open_workspace
@@ -402,6 +403,7 @@ def test_later_stages_reserve_what_preparation_keeps_live(
     def watched_open(root: Path, prepared: object, wanted: object, budget: ComputeBudget) -> object:
         prepared_any = cast("Any", prepared)
         seen["held"] = len(prepared_any.envelope.canonical_bytes) + len(prepared_any.provenance)
+        seen["envelope"] = len(prepared_any.envelope.canonical_bytes)
         seen["open"] = budget.reserved_bytes
         return genuine_open(root, cast("Any", prepared), cast("Any", wanted), budget)
 
@@ -419,9 +421,33 @@ def test_later_stages_reserve_what_preparation_keeps_live(
     assert receipt["run"]["status"] == "SUCCESS"
     assert seen["held"] > 0
     assert seen["result"] > 0
-    # Stage A and B run beside the preparation; the commit also runs beside the result.
+    # Stage A runs beside the whole preparation. The preparation graph is released
+    # afterwards, so the commit only carries the envelope and the result.
     assert seen["open"] == seen["held"]
-    assert seen["record"] == seen["held"] + seen["result"]
+    assert seen["record"] == seen["envelope"] + seen["result"]
+
+
+def test_an_export_cannot_target_the_managed_runs_directory(case: tuple[Path, Path]) -> None:
+    """An export inside the runs root could become the run's own immutable artifact."""
+    home, request = case
+    _cli(home, "db", "run-install")
+    managed = load_paths(home).runs / "run-collide"
+    managed.mkdir(parents=True, exist_ok=True)
+    result = run_cli(
+        *_arguments(
+            request,
+            "--run-id",
+            "run-collide",
+            "--envelope-output",
+            str(managed / "envelope.json"),
+        ),
+        home=home,
+    )
+    assert result.returncode == 1
+    assert not result.stdout
+    assert "managed runs directory" in json.loads(result.stderr)["error"]
+    assert not (managed / "envelope.json").exists()
+    assert _statuses(home) == []
 
 
 @pytest.mark.parametrize("cleanup_error", [TypeError, OSError])

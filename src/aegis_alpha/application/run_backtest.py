@@ -13,6 +13,7 @@ long replay never blocks another reader of the same installation.
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 from dataclasses import dataclass, replace
 from importlib import import_module
@@ -28,6 +29,7 @@ from aegis_alpha.application.prepare_cli import (
     require_new_outputs,
     seal_outputs,
 )
+from aegis_alpha.compute_resources import ComputeResourceError
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
 from aegis_alpha.engine.codec import decode_json
@@ -69,6 +71,9 @@ _HASH_FORMAT = "aas-canonical-json-sha256-v1"
 # A failure reason is stored and read back on every verification, so what an arbitrary
 # exception carries is bounded here rather than written through at whatever length.
 _MAX_REASON_CHARS = 512
+# A sealed document is decoded whole before it is used, so it is charged at the same
+# expansion the run store already charges for decoding one of its own artifacts.
+_DOCUMENT_EXPANSION = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +114,35 @@ class _Opened:
     handle: RunHandle
     bundle: InputBundleRef
     installation: tuple[str, str, str, str | None]
+
+
+@dataclass(frozen=True, slots=True)
+class _Carried:
+    """Only what survives stage A, so the rest of the preparation can be released.
+
+    The decisions, features, slots and projection are needed to open the run and never
+    again. Holding the whole `PreparedBacktest` through the accounting would keep that
+    graph resident beside the result being built, for no reader.
+    """
+
+    request_hash: str
+    envelope_bytes: bytes
+    envelope_sha256: str
+    preparation_sha256: str
+    target_weights: dict[str, dict[str, float]]
+
+
+def _carry(prepared: PreparedBacktest) -> _Carried:
+    return _Carried(
+        request_hash=prepared.request_hash,
+        envelope_bytes=prepared.envelope.canonical_bytes,
+        envelope_sha256=prepared.envelope.envelope_sha256,
+        preparation_sha256=hashlib.sha256(prepared.provenance).hexdigest(),
+        target_weights={
+            day.isoformat(): dict(sorted(weights.items()))
+            for day, weights in sorted(prepared.targets.items())
+        },
+    )
 
 
 def _object(value: object, field: str) -> dict[str, object]:
@@ -215,6 +249,25 @@ def _retaining(budget: ComputeBudget, *held: bytes) -> ComputeBudget:
     return replace(budget, reserved_bytes=budget.reserved_bytes + sum(len(item) for item in held))
 
 
+def _admit(budget: ComputeBudget, size: int) -> None:
+    """Charge a materialization before it happens, never after it is in memory."""
+    if size * _DOCUMENT_EXPANSION > budget.available_bytes:
+        raise ComputeResourceError("accounting exceeds the remaining materialization budget")
+
+
+def _require_exportable(home: Path, output: Path) -> None:
+    """Refuse an export that could collide with the run's own immutable artifacts.
+
+    The run store accepts identical bytes under a sealed name as a resumed seal, so an
+    export written into the managed runs directory can become the artifact itself.
+    Removing the export afterwards would then make the run unreadable.
+    """
+    runs = Path(os.path.realpath(load_paths(home).runs))
+    parent = Path(os.path.realpath(output.parent))
+    if parent == runs or runs in parent.parents:
+        raise ValueError("an envelope export cannot be written inside the managed runs directory")
+
+
 def _open(
     home: Path, prepared: PreparedBacktest, request: RunBacktestRequest, budget: ComputeBudget
 ) -> _Opened:
@@ -312,7 +365,7 @@ class _Outcome:
 
 def _receipt(
     request: RunBacktestRequest,
-    prepared: PreparedBacktest,
+    carried: _Carried,
     opened: _Opened,
     outcome: _Outcome,
 ) -> dict[str, object]:
@@ -320,15 +373,12 @@ def _receipt(
     return {
         "executed": True,
         "request_sha256": request.request_sha256,
-        "request_hash": prepared.request_hash,
+        "request_hash": carried.request_hash,
         "bundle_id": opened.bundle.bundle_id,
-        "envelope": {"sha256": prepared.envelope.envelope_sha256},
-        "preparation": {"sha256": hashlib.sha256(prepared.provenance).hexdigest()},
+        "envelope": {"sha256": carried.envelope_sha256},
+        "preparation": {"sha256": carried.preparation_sha256},
         "exported": outcome.exported,
-        "target_weights": {
-            day.isoformat(): dict(sorted(weights.items()))
-            for day, weights in sorted(prepared.targets.items())
-        },
+        "target_weights": carried.target_weights,
         "backtest": outcome.response,
         "run": outcome.recorded,
         "certified": False,
@@ -356,11 +406,18 @@ def _staged(
     # Everything from here on runs beside a resident PreparedBacktest.
     retained = _retaining(budget, prepared.envelope.canonical_bytes, prepared.provenance)
     opened = _open(home, prepared, request, retained)
+    # The run is durable, so the preparation graph has no reader left. Releasing it
+    # before the accounting keeps the two largest materializations from overlapping.
+    carried = _carry(prepared)
+    del prepared
+    retained = _retaining(budget, carried.envelope_bytes)
     try:
         # Stage B. No storage lock and no state transaction is held across this call.
-        response = run_document(
-            prepared.envelope.canonical_bytes, prepared.envelope.envelope_sha256
-        )
+        # run_document takes no budget of its own, so the decode it is about to perform
+        # is admitted here against what this command still holds live. A refusal ends the
+        # run cleanly instead of letting the host kill a process mid-calculation.
+        _admit(retained, len(carried.envelope_bytes))
+        response = run_document(carried.envelope_bytes, carried.envelope_sha256)
         result = RunResult(canonical_json_bytes(response))
     except BaseException as error:
         error.add_note(
@@ -373,7 +430,7 @@ def _staged(
             home,
             opened,
             result,
-            prepared.request_hash,
+            carried.request_hash,
             _retaining(retained, result.backtest_bytes),
         )
     except BaseException as error:
@@ -381,7 +438,7 @@ def _staged(
             "run " + _abandon(home, opened.handle, "result was not recorded: " + _describe(error))
         )
         raise
-    return _receipt(request, prepared, opened, _Outcome(response, recorded, exported))
+    return _receipt(request, carried, opened, _Outcome(response, recorded, exported))
 
 
 def _admitted(home: Path | None) -> tuple[Path, tuple[Path, ...], type[Exception]]:
@@ -404,6 +461,8 @@ def run_backtest(request: RunBacktestRequest) -> dict[str, object]:
     parsed = read_prepare_request(request.request, request.request_sha256)
     output = None if request.envelope_output is None else admitted_path(request.envelope_output)
     home, targets, database_error = _admitted(request.home)
+    if output is not None:
+        _require_exportable(home, output)
     try:
         with price_compute(excluded_locks=targets) as budget:
             if budget is None:
