@@ -43,6 +43,21 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   invisible to the PREPARED-only scan. Every receipt is derived from the sealed files,
   never from caller-supplied values, and a strategy pin must name a version the private
   store admitted. Result `at_us` encodes a session date as midnight UTC, not an instant.
+- A sealed envelope must carry the `dates` it was exported from: valid ISO sessions,
+  increasing, without repeats, at least two. `open_run` checks them before the envelope
+  becomes an artifact, and candidate validation checks every fill against them, so a
+  decision off the supplied sessions, a reversed or same-day pair, a skipped session or
+  a decision without targets seals no result, writes no market marker and never reaches
+  SUCCESS. Adjacency is read from the supplied list alone; a weekend or a closed venue
+  is the next session, never the next calendar day, and neither a system calendar nor a
+  current market lookup may stand in for the sealed list. Symbols, quantities, prices
+  and fees stay unjudged because storage cannot replay them, and no result is required
+  to fill every target day. A run recorded SUCCESS before this check with an envelope
+  that names no sessions keeps its recorded status: `read_run`, `verify_run` and
+  workspace verification now refuse it explicitly, and `recover_run` leaves it alone
+  because it only finishes an interrupted RUNNING run. Correcting such a record means
+  opening a new run against a complete envelope; sealed bytes and hashes are never
+  rewritten, backfilled from current data, or silently accepted in the old shape.
 - `strategies.LineageSpec` keeps four exact caller fields. The accepted direct
   parent status is sealed by v2 state/private request hashes at first durable
   acceptance, before PREPARED commits. Retry decodes that commitment, never

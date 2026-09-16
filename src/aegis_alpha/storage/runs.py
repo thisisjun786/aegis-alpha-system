@@ -20,6 +20,7 @@ from dataclasses import dataclass, replace
 from datetime import date
 from decimal import ROUND_HALF_EVEN, Context, Decimal
 from fractions import Fraction
+from itertools import pairwise
 from typing import TYPE_CHECKING
 
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
@@ -64,6 +65,9 @@ _DEFAULT_MEMORY_BYTES = 512 * 1024 * 1024
 # A reason is stored twice and read back on every verification, so it is bounded
 # rather than left to the caller.
 _MAX_REASON_BYTES = 4096
+# The first supplied session is the account baseline, so a decision and the session it
+# executes on need two. The exporter holds the same minimum on the other side of the seal.
+_MINIMUM_SESSIONS = 2
 _RUN_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}")
 # One stored result row becomes a Python dict, a tagged rowset encoding and a sort
 # key, all live at once, on top of its own measured text.
@@ -206,7 +210,7 @@ def _exact(value: object) -> Decimal:
     return Decimal(repr(value))
 
 
-def _session_us(value: object) -> int:
+def _session_us(value: object, label: str = "result dates") -> int:
     """Encode a calendar session date in the at_us column.
 
     The result contract supplies a session date and no instant, and the frozen market
@@ -217,12 +221,18 @@ def _session_us(value: object) -> int:
     the pinned session calendar and a column that can hold it, which is a schema change.
     """
     if not isinstance(value, str):
-        raise RunStorageError("result dates must be ISO text")
-    stamp = calendar.timegm(date.fromisoformat(value).timetuple()) * 1_000_000
+        raise RunStorageError(f"{label} must be ISO text")
+    try:
+        day = date.fromisoformat(value)
+    except ValueError as error:
+        # fromisoformat reports the offending text but not the field it came from, and
+        # the envelope and the result both reach the column through here.
+        raise RunStorageError(f"{label} must be ISO text") from error
+    stamp = calendar.timegm(day.timetuple()) * 1_000_000
     if stamp < 0:
         # The stored columns are constrained non-negative, and that constraint must be
         # met before sealing rather than at the insert, when the artifact is immutable.
-        raise RunStorageError("result dates before 1970 are not storable")
+        raise RunStorageError(f"{label} before 1970 are not storable")
     return stamp
 
 
@@ -280,6 +290,65 @@ def _by_date(rows: list[object], field: str, label: str) -> list[dict[str, objec
     )
 
 
+def _envelope_sessions(envelope: dict[str, object]) -> tuple[int, ...]:
+    """The sessions the envelope was exported from, in the stored date encoding.
+
+    The engine fills a decision at the next supplied session's open, so this list is
+    what decides which decision and execution pairs the sealed input could have
+    produced. It is required rather than reconstructed: a system calendar or a current
+    market lookup answers for today's venue rather than for the period this run was
+    prepared from, and would keep answering after the two stopped agreeing.
+    """
+    listed = envelope.get("dates")
+    if listed is None:
+        raise RunStorageError("envelope does not name the sessions it was prepared from")
+    sessions = tuple(
+        _session_us(day, "envelope sessions") for day in _sequence(listed, "envelope dates")
+    )
+    if len(sessions) < _MINIMUM_SESSIONS:
+        raise RunStorageError("envelope must supply at least two sessions")
+    if any(earlier >= later for earlier, later in pairwise(sessions)):
+        # A repeated or reordered session would make adjacency ambiguous, and the
+        # exporter never produces one.
+        raise RunStorageError("envelope sessions must increase without repeating")
+    return sessions
+
+
+def _require_paired_sessions(envelope: dict[str, object], fills: list[dict[str, object]]) -> None:
+    """Refuse fills the sealed envelope could not have produced.
+
+    The engine decides on one supplied session's close and fills at the next supplied
+    session's open, so a fill is possible only when its decision is a session carrying
+    targets and its execution is the session immediately after it. Whether that gap is
+    a calendar day or a weekend is never asked: adjacency belongs to the supplied list.
+
+    Only that relationship is judged here. Symbols, quantities, prices and fees would
+    take the replay itself to check, and demanding a fill for every target day would
+    refuse an unchanged allocation, an all-cash target, or a sale of a symbol the new
+    positive weights no longer name, all of which the engine produces legitimately.
+    """
+    sessions = _envelope_sessions(envelope)
+    position = {session: index for index, session in enumerate(sessions)}
+    decisions = {
+        _session_us(day, "envelope target dates")
+        for day in _mapping(envelope.get("targets"), "targets")
+    }
+    for fill in fills:
+        decision = _session_us(fill.get("decision_date"))
+        execution = _session_us(fill.get("execution_date"))
+        if decision >= execution:
+            # The engine decides on a close and fills on a later open. A fill that does
+            # not follow its decision would corrupt the trade chronology.
+            raise RunStorageError("a fill must execute after the decision that produced it")
+        index = position.get(decision)
+        if index is None:
+            raise RunStorageError("a fill decision is not one of the envelope sessions")
+        if decision not in decisions:
+            raise RunStorageError("a fill decision carries no target weights in the envelope")
+        if index + 1 == len(sessions) or sessions[index + 1] != execution:
+            raise RunStorageError("a fill must execute on the session after its decision")
+
+
 def project_result_rows(backtest_bytes: bytes, envelope_bytes: bytes) -> dict[str, list[dict]]:
     """Derive stored result rows from the sealed bytes, deterministically.
 
@@ -303,11 +372,9 @@ def project_result_rows(backtest_bytes: bytes, envelope_bytes: bytes) -> dict[st
         }
         for entry in _by_date(_sequence(account.get("nav"), "nav"), "date", "nav entry")
     ]
-    for fill in _by_date(_sequence(account.get("fills"), "fills"), "execution_date", "fill"):
-        if _session_us(fill.get("decision_date")) >= _session_us(fill.get("execution_date")):
-            # The engine decides on a close and fills on a later open. A fill that does
-            # not follow its decision would corrupt the trade chronology.
-            raise RunStorageError("a fill must execute after the decision that produced it")
+    _require_paired_sessions(
+        envelope, _by_date(_sequence(account.get("fills"), "fills"), "execution_date", "fill")
+    )
     trades: list[dict[str, object]] = [
         {
             "module": module,
@@ -730,8 +797,12 @@ def open_run(
     held = _allowance(budget)
     held = replace(held, reserved_bytes=held.reserved_bytes + inputs)
     request = _sealed_request(workspace, intent.bundle_id, request_hash, held)
-    module = _envelope_module(_mapping(json.loads(intent.envelope_bytes), "envelope"))
+    envelope = _mapping(json.loads(intent.envelope_bytes), "envelope")
+    module = _envelope_module(envelope)
     _require_sealed_provenance(intent, request, module)
+    # Every later check reads the result's fills against this list, so an envelope
+    # without one is refused before it becomes an artifact nothing can replace.
+    _envelope_sessions(envelope)
     # Checked before anything durable happens, so a preparation that belongs to another
     # request or another envelope is never sealed under this run.
     _require_linked_inputs(intent.envelope_bytes, intent.preparation_bytes, request_hash)
