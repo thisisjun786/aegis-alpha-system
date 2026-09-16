@@ -165,7 +165,7 @@ def intent(run_id: str, *, prior_run_id: str | None = None) -> RunIntent:
     )
 
 
-def observed(home: Path, run_id: str) -> tuple[str, str | None]:
+def observed(home: Path, run_id: str) -> tuple[str | None, str | None]:
     with open_workspace(home) as workspace:
         run = workspace.state.execute(
             "SELECT status FROM runs WHERE run_id=?", (run_id,)
@@ -173,7 +173,10 @@ def observed(home: Path, run_id: str) -> tuple[str, str | None]:
         operation = workspace.state.execute(
             "SELECT phase FROM storage_operations WHERE target_id=?", (run_id,)
         ).fetchone()
-        return run[0], None if operation is None else operation[0]
+        return (
+            None if run is None else run[0],
+            None if operation is None else operation[0],
+        )
 
 
 def test_committed_run_reads_back_identically_in_a_separate_process(tmp_path: Path) -> None:
@@ -655,3 +658,121 @@ def test_verification_rejects_a_successful_run_whose_stored_rows_changed(tmp_pat
             verify_workspace(workspace, budget=BUDGET)
         with pytest.raises(ValueError, match="disagree with the sealed evidence"):
             read_run(workspace, "run-1", budget=BUDGET)
+
+
+def linked(request_hash: str, envelope_bytes: bytes) -> bytes:
+    """A preparation document shaped like the real aas-prepared-backtest-v1 sidecar."""
+    return canonical(
+        {
+            "schema": "aas-prepared-backtest-v1",
+            "hash_format": HASH_FORMAT,
+            "request_hash": request_hash,
+            "envelope_sha256": hashlib.sha256(envelope_bytes).hexdigest(),
+        }
+    )
+
+
+def test_a_preparation_from_another_request_is_never_sealed(tmp_path: Path) -> None:
+    home = prepared(tmp_path / "home")
+    foreign = canonical(
+        {
+            "schema": "aas-prepared-backtest-v1",
+            "hash_format": HASH_FORMAT,
+            "request_hash": "c" * 64,
+            "envelope_sha256": hashlib.sha256(ENVELOPE).hexdigest(),
+        }
+    )
+    with open_workspace(home, writable=True) as workspace:
+        with pytest.raises(RunStorageError, match="preparation request names different evidence"):
+            open_run(workspace, replace(intent("run-1"), preparation_bytes=foreign))
+        assert not (workspace.paths.runs / "run-1").exists()
+        other = canonical({"targets": {"2024-01-02": {"ZZZ": 1.0}}})
+        with pytest.raises(RunStorageError, match="preparation envelope names different evidence"):
+            open_run(
+                workspace,
+                replace(intent("run-1"), preparation_bytes=linked(REQUEST_HASH, other)),
+            )
+    assert observed(home, "run-1") == (None, None)
+
+
+def test_a_result_computed_from_another_envelope_is_refused(tmp_path: Path) -> None:
+    home = prepared(tmp_path / "home")
+    other = canonical({"targets": {"2024-01-02": {"ZZZ": 1.0}}})
+    mismatched = canonical(
+        {
+            "module": "aegis",
+            "input_sha256": hashlib.sha256(other).hexdigest(),
+            "result": {"nav": NAV, "fills": FILLS},
+        }
+    )
+    with open_workspace(home, writable=True) as workspace:
+        handle = open_run(
+            workspace, replace(intent("run-1"), preparation_bytes=linked(REQUEST_HASH, ENVELOPE))
+        )
+        with pytest.raises(RunStorageError, match="backtest envelope names different evidence"):
+            commit_run(workspace, handle, RunResult(mismatched), budget=BUDGET)
+        assert not (workspace.paths.runs / "run-1" / "backtest.json").exists()
+    assert observed(home, "run-1") == ("RUNNING", "PREPARED")
+
+
+def test_a_result_from_another_module_is_refused(tmp_path: Path) -> None:
+    home = prepared(tmp_path / "home")
+    envelope = canonical({"module": "aegis", "targets": {"2024-01-02": {"AAA": 1.0}}})
+    foreign = canonical({"module": "hedge", "result": {"nav": NAV, "fills": FILLS}})
+    with open_workspace(home, writable=True) as workspace:
+        handle = open_run(workspace, replace(intent("run-1"), envelope_bytes=envelope))
+        with pytest.raises(RunStorageError, match="module conflicts with the envelope"):
+            commit_run(workspace, handle, RunResult(foreign), budget=BUDGET)
+        assert not (workspace.paths.runs / "run-1" / "backtest.json").exists()
+
+
+def test_a_rejected_result_leaves_the_run_open_for_a_corrected_retry(tmp_path: Path) -> None:
+    home = prepared(tmp_path / "home")
+    malformed = canonical({"module": "aegis", "result": {"nav": [], "fills": "bad"}})
+    with open_workspace(home, writable=True) as workspace:
+        handle = open_run(workspace, intent("run-1"))
+        with pytest.raises(RunStorageError, match="fills must be an array"):
+            commit_run(workspace, handle, RunResult(malformed), budget=BUDGET)
+        assert not (workspace.paths.runs / "run-1" / "backtest.json").exists()
+        # The corrected result is not blocked by an artifact the rejected one left behind.
+        committed = commit_run(workspace, handle, RunResult(RESULT), budget=BUDGET)
+    assert committed["table_counts"] == COUNTS
+
+
+def test_a_retry_cannot_substitute_a_different_preparation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = prepared(tmp_path / "home")
+    sealed: list[str] = []
+    original = _seal
+
+    def once(workspace: Workspace, run_id: str, name: str, raw: bytes) -> str:
+        if sealed:
+            raise RuntimeError("interrupted between seals")
+        sealed.append(name)
+        return original(workspace, run_id, name, raw)
+
+    monkeypatch.setattr("aegis_alpha.storage.runs._seal", once)
+    with (
+        open_workspace(home, writable=True) as workspace,
+        pytest.raises(RuntimeError, match="between seals"),
+    ):
+        open_run(workspace, intent("run-1"))
+    monkeypatch.undo()
+    substitute = canonical({"schema": "aas-backtest-preparation-v1", "note": "substituted"})
+    with open_workspace(home, writable=True) as workspace:
+        # The intent commits both input digests, so the accepted preparation cannot be
+        # swapped by a retry that reuses the envelope.
+        with pytest.raises(ValueError, match="already identifies a different request"):
+            open_run(workspace, replace(intent("run-1"), preparation_bytes=substitute))
+        assert open_run(workspace, intent("run-1")).run_id == "run-1"
+
+
+def test_provenance_identities_must_be_digests(tmp_path: Path) -> None:
+    home = prepared(tmp_path / "home")
+    with open_workspace(home, writable=True) as workspace:
+        with pytest.raises(RunStorageError, match="engine_hash must be a lowercase SHA-256"):
+            open_run(workspace, replace(intent("run-1"), engine_hash="engine-v1"))
+        with pytest.raises(RunStorageError, match="environment_hash must be a lowercase"):
+            open_run(workspace, replace(intent("run-1"), environment_hash="ENV"))
+    assert observed(home, "run-1") == (None, None)

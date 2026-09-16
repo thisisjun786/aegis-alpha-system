@@ -105,14 +105,14 @@ def _verify_runs(workspace: Workspace, budget: ComputeBudget) -> list[str]:
         if workspace.market.execute("SELECT 1 FROM result_commits").fetchone():
             raise ValueError("result markers exist without the run add-on")
         return []
-    _admit_document(
+    runs_held = _admit_retained(
         workspace.state.execute(
             "SELECT coalesce(count(*)*2048 + sum(128*length(CAST(run_id AS BLOB))),0) FROM runs"
         ).fetchone(),
         budget.available_bytes,
         "run catalog exceeds materialization budget",
     )
-    _admit_document(
+    markers_held = _admit_retained(
         workspace.market.execute(
             "SELECT count(*)*2048 + "
             "coalesce(sum(128*coalesce(octet_length(encode(run_id)),0)),0) FROM result_commits"
@@ -130,12 +130,15 @@ def _verify_runs(workspace: Workspace, budget: ComputeBudget) -> list[str]:
             "LEFT JOIN run_details d ON d.run_id=r.run_id"
         )
     }
+    # Both catalogs stay live while every successful run is re-derived, so each run is
+    # admitted against what is left rather than against the whole allowance.
+    held = replace(budget, reserved_bytes=budget.reserved_bytes + runs_held + markers_held)
     for run_id, (status, request_hash) in sorted(recorded.items()):
         if status != "SUCCESS":
             continue
         if request_hash is None:
             raise ValueError("successful run has no recorded request")
-        verify_run(workspace, run_id, request_hash, budget=budget)
+        verify_run(workspace, run_id, request_hash, budget=held)
     if any(run_id not in recorded for run_id in committed):
         raise ValueError("result marker has no run record")
     return [

@@ -41,6 +41,8 @@ if TYPE_CHECKING:
 RUN_OPERATION_KIND = "run_commit"
 METRIC_DEFINITION_VERSION = "aas-run-metrics-v1"
 _MANIFEST_SCHEMA = "aas-run-manifest-v1"
+_INPUTS_SCHEMA = "aas-run-inputs-v1"
+_HASH_FORMAT = "aas-canonical-json-sha256-v1"
 _ENVELOPE = "envelope.json"
 _PREPARATION = "preparation.json"
 _BACKTEST = "backtest.json"
@@ -249,6 +251,11 @@ def project_result_rows(backtest_bytes: bytes, envelope_bytes: bytes) -> dict[st
     document = _mapping(json.loads(backtest_bytes), "backtest result")
     envelope = _mapping(json.loads(envelope_bytes), "envelope")
     module = _text(document.get("module"), "module")
+    declared = envelope.get("module")
+    if declared is not None and declared != module:
+        # The envelope supplies the target weights. A result produced by a different
+        # module must not be recorded against them.
+        raise RunStorageError("result module conflicts with the envelope module")
     account, _unit_nav = account_evidence(document)
     equity: list[dict[str, object]] = [
         {
@@ -489,16 +496,30 @@ def open_run(workspace: Workspace, intent: RunIntent) -> RunHandle:
     ).fetchone()
     if stored is None or stored[0] != request_hash:
         raise RunStorageError("run requires a registered request for its bundle")
+    # Checked before anything durable happens, so a preparation that belongs to another
+    # request or another envelope is never sealed under this run.
+    _require_linked_inputs(intent.envelope_bytes, intent.preparation_bytes, request_hash)
     run_id = intent.run_id or "run-" + uuid.uuid4().hex
     _text(run_id, "run_id")
     envelope_sha256 = hashlib.sha256(intent.envelope_bytes).hexdigest()
+    preparation_sha256 = hashlib.sha256(intent.preparation_bytes).hexdigest()
     operation_id = "run:" + run_id
     durable = _DurableIntent(
         operation_id=operation_id,
         request_hash=request_hash,
         target_id=run_id,
         expected_parent=intent.prior_run_id,
-        payload_hash=envelope_sha256,
+        # Both sealed inputs are named in the immutable intent. Committing only the
+        # envelope would let a retry after an interrupted seal substitute a different
+        # preparation under the same accepted run.
+        payload_hash=content_sha256(
+            {
+                "schema": _INPUTS_SCHEMA,
+                "hash_format": _HASH_FORMAT,
+                "envelope_sha256": envelope_sha256,
+                "preparation_sha256": preparation_sha256,
+            }
+        ),
     )
     if workspace.state.execute("SELECT 1 FROM runs WHERE run_id=?", (run_id,)).fetchone():
         # A resumed open: prepare_operation refuses a different or quarantined intent
@@ -532,8 +553,8 @@ def _open_intent(workspace: Workspace, intent: RunIntent, durable: _DurableInten
                 run_id,
                 intent.prior_run_id,
                 intent.bundle_id,
-                _text(intent.engine_hash, "engine_hash"),
-                _text(intent.environment_hash, "environment_hash"),
+                _digest(_text(intent.engine_hash, "engine_hash"), "engine_hash"),
+                _digest(_text(intent.environment_hash, "environment_hash"), "environment_hash"),
                 _text(intent.reason, "reason"),
                 now,
             ),
@@ -665,27 +686,91 @@ def _derive(
         "run artifacts exceed materialization budget",
     )
     envelope_bytes = _read_sealed(workspace, run_id, _ENVELOPE)
+    preparation_bytes = _read_sealed(workspace, run_id, _PREPARATION)
     backtest_bytes = _read_sealed(workspace, run_id, _BACKTEST)
-    rows = project_result_rows(backtest_bytes, envelope_bytes)
-    hashes, counts = table_receipts(rows)
-    document = _mapping(json.loads(backtest_bytes), "backtest result")
+    projected = _project(envelope_bytes, preparation_bytes, backtest_bytes, request_hash)
     return _Derived(
         run_id=run_id,
         request_hash=request_hash,
-        module=_text(document.get("module"), "module"),
+        module=projected.module,
         artifacts=artifacts,
         sizes=sizes,
-        ordered={name: _ordered(name, rows[name]) for name in sorted(_ROW_SCHEMAS)},
-        hashes=hashes,
-        counts=counts,
-        manifest=manifest_hash(request_hash, artifacts, (hashes, counts)),
-        metrics=project_metrics(backtest_bytes),
+        ordered=projected.ordered,
+        hashes=projected.hashes,
+        counts=projected.counts,
+        manifest=manifest_hash(request_hash, artifacts, (projected.hashes, projected.counts)),
+        metrics=projected.metrics,
     )
 
 
 def _normalized(value: object) -> object:
     """Re-quantize a stored decimal so its scale cannot depend on the driver."""
     return _DECIMAL.quantize(value, _QUANTUM) if isinstance(value, Decimal) else value
+
+
+def _require_linked_inputs(
+    envelope_bytes: bytes, preparation_bytes: bytes, request_hash: str
+) -> str:
+    """Refuse artifacts that name a different request or a different envelope.
+
+    The preparation document records the request it was prepared for and the envelope
+    it produced, and the backtest response records the envelope it consumed. Without
+    comparing them, a result calculated from another envelope would receive a
+    self-consistent receipt under this run's request. A document that omits a link is
+    left alone; one that carries a conflicting link is refused.
+    """
+    envelope_sha256 = hashlib.sha256(envelope_bytes).hexdigest()
+    preparation = _mapping(json.loads(preparation_bytes), "preparation")
+    for recorded, expected, label in (
+        (preparation.get("request_hash"), request_hash, "preparation request"),
+        (preparation.get("envelope_sha256"), envelope_sha256, "preparation envelope"),
+    ):
+        if recorded is not None and recorded != expected:
+            raise RunStorageError(label + " names different evidence")
+    return envelope_sha256
+
+
+def _require_linked_evidence(
+    envelope_bytes: bytes, preparation_bytes: bytes, backtest_bytes: bytes, request_hash: str
+) -> None:
+    envelope_sha256 = _require_linked_inputs(envelope_bytes, preparation_bytes, request_hash)
+    document = _mapping(json.loads(backtest_bytes), "backtest result")
+    recorded = document.get("input_sha256")
+    if recorded is not None and recorded != envelope_sha256:
+        raise RunStorageError("backtest envelope names different evidence")
+
+
+@dataclass(frozen=True, slots=True)
+class _Projection:
+    """Everything derived from the three documents, with no file identity in it."""
+
+    module: str
+    ordered: dict[str, list[tuple[int, dict[str, object]]]]
+    hashes: dict[str, str]
+    counts: dict[str, int]
+    metrics: dict[str, tuple[Decimal | None, str]]
+
+
+def _project(
+    envelope_bytes: bytes, preparation_bytes: bytes, backtest_bytes: bytes, request_hash: str
+) -> _Projection:
+    """Validate the evidence links, then derive every stored row, receipt and metric.
+
+    Commit runs this against the candidate bytes before sealing them and recovery runs
+    it again from disk, so a document that fails any check never becomes an artifact
+    that a corrected retry could not replace.
+    """
+    _require_linked_evidence(envelope_bytes, preparation_bytes, backtest_bytes, request_hash)
+    rows = project_result_rows(backtest_bytes, envelope_bytes)
+    hashes, counts = table_receipts(rows)
+    document = _mapping(json.loads(backtest_bytes), "backtest result")
+    return _Projection(
+        module=_text(document.get("module"), "module"),
+        ordered={name: _ordered(name, rows[name]) for name in sorted(_ROW_SCHEMAS)},
+        hashes=hashes,
+        counts=counts,
+        metrics=project_metrics(backtest_bytes),
+    )
 
 
 def _row_charge(workspace: Workspace, run_id: str) -> int:
@@ -923,6 +1008,30 @@ def _terminate(
     return {"run_id": run_id, "status": final, "reason": reason}
 
 
+def _check_candidate(
+    workspace: Workspace,
+    handle: RunHandle,
+    backtest_bytes: bytes,
+    budget: ComputeBudget | None,
+) -> None:
+    """Derive the whole result from the candidate bytes before any of it is sealed."""
+    measured = [
+        _artifact_digest(workspace, handle.run_id, name) for name in (_ENVELOPE, _PREPARATION)
+    ]
+    _admit(
+        budget,
+        _DOCUMENT_OVERHEAD
+        + _DOCUMENT_EXPANSION * (sum(size for _hash, size in measured) + len(backtest_bytes)),
+        "run artifacts exceed materialization budget",
+    )
+    _project(
+        _read_sealed(workspace, handle.run_id, _ENVELOPE),
+        _read_sealed(workspace, handle.run_id, _PREPARATION),
+        backtest_bytes,
+        handle.request_hash,
+    )
+
+
 def commit_run(
     workspace: Workspace,
     handle: RunHandle,
@@ -935,9 +1044,10 @@ def commit_run(
     if workspace.state.in_transaction:
         raise RunStorageError("commit_run cannot run inside another state transaction")
     _require_open(workspace, handle)
-    # The result contract is checked against an unsealed copy first: an unsupported
-    # document must be refused before it becomes a durable artifact.
-    account_evidence(_mapping(json.loads(result.backtest_bytes), "backtest result"))
+    # A sealed artifact is never replaced, so everything the commit will check runs
+    # against the candidate bytes first. A rejected result leaves the run open for a
+    # corrected retry instead of stranding it behind an unreplaceable file.
+    _check_candidate(workspace, handle, result.backtest_bytes, budget)
     _seal(workspace, handle.run_id, _BACKTEST, result.backtest_bytes)
     derived = _derive(workspace, handle.run_id, handle.request_hash, budget)
     if (
