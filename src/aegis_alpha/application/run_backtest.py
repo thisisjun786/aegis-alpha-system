@@ -447,6 +447,10 @@ def _staged(
         _admit(retained, len(carried.envelope_bytes))
         response = run_document(carried.envelope_bytes, carried.envelope_sha256)
         result = RunResult(canonical_json_bytes(response))
+        # The sealed bytes are the response. Dropping the decoded copy keeps it from
+        # spanning the commit, which decodes and projects those same bytes again; the
+        # receipt reads it back afterwards, from exactly what was stored.
+        del response
     except BaseException as error:
         error.add_note(
             "run "
@@ -466,7 +470,8 @@ def _staged(
             "run " + _abandon(home, opened.handle, "result was not recorded: " + _describe(error))
         )
         raise
-    return _receipt(request, carried, opened, _Outcome(response, recorded, exported))
+    sealed = _object(decode_json(result.backtest_bytes), "sealed backtest result")
+    return _receipt(request, carried, opened, _Outcome(sealed, recorded, exported))
 
 
 def _admitted(home: Path | None) -> tuple[Path, tuple[Path, ...], type[Exception]]:

@@ -165,6 +165,11 @@ def test_clean_installation_runs_and_reads_the_result_back(
     assert receipt["run"]["metrics"]["final_equity"]["value"] == "80.000000000000"
     assert receipt["run"]["metrics"]["total_return"]["value"] == "-0.200000000000"
     assert receipt["run"]["metrics"]["sharpe"]["value_state"] == "not_collected"
+    # The reported accounting is the sealed artifact itself, not a separate copy.
+    assert (
+        sha(canonical_json_bytes(receipt["backtest"]))
+        == receipt["run"]["artifacts"]["backtest.json"]
+    )
 
     for key in ("envelope", "preparation"):
         exported = Path(receipt["exported"][key]["path"])
