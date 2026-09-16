@@ -304,22 +304,31 @@ class _PeakWatcher:
     before the window closes, so a closing snapshot shows only survivors and never
     the operation that mattered. Current traced memory is no better, because it
     stays low at every Python call boundary when one C call allocates and frees
-    inside itself. The mark, sampled on profile events that include the C-call and
-    C-return events, is the one quantity that still carries the information.
+    inside itself. The mark, sampled when calls return, is the one quantity that
+    still carries the information.
 
-    This runs inside the region it observes, so it stores references and formats
-    nothing: building a string here would allocate at exactly the instant the mark
-    is highest, which is the measurement it must not move. A frame is never
-    retained, because holding one keeps its locals alive. The mark is only read,
-    never reset, so the assertion still sees the true peak.
+    This runs inside the region it observes, so it keeps only short strings and
+    code objects. Retaining the C method handed to the hook would also retain its
+    receiver, which can be the very buffer being measured, and formatting here
+    would allocate at the instant the mark is highest. A frame is never retained
+    either, since holding one keeps its locals alive. The mark is only read and
+    never reset.
 
-    It cannot be free. Installing any profile function makes CPython materialize a
-    frame object for every active call, so the observed peak rises by roughly the
-    call-stack depth at the peak: measured here at 1,535 to 1,852 bytes over eight
-    paired runs, and 12,436 bytes on the first hooked window in a process, against
-    a margin of about 1,034,000 bytes between the real peak and the bound. The
-    error is one-directional -- the window can only become stricter, never more
-    permissive -- so it cannot hide a real budget violation.
+    Observing is not free, and the effect is not one-directional. Installing any
+    profile function makes CPython materialize a frame object per active call, on
+    the order of 200 bytes each, which raises the observed peak: measured at 1,535
+    to 1,852 bytes over eight paired runs of this workload, and 12,436 bytes on the
+    first hooked window in a process, against a margin of about 1,034,000 bytes.
+    Those same allocations can instead advance a garbage collection and lower a
+    peak that would otherwise have been measured; that is demonstrable on a
+    synthetic workload holding an unreachable cycle. No pure-Python design
+    attributes an arbitrary in-window transient with exactly zero effect on the
+    measurement. A separate diagnostic re-run would preserve the measurement but
+    could not attribute the same transient event.
+
+    Rises below _ALLOCATION_RISE_BYTES are not recorded, so the last record can
+    trail the reported peak by just under that threshold. It is the latest
+    qualifying observation, never a proof of which call owns the memory.
     """
 
     def __init__(self) -> None:
@@ -346,16 +355,20 @@ class _PeakWatcher:
         self.seen += 1
         self.marks[index] = peak
         self.events[index] = event
-        self.owners[index] = arg if event[0] == "c" else frame.f_code
+        # Never retain the C method itself: holding it holds its receiver,
+        # which can be the buffer whose allocation is being measured.
+        if event[0] == "c":
+            name = getattr(arg, "__qualname__", None)
+            self.owners[index] = name if isinstance(name, str) else type(arg).__name__
+        else:
+            self.owners[index] = frame.f_code
         self.threads[index] = threading.get_ident()
 
 
 def _describe_owner(owner: object, event: str) -> str:
     if isinstance(owner, CodeType):
         return f"{owner.co_filename}:{owner.co_firstlineno} {owner.co_qualname} [{event}]"
-    name = getattr(owner, "__qualname__", None) or repr(owner)
-    module = getattr(owner, "__module__", None)
-    return f"{module + '.' if module else ''}{name} [{event}]"
+    return f"{owner} [{event}]"
 
 
 def _allocation_report(
