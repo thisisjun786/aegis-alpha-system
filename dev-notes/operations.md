@@ -741,3 +741,53 @@ docker compose run --rm aas doctor
 라이브 공급자 검증·기존 DB 이전·스케줄러 활성화·실주문은 위 오프라인 설치 검사의 범위에
 포함되지 않는다. CLI preview는 합성 비중 계산이고, `prepare`와 `backtest`는 저장한 입력의
 준비와 명시한 봉투의 회계까지다. run 저장·결과 확정·복원은 아직 별도 구현이다.
+
+## 메타데이터 예산 검사의 간헐적 실패 (JUN-176)
+
+`tests/storage/test_publication_lineage.py::test_source_marker_metadata_budget`이 CI에서
+드물게 실패한다. 회수한 실패는 한 건이다. GitHub Actions run 35045809314(PR 24)에서
+파라미터 `[request_hash-False-market]`이 `assert 4908067 < 2097152`로 떨어졌다.
+한계 2,097,152는 제품 상수가 아니라 `store == "market"`일 때의 `size // 2`다.
+
+실패 지점은 `tests/storage/test_publication_lineage.py:464`, 즉 저장소를 변조하기 **전**의
+첫 측정 창이다. 그 시점의 자료는 정상이므로 이 실패는 승인 전에 초과 자료를 읽었다는
+증거가 되지 못한다. 정상 `admit_native_input` 한 번이 4.9 MB를 쓴 것이다.
+같은 창은 `store=market`, `selected_field=False`인 여섯 개 field 값에서 완전히 동일하게
+도는데 그중 하나만 실패했다. 입력에 따라 갈리는 문제가 아니다.
+
+### 계측이 지목한 지점
+
+측정되는 최대치는 창이 닫힐 때 살아남지 않는다. 닫는 시점의 snapshot에서 가장 큰 블록은
+1,296 B인데 최대치는 1,063,479 B다. 현재 사용량을 Python 호출 경계에서 재도 보이지 않는다.
+경계마다 64 KB를 넘지 않기 때문이다. 최대치는 C 호출 하나가 내부에서 할당하고 반환 전에
+해제하는 구간에 있다.
+
+그래서 `metadata_allocation_bound`는 profile 이벤트에서 `tracemalloc`의 최고 수위를 읽어
+그것이 올라간 지점을 기록한다. 실패했을 때만 서식을 만들고, 한계는 건드리지 않는다.
+이 계측이 지목한 지점은 `BufferedReader.read [c_return]`, 1,061,683 B다.
+경로는 `market_inputs._raw_payload` -> `DescriptorTree.read_bytes`이고,
+`read_bytes`는 파일 크기와 무관하게 1 MiB를 요청한 뒤 그 다음에 `max_bytes`를 확인한다.
+이 호출의 `max_bytes`는 128 KiB다. 즉 자기 허용치의 여덟 배를 먼저 할당한다.
+정상 최대치는 사실상 전부 이 버퍼이며, 남은 여유는 두 배뿐이다.
+
+`src/aegis_alpha/data/descriptor_tree.py`는 이 작업의 쓰기 범위 밖이라 고치지 않았다.
+승인이 읽기보다 먼저여야 한다는 결정 0016의 계약과 어긋나는 순서이므로 별도 범위로 보고한다.
+
+### 확인한 것과 남은 것
+
+| 가설 | 결과 |
+|---|---|
+| 순환 GC가 최대치를 부풀린다 | 기각. `gc.disable()`에서도 1.069 MB로 같다 |
+| `api()`의 지연 import가 창 안에 들어온다 | 기각. `pin()`이 창 전에 이미 부른다 |
+| DuckDB 결과 할당 | 기각. `execute().fetchone()`이 64~96 B다 |
+| `tracemalloc` 중첩 | 기각. 저장소 전체에서 균형 잡힌 두 쌍뿐이다 |
+| 예산에서 크기가 나오는 버퍼 | 기각. `component()`와 `_raw_payload`의 값은 비교에만 쓴다 |
+| 창 안의 일회성 초기화 | 미확인. 지역 재현이 없어 남겨 둔다 |
+
+지역 재현율은 0이다. 창 단위로 1,051회(단독 probe 60회 + `tests/storage` 1회 + 전체 lane 1회)를
+돌렸고 한계를 넘은 창은 없다. 단독 probe 60회의 최대치는 최소 1,063,212, 최대 1,063,479,
+모집단 표준편차 79 B였다. CI가 본 4,908,067은 이 분포에서 나올 수 있는 값이 아니다.
+전체 lane(`pytest -m "not database"`)은 4257 passed로 통과했다.
+
+원인을 확정하지 못했으므로 이 결함은 닫지 않는다. 다음 CI 실패가 나면 계측이 최고 수위를
+올린 호출과 창 안에서 새로 import된 모듈을 실패 메시지에 직접 남긴다.
