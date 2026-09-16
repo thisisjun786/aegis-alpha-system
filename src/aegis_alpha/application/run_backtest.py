@@ -53,6 +53,9 @@ from aegis_alpha.storage.runs import (
 from aegis_alpha.storage.workspace import Workspace, open_workspace
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+    from datetime import date
+
     from aegis_alpha.application.backtest_prepare import (
         PreparedBacktest,
         PrepareRequest,
@@ -128,7 +131,7 @@ class _Carried:
     envelope_bytes: bytes
     envelope_sha256: str
     preparation_sha256: str
-    target_weights: dict[str, dict[str, float]]
+    targets: Mapping[date, Mapping[str, float]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,10 +164,9 @@ def _carry(prepared: PreparedBacktest) -> tuple[_Opening, _Carried]:
         envelope_bytes=prepared.envelope.canonical_bytes,
         envelope_sha256=prepared.envelope.envelope_sha256,
         preparation_sha256=hashlib.sha256(prepared.provenance).hexdigest(),
-        target_weights={
-            day.isoformat(): dict(sorted(weights.items()))
-            for day, weights in sorted(prepared.targets.items())
-        },
+        # Referenced, not copied. The receipt's plain mapping is built after the
+        # preparation is released, so no duplicate exists while the graph is still live.
+        targets=prepared.targets,
     )
     return opening, carried
 
@@ -402,7 +404,10 @@ def _receipt(
         "envelope": {"sha256": carried.envelope_sha256},
         "preparation": {"sha256": carried.preparation_sha256},
         "exported": outcome.exported,
-        "target_weights": carried.target_weights,
+        "target_weights": {
+            day.isoformat(): dict(sorted(weights.items()))
+            for day, weights in sorted(carried.targets.items())
+        },
         "backtest": outcome.response,
         "run": outcome.recorded,
         "certified": False,
