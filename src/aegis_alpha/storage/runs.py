@@ -366,6 +366,11 @@ def project_metrics(backtest_bytes: bytes) -> dict[str, tuple[Decimal | None, st
         metrics["total_return"] = _change([entry.get("equity") for entry in nav])
     else:
         units = _by_date(unit_nav, "date", "unit nav entry")
+        if [entry.get("date") for entry in units] != [entry.get("date") for entry in nav]:
+            # The engine emits one unit value per account session. Without this, a
+            # truncated array would measure the return over a different period than
+            # the final equity describes.
+            raise RunStorageError("unit nav sessions do not match the account nav")
         metrics["total_return"] = _change([entry.get("unit_value") for entry in units])
     return metrics
 
@@ -585,6 +590,13 @@ def _require_recorded_metadata(workspace: Workspace, run_id: str) -> None:
     run_details and the started event recorded the same values under immutable triggers
     at open time, so read_run cannot return lineage, a reason or a time nobody recorded.
     """
+    seeded = workspace.state.execute(
+        "SELECT 1 FROM runs WHERE run_id=? AND seed IS NOT NULL", (run_id,)
+    ).fetchone()
+    if seeded is not None:
+        # open_run always records NULL and no sealed evidence supplies a seed, so a
+        # non-null value can only have been written after the fact.
+        raise RunStorageError("run seed was recorded without any sealed evidence")
     row = workspace.state.execute(
         "SELECT r.prior_run_id,r.reason,r.created_at_us,d.prior_run_id,e.reason,e.known_at_us "
         "FROM runs r JOIN run_details d ON d.run_id=r.run_id "
@@ -1201,17 +1213,17 @@ def _metric_records(
     }
 
 
-def _reserved(budget: ComputeBudget | None, derived: _Derived) -> ComputeBudget | None:
+def _reserved(budget: ComputeBudget | None, derived: _Derived) -> ComputeBudget:
     """Hold the live projection against the allowance before a second copy is read.
 
     _derive leaves every projected row resident. Admitting the stored rows against the
-    unchanged allowance would let two individually acceptable materializations exceed",
-    the caller allowance together.
+    unchanged allowance would let two individually acceptable materializations exceed
+    the allowance together. An omitted budget resolves to the same fallback _admit uses,
+    so the reservation is not discarded on the default path.
     """
-    if budget is None:
-        return None
+    held = _allowance(budget)
     charge = sum(derived.counts.values()) * _ROW_OVERHEAD * _ROW_COPIES
-    return replace(budget, reserved_bytes=budget.reserved_bytes + charge)
+    return replace(held, reserved_bytes=held.reserved_bytes + charge)
 
 
 def _finish(

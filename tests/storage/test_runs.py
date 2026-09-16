@@ -1264,3 +1264,25 @@ def test_a_fill_that_precedes_its_decision_is_refused(tmp_path: Path) -> None:
         with pytest.raises(RunStorageError, match="must execute after the decision"):
             commit_run(workspace, handle, RunResult(backtest(NAV, impossible)), budget=BUDGET)
         assert not (workspace.paths.runs / "run-1" / "backtest.json").exists()
+
+
+def test_a_seed_written_after_the_fact_is_refused(tmp_path: Path) -> None:
+    fx = prepared(tmp_path)
+    with open_workspace(fx.home, writable=True) as workspace:
+        handle = open_run(workspace, intent(fx, "run-1"))
+        workspace.state.execute("UPDATE runs SET seed=7 WHERE run_id='run-1'")
+        workspace.state.commit()
+        commit_run(workspace, handle, RunResult(RESULT), budget=BUDGET)
+    with (
+        open_workspace(fx.home) as workspace,
+        pytest.raises(RunStorageError, match="seed was recorded without"),
+    ):
+        read_run(workspace, "run-1", budget=BUDGET)
+
+
+def test_unit_nav_must_cover_the_same_sessions_as_the_account(tmp_path: Path) -> None:
+    fx = prepared(tmp_path)
+    with open_workspace(fx.home, writable=True) as workspace:
+        handle = open_run(workspace, intent(fx, "run-1"))
+        with pytest.raises(RunStorageError, match="unit nav sessions do not match"):
+            commit_run(workspace, handle, RunResult(cashflow(NAV, UNIT_NAV[:1])), budget=BUDGET)
