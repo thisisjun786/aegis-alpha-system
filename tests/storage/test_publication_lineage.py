@@ -300,8 +300,16 @@ def metadata_allocation_bound(
             yield
         finally:
             _, peak = tracemalloc.get_traced_memory()
+            # JUN-176 diagnostic: name the allocation sites when the bound is missed.
+            detail = (
+                chr(10).join(
+                    str(entry) for entry in tracemalloc.take_snapshot().statistics("lineno")[:15]
+                )
+                if peak >= max_bytes
+                else ""
+            )
             tracemalloc.stop()
-        assert peak < max_bytes
+        assert peak < max_bytes, detail
 
 
 def receipt_inventory(home: Path) -> dict[str, str]:
