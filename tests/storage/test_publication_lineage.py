@@ -13,7 +13,7 @@ from contextlib import closing, contextmanager
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
-from types import FrameType
+from types import CodeType, FrameType
 from typing import TYPE_CHECKING, cast
 
 import duckdb
@@ -292,45 +292,70 @@ def seed_metadata_budget(workspace: Workspace, root: Path, store: str) -> str:
     return "arrow-prices"
 
 
-# A rise smaller than this is ordinary churn and is not worth a site record.
+# A rise smaller than this is ordinary churn and is not worth a record.
 _ALLOCATION_RISE_BYTES = 64 * 1024
-_MAX_RECORDED_RISES = 12
-_MAX_REPORTED_SITES = 6
-
-
-def _profiled_site(frame: FrameType, event: str, arg: object) -> str:
-    if event.startswith("c_"):
-        name = getattr(arg, "__qualname__", None) or repr(arg)
-        module = getattr(arg, "__module__", None)
-        return f"{module + '.' if module else ''}{name} [{event}]"
-    code = frame.f_code
-    return f"{code.co_filename}:{frame.f_lineno} {code.co_qualname} [{event}]"
+_MAX_RECORDED_RISES = 6
 
 
 class _PeakWatcher:
-    """Name the operation that raised the high-water mark, not the survivors.
+    """Record where tracemalloc's high-water mark was seen rising.
 
     The measured peak is transient: the buffer that raises it is normally freed
-    before the window closes, so a closing snapshot reports only what survived and
-    never the site that mattered. Current traced memory is no better, because it
+    before the window closes, so a closing snapshot shows only survivors and never
+    the operation that mattered. Current traced memory is no better, because it
     stays low at every Python call boundary when one C call allocates and frees
-    inside itself. Sampling the high-water mark on profile events, which include
-    the C-call and C-return events, attributes the peak to the operation that
-    actually raised it. The mark is only read here and never reset, so the
-    assertion still sees the true peak.
+    inside itself. The mark, sampled on profile events that include the C-call and
+    C-return events, is the one quantity that still carries the information.
+
+    This runs inside the region it observes, so it stores references and formats
+    nothing: building a string here would allocate at exactly the instant the mark
+    is highest, which is the measurement it must not move. A frame is never
+    retained, because holding one keeps its locals alive. The mark is only read,
+    never reset, so the assertion still sees the true peak.
+
+    It cannot be free. Installing any profile function makes CPython materialize a
+    frame object for every active call, so the observed peak rises by roughly the
+    call-stack depth at the peak: measured here at 1,535 to 1,852 bytes over eight
+    paired runs, and 12,436 bytes on the first hooked window in a process, against
+    a margin of about 1,034,000 bytes between the real peak and the bound. The
+    error is one-directional -- the window can only become stricter, never more
+    permissive -- so it cannot hide a real budget violation.
     """
 
     def __init__(self) -> None:
         self.mark = 0
-        self.rises: list[tuple[int, str, int]] = []
+        self.seen = 0
+        self.marks = [0] * _MAX_RECORDED_RISES
+        self.events = [""] * _MAX_RECORDED_RISES
+        self.owners: list[object] = [None] * _MAX_RECORDED_RISES
+        self.threads = [0] * _MAX_RECORDED_RISES
 
     def __call__(self, frame: FrameType, event: str, arg: object) -> None:
+        # Only return-type events. A rise inside a call is still observable when
+        # that call returns, and sampling the entry events as well would double
+        # the allocations this hook makes while a large buffer is still live.
+        if not event.endswith(("return", "exception")):
+            return
         peak = tracemalloc.get_traced_memory()[1]
         if peak < self.mark + _ALLOCATION_RISE_BYTES:
             return
         self.mark = peak
-        self.rises.append((peak, _profiled_site(frame, event, arg), threading.get_ident()))
-        del self.rises[:-_MAX_RECORDED_RISES]
+        # Keep the earliest rises and always the latest: marks only increase, so
+        # the last record is the one closest to the reported peak.
+        index = min(self.seen, _MAX_RECORDED_RISES - 1)
+        self.seen += 1
+        self.marks[index] = peak
+        self.events[index] = event
+        self.owners[index] = arg if event[0] == "c" else frame.f_code
+        self.threads[index] = threading.get_ident()
+
+
+def _describe_owner(owner: object, event: str) -> str:
+    if isinstance(owner, CodeType):
+        return f"{owner.co_filename}:{owner.co_firstlineno} {owner.co_qualname} [{event}]"
+    name = getattr(owner, "__qualname__", None) or repr(owner)
+    module = getattr(owner, "__module__", None)
+    return f"{module + '.' if module else ''}{name} [{event}]"
 
 
 def _allocation_report(
@@ -341,18 +366,25 @@ def _allocation_report(
     loaded: frozenset[str],
 ) -> str:
     """Explain an exceeded bound. Diagnostic only: it changes no limit."""
+    recorded = min(watcher.seen, _MAX_RECORDED_RISES)
     lines = [
         f"metadata allocation peak {peak} is not below the {max_bytes} byte bound",
-        "high-water-mark risers, oldest first (the sites that raised the peak):",
+        # The hook sees only the thread it was installed on, while tracemalloc
+        # counts every thread, so this is where a rise was first observed rather
+        # than proof of which thread or call owns the memory.
+        "where the mark was seen rising, earliest first (observing thread):",
     ]
     lines += [
-        f"  {mark:>10} B  thread {thread}  {site}"
-        for mark, site, thread in watcher.rises[-_MAX_REPORTED_SITES:]
-    ] or [f"  none: no single step raised the mark by {_ALLOCATION_RISE_BYTES} bytes"]
-    lines.append("largest surviving allocations (these are not the peak site):")
+        f"  {watcher.marks[index]:>10} B  thread {watcher.threads[index]}  "
+        f"{_describe_owner(watcher.owners[index], watcher.events[index])}"
+        for index in range(recorded)
+    ] or [f"  nothing rose by {_ALLOCATION_RISE_BYTES} bytes in one step"]
+    if watcher.seen > _MAX_RECORDED_RISES:
+        lines.append(f"  and {watcher.seen - _MAX_RECORDED_RISES} further rises, not kept")
+    lines.append("largest surviving allocations (these are not the peak's site):")
     lines += [
         f"  {stat.size:>10} B  {stat.count:>6} blocks  {stat.traceback[0]}"
-        for stat in survivors.statistics("lineno")[:_MAX_REPORTED_SITES]
+        for stat in survivors.statistics("lineno")[:_MAX_RECORDED_RISES]
     ]
     # A one-time import landing inside the window is invisible in a size ranking
     # and obvious here. Initialization inside an already-imported module is not.
