@@ -382,6 +382,13 @@ def _allocation_report(
     recorded = min(watcher.seen, _MAX_RECORDED_RISES)
     lines = [
         f"metadata allocation peak {peak} is not below the {max_bytes} byte bound",
+        # Print the gap rather than only describing it: if the last record sits
+        # well below the peak, the rise that mattered was never big enough in one
+        # step to be recorded, and the sites below do not explain this failure.
+        (
+            f"highest mark recorded here: {watcher.mark}, which can trail the peak "
+            f"by up to {_ALLOCATION_RISE_BYTES - 1} bytes"
+        ),
         # The hook sees only the thread it was installed on, while tracemalloc
         # counts every thread, so this is where a rise was first observed rather
         # than proof of which thread or call owns the memory.
