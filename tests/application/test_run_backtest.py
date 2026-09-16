@@ -638,3 +638,50 @@ def test_empty_schedule_with_cashflows_records_a_no_fill_result(
     assert receipt["run"]["metrics"]["total_return"]["value_state"] == "present"
     shown = _cli(home, "run", "show", "--run-id", receipt["run"]["run_id"])["run"]
     assert shown["result_hash"] == receipt["run"]["result_hash"]
+
+
+def test_a_run_cannot_be_its_own_predecessor(case: tuple[Path, Path]) -> None:
+    """The store refuses a self-reference only after stage A registers, so refuse it first."""
+    home, request = case
+    _cli(home, "db", "run-install")
+    arguments = _arguments(request, "--run-id", "run-self", "--prior-run-id", "run-self")
+    result = run_cli(*arguments, home=home)
+    assert result.returncode == 1
+    assert not result.stdout
+    assert "own predecessor" in json.loads(result.stderr)["error"]
+    assert _statuses(home) == []
+    with open_workspace(home) as workspace:
+        bundles = workspace.state.execute("SELECT count(*) FROM input_bundles").fetchone()
+    assert bundles[0] == 0
+
+
+def test_the_parsed_request_is_handed_over_not_retained(
+    case: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stage 0 takes the decoded request; no outer frame keeps it for the rest of the run."""
+    home, request = case
+    _cli(home, "db", "run-install")
+    genuine = run_module._staged  # noqa: SLF001 -- carrier handover observation point
+    seen: dict[str, int] = {}
+
+    def watched(
+        root: Path, carrier: object, wanted: object, budget: object, output: object
+    ) -> dict[str, object]:
+        slot = cast("list[object]", carrier)
+        seen["before"] = len(slot)
+        result = genuine(
+            root,
+            cast("Any", carrier),
+            cast("Any", wanted),
+            cast("Any", budget),
+            cast("Any", output),
+        )
+        seen["after"] = len(slot)
+        return result
+
+    monkeypatch.setattr(run_module, "_staged", watched)
+    receipt = _api(home, request)
+
+    assert receipt["run"]["status"] == "SUCCESS"
+    assert seen["before"] == 1
+    assert seen["after"] == 0

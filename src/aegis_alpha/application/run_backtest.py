@@ -119,6 +119,10 @@ class RunBacktestRequest:
             raise ValueError("reason is too large to record")
         if self.run_id is not None and not _RUN_ID.fullmatch(self.run_id):
             raise ValueError("run_id must be a plain identifier")
+        if self.run_id is not None and self.run_id == self.prior_run_id:
+            # The run store refuses a self-referencing predecessor too, but only once
+            # stage A has registered; refused here so a bad intent strands nothing.
+            raise ValueError("a run cannot be its own predecessor")
 
 
 @dataclass(frozen=True, slots=True)
@@ -444,19 +448,24 @@ def _receipt(
 
 def _staged(
     home: Path,
-    parsed: PrepareRequest,
+    carrier: list[PrepareRequest],
     request: RunBacktestRequest,
     budget: ComputeBudget,
     output: Path | None,
 ) -> dict[str, object]:
-    """The four stages. Only A and C hold a writable workspace, and neither calculates."""
+    """The four stages. Only A and C hold a writable workspace, and neither calculates.
+
+    The parsed request arrives in a one-slot carrier that stage 0 empties as it takes it,
+    so no frame here keeps the decoded request document alive beside a later stage. It
+    survives inside the returned PreparedBacktest until del prepared releases that too.
+    """
     if output is None:
-        prepared = _prepare(home, parsed, budget)
+        prepared = _prepare(home, carrier.pop(), budget)
         exported = None
     else:
         with DescriptorTree.open_path(output.parent) as tree:
             require_new_outputs(tree, output.name)
-            prepared = _prepare(home, parsed, budget)
+            prepared = _prepare(home, carrier.pop(), budget)
             exported = seal_outputs(
                 tree, output.name, prepared.envelope.canonical_bytes, prepared.provenance
             )
@@ -528,7 +537,9 @@ def run_backtest(request: RunBacktestRequest) -> dict[str, object]:
     run interrupted while its inputs are being sealed stays RUNNING for `aas db recover`
     rather than being force-failed, exactly as the run lifecycle defines.
     """
-    parsed = read_prepare_request(request.request, request.request_sha256)
+    # Handed over in a one-slot carrier so this frame stops referencing the decoded
+    # request the moment stage 0 takes it, rather than holding it for the whole run.
+    carrier = [read_prepare_request(request.request, request.request_sha256)]
     output = None if request.envelope_output is None else admitted_path(request.envelope_output)
     home, targets, database_error = _admitted(request.home)
     if output is not None:
@@ -537,7 +548,7 @@ def run_backtest(request: RunBacktestRequest) -> dict[str, object]:
         with price_compute(excluded_locks=targets) as budget:
             if budget is None:
                 raise ValueError("a run requires the explicit AAS compute budget environment")
-            return _staged(home, parsed, request, budget, output)
+            return _staged(home, carrier, request, budget, output)
     except (sqlite3.Error, database_error) as error:
         raise _translated(error) from None
 
