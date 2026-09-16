@@ -745,7 +745,7 @@ docker compose run --rm aas doctor
 ## 메타데이터 예산 검사의 간헐적 실패 (JUN-176)
 
 `tests/storage/test_publication_lineage.py::test_source_marker_metadata_budget`이 CI에서
-드물게 실패한다. 회수한 실패는 한 건이다. GitHub Actions run 35045809314(PR 24)에서
+드물게 실패한다. 확보한 실패 로그는 한 건이다. GitHub Actions run 35045809314(PR 24)에서
 파라미터 `[request_hash-False-market]`이 `assert 4908067 < 2097152`로 떨어졌다.
 한계 2,097,152는 제품 상수가 아니라 `store == "market"`일 때의 `size // 2`다.
 
@@ -763,12 +763,18 @@ docker compose run --rm aas doctor
 해제하는 구간에 있다.
 
 그래서 `metadata_allocation_bound`는 profile 이벤트에서 `tracemalloc`의 최고 수위를 읽어
-그것이 올라간 지점을 기록한다. 실패했을 때만 서식을 만들고, 한계는 건드리지 않는다.
-이 계측이 지목한 지점은 `BufferedReader.read [c_return]`, 1,061,683 B다.
+그것이 올라간 지점을 기록한다. 실패했을 때만 snapshot과 보고문을 만들고, 한계는 건드리지 않는다.
+통과하는 창을 로컬에서 관측했을 때 이 계측이 지목한 지점은 `BufferedReader.read [c_return]`,
+1,061,691 B다. 이것은 정상 창의 관측이며 CI가 본 4.9 MB를 설명한 것이 아니다.
 경로는 `market_inputs._raw_payload` -> `DescriptorTree.read_bytes`이고,
 `read_bytes`는 파일 크기와 무관하게 1 MiB를 요청한 뒤 그 다음에 `max_bytes`를 확인한다.
 이 호출의 `max_bytes`는 128 KiB다. 즉 자기 허용치의 여덟 배를 먼저 할당한다.
 정상 최대치는 사실상 전부 이 버퍼이며, 남은 여유는 두 배뿐이다.
+
+계측 자체는 공짜가 아니다. profile 함수를 걸면 CPython이 호출마다 frame 객체를 실제로 만들기
+때문에 관측되는 최대치가 최대 호출 깊이만큼 올라간다. 여기서는 8쌍 측정에서 1,535~1,852 B,
+프로세스의 첫 창에서 12,436 B였다. 실제 창의 여유가 약 1,034,000 B이므로 판정을 뒤집지 못하고,
+방향도 한쪽이다. 창이 더 엄격해질 뿐이라 실제 예산 위반을 가릴 수는 없다.
 
 `src/aegis_alpha/data/descriptor_tree.py`는 이 작업의 쓰기 범위 밖이라 고치지 않았다.
 승인이 읽기보다 먼저여야 한다는 결정 0016의 계약과 어긋나는 순서이므로 별도 범위로 보고한다.
@@ -777,16 +783,17 @@ docker compose run --rm aas doctor
 
 | 가설 | 결과 |
 |---|---|
-| 순환 GC가 최대치를 부풀린다 | 기각. `gc.disable()`에서도 1.069 MB로 같다 |
-| `api()`의 지연 import가 창 안에 들어온다 | 기각. `pin()`이 창 전에 이미 부른다 |
-| DuckDB 결과 할당 | 기각. `execute().fetchone()`이 64~96 B다 |
-| `tracemalloc` 중첩 | 기각. 저장소 전체에서 균형 잡힌 두 쌍뿐이다 |
-| 예산에서 크기가 나오는 버퍼 | 기각. `component()`와 `_raw_payload`의 값은 비교에만 쓴다 |
+| 순환 GC가 최대치를 부풀린다 | 로컬 실험에서 뒷받침되지 않음. `gc.disable()`에서도 1.069 MB로 같다 |
+| `api()`의 지연 import가 창 안에 들어온다 | 배제. `pin()`이 창 전에 이미 부른다 |
+| DuckDB 결과 할당 | 로컬 실험에서 뒷받침되지 않음. `execute().fetchone()`이 64~96 B다 |
+| `tracemalloc` 중첩 | 배제. 저장소 전체에서 균형 잡힌 두 쌍뿐이다 |
+| 예산에서 크기가 나오는 버퍼 | 배제. `component()`와 `_raw_payload`의 값은 비교에만 쓴다 |
 | 창 안의 일회성 초기화 | 미확인. 지역 재현이 없어 남겨 둔다 |
 
-지역 재현율은 0이다. 창 단위로 1,051회(단독 probe 60회 + `tests/storage` 1회 + 전체 lane 1회)를
+로컬 재현율은 0이다. 창 단위로 1,051회(단독 probe 60회 + `tests/storage` 1회 + 전체 lane 1회)를
 돌렸고 한계를 넘은 창은 없다. 단독 probe 60회의 최대치는 최소 1,063,212, 최대 1,063,479,
-모집단 표준편차 79 B였다. CI가 본 4,908,067은 이 분포에서 나올 수 있는 값이 아니다.
+관측 60회의 표준편차는 79 B였다. CI가 본 4,908,067은 이 관측 범위를 크게 벗어난다. 다만 로컬이 안정적이라는 사실만으로
+CI에서의 기여 요인을 배제할 수는 없다.
 전체 lane(`pytest -m "not database"`)은 4257 passed로 통과했다.
 
 원인을 확정하지 못했으므로 이 결함은 닫지 않는다. 다음 CI 실패가 나면 계측이 최고 수위를
