@@ -15,6 +15,7 @@ from aegis_alpha.storage.raw import put_raw, verify_raw
 if TYPE_CHECKING:
     import sqlite3
 
+    from aegis_alpha.compute_resources import ComputeBudget
     from aegis_alpha.storage.workspace import Workspace
 
 
@@ -283,7 +284,9 @@ def read_dataset(workspace: Workspace, dataset_id: str, version: str) -> dict[st
     return dict(row)
 
 
-def recover_operations(workspace: Workspace) -> dict[str, object]:
+def recover_operations(
+    workspace: Workspace, *, budget: ComputeBudget | None = None
+) -> dict[str, object]:
     from aegis_alpha.storage.runs import RUN_OPERATION_KIND  # noqa: PLC0415
 
     recovered: list[str] = []
@@ -313,7 +316,7 @@ def recover_operations(workspace: Workspace) -> dict[str, object]:
         elif operation["kind"] == RUN_OPERATION_KIND:
             from aegis_alpha.storage.runs import recover_run  # noqa: PLC0415
 
-            if not recover_run(workspace, operation):
+            if not recover_run(workspace, operation, budget=budget):
                 pending.append(op_id)
                 continue
         else:

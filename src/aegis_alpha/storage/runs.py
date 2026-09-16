@@ -15,9 +15,10 @@ import math
 import os
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from decimal import ROUND_HALF_EVEN, Context, Decimal
+from fractions import Fraction
 from typing import TYPE_CHECKING
 
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
@@ -166,8 +167,7 @@ class RunResult:
 
 
 def _decimal12(value: object) -> Decimal:
-    number = _finite(value)
-    exact = Decimal(repr(number))
+    exact = _exact(value)
     if exact.copy_abs() >= _DECIMAL_LIMIT:
         raise RunStorageError("result value exceeds DECIMAL(38,12)")
     projected = _DECIMAL.quantize(exact, _QUANTUM)
@@ -178,16 +178,32 @@ def _decimal12(value: object) -> Decimal:
     return projected
 
 
-def _finite(value: object) -> float:
+def _exact(value: object) -> Decimal:
+    """Take the number at full width.
+
+    An integer goes straight to Decimal. Routing it through binary64 first would
+    silently round every integer above 2**53, and the stored row would then disagree
+    with the sealed artifact while reproducing the same wrong value on every read.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise RunStorageError("result values must be numbers")
-    number = float(value)
-    if not math.isfinite(number):
+    if isinstance(value, int):
+        return Decimal(value)
+    if not math.isfinite(value):
         raise RunStorageError("result values must be finite")
-    return number
+    return Decimal(repr(value))
 
 
 def _session_us(value: object) -> int:
+    """Encode a calendar session date in the at_us column.
+
+    The result contract supplies a session date and no instant, and the frozen market
+    DDL gives these tables one BIGINT column for it. Midnight UTC is therefore an
+    encoding of the date, not a claim about when the session opened: a fill dated
+    2024-01-02 on a US venue did not execute at 00:00Z. Ordering and joining these rows
+    against real intraday UTC events is not supported. Resolving an actual instant needs
+    the pinned session calendar and a column that can hold it, which is a schema change.
+    """
     if not isinstance(value, str):
         raise RunStorageError("result dates must be ISO text")
     return calendar.timegm(date.fromisoformat(value).timetuple()) * 1_000_000
@@ -426,6 +442,30 @@ def _pin_rows(pins: tuple[RunStrategyPin, ...]) -> list[tuple[object, ...]]:
     ]
 
 
+def _require_admitted_pins(workspace: Workspace, pins: tuple[RunStrategyPin, ...]) -> None:
+    """Refuse a pin the private strategy store cannot confirm.
+
+    read_run returns these hashes as the run's immutable provenance, so a caller that
+    supplies a fabricated or stale pin would make a successful run report a strategy it
+    never used. Only a version the store actually admitted is recorded.
+    """
+    if not pins:
+        return
+    if workspace.strategies is None:
+        raise RunStorageError("strategy pins require the private strategy store")
+    store_id = workspace.strategies.execute("SELECT store_id FROM store_info").fetchone()[0]
+    for pin in pins:
+        if pin.store_id != store_id:
+            raise RunStorageError("strategy pin names a different strategy store")
+        admitted = workspace.strategies.execute(
+            "SELECT 1 FROM strategy_versions WHERE strategy_id=? AND version=? "
+            "AND raw_sha256=? AND contract_sha256=?",
+            (pin.strategy_id, pin.version, pin.raw_hash, pin.contract_hash),
+        ).fetchone()
+        if admitted is None:
+            raise RunStorageError("strategy pin does not match an admitted strategy version")
+
+
 def _require_same_intent(
     workspace: Workspace, intent: RunIntent, run_id: str, request_hash: str
 ) -> None:
@@ -499,6 +539,7 @@ def open_run(workspace: Workspace, intent: RunIntent) -> RunHandle:
     # Checked before anything durable happens, so a preparation that belongs to another
     # request or another envelope is never sealed under this run.
     _require_linked_inputs(intent.envelope_bytes, intent.preparation_bytes, request_hash)
+    _require_admitted_pins(workspace, intent.strategy_pins)
     run_id = intent.run_id or "run-" + uuid.uuid4().hex
     _text(run_id, "run_id")
     envelope_sha256 = hashlib.sha256(intent.envelope_bytes).hexdigest()
@@ -920,6 +961,35 @@ def _metric_payload(
     }
 
 
+def _metric_records(
+    metrics: dict[str, tuple[Decimal | None, str]],
+) -> dict[str, dict[str, object]]:
+    """The full stored shape. v1 pins no comparison references, so all four are null."""
+    return {
+        name: {
+            **entry,
+            "benchmark_ref": None,
+            "risk_free_ref": None,
+            "cost_ref": None,
+            "comparison_condition_hash": None,
+        }
+        for name, entry in _metric_payload(metrics).items()
+    }
+
+
+def _reserved(budget: ComputeBudget | None, derived: _Derived) -> ComputeBudget | None:
+    """Hold the live projection against the allowance before a second copy is read.
+
+    _derive leaves every projected row resident. Admitting the stored rows against the
+    unchanged allowance would let two individually acceptable materializations exceed",
+    the caller allowance together.
+    """
+    if budget is None:
+        return None
+    charge = sum(derived.counts.values()) * _ROW_OVERHEAD * _ROW_COPIES
+    return replace(budget, reserved_bytes=budget.reserved_bytes + charge)
+
+
 def _finish(
     workspace: Workspace,
     derived: _Derived,
@@ -929,7 +999,7 @@ def _finish(
 ) -> dict[str, object]:
     """Record the receipts and end the run SUCCESS, only after the marker verifies."""
     run_id = derived.run_id
-    hashes, counts = table_receipts(_stored_rows(workspace, run_id, budget))
+    hashes, counts = table_receipts(_stored_rows(workspace, run_id, _reserved(budget, derived)))
     if hashes != derived.hashes or counts != derived.counts:
         raise RunStorageError("stored result rows disagree with the sealed evidence")
     now = time.time_ns() // 1000
@@ -1115,7 +1185,7 @@ def verify_run(
         raise RunStorageError("successful run has no result marker")
     derived = _derive(workspace, run_id, request_hash, budget)
     _require_marker_match(marker, operation["operation_id"], derived)
-    hashes, counts = table_receipts(_stored_rows(workspace, run_id, budget))
+    hashes, counts = table_receipts(_stored_rows(workspace, run_id, _reserved(budget, derived)))
     if hashes != derived.hashes or counts != derived.counts:
         raise RunStorageError("stored result rows disagree with the sealed evidence")
     recorded = {
@@ -1127,11 +1197,20 @@ def verify_run(
     }
     if recorded != {name: (derived.sizes[name], derived.artifacts[name]) for name in _ARTIFACTS}:
         raise RunStorageError("recorded artifacts disagree with the files on disk")
-    if {
-        name: {"value": entry["value"], "value_state": entry["value_state"]}
-        for name, entry in _recorded_metrics(workspace, run_id).items()
-    } != _metric_payload(derived.metrics):
+    if _recorded_metrics(workspace, run_id) != _metric_records(derived.metrics):
         raise RunStorageError("recorded metrics disagree with the sealed evidence")
+    manifests = [
+        tuple(row)
+        for row in workspace.state.execute(
+            "SELECT module,output_schema,content_hash,row_count FROM module_manifests "
+            "WHERE run_id=?",
+            (run_id,),
+        )
+    ]
+    if manifests != [
+        (derived.module, _MANIFEST_SCHEMA, derived.manifest, sum(derived.counts.values()))
+    ]:
+        raise RunStorageError("recorded module manifest disagrees with the sealed evidence")
     return derived
 
 
@@ -1204,6 +1283,10 @@ def recover_run(
     workspace: Workspace, operation: sqlite3.Row, *, budget: ComputeBudget | None = None
 ) -> bool:
     """Finish or end one interrupted run. It never recalculates anything."""
+    # Recovery runs from the CLI, which has no budget to hand down. Falling back to
+    # the serial default keeps the materialization checks on rather than disabling
+    # them on exactly the path that reads unverified evidence.
+    budget = budget or ComputeBudget(Fraction(1), 512 * 1024 * 1024)
     run_id = str(operation["target_id"])
     operation_id = str(operation["operation_id"])
     request_hash = str(operation["request_hash"])

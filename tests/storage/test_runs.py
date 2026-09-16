@@ -25,6 +25,7 @@ from aegis_alpha.storage.runs import (
     RunStrategyPin,
     _ordered,
     _seal,
+    _stored_rows,
     commit_run,
     fail_run,
     list_runs,
@@ -150,7 +151,44 @@ def prepared(home: Path) -> Path:
     return home
 
 
-def intent(run_id: str, *, prior_run_id: str | None = None) -> RunIntent:
+def admit_strategy(home: Path, root: Path) -> RunStrategyPin:
+    """Admit one strategy version through the real registration path.
+
+    A pin has to name a version the private store actually admitted, so the fixture
+    registers one rather than inserting rows behind the journal.
+    """
+    from aegis_alpha.storage.strategy_import import register_strategy  # noqa: PLC0415
+    from tests.engine.engine_support import contract, raw_bundle  # noqa: PLC0415
+
+    raw = raw_bundle(contract())
+    digest = hashlib.sha256(raw).hexdigest()
+    bundle = root / "bundle.json"
+    bundle.write_bytes(raw)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        assert workspace.strategies is not None
+        register_strategy(workspace, bundle, digest, "synthetic-probe", "1")
+        store_id, contract_hash = workspace.strategies.execute(
+            "SELECT (SELECT store_id FROM store_info), contract_sha256 FROM strategy_versions "
+            "WHERE strategy_id=? AND version=?",
+            ("synthetic-probe", "1"),
+        ).fetchone()
+    return RunStrategyPin(
+        module="aegis",
+        ordinal=0,
+        store_id=store_id,
+        strategy_id="synthetic-probe",
+        version="1",
+        raw_hash=digest,
+        contract_hash=contract_hash,
+    )
+
+
+def intent(
+    run_id: str,
+    *,
+    prior_run_id: str | None = None,
+    pins: tuple[RunStrategyPin, ...] = (),
+) -> RunIntent:
     return RunIntent(
         request_hash=REQUEST_HASH,
         bundle_id="b-empty",
@@ -159,7 +197,7 @@ def intent(run_id: str, *, prior_run_id: str | None = None) -> RunIntent:
         reason="synthetic run",
         envelope_bytes=ENVELOPE,
         preparation_bytes=PREPARATION,
-        strategy_pins=(RunStrategyPin("aegis", 0, "store", "strategy", "1", "a" * 64, "b" * 64),),
+        strategy_pins=pins,
         prior_run_id=prior_run_id,
         run_id=run_id,
     )
@@ -181,8 +219,9 @@ def observed(home: Path, run_id: str) -> tuple[str | None, str | None]:
 
 def test_committed_run_reads_back_identically_in_a_separate_process(tmp_path: Path) -> None:
     home = prepared(tmp_path / "home")
+    admitted = admit_strategy(home, tmp_path)
     with open_workspace(home, writable=True) as workspace:
-        handle = open_run(workspace, intent("run-1"))
+        handle = open_run(workspace, intent("run-1", pins=(admitted,)))
         committed = commit_run(workspace, handle, RunResult(RESULT), budget=BUDGET)
     assert committed["status"] == "SUCCESS"
     assert committed["table_counts"] == COUNTS
@@ -215,11 +254,11 @@ def test_committed_run_reads_back_identically_in_a_separate_process(tmp_path: Pa
         {
             "module": "aegis",
             "ordinal": 0,
-            "strategy_store_id": "store",
-            "strategy_id": "strategy",
+            "strategy_store_id": admitted.store_id,
+            "strategy_id": "synthetic-probe",
             "version": "1",
-            "raw_hash": "a" * 64,
-            "contract_hash": "b" * 64,
+            "raw_hash": admitted.raw_hash,
+            "contract_hash": admitted.contract_hash,
         }
     ]
     with open_workspace(home) as workspace:
@@ -776,3 +815,103 @@ def test_provenance_identities_must_be_digests(tmp_path: Path) -> None:
         with pytest.raises(RunStorageError, match="environment_hash must be a lowercase"):
             open_run(workspace, replace(intent("run-1"), environment_hash="ENV"))
     assert observed(home, "run-1") == (None, None)
+
+
+def test_a_fabricated_strategy_pin_is_refused(tmp_path: Path) -> None:
+    home = prepared(tmp_path / "home")
+    admitted = admit_strategy(home, tmp_path)
+    with open_workspace(home, writable=True) as workspace:
+        with pytest.raises(RunStorageError, match="does not match an admitted strategy version"):
+            open_run(workspace, intent("run-1", pins=(replace(admitted, raw_hash="a" * 64),)))
+        with pytest.raises(RunStorageError, match="names a different strategy store"):
+            open_run(workspace, intent("run-1", pins=(replace(admitted, store_id="elsewhere"),)))
+    assert observed(home, "run-1") == (None, None)
+
+
+def test_an_exact_integer_is_not_rounded_through_binary64(tmp_path: Path) -> None:
+    home = prepared(tmp_path / "home")
+    exact = 9007199254740993
+    nav: list[dict[str, object]] = [
+        {"date": "2024-01-02", "equity": 1000, "cash": 0},
+        {"date": "2024-01-03", "equity": exact, "cash": 0},
+    ]
+    with open_workspace(home, writable=True) as workspace:
+        committed = commit_run(
+            workspace,
+            open_run(workspace, intent("run-1")),
+            RunResult(backtest(nav, [])),
+            budget=BUDGET,
+        )
+    metrics = cast("dict[str, dict[str, object]]", committed["metrics"])
+    # binary64 cannot hold this integer; routing it through float would store ...992.
+    assert metrics["final_equity"]["value"] == "9007199254740993.000000000000"
+    with open_workspace(home) as workspace:
+        stored = workspace.market.execute(
+            "SELECT equity FROM equity_points WHERE run_id='run-1' ORDER BY ordinal"
+        ).fetchall()
+        assert stored[-1][0] == Decimal("9007199254740993.000000000000")
+
+
+def test_a_tampered_metric_reference_is_refused(tmp_path: Path) -> None:
+    home = prepared(tmp_path / "home")
+    with open_workspace(home, writable=True) as workspace:
+        commit_run(
+            workspace, open_run(workspace, intent("run-1")), RunResult(RESULT), budget=BUDGET
+        )
+    with open_workspace(home, writable=True) as workspace:
+        # The immutable trigger blocks UPDATE, so the row is replaced through the
+        # same path an attacker with database access would have to use.
+        workspace.state.execute("PRAGMA writable_schema=ON")
+        workspace.state.execute("DROP TRIGGER immutable_run_metrics_update")
+        workspace.state.execute("PRAGMA writable_schema=OFF")
+        workspace.state.execute(
+            "UPDATE run_metrics SET risk_free_ref='invented' WHERE metric='final_equity'"
+        )
+        workspace.state.commit()
+    with (
+        open_workspace(home) as workspace,
+        pytest.raises(RunStorageError, match="recorded metrics disagree"),
+    ):
+        read_run(workspace, "run-1", budget=BUDGET)
+
+
+def test_a_tampered_module_manifest_is_refused(tmp_path: Path) -> None:
+    home = prepared(tmp_path / "home")
+    with open_workspace(home, writable=True) as workspace:
+        commit_run(
+            workspace, open_run(workspace, intent("run-1")), RunResult(RESULT), budget=BUDGET
+        )
+    with open_workspace(home, writable=True) as workspace:
+        workspace.state.execute("PRAGMA writable_schema=ON")
+        workspace.state.execute("DROP TRIGGER immutable_module_manifests_update")
+        workspace.state.execute("PRAGMA writable_schema=OFF")
+        workspace.state.execute("UPDATE module_manifests SET row_count=row_count+1")
+        workspace.state.commit()
+    with open_workspace(home) as workspace:
+        with pytest.raises(RunStorageError, match="module manifest disagrees"):
+            read_run(workspace, "run-1", budget=BUDGET)
+        with pytest.raises(ValueError, match="module manifest disagrees"):
+            verify_workspace(workspace, budget=BUDGET)
+
+
+def test_recovery_charges_its_reads_without_a_caller_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = prepared(tmp_path / "home")
+    committed_run(home, monkeypatch)
+    seen: list[object] = []
+    original = _stored_rows
+
+    def record(
+        workspace: Workspace, run_id: str, budget: ComputeBudget | None = None
+    ) -> dict[str, list[dict[str, object]]]:
+        seen.append(budget)
+        return original(workspace, run_id, budget)
+
+    monkeypatch.setattr("aegis_alpha.storage.runs._stored_rows", record)
+    with open_workspace(home, writable=True) as workspace:
+        assert recover_operations(workspace)["recovered"] == ["run:run-1"]
+    monkeypatch.undo()
+    assert seen != []
+    # The CLI hands down no budget, so recovery supplies one rather than read unchecked.
+    assert None not in seen
