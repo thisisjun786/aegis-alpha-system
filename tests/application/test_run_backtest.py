@@ -400,12 +400,16 @@ def test_later_stages_reserve_what_preparation_keeps_live(
     genuine_record = run_module._record  # noqa: SLF001 -- stage budget observation point
     seen: dict[str, int] = {}
 
-    def watched_open(root: Path, prepared: object, wanted: object, budget: ComputeBudget) -> object:
-        prepared_any = cast("Any", prepared)
-        seen["held"] = len(prepared_any.envelope.canonical_bytes) + len(prepared_any.provenance)
-        seen["envelope"] = len(prepared_any.envelope.canonical_bytes)
+    def watched_open(root: Path, opening: object, wanted: object, budget: ComputeBudget) -> object:
+        opening_any = cast("Any", opening)
+        seen["held"] = (
+            len(opening_any.projection_bytes)
+            + len(opening_any.envelope_bytes)
+            + len(opening_any.provenance_bytes)
+        )
+        seen["envelope"] = len(opening_any.envelope_bytes)
         seen["open"] = budget.reserved_bytes
-        return genuine_open(root, cast("Any", prepared), cast("Any", wanted), budget)
+        return genuine_open(root, cast("Any", opening), cast("Any", wanted), budget)
 
     def watched_record(
         root: Path, opened: object, result: object, request_hash: str, budget: ComputeBudget
@@ -421,8 +425,8 @@ def test_later_stages_reserve_what_preparation_keeps_live(
     assert receipt["run"]["status"] == "SUCCESS"
     assert seen["held"] > 0
     assert seen["result"] > 0
-    # Stage A runs beside the whole preparation. The preparation graph is released
-    # afterwards, so the commit only carries the envelope and the result.
+    # The preparation is released before stage A, so stage A carries only the documents
+    # it reads, and the commit narrows further to the envelope and the result.
     assert seen["open"] == seen["held"]
     assert seen["record"] == seen["envelope"] + seen["result"]
 

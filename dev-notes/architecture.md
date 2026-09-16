@@ -15,6 +15,7 @@ AAS의 목표는 외부 앱과 에이전트가 사용하는 데이터·연구 �
 | `engine.load_bundle` / `engine.replay` | 외부 bundle 검증과 호출자가 주입한 입력 계산 | DB에서 전략·시장 입력 자동 선택 |
 | `aas backtest` | 명시한 ETF 목표 비중의 다음 거래일 시가 체결·비용·NAV 계산 | 원본 전략 규칙 자동 해석·제출 가격의 출처 및 시점 인증 |
 | `aas prepare` | 등록 전략과 고정 pin에서 판단별 목표 비중을 계산해 `aas backtest` 봉투와 출처 sidecar로 내보내기 (SELECT만) | 체결·NAV 계산, run·요청 등록, 결과 저장·복원, 원본 자료의 PIT 인증 |
+| `aas run` | 준비·요청 등록·`open_run`·잠금 없는 회계·`commit_run`을 한 명령으로 잇고 run ID로 결과 조회 (`db run-install` 필요) | 결과 복원, 원본 자료의 PIT 인증, 알파·헷지 전략 실행, 실주문 |
 | `aas init/doctor/db/strategy/data` | `storage/`의 내장 DB 설치·등록·조회·복구, 관례·pin 문서 등록, run 추가 스키마 설치 | 회계 결과를 run으로 확정·복원하는 경로 |
 | `aas providers/collect` | 기존 공급자·예산·실행 영수증 도구 | 수집기의 내장 DB 이식·스케줄러 자동 활성화 |
 
@@ -99,7 +100,7 @@ DuckDB 한 파일**을 기본으로 사용한다. PostgreSQL과 Parquet를 기�
 
 ```text
 목표 연결: 외부 앱·에이전트
-  → AAS의 데이터·연구 요청 경계 (준비·봉투 회계까지 연결, run 확정 미구현)
+  → AAS의 데이터·연구 요청 경계 (준비·봉투 회계·run 확정까지 연결, 복원은 별도)
   → 공통 reader · 계산 엔진 · 소유자별 writer
       ├─ state.sqlite3: identity·catalog·권한·작업·입력 pin·실행 영수증
       ├─ strategies.sqlite3: 별도 비공개 전략 원문·버전·계보·원래 성과
@@ -112,8 +113,8 @@ universe·전략·시장 관례의 exact version/hash를 묶고, 각 의사결�
 조회해야 한다. DuckDB 파일의 물리 hash와 dataset의 논리 내용 hash를 구분한다.
 공통 transaction이 없는 파일 간 저장은 durable intent와 대상 완료 영수증을 대조해 확정한다.
 내장 저장 경로는 `storage/`와 CLI `init`·`doctor`·`db`·`strategy`·`data`에 연결돼 있다.
-저장 전략과 고정 입력의 조합·계산은 `aas prepare`까지 연결됐고, 회계 결과의 run 확정과
-공급자 수집기의 전환은 별도로 검증한다.
+저장 전략과 고정 입력의 조합·계산은 `aas prepare`가, 그 결과의 run 확정과 재조회는
+`aas run`이 맡는다. 결과 복원과 공급자 수집기의 전환은 별도로 검증한다.
 
 `storage/source_library`는 기존 전략·연구·시장 자료를 조회할 수 있는 원본 자료실이다.
 원본 SQLite의 테이블은 비공개 SQLite에, 명시적으로 전달한 Arrow 자료는 DuckDB에

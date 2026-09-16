@@ -53,7 +53,11 @@ from aegis_alpha.storage.runs import (
 from aegis_alpha.storage.workspace import Workspace, open_workspace
 
 if TYPE_CHECKING:
-    from aegis_alpha.application.backtest_prepare import PreparedBacktest, PrepareRequest
+    from aegis_alpha.application.backtest_prepare import (
+        PreparedBacktest,
+        PrepareRequest,
+        StrategyPin,
+    )
     from aegis_alpha.compute_resources import ComputeBudget
 
 __all__ = [
@@ -118,12 +122,7 @@ class _Opened:
 
 @dataclass(frozen=True, slots=True)
 class _Carried:
-    """Only what survives stage A, so the rest of the preparation can be released.
-
-    The decisions, features, slots and projection are needed to open the run and never
-    again. Holding the whole `PreparedBacktest` through the accounting would keep that
-    graph resident beside the result being built, for no reader.
-    """
+    """What outlives the whole preparation: the receipt's evidence and the calculation input."""
 
     request_hash: str
     envelope_bytes: bytes
@@ -132,8 +131,32 @@ class _Carried:
     target_weights: dict[str, dict[str, float]]
 
 
-def _carry(prepared: PreparedBacktest) -> _Carried:
-    return _Carried(
+@dataclass(frozen=True, slots=True)
+class _Opening:
+    """Exactly what stage A reads, so nothing else stays resident while it materializes.
+
+    The decisions, features, slots, inputs and definition are the preparation's bulk and
+    no later stage reads any of them. Extracting these serialized documents first lets
+    the whole `PreparedBacktest` graph be released before a single run is opened.
+    """
+
+    request_hash: str
+    projection_bytes: bytes
+    envelope_bytes: bytes
+    provenance_bytes: bytes
+    strategy: StrategyPin
+
+
+def _carry(prepared: PreparedBacktest) -> tuple[_Opening, _Carried]:
+    """Take every byte the later stages need, so the preparation can be dropped at once."""
+    opening = _Opening(
+        request_hash=prepared.request_hash,
+        projection_bytes=prepared.projection.canonical_bytes,
+        envelope_bytes=prepared.envelope.canonical_bytes,
+        provenance_bytes=prepared.provenance,
+        strategy=prepared.request.strategy,
+    )
+    carried = _Carried(
         request_hash=prepared.request_hash,
         envelope_bytes=prepared.envelope.canonical_bytes,
         envelope_sha256=prepared.envelope.envelope_sha256,
@@ -143,6 +166,7 @@ def _carry(prepared: PreparedBacktest) -> _Carried:
             for day, weights in sorted(prepared.targets.items())
         },
     )
+    return opening, carried
 
 
 def _object(value: object, field: str) -> dict[str, object]:
@@ -189,26 +213,26 @@ def _bundle_id(explicit: str | None, bindings: object, request_hash: str) -> str
     )
 
 
-def _intent(prepared: PreparedBacktest, request: RunBacktestRequest, bundle_id: str) -> RunIntent:
+def _intent(opening: _Opening, request: RunBacktestRequest, bundle_id: str) -> RunIntent:
     """Fill every RunIntent field from the request this run is about to register.
 
     The engine and environment hashes come from the projected canonical request rather
     than from the identity objects themselves: storage hashes exactly those decoded
     members, and a differently normalized copy would be refused at open time.
     """
-    projected = _object(decode_json(prepared.projection.canonical_bytes), "projected request")
-    envelope = _object(decode_json(prepared.envelope.canonical_bytes), "envelope")
-    strategy = prepared.request.strategy
+    projected = _object(decode_json(opening.projection_bytes), "projected request")
+    envelope = _object(decode_json(opening.envelope_bytes), "envelope")
+    strategy = opening.strategy
     return RunIntent(
-        request_hash=prepared.request_hash,
+        request_hash=opening.request_hash,
         bundle_id=bundle_id,
         engine_hash=content_sha256(_object(projected.get("engine"), "request engine")),
         environment_hash=content_sha256(
             _object(projected.get("environment"), "request environment")
         ),
         reason=request.reason,
-        envelope_bytes=prepared.envelope.canonical_bytes,
-        preparation_bytes=prepared.provenance,
+        envelope_bytes=opening.envelope_bytes,
+        preparation_bytes=opening.provenance_bytes,
         strategy_pins=(
             RunStrategyPin(
                 # Read from the sealed envelope: storage places the single pin on the
@@ -269,16 +293,16 @@ def _require_exportable(home: Path, output: Path) -> None:
 
 
 def _open(
-    home: Path, prepared: PreparedBacktest, request: RunBacktestRequest, budget: ComputeBudget
+    home: Path, opening: _Opening, request: RunBacktestRequest, budget: ComputeBudget
 ) -> _Opened:
     """Stage A: one short write that registers the inputs and commits the run intent."""
-    projected = _object(decode_json(prepared.projection.canonical_bytes), "projected request")
+    projected = _object(decode_json(opening.projection_bytes), "projected request")
     bindings = projected.get("bindings")
     document = canonical_json_bytes(
         {
             "schema": _BUNDLE_SCHEMA,
             "hash_format": _HASH_FORMAT,
-            "bundle_id": _bundle_id(request.bundle_id, bindings, prepared.request_hash),
+            "bundle_id": _bundle_id(request.bundle_id, bindings, opening.request_hash),
             "bindings": bindings,
         }
     )
@@ -292,11 +316,11 @@ def _open(
         register_backtest_request(
             workspace,
             bundle,
-            prepared.projection.canonical_bytes,
-            expected_request_hash=prepared.request_hash,
+            opening.projection_bytes,
+            expected_request_hash=opening.request_hash,
             budget=budget,
         )
-        handle = open_run(workspace, _intent(prepared, request, bundle.bundle_id), budget=budget)
+        handle = open_run(workspace, _intent(opening, request, bundle.bundle_id), budget=budget)
         return _Opened(handle, bundle, _installation(workspace))
 
 
@@ -403,15 +427,19 @@ def _staged(
             exported = seal_outputs(
                 tree, output.name, prepared.envelope.canonical_bytes, prepared.provenance
             )
-    # Everything from here on runs beside a resident PreparedBacktest.
-    retained = _retaining(budget, prepared.envelope.canonical_bytes, prepared.provenance)
-    opened = _open(home, prepared, request, retained)
-    # The run is durable, so the preparation graph has no reader left. Releasing it
-    # before the accounting keeps the two largest materializations from overlapping.
-    carried = _carry(prepared)
+    # Take what the later stages read, then release the preparation before anything
+    # else materializes. No stage after this runs beside the decisions and features.
+    opening, carried = _carry(prepared)
     del prepared
-    retained = _retaining(budget, carried.envelope_bytes)
+    retained = _retaining(
+        budget, opening.projection_bytes, opening.envelope_bytes, opening.provenance_bytes
+    )
+    opened = _open(home, opening, request, retained)
     try:
+        # The run is durable now, so every failure from here ends it rather than
+        # stranding it, including one raised while narrowing what is still held.
+        del opening
+        retained = _retaining(budget, carried.envelope_bytes)
         # Stage B. No storage lock and no state transaction is held across this call.
         # run_document takes no budget of its own, so the decode it is about to perform
         # is admitted here against what this command still holds live. A refusal ends the
