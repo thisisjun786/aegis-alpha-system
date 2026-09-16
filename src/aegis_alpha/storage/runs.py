@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -54,6 +55,13 @@ _SHA_LENGTH = 64
 # stores already use for their own documents, before anything is read.
 _DOCUMENT_OVERHEAD = 2048
 _DOCUMENT_EXPANSION = 128
+# Fields the frozen result row cannot hold, kept in the run add-on on the same ordinal.
+_ADDON_FIELDS = frozenset({"decision_at_us"})
+# Every entry point falls back to this when a caller names no budget, so no path
+# decodes caller-controlled documents with the checks switched off.
+_DEFAULT_MEMORY_BYTES = 512 * 1024 * 1024
+# A run identifier becomes a directory name under the runs root.
+_RUN_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}")
 # One stored result row becomes a Python dict, a tagged rowset encoding and a sort
 # key, all live at once, on top of its own measured text.
 _ROW_OVERHEAD = 512
@@ -86,6 +94,7 @@ _ROW_SCHEMAS: dict[str, tuple[tuple[str, str], ...]] = {
     "simulated_trades": (
         ("module", "text"),
         ("at_us", "utc_us"),
+        ("decision_at_us", "utc_us"),
         ("instrument_id", "text"),
         ("quantity", "decimal"),
         ("price", "decimal"),
@@ -286,6 +295,7 @@ def project_result_rows(backtest_bytes: bytes, envelope_bytes: bytes) -> dict[st
         {
             "module": module,
             "at_us": _session_us(fill.get("execution_date")),
+            "decision_at_us": _session_us(fill.get("decision_date")),
             "instrument_id": _text(fill.get("symbol"), "fill symbol"),
             "quantity": _decimal12(fill.get("shares")),
             "price": _decimal12(fill.get("price")),
@@ -442,6 +452,60 @@ def _pin_rows(pins: tuple[RunStrategyPin, ...]) -> list[tuple[object, ...]]:
     ]
 
 
+def _sealed_request(
+    workspace: Workspace, bundle_id: str, request_hash: str, budget: ComputeBudget | None
+) -> dict[str, object]:
+    """Read the registered request this run must match, charged before it is decoded."""
+    _admit(
+        budget,
+        int(
+            workspace.state.execute(
+                "SELECT coalesce(max(2048 + 128*length(CAST(request_bytes AS BLOB))),0) "
+                "FROM backtest_requests WHERE bundle_id=?",
+                (bundle_id,),
+            ).fetchone()[0]
+        ),
+        "backtest request exceeds materialization budget",
+    )
+    row = workspace.state.execute(
+        "SELECT request_bytes,request_hash FROM backtest_requests WHERE bundle_id=?", (bundle_id,)
+    ).fetchone()
+    if row is None or row[1] != request_hash:
+        raise RunStorageError("run requires a registered request for its bundle")
+    if hashlib.sha256(row[0]).hexdigest() != request_hash:
+        raise RunStorageError("registered request bytes do not match their hash")
+    return _mapping(json.loads(row[0]), "backtest request")
+
+
+def _require_sealed_provenance(intent: RunIntent, request: dict[str, object]) -> None:
+    """Refuse provenance the registered request does not already seal.
+
+    read_run returns the engine, environment and strategy identities as the run
+    immutable provenance. The request already seals all three, so accepting whatever a
+    caller passes would let a successful run describe a calculation nobody performed.
+    """
+    for field, supplied in (
+        ("engine", intent.engine_hash),
+        ("environment", intent.environment_hash),
+    ):
+        if content_sha256(_mapping(request.get(field), "request " + field)) != supplied:
+            raise RunStorageError(field + "_hash does not match the registered request")
+    sealed = _mapping(request.get("strategy"), "request strategy")
+    expected = (
+        _text(sealed.get("strategy_store_id"), "request strategy store"),
+        _text(sealed.get("strategy_id"), "request strategy_id"),
+        _text(sealed.get("version"), "request strategy version"),
+        _digest(_text(sealed.get("raw_sha256"), "request raw_sha256"), "request raw_sha256"),
+        _digest(
+            _text(sealed.get("contract_sha256"), "request contract_sha256"),
+            "request contract_sha256",
+        ),
+    )
+    pins = _pin_rows(intent.strategy_pins)
+    if len(pins) != 1 or tuple(pins[0][2:]) != expected:
+        raise RunStorageError("strategy pins do not match the registered request")
+
+
 def _require_admitted_pins(workspace: Workspace, pins: tuple[RunStrategyPin, ...]) -> None:
     """Refuse a pin the private strategy store cannot confirm.
 
@@ -523,7 +587,9 @@ class _DurableIntent:
         )
 
 
-def open_run(workspace: Workspace, intent: RunIntent) -> RunHandle:
+def open_run(
+    workspace: Workspace, intent: RunIntent, *, budget: ComputeBudget | None = None
+) -> RunHandle:
     """Record a durable intent, then seal the inputs. Nothing is calculated here."""
     require_run_schema(workspace)
     if workspace.state.in_transaction:
@@ -531,17 +597,16 @@ def open_run(workspace: Workspace, intent: RunIntent) -> RunHandle:
         # rollback would erase this run while its sealed files stayed on disk.
         raise RunStorageError("open_run cannot run inside another state transaction")
     request_hash = _digest(_text(intent.request_hash, "request_hash"), "request_hash")
-    stored = workspace.state.execute(
-        "SELECT request_hash FROM backtest_requests WHERE bundle_id=?", (intent.bundle_id,)
-    ).fetchone()
-    if stored is None or stored[0] != request_hash:
-        raise RunStorageError("run requires a registered request for its bundle")
+    request = _sealed_request(workspace, intent.bundle_id, request_hash, budget)
+    _require_sealed_provenance(intent, request)
     # Checked before anything durable happens, so a preparation that belongs to another
     # request or another envelope is never sealed under this run.
     _require_linked_inputs(intent.envelope_bytes, intent.preparation_bytes, request_hash)
     _require_admitted_pins(workspace, intent.strategy_pins)
     run_id = intent.run_id or "run-" + uuid.uuid4().hex
-    _text(run_id, "run_id")
+    if not _RUN_ID.fullmatch(_text(run_id, "run_id")):
+        # This becomes a directory name under the runs root.
+        raise RunStorageError("run_id must be a plain identifier")
     envelope_sha256 = hashlib.sha256(intent.envelope_bytes).hexdigest()
     preparation_sha256 = hashlib.sha256(intent.preparation_bytes).hexdigest()
     operation_id = "run:" + run_id
@@ -620,8 +685,13 @@ def _open_intent(workspace: Workspace, intent: RunIntent, durable: _DurableInten
 
 def _admit(budget: ComputeBudget | None, needed: int, message: str) -> None:
     """Charge a materialization before it happens, never after it is in memory."""
-    if budget is not None and needed > budget.available_bytes:
+    if needed > _allowance(budget).available_bytes:
         raise ComputeResourceError(message)
+
+
+def _allowance(budget: ComputeBudget | None) -> ComputeBudget:
+    """Fall back to the serial default rather than treating no budget as no limit."""
+    return budget or ComputeBudget(Fraction(1), _DEFAULT_MEMORY_BYTES)
 
 
 def _marker(
@@ -749,25 +819,30 @@ def _normalized(value: object) -> object:
     return _DECIMAL.quantize(value, _QUANTUM) if isinstance(value, Decimal) else value
 
 
+def _require_link(document: dict[str, object], field: str, expected: str, label: str) -> None:
+    """Require the document to name the evidence it was produced from."""
+    recorded = document.get(field)
+    if recorded is None:
+        raise RunStorageError(label + " does not name the evidence it used")
+    if recorded != expected:
+        raise RunStorageError(label + " names different evidence")
+
+
 def _require_linked_inputs(
     envelope_bytes: bytes, preparation_bytes: bytes, request_hash: str
 ) -> str:
-    """Refuse artifacts that name a different request or a different envelope.
+    """Refuse artifacts that do not name this run request and envelope.
 
     The preparation document records the request it was prepared for and the envelope
-    it produced, and the backtest response records the envelope it consumed. Without
-    comparing them, a result calculated from another envelope would receive a
-    self-consistent receipt under this run's request. A document that omits a link is
-    left alone; one that carries a conflicting link is refused.
+    it produced, and the backtest response records the envelope it consumed. These are
+    required rather than compared only when present: a document that omits its link
+    proves nothing about which calculation produced it, and the manifest built over it
+    would be internally consistent while certifying unrelated evidence.
     """
     envelope_sha256 = hashlib.sha256(envelope_bytes).hexdigest()
     preparation = _mapping(json.loads(preparation_bytes), "preparation")
-    for recorded, expected, label in (
-        (preparation.get("request_hash"), request_hash, "preparation request"),
-        (preparation.get("envelope_sha256"), envelope_sha256, "preparation envelope"),
-    ):
-        if recorded is not None and recorded != expected:
-            raise RunStorageError(label + " names different evidence")
+    _require_link(preparation, "request_hash", request_hash, "preparation request")
+    _require_link(preparation, "envelope_sha256", envelope_sha256, "preparation envelope")
     return envelope_sha256
 
 
@@ -776,9 +851,7 @@ def _require_linked_evidence(
 ) -> None:
     envelope_sha256 = _require_linked_inputs(envelope_bytes, preparation_bytes, request_hash)
     document = _mapping(json.loads(backtest_bytes), "backtest result")
-    recorded = document.get("input_sha256")
-    if recorded is not None and recorded != envelope_sha256:
-        raise RunStorageError("backtest envelope names different evidence")
+    _require_link(document, "input_sha256", envelope_sha256, "backtest envelope")
 
 
 @dataclass(frozen=True, slots=True)
@@ -842,10 +915,20 @@ def _stored_rows(
     stored: dict[str, list[dict[str, object]]] = {}
     for name in sorted(_ROW_SCHEMAS):
         fields = tuple(field for field, _kind in _ROW_SCHEMAS[name])
-        columns = ",".join('"' + field + '"' for field in fields)
+        columns = ",".join(
+            ("d.decision_at_us" if field in _ADDON_FIELDS else 't."' + field + '"')
+            for field in fields
+        )
         # The names come from this module's own schema map, never from input, and the
-        # receipt hash sorts rows itself so no stored order is relied on here.
-        statement = f'SELECT {columns} FROM "{name}" WHERE run_id=?'  # noqa: S608
+        # receipt hash sorts rows itself so no stored order is relied on here. The
+        # decision date lives in the run add-on, joined back on the shared ordinal.
+        source = f'"{name}" t'
+        if any(field in _ADDON_FIELDS for field, _kind in _ROW_SCHEMAS[name]):
+            source += (
+                " JOIN result_trade_decisions d ON d.run_id=t.run_id "
+                "AND d.module=t.module AND d.ordinal=t.ordinal"
+            )
+        statement = f"SELECT {columns} FROM {source} WHERE t.run_id=?"  # noqa: S608
         stored[name] = [
             {field: _normalized(row[index]) for index, field in enumerate(fields)}
             for row in workspace.market.execute(statement, [run_id]).fetchall()
@@ -923,7 +1006,9 @@ def _write_marker(workspace: Workspace, derived: _Derived, operation_id: str) ->
             payload = derived.ordered[name]
             if not payload:
                 continue
-            fields = tuple(field for field, _kind in _ROW_SCHEMAS[name])
+            fields = tuple(
+                field for field, _kind in _ROW_SCHEMAS[name] if field not in _ADDON_FIELDS
+            )
             named = ("run_id", "ordinal", *fields)
             columns = ",".join('"' + field + '"' for field in named)
             marks = ",".join("?" * (2 + len(fields)))
@@ -933,6 +1018,18 @@ def _write_marker(workspace: Workspace, derived: _Derived, operation_id: str) ->
                 [
                     [derived.run_id, ordinal, *(row[field] for field in fields)]
                     for ordinal, row in payload
+                ],
+            )
+        # The frozen simulated_trades row holds one date, so the decision that produced
+        # each fill lives in the run add-on table made for it, under the same ordinal.
+        decisions = derived.ordered["simulated_trades"]
+        if decisions:
+            workspace.market.executemany(
+                "INSERT INTO result_trade_decisions(run_id,module,ordinal,decision_at_us) "
+                "VALUES (?,?,?,?)",
+                [
+                    [derived.run_id, row["module"], ordinal, row["decision_at_us"]]
+                    for ordinal, row in decisions
                 ],
             )
         workspace.market.execute("COMMIT")
@@ -1305,9 +1402,14 @@ def recover_run(
         # Refusing to materialize describes this machine, not the stored result. The
         # run stays open so a recovery with room to work can still finish it.
         raise
-    except (ValueError, OSError):
+    except (ValueError, OSError) as error:
+        # The quarantine reason is the only record an operator gets, so it carries the
+        # actual failure rather than a fixed sentence.
         return _quarantine_run(
-            workspace, run_id, operation_id, "result marker disagrees with the sealed evidence"
+            workspace,
+            run_id,
+            operation_id,
+            "result marker disagrees with the sealed evidence: " + str(error),
         )
     if derived is None:
         # Absence cannot separate an unfinished calculation from a rolled-back commit,
@@ -1318,8 +1420,11 @@ def recover_run(
         _finish(workspace, derived, operation_id, budget=budget)
     except ComputeResourceError:
         raise
-    except (ValueError, OSError):
+    except (ValueError, OSError) as error:
         return _quarantine_run(
-            workspace, run_id, operation_id, "stored result rows disagree with the sealed evidence"
+            workspace,
+            run_id,
+            operation_id,
+            "stored result rows disagree with the sealed evidence: " + str(error),
         )
     return True

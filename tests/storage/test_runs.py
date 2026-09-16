@@ -4,7 +4,7 @@ import hashlib
 import json
 import subprocess
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
@@ -13,6 +13,7 @@ from typing import cast
 import pytest
 
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
+from aegis_alpha.data.serialization import content_sha256
 from aegis_alpha.storage.backtest_requests import register_backtest_request
 from aegis_alpha.storage.backup import backup
 from aegis_alpha.storage.input_pins import register_input_bundle
@@ -24,6 +25,7 @@ from aegis_alpha.storage.runs import (
     RunStorageError,
     RunStrategyPin,
     _ordered,
+    _require_admitted_pins,
     _seal,
     _stored_rows,
     commit_run,
@@ -37,7 +39,21 @@ from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
 
 BUDGET = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
+TIGHT = replace(
+    BUDGET, reserved_bytes=BUDGET.memory_limit_bytes - BUDGET.duckdb_memory_limit_bytes - 1
+)
 HASH_FORMAT = "aas-canonical-json-sha256-v1"
+ENGINE: dict[str, object] = {
+    "schema": "aas-engine-identity-v1",
+    "hash_format": HASH_FORMAT,
+    "package_version": "0.0.0",
+    "calculation_source_hash": "c" * 64,
+}
+ENVIRONMENT: dict[str, object] = {
+    "schema": "aas-environment-identity-v1",
+    "hash_format": HASH_FORMAT,
+    "versions": [{"name": "python_version", "version": "3.13.0"}],
+}
 READER = """
 import json, sys
 from fractions import Fraction
@@ -66,31 +82,30 @@ BUNDLE = canonical(
         "bindings": [],
     }
 )
-REQUEST = canonical(
+ENVELOPE = canonical({"targets": {"2024-01-02": {"AAA": 1.0}, "2024-01-03": {"AAA": 0.5}}})
+ENVELOPE_SHA256 = hashlib.sha256(ENVELOPE).hexdigest()
+NAV: list[dict[str, object]] = [
+    {"date": "2024-01-02", "equity": 1000.0, "cash": 0.0},
+    {"date": "2024-01-03", "equity": 1100.0, "cash": 10.0},
+]
+FILLS: list[dict[str, object]] = [
     {
-        "schema": "aas-backtest-request-v1",
-        "hash_format": HASH_FORMAT,
-        "strategy": {},
-        "bindings": [],
-        "refs": [],
-        "price_inputs": [],
-        "macro_inputs": [],
-        "derived_inputs": [],
-        "proxy_rules": [],
-        "period": {"start": "2024-01-02", "end": "2024-01-03"},
-        "history": {},
-        "cutoff": {},
-        "decision_latency_us": 0,
-        "explicit_decision_dates": None,
-        "account": {"initial_cash": 1000},
-        "comparison": {},
-        "envelope": {},
-        "conventions": [],
-        "engine": {},
-        "environment": {},
-    }
-)
-REQUEST_HASH = hashlib.sha256(REQUEST).hexdigest()
+        "decision_date": "2024-01-01",
+        "execution_date": "2024-01-02",
+        "symbol": "AAA",
+        "shares": 10.0,
+        "price": 100.0,
+        "fee": 1.0,
+    },
+    {
+        "decision_date": "2024-01-02",
+        "execution_date": "2024-01-03",
+        "symbol": "BBB",
+        "shares": 2.0,
+        "price": 50.0,
+        "fee": 0.5,
+    },
+]
 COUNTS = {
     "equity_points": 2,
     "positions": 0,
@@ -106,57 +121,75 @@ METRICS = {
 }
 
 
-def states(payload: dict[str, object]) -> dict[str, dict[str, object]]:
-    """Reduce a read payload to the metric values and their states."""
-    metrics = cast("dict[str, dict[str, object]]", payload["metrics"])
-    return {
-        name: {"value": entry["value"], "value_state": entry["value_state"]}
-        for name, entry in metrics.items()
-    }
-
-
-ENVELOPE = canonical({"targets": {"2024-01-02": {"AAA": 1.0}, "2024-01-03": {"AAA": 0.5}}})
-PREPARATION = canonical({"schema": "aas-backtest-preparation-v1"})
-NAV: list[dict[str, object]] = [
-    {"date": "2024-01-02", "equity": 1000.0, "cash": 0.0},
-    {"date": "2024-01-03", "equity": 1100.0, "cash": 10.0},
-]
-FILLS: list[dict[str, object]] = [
-    {"execution_date": "2024-01-02", "symbol": "AAA", "shares": 10.0, "price": 100.0, "fee": 1.0},
-    {"execution_date": "2024-01-03", "symbol": "BBB", "shares": 2.0, "price": 50.0, "fee": 0.5},
-]
-
-
 def backtest(nav: list[dict[str, object]], fills: list[dict[str, object]]) -> bytes:
-    return canonical({"module": "aegis", "result": {"nav": nav, "fills": fills}})
+    return canonical(
+        {
+            "module": "aegis",
+            "input_sha256": ENVELOPE_SHA256,
+            "result": {"nav": nav, "fills": fills},
+        }
+    )
 
 
 RESULT = backtest(NAV, FILLS)
 
 
-def prepared(home: Path) -> Path:
-    """An installation whose bundle and request already admit one run."""
-    initialize(home)
-    install_run_schema(home)
-    with open_workspace(home, writable=True) as workspace:
-        pin = register_input_bundle(
-            workspace,
-            BUNDLE,
-            expected_file_sha256=hashlib.sha256(BUNDLE).hexdigest(),
-            budget=BUDGET,
-        )
-        register_backtest_request(
-            workspace, pin, REQUEST, expected_request_hash=REQUEST_HASH, budget=BUDGET
-        )
-    return home
+def request_document(pin: RunStrategyPin) -> bytes:
+    """A request shaped like the real one, sealing the identities a run must match."""
+    return canonical(
+        {
+            "schema": "aas-backtest-request-v1",
+            "hash_format": HASH_FORMAT,
+            "strategy": {
+                "strategy_store_id": pin.store_id,
+                "strategy_id": pin.strategy_id,
+                "version": pin.version,
+                "raw_sha256": pin.raw_hash,
+                "contract_sha256": pin.contract_hash,
+            },
+            "bindings": [],
+            "refs": [],
+            "price_inputs": [],
+            "macro_inputs": [],
+            "derived_inputs": [],
+            "proxy_rules": [],
+            "period": {"start": "2024-01-02", "end": "2024-01-03"},
+            "history": {},
+            "cutoff": {},
+            "decision_latency_us": 0,
+            "explicit_decision_dates": None,
+            "account": {"initial_cash": 1000},
+            "comparison": {},
+            "envelope": {},
+            "conventions": [],
+            "engine": ENGINE,
+            "environment": ENVIRONMENT,
+        }
+    )
+
+
+def preparation_document(request_hash: str, envelope_bytes: bytes = ENVELOPE) -> bytes:
+    return canonical(
+        {
+            "schema": "aas-prepared-backtest-v1",
+            "hash_format": HASH_FORMAT,
+            "request_hash": request_hash,
+            "envelope_sha256": hashlib.sha256(envelope_bytes).hexdigest(),
+        }
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class Fixture:
+    """One installation whose request, strategy and preparation already agree."""
+
+    home: Path
+    pin: RunStrategyPin
+    request_hash: str
 
 
 def admit_strategy(home: Path, root: Path) -> RunStrategyPin:
-    """Admit one strategy version through the real registration path.
-
-    A pin has to name a version the private store actually admitted, so the fixture
-    registers one rather than inserting rows behind the journal.
-    """
+    """Admit one strategy version through the real registration path."""
     from aegis_alpha.storage.strategy_import import register_strategy  # noqa: PLC0415
     from tests.engine.engine_support import contract, raw_bundle  # noqa: PLC0415
 
@@ -183,24 +216,55 @@ def admit_strategy(home: Path, root: Path) -> RunStrategyPin:
     )
 
 
+def prepared(root: Path) -> Fixture:
+    """An installation whose bundle, strategy and request already admit one run."""
+    home = root / "home"
+    initialize(home)
+    install_run_schema(home)
+    pin = admit_strategy(home, root)
+    body = request_document(pin)
+    digest = hashlib.sha256(body).hexdigest()
+    with open_workspace(home, writable=True) as workspace:
+        bundle_pin = register_input_bundle(
+            workspace,
+            BUNDLE,
+            expected_file_sha256=hashlib.sha256(BUNDLE).hexdigest(),
+            budget=BUDGET,
+        )
+        register_backtest_request(
+            workspace, bundle_pin, body, expected_request_hash=digest, budget=BUDGET
+        )
+    return Fixture(home=home, pin=pin, request_hash=digest)
+
+
 def intent(
+    fx: Fixture,
     run_id: str,
     *,
     prior_run_id: str | None = None,
-    pins: tuple[RunStrategyPin, ...] = (),
+    pins: tuple[RunStrategyPin, ...] | None = None,
 ) -> RunIntent:
     return RunIntent(
-        request_hash=REQUEST_HASH,
+        request_hash=fx.request_hash,
         bundle_id="b-empty",
-        engine_hash="e" * 64,
-        environment_hash="f" * 64,
+        engine_hash=content_sha256(ENGINE),
+        environment_hash=content_sha256(ENVIRONMENT),
         reason="synthetic run",
         envelope_bytes=ENVELOPE,
-        preparation_bytes=PREPARATION,
-        strategy_pins=pins,
+        preparation_bytes=preparation_document(fx.request_hash),
+        strategy_pins=(fx.pin,) if pins is None else pins,
         prior_run_id=prior_run_id,
         run_id=run_id,
     )
+
+
+def states(payload: dict[str, object]) -> dict[str, dict[str, object]]:
+    """Reduce a read payload to the metric values and their states."""
+    metrics = cast("dict[str, dict[str, object]]", payload["metrics"])
+    return {
+        name: {"value": entry["value"], "value_state": entry["value_state"]}
+        for name, entry in metrics.items()
+    }
 
 
 def observed(home: Path, run_id: str) -> tuple[str | None, str | None]:
@@ -218,10 +282,11 @@ def observed(home: Path, run_id: str) -> tuple[str | None, str | None]:
 
 
 def test_committed_run_reads_back_identically_in_a_separate_process(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
-    admitted = admit_strategy(home, tmp_path)
+    fx = prepared(tmp_path)
+    home = fx.home
+    admitted = fx.pin
     with open_workspace(home, writable=True) as workspace:
-        handle = open_run(workspace, intent("run-1", pins=(admitted,)))
+        handle = open_run(workspace, intent(fx, "run-1", pins=(admitted,)))
         committed = commit_run(workspace, handle, RunResult(RESULT), budget=BUDGET)
     assert committed["status"] == "SUCCESS"
     assert committed["table_counts"] == COUNTS
@@ -267,15 +332,16 @@ def test_committed_run_reads_back_identically_in_a_separate_process(tmp_path: Pa
 
 
 def test_row_order_in_the_result_does_not_move_a_receipt_or_an_ordinal(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     shuffled = backtest(list(reversed(NAV)), list(reversed(FILLS)))
     with open_workspace(home, writable=True) as workspace:
         first = commit_run(
-            workspace, open_run(workspace, intent("run-1")), RunResult(RESULT), budget=BUDGET
+            workspace, open_run(workspace, intent(fx, "run-1")), RunResult(RESULT), budget=BUDGET
         )
         second = commit_run(
             workspace,
-            open_run(workspace, intent("run-2", prior_run_id="run-1")),
+            open_run(workspace, intent(fx, "run-2", prior_run_id="run-1")),
             RunResult(shuffled),
             budget=BUDGET,
         )
@@ -321,9 +387,10 @@ def test_declared_keys_alone_do_not_decide_an_ordinal() -> None:
 
 
 def test_an_interrupted_intent_never_leaves_a_run_that_recovery_cannot_find(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     with open_workspace(home, writable=True) as workspace:
-        open_run(workspace, intent("run-1"))
+        open_run(workspace, intent(fx, "run-1"))
         assert verify_workspace(workspace, budget=BUDGET)["pending_operations"] == 1
     with open_workspace(home, writable=True) as workspace:
         assert recover_operations(workspace)["recovered"] == ["run:run-1"]
@@ -337,9 +404,10 @@ def test_an_interrupted_intent_never_leaves_a_run_that_recovery_cannot_find(tmp_
 def test_recovery_finishes_a_committed_result_without_calculating_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     with open_workspace(home, writable=True) as workspace:
-        handle = open_run(workspace, intent("run-1"))
+        handle = open_run(workspace, intent(fx, "run-1"))
         monkeypatch.setattr(
             "aegis_alpha.storage.runs._finish",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("interrupted")),
@@ -361,9 +429,10 @@ def test_recovery_finishes_a_committed_result_without_calculating_again(
 def test_a_marker_that_disagrees_with_its_evidence_is_kept_not_overwritten(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     with open_workspace(home, writable=True) as workspace:
-        handle = open_run(workspace, intent("run-1"))
+        handle = open_run(workspace, intent(fx, "run-1"))
         monkeypatch.setattr(
             "aegis_alpha.storage.runs._finish",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("interrupted")),
@@ -391,9 +460,10 @@ def test_a_marker_that_disagrees_with_its_evidence_is_kept_not_overwritten(
 
 
 def test_a_handled_calculation_failure_blocks_neither_recovery_nor_backup(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     with open_workspace(home, writable=True) as workspace:
-        handle = open_run(workspace, intent("run-1"))
+        handle = open_run(workspace, intent(fx, "run-1"))
         assert fail_run(workspace, handle, "calculation raised")["status"] == "FAILED"
     with open_workspace(home, writable=True) as workspace:
         assert recover_operations(workspace) == {
@@ -408,9 +478,10 @@ def test_a_handled_calculation_failure_blocks_neither_recovery_nor_backup(tmp_pa
 def test_a_committed_run_cannot_be_failed_or_quarantined_by_hand(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     with open_workspace(home, writable=True) as workspace:
-        handle = open_run(workspace, intent("run-1"))
+        handle = open_run(workspace, intent(fx, "run-1"))
         with pytest.raises(ValueError, match="ended by recovery"):
             quarantine(workspace, handle.operation_id, "manual")
         monkeypatch.setattr(
@@ -425,23 +496,25 @@ def test_a_committed_run_cannot_be_failed_or_quarantined_by_hand(
 
 
 def test_a_run_requires_a_registered_request_and_its_own_transaction(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     with (
         open_workspace(home, writable=True) as workspace,
         pytest.raises(RunStorageError, match="registered request"),
     ):
-        open_run(workspace, replace(intent("run-1"), request_hash="c" * 64))
+        open_run(workspace, replace(intent(fx, "run-1"), request_hash="c" * 64))
     with open_workspace(home, writable=True) as workspace:
         workspace.state.execute("BEGIN IMMEDIATE")
         with pytest.raises(RunStorageError, match="another state transaction"):
-            open_run(workspace, intent("run-1"))
+            open_run(workspace, intent(fx, "run-1"))
         workspace.state.rollback()
 
 
 def test_a_tampered_artifact_refuses_to_read_back(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     with open_workspace(home, writable=True) as workspace:
-        handle = open_run(workspace, intent("run-1"))
+        handle = open_run(workspace, intent(fx, "run-1"))
         commit_run(workspace, handle, RunResult(RESULT), budget=BUDGET)
         sealed = workspace.paths.runs / "run-1" / "backtest.json"
     sealed.write_bytes(backtest(NAV, FILLS[:1]))
@@ -465,6 +538,7 @@ def cashflow(nav: list[dict[str, object]], unit_nav: list[dict[str, object]]) ->
     return canonical(
         {
             "module": "aegis",
+            "input_sha256": ENVELOPE_SHA256,
             "result": {
                 "account": {"nav": nav, "fills": FILLS},
                 "unit_nav": unit_nav,
@@ -481,10 +555,10 @@ def interrupt(monkeypatch: pytest.MonkeyPatch, target: str) -> None:
     )
 
 
-def committed_run(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def committed_run(fx: Fixture, monkeypatch: pytest.MonkeyPatch) -> None:
     """Leave a run whose market marker is committed but whose state record is not."""
-    with open_workspace(home, writable=True) as workspace:
-        handle = open_run(workspace, intent("run-1"))
+    with open_workspace(fx.home, writable=True) as workspace:
+        handle = open_run(workspace, intent(fx, "run-1"))
         interrupt(monkeypatch, "_finish")
         with pytest.raises(RuntimeError, match="interrupted"):
             commit_run(workspace, handle, RunResult(RESULT), budget=BUDGET)
@@ -508,8 +582,9 @@ def alter_market(home: Path, statement: str, parameters: list[object]) -> None:
 def test_corrupted_results_end_the_run_instead_of_blocking_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, statement: str, parameters: list[object]
 ) -> None:
-    home = prepared(tmp_path / "home")
-    committed_run(home, monkeypatch)
+    fx = prepared(tmp_path)
+    home = fx.home
+    committed_run(fx, monkeypatch)
     alter_market(home, statement, parameters)
     with open_workspace(home, writable=True) as workspace:
         assert recover_operations(workspace)["recovered"] == ["run:run-1"]
@@ -521,8 +596,9 @@ def test_corrupted_results_end_the_run_instead_of_blocking_recovery(
 def test_a_refused_materialization_leaves_the_run_open_instead_of_quarantining_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home = prepared(tmp_path / "home")
-    committed_run(home, monkeypatch)
+    fx = prepared(tmp_path)
+    home = fx.home
+    committed_run(fx, monkeypatch)
     with open_workspace(home, writable=True) as workspace:
         operation = workspace.state.execute(
             "SELECT * FROM storage_operations WHERE target_id='run-1'"
@@ -539,10 +615,11 @@ def test_a_refused_materialization_leaves_the_run_open_instead_of_quarantining_i
 def test_reading_and_verifying_refuse_to_materialize_beyond_the_allowance(
     tmp_path: Path,
 ) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     with open_workspace(home, writable=True) as workspace:
         commit_run(
-            workspace, open_run(workspace, intent("run-1")), RunResult(RESULT), budget=BUDGET
+            workspace, open_run(workspace, intent(fx, "run-1")), RunResult(RESULT), budget=BUDGET
         )
     with open_workspace(home) as workspace:
         with pytest.raises(ComputeResourceError):
@@ -552,10 +629,11 @@ def test_reading_and_verifying_refuse_to_materialize_beyond_the_allowance(
 
 
 def test_an_intent_from_another_run_cannot_end_this_one(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     with open_workspace(home, writable=True) as workspace:
-        first = open_run(workspace, intent("run-1"))
-        second = open_run(workspace, intent("run-2"))
+        first = open_run(workspace, intent(fx, "run-1"))
+        second = open_run(workspace, intent(fx, "run-2"))
         borrowed = replace(second, operation_id=first.operation_id)
         with pytest.raises(RunStorageError, match="does not belong to this run"):
             fail_run(workspace, borrowed, "wrong run")
@@ -566,12 +644,13 @@ def test_an_intent_from_another_run_cannot_end_this_one(tmp_path: Path) -> None:
 def test_an_identical_retry_resumes_instead_of_failing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     with open_workspace(home, writable=True) as workspace:
-        first = open_run(workspace, intent("run-1"))
-        assert open_run(workspace, intent("run-1")) == first
+        first = open_run(workspace, intent(fx, "run-1"))
+        assert open_run(workspace, intent(fx, "run-1")) == first
         with pytest.raises(RunStorageError, match="different or finished run"):
-            open_run(workspace, replace(intent("run-1"), reason="a different question"))
+            open_run(workspace, replace(intent(fx, "run-1"), reason="a different question"))
         interrupt(monkeypatch, "_finish")
         with pytest.raises(RuntimeError, match="interrupted"):
             commit_run(workspace, first, RunResult(RESULT), budget=BUDGET)
@@ -585,9 +664,10 @@ def test_an_identical_retry_resumes_instead_of_failing(
 
 
 def test_a_sealed_artifact_is_never_replaced_by_different_bytes(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     with open_workspace(home, writable=True) as workspace:
-        handle = open_run(workspace, intent("run-1"))
+        handle = open_run(workspace, intent(fx, "run-1"))
         commit_run(workspace, handle, RunResult(RESULT), budget=BUDGET)
         with pytest.raises(RunStorageError, match="already holds different bytes"):
             _seal(workspace, "run-1", "backtest.json", backtest(NAV, FILLS[:1]))
@@ -596,7 +676,8 @@ def test_a_sealed_artifact_is_never_replaced_by_different_bytes(tmp_path: Path) 
 def test_an_interrupted_seal_still_leaves_a_discoverable_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     sealed: list[str] = []
     original = _seal
 
@@ -611,7 +692,7 @@ def test_an_interrupted_seal_still_leaves_a_discoverable_run(
         open_workspace(home, writable=True) as workspace,
         pytest.raises(RuntimeError, match="between seals"),
     ):
-        open_run(workspace, intent("run-1"))
+        open_run(workspace, intent(fx, "run-1"))
     monkeypatch.undo()
     assert sealed == ["envelope.json"]
     assert observed(home, "run-1") == ("RUNNING", "PREPARED")
@@ -621,15 +702,16 @@ def test_an_interrupted_seal_still_leaves_a_discoverable_run(
 
 
 def test_metrics_do_not_depend_on_the_supplied_array_order(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     with open_workspace(home, writable=True) as workspace:
         forward = commit_run(
-            workspace, open_run(workspace, intent("run-1")), RunResult(RESULT), budget=BUDGET
+            workspace, open_run(workspace, intent(fx, "run-1")), RunResult(RESULT), budget=BUDGET
         )
         reversed_document = backtest(list(reversed(NAV)), list(reversed(FILLS)))
         backward = commit_run(
             workspace,
-            open_run(workspace, intent("run-2")),
+            open_run(workspace, intent(fx, "run-2")),
             RunResult(reversed_document),
             budget=BUDGET,
         )
@@ -639,7 +721,8 @@ def test_metrics_do_not_depend_on_the_supplied_array_order(tmp_path: Path) -> No
 def test_an_unrepresentable_return_is_recorded_as_unsupported_not_as_a_number(
     tmp_path: Path,
 ) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     extreme: list[dict[str, object]] = [
         {"date": "2024-01-02", "equity": 1e-12, "cash": 0.0},
         {"date": "2024-01-03", "equity": 1e25, "cash": 0.0},
@@ -647,7 +730,7 @@ def test_an_unrepresentable_return_is_recorded_as_unsupported_not_as_a_number(
     with open_workspace(home, writable=True) as workspace:
         committed = commit_run(
             workspace,
-            open_run(workspace, intent("run-1")),
+            open_run(workspace, intent(fx, "run-1")),
             RunResult(backtest(extreme, [])),
             budget=BUDGET,
         )
@@ -657,11 +740,12 @@ def test_an_unrepresentable_return_is_recorded_as_unsupported_not_as_a_number(
 
 
 def test_a_cashflow_result_measures_return_without_the_contributions(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     with open_workspace(home, writable=True) as workspace:
         committed = commit_run(
             workspace,
-            open_run(workspace, intent("run-1")),
+            open_run(workspace, intent(fx, "run-1")),
             RunResult(cashflow(NAV, UNIT_NAV)),
             budget=BUDGET,
         )
@@ -675,10 +759,17 @@ def test_a_cashflow_result_measures_return_without_the_contributions(tmp_path: P
 
 
 def test_an_unsupported_result_contract_is_refused_before_it_is_sealed(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     with open_workspace(home, writable=True) as workspace:
-        handle = open_run(workspace, intent("run-1"))
-        unsupported = canonical({"module": "aegis", "result": {"positions": []}})
+        handle = open_run(workspace, intent(fx, "run-1"))
+        unsupported = canonical(
+            {
+                "module": "aegis",
+                "input_sha256": ENVELOPE_SHA256,
+                "result": {"positions": []},
+            }
+        )
         with pytest.raises(RunStorageError, match="unsupported backtest result contract"):
             commit_run(workspace, handle, RunResult(unsupported), budget=BUDGET)
         assert not (workspace.paths.runs / "run-1" / "backtest.json").exists()
@@ -686,10 +777,11 @@ def test_an_unsupported_result_contract_is_refused_before_it_is_sealed(tmp_path:
 
 
 def test_verification_rejects_a_successful_run_whose_stored_rows_changed(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     with open_workspace(home, writable=True) as workspace:
         commit_run(
-            workspace, open_run(workspace, intent("run-1")), RunResult(RESULT), budget=BUDGET
+            workspace, open_run(workspace, intent(fx, "run-1")), RunResult(RESULT), budget=BUDGET
         )
     alter_market(home, "UPDATE equity_points SET cash=? WHERE ordinal=0", [Decimal("7.5")])
     with open_workspace(home) as workspace:
@@ -699,7 +791,7 @@ def test_verification_rejects_a_successful_run_whose_stored_rows_changed(tmp_pat
             read_run(workspace, "run-1", budget=BUDGET)
 
 
-def linked(request_hash: str, envelope_bytes: bytes) -> bytes:
+def linked_preparation(request_hash: str, envelope_bytes: bytes) -> bytes:
     """A preparation document shaped like the real aas-prepared-backtest-v1 sidecar."""
     return canonical(
         {
@@ -712,7 +804,8 @@ def linked(request_hash: str, envelope_bytes: bytes) -> bytes:
 
 
 def test_a_preparation_from_another_request_is_never_sealed(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     foreign = canonical(
         {
             "schema": "aas-prepared-backtest-v1",
@@ -723,19 +816,23 @@ def test_a_preparation_from_another_request_is_never_sealed(tmp_path: Path) -> N
     )
     with open_workspace(home, writable=True) as workspace:
         with pytest.raises(RunStorageError, match="preparation request names different evidence"):
-            open_run(workspace, replace(intent("run-1"), preparation_bytes=foreign))
+            open_run(workspace, replace(intent(fx, "run-1"), preparation_bytes=foreign))
         assert not (workspace.paths.runs / "run-1").exists()
         other = canonical({"targets": {"2024-01-02": {"ZZZ": 1.0}}})
         with pytest.raises(RunStorageError, match="preparation envelope names different evidence"):
             open_run(
                 workspace,
-                replace(intent("run-1"), preparation_bytes=linked(REQUEST_HASH, other)),
+                replace(
+                    intent(fx, "run-1"),
+                    preparation_bytes=linked_preparation(fx.request_hash, other),
+                ),
             )
     assert observed(home, "run-1") == (None, None)
 
 
 def test_a_result_computed_from_another_envelope_is_refused(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     other = canonical({"targets": {"2024-01-02": {"ZZZ": 1.0}}})
     mismatched = canonical(
         {
@@ -746,7 +843,10 @@ def test_a_result_computed_from_another_envelope_is_refused(tmp_path: Path) -> N
     )
     with open_workspace(home, writable=True) as workspace:
         handle = open_run(
-            workspace, replace(intent("run-1"), preparation_bytes=linked(REQUEST_HASH, ENVELOPE))
+            workspace,
+            replace(
+                intent(fx, "run-1"), preparation_bytes=linked_preparation(fx.request_hash, ENVELOPE)
+            ),
         )
         with pytest.raises(RunStorageError, match="backtest envelope names different evidence"):
             commit_run(workspace, handle, RunResult(mismatched), budget=BUDGET)
@@ -755,21 +855,42 @@ def test_a_result_computed_from_another_envelope_is_refused(tmp_path: Path) -> N
 
 
 def test_a_result_from_another_module_is_refused(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     envelope = canonical({"module": "aegis", "targets": {"2024-01-02": {"AAA": 1.0}}})
-    foreign = canonical({"module": "hedge", "result": {"nav": NAV, "fills": FILLS}})
+    foreign = canonical(
+        {
+            "module": "hedge",
+            "input_sha256": hashlib.sha256(envelope).hexdigest(),
+            "result": {"nav": NAV, "fills": FILLS},
+        }
+    )
     with open_workspace(home, writable=True) as workspace:
-        handle = open_run(workspace, replace(intent("run-1"), envelope_bytes=envelope))
+        handle = open_run(
+            workspace,
+            replace(
+                intent(fx, "run-1"),
+                envelope_bytes=envelope,
+                preparation_bytes=preparation_document(fx.request_hash, envelope),
+            ),
+        )
         with pytest.raises(RunStorageError, match="module conflicts with the envelope"):
             commit_run(workspace, handle, RunResult(foreign), budget=BUDGET)
         assert not (workspace.paths.runs / "run-1" / "backtest.json").exists()
 
 
 def test_a_rejected_result_leaves_the_run_open_for_a_corrected_retry(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
-    malformed = canonical({"module": "aegis", "result": {"nav": [], "fills": "bad"}})
+    fx = prepared(tmp_path)
+    home = fx.home
+    malformed = canonical(
+        {
+            "module": "aegis",
+            "input_sha256": ENVELOPE_SHA256,
+            "result": {"nav": [], "fills": "bad"},
+        }
+    )
     with open_workspace(home, writable=True) as workspace:
-        handle = open_run(workspace, intent("run-1"))
+        handle = open_run(workspace, intent(fx, "run-1"))
         with pytest.raises(RunStorageError, match="fills must be an array"):
             commit_run(workspace, handle, RunResult(malformed), budget=BUDGET)
         assert not (workspace.paths.runs / "run-1" / "backtest.json").exists()
@@ -781,7 +902,8 @@ def test_a_rejected_result_leaves_the_run_open_for_a_corrected_retry(tmp_path: P
 def test_a_retry_cannot_substitute_a_different_preparation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     sealed: list[str] = []
     original = _seal
 
@@ -796,40 +918,75 @@ def test_a_retry_cannot_substitute_a_different_preparation(
         open_workspace(home, writable=True) as workspace,
         pytest.raises(RuntimeError, match="between seals"),
     ):
-        open_run(workspace, intent("run-1"))
+        open_run(workspace, intent(fx, "run-1"))
     monkeypatch.undo()
-    substitute = canonical({"schema": "aas-backtest-preparation-v1", "note": "substituted"})
+    substitute = canonical(
+        {
+            "schema": "aas-prepared-backtest-v1",
+            "hash_format": HASH_FORMAT,
+            "request_hash": fx.request_hash,
+            "envelope_sha256": ENVELOPE_SHA256,
+            "note": "substituted",
+        }
+    )
     with open_workspace(home, writable=True) as workspace:
         # The intent commits both input digests, so the accepted preparation cannot be
         # swapped by a retry that reuses the envelope.
         with pytest.raises(ValueError, match="already identifies a different request"):
-            open_run(workspace, replace(intent("run-1"), preparation_bytes=substitute))
-        assert open_run(workspace, intent("run-1")).run_id == "run-1"
+            open_run(workspace, replace(intent(fx, "run-1"), preparation_bytes=substitute))
+        assert open_run(workspace, intent(fx, "run-1")).run_id == "run-1"
 
 
-def test_provenance_identities_must_be_digests(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
-    with open_workspace(home, writable=True) as workspace:
-        with pytest.raises(RunStorageError, match="engine_hash must be a lowercase SHA-256"):
-            open_run(workspace, replace(intent("run-1"), engine_hash="engine-v1"))
-        with pytest.raises(RunStorageError, match="environment_hash must be a lowercase"):
-            open_run(workspace, replace(intent("run-1"), environment_hash="ENV"))
-    assert observed(home, "run-1") == (None, None)
+def test_provenance_identities_must_match_the_registered_request(tmp_path: Path) -> None:
+    fx = prepared(tmp_path)
+    with open_workspace(fx.home, writable=True) as workspace:
+        for wrong in (
+            replace(intent(fx, "run-1"), engine_hash="e" * 64),
+            replace(intent(fx, "run-1"), environment_hash="f" * 64),
+        ):
+            with pytest.raises(RunStorageError, match="does not match the registered request"):
+                open_run(workspace, wrong)
+    assert observed(fx.home, "run-1") == (None, None)
 
 
-def test_a_fabricated_strategy_pin_is_refused(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
-    admitted = admit_strategy(home, tmp_path)
-    with open_workspace(home, writable=True) as workspace:
+def test_a_run_id_cannot_escape_the_runs_directory(tmp_path: Path) -> None:
+    fx = prepared(tmp_path)
+    with open_workspace(fx.home, writable=True) as workspace:
+        for unsafe in ("../escape", "with/slash", " leading", ".hidden"):
+            with pytest.raises(RunStorageError, match="run_id"):
+                open_run(workspace, replace(intent(fx, "run-1"), run_id=unsafe))
+
+
+def test_strategy_pins_must_match_the_registered_request(tmp_path: Path) -> None:
+    fx = prepared(tmp_path)
+    admitted = fx.pin
+    with open_workspace(fx.home, writable=True) as workspace:
+        for wrong in (
+            replace(admitted, raw_hash="a" * 64),
+            replace(admitted, store_id="elsewhere"),
+            replace(admitted, version="2"),
+        ):
+            with pytest.raises(RunStorageError, match="do not match the registered request"):
+                open_run(workspace, intent(fx, "run-1", pins=(wrong,)))
+        with pytest.raises(RunStorageError, match="do not match the registered request"):
+            open_run(workspace, intent(fx, "run-1", pins=()))
+    assert observed(fx.home, "run-1") == (None, None)
+
+
+def test_a_pin_the_private_store_never_admitted_is_refused(tmp_path: Path) -> None:
+    fx = prepared(tmp_path)
+    with open_workspace(fx.home, writable=True) as workspace:
+        # The second line of defence: even a pin the request agrees with must name a
+        # version the private store actually holds.
         with pytest.raises(RunStorageError, match="does not match an admitted strategy version"):
-            open_run(workspace, intent("run-1", pins=(replace(admitted, raw_hash="a" * 64),)))
+            _require_admitted_pins(workspace, (replace(fx.pin, raw_hash="a" * 64),))
         with pytest.raises(RunStorageError, match="names a different strategy store"):
-            open_run(workspace, intent("run-1", pins=(replace(admitted, store_id="elsewhere"),)))
-    assert observed(home, "run-1") == (None, None)
+            _require_admitted_pins(workspace, (replace(fx.pin, store_id="elsewhere"),))
 
 
 def test_an_exact_integer_is_not_rounded_through_binary64(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     exact = 9007199254740993
     nav: list[dict[str, object]] = [
         {"date": "2024-01-02", "equity": 1000, "cash": 0},
@@ -838,7 +995,7 @@ def test_an_exact_integer_is_not_rounded_through_binary64(tmp_path: Path) -> Non
     with open_workspace(home, writable=True) as workspace:
         committed = commit_run(
             workspace,
-            open_run(workspace, intent("run-1")),
+            open_run(workspace, intent(fx, "run-1")),
             RunResult(backtest(nav, [])),
             budget=BUDGET,
         )
@@ -853,10 +1010,11 @@ def test_an_exact_integer_is_not_rounded_through_binary64(tmp_path: Path) -> Non
 
 
 def test_a_tampered_metric_reference_is_refused(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     with open_workspace(home, writable=True) as workspace:
         commit_run(
-            workspace, open_run(workspace, intent("run-1")), RunResult(RESULT), budget=BUDGET
+            workspace, open_run(workspace, intent(fx, "run-1")), RunResult(RESULT), budget=BUDGET
         )
     with open_workspace(home, writable=True) as workspace:
         # The immutable trigger blocks UPDATE, so the row is replaced through the
@@ -876,10 +1034,11 @@ def test_a_tampered_metric_reference_is_refused(tmp_path: Path) -> None:
 
 
 def test_a_tampered_module_manifest_is_refused(tmp_path: Path) -> None:
-    home = prepared(tmp_path / "home")
+    fx = prepared(tmp_path)
+    home = fx.home
     with open_workspace(home, writable=True) as workspace:
         commit_run(
-            workspace, open_run(workspace, intent("run-1")), RunResult(RESULT), budget=BUDGET
+            workspace, open_run(workspace, intent(fx, "run-1")), RunResult(RESULT), budget=BUDGET
         )
     with open_workspace(home, writable=True) as workspace:
         workspace.state.execute("PRAGMA writable_schema=ON")
@@ -897,8 +1056,9 @@ def test_a_tampered_module_manifest_is_refused(tmp_path: Path) -> None:
 def test_recovery_charges_its_reads_without_a_caller_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home = prepared(tmp_path / "home")
-    committed_run(home, monkeypatch)
+    fx = prepared(tmp_path)
+    home = fx.home
+    committed_run(fx, monkeypatch)
     seen: list[object] = []
     original = _stored_rows
 
