@@ -34,6 +34,7 @@ from aegis_alpha.storage.runs import (
     open_run,
     read_run,
     recover_run,
+    verify_run,
 )
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
@@ -82,26 +83,33 @@ BUNDLE = canonical(
         "bindings": [],
     }
 )
-ENVELOPE = canonical(
-    {"module": "aegis", "targets": {"2024-01-02": {"AAA": 1.0}, "2024-01-03": {"AAA": 0.5}}}
-)
+# Three supplied sessions with targets on the first two, so every fill below decides on
+# one session and executes on the next one. The engine pairs dates[index - 1] with
+# dates[index], so an envelope that names no sessions cannot justify any fill at all.
+SESSIONS = ["2024-01-02", "2024-01-03", "2024-01-04"]
+TARGETS: dict[str, dict[str, float]] = {
+    "2024-01-02": {"AAA": 1.0},
+    "2024-01-03": {"AAA": 0.5},
+}
+ENVELOPE = canonical({"module": "aegis", "dates": SESSIONS, "targets": TARGETS})
 ENVELOPE_SHA256 = hashlib.sha256(ENVELOPE).hexdigest()
 NAV: list[dict[str, object]] = [
     {"date": "2024-01-02", "equity": 1000.0, "cash": 0.0},
-    {"date": "2024-01-03", "equity": 1100.0, "cash": 10.0},
+    {"date": "2024-01-03", "equity": 1050.0, "cash": 10.0},
+    {"date": "2024-01-04", "equity": 1100.0, "cash": 10.0},
 ]
 FILLS: list[dict[str, object]] = [
     {
-        "decision_date": "2024-01-01",
-        "execution_date": "2024-01-02",
+        "decision_date": "2024-01-02",
+        "execution_date": "2024-01-03",
         "symbol": "AAA",
         "shares": 10.0,
         "price": 100.0,
         "fee": 1.0,
     },
     {
-        "decision_date": "2024-01-02",
-        "execution_date": "2024-01-03",
+        "decision_date": "2024-01-03",
+        "execution_date": "2024-01-04",
         "symbol": "BBB",
         "shares": 2.0,
         "price": 50.0,
@@ -109,7 +117,7 @@ FILLS: list[dict[str, object]] = [
     },
 ]
 COUNTS = {
-    "equity_points": 2,
+    "equity_points": 3,
     "positions": 0,
     "signals": 0,
     "simulated_trades": 2,
@@ -155,7 +163,7 @@ def request_document(pin: RunStrategyPin) -> bytes:
             "macro_inputs": [],
             "derived_inputs": [],
             "proxy_rules": [],
-            "period": {"start": "2024-01-02", "end": "2024-01-03"},
+            "period": {"start": "2024-01-02", "end": "2024-01-04"},
             "history": {},
             "cutoff": {},
             "decision_latency_us": 0,
@@ -532,7 +540,8 @@ TIGHT = replace(
 )
 UNIT_NAV: list[dict[str, object]] = [
     {"date": "2024-01-02", "unit_value": 1.0, "units": 1000.0, "external_flow": 0.0},
-    {"date": "2024-01-03", "unit_value": 1.02, "units": 1000.0, "external_flow": 500.0},
+    {"date": "2024-01-03", "unit_value": 1.01, "units": 1000.0, "external_flow": 0.0},
+    {"date": "2024-01-04", "unit_value": 1.02, "units": 1000.0, "external_flow": 500.0},
 ]
 
 
@@ -544,7 +553,7 @@ def cashflow(nav: list[dict[str, object]], unit_nav: list[dict[str, object]]) ->
             "result": {
                 "account": {"nav": nav, "fills": FILLS},
                 "unit_nav": unit_nav,
-                "cashflows": [{"date": "2024-01-03", "amount": 500.0}],
+                "cashflows": [{"date": "2024-01-04", "amount": 500.0}],
             },
         }
     )
@@ -859,7 +868,13 @@ def test_a_result_computed_from_another_envelope_is_refused(tmp_path: Path) -> N
 def test_a_result_from_another_module_is_refused(tmp_path: Path) -> None:
     fx = prepared(tmp_path)
     home = fx.home
-    envelope = canonical({"module": "aegis", "targets": {"2024-01-02": {"AAA": 1.0}}})
+    envelope = canonical(
+        {
+            "module": "aegis",
+            "dates": ["2024-01-02", "2024-01-03"],
+            "targets": {"2024-01-02": {"AAA": 1.0}},
+        }
+    )
     foreign = canonical(
         {
             "module": "hedge",
@@ -1309,3 +1324,325 @@ def test_a_stale_handle_seals_nothing(tmp_path: Path) -> None:
         assert (
             commit_run(workspace, handle, RunResult(RESULT), budget=BUDGET)["status"] == "SUCCESS"
         )
+
+
+def sealed_under(fx: Fixture, run_id: str, envelope_bytes: bytes) -> RunIntent:
+    """An intent whose preparation names the envelope it is sealed beside."""
+    return replace(
+        intent(fx, run_id),
+        envelope_bytes=envelope_bytes,
+        preparation_bytes=preparation_document(fx.request_hash, envelope_bytes),
+    )
+
+
+def counts(payload: dict[str, object]) -> dict[str, int]:
+    """The per-table row counts a commit or a read reports."""
+    return cast("dict[str, int]", payload["table_counts"])
+
+
+def prepared_envelope_and_result() -> tuple[bytes, bytes]:
+    """A real exported envelope and the result the shipped runner computes from it."""
+    from aegis_alpha.application.backtest_cli import run_document  # noqa: PLC0415
+    from tests.engine.test_backtest_request import emit, fixture, project  # noqa: PLC0415
+
+    body, definition, docs = fixture()
+    parsed, projection = project(body, definition, docs)
+    exported = emit(parsed, projection)
+    return exported.canonical_bytes, canonical(
+        run_document(exported.canonical_bytes, exported.envelope_sha256)
+    )
+
+
+def test_a_prepared_envelope_and_its_engine_result_survive_a_closed_weekend(
+    tmp_path: Path,
+) -> None:
+    fx = prepared(tmp_path)
+    envelope_bytes, result_bytes = prepared_envelope_and_result()
+    document = json.loads(result_bytes)
+    # A Friday decision executing on the Monday open: adjacent in the supplied sessions
+    # and three calendar days apart, which is what a calendar-derived rule gets wrong.
+    assert json.loads(envelope_bytes)["dates"] == ["2026-01-30", "2026-02-02"]
+    assert [
+        (fill["decision_date"], fill["execution_date"]) for fill in document["result"]["fills"]
+    ] == [("2026-01-30", "2026-02-02")]
+    with open_workspace(fx.home, writable=True) as workspace:
+        handle = open_run(workspace, sealed_under(fx, "run-1", envelope_bytes))
+        committed = commit_run(workspace, handle, RunResult(result_bytes), budget=BUDGET)
+    assert committed["status"] == "SUCCESS"
+    assert counts(committed)["simulated_trades"] == 1
+    separate = subprocess.run(  # noqa: S603 -- a second process is the point of the check
+        [sys.executable, "-c", READER, str(fx.home), "run-1"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(separate.stdout)
+    assert payload["result_hash"] == committed["result_hash"]
+    assert payload["table_hashes"] == committed["table_hashes"]
+    assert payload["table_counts"] == committed["table_counts"]
+    with open_workspace(fx.home) as workspace:
+        assert verify_workspace(workspace, budget=BUDGET)["verified"] is True
+
+
+@pytest.mark.parametrize(
+    ("document", "message"),
+    [
+        ({"module": "aegis", "targets": TARGETS}, "does not name the sessions"),
+        (
+            {"module": "aegis", "dates": [SESSIONS[0]], "targets": TARGETS},
+            "at least two sessions",
+        ),
+        (
+            {"module": "aegis", "dates": [SESSIONS[0], SESSIONS[0]], "targets": TARGETS},
+            "increase without repeating",
+        ),
+        (
+            {"module": "aegis", "dates": [SESSIONS[1], SESSIONS[0]], "targets": TARGETS},
+            "increase without repeating",
+        ),
+        (
+            {"module": "aegis", "dates": [SESSIONS[0], "the-next-one"], "targets": TARGETS},
+            "envelope sessions must be ISO text",
+        ),
+        (
+            {"module": "aegis", "dates": SESSIONS[0], "targets": TARGETS},
+            "envelope dates must be an array",
+        ),
+    ],
+)
+def test_an_envelope_without_a_usable_session_list_is_never_sealed(
+    tmp_path: Path, document: dict[str, object], message: str
+) -> None:
+    fx = prepared(tmp_path)
+    envelope_bytes = canonical(document)
+    with open_workspace(fx.home, writable=True) as workspace:
+        with pytest.raises(RunStorageError, match=message):
+            open_run(workspace, sealed_under(fx, "run-1", envelope_bytes))
+        assert not (workspace.paths.runs / "run-1").exists()
+    # The list is read from the sealed envelope alone. Nothing falls back to a system
+    # calendar or a current market lookup to supply the sessions it does not carry.
+    assert observed(fx.home, "run-1") == (None, None)
+
+
+@pytest.mark.parametrize(
+    ("targets", "message"),
+    [
+        ({SESSIONS[2]: {"AAA": 1.0}}, "requires a following supplied session"),
+        ({"2024-01-09": {"AAA": 1.0}}, "requires a following supplied session"),
+        ({"20240102": {"AAA": 1.0}}, "must be spelled YYYY-MM-DD"),
+    ],
+)
+def test_a_target_the_sessions_cannot_execute_is_never_sealed(
+    tmp_path: Path, targets: dict[str, dict[str, float]], message: str
+) -> None:
+    """A decision needs a following session whether or not any fill acted on it.
+
+    The weight row is stored from the envelope alone, so a target nothing could execute
+    would be committed even by a result with no fills at all.
+    """
+    fx = prepared(tmp_path)
+    envelope_bytes = canonical({"module": "aegis", "dates": SESSIONS, "targets": targets})
+    with open_workspace(fx.home, writable=True) as workspace:
+        handle = open_run(workspace, sealed_under(fx, "run-1", envelope_bytes))
+        empty = canonical(
+            {
+                "module": "aegis",
+                "input_sha256": hashlib.sha256(envelope_bytes).hexdigest(),
+                "result": {"nav": NAV, "fills": []},
+            }
+        )
+        with pytest.raises(RunStorageError, match=message):
+            commit_run(workspace, handle, RunResult(empty), budget=BUDGET)
+        assert not (workspace.paths.runs / "run-1" / "backtest.json").exists()
+
+
+def one_fill(decision: str, execution: str) -> list[dict[str, object]]:
+    return [
+        {
+            "decision_date": decision,
+            "execution_date": execution,
+            "symbol": "AAA",
+            "shares": 10.0,
+            "price": 100.0,
+            "fee": 1.0,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("decision", "execution"),
+    [("20240102", "2024-01-03"), ("2024-01-02", "2024-W01-3")],
+)
+def test_a_date_the_shipped_runner_would_refuse_is_not_certified_here(
+    tmp_path: Path, decision: str, execution: str
+) -> None:
+    """date.fromisoformat accepts spellings backtest_cli._day rejects.
+
+    Normalising them here would let storage certify a pairing the supported executor
+    would never have produced, so the sealed text must already be canonical.
+    """
+    fx = prepared(tmp_path)
+    with open_workspace(fx.home, writable=True) as workspace:
+        handle = open_run(workspace, intent(fx, "run-1"))
+        with pytest.raises(RunStorageError, match="must be spelled YYYY-MM-DD"):
+            commit_run(
+                workspace,
+                handle,
+                RunResult(backtest(NAV, one_fill(decision, execution))),
+                budget=BUDGET,
+            )
+        assert not (workspace.paths.runs / "run-1" / "backtest.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("decision", "execution", "message"),
+    [
+        ("2024-01-01", "2024-01-02", "not one of the envelope sessions"),
+        ("2024-01-02", "2024-01-04", "on the session after its decision"),
+        ("2024-01-02", "2024-01-05", "on the session after its decision"),
+        ("2024-01-02", "2024-01-02", "must execute after the decision"),
+        ("2024-01-03", "2024-01-02", "must execute after the decision"),
+        ("2024-01-04", "2024-01-05", "no target weights in the envelope"),
+    ],
+)
+def test_a_pair_the_sealed_sessions_cannot_produce_seals_nothing(
+    tmp_path: Path, decision: str, execution: str, message: str
+) -> None:
+    fx = prepared(tmp_path)
+    with open_workspace(fx.home, writable=True) as workspace:
+        handle = open_run(workspace, intent(fx, "run-1"))
+        with pytest.raises(RunStorageError, match=message):
+            commit_run(
+                workspace,
+                handle,
+                RunResult(backtest(NAV, one_fill(decision, execution))),
+                budget=BUDGET,
+            )
+        assert not (workspace.paths.runs / "run-1" / "backtest.json").exists()
+        markers = workspace.market.execute("SELECT count(*) FROM result_commits").fetchone()
+        assert markers is not None
+        assert markers[0] == 0
+        status = workspace.state.execute("SELECT status FROM runs WHERE run_id=?", ("run-1",))
+        assert [tuple(row) for row in status] == [("RUNNING",)]
+        # The run stays open, so a corrected result still commits under the same handle.
+        corrected = commit_run(workspace, handle, RunResult(RESULT), budget=BUDGET)
+    assert corrected["status"] == "SUCCESS"
+    assert observed(fx.home, "run-1") == ("SUCCESS", "COMPLETED")
+
+
+SOLD_OUT_OF_THE_TARGETS: list[dict[str, object]] = [
+    {
+        "decision_date": "2024-01-03",
+        "execution_date": "2024-01-04",
+        "symbol": "ZZZ",
+        "shares": -4.0,
+        "price": 25.0,
+        "fee": 0.25,
+    }
+]
+
+
+@pytest.mark.parametrize(
+    ("fills", "trades"), [([], 0), (FILLS[:1], 1), (SOLD_OUT_OF_THE_TARGETS, 1)]
+)
+def test_ordinary_results_are_not_refused_for_the_fills_they_do_not_have(
+    tmp_path: Path, fills: list[dict[str, object]], trades: int
+) -> None:
+    """No trade, one target day acted on, and a sale of a symbol the targets dropped.
+
+    The engine builds fills from previous.keys() | units.keys(), so a sold symbol need
+    not appear among the new positive weights and a decision day need not produce a fill
+    at all. Storage judges the session pairing and re-derives no symbol, quantity, price
+    or fee, which is why an unheard-of ZZZ at an arbitrary price is still storable.
+    """
+    fx = prepared(tmp_path)
+    with open_workspace(fx.home, writable=True) as workspace:
+        committed = commit_run(
+            workspace,
+            open_run(workspace, intent(fx, "run-1")),
+            RunResult(backtest(NAV, fills)),
+            budget=BUDGET,
+        )
+    assert committed["status"] == "SUCCESS"
+    assert counts(committed)["simulated_trades"] == trades
+    # Both target days keep their weight row whether or not a fill acted on them.
+    assert counts(committed)["target_weights"] == len(TARGETS)
+
+
+def test_an_all_cash_decision_and_its_liquidating_fill_still_commit(tmp_path: Path) -> None:
+    fx = prepared(tmp_path)
+    envelope_bytes = canonical(
+        {
+            "module": "aegis",
+            "dates": SESSIONS,
+            "targets": {"2024-01-02": {"AAA": 1.0}, "2024-01-03": {}},
+        }
+    )
+    liquidation: list[dict[str, object]] = [
+        {
+            "decision_date": "2024-01-03",
+            "execution_date": "2024-01-04",
+            "symbol": "AAA",
+            "shares": -10.0,
+            "price": 105.0,
+            "fee": 1.05,
+        }
+    ]
+    result = canonical(
+        {
+            "module": "aegis",
+            "input_sha256": hashlib.sha256(envelope_bytes).hexdigest(),
+            "result": {"nav": NAV, "fills": liquidation},
+        }
+    )
+    with open_workspace(fx.home, writable=True) as workspace:
+        handle = open_run(workspace, sealed_under(fx, "run-1", envelope_bytes))
+        committed = commit_run(workspace, handle, RunResult(result), budget=BUDGET)
+    # An all-cash day carries no weight row, and that absence is not a missing target.
+    assert counts(committed)["target_weights"] == 1
+    assert counts(committed)["simulated_trades"] == 1
+
+
+def test_a_success_run_sealed_before_this_check_keeps_its_status_and_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fx = prepared(tmp_path)
+    legacy = canonical({"module": "aegis", "targets": {"2024-01-02": {"AAA": 1.0}}})
+    recorded = canonical(
+        {
+            "module": "aegis",
+            "input_sha256": hashlib.sha256(legacy).hexdigest(),
+            "result": {"nav": NAV, "fills": []},
+        }
+    )
+    # Suspend the new checks to reproduce a record the previous contract accepted.
+    # Nothing here rewrites sealed bytes or backfills a session list into an envelope
+    # that never carried one.
+    monkeypatch.setattr("aegis_alpha.storage.runs._envelope_sessions", lambda _envelope: ())
+    monkeypatch.setattr(
+        "aegis_alpha.storage.runs._require_paired_sessions", lambda *_arguments: None
+    )
+    with open_workspace(fx.home, writable=True) as workspace:
+        handle = open_run(workspace, sealed_under(fx, "run-1", legacy))
+        committed = commit_run(workspace, handle, RunResult(recorded), budget=BUDGET)
+    monkeypatch.undo()
+    assert committed["status"] == "SUCCESS"
+    assert observed(fx.home, "run-1") == ("SUCCESS", "COMPLETED")
+    with open_workspace(fx.home) as workspace:
+        for refused in (
+            lambda: read_run(workspace, "run-1", budget=BUDGET),
+            lambda: verify_run(workspace, "run-1", fx.request_hash, budget=BUDGET),
+            lambda: verify_workspace(workspace, budget=BUDGET),
+        ):
+            with pytest.raises(RunStorageError, match="does not name the sessions"):
+                refused()
+    with open_workspace(fx.home, writable=True) as workspace:
+        operation = workspace.state.execute(
+            "SELECT * FROM storage_operations WHERE target_id='run-1'"
+        ).fetchone()
+        # Recovery finishes an interrupted RUNNING run and returns before re-reading
+        # sealed evidence for anything else, so this record is neither re-examined nor
+        # moved out of SUCCESS. Changing its recorded status is a separate decision.
+        assert recover_run(workspace, operation, budget=BUDGET) is True
+        assert recover_operations(workspace)["recovered"] == []
+    assert observed(fx.home, "run-1") == ("SUCCESS", "COMPLETED")
