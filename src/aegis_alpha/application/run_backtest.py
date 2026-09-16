@@ -53,9 +53,6 @@ from aegis_alpha.storage.runs import (
 from aegis_alpha.storage.workspace import Workspace, open_workspace
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-    from datetime import date
-
     from aegis_alpha.application.backtest_prepare import (
         PreparedBacktest,
         PrepareRequest,
@@ -131,7 +128,6 @@ class _Carried:
     envelope_bytes: bytes
     envelope_sha256: str
     preparation_sha256: str
-    targets: Mapping[date, Mapping[str, float]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,11 +160,24 @@ def _carry(prepared: PreparedBacktest) -> tuple[_Opening, _Carried]:
         envelope_bytes=prepared.envelope.canonical_bytes,
         envelope_sha256=prepared.envelope.envelope_sha256,
         preparation_sha256=hashlib.sha256(prepared.provenance).hexdigest(),
-        # Referenced, not copied. The receipt's plain mapping is built after the
-        # preparation is released, so no duplicate exists while the graph is still live.
-        targets=prepared.targets,
     )
     return opening, carried
+
+
+def _sealed_targets(envelope_bytes: bytes) -> dict[str, dict[str, object]]:
+    """Read the decision weights back from the sealed envelope.
+
+    The preparation holds the same mapping, but keeping either a copy or a reference to
+    it would carry the decoded graph through every later stage for one receipt field.
+    The envelope is retained and reserved anyway, and it is the authority the result was
+    projected against, so the reported weights are by construction the ones that ran.
+    """
+    envelope = _object(decode_json(envelope_bytes), "envelope")
+    targets = _object(envelope.get("targets"), "envelope targets")
+    return {
+        _text(day, "target date"): dict(sorted(_object(weights, "target weights").items()))
+        for day, weights in sorted(targets.items())
+    }
 
 
 def _object(value: object, field: str) -> dict[str, object]:
@@ -404,10 +413,8 @@ def _receipt(
         "envelope": {"sha256": carried.envelope_sha256},
         "preparation": {"sha256": carried.preparation_sha256},
         "exported": outcome.exported,
-        "target_weights": {
-            day.isoformat(): dict(sorted(weights.items()))
-            for day, weights in sorted(carried.targets.items())
-        },
+        # Read back from the sealed envelope: nothing of the preparation is retained.
+        "target_weights": _sealed_targets(carried.envelope_bytes),
         "backtest": outcome.response,
         "run": outcome.recorded,
         "certified": False,
