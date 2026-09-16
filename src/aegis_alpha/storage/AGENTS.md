@@ -34,6 +34,15 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   differing content or lineage fails. `db recover` completes a committed import
   whose state operation was left PREPARED by verifying stored content only; it
   grants no execution eligibility.
+- `runs` owns the formal run lifecycle. `open_run` commits the intent before any
+  calculation and seals the envelope and preparation; `commit_run` seals the result,
+  commits the market marker, then records receipts and ends the run SUCCESS;
+  `recover_run` finishes or ends exactly one interrupted run and never recalculates.
+  `db recover` reaches it through the `run_commit` kind, and the generic `quarantine`
+  refuses a run intent because ending that alone would leave the run RUNNING and
+  invisible to the PREPARED-only scan. Every receipt is derived from the sealed files,
+  never from caller-supplied values, and a strategy pin must name a version the private
+  store admitted. Result `at_us` encodes a session date as midnight UTC, not an instant.
 - `strategies.LineageSpec` keeps four exact caller fields. The accepted direct
   parent status is sealed by v2 state/private request hashes at first durable
   acceptance, before PREPARED commits. Retry decodes that commitment, never

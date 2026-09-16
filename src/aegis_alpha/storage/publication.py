@@ -13,6 +13,9 @@ from aegis_alpha.storage.import_document import ImportDocument, parse_import, re
 from aegis_alpha.storage.raw import put_raw, verify_raw
 
 if TYPE_CHECKING:
+    import sqlite3
+
+    from aegis_alpha.compute_resources import ComputeBudget
     from aegis_alpha.storage.workspace import Workspace
 
 
@@ -281,8 +284,10 @@ def read_dataset(workspace: Workspace, dataset_id: str, version: str) -> dict[st
     return dict(row)
 
 
-def recover_operations(workspace: Workspace) -> dict[str, object]:
-    from aegis_alpha.storage.market import verify_generation  # noqa: PLC0415
+def recover_operations(
+    workspace: Workspace, *, budget: ComputeBudget | None = None
+) -> dict[str, object]:
+    from aegis_alpha.storage.runs import RUN_OPERATION_KIND  # noqa: PLC0415
 
     recovered: list[str] = []
     pending: list[str] = []
@@ -305,31 +310,43 @@ def recover_operations(workspace: Workspace) -> dict[str, object]:
                 pending.append(op_id)
                 continue
         elif operation["kind"] == "market_publish":
-            marker_row = workspace.market.execute(
-                "SELECT generation_id FROM market_generations WHERE operation_id=?", [op_id]
-            ).fetchone()
-            if marker_row is None:
+            if not _recover_publication(workspace, operation):
                 pending.append(op_id)
                 continue
-            marker = verify_generation(workspace.market, marker_row[0])
-            digest = operation["payload_hash"]
-            relative = digest[:2] + "/" + digest
-            from aegis_alpha.data.descriptor_tree import DescriptorTree  # noqa: PLC0415
+        elif operation["kind"] == RUN_OPERATION_KIND:
+            from aegis_alpha.storage.runs import recover_run  # noqa: PLC0415
 
-            with DescriptorTree.open_path(workspace.paths.raw) as tree:
-                raw = tree.read_bytes(relative, max_bytes=64 * 1024 * 1024)
-            document = parse_import(raw)
-            if (
-                document.sha256 != operation["request_hash"]
-                or document.body["operation_id"] != op_id
-            ):
-                raise ValueError("stored source does not match prepared publication")
-            _complete_publication(workspace, document, marker)
+            if not recover_run(workspace, operation, budget=budget):
+                pending.append(op_id)
+                continue
         else:
             pending.append(op_id)
             continue
         recovered.append(op_id)
     return {"recovered": recovered, "pending": pending, "provider_calls": 0}
+
+
+def _recover_publication(workspace: Workspace, operation: sqlite3.Row) -> bool:
+    """Finish a publication whose verifiable generation marker already exists."""
+    from aegis_alpha.data.descriptor_tree import DescriptorTree  # noqa: PLC0415
+    from aegis_alpha.storage.market import verify_generation  # noqa: PLC0415
+
+    op_id = operation["operation_id"]
+    marker_row = workspace.market.execute(
+        "SELECT generation_id FROM market_generations WHERE operation_id=?", [op_id]
+    ).fetchone()
+    if marker_row is None:
+        return False
+    marker = verify_generation(workspace.market, marker_row[0])
+    digest = operation["payload_hash"]
+    relative = digest[:2] + "/" + digest
+    with DescriptorTree.open_path(workspace.paths.raw) as tree:
+        raw = tree.read_bytes(relative, max_bytes=64 * 1024 * 1024)
+    document = parse_import(raw)
+    if document.sha256 != operation["request_hash"] or document.body["operation_id"] != op_id:
+        raise ValueError("stored source does not match prepared publication")
+    _complete_publication(workspace, document, marker)
+    return True
 
 
 def execute_data(workspace: Workspace, args: argparse.Namespace) -> dict[str, object]:
@@ -357,8 +374,14 @@ def execute_data(workspace: Workspace, args: argparse.Namespace) -> dict[str, ob
 
 
 def quarantine(workspace: Workspace, operation_id: str, reason: str) -> dict[str, object]:
-    from aegis_alpha.storage.state import quarantine_operation  # noqa: PLC0415
+    from aegis_alpha.storage.runs import RUN_OPERATION_KIND  # noqa: PLC0415
+    from aegis_alpha.storage.state import get_operation, quarantine_operation  # noqa: PLC0415
 
+    intent = get_operation(workspace.state, operation_id)
+    if intent is not None and intent["kind"] == RUN_OPERATION_KIND:
+        # Ending the intent alone would leave its run RUNNING and invisible to the
+        # PREPARED-only recovery scan.
+        raise ValueError("a run intent is ended by recovery, which also ends its run")
     if (
         workspace.market.execute(
             "SELECT 1 FROM market_generations WHERE operation_id=?", [operation_id]

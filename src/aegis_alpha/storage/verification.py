@@ -90,6 +90,62 @@ def _admit_retained(row: object, allowance: int, message: str) -> int:
     return charge
 
 
+def _verify_runs(workspace: Workspace, budget: ComputeBudget) -> list[str]:
+    """Check both directions between successful runs and their result markers.
+
+    A successful run is re-derived from its own evidence, so an altered stored row or a
+    replaced artifact cannot keep certifying itself through a hash string that still
+    matches. A run that is still open, or one that ended without a result, is reported
+    rather than raised: those are the states recovery exists to resolve, and failing
+    here would block backup on exactly the workspace that needs one.
+    """
+    from aegis_alpha.storage.runs import verify_run  # noqa: PLC0415
+
+    if inspect_run_schema(workspace).state != "complete":
+        if workspace.market.execute("SELECT 1 FROM result_commits").fetchone():
+            raise ValueError("result markers exist without the run add-on")
+        return []
+    runs_held = _admit_retained(
+        workspace.state.execute(
+            "SELECT coalesce(count(*)*2048 + sum(128*length(CAST(run_id AS BLOB))),0) FROM runs"
+        ).fetchone(),
+        budget.available_bytes,
+        "run catalog exceeds materialization budget",
+    )
+    markers_held = _admit_retained(
+        workspace.market.execute(
+            "SELECT count(*)*2048 + "
+            "coalesce(sum(128*coalesce(octet_length(encode(run_id)),0)),0) FROM result_commits"
+        ).fetchone(),
+        budget.available_bytes,
+        "result marker catalog exceeds materialization budget",
+    )
+    committed = {
+        row[0] for row in workspace.market.execute("SELECT run_id FROM result_commits").fetchall()
+    }
+    recorded = {
+        row[0]: (row[1], row[2])
+        for row in workspace.state.execute(
+            "SELECT r.run_id,r.status,d.request_hash FROM runs r "
+            "LEFT JOIN run_details d ON d.run_id=r.run_id"
+        )
+    }
+    # Both catalogs stay live while every successful run is re-derived, so each run is
+    # admitted against what is left rather than against the whole allowance.
+    held = replace(budget, reserved_bytes=budget.reserved_bytes + runs_held + markers_held)
+    for run_id, (status, request_hash) in sorted(recorded.items()):
+        if status != "SUCCESS":
+            continue
+        if request_hash is None:
+            raise ValueError("successful run has no recorded request")
+        verify_run(workspace, run_id, request_hash, budget=held)
+    if any(run_id not in recorded for run_id in committed):
+        raise ValueError("result marker has no run record")
+    return [
+        run_id for run_id in sorted(committed) if recorded.get(run_id, (None, None))[0] != "SUCCESS"
+    ]
+
+
 def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification boundary
     workspace: Workspace, *, budget: ComputeBudget | None = None
 ) -> dict[str, object]:
@@ -193,6 +249,7 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
         read_convention(workspace.state, ConventionPin(*convention))
     _verify_input_documents(workspace, held)
     _verify_artifacts(workspace)
+    unfinished_runs = _verify_runs(workspace, held)
     pending = workspace.state.execute(
         "SELECT count(*) FROM storage_operations WHERE phase='PREPARED'"
     ).fetchone()[0]
@@ -218,6 +275,8 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
         "pending_operations": pending,
         "orphan_generations": [row[0] for row in untracked if row[0] not in visible],
     }
+    if unfinished_runs:
+        report["unfinished_runs"] = unfinished_runs
     from aegis_alpha.storage.source_library import verify_sources  # noqa: PLC0415
 
     # The catalog and generation lists are still held, so source verification is
