@@ -22,11 +22,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from aegis_alpha.application.backtest_cli import run_document
-from aegis_alpha.application.backtest_prepare import prepare_backtest
+from aegis_alpha.application.backtest_prepare import (
+    PrepareRequest,
+    parse_prepare_request,
+    prepare_backtest,
+)
 from aegis_alpha.application.compute_cli import price_compute
 from aegis_alpha.application.prepare_cli import (
     admitted_path,
-    read_prepare_request,
+    read_request_bytes,
     require_new_outputs,
     seal_outputs,
 )
@@ -54,11 +58,7 @@ from aegis_alpha.storage.runs import (
 from aegis_alpha.storage.workspace import Workspace, open_workspace
 
 if TYPE_CHECKING:
-    from aegis_alpha.application.backtest_prepare import (
-        PreparedBacktest,
-        PrepareRequest,
-        StrategyPin,
-    )
+    from aegis_alpha.application.backtest_prepare import PreparedBacktest, StrategyPin
     from aegis_alpha.compute_resources import ComputeBudget
 
 __all__ = [
@@ -276,12 +276,18 @@ def _intent(opening: _Opening, request: RunBacktestRequest, bundle_id: str) -> R
     )
 
 
-def _prepare(home: Path, request: PrepareRequest, budget: ComputeBudget) -> PreparedBacktest:
-    """Stage 0: SELECT-only preparation, after refusing an installation without the add-on."""
+def _prepare(home: Path, raw: bytes, budget: ComputeBudget) -> PreparedBacktest:
+    """Stage 0: SELECT-only preparation, after refusing an installation without the add-on.
+
+    The request document is decoded here rather than by the caller, so the object graph
+    it expands into is built inside the compute lease instead of beside it, where
+    concurrent runs would each materialize one with nothing serializing them.
+    """
     with open_workspace(home) as workspace:
         # Checked before any calculation, so a missing add-on costs nothing and names
         # its install command instead of failing at the first durable write.
         require_run_schema(workspace)
+        request = PrepareRequest(parse_prepare_request(raw))
         return prepare_backtest(workspace, request, budget=budget)
 
 
@@ -448,16 +454,16 @@ def _receipt(
 
 def _staged(
     home: Path,
-    carrier: list[PrepareRequest],
+    carrier: list[bytes],
     request: RunBacktestRequest,
     budget: ComputeBudget,
     output: Path | None,
 ) -> dict[str, object]:
     """The four stages. Only A and C hold a writable workspace, and neither calculates.
 
-    The parsed request arrives in a one-slot carrier that stage 0 empties as it takes it,
-    so no frame here keeps the decoded request document alive beside a later stage. It
-    survives inside the returned PreparedBacktest until del prepared releases that too.
+    The request bytes arrive in a one-slot carrier that stage 0 empties as it takes them,
+    so no frame here keeps them or the document they decode into alive beside a later
+    stage. The decoded form lives inside PreparedBacktest until del prepared drops it.
     """
     if output is None:
         prepared = _prepare(home, carrier.pop(), budget)
@@ -537,9 +543,10 @@ def run_backtest(request: RunBacktestRequest) -> dict[str, object]:
     run interrupted while its inputs are being sealed stays RUNNING for `aas db recover`
     rather than being force-failed, exactly as the run lifecycle defines.
     """
-    # Handed over in a one-slot carrier so this frame stops referencing the decoded
-    # request the moment stage 0 takes it, rather than holding it for the whole run.
-    carrier = [read_prepare_request(request.request, request.request_sha256)]
+    # Read and hash-checked here because that is bounded and cheap, then handed over in
+    # a one-slot carrier. Stage 0 decodes it under the lease and this frame stops
+    # referencing it, rather than expanding it outside the lease and holding it.
+    carrier = [read_request_bytes(request.request, request.request_sha256)]
     output = None if request.envelope_output is None else admitted_path(request.envelope_output)
     home, targets, database_error = _admitted(request.home)
     if output is not None:

@@ -655,10 +655,10 @@ def test_a_run_cannot_be_its_own_predecessor(case: tuple[Path, Path]) -> None:
     assert bundles[0] == 0
 
 
-def test_the_parsed_request_is_handed_over_not_retained(
+def test_the_request_document_is_handed_over_not_retained(
     case: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Stage 0 takes the decoded request; no outer frame keeps it for the rest of the run."""
+    """Stage 0 takes the request bytes and decodes them; no outer frame keeps either."""
     home, request = case
     _cli(home, "db", "run-install")
     genuine = run_module._staged  # noqa: SLF001 -- carrier handover observation point

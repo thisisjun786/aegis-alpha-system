@@ -49,14 +49,23 @@ def admitted_path(path: Path) -> Path:
     return path.absolute()
 
 
-def read_prepare_request(path: Path, expected_sha256: str) -> PrepareRequest:
-    """Read and parse the exact request document, refusing anything but its own bytes."""
+def read_request_bytes(path: Path, expected_sha256: str) -> bytes:
+    """Read the exact request document, refusing anything but its own bytes.
+
+    Kept separate from parsing so a caller that owns a compute lease can decode inside
+    it. The read itself is bounded and cheap, so it stays available before the lease.
+    """
     request = admitted_path(path)
     with DescriptorTree.open_path(request.parent) as tree:
         raw = tree.read_bytes(request.name, max_bytes=_MAX_REQUEST_BYTES)
     if hashlib.sha256(raw).hexdigest() != expected_sha256:
         raise ValueError("prepare request SHA-256 mismatch")
-    return PrepareRequest(parse_prepare_request(raw))
+    return raw
+
+
+def read_prepare_request(path: Path, expected_sha256: str) -> PrepareRequest:
+    """Read and parse the exact request document, refusing anything but its own bytes."""
+    return PrepareRequest(parse_prepare_request(read_request_bytes(path, expected_sha256)))
 
 
 def require_new_outputs(tree: DescriptorTree, name: str) -> None:
