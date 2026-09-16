@@ -5,12 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import sys
+import threading
 import tracemalloc
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
+from types import FrameType
 from typing import TYPE_CHECKING, cast
 
 import duckdb
@@ -289,18 +292,99 @@ def seed_metadata_budget(workspace: Workspace, root: Path, store: str) -> str:
     return "arrow-prices"
 
 
+# A rise smaller than this is ordinary churn and is not worth a site record.
+_ALLOCATION_RISE_BYTES = 64 * 1024
+_MAX_RECORDED_RISES = 12
+_MAX_REPORTED_SITES = 6
+
+
+def _profiled_site(frame: FrameType, event: str, arg: object) -> str:
+    if event.startswith("c_"):
+        name = getattr(arg, "__qualname__", None) or repr(arg)
+        module = getattr(arg, "__module__", None)
+        return f"{module + '.' if module else ''}{name} [{event}]"
+    code = frame.f_code
+    return f"{code.co_filename}:{frame.f_lineno} {code.co_qualname} [{event}]"
+
+
+class _PeakWatcher:
+    """Name the operation that raised the high-water mark, not the survivors.
+
+    The measured peak is transient: the buffer that raises it is normally freed
+    before the window closes, so a closing snapshot reports only what survived and
+    never the site that mattered. Current traced memory is no better, because it
+    stays low at every Python call boundary when one C call allocates and frees
+    inside itself. Sampling the high-water mark on profile events, which include
+    the C-call and C-return events, attributes the peak to the operation that
+    actually raised it. The mark is only read here and never reset, so the
+    assertion still sees the true peak.
+    """
+
+    def __init__(self) -> None:
+        self.mark = 0
+        self.rises: list[tuple[int, str, int]] = []
+
+    def __call__(self, frame: FrameType, event: str, arg: object) -> None:
+        peak = tracemalloc.get_traced_memory()[1]
+        if peak < self.mark + _ALLOCATION_RISE_BYTES:
+            return
+        self.mark = peak
+        self.rises.append((peak, _profiled_site(frame, event, arg), threading.get_ident()))
+        del self.rises[:-_MAX_RECORDED_RISES]
+
+
+def _allocation_report(
+    peak: int,
+    max_bytes: int,
+    watcher: _PeakWatcher,
+    survivors: tracemalloc.Snapshot,
+    loaded: frozenset[str],
+) -> str:
+    """Explain an exceeded bound. Diagnostic only: it changes no limit."""
+    lines = [
+        f"metadata allocation peak {peak} is not below the {max_bytes} byte bound",
+        "high-water-mark risers, oldest first (the sites that raised the peak):",
+    ]
+    lines += [
+        f"  {mark:>10} B  thread {thread}  {site}"
+        for mark, site, thread in watcher.rises[-_MAX_REPORTED_SITES:]
+    ]
+    lines.append("largest surviving allocations (these are not the peak site):")
+    lines += [
+        f"  {stat.size:>10} B  {stat.count:>6} blocks  {stat.traceback[0]}"
+        for stat in survivors.statistics("lineno")[:_MAX_REPORTED_SITES]
+    ]
+    # A one-time import landing inside the window is invisible in a size ranking
+    # and obvious here. Initialization inside an already-imported module is not.
+    imported = sorted(frozenset(sys.modules) - loaded)
+    lines.append(f"modules imported inside the window: {imported or 'none'}")
+    return "\n".join(lines)
+
+
 @contextmanager
 def metadata_allocation_bound(
     workspace: Workspace, max_bytes: int = METADATA_BUDGET.memory_limit_bytes
 ) -> Iterator[None]:
     assert workspace.strategies is not None
     with select_only(workspace.state), select_only(workspace.strategies):
+        # Build the module inventory before tracing starts. A set of every module
+        # name costs tens of kilobytes and would otherwise be charged to the very
+        # window it is meant to describe.
+        loaded = frozenset(sys.modules)
+        watcher = _PeakWatcher()
         tracemalloc.start()
+        sys.setprofile(watcher)
         try:
             yield
         finally:
+            sys.setprofile(None)
             _, peak = tracemalloc.get_traced_memory()
+            # Only a failing window pays for a snapshot; taking one on every window
+            # would change what the passing windows measure.
+            survivors = tracemalloc.take_snapshot() if peak >= max_bytes else None
             tracemalloc.stop()
+        if survivors is not None:
+            raise AssertionError(_allocation_report(peak, max_bytes, watcher, survivors, loaded))
         assert peak < max_bytes
 
 
