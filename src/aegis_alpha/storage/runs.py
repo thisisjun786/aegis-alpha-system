@@ -359,18 +359,17 @@ def project_metrics(backtest_bytes: bytes) -> dict[str, tuple[Decimal | None, st
         "sortino": (None, "not_collected"),
     }
     nav = _by_date(_sequence(account.get("nav"), "nav"), "date", "nav entry")
+    units = None if unit_nav is None else _by_date(unit_nav, "date", "unit nav entry")
+    if units is not None and [e.get("date") for e in units] != [e.get("date") for e in nav]:
+        # The engine emits one unit value per account session. Checked before the empty
+        # case, so contradictory unit evidence cannot pass as merely missing metrics.
+        raise RunStorageError("unit nav sessions do not match the account nav")
     if not nav:
         return {**metrics, "final_equity": (None, "missing"), "total_return": (None, "missing")}
     metrics["final_equity"] = (_decimal12(nav[-1].get("equity")), "present")
-    if unit_nav is None:
+    if units is None:
         metrics["total_return"] = _change([entry.get("equity") for entry in nav])
     else:
-        units = _by_date(unit_nav, "date", "unit nav entry")
-        if [entry.get("date") for entry in units] != [entry.get("date") for entry in nav]:
-            # The engine emits one unit value per account session. Without this, a
-            # truncated array would measure the return over a different period than
-            # the final equity describes.
-            raise RunStorageError("unit nav sessions do not match the account nav")
         metrics["total_return"] = _change([entry.get("unit_value") for entry in units])
     return metrics
 
@@ -1222,8 +1221,15 @@ def _reserved(budget: ComputeBudget | None, derived: _Derived) -> ComputeBudget:
     so the reservation is not discarded on the default path.
     """
     held = _allowance(budget)
-    charge = sum(derived.counts.values()) * _ROW_OVERHEAD * _ROW_COPIES
-    return replace(held, reserved_bytes=held.reserved_bytes + charge)
+    text_bytes = sum(
+        len(value.encode())
+        for rows in derived.ordered.values()
+        for _ordinal, row in rows
+        for value in row.values()
+        if isinstance(value, str)
+    )
+    charge = sum(derived.counts.values()) * _ROW_OVERHEAD + text_bytes
+    return replace(held, reserved_bytes=held.reserved_bytes + charge * _ROW_COPIES)
 
 
 def _finish(
@@ -1330,6 +1336,14 @@ def _check_candidate(
         + _DOCUMENT_EXPANSION * (sum(size for _hash, size in measured) + len(backtest_bytes)),
         "run artifacts exceed materialization budget",
     )
+    sealed = dict(zip((_ENVELOPE, _PREPARATION), measured, strict=True))
+    if (sealed[_ENVELOPE][0], sealed[_PREPARATION][0]) != (
+        handle.envelope_sha256,
+        handle.preparation_sha256,
+    ):
+        # Checked before sealing: a stale handle must not leave an artifact behind that
+        # a corrected commit could never replace.
+        raise RunStorageError("sealed run inputs changed after the run was opened")
     _project(
         _read_sealed(workspace, handle.run_id, _ENVELOPE),
         _read_sealed(workspace, handle.run_id, _PREPARATION),

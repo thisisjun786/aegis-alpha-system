@@ -1286,3 +1286,26 @@ def test_unit_nav_must_cover_the_same_sessions_as_the_account(tmp_path: Path) ->
         handle = open_run(workspace, intent(fx, "run-1"))
         with pytest.raises(RunStorageError, match="unit nav sessions do not match"):
             commit_run(workspace, handle, RunResult(cashflow(NAV, UNIT_NAV[:1])), budget=BUDGET)
+
+
+def test_unit_nav_without_account_nav_is_refused(tmp_path: Path) -> None:
+    fx = prepared(tmp_path)
+    with open_workspace(fx.home, writable=True) as workspace:
+        handle = open_run(workspace, intent(fx, "run-1"))
+        with pytest.raises(RunStorageError, match="unit nav sessions do not match"):
+            commit_run(workspace, handle, RunResult(cashflow([], UNIT_NAV)), budget=BUDGET)
+        assert not (workspace.paths.runs / "run-1" / "backtest.json").exists()
+
+
+def test_a_stale_handle_seals_nothing(tmp_path: Path) -> None:
+    fx = prepared(tmp_path)
+    with open_workspace(fx.home, writable=True) as workspace:
+        handle = open_run(workspace, intent(fx, "run-1"))
+        stale = replace(handle, envelope_sha256="a" * 64)
+        with pytest.raises(RunStorageError, match="inputs changed after the run was opened"):
+            commit_run(workspace, stale, RunResult(RESULT), budget=BUDGET)
+        assert not (workspace.paths.runs / "run-1" / "backtest.json").exists()
+        # The real handle still commits, so a stale one strands nothing.
+        assert (
+            commit_run(workspace, handle, RunResult(RESULT), budget=BUDGET)["status"] == "SUCCESS"
+        )
