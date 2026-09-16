@@ -348,7 +348,7 @@ def _allocation_report(
     lines += [
         f"  {mark:>10} B  thread {thread}  {site}"
         for mark, site, thread in watcher.rises[-_MAX_REPORTED_SITES:]
-    ]
+    ] or [f"  none: no single step raised the mark by {_ALLOCATION_RISE_BYTES} bytes"]
     lines.append("largest surviving allocations (these are not the peak site):")
     lines += [
         f"  {stat.size:>10} B  {stat.count:>6} blocks  {stat.traceback[0]}"
@@ -372,12 +372,15 @@ def metadata_allocation_bound(
         # window it is meant to describe.
         loaded = frozenset(sys.modules)
         watcher = _PeakWatcher()
+        # Restore rather than clear: another tool may own the profile hook, and
+        # this context manager must not silently disable it.
+        previous = sys.getprofile()
         tracemalloc.start()
         sys.setprofile(watcher)
         try:
             yield
         finally:
-            sys.setprofile(None)
+            sys.setprofile(previous)
             _, peak = tracemalloc.get_traced_memory()
             # Only a failing window pays for a snapshot; taking one on every window
             # would change what the passing windows measure.
