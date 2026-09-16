@@ -228,6 +228,11 @@ def _session_us(value: object, label: str = "result dates") -> int:
         # fromisoformat reports the offending text but not the field it came from, and
         # the envelope and the result both reach the column through here.
         raise RunStorageError(f"{label} must be ISO text") from error
+    if day.isoformat() != value:
+        # fromisoformat also accepts 20240102 and 2024-W01-2. The shipped runner spells
+        # every date YYYY-MM-DD and refuses the rest, so accepting an alternate spelling
+        # here would certify a session the supported executor would not have run.
+        raise RunStorageError(f"{label} must be spelled YYYY-MM-DD")
     stamp = calendar.timegm(day.timetuple()) * 1_000_000
     if stamp < 0:
         # The stored columns are constrained non-negative, and that constraint must be
@@ -333,6 +338,12 @@ def _require_paired_sessions(envelope: dict[str, object], fills: list[dict[str, 
         _session_us(day, "envelope target dates")
         for day in _mapping(envelope.get("targets"), "targets")
     }
+    if not decisions.issubset(sessions[:-1]):
+        # Checked apart from the fills, because an unchanged or all-cash decision
+        # legitimately produces none. A target on the final session or on no session at
+        # all names a decision nothing could execute, and its weight row would be stored
+        # anyway. The exporter refuses the same target on the other side of the seal.
+        raise RunStorageError("an envelope target requires a following supplied session")
     for fill in fills:
         decision = _session_us(fill.get("decision_date"))
         execution = _session_us(fill.get("execution_date"))

@@ -1424,6 +1424,38 @@ def test_an_envelope_without_a_usable_session_list_is_never_sealed(
     assert observed(fx.home, "run-1") == (None, None)
 
 
+@pytest.mark.parametrize(
+    ("targets", "message"),
+    [
+        ({SESSIONS[2]: {"AAA": 1.0}}, "requires a following supplied session"),
+        ({"2024-01-09": {"AAA": 1.0}}, "requires a following supplied session"),
+        ({"20240102": {"AAA": 1.0}}, "must be spelled YYYY-MM-DD"),
+    ],
+)
+def test_a_target_the_sessions_cannot_execute_is_never_sealed(
+    tmp_path: Path, targets: dict[str, dict[str, float]], message: str
+) -> None:
+    """A decision needs a following session whether or not any fill acted on it.
+
+    The weight row is stored from the envelope alone, so a target nothing could execute
+    would be committed even by a result with no fills at all.
+    """
+    fx = prepared(tmp_path)
+    envelope_bytes = canonical({"module": "aegis", "dates": SESSIONS, "targets": targets})
+    with open_workspace(fx.home, writable=True) as workspace:
+        handle = open_run(workspace, sealed_under(fx, "run-1", envelope_bytes))
+        empty = canonical(
+            {
+                "module": "aegis",
+                "input_sha256": hashlib.sha256(envelope_bytes).hexdigest(),
+                "result": {"nav": NAV, "fills": []},
+            }
+        )
+        with pytest.raises(RunStorageError, match=message):
+            commit_run(workspace, handle, RunResult(empty), budget=BUDGET)
+        assert not (workspace.paths.runs / "run-1" / "backtest.json").exists()
+
+
 def one_fill(decision: str, execution: str) -> list[dict[str, object]]:
     return [
         {
@@ -1435,6 +1467,31 @@ def one_fill(decision: str, execution: str) -> list[dict[str, object]]:
             "fee": 1.0,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("decision", "execution"),
+    [("20240102", "2024-01-03"), ("2024-01-02", "2024-W01-3")],
+)
+def test_a_date_the_shipped_runner_would_refuse_is_not_certified_here(
+    tmp_path: Path, decision: str, execution: str
+) -> None:
+    """date.fromisoformat accepts spellings backtest_cli._day rejects.
+
+    Normalising them here would let storage certify a pairing the supported executor
+    would never have produced, so the sealed text must already be canonical.
+    """
+    fx = prepared(tmp_path)
+    with open_workspace(fx.home, writable=True) as workspace:
+        handle = open_run(workspace, intent(fx, "run-1"))
+        with pytest.raises(RunStorageError, match="must be spelled YYYY-MM-DD"):
+            commit_run(
+                workspace,
+                handle,
+                RunResult(backtest(NAV, one_fill(decision, execution))),
+                budget=BUDGET,
+            )
+        assert not (workspace.paths.runs / "run-1" / "backtest.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -1558,9 +1615,13 @@ def test_a_success_run_sealed_before_this_check_keeps_its_status_and_is_refused(
             "result": {"nav": NAV, "fills": []},
         }
     )
-    # Reproduce a record the previous contract accepted. Nothing here rewrites sealed
-    # bytes or backfills a session list into an envelope that never carried one.
+    # Suspend the new checks to reproduce a record the previous contract accepted.
+    # Nothing here rewrites sealed bytes or backfills a session list into an envelope
+    # that never carried one.
     monkeypatch.setattr("aegis_alpha.storage.runs._envelope_sessions", lambda _envelope: ())
+    monkeypatch.setattr(
+        "aegis_alpha.storage.runs._require_paired_sessions", lambda *_arguments: None
+    )
     with open_workspace(fx.home, writable=True) as workspace:
         handle = open_run(workspace, sealed_under(fx, "run-1", legacy))
         committed = commit_run(workspace, handle, RunResult(recorded), budget=BUDGET)
