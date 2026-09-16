@@ -5,12 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import sys
+import threading
 import tracemalloc
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
+from types import CodeType, FrameType
 from typing import TYPE_CHECKING, cast
 
 import duckdb
@@ -289,18 +292,157 @@ def seed_metadata_budget(workspace: Workspace, root: Path, store: str) -> str:
     return "arrow-prices"
 
 
+# A rise smaller than this is ordinary churn and is not worth a record.
+_ALLOCATION_RISE_BYTES = 64 * 1024
+_MAX_RECORDED_RISES = 6
+
+
+class _PeakWatcher:
+    """Record where tracemalloc's high-water mark was seen rising.
+
+    The measured peak is transient: the buffer that raises it is normally freed
+    before the window closes, so a closing snapshot shows only survivors and never
+    the operation that mattered. Current traced memory is no better, because it
+    stays low at every Python call boundary when one C call allocates and frees
+    inside itself. The mark, sampled when calls return, is the one quantity that
+    still carries the information.
+
+    This runs inside the region it observes, so it keeps only short strings and
+    code objects. Retaining the C method handed to the hook would also retain its
+    receiver, which can be the very buffer being measured, and formatting here
+    would allocate at the instant the mark is highest. A frame is never retained
+    either, since holding one keeps its locals alive. The mark is only read and
+    never reset.
+
+    Observing is not free, and the effect is not one-directional. Installing any
+    profile function makes CPython materialize a frame object per active call, on
+    the order of 200 bytes each, which raises the observed peak: measured at 1,535
+    to 1,852 bytes over eight paired runs of this workload, and 12,436 bytes on the
+    first hooked window in a process, against a margin of about 1,034,000 bytes.
+    Those same allocations can instead advance a garbage collection and lower a
+    peak that would otherwise have been measured; that is demonstrable on a
+    synthetic workload holding an unreachable cycle. No pure-Python design
+    attributes an arbitrary in-window transient with exactly zero effect on the
+    measurement. A separate diagnostic re-run would preserve the measurement but
+    could not attribute the same transient event.
+
+    Rises below _ALLOCATION_RISE_BYTES are not recorded, so the last record can
+    trail the reported peak by just under that threshold. It is the latest
+    qualifying observation, never a proof of which call owns the memory.
+    """
+
+    def __init__(self) -> None:
+        self.mark = 0
+        self.seen = 0
+        self.marks = [0] * _MAX_RECORDED_RISES
+        self.events = [""] * _MAX_RECORDED_RISES
+        self.owners: list[object] = [None] * _MAX_RECORDED_RISES
+        self.threads = [0] * _MAX_RECORDED_RISES
+
+    def __call__(self, frame: FrameType, event: str, arg: object) -> None:
+        # Only return-type events. A rise inside a call is still observable when
+        # that call returns, and sampling the entry events as well would double
+        # the allocations this hook makes while a large buffer is still live.
+        if not event.endswith(("return", "exception")):
+            return
+        peak = tracemalloc.get_traced_memory()[1]
+        if peak < self.mark + _ALLOCATION_RISE_BYTES:
+            return
+        self.mark = peak
+        # Keep the earliest rises and always the latest: marks only increase, so
+        # the last record is the one closest to the reported peak.
+        index = min(self.seen, _MAX_RECORDED_RISES - 1)
+        self.seen += 1
+        self.marks[index] = peak
+        self.events[index] = event
+        # Never retain the C method itself: holding it holds its receiver,
+        # which can be the buffer whose allocation is being measured.
+        if event[0] == "c":
+            name = getattr(arg, "__qualname__", None)
+            self.owners[index] = name if isinstance(name, str) else type(arg).__name__
+        else:
+            self.owners[index] = frame.f_code
+        self.threads[index] = threading.get_ident()
+
+
+def _describe_owner(owner: object, event: str) -> str:
+    if isinstance(owner, CodeType):
+        return f"{owner.co_filename}:{owner.co_firstlineno} {owner.co_qualname} [{event}]"
+    return f"{owner} [{event}]"
+
+
+def _allocation_report(
+    peak: int,
+    max_bytes: int,
+    watcher: _PeakWatcher,
+    survivors: tracemalloc.Snapshot,
+    loaded: frozenset[str],
+) -> str:
+    """Explain an exceeded bound. Diagnostic only: it changes no limit."""
+    recorded = min(watcher.seen, _MAX_RECORDED_RISES)
+    lines = [
+        f"metadata allocation peak {peak} is not below the {max_bytes} byte bound",
+        # Print the gap rather than only describing it: if the last record sits
+        # well below the peak, the rise that mattered was never big enough in one
+        # step to be recorded, and the sites below do not explain this failure.
+        (
+            f"highest mark recorded here: {watcher.mark}, which can trail the peak "
+            f"by up to {_ALLOCATION_RISE_BYTES - 1} bytes"
+        ),
+        # The hook sees only the thread it was installed on, while tracemalloc
+        # counts every thread, so this is where a rise was first observed rather
+        # than proof of which thread or call owns the memory.
+        "where the mark was seen rising, earliest first (observing thread):",
+    ]
+    lines += [
+        f"  {watcher.marks[index]:>10} B  thread {watcher.threads[index]}  "
+        f"{_describe_owner(watcher.owners[index], watcher.events[index])}"
+        for index in range(recorded)
+    ] or [f"  nothing rose by {_ALLOCATION_RISE_BYTES} bytes in one step"]
+    if watcher.seen > _MAX_RECORDED_RISES:
+        lines.append(f"  and {watcher.seen - _MAX_RECORDED_RISES} further rises, not kept")
+    lines.append("largest surviving allocations (these are not the peak's site):")
+    lines += [
+        f"  {stat.size:>10} B  {stat.count:>6} blocks  {stat.traceback[0]}"
+        for stat in survivors.statistics("lineno")[:_MAX_RECORDED_RISES]
+    ]
+    # A one-time import landing inside the window is invisible in a size ranking
+    # and obvious here. Initialization inside an already-imported module is not.
+    imported = sorted(frozenset(sys.modules) - loaded)
+    lines.append(f"modules imported inside the window: {imported or 'none'}")
+    return "\n".join(lines)
+
+
 @contextmanager
 def metadata_allocation_bound(
     workspace: Workspace, max_bytes: int = METADATA_BUDGET.memory_limit_bytes
 ) -> Iterator[None]:
     assert workspace.strategies is not None
     with select_only(workspace.state), select_only(workspace.strategies):
+        # Build the module inventory before tracing starts. A set of every module
+        # name costs tens of kilobytes and would otherwise be charged to the very
+        # window it is meant to describe.
+        loaded = frozenset(sys.modules)
+        watcher = _PeakWatcher()
+        # Restore rather than clear: another tool may own the profile hook, and
+        # this context manager must not silently disable it.
+        # It is displaced for the duration of the window, which is deliberate:
+        # chaining to it instead would run two hooks per event and double the
+        # observer effect this measurement is trying to keep small.
+        previous = sys.getprofile()
         tracemalloc.start()
+        sys.setprofile(watcher)
         try:
             yield
         finally:
+            sys.setprofile(previous)
             _, peak = tracemalloc.get_traced_memory()
+            # Only a failing window pays for a snapshot; taking one on every window
+            # would change what the passing windows measure.
+            survivors = tracemalloc.take_snapshot() if peak >= max_bytes else None
             tracemalloc.stop()
+        if survivors is not None:
+            raise AssertionError(_allocation_report(peak, max_bytes, watcher, survivors, loaded))
         assert peak < max_bytes
 
 
