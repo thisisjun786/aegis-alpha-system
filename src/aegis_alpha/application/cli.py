@@ -14,6 +14,7 @@ from aegis_alpha.application import (
     provider_cli,
     proxy_cli,
     research_cli,
+    run_cli,
     storage_cli,
 )
 from aegis_alpha.application.contracts import parse_request
@@ -37,6 +38,7 @@ def _parser() -> argparse.ArgumentParser:
     provider_cli.add_commands(commands)
     backtest_cli.add_commands(commands)
     prepare_cli.add_commands(commands)
+    run_cli.add_commands(commands)
     proxy_cli.add_commands(commands)
     research_cli.add_commands(commands)
     etf_cli.add_commands(commands)
@@ -51,6 +53,7 @@ def _status() -> dict[str, object]:
             "allocation_preview": True,
             "strategy_execution": False,
             "aegis_etf_target_replay": True,
+            "aegis_registered_strategy_run": True,
             "research_proxy_returns": True,
             "research_candidate_generation": True,
             "database_adapter": True,
@@ -86,6 +89,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912 -- explic
                 result = backtest_cli.execute(args)
             case "prepare":
                 result = prepare_cli.execute(args)
+            case "run":
+                result = run_cli.execute(args)
             case "proxy":
                 result = proxy_cli.execute(args)
             case "research":
@@ -106,7 +111,13 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912 -- explic
                 raise ValueError("unknown command")  # noqa: TRY301 -- unreachable after argparse choices
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False))  # noqa: T201 -- CLI output
     except (ValueError, OSError, RuntimeError, TypeError) as exc:
-        print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)  # noqa: T201 -- CLI diagnostic
+        # Notes carry what a failed command left behind, such as a run that recovery
+        # still owns. str() drops them, so they are reported as their own field.
+        diagnostic: dict[str, object] = {"error": str(exc)}
+        notes = getattr(exc, "__notes__", ())
+        if notes:
+            diagnostic["notes"] = list(notes)
+        print(json.dumps(diagnostic, ensure_ascii=False), file=sys.stderr)  # noqa: T201 -- CLI diagnostic
         return 1
     code = result.get("exit_code", 0) if args.command == "collect" else 0
     return code if type(code) is int else 1

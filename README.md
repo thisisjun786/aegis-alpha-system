@@ -65,14 +65,48 @@ aas --home /path/to/new-home db restore --backup /path/to/new-backup
 `aegis_alpha.engine.load_bundle`과 `replay`는 명시한 외부 전략과 검증한 입력을 계산하는
 Python API다. `aas prepare --request FILE --sha256 SHA256 --output ENVELOPE`는 등록한
 전략과 고정한 관례·세션·가격·membership pin만 읽어 판단별 목표 비중을 `aas backtest` 봉투와
-출처 sidecar로 내보내며, 체결 계산과 run 등록은 하지 않는다. 봉투 회계는 `aas backtest`가
-맡는다. run 저장·결과 확정, 상시 앱, 실주문은 아직 구현 전이다.
+출처 sidecar로 내보내며, 체결 계산과 run 등록은 하지 않는다. 봉투 하나만 따로 계산하려면
+`aas backtest`를 쓴다. 상시 앱과 실주문은 아직 구현 전이다.
 요청 형식과 등록 선행 조건은 [운영 안내](dev-notes/operations.md#저장한-전략과-입력의-준비)에 있다.
+
+준비부터 결과 저장까지 한 번에 하려면 `aas run`을 쓴다. 같은 요청 문서로 준비하고,
+요청을 등록하고, 잠금 없이 계산한 다음 결과를 run으로 확정한다. run 저장 표는 기본
+설치에 없으므로 `aas db run-install`을 먼저 한 번 실행한다. 설치 전에 실행하면 계산하기
+전에 그 명령을 알려주며 실패한다.
+
+```bash
+aas db run-install
+aas run execute --request request.json --sha256 SHA256
+aas run show --run-id run-0123456789abcdef
+aas run list
+```
+
+`aas run execute`는 결과가 저장된 뒤에만 영수증을 돌려준다. 영수증에는 준비 hash,
+판단별 목표 비중, 체결·NAV가 담긴 `backtest`, 그리고 run ID·결과 hash·표별 행 수와
+지표가 담긴 `run`이 들어 있다. `--envelope-output PATH`를 주면 봉투와 출처 sidecar를
+파일로도 남긴다.
+
+```json
+{"executed": true, "request_hash": "3d4bd0e5...", "bundle_id": "inputs-9f2c...",
+ "target_weights": {"2026-01-29": {"ASSET_A": 1.0}, "2026-02-26": {"ASSET_B": 1.0}},
+ "backtest": {"module": "aegis", "live_orders": false,
+              "result": {"nav": [{"date": "2026-03-30", "equity": 80.0, "cash": 0.0}]}},
+ "run": {"run_id": "run-0123456789abcdef", "status": "SUCCESS",
+         "result_hash": "8c68a7c3...", "metrics": {"final_equity": {"value": "80.000000000000"}}},
+ "certified": false}
+```
+
+`aas run show --run-id ID`는 기록·표시자·봉인 파일이 여전히 서로 맞을 때만 그 run을
+돌려준다. 같은 요청을 CLI로 돌리든 `aegis_alpha.application.run_backtest.run_backtest`
+Python API로 돌리든 run ID만 다르고 준비 hash·목표 비중·체결·NAV·비교 상태는 같다.
+계산 도중 프로세스가 죽으면 run은 RUNNING으로 남고 `aas db recover`가 기존 계약대로
+INTERRUPTED로 끝낸다. 회복은 다시 계산하지 않는다.
 
 이지스·알파·헷지는 자산배분·개별 종목·방어 배분의 연구 영역이다. 현재 preview 입력은
 세 모듈을 모두 명시해야 하지만, 각 모듈이 전략을 실행하는 것은 아니다. 전략 등록은
-bundle을 검증·저장하며 실행을 시작하지 않는다. 준비와 회계 결과를 run으로 저장·확정하는
-경로와 HTTP/MCP 서버는 제공하지 않는다. [제품 경계 결정](dev-notes/decisions/0015-research-engine-product-boundary.md)에
+bundle을 검증·저장하며 실행을 시작하지 않는다. `aas run`의 통합 실행은 이지스 봉투를
+내보내는 등록 전략에만 해당하고, 알파·헷지 전략 자료나 실주문을 뜻하지 않는다.
+HTTP/MCP 서버와 상시 daemon은 제공하지 않는다. [제품 경계 결정](dev-notes/decisions/0015-research-engine-product-boundary.md)에
 목표와 현재 구현의 차이를 기록했다.
 
 기존 공급자 수집기는 전환 중이다. `legacy-db`·`legacy-data`와 해당 수집기, 그리고

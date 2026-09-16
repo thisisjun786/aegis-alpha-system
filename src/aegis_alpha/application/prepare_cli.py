@@ -27,6 +27,7 @@ from aegis_alpha.storage.paths import load_paths, resolve_home
 from aegis_alpha.storage.workspace import open_workspace
 
 _MAX_REQUEST_BYTES = 1024 * 1024
+_SIDECAR = ".preparation.json"
 
 
 def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -41,10 +42,44 @@ def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
     )
 
 
-def _path(path: Path) -> Path:
+def admitted_path(path: Path) -> Path:
+    """Absolute, alias-free path. Shared with every command that seals these outputs."""
     if ".." in path.parts:
         raise ValueError("prepare paths cannot contain parent aliases")
     return path.absolute()
+
+
+def read_prepare_request(path: Path, expected_sha256: str) -> PrepareRequest:
+    """Read and parse the exact request document, refusing anything but its own bytes."""
+    request = admitted_path(path)
+    with DescriptorTree.open_path(request.parent) as tree:
+        raw = tree.read_bytes(request.name, max_bytes=_MAX_REQUEST_BYTES)
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ValueError("prepare request SHA-256 mismatch")
+    return PrepareRequest(parse_prepare_request(raw))
+
+
+def require_new_outputs(tree: DescriptorTree, name: str) -> None:
+    """Refuse before any work when either output name is already taken."""
+    if tree.exists(name) or tree.exists(name + _SIDECAR):
+        raise FileExistsError("prepare outputs must both be new files")
+
+
+def seal_outputs(
+    tree: DescriptorTree, name: str, envelope_bytes: bytes, provenance_bytes: bytes
+) -> dict[str, dict[str, str]]:
+    """Create, fsync and re-read both outputs under one admitted directory handle."""
+    require_new_outputs(tree, name)
+    sidecar = name + _SIDECAR
+    envelope_stat = _write(tree, name, envelope_bytes)
+    sidecar_stat = _write(tree, sidecar, provenance_bytes)
+    tree.fsync_directory()
+    envelope = _verify(tree, name, envelope_bytes, envelope_stat)
+    preparation = _verify(tree, sidecar, provenance_bytes, sidecar_stat)
+    with DescriptorTree.open_path(tree.logical_root) as visible:
+        if visible.identity != tree.identity:
+            raise ValueError("prepare output directory changed during sealing")
+    return {"envelope": envelope, "preparation": preparation}
 
 
 def _write(tree: DescriptorTree, name: str, raw: bytes) -> os.stat_result:
@@ -71,22 +106,15 @@ def _verify(tree: DescriptorTree, name: str, raw: bytes, owned: os.stat_result) 
 
 
 def execute(args: argparse.Namespace) -> dict[str, object]:
-    path = _path(cast("Path", args.request))
-    with DescriptorTree.open_path(path.parent) as tree:
-        raw = tree.read_bytes(path.name, max_bytes=_MAX_REQUEST_BYTES)
-    if hashlib.sha256(raw).hexdigest() != args.sha256:
-        raise ValueError("prepare request SHA-256 mismatch")
-    request = PrepareRequest(parse_prepare_request(raw))
-    output = _path(cast("Path", args.output))
-    sidecar = output.name + ".preparation.json"
+    request = read_prepare_request(cast("Path", args.request), args.sha256)
+    output = admitted_path(cast("Path", args.output))
     home = resolve_home(args.home)
     private_directory(home)
     targets = storage_lock_targets(home, load_paths(home).stores())
     # Load the optional runtime driver only for this command, not help/status.
     database_error = import_module("duckdb").Error
     with DescriptorTree.open_path(output.parent) as tree:
-        if tree.exists(output.name) or tree.exists(sidecar):
-            raise FileExistsError("prepare outputs must both be new files")
+        require_new_outputs(tree, output.name)
         try:
             with price_compute(excluded_locks=targets) as budget:
                 if budget is None:
@@ -95,19 +123,14 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
                     prepared = prepare_backtest(workspace, request, budget=budget)
         except (sqlite3.Error, database_error):
             raise ValueError("local database operation failed; run aas db verify") from None
-        envelope_stat = _write(tree, output.name, prepared.envelope.canonical_bytes)
-        sidecar_stat = _write(tree, sidecar, prepared.provenance)
-        tree.fsync_directory()
-        envelope = _verify(tree, output.name, prepared.envelope.canonical_bytes, envelope_stat)
-        preparation = _verify(tree, sidecar, prepared.provenance, sidecar_stat)
-        with DescriptorTree.open_path(output.parent) as visible:
-            if visible.identity != tree.identity:
-                raise ValueError("prepare output directory changed during sealing")
+        sealed = seal_outputs(
+            tree, output.name, prepared.envelope.canonical_bytes, prepared.provenance
+        )
     return {
         "prepared": True,
         "request_sha256": args.sha256,
         "request_hash": prepared.request_hash,
-        "envelope": envelope,
-        "preparation": preparation,
+        "envelope": sealed["envelope"],
+        "preparation": sealed["preparation"],
         "certified": False,
     }
