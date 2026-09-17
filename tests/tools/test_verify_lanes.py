@@ -37,6 +37,76 @@ _PREVIEW = {
 }
 # Only process boundaries are faked: lane shell, fingerprint Python, venv
 # interpreter, JSON validation and installed-package import checks all execute.
+_FAKE_SCENARIO = r"""
+import json
+import os
+import sys
+from pathlib import Path
+
+mode = sys.argv[1]
+log = os.getenv("FAKE_SCENARIO_LOG")
+if log:
+    with Path(log).open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "mode": mode,
+                    "argv": sys.argv[1:],
+                    "cwd": os.getcwd(),
+                    "executable": sys.executable,
+                    "pythonpath": os.environ.get("PYTHONPATH"),
+                }
+            )
+            + "\n"
+        )
+if os.getenv("FAKE_SCENARIO_FAIL") == mode:
+    sys.exit("fake scenario refused: " + mode)
+override = os.getenv("FAKE_SEED" if mode == "seed" else "FAKE_SCENARIO")
+print(override if override else json.dumps(json.loads(os.environ["FAKE_SCENARIO_DEFAULT"])[mode]))
+"""
+
+_RECOVERY = {
+    "observers_armed": True,
+    "observers_fired": [],
+    "armed_calculation_targets": ["aegis_alpha.engine.replay.replay"],
+    "armed_network_targets": ["socket.create_connection"],
+}
+_SCENARIO_DEFAULT = {
+    "seed": {"seeded": True, "any_call_saw_pythonpath": False},
+    "scenario": {
+        "scenario": "complete",
+        "any_call_saw_pythonpath": False,
+        "provenance": {"import_root_inside_prefix": True, "legacy_extra": "not_exercised"},
+        "strategies": [
+            {"strategy_id": "synthetic-probe", "contract_sha256": "a"},
+            {"strategy_id": "synthetic-probe-wide", "contract_sha256": "b"},
+        ],
+        "cases": {
+            "a_cli": {"result_hash": "one"},
+            "b_cli": {"result_hash": "two"},
+            "a_api": {"result_hash": "one"},
+        },
+        "reexecuted_without_seed": {"case_directory_present": False},
+        "restored_runs": [{"run_id": "run-x", "identical": True}],
+        "restore_refusals": {
+            "existing_home_unchanged": True,
+            "nothing_written_before_verification": True,
+            "tampered_home_is_marked_incomplete": True,
+        },
+        "recovery_without_marker": {**_RECOVERY, "status": "INTERRUPTED"},
+        "recovery_after_marker": {
+            **_RECOVERY,
+            "status": "SUCCESS",
+            "sealed_files_unchanged": True,
+        },
+        "cleanup": {
+            "removed": [{"path": "owned-work-root", "remaining": False}],
+            "lock_probes": [{"path": "owned-storage-lock", "state": "free"}],
+        },
+    },
+}
+
+
 _FAKE_TOOL = r"""
 import json
 import os
@@ -199,6 +269,11 @@ def harness(tmp_path: Path) -> Harness:
         *(path.name for path in (_ROOT / "scripts").glob("verify-lane-*")),
     ):
         shutil.copy2(_ROOT / "scripts" / name, scripts / name)
+    # The real installed-scenario driver needs a real wheel and a real installation, which
+    # this harness fakes at the process boundary. Renaming the driver must break loudly
+    # here rather than silently skipping the lane's newest step.
+    assert (_ROOT / "scripts/verify_installed_scenario.py").is_file()
+    (scripts / "verify_installed_scenario.py").write_text(_FAKE_SCENARIO)
     for name in ("pyproject.toml", "uv.lock"):
         shutil.copy2(_ROOT / name, root / name)
     (root / ".python-version").write_text(f"{sys.version_info.major}.{sys.version_info.minor}\n")
@@ -224,6 +299,8 @@ def harness(tmp_path: Path) -> Harness:
         FAKE_ROOT=str(root),
         FAKE_STATUS=json.dumps(_STATUS),
         FAKE_PREVIEW=json.dumps(_PREVIEW),
+        FAKE_SCENARIO_DEFAULT=json.dumps(_SCENARIO_DEFAULT),
+        FAKE_SCENARIO_LOG=str(tmp_path / "scenario.jsonl"),
         FAKE_UV_VERSION="0.11.32",
         AAS_TEST_DATABASE_URL="postgresql+psycopg://synthetic.invalid/disposable_test",
     )
@@ -597,3 +674,86 @@ def test_installed_package_rejects_retired_runtime(harness: Harness, retired: st
     assert not harness.calls("aas")
     build = next(call for call in harness.calls() if call["args"][0] == "build")
     assert not Path(build["args"][-1]).parent.exists()
+
+
+def test_package_lane_runs_the_installed_scenario(harness: Harness) -> None:
+    """The lane must drive the scenario, and the scenario must not see the checkout."""
+    result = harness.run('"$FAKE_ROOT/scripts/verify-lane-build"', PYTHONPATH=str(harness.root))
+    assert result.returncode == 0, result.stderr
+    assert "installed candidate provenance:" in result.stdout
+    assert (
+        "registration, run, re-read, backup, restore, refusal and recovery: pass" in result.stdout
+    )
+    calls = [
+        json.loads(line)
+        for line in Path(harness.environment["FAKE_SCENARIO_LOG"]).read_text().splitlines()
+    ]
+    assert [call["mode"] for call in calls] == ["seed", "scenario"]
+    seeded, ran = calls
+    # seed needs the development interpreter because the generator lives under tests/.
+    assert seeded["executable"].startswith(str(harness.root))
+    # The scenario must not: it runs the installed interpreter with no checkout on the path.
+    assert not ran["executable"].startswith(str(harness.root))
+    assert ran["pythonpath"] is None
+    assert not ran["cwd"].startswith(str(harness.root))
+    for call in calls:
+        assert "--aas" in call["argv"]
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        {"FAKE_SCENARIO_FAIL": "seed"},
+        {"FAKE_SCENARIO_FAIL": "scenario"},
+        {"FAKE_SCENARIO": json.dumps({**_SCENARIO_DEFAULT["scenario"], "scenario": "partial"})},
+        {
+            "FAKE_SCENARIO": json.dumps(
+                {
+                    **_SCENARIO_DEFAULT["scenario"],
+                    "recovery_without_marker": {
+                        **_SCENARIO_DEFAULT["scenario"]["recovery_without_marker"],
+                        "status": "SUCCESS",
+                    },
+                }
+            )
+        },
+        {
+            "FAKE_SCENARIO": json.dumps(
+                {
+                    **_SCENARIO_DEFAULT["scenario"],
+                    "restored_runs": [{"run_id": "run-x", "identical": False}],
+                }
+            )
+        },
+        {
+            "FAKE_SCENARIO": json.dumps(
+                {
+                    **_SCENARIO_DEFAULT["scenario"],
+                    "cases": {
+                        "a_cli": {"result_hash": "same"},
+                        "b_cli": {"result_hash": "same"},
+                        "a_api": {"result_hash": "same"},
+                    },
+                }
+            )
+        },
+        {
+            "FAKE_SCENARIO": json.dumps(
+                {
+                    **_SCENARIO_DEFAULT["scenario"],
+                    "recovery_after_marker": {
+                        **_SCENARIO_DEFAULT["scenario"]["recovery_after_marker"],
+                        "observers_fired": ["aegis_alpha.engine.replay.replay"],
+                    },
+                }
+            )
+        },
+    ],
+)
+def test_package_lane_rejects_a_scenario_that_did_not_prove_itself(
+    harness: Harness, setting: dict[str, str]
+) -> None:
+    """A green exit code is not the evidence; the lane reads the document and refuses."""
+    result = harness.run('"$FAKE_ROOT/scripts/verify-lane-build"', **setting)
+    assert result.returncode != 0
+    assert "recovery: pass" not in result.stdout

@@ -21,6 +21,23 @@ if TYPE_CHECKING:
 _MANIFEST = "backup.json"
 
 
+def _run_counts(workspace: Workspace) -> dict[str, int]:
+    """Recorded runs by status, for the receipt only.
+
+    This never enters the verification report. Restore compares that report against the
+    manifest's stored copy by full equality, so a new key there would make every backup
+    taken before this change restore as incomplete.
+    """
+    from aegis_alpha.storage.run_schema import inspect_run_schema  # noqa: PLC0415
+
+    if inspect_run_schema(workspace).state != "complete":
+        return {}
+    return {
+        str(row[0]): int(row[1])
+        for row in workspace.state.execute("SELECT status, count(*) FROM runs GROUP BY status")
+    }
+
+
 def _copy_file(source: Path, target: Path) -> dict[str, object]:
     private_file(source)
     private_directory(target.parent, create=True)
@@ -153,6 +170,7 @@ def backup_workspace(
         "backup_root": str(target),
         "secrets_included": False,
         "files": len(files),
+        "runs": _run_counts(workspace),
     }
 
 
@@ -223,6 +241,7 @@ def restore(
             verification = verify_workspace(workspace, budget=budget)
             if verification != manifest["logical"]:
                 raise ValueError("restored logical verification differs from backup")  # noqa: TRY301 -- persist failed restore receipt
+            counts = _run_counts(workspace)
     except BaseException:
         receipt["phase"] = "restore-incomplete"
         write_json(new_home / "installation.json", receipt)
@@ -234,4 +253,5 @@ def restore(
         "home": str(new_home),
         "verification": verification,
         "secrets_restored": False,
+        "runs": counts,
     }

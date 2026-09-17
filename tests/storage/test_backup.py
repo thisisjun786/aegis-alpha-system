@@ -396,3 +396,24 @@ def test_arbitrary_membership_header_blocks_backup_without_mutation(tmp_path: Pa
     assert not target.exists()
     with open_workspace(home) as workspace:
         assert state_image(workspace) == before
+
+
+def test_backup_and_restore_receipts_count_recorded_runs(tmp_path: Path) -> None:
+    """An operator restoring a run-bearing backup must be told what it carried.
+
+    The count belongs on the receipt, never in the verification report: restore compares
+    that report against the manifest by full equality, so a new key there would make every
+    backup taken before this change restore as incomplete.
+    """
+    home = tmp_path / "aas"
+    seed_workspace(home)
+    result = backup(home)
+    assert result["runs"] == {}
+    root = Path(str(result["backup_root"]))
+    restored = restore(root, tmp_path / "restored")
+    assert restored["runs"] == {}
+    verification = restored["verification"]
+    assert isinstance(verification, dict)
+    assert "runs" not in verification
+    stored = json.loads((root / "backup.json").read_text())
+    assert "runs" not in stored["logical"]

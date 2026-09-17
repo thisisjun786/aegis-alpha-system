@@ -35,8 +35,17 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
     db = commands.add_parser("db", help="Manage local SQLite and DuckDB storage")
     _home(db)
     sub = db.add_subparsers(dest="db_command", required=True)
-    for name in ("status", "verify", "recover", "quarantine", "backup", "restore", "run-install"):
-        command = sub.add_parser(name)
+    maintenance = {
+        "status": "Report the installation, its stores and their identifiers",
+        "verify": "Re-derive every stored publication, strategy and run",
+        "recover": "Finish or end interrupted operations without recalculating",
+        "quarantine": "End one named prepared operation with a recorded reason",
+        "backup": "Copy the quiesced stores and run artifacts, excluding secrets",
+        "restore": "Rebuild an installation from a backup into a new home",
+        "run-install": "Install the formal run add-on schema, after a backup",
+    }
+    for name, description in maintenance.items():
+        command = sub.add_parser(name, help=description)
         _home(command)
         if name == "quarantine":
             command.add_argument("--operation", required=True)

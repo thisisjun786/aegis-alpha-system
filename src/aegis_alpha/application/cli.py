@@ -71,6 +71,20 @@ def _status() -> dict[str, object]:
             "docker": False,
         },
         "storage": {"state": "sqlite", "strategies": "sqlite", "market": "duckdb"},
+        # aegis_registered_strategy_run says the code is here, not that this installation
+        # can use it: the run tables are a separate explicit install. Recording the two
+        # separately is what keeps a stored result from reading as execution eligibility.
+        "run_storage": {
+            "module": "aegis",
+            "add_on_required": True,
+            "install_command": "aas db run-install",
+            "recovery_command": "aas db recover",
+            "backup_restore": True,
+            "research_only": True,
+            "execution_eligibility": False,
+            "live_trading_approval": False,
+            "point_in_time_certified": False,
+        },
         "provider_storage": "legacy_adapter_pending_migration",
     }
 

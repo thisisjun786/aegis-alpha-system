@@ -15,8 +15,8 @@ AAS의 목표는 외부 앱과 에이전트가 사용하는 데이터·연구 �
 | `engine.load_bundle` / `engine.replay` | 외부 bundle 검증과 호출자가 주입한 입력 계산 | DB에서 전략·시장 입력 자동 선택 |
 | `aas backtest` | 명시한 ETF 목표 비중의 다음 거래일 시가 체결·비용·NAV 계산 | 원본 전략 규칙 자동 해석·제출 가격의 출처 및 시점 인증 |
 | `aas prepare` | 등록 전략과 고정 pin에서 판단별 목표 비중을 계산해 `aas backtest` 봉투와 출처 sidecar로 내보내기 (SELECT만) | 체결·NAV 계산, run·요청 등록, 결과 저장·복원, 원본 자료의 PIT 인증 |
-| `aas run` | 준비·요청 등록·`open_run`·잠금 없는 회계·`commit_run`을 한 명령으로 잇고 run ID로 결과 조회 (`db run-install` 필요) | 결과 복원, 원본 자료의 PIT 인증, 알파·헷지 전략 실행, 실주문 |
-| `aas init/doctor/db/strategy/data` | `storage/`의 내장 DB 설치·등록·조회·복구, 관례·pin 문서 등록, run 추가 스키마 설치 | 회계 결과를 run으로 확정·복원하는 경로 |
+| `aas run` | 준비·요청 등록·`open_run`·잠금 없는 회계·`commit_run`을 한 명령으로 잇고 run ID로 결과 조회 (`db run-install` 필요) | 원본 자료의 PIT 인증, 알파·헷지 전략 실행, 실주문 |
+| `aas init/doctor/db/strategy/data` | `storage/`의 내장 DB 설치·등록·조회·복구, 관례·pin 문서 등록, run 추가 스키마 설치, 기록한 run을 담은 백업과 새 home 복원 | 실행 자격 부여, 기존 home 덮어쓰기 |
 | `aas providers/collect` | 기존 공급자·예산·실행 영수증 도구 | 수집기의 내장 DB 이식·스케줄러 자동 활성화 |
 
 외부 도구는 현재 Python 계산 API 또는 CLI를 재사용할 수 있다. 모든 저장·수집 기능이

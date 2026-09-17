@@ -66,3 +66,25 @@ def test_cli_missing_file_and_usage_errors(tmp_path: Path) -> None:
     assert _run("preview", "--input", str(tmp_path / "absent.json")).returncode == 1
     assert _run("preview").returncode == _USAGE_ERROR
     assert _run("trade").returncode == _USAGE_ERROR
+
+
+def test_status_separates_the_run_add_on_from_execution_eligibility() -> None:
+    """aegis_registered_strategy_run says the code is here, not that this install can run.
+
+    The run tables are a separate explicit install, and a stored result is research
+    evidence. Status has to say both, or a true capability flag reads as readiness.
+    """
+    result = _run("status")
+    assert result.returncode == 0, result.stderr
+    status = json.loads(result.stdout)
+    assert status["capabilities"]["aegis_registered_strategy_run"] is True
+    block = status["run_storage"]
+    assert block["module"] == "aegis"
+    assert block["add_on_required"] is True
+    assert block["install_command"] == "aas db run-install"
+    assert block["recovery_command"] == "aas db recover"
+    assert block["backup_restore"] is True
+    assert block["research_only"] is True
+    assert block["execution_eligibility"] is False
+    assert block["live_trading_approval"] is False
+    assert block["point_in_time_certified"] is False
