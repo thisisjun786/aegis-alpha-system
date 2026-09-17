@@ -15,7 +15,9 @@ checked and unit tested.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -258,8 +260,12 @@ def recover_in_process(home: Path, lock: Path) -> Document:
     socket.getaddrinfo = refuse  # ty: ignore[invalid-assignment]
     socket.socket.connect = refuse  # ty: ignore[invalid-assignment]
     sys.setprofile(observer)
+    # cli_main prints its receipt, and this scenario's own stdout is a single JSON
+    # document, so the receipt is captured and reported rather than interleaved.
+    captured = io.StringIO()
     try:
-        code = cli_main(["--home", str(home), "db", "recover"])
+        with contextlib.redirect_stdout(captured):
+            code = cli_main(["--home", str(home), "db", "recover"])
     finally:
         sys.setprofile(None)
         socket.create_connection = saved[0]
@@ -267,6 +273,7 @@ def recover_in_process(home: Path, lock: Path) -> Document:
         socket.socket.connect = saved[2]
     return {
         "exit_code": code,
+        "receipt": json.loads(captured.getvalue()) if captured.getvalue().strip() else None,
         "armed_calculation_targets": sorted(armed.values()),
         "armed_network_targets": [
             "socket.create_connection",
