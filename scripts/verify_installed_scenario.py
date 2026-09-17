@@ -629,6 +629,13 @@ def scenario(arguments: argparse.Namespace) -> Document:
         receipt_a["target_weights"] != receipt_b["target_weights"],
         "the widened strategy must reach different allocation decisions",
     )
+    # all() is true of an empty mapping, so the decision dates are required first:
+    # a strategy that decided nothing would otherwise satisfy every count below.
+    require(
+        sorted(receipt_a["target_weights"]) == sorted(receipt_b["target_weights"])
+        and len(receipt_a["target_weights"]) > 1,
+        "both cases cover the same period and must decide on the same dates",
+    )
     require(
         all(len(weights) == 1 for weights in receipt_a["target_weights"].values()),
         "the baseline strategy selects one asset per decision",
