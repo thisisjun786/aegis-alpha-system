@@ -32,6 +32,7 @@ def test_cli_status_without_site_packages() -> None:
         "allocation_preview": True,
         "strategy_execution": False,
         "aegis_etf_target_replay": True,
+        "aegis_registered_strategy_run": True,
         "research_proxy_returns": True,
         "research_candidate_generation": True,
         "database_adapter": True,

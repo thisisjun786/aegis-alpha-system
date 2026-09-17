@@ -285,13 +285,15 @@ aas data binding-import --spec /path/to/pin-document.json --sha256 SHA256
 aas prepare --request /path/to/prepare-request.json --sha256 SHA256 --output /path/to/new/envelope.json
 aas backtest --input /path/to/new/envelope.json --sha256 <prepare가 돌려준 envelope.sha256>
 aas db run-install [--backup-output /path/to/new-backup]
+aas run execute --request /path/to/prepare-request.json --sha256 SHA256
 ```
 
 `aas prepare`는 등록된 전략과 고정한 입력만 읽어 각 의사결정 시점의 목표 비중을 계산하고,
 기존 `aas backtest`가 읽는 봉투(`aas-etf-backtest-v1`/`v2`)로 내보낸다. 체결·NAV 계산,
-run 등록, 결과 저장은 하지 않는다. 봉투 회계는 별도 `aas backtest` 호출이며, run·결과의
-정식 저장·검증·복원은 아직 연결되지 않은 후속 작업이다. `db run-install`은 그 후속 소비자가
-쓸 state·market 추가 스키마를 백업 후 설치할 뿐이고 `prepare`에는 필요 없다.
+run 등록, 결과 저장은 하지 않는다. 봉투 회계는 별도 `aas backtest` 호출이다. 준비부터
+결과 저장까지 한 번에 하려면 [`aas run execute`](#준비부터-run-저장까지-한-번에)를 쓴다.
+`db run-install`은 그 run이 쓰는 state·market 추가 스키마를 백업 후 설치하며 `prepare`와
+`backtest`에는 필요 없다. 복원은 여전히 별도 경로다.
 
 ### 준비 요청 문서
 
@@ -432,7 +434,7 @@ revision만 재생한다. 나중에 게시한 generation·revision은 같은 pin
 NAV·체결을 계산한다. 응답의 `source_pins_verified`·`point_in_time_verified`·`live_orders`는
 계속 false다. 회계 결과는 stdout의 JSON 응답 하나이며 명령이 결과 파일을 저장하지 않는다.
 아래 실습의 `tee "$LAB/backtest.json"`처럼 셸 리디렉션으로 남기는 사본은 run 보존이 아니다.
-run 등록·결과 확정·복원은 아직 없다.
+결과를 run으로 확정하려면 아래 `aas run`을 쓴다. 복원은 별도 경로다.
 
 같은 준비를 Python에서 호출할 수 있다.
 [backtest_prepare.py](../src/aegis_alpha/application/backtest_prepare.py)의
@@ -465,6 +467,76 @@ compute 환경이 없으면 `None`을 yield한다. 아래 실습 5단계가 이 
 사용한다. 이 외부 driver·의존성 버전은 닫힌 환경 v1에 포함되지 않으므로 임의 버전 간
 재현성을 보장하지 않는다. 의존성 정체성이 필요하면 별도의 버전된 환경 계약이 필요하며,
 v1 필드에 조용히 추가하지 않는다.
+
+### 준비부터 run 저장까지 한 번에
+
+`aas run execute`는 위의 준비와 회계를 정식 run 기록까지 이어 붙인 명령이다. 네 단계로
+나뉘며 계산 동안에는 저장 잠금도 state 트랜잭션도 쥐지 않는다.
+
+| 단계 | 쥐는 것 | 하는 일 |
+| --- | --- | --- |
+| 0 | compute lease + 읽기 전용 설치 | run add-on 확인, `prepare_backtest`, 선택적 파일 내보내기 |
+| A | compute lease + 짧은 쓰기 | 입력 bundle·요청 등록, `open_run`으로 의도 확정과 입력 봉인 |
+| B | compute lease만 | 봉인한 봉투 바이트로 회계 계산 |
+| C | compute lease + 짧은 쓰기 | 설치 정체성과 pin 재확인 후 `commit_run`, 정상 실패면 `fail_run` |
+
+run 저장 표는 기본 설치에 없다. `aas db run-install`을 한 번 실행해 두지 않으면 0단계에서
+그 명령을 알려주며 계산 전에 끝난다. 이 명령이 표를 몰래 만들지 않는다.
+
+```bash
+aas db run-install
+aas run execute --request "$LAB/request.json" --sha256 "$REQUEST_SHA256"
+aas run show --run-id run-0123456789abcdef
+aas run list
+```
+
+선택 인자는 `--reason`(기록할 사유), `--bundle-id`(입력 bundle 이름; 기본값은 요청의
+bindings와 요청 hash에서 함께 유도한다. bundle 하나에는 요청 하나만 저장되므로, 같은 입력을
+고정한 채 기간·계좌·일정만 바꾼 요청은 다른 이름을 받는다), `--prior-run-id`(재계산의 선행 run),
+`--run-id`(명시적 run ID),
+`--envelope-output PATH`(봉투와 `PATH.preparation.json`을 파일로도 남긴다; 기존 경로는
+덮어쓰지 않는다)다. 요청 파일 규칙과 compute 환경 요구는 `prepare`와 같다.
+
+성공 응답은 결과가 저장된 뒤에만 돌아온다. `request_hash`, `bundle_id`,
+`envelope.sha256`·`preparation.sha256`, 판단별 `target_weights`, 회계 응답 전체를 담은
+`backtest`, 그리고 `run_id`·`status`·`result_hash`·표별 hash와 행 수·지표를 담은 `run`,
+`certified=false`가 들어 있다. 같은 요청을 CLI로 돌리든
+[run_backtest.py](../src/aegis_alpha/application/run_backtest.py)의
+`run_backtest(RunBacktestRequest(...))`로 돌리든 `run.run_id`만 다르고 나머지는 같다.
+`read_backtest_run(run_id, home=...)`와 `list_backtest_runs(home=...)`가 조회 진입점이며
+`aas run show`·`aas run list`가 그것을 그대로 부른다.
+
+`aas run show`는 기록·결과 표시자·봉인 파일이 모두 서로 맞을 때만 run을 돌려주고, 아니면
+거부한다. 실패는 stdout 없이 stderr 한 줄 `{"error": ...}`와 종료 코드 1이다. 잘못된 요청
+hash, 잘못된 pin, 미등록 전략 버전, 설치 경쟁, 그리고 run을 열기 전의 예산 부족은 run을
+남기지 않는다. run을 연 다음의 실패는 다르다. 계산이 정상적으로 실패하거나, 결과를 봉인할
+예산이 모자라거나, 준비 이후 설치 정체성이 바뀌면 그 run은 `fail_run`으로 FAILED가 되어
+run 이력에 남는다. 어느 쪽이든 성공 영수증은 없다. 그 run을 끝내지 못했다면 오류에
+`notes`가 붙어 run ID와 필요한 복구 명령을 알려준다.
+
+준비가 붙잡고 있는 봉투·출처 바이트와 계산이 만든 결과 바이트는 다음 단계의 예산에서
+`reserved_bytes`로 뺀다. 각각은 들어가지만 합치면 할당을 넘는 두 적재가 동시에 살아 있는
+상황을 막는다. 남은 여유가 없으면 그 단계를 시작하기 전에 거부한다.
+
+기록하는 `engine_hash`는 준비 목록 `CALCULATION_MODULES`의 정체성이다. 회계를 실행하는
+`application/backtest_cli`와 응답을 직렬화하는 `storage.publication`은 그 목록에 없다.
+두 파일만 바뀌면 같은 `request_hash`가 다른 결과 바이트를 봉인할 수 있다. 목록을 넓히면
+모든 요청의 `request_hash`가 바뀌므로 준비 정체성을 소유한 별도 결정으로 다룬다.
+
+계산 도중 프로세스가 죽으면 run은 RUNNING으로 남는다. 기존 복구 계약이 그대로 적용된다.
+표시자가 없으면 `aas db recover`가 INTERRUPTED로 끝내고, 정상 표시자가 있으면 저장을
+재개하며, 손상 증거는 QUARANTINED가 된다. 복구는 계산이나 공급자 호출을 되풀이하지 않는다.
+재계산은 새 run이므로 `--prior-run-id`로 이전 run에 연결한다.
+
+입력을 봉인하는 도중 실패해도 run은 RUNNING으로 남는다. 이때는 `fail_run`으로 억지로
+끝내지 않고 복구에 맡긴다. `--envelope-output`으로 내보낸 파일은 run을 열기 전에 쓰므로
+실패해도 검사용으로 남는다. 둘 다 성공 영수증이 아니다.
+
+**같은 설치에서 run이 도는 동안 `aas db recover`를 돌리지 않는다.** 표시자가 없는 상태는
+"죽은 계산"과 "아직 계산 중"을 구분하지 못한다. 복구는 계산 단계에서 저장 잠금을 쥐지 않는
+살아 있는 run도 INTERRUPTED로 끝낼 수 있고, 그러면 그 run의 저장이 거부되며 명령은 구조화된
+오류로 실패한다. 잘못된 결과가 저장되지는 않지만 실행은 버려진다. 이는 복구 계약 자체의
+성질이며 통합 명령이 새로 만든 것이 아니다.
 
 ### 저장소 checkout 실습
 
@@ -740,4 +812,5 @@ docker compose run --rm aas doctor
 
 라이브 공급자 검증·기존 DB 이전·스케줄러 활성화·실주문은 위 오프라인 설치 검사의 범위에
 포함되지 않는다. CLI preview는 합성 비중 계산이고, `prepare`와 `backtest`는 저장한 입력의
-준비와 명시한 봉투의 회계까지다. run 저장·결과 확정·복원은 아직 별도 구현이다.
+준비와 명시한 봉투의 회계까지다. 그 둘을 이어 run으로 확정하고 다시 읽는 것은 `aas run`이며
+`aas db run-install`이 필요하다. 결과 복원은 아직 별도 구현이다.

@@ -333,7 +333,7 @@ SQLite와 DuckDB 중 하나만 성공하면 설치는 migration-incomplete로 �
 | L1 저장소 기반 | 로컬 경로 구현: `storage/paths.py`, `workspace.py`, `locks.py`, `sqlite.py`, 세 schema 파일. `tests/storage/test_workspace.py`에 초기화·잠금·정체성 거부 사례 | 현재 초기화·검증 경로 유지. 자동 schema 업그레이드와 서비스 소유권 인계는 미구현이며 별도 실패·복구 계약 검증 필요 |
 | L2 전략·상태 | bundle 등록·로드와 영수증 구현: `strategies.py`, `strategy_import.py`, `state.py`. CLI는 등록·목록 제공; lineage·원래 성과용 schema 존재 | 원래 성과·비교 조건의 전체 입력 경로, 실행 입력 bundle·run 소비자 연결 필요. schema만으로 DB 재실행 완료를 주장하지 않음 |
 | L3 시장·publication | typed JSON import, generation·revision 조회, 중단 게시 재개 구현: `import_document.py`, `market.py`, `publication.py`; `tests/storage/test_market.py`, `test_publication.py`에 합성 사례 | 기존 `data/catalog_access.py`·`pinned_prices.py`, identity/metadata 소비자와 수집기 전환 필요. 도메인별 품질·사용 자격과 전체 입력 고정 검증은 별도 |
-| L4 수집·실행 | `collection/`, `data/`의 공급자 도구와 `application/daily_collection.py`는 전환 전 경로. 저장 전략→고정 입력→계산→봉투는 `application/backtest_prepare.py`·`aas prepare`가 SELECT-only로 연결(`tests/application/test_backtest_prepare.py`, `test_prepare_cli.py`에 합성 사례); 봉투 회계는 기존 `aas backtest`. `storage/run_schema.py`의 run 추가 스키마와 `backtest_requests.py`의 정규 요청 저장 API 존재, 호출하는 run 소비자는 없음 | 수집기 내장 DB 이식, 예산·watermark 결합, run 할당·회계 결과 확정·복구 연결 필요. 준비 출력은 `certified=false`이며 불확실 호출·부분 결과·재시작 시나리오를 검증해야 완료 |
+| L4 수집·실행 | `collection/`, `data/`의 공급자 도구와 `application/daily_collection.py`는 전환 전 경로. 저장 전략→고정 입력→계산→봉투는 `application/backtest_prepare.py`·`aas prepare`가 SELECT-only로 연결(`tests/application/test_backtest_prepare.py`, `test_prepare_cli.py`에 합성 사례); 봉투 회계는 기존 `aas backtest`. `storage/run_schema.py`의 run 추가 스키마와 `backtest_requests.py`의 정규 요청 저장 API를 `application/run_backtest.py`·`aas run`이 소비해 요청 등록·`open_run`·잠금 없는 계산·`commit_run`·run ID 조회를 잇는다(`tests/application/test_run_backtest.py`에 합성 사례). 명시적 `aas db run-install` 필요 | 수집기 내장 DB 이식, 예산·watermark 결합, 결과 복원 연결 필요. 준비·실행 출력은 `certified=false`이며 불확실 호출·부분 결과·재시작 시나리오를 검증해야 완료 |
 | L5 설치·백업 | native CLI와 선택적 단일 이미지, `storage/backup.py`의 일관 백업·새 루트 복원 구현. `tests/storage/test_backup.py`에 합성 복원·손상 거부 사례 | 0013의 상시 앱·소켓·예약 실행, 자동 업그레이드, artifact 게시·실제 자료 이전은 미완료. 구현·게시·운영 검증을 각각 기록 |
 | L6 구경로 제거 | PostgreSQL adapter·Alembic chain·Parquet reader와 `legacy` 추가 의존성 유지 | 앞 단계에서 모든 호출자와 실패 계약을 대체한 뒤 미사용 코드·의존성·관련 테스트·CI 선택을 함께 정리. 현재 제거 완료로 표시하지 않음 |
 
@@ -367,6 +367,6 @@ L1~L6를 모두 미착수로 취급하거나 모두 완료로 묶지 않는다. 
 특정 전략만 통과하도록 가격 몇 종목으로 데이터 모델을 축소하지 않는다.
 
 현재 구현은 빈 설치·전략 원문 저장·typed market generation·시점 조회·게시 재개·
-일관된 백업과 새 루트 복원, 관례·pin 문서 등록, 저장 입력의 준비와 봉투 회계까지다.
-공급자 수집기 이식, run 할당·결과 확정·복구, 상시 앱 소켓, schema 업그레이드와 실제
-데이터 이전·이미지 배포는 완료되지 않았다.
+일관된 백업과 새 루트 복원, 관례·pin 문서 등록, 저장 입력의 준비와 봉투 회계, 그리고
+그 둘을 이어 run으로 확정하고 run ID로 다시 읽는 것까지다. 공급자 수집기 이식, 결과 복원,
+상시 앱 소켓, schema 업그레이드와 실제 데이터 이전·이미지 배포는 완료되지 않았다.
