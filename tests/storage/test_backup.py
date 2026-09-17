@@ -5,6 +5,7 @@ import json
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -12,6 +13,7 @@ from aegis_alpha.storage import publication
 from aegis_alpha.storage.backup import backup, restore
 from aegis_alpha.storage.import_document import parse_import
 from aegis_alpha.storage.raw import put_raw_file
+from aegis_alpha.storage.runs import RunResult, commit_run, open_run, read_run
 from aegis_alpha.storage.strategies import LineageSpec, load_strategy
 from aegis_alpha.storage.strategy_import import register_strategy
 from aegis_alpha.storage.verification import verify_workspace
@@ -28,6 +30,8 @@ from tests.storage.test_membership_pins import (
     state_image,
 )
 from tests.storage.test_publication import document
+from tests.storage.test_runs import BUDGET as RUN_BUDGET
+from tests.storage.test_runs import RESULT, intent, prepared
 
 _MIN_BACKUP_FILES = 5
 
@@ -417,3 +421,64 @@ def test_backup_and_restore_receipts_count_recorded_runs(tmp_path: Path) -> None
     assert "runs" not in verification
     stored = json.loads((root / "backup.json").read_text())
     assert "runs" not in stored["logical"]
+
+
+def test_a_recorded_success_run_survives_a_backup_into_a_new_home(tmp_path: Path) -> None:
+    """The gap the installed lane was built for, held at storage level too.
+
+    Without this, every run-bearing backup claim needs a wheel to falsify.
+    """
+    fx = prepared(tmp_path / "source")
+    home = fx.home
+    with open_workspace(home, writable=True) as workspace:
+        handle = open_run(workspace, intent(fx, "run-backed-up"))
+        commit_run(workspace, handle, RunResult(RESULT), budget=RUN_BUDGET)
+    # The commit receipt carries no artifact sizes, so the comparison baseline is a read.
+    with open_workspace(home) as workspace:
+        before = read_run(workspace, "run-backed-up", budget=RUN_BUDGET)
+
+    saved = backup(home, tmp_path / "archive")
+    assert saved["runs"] == {"SUCCESS": 1}
+    root = Path(str(saved["backup_root"]))
+
+    restored_home = tmp_path / "restored"
+    restored = restore(root, restored_home, budget=RUN_BUDGET)
+    assert restored["restored"] is True
+    assert restored["runs"] == {"SUCCESS": 1}
+    with open_workspace(restored_home) as workspace:
+        after = read_run(workspace, "run-backed-up", budget=RUN_BUDGET)
+        assert verify_workspace(workspace, budget=RUN_BUDGET)["verified"] is True
+    for field in (
+        "status",
+        "result_hash",
+        "request_hash",
+        "table_hashes",
+        "table_counts",
+        "artifacts",
+        "artifact_sizes",
+        "metrics",
+        "strategy_pins",
+    ):
+        assert after[field] == before[field], field
+    # The sealed files themselves moved, not just the rows that describe them.
+    artifacts = cast("dict[str, str]", after["artifacts"])
+    sizes = cast("dict[str, int]", after["artifact_sizes"])
+    for name, content_hash in artifacts.items():
+        copied = restored_home / "runs" / "run-backed-up" / name
+        raw = copied.read_bytes()
+        assert hashlib.sha256(raw).hexdigest() == content_hash
+        assert len(raw) == sizes[name]
+
+    # Restoring onto a home that already exists is refused and changes nothing.
+    fingerprint = {
+        str(path.relative_to(restored_home)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(restored_home.rglob("*"))
+        if path.is_file()
+    }
+    with pytest.raises(ValueError, match="nonexistent home"):
+        restore(root, restored_home, budget=RUN_BUDGET)
+    assert {
+        str(path.relative_to(restored_home)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(restored_home.rglob("*"))
+        if path.is_file()
+    } == fingerprint
