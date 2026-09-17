@@ -386,8 +386,13 @@ def fixture_documents(root: Path) -> Document:
     return body
 
 
-def register_fixture(root: Path, cli: CLI) -> tuple[Path, Path]:
-    """All writes to the tested home go through init/registration CLI commands."""
+def register_fixture(root: Path, cli: CLI, keep_incoming: Path | None = None) -> tuple[Path, Path]:
+    """All writes to the tested home go through init/registration CLI commands.
+
+    keep_incoming copies the incoming documents somewhere durable before they are
+    removed, so a caller that has to derive a second strategy from the same bundle
+    does not have to reach into the private store to recover it.
+    """
     body = fixture_documents(root)
     incoming = root / "incoming"
     initialized = cli("init")
@@ -469,6 +474,10 @@ def register_fixture(root: Path, cli: CLI) -> tuple[Path, Path]:
         )
     request = root / "request.json"
     request.write_bytes(canonical_json_bytes(body))
+    if keep_incoming is not None:
+        keep_incoming.mkdir(parents=True, exist_ok=True)
+        for path in incoming.iterdir():
+            (keep_incoming / path.name).write_bytes(path.read_bytes())
     for path in incoming.iterdir():
         path.unlink()
     incoming.rmdir()
