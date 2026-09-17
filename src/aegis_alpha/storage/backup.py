@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from aegis_alpha.data.descriptor_tree import DescriptorTree
+from aegis_alpha.data.descriptor_tree import DescriptorTree, DescriptorTreeError
 from aegis_alpha.storage.locks import private_directory, private_file
 from aegis_alpha.storage.paths import DEFAULT_PATHS, load_paths, read_json, resolve_home
 from aegis_alpha.storage.verification import verify_workspace
@@ -174,6 +174,24 @@ def backup_workspace(
     }
 
 
+def _listed_file_hash(root: Path, path: Path, relative: str) -> dict[str, object]:
+    """Hash one file the manifest lists, naming the backup when it cannot be read.
+
+    The descriptor layer describes a file handle, which is the wrong subject for someone
+    holding a broken backup. Translation keys off the exception cause rather than message
+    text, so an ownership, mode or hard-link refusal keeps its own reason instead of being
+    relabelled as missing.
+    """
+    try:
+        return _file_hash(root / path)
+    except DescriptorTreeError as error:
+        if isinstance(error.__cause__, FileNotFoundError):
+            raise ValueError("backup is missing a file it lists: " + relative) from error  # noqa: TRY004 -- a broken backup, not a caller type error
+        if isinstance(error.__cause__, PermissionError):
+            raise ValueError("backup file cannot be read: " + relative) from error  # noqa: TRY004 -- a broken backup, not a caller type error
+        raise
+
+
 def _validated_manifest(root: Path) -> dict[str, object]:
     private_directory(root)
     manifest = read_json(root / _MANIFEST)
@@ -207,7 +225,7 @@ def _validated_manifest(root: Path) -> dict[str, object]:
             or not (relative in required or relative.startswith(("raw/", "runs/")))
         ):
             raise ValueError("backup contains an unsafe or unsupported path")
-        if _file_hash(root / path) != expected:
+        if _listed_file_hash(root, path, relative) != expected:
             raise ValueError("backup file hash/size mismatch")
     paths = load_paths(root)
     if any(Path(value) != root / DEFAULT_PATHS[key] for key, value in paths.to_dict().items()):

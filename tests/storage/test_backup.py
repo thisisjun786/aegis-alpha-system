@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -482,3 +483,42 @@ def test_a_recorded_success_run_survives_a_backup_into_a_new_home(tmp_path: Path
         for path in sorted(restored_home.rglob("*"))
         if path.is_file()
     } == fingerprint
+
+
+def test_a_backup_missing_a_listed_file_says_so(tmp_path: Path) -> None:
+    """The operator gets a sentence about the backup, not about a file descriptor.
+
+    A security refusal must keep its own reason, so only a genuinely absent or unreadable
+    file is translated; ownership, mode and hard-link refusals are re-raised untouched.
+    """
+    home = tmp_path / "aas"
+    seed_workspace(home)
+    root = Path(str(backup(home, tmp_path / "archive")["backup_root"]))
+    listed = json.loads((root / "backup.json").read_text())["files"]
+    assert "state.sqlite3" in listed
+
+    (root / "state.sqlite3").unlink()
+    with pytest.raises(ValueError, match=r"backup is missing a file it lists: state\.sqlite3"):
+        restore(root, tmp_path / "restored")
+    assert not (tmp_path / "restored").exists()
+
+    # A present but altered file keeps the distinct hash/size wording.
+    intact = Path(str(backup(home, tmp_path / "archive-two")["backup_root"]))
+    raw = bytearray((intact / "state.sqlite3").read_bytes())
+    raw[len(raw) // 2] ^= 0xFF
+    (intact / "state.sqlite3").write_bytes(bytes(raw))
+    with pytest.raises(ValueError, match=r"hash/size mismatch"):
+        restore(intact, tmp_path / "restored-two")
+    assert not (tmp_path / "restored-two").exists()
+
+    # A refusal about ownership or linking is not a missing file and must not say it is.
+    linked = Path(str(backup(home, tmp_path / "archive-three")["backup_root"]))
+    target = linked / "state.sqlite3"
+    duplicate = linked / "state.sqlite3.extra"
+    os.link(target, duplicate)
+    try:
+        with pytest.raises(ValueError, match=r"private, owned and not linked"):
+            restore(linked, tmp_path / "restored-three")
+    finally:
+        duplicate.unlink()
+    assert not (tmp_path / "restored-three").exists()
