@@ -411,9 +411,9 @@ def register_fixture(root: Path, cli: CLI, keep_incoming: Path | None = None) ->
         sha(path.read_bytes()),
     )
     strategy.update(raw_sha256=imported["raw_sha256"], contract_sha256=imported["contract_sha256"])
-    strategy["strategy_store_id"] = json.loads((home / "installation.json").read_bytes())["stores"][
-        "strategies"
-    ]["store_id"]
+    # Read through the command, not the file: this is the interface an operator has, and
+    # the installed lane reuses this helper, so a broken doctor must fail here too.
+    strategy["strategy_store_id"] = cli("doctor")["stores"]["strategies"]["store_id"]
     for name in ("signal", "outcomes", "sessions"):
         source = incoming / (name + ".sqlite3")
         imported = cli(
@@ -444,20 +444,27 @@ def register_fixture(root: Path, cli: CLI, keep_incoming: Path | None = None) ->
             spec = incoming / (kind.replace(":", "-") + ".json")
             if kind in ("identity", "universe"):
                 document = json.loads(spec.read_bytes())
-                # Registration times belong to the actual fresh publication, not the seed.
-                with open_workspace(home) as workspace:
-                    document["sources"] = [
-                        {
-                            **dict(
-                                workspace.state.execute(
-                                    "SELECT * FROM source_snapshots WHERE snapshot_id=?",
-                                    (source["snapshot_id"],),
-                                ).fetchone()
-                            ),
-                            "files": source["files"],
-                        }
-                        for source in document["sources"]
+                # Registration times belong to the actual fresh publication, not the seed,
+                # and they come back through data inspect rather than a direct read, so
+                # the installed lane exercises that interface instead of bypassing it.
+                headers = {
+                    str(snapshot["snapshot_id"]): snapshot
+                    for name in ("signal", "outcomes", "sessions")
+                    for snapshot in cli("data", "inspect", "--dataset", name, "--version", "1")[
+                        "source_snapshots"
                     ]
+                }
+                document["sources"] = [
+                    {
+                        **{
+                            key: value
+                            for key, value in headers[source["snapshot_id"]].items()
+                            if key != "files"
+                        },
+                        "files": source["files"],
+                    }
+                    for source in document["sources"]
+                ]
                 spec.write_bytes(canonical_json_bytes(document))
             result = cli(
                 "data",

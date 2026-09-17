@@ -496,15 +496,14 @@ def require(condition: bool, message: str) -> None:  # noqa: FBT001 -- an assert
 
 
 def cleanup_receipt(owned: list[Path], locks: list[Path]) -> Document:
-    """Remove only what this scenario created and prove no lock is still held."""
+    """Prove no lock is still held, then remove only what this scenario created.
+
+    Probing has to come first. The locks live inside the tree being removed, so deleting
+    before probing would report every one of them absent and the receipt would say nothing.
+    """
     import fcntl  # noqa: PLC0415
     import shutil  # noqa: PLC0415
 
-    removed = []
-    for path in owned:
-        if path.exists():
-            shutil.rmtree(path, ignore_errors=True)
-        removed.append({"path": str(path), "remaining": path.exists()})
     probes = []
     for path in locks:
         if not path.exists():
@@ -519,6 +518,13 @@ def cleanup_receipt(owned: list[Path], locks: list[Path]) -> Document:
             probes.append({"path": str(path), "state": "STILL HELD"})
         finally:
             os.close(handle)
+    held = [str(probe["path"]) for probe in probes if probe["state"] == "STILL HELD"]
+    require(not held, "locks still held at cleanup: " + ", ".join(held))
+    removed = []
+    for path in owned:
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
+        removed.append({"path": str(path), "remaining": path.exists()})
     return {"removed": removed, "lock_probes": probes}
 
 
@@ -616,6 +622,20 @@ def scenario(arguments: argparse.Namespace) -> Document:
     require(
         receipt_a["run"]["result_hash"] != receipt_b["run"]["result_hash"],
         "two different strategies must not produce one result",
+    )
+    # result_hash covers the request hash too, so two different requests differ whatever
+    # the strategies did. The decisions themselves are what shows the second strategy ran.
+    require(
+        receipt_a["target_weights"] != receipt_b["target_weights"],
+        "the widened strategy must reach different allocation decisions",
+    )
+    require(
+        all(len(weights) == 1 for weights in receipt_a["target_weights"].values()),
+        "the baseline strategy selects one asset per decision",
+    )
+    require(
+        all(len(weights) > 1 for weights in receipt_b["target_weights"].values()),
+        "the widened strategy selects more than one asset per decision",
     )
     require(
         api["run"]["result_hash"] == receipt_a["run"]["result_hash"]
@@ -785,9 +805,12 @@ def finish_scenario(  # noqa: PLR0913, PLR0915, PLR0917 -- the rest of one linea
         call["pythonpath_present"] for call in evidence["installed_calls"]
     )
     require(evidence["any_call_saw_pythonpath"] is False, "no installed call may see PYTHONPATH")
+    # Every lock either installation could still be holding, not just the workspace one.
+    stores = ("state.sqlite3.lock", "strategies.sqlite3.lock", "market.duckdb.lock")
     evidence["cleanup"] = cleanup_receipt(
         [work],
-        [home / ".storage.lock", restored_home / ".storage.lock", lock],
+        [lock]
+        + [root / name for root in (home, restored_home) for name in (".storage.lock", *stores)],
     )
     evidence["scenario"] = "complete"
     return evidence

@@ -148,30 +148,37 @@ def test_command_environment_cannot_leak_the_checkout(tmp_path: Path) -> None:
         assert environment[name]
 
 
-def test_cleanup_receipt_removes_owned_paths_and_reports_a_held_lock(tmp_path: Path) -> None:
-    """A success-only receipt is worthless if it cannot tell a held lock from a free one."""
+def test_cleanup_receipt_refuses_while_a_lock_is_held(tmp_path: Path) -> None:
+    """A held lock must stop the receipt, and probing must happen before deletion.
+
+    The real locks live inside the tree cleanup removes, so deleting first would report
+    every one of them absent and the receipt would certify nothing.
+    """
     owned = tmp_path / "work"
     (owned / "deep").mkdir(parents=True)
     (owned / "deep/file").write_bytes(b"x")
-    # The lock lives outside owned, because cleanup deletes before it probes.
-    lock = tmp_path / "storage.lock"
+    lock = owned / "storage.lock"
     lock.write_bytes(b"")
     absent = tmp_path / "never-created.lock"
 
     holder = os.open(lock, os.O_RDWR)
     try:
         fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        receipt = cleanup_receipt([owned], [lock, absent])
+        with pytest.raises(SystemExit, match="locks still held at cleanup"):
+            cleanup_receipt([owned], [lock, absent])
+        # Refusing must not delete the evidence it refused over.
+        assert lock.exists()
+        assert (owned / "deep/file").exists()
     finally:
         os.close(holder)
+
+    receipt = cleanup_receipt([owned], [lock, absent])
     assert receipt["removed"] == [{"path": str(owned), "remaining": False}]
     assert not owned.exists()
     assert receipt["lock_probes"] == [
-        {"path": str(lock), "state": "STILL HELD"},
+        {"path": str(lock), "state": "free"},
         {"path": str(absent), "state": "absent"},
     ]
-    # Once the holder is gone the same probe reports free, so the check is not constant.
-    assert cleanup_receipt([], [lock])["lock_probes"] == [{"path": str(lock), "state": "free"}]
 
 
 def test_refused_rejects_a_command_that_unexpectedly_succeeded(
