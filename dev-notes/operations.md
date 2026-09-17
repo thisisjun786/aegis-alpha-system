@@ -820,8 +820,9 @@ docker compose run --rm aas doctor
 ## 설치한 wheel 검증
 
 `scripts/verify-lane-build`는 wheel을 만들어 깨끗한 환경에 설치한 뒤
-`scripts/verify_installed_scenario.py`로 제품 경로 전체를 돌린다. 합성 전략 둘을 등록하고
-두 사례를 CLI와 Python API로 실행하며, 준비에 쓴 입력 문서를 모두 지우고 다른 작업
+`scripts/verify_installed_scenario.py`로 제품 경로 전체를 돌린다. 합성 전략 둘을 등록해
+두 사례를 CLI로 실행하고, 그중 첫 사례는 Python API로도 실행해 두 경로가 같은 결과를
+내는지 대조한다. 준비에 쓴 입력 문서를 모두 지우고 다른 작업
 디렉터리에서 재실행·재조회한다. 그 다음 설치본을 백업해 새 home에 복원하고 기록한 run을
 하나씩 대조하며, 기존 home 대상 복원과 손상·누락 백업이 거부되는지 확인한다. 마지막으로
 실제 run 둘을 커밋 순서의 정확한 지점에서 중단시켜 복구시킨다.

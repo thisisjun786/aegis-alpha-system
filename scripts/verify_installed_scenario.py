@@ -709,8 +709,20 @@ def finish_scenario(  # noqa: PLR0913, PLR0915, PLR0917 -- the rest of one linea
     proves the restored installation is operational rather than merely readable.
     """
     backup_root = work / "backup"
+    # Seed real secret material first. Asserting that an empty secrets directory stayed
+    # empty proves nothing about a backup's exclusion rule.
+    secret = home / "secrets" / "provider.json"
+    secret.write_text(json.dumps({"api_key": "synthetic-secret-never-copied"}), encoding="utf-8")
+    secret.chmod(0o600)
     evidence["backup"] = cli.json("db", "backup", "--output", str(backup_root))
     require(evidence["backup"]["secrets_included"] is False, "a backup must exclude secrets")
+    carried = [
+        str(path)
+        for path in backup_root.rglob("*")
+        if path.is_file() and b"synthetic-secret-never-copied" in path.read_bytes()
+    ]
+    require(not carried, "secret material reached the backup: " + ", ".join(carried))
+    evidence["secret_material_seeded"] = True
     require(
         not (backup_root / "secrets").exists()
         and json.loads((backup_root / "runtime.json").read_text())["providers"] == {},
