@@ -111,10 +111,11 @@ HTTP/MCP 서버와 상시 daemon은 제공하지 않는다. [제품 경계 결�
 
 기존 공급자 수집기는 전환 중이다. `legacy-db`·`legacy-data`와 해당 수집기, 그리고
 `storage.source_library.import_arrow`의 Arrow 적재는 `legacy` 추가 의존성이 필요하다.
-새 기본 설치에는 PostgreSQL 드라이버·Alembic·PyArrow를 설치하지 않는다. 위 준비 흐름은
-`uv sync --locked --dev`의 잠긴 개발 환경(같은 패키지 포함)에서 확인했고, 기본 설치만으로
-같은 흐름을 검증하지는 않았다. 의존성은 `pyproject.toml`과 `uv.lock`이 정본이다.
-수집기 이식 후 전환용 경로를 제거한다.
+새 기본 설치에는 PostgreSQL 드라이버·Alembic·PyArrow를 설치하지 않는다. 이 전환용 경로는
+`uv sync --locked --dev`의 잠긴 개발 환경에서만 확인했고 기본 설치로는 검증하지 않았다.
+native 경로는 다르다. 등록부터 run 실행·재조회·백업·새 루트 복원·중단 복구까지는
+`scripts/verify-lane-build`가 깨끗한 환경에 설치한 wheel로 직접 돌려 확인한다.
+의존성은 `pyproject.toml`과 `uv.lock`이 정본이다. 수집기 이식 후 전환용 경로를 제거한다.
 
 Docker는 앱 하나를 포장하는 선택사항이다. 기본 Compose에는 DB 서비스가 없다.
 컨테이너 사용 절차는 [운영 안내](dev-notes/operations.md)를 따른다.

@@ -813,4 +813,21 @@ docker compose run --rm aas doctor
 라이브 공급자 검증·기존 DB 이전·스케줄러 활성화·실주문은 위 오프라인 설치 검사의 범위에
 포함되지 않는다. CLI preview는 합성 비중 계산이고, `prepare`와 `backtest`는 저장한 입력의
 준비와 명시한 봉투의 회계까지다. 그 둘을 이어 run으로 확정하고 다시 읽는 것은 `aas run`이며
-`aas db run-install`이 필요하다. 결과 복원은 아직 별도 구현이다.
+`aas db run-install`이 필요하다. 저장한 run은 `aas db backup`이 함께 담고
+`aas db restore`가 존재하지 않는 새 home에 되살린다. 복원한 run은 입력 pin·결과와 artifact
+해시·표 행 수와 내용·판정 상태가 원본과 같다.
+
+## 설치한 wheel 검증
+
+`scripts/verify-lane-build`는 wheel을 만들어 깨끗한 환경에 설치한 뒤
+`scripts/verify_installed_scenario.py`로 제품 경로 전체를 돌린다. 합성 전략 둘을 등록해
+두 사례를 CLI로 실행하고, 그중 첫 사례는 Python API로도 실행해 두 경로가 같은 결과를
+내는지 대조한다. 준비에 쓴 입력 문서를 모두 지우고 다른 작업
+디렉터리에서 재실행·재조회한다. 그 다음 설치본을 백업해 새 home에 복원하고 기록한 run을
+하나씩 대조하며, 기존 home 대상 복원과 손상·누락 백업이 거부되는지 확인한다. 마지막으로
+실제 run 둘을 커밋 순서의 정확한 지점에서 중단시켜 복구시킨다.
+
+증거 경계는 이렇다. 기본 설치만 검사하며 `legacy` 추가 의존성은 돌리지 않는다. 합성
+입력 문서는 저장소의 생성기가 만들고, 등록부터는 설치한 실행 파일만 쓴다. 후보 revision과
+wheel·lock 해시, Python 버전, 설치 extra, import 경로는 작업 기록에 남는다. 이 검사가
+통과했다는 것이 실행 자격이나 실거래 승인을 뜻하지는 않는다.

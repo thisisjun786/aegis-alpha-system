@@ -21,6 +21,7 @@ from aegis_alpha.application.backtest_prepare import (
     prepare_backtest,
 )
 from aegis_alpha.application.compute_cli import price_compute
+from aegis_alpha.application.storage_cli import home_option
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.storage.locks import private_directory, storage_lock_targets
 from aegis_alpha.storage.paths import load_paths, resolve_home
@@ -32,7 +33,10 @@ _SIDECAR = ".preparation.json"
 
 def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     parser = commands.add_parser("prepare", help="Export stored inputs without executing fills")
-    parser.add_argument("--request", type=Path, required=True)
+    home_option(parser)
+    parser.add_argument(
+        "--request", type=Path, required=True, help="Exact prepare request document"
+    )
     parser.add_argument("--sha256", required=True, help="Expected exact request file SHA-256")
     parser.add_argument(
         "--output",

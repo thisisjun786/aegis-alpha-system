@@ -248,6 +248,16 @@ class Workspace:
             "home": str(self.paths.root),
             "paths": self.paths.to_dict(),
             "storage": {"state": "sqlite", "strategies": "sqlite", "market": "duckdb"},
+            # A prepared backtest request has to name the strategy store this installation
+            # actually holds, so the identifier has to be readable without opening
+            # installation.json or the database by hand.
+            "stores": {
+                "state": {"store_id": _store_info(self.state)["store_id"]},
+                "strategies": {"store_id": _store_info(self.strategies)["store_id"]}
+                if self.strategies
+                else None,
+                "market": {"store_id": _store_info(self.market)["store_id"]},
+            },
             "strategy_versions": self.strategies.execute(
                 "SELECT count(*) FROM strategy_versions"
             ).fetchone()[0]

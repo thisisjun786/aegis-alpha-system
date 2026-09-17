@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from aegis_alpha.data.descriptor_tree import DescriptorTree
+from aegis_alpha.data.descriptor_tree import DescriptorTree, DescriptorTreeError
 from aegis_alpha.storage.locks import private_directory, private_file
 from aegis_alpha.storage.paths import DEFAULT_PATHS, load_paths, read_json, resolve_home
 from aegis_alpha.storage.verification import verify_workspace
@@ -19,6 +19,23 @@ if TYPE_CHECKING:
     from aegis_alpha.compute_resources import ComputeBudget
 
 _MANIFEST = "backup.json"
+
+
+def _run_counts(workspace: Workspace) -> dict[str, int]:
+    """Recorded runs by status, for the receipt only.
+
+    This never enters the verification report. Restore compares that report against the
+    manifest's stored copy by full equality, so a new key there would make every backup
+    taken before this change restore as incomplete.
+    """
+    from aegis_alpha.storage.run_schema import inspect_run_schema  # noqa: PLC0415
+
+    if inspect_run_schema(workspace).state != "complete":
+        return {}
+    return {
+        str(row[0]): int(row[1])
+        for row in workspace.state.execute("SELECT status, count(*) FROM runs GROUP BY status")
+    }
 
 
 def _copy_file(source: Path, target: Path) -> dict[str, object]:
@@ -153,7 +170,26 @@ def backup_workspace(
         "backup_root": str(target),
         "secrets_included": False,
         "files": len(files),
+        "runs": _run_counts(workspace),
     }
+
+
+def _listed_file_hash(root: Path, path: Path, relative: str) -> dict[str, object]:
+    """Hash one file the manifest lists, naming the backup when it cannot be read.
+
+    The descriptor layer describes a file handle, which is the wrong subject for someone
+    holding a broken backup. Translation keys off the exception cause rather than message
+    text, so an ownership, mode or hard-link refusal keeps its own reason instead of being
+    relabelled as missing.
+    """
+    try:
+        return _file_hash(root / path)
+    except DescriptorTreeError as error:
+        if isinstance(error.__cause__, FileNotFoundError):
+            raise ValueError("backup is missing a file it lists: " + relative) from error  # noqa: TRY004 -- a broken backup, not a caller type error
+        if isinstance(error.__cause__, PermissionError):
+            raise ValueError("backup file cannot be read: " + relative) from error  # noqa: TRY004 -- a broken backup, not a caller type error
+        raise
 
 
 def _validated_manifest(root: Path) -> dict[str, object]:
@@ -189,7 +225,7 @@ def _validated_manifest(root: Path) -> dict[str, object]:
             or not (relative in required or relative.startswith(("raw/", "runs/")))
         ):
             raise ValueError("backup contains an unsafe or unsupported path")
-        if _file_hash(root / path) != expected:
+        if _listed_file_hash(root, path, relative) != expected:
             raise ValueError("backup file hash/size mismatch")
     paths = load_paths(root)
     if any(Path(value) != root / DEFAULT_PATHS[key] for key, value in paths.to_dict().items()):
@@ -223,6 +259,7 @@ def restore(
             verification = verify_workspace(workspace, budget=budget)
             if verification != manifest["logical"]:
                 raise ValueError("restored logical verification differs from backup")  # noqa: TRY301 -- persist failed restore receipt
+            counts = _run_counts(workspace)
     except BaseException:
         receipt["phase"] = "restore-incomplete"
         write_json(new_home / "installation.json", receipt)
@@ -234,4 +271,5 @@ def restore(
         "home": str(new_home),
         "verification": verification,
         "secrets_restored": False,
+        "runs": counts,
     }

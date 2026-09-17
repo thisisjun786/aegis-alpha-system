@@ -758,3 +758,61 @@ def test_execution_requirements_empty_and_transport_hash(tmp_path: Path) -> None
     source.unlink()
     with pytest.raises(ValueError, match="requirements"):
         storage_cli._execution_bindings(source, digest)  # noqa: SLF001
+
+
+_STORE_ID_CHARS = 32
+
+
+def test_doctor_reports_store_ids_and_inspect_reports_source_snapshots(tmp_path: Path) -> None:
+    """A request has to name the strategy store and repeat the snapshot header exactly.
+
+    Before this, both values were reachable only by opening installation.json or the state
+    database by hand, so a supported recipe could not be followed with commands alone.
+    """
+    home = tmp_path / "home"
+    assert run_cli("init", home=home).returncode == 0
+    doctor = json.loads(run_cli("doctor", home=home).stdout)
+    assert sorted(doctor["stores"]) == ["market", "state", "strategies"]
+    for kind in ("market", "state", "strategies"):
+        assert len(doctor["stores"][kind]["store_id"]) == _STORE_ID_CHARS
+    receipt = json.loads((home / "installation.json").read_text())
+    assert {kind: doctor["stores"][kind]["store_id"] for kind in doctor["stores"]} == {
+        kind: receipt["stores"][kind]["store_id"] for kind in doctor["stores"]
+    }
+
+    source = tmp_path / "import.json"
+    raw = document()
+    source.write_bytes(raw)
+    imported = run_cli(
+        "data", "import", str(source), "--sha256", hashlib.sha256(raw).hexdigest(), home=home
+    )
+    assert imported.returncode == 0, imported.stderr
+    inspected = json.loads(
+        run_cli(
+            "data", "inspect", "--dataset", "synthetic-prices", "--version", "1", home=home
+        ).stdout
+    )
+    snapshots = inspected["source_snapshots"]
+    assert snapshots, "a committed generation always names the snapshot it came from"
+    for snapshot in snapshots:
+        assert sorted(snapshot) == [
+            "files",
+            "provider",
+            "publication_at_us",
+            "requested_at_us",
+            "retrieved_at_us",
+            "snapshot_id",
+            "status",
+        ]
+        for entry in snapshot["files"]:
+            assert sorted(entry) == ["byte_hash", "relative_path", "size_bytes"]
+            assert (home / "raw" / entry["relative_path"]).is_file()
+    with open_workspace(home) as workspace:
+        stored = [
+            dict(row)
+            for row in workspace.state.execute(
+                "SELECT snapshot_id, provider, requested_at_us, retrieved_at_us, "
+                "publication_at_us, status FROM source_snapshots ORDER BY snapshot_id"
+            )
+        ]
+    assert [{k: v for k, v in s.items() if k != "files"} for s in snapshots] == stored

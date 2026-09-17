@@ -10,10 +10,11 @@ Follow [POLICY.md](../POLICY.md) for CI composition and local verification scope
 | `verify-lib.sh` | Shared locked preparation, validated prepared tokens, owned process handling and synthetic CLI smoke oracle |
 | `verify-lane-style` | Combined format/lint; standalone setup installs locked development tools only |
 | `verify-lane-format` / `verify-lane-lint` | Standalone ruff checks |
-| `verify-lane-types` | ty over `src`, `tests`, and the CI Python entry points |
+| `verify-lane-types` | ty over `src`, `tests`, the CI Python entry points and the installed-scenario driver |
 | `verify-lane-test` | All `not database` tests, with `AAS_TEST_DATABASE_URL` unset |
 | `verify-lane-database` | `database` tests using a supplied disposable test DB, or a script-owned pinned PostgreSQL container |
-| `verify-lane-build` | Build wheel/sdist, install locked dependencies and wheel in a fresh environment, smoke installed CLI outside checkout |
+| `verify-lane-build` | Build wheel/sdist, install locked dependencies and wheel in a fresh environment, smoke installed CLI outside checkout, then run the installed end-to-end scenario |
+| `verify_installed_scenario.py` | Registration, run, re-read, backup, restore, refusal and recovery against the installed wheel; `seed` under the development interpreter, `scenario` under the installed one |
 | `verify-lane-container aas` | Build the selected image and smoke it with no network, host mounts, provider calls or server startup |
 | `verify-workflows` | Checksum-pinned actionlint and syntax checks for the verification shell scripts; Linux x86-64 runner tooling |
 | `python3 -m scripts.ci_changes` | Complete PR diff selection and candidate parent/tree provenance; see `--help` |
@@ -47,5 +48,11 @@ Download caches are keyed by platform, profile, Python and dependency inputs. Re
 Put application logic and argument handling in the owning package module. Keep script wrappers limited to importing and calling that module's `main`. Inspect existing standalone probes before changing them; their exceptional structure is not a template for new wrappers.
 
 The `ci_*.py` entry points are repository automation, not application commands. Keep them standard-library-only so classification, document checks and aggregation need no application installation. Their contracts are tested under `tests/tools/`.
+
+`verify_installed_scenario.py` is a verification probe, not a `ci_*` entry point and not an
+application command, so it may import `aegis_alpha`. Its `seed` mode is the only part that
+imports `tests`, because the synthetic input documents come from the repository generator
+that the wheel deliberately does not ship. Its `scenario` mode runs under the installed
+interpreter with `-I` and must never gain a checkout import.
 
 Preserve `from __future__ import annotations`, strict validation, and justified lint suppressions where the package conventions require them. Do not restore retired runtime environments when changing verification.

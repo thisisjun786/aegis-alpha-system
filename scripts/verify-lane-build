@@ -84,4 +84,69 @@ assert json.loads(Path(sys.argv[2]).read_text())["restored"] is True
 assert all(importlib.util.find_spec(name) is None for name in ("sqlalchemy", "psycopg", "alembic", "pyarrow"))
 print("installed native init/doctor/backup/restore without PostgreSQL or Parquet dependencies: pass")
 PY
+
+# The installation backed up above is empty, so it cannot show that a recorded run
+# survives a backup, that an interrupted run recovers, or that the product path works at
+# all past status and preview. Seed a synthetic installation through the installed binary,
+# then run the whole path under the installed interpreter.
+candidate_revision="$(git -C "$_AAS_VERIFY_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+verify_run "$AAS_VERIFY_PYTHON" "$_AAS_VERIFY_ROOT/scripts/verify_installed_scenario.py" seed \
+  --aas "$scratch/installed/bin/aas" --root "$native_home/seed" --case "$native_home/case" \
+  > "$scratch/seed.json"
+verify_run "$scratch/installed/bin/python" -I \
+  "$_AAS_VERIFY_ROOT/scripts/verify_installed_scenario.py" scenario \
+  --aas "$scratch/installed/bin/aas" --home "$native_home/seed/home" \
+  --case "$native_home/case" --work "$native_home/work" > "$scratch/scenario.json"
+"$scratch/installed/bin/python" -I - "$scratch/seed.json" "$scratch/scenario.json" \
+  "$candidate_revision" "${wheels[0]}" "$_AAS_VERIFY_ROOT/uv.lock" "$scratch/requirements.txt" \
+  <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+
+def digest(value: str) -> str:
+    return hashlib.sha256(Path(value).read_bytes()).hexdigest()
+
+
+seed = json.loads(Path(sys.argv[1]).read_text())
+scenario = json.loads(Path(sys.argv[2]).read_text())
+assert seed["seeded"] is True
+assert seed["any_call_saw_pythonpath"] is False
+assert scenario["scenario"] == "complete"
+assert scenario["any_call_saw_pythonpath"] is False
+assert scenario["provenance"]["import_root_inside_prefix"] is True
+assert scenario["provenance"]["legacy_extra"] == "not_exercised"
+assert len({entry["strategy_id"] for entry in scenario["strategies"]}) >= 2
+assert scenario["cases"]["a_cli"]["result_hash"] != scenario["cases"]["b_cli"]["result_hash"]
+assert scenario["cases"]["a_api"]["result_hash"] == scenario["cases"]["a_cli"]["result_hash"]
+assert scenario["reexecuted_without_seed"]["case_directory_present"] is False
+assert scenario["restored_runs"]
+assert all(row["identical"] for row in scenario["restored_runs"])
+assert scenario["restore_refusals"]["existing_home_unchanged"] is True
+assert scenario["restore_refusals"]["nothing_written_before_verification"] is True
+assert scenario["restore_refusals"]["tampered_home_is_marked_incomplete"] is True
+assert scenario["recovery_without_marker"]["status"] == "INTERRUPTED"
+assert scenario["recovery_after_marker"]["status"] == "SUCCESS"
+assert scenario["recovery_after_marker"]["sealed_files_unchanged"] is True
+for phase in ("recovery_without_marker", "recovery_after_marker"):
+    assert scenario[phase]["observers_armed"] is True
+    assert scenario[phase]["observers_fired"] == []
+assert all(entry["remaining"] is False for entry in scenario["cleanup"]["removed"])
+assert all(probe["state"] in {"free", "absent"} for probe in scenario["cleanup"]["lock_probes"])
+# Base install only: the legacy extra is never installed here, and the import check above
+# is what proves those distributions are absent.
+provenance = {
+    "candidate_revision": sys.argv[3],
+    "wheel_sha256": digest(sys.argv[4]),
+    "lock_sha256": digest(sys.argv[5]),
+    "requirements_sha256": digest(sys.argv[6]),
+    "install_extras": [],
+    "base_only": True,
+    **scenario["provenance"],
+}
+print("installed candidate provenance: " + json.dumps(provenance, sort_keys=True))
+print("installed registration, run, re-read, backup, restore, refusal and recovery: pass")
+PY
 rm -rf -- "$native_home"

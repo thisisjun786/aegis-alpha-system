@@ -685,3 +685,32 @@ def test_the_request_document_is_handed_over_not_retained(
     assert receipt["run"]["status"] == "SUCCESS"
     assert seen["before"] == 1
     assert seen["after"] == 0
+
+
+def test_run_accepts_home_after_the_subcommand(case: tuple[Path, Path]) -> None:
+    """run execute/show/list take --home after the subcommand, like every other command.
+
+    An omitted subcommand flag must still fall through to the global value, which is what
+    argparse.SUPPRESS on the subcommand option preserves.
+    """
+    home, request = case
+    assert _cli(home, "db", "run-install")["state"] == "complete"
+    receipt = _cli(home, *_arguments(request))
+    run_id = str(receipt["run"]["run_id"])
+    for arguments in (
+        ("run", "list", "--home", str(home)),
+        ("run", "show", "--run-id", run_id, "--home", str(home)),
+        (
+            "run",
+            "execute",
+            "--request",
+            str(request),
+            "--sha256",
+            sha(request.read_bytes()),
+            "--home",
+            str(home),
+        ),
+    ):
+        result = run_cli(*arguments, home=home)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(result.stdout)["certified"] is False
