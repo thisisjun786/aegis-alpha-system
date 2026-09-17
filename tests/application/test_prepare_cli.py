@@ -526,3 +526,26 @@ def test_fresh_cli_registration_prepare_backtest(tmp_path: Path) -> None:
     assert_accounting(response)
     with open_workspace(home) as workspace:
         assert registration_state(workspace) == before
+
+
+def test_prepare_accepts_home_after_the_subcommand(case: tuple[Path, Path], tmp_path: Path) -> None:
+    """Every other command takes --home after its name; prepare used to reject it."""
+    home, request = case
+    output = tmp_path / "envelope.json"
+    assert (
+        main(
+            [
+                "prepare",
+                "--request",
+                str(request),
+                "--sha256",
+                sha(request.read_bytes()),
+                "--output",
+                str(output),
+                "--home",
+                str(home),
+            ]
+        )
+        == 0
+    )
+    assert output.is_file()

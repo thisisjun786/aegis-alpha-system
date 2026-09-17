@@ -284,6 +284,42 @@ def read_dataset(workspace: Workspace, dataset_id: str, version: str) -> dict[st
     return dict(row)
 
 
+def source_snapshots(
+    workspace: Workspace, dataset_id: str, version: str
+) -> list[dict[str, object]]:
+    """Return every snapshot header this generation was published from, with its raw files.
+
+    An identity or universe binding document has to repeat these rows byte for byte, and
+    the publication timestamps they carry exist nowhere else a command can reach. The link
+    is the dataset_sources relation written in the publishing transaction, never a name
+    built from the manifest hash, and a generation may name more than one snapshot.
+    """
+    headers: list[dict[str, object]] = []
+    for link in workspace.state.execute(
+        "SELECT source_snapshot_id FROM dataset_sources WHERE dataset_id=? AND version=? "
+        "ORDER BY source_snapshot_id",
+        (dataset_id, version),
+    ).fetchall():
+        row = workspace.state.execute(
+            "SELECT snapshot_id, provider, requested_at_us, retrieved_at_us, "
+            "publication_at_us, status FROM source_snapshots WHERE snapshot_id=?",
+            (link[0],),
+        ).fetchone()
+        if row is None:
+            continue
+        header = dict(row)
+        header["files"] = [
+            dict(entry)
+            for entry in workspace.state.execute(
+                "SELECT relative_path, byte_hash, size_bytes FROM source_files "
+                "WHERE snapshot_id=? ORDER BY relative_path",
+                (link[0],),
+            )
+        ]
+        headers.append(header)
+    return headers
+
+
 def recover_operations(
     workspace: Workspace, *, budget: ComputeBudget | None = None
 ) -> dict[str, object]:
@@ -360,7 +396,10 @@ def execute_data(workspace: Workspace, args: argparse.Namespace) -> dict[str, ob
         return {"datasets": [dict(row) for row in rows]}
     dataset = read_dataset(workspace, args.dataset, args.version)
     if args.data_command == "inspect":
-        return dataset
+        return {
+            **dataset,
+            "source_snapshots": source_snapshots(workspace, args.dataset, args.version),
+        }
     from aegis_alpha.storage.market import read_generation  # noqa: PLC0415
 
     rows = read_generation(

@@ -15,10 +15,18 @@ if TYPE_CHECKING:
     from aegis_alpha.storage.workspace import Workspace
 
 
-def _home(parser: argparse.ArgumentParser) -> None:
+def home_option(parser: argparse.ArgumentParser) -> None:
+    """Accept --home after a subcommand without shadowing the global value.
+
+    SUPPRESS is what keeps an omitted subcommand flag from overwriting a global
+    --home. Shared with prepare and run so every command spells the option alike.
+    """
     parser.add_argument(
         "--home", type=Path, default=argparse.SUPPRESS, help="AAS user data directory"
     )
+
+
+_home = home_option
 
 
 def add_commands(commands: argparse._SubParsersAction) -> None:

@@ -17,17 +17,22 @@ from aegis_alpha.application.run_backtest import (
     read_backtest_run,
     run_backtest,
 )
+from aegis_alpha.application.storage_cli import home_option
 
 
 def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     parser = commands.add_parser(
         "run", help="Run a registered strategy end to end and read stored runs"
     )
+    home_option(parser)
     sub = parser.add_subparsers(dest="run_command", required=True)
     execution = sub.add_parser(
         "execute", help="Prepare, calculate and record one run of a registered strategy"
     )
-    execution.add_argument("--request", type=Path, required=True)
+    home_option(execution)
+    execution.add_argument(
+        "--request", type=Path, required=True, help="Exact prepare request document"
+    )
     execution.add_argument("--sha256", required=True, help="Expected exact request file SHA-256")
     execution.add_argument("--reason", default=DEFAULT_REASON, help="Recorded run reason")
     execution.add_argument(
@@ -41,8 +46,9 @@ def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
         help="Optional new envelope path; also creates PATH.preparation.json (no overwrites)",
     )
     stored = sub.add_parser("show", help="Re-verify and read one recorded run by its ID")
+    home_option(stored)
     stored.add_argument("--run-id", required=True)
-    sub.add_parser("list", help="List recorded runs without verifying their results")
+    home_option(sub.add_parser("list", help="List recorded runs without verifying their results"))
 
 
 def execute(args: argparse.Namespace) -> dict[str, object]:
