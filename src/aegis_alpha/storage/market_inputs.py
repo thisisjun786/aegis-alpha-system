@@ -810,14 +810,14 @@ def load_pinned_proxy(
     return PinnedProxySeries(pin, history, definition)
 
 
-def _proxy_publication(
+def _feature_publication_document(
     workspace: Workspace,
     transform_hash: str,
     transform: dict[str, object],
     budget: ComputeBudget,
     *,
     label: str = "proxy",
-) -> History:
+) -> tuple[GenerationPin, ImportDocument]:
     """Authenticate the transform pointer with the independently sealed import bytes."""
     destination = transform.get("dataset")
     if not isinstance(destination, dict):
@@ -853,6 +853,21 @@ def _proxy_publication(
         )
     ):
         raise ValueError(label + " transform conflicts with publication evidence")
+    return pin, document
+
+
+def _proxy_publication(
+    workspace: Workspace,
+    transform_hash: str,
+    transform: dict[str, object],
+    budget: ComputeBudget,
+    *,
+    label: str = "proxy",
+) -> History:
+    """Authenticate the pointer, then reload the referencing delta for the proxy reader."""
+    pin, document = _feature_publication_document(
+        workspace, transform_hash, transform, budget, label=label
+    )
     return _proxy_publication_delta(workspace, pin, document, budget)
 
 
@@ -1113,7 +1128,13 @@ def _observation_generations(
     expected: dict[str, object],
     budget: ComputeBudget,
 ) -> None:
-    """Authenticate every contributing generation's own transform and sealed delta."""
+    """Authenticate every contributing generation's transform against the loaded history.
+
+    The caller has already verified the whole chain once, so each delta is selected
+    from that history rather than reloaded. Reloading per generation would replay
+    every chain prefix and make an ordinary read quadratic in the number of
+    generations, which a panel published as several bounded chunks always is.
+    """
     for generation in dict.fromkeys(str(row["generation_id"]) for row in history):
         transform_hash, transform = _transform(workspace, generation, budget)
         if (
@@ -1121,9 +1142,12 @@ def _observation_generations(
             or transform.get("schema_version") != "aas-observation-transform-v1"
         ):
             raise ValueError("observation transform conflicts with feature contract")
-        delta = _proxy_publication(
+        _, document = _feature_publication_document(
             workspace, transform_hash, transform, budget, label="observation"
         )
+        delta = tuple(row for row in history if row["generation_id"] == generation)
+        if len(delta) != len(document.rows):
+            raise ValueError("observation delta conflicts with its sealed publication")
         if any(row[key] != value for row in delta for key, value in expected.items()):
             raise ValueError("observation points conflict with pinned definition/inputs")
         _verify_proxy_catalog(workspace, generation, transform_hash, label="observation")
