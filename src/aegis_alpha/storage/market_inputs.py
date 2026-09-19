@@ -1142,6 +1142,13 @@ def _observation_chain(
             (pin.dataset_id,),
         ).fetchone()
         history = _load(workspace, GenerationPin(*head), budget.component(2), "feature_values")
+        # A chain this route owns must be observations end to end. Another writer can
+        # append to an observation head because the domain matches, and each delta
+        # then verifies alone while both readers reject the mixed head.
+        for marker in market.generation_chain(workspace.market, str(head["generation_id"])):
+            _, transform = _transform(workspace, str(marker["generation_id"]), budget)
+            if transform.get("schema_version") != "aas-observation-transform-v1":
+                raise ValueError("observation chain contains a generation from another route")
         chains[pin.dataset_id] = history
     return history
 
