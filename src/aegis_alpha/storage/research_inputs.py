@@ -426,7 +426,12 @@ def _sessions_document(workspace: Workspace, transform: _Transform) -> ImportDoc
 
 
 def native_input_document(
-    workspace: Workspace, raw: bytes, *, expected_schema: str, budget: ComputeBudget
+    workspace: Workspace,
+    raw: bytes,
+    *,
+    expected_schema: str,
+    budget: ComputeBudget,
+    resolved: set[SourcePin] | None = None,
 ) -> tuple[ImportDocument, SourcePin]:
     """Reconstruct a native publication and its source pin without publishing.
 
@@ -459,7 +464,10 @@ def native_input_document(
     if expected_schema == "aas-price-transform-v1":
         return _price_document(workspace, raw)[0], source
     if expected_schema == "aas-observation-transform-v1":
-        return _observation_document(workspace, raw, hashlib.sha256(raw).hexdigest())[0], source
+        document = _observation_document(workspace, raw, hashlib.sha256(raw).hexdigest(), resolved)[
+            0
+        ]
+        return document, source
     transform = _parse_transform(raw, hashlib.sha256(raw).hexdigest(), "sessions")
     return _sessions_document(workspace, transform), source
 
@@ -674,9 +682,15 @@ def _check_identities(workspace: Workspace, supplied: object) -> None:
 
 
 def _observation_definition(
-    workspace: Workspace, body: dict[str, object]
+    workspace: Workspace, body: dict[str, object], resolved: set[SourcePin] | None = None
 ) -> tuple[dict[str, object], str, list[tuple[str, str, str, str]]]:
-    """Admit one observation contract: identity, price semantics and its pinned inputs."""
+    """Admit one observation contract: identity, price semantics and its pinned inputs.
+
+    resolved carries the upstream pins a caller has already checked in this pass.
+    Resolving recomputes the panel's table digest, and every generation of one panel
+    shares that pin, so a chunked panel would otherwise rehash the same upstream
+    table once per generation.
+    """
     definition = _object(body["observation"], _OBSERVATION)
     for key in ("series_id", "version", "observation_role", "basis", "currency", "adjustment"):
         _text(definition[key])
@@ -695,7 +709,10 @@ def _observation_definition(
     ):
         raise ValueError("observation normalization must declare its source type and output")
     pin = _source_pin(definition["observed_source"])
-    resolve_source(workspace, pin)
+    if resolved is None or pin not in resolved:
+        resolve_source(workspace, pin)
+        if resolved is not None:
+            resolved.add(pin)
     inputs = [("observed_source:" + pin.table, pin.source_id, pin.source_sha256, pin.table_digest)]
     reference = _object(definition["calendar_ref"], frozenset({"id", "version", "sha256"}))
     # Reuse SourcePin's lowercase digest admission without resolving a convention as a table.
@@ -780,7 +797,7 @@ def _check_observation_parent(
 
 
 def _observation_document(
-    workspace: Workspace, raw: bytes, sha256: str
+    workspace: Workspace, raw: bytes, sha256: str, resolved: set[SourcePin] | None = None
 ) -> tuple[ImportDocument, _Transform, dict[str, object], str, list[tuple[str, str, str, str]]]:
     """Rebuild one observation publication from its pinned source, without publishing.
 
@@ -789,7 +806,7 @@ def _observation_document(
     generation actually committed instead of trusting its metadata.
     """
     transform = _parse_transform(raw, sha256, "observation")
-    definition, contract, inputs = _observation_definition(workspace, transform.body)
+    definition, contract, inputs = _observation_definition(workspace, transform.body, resolved)
     identities = _instruments(transform.body["instruments"])
     if any(
         item["asset_type"] == "proxy"

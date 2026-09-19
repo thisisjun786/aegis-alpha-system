@@ -16,7 +16,13 @@ from aegis_alpha.application.data_cli import execute_native_data
 from aegis_alpha.application.storage_cli import add_commands
 from aegis_alpha.compute_resources import ComputeBudget
 from aegis_alpha.data.serialization import canonical_json_bytes
-from aegis_alpha.storage import import_document, market, market_inputs, publication
+from aegis_alpha.storage import (
+    import_document,
+    market,
+    market_inputs,
+    publication,
+    research_inputs,
+)
 from aegis_alpha.storage.raw import put_raw
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace
@@ -32,6 +38,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from aegis_alpha.storage.market_inputs import History
+    from aegis_alpha.storage.source_reader import SourcePin
     from aegis_alpha.storage.workspace import Workspace
 
 BUDGET = ComputeBudget(Fraction(1), 64 * 1024 * 1024)
@@ -41,6 +48,7 @@ PANEL_OPEN = 49.29364776611328
 DECIMAL_SCALE = Decimal("0.000000000001")
 # An additively adjusted series legitimately falls below zero.
 NEGATIVE_OBSERVATION = -1.5
+CHUNKS = 2
 COMMON_FIELDS = frozenset(
     {
         "generation_id",
@@ -530,3 +538,51 @@ def test_observation_verification_is_charged_against_the_retained_history(
         assert retained > 0
         assert seen[0].reserved_bytes == BUDGET.reserved_bytes + retained
         assert seen[0].available_bytes == BUDGET.available_bytes - retained
+
+
+def test_chunked_panel_resolves_its_upstream_source_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Given a panel published as two generations of one contract, as a bounded
+    # chunk sequence is, and every generation sharing the same upstream pin.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        first = _observation_spec(workspace, tmp_path / "chunk.sqlite3")
+        _ = _register_domain(workspace, first, "observation")
+        later = _observation_spec(
+            workspace,
+            tmp_path / "chunk2.sqlite3",
+            value=52.5,
+            options={
+                "feature_at_us": 40,
+                "dataset": {
+                    "dataset_id": "chunk",
+                    "version": "2",
+                    "generation_id": "chunk2",
+                    "operation_id": "op-chunk2",
+                    "parent_id": "chunk",
+                },
+            },
+        )
+        _ = _register_domain(workspace, later, "observation")
+        head = publication.read_dataset(workspace, "chunk", "2")
+        pin = market_inputs.GenerationPin(
+            str(head["dataset_id"]),
+            str(head["version"]),
+            str(head["generation_id"]),
+            str(head["chain_hash"]),
+            str(head["manifest_hash"]),
+        )
+        calls: list[SourcePin] = []
+        original = research_inputs.resolve_source
+
+        def counted(target: Workspace, source: SourcePin) -> dict[str, object]:
+            calls.append(source)
+            return original(target, source)
+
+        monkeypatch.setattr(research_inputs, "resolve_source", counted)
+        # When the whole chain is read,
+        series = market_inputs.load_pinned_observations(workspace, pin, budget=BUDGET)
+        # Then the upstream panel digest is recomputed once, not once per generation.
+        assert len(series.history) == CHUNKS
+        assert len(calls) == 1

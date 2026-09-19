@@ -1242,6 +1242,9 @@ def _observation_generations(
     grouped: dict[str, list[Row]] = {}
     for row in history:
         grouped.setdefault(str(row["generation_id"]), []).append(row)
+    # Every generation of one panel shares the contract's upstream pin, and resolving
+    # it recomputes that table's digest, so it is checked once for the whole pass.
+    resolved: set[SourcePin] = set()
     for generation, rows in grouped.items():
         transform_hash, transform = _transform(workspace, generation, budget)
         destination = transform.get("dataset")
@@ -1261,6 +1264,7 @@ def _observation_generations(
             _raw_payload(workspace, transform_hash, budget),
             expected_schema="aas-observation-transform-v1",
             budget=budget,
+            resolved=resolved,
         )
         if derived.sha256 != marker["request_hash"]:
             raise ValueError("observation delta was not derived from its pinned source")
