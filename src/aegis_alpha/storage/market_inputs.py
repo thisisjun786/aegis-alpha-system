@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from decimal import localcontext
 from types import MappingProxyType
@@ -26,6 +26,7 @@ from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.engine.codec import decode_json
 from aegis_alpha.storage import market
 from aegis_alpha.storage.import_document import ImportDocument, parse_import
+from aegis_alpha.storage.market_schema import COMMON, DOMAINS
 from aegis_alpha.storage.membership_pins import (
     IdentityPin,
     UniversePin,
@@ -1070,10 +1071,30 @@ class PinnedObservationSeries:
 def load_pinned_observations(
     workspace: Workspace, pin: GenerationPin, *, budget: ComputeBudget
 ) -> PinnedObservationSeries:
-    """Verify one observation definition against every retained feature revision."""
+    """Verify one observation definition against every retained feature revision.
+
+    The loaded history stays live for the caller, so it is charged as retained
+    state before verification runs. Handing the verifier the whole allowance again
+    would let it materialize bytes this history is still holding, which decision
+    0016 bounds as charge plus live. Too little left raises ComputeResourceError
+    rather than letting the process meet memory pressure instead.
+    """
     history = _load(workspace, pin, budget.component(2), "feature_values")
-    definition = verify_observation_content(workspace, history, budget=budget)
+    definition = verify_observation_content(
+        workspace,
+        history,
+        budget=replace(budget, reserved_bytes=budget.reserved_bytes + _retained_bytes(history)),
+    )
     return PinnedObservationSeries(pin, history, definition)
+
+
+def _retained_bytes(history: History) -> int:
+    """Estimate what a loaded feature history holds live, as the chain admission does."""
+    schema = COMMON + DOMAINS["feature_values"]
+    characters = sum(
+        len(value) for row in history for value in row.values() if isinstance(value, str)
+    )
+    return 64 * 1024 + len(history) * (1024 + 256 * len(schema)) + 32 * characters
 
 
 def verify_observation_publications(workspace: Workspace, *, budget: ComputeBudget) -> None:
@@ -1189,29 +1210,46 @@ def _observation_generations(
     expected: dict[str, object],
     budget: ComputeBudget,
 ) -> None:
-    """Authenticate every contributing generation's transform against the loaded history.
+    """Re-derive every contributing generation from its pinned source and match it.
 
     The caller has already verified the whole chain once, so each delta is selected
     from that history rather than reloaded. Reloading per generation would replay
     every chain prefix, and rescanning the history per generation would cost
     generations times rows, so the rows are grouped by generation in one pass.
+
+    Matching metadata and a row count is not enough. A transform hash addresses
+    immutable bytes that a failed registration can leave behind, and the generic
+    import route accepts an existing hash as its pointer, so a publication can
+    reference a real observation transform while carrying values that transform
+    never produced. Each delta is therefore rebuilt from the pinned source through
+    the registration parser and compared by publication bytes.
     """
     grouped: dict[str, list[Row]] = {}
     for row in history:
         grouped.setdefault(str(row["generation_id"]), []).append(row)
     for generation, rows in grouped.items():
         transform_hash, transform = _transform(workspace, generation, budget)
+        destination = transform.get("dataset")
         if (
             transform.get("observation") != definition
             or transform.get("schema_version") != "aas-observation-transform-v1"
+            or not isinstance(destination, dict)
+            or destination.get("generation_id") != generation
         ):
             raise ValueError("observation transform conflicts with feature contract")
-        _, document = _feature_publication_document(
+        _ = _feature_publication_document(
             workspace, transform_hash, transform, budget, label="observation"
         )
+        marker = market.marker_for(workspace.market, generation)
+        derived, _ = native_input_document(
+            workspace,
+            _raw_payload(workspace, transform_hash, budget),
+            expected_schema="aas-observation-transform-v1",
+            budget=budget,
+        )
+        if derived.sha256 != marker["request_hash"]:
+            raise ValueError("observation delta was not derived from its pinned source")
         delta = tuple(rows)
-        if len(delta) != len(document.rows):
-            raise ValueError("observation delta conflicts with its sealed publication")
         if any(row[key] != value for row in delta for key, value in expected.items()):
             raise ValueError("observation points conflict with pinned definition/inputs")
         _verify_proxy_catalog(workspace, generation, transform_hash, label="observation")

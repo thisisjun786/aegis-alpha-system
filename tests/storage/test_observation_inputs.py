@@ -15,7 +15,9 @@ import pytest
 from aegis_alpha.application.data_cli import execute_native_data
 from aegis_alpha.application.storage_cli import add_commands
 from aegis_alpha.compute_resources import ComputeBudget
-from aegis_alpha.storage import market, market_inputs, publication
+from aegis_alpha.data.serialization import canonical_json_bytes
+from aegis_alpha.storage import import_document, market, market_inputs, publication
+from aegis_alpha.storage.raw import put_raw
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace
 from tests.storage.test_research_inputs import (
@@ -29,6 +31,7 @@ from tests.storage.test_research_inputs import (
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from aegis_alpha.storage.market_inputs import History
     from aegis_alpha.storage.workspace import Workspace
 
 BUDGET = ComputeBudget(Fraction(1), 64 * 1024 * 1024)
@@ -441,3 +444,89 @@ def test_extending_a_chain_leaves_the_earlier_pin_byte_identical(tmp_path: Path)
             budget=BUDGET,
         )
         assert len(extended.history) == len(before.history) + 1
+
+
+def test_observation_delta_must_be_derived_from_its_pinned_source(tmp_path: Path) -> None:
+    # Given a registered observation whose exact transform is retained in raw/.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        spec = _observation_spec(workspace, tmp_path / "sub.sqlite3")
+        _ = _register_domain(workspace, spec, "observation")
+        origin = _pin(workspace, "sub")
+        # A failed attempt can leave an observation transform in raw/. Craft the one
+        # naming the generation about to be published, so schema, contract identity
+        # and publication identity all line up and only the values are wrong.
+        forged_transform = json.loads(spec.read_bytes())
+        forged_transform["dataset"] = {
+            "dataset_id": "sub",
+            "version": "2",
+            "generation_id": "sub-forged",
+            "operation_id": "op-sub-forged",
+            "parent_id": "sub",
+        }
+        forged_raw = canonical_json_bytes(forged_transform)
+        put_raw(workspace.paths.raw, forged_raw)
+        # When a generic publication points at it while carrying a value that
+        # transform never produced,
+        sealed = workspace.paths.raw / origin.manifest_hash[:2] / origin.manifest_hash
+        document = json.loads(sealed.read_bytes())
+        prior = document["rows"][0]
+        document.update(
+            version="2",
+            generation_id="sub-forged",
+            operation_id="op-sub-forged",
+            parent_id="sub",
+            transform_sha256=hashlib.sha256(forged_raw).hexdigest(),
+        )
+        document["rows"] = [
+            {
+                **prior,
+                "value": PANEL_OPEN + 1.0,
+                "op": "SUPERSEDE",
+                "supersedes_revision_id": prior["revision_id"],
+                "revision_id": "forged-r1",
+            }
+        ]
+        _ = publication.publish_document(
+            workspace, import_document.parse_import(canonical_json_bytes(document))
+        )
+        head = publication.read_dataset(workspace, "sub", "2")
+        forged = market_inputs.GenerationPin(
+            str(head["dataset_id"]),
+            str(head["version"]),
+            str(head["generation_id"]),
+            str(head["chain_hash"]),
+            str(head["manifest_hash"]),
+        )
+        # Then the reader refuses values it never derived from the pinned source.
+        with pytest.raises(ValueError, match=r"pinned source"):
+            _ = market_inputs.load_pinned_observations(workspace, forged, budget=BUDGET)
+        # The untouched earlier pin still reads.
+        assert market_inputs.load_pinned_observations(workspace, origin, budget=BUDGET).history
+
+
+def test_observation_verification_is_charged_against_the_retained_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Given a registered observation the reader will hold live while it verifies.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        spec = _observation_spec(workspace, tmp_path / "lease.sqlite3")
+        _ = _register_domain(workspace, spec, "observation")
+        origin = _pin(workspace, "lease")
+        seen: list[ComputeBudget] = []
+        original = market_inputs.verify_observation_content
+
+        def record(target: Workspace, history: History, *, budget: ComputeBudget) -> str:
+            seen.append(budget)
+            return original(target, history, budget=budget)
+
+        monkeypatch.setattr(market_inputs, "verify_observation_content", record)
+        # When the series is read under an explicit lease,
+        series = market_inputs.load_pinned_observations(workspace, origin, budget=BUDGET)
+        # Then the verifier is charged for what the history holds live, so charge plus
+        # live stays inside the caller's allowance rather than double-spending it.
+        retained = market_inputs._retained_bytes(series.history)  # noqa: SLF001 -- accounting under test
+        assert retained > 0
+        assert seen[0].reserved_bytes == BUDGET.reserved_bytes + retained
+        assert seen[0].available_bytes == BUDGET.available_bytes - retained

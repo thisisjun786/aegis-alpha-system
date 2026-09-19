@@ -439,7 +439,12 @@ def native_input_document(
         raise ComputeResourceError("native transform exceeds materialization budget")
     body = _decode_transform(raw)
     if (
-        expected_schema not in {"aas-price-transform-v1", "aas-sessions-transform-v1"}
+        expected_schema
+        not in {
+            "aas-price-transform-v1",
+            "aas-sessions-transform-v1",
+            "aas-observation-transform-v1",
+        }
         or not isinstance(body, dict)
         or body.get("schema_version") != expected_schema
     ):
@@ -453,6 +458,8 @@ def native_input_document(
     )
     if expected_schema == "aas-price-transform-v1":
         return _price_document(workspace, raw)[0], source
+    if expected_schema == "aas-observation-transform-v1":
+        return _observation_document(workspace, raw, hashlib.sha256(raw).hexdigest())[0], source
     transform = _parse_transform(raw, hashlib.sha256(raw).hexdigest(), "sessions")
     return _sessions_document(workspace, transform), source
 
@@ -772,6 +779,39 @@ def _check_observation_parent(
             raise ValueError("observation ancestor was not published by this contract's route")
 
 
+def _observation_document(
+    workspace: Workspace, raw: bytes, sha256: str
+) -> tuple[ImportDocument, _Transform, dict[str, object], str, list[tuple[str, str, str, str]]]:
+    """Rebuild one observation publication from its pinned source, without publishing.
+
+    Every value is re-derived here through the same mapping and numeric policy the
+    registration used, so a caller can compare the resulting bytes with what a
+    generation actually committed instead of trusting its metadata.
+    """
+    transform = _parse_transform(raw, sha256, "observation")
+    definition, contract, inputs = _observation_definition(workspace, transform.body)
+    identities = _instruments(transform.body["instruments"])
+    if any(
+        item["asset_type"] == "proxy"
+        for item in cast("list[dict[str, object]]", transform.body["instruments"])
+    ):
+        raise ValueError("research return proxies belong in feature contracts of their own")
+    expected = {
+        "contract_id": contract,
+        "contract_version": definition["version"],
+        "contract_hash": hashlib.sha256(canonical_json_bytes(definition)).hexdigest(),
+        "input_bundle_hash": hashlib.sha256(
+            canonical_json_bytes([definition["observed_source"], definition["calendar_ref"]])
+        ).hexdigest(),
+    }
+    rows = _mapped_rows(workspace, transform)
+    for row in rows:
+        if row["instrument_id"] not in identities:
+            raise ValueError("source row lacks an explicitly supplied instrument identity")
+    _observation_values(rows, expected, definition)
+    return _input_document(transform, rows), transform, definition, contract, inputs
+
+
 def register_observation_input(
     workspace: Workspace, spec_path: Path, sha256: str
 ) -> dict[str, object]:
@@ -811,32 +851,14 @@ def register_observation_input(
     Registration confers no provider authority, PIT eligibility or execution
     readiness, and asserts no equivalence to any certified price source.
     """
-    transform = _read_transform(spec_path, sha256, "observation")
-    definition, contract, inputs = _observation_definition(workspace, transform.body)
-    identities = _instruments(transform.body["instruments"])
-    if any(
-        item["asset_type"] == "proxy"
-        for item in cast("list[dict[str, object]]", transform.body["instruments"])
-    ):
-        raise ValueError("research return proxies belong in feature contracts of their own")
+    read = _read_transform(spec_path, sha256, "observation")
+    document, transform, definition, contract, inputs = _observation_document(
+        workspace, read.raw, sha256
+    )
     _check_identities(workspace, transform.body["instruments"])
     _check_observation_parent(
         workspace, transform.dataset["parent_id"], contract, definition["version"], definition
     )
-    expected = {
-        "contract_id": contract,
-        "contract_version": definition["version"],
-        "contract_hash": hashlib.sha256(canonical_json_bytes(definition)).hexdigest(),
-        "input_bundle_hash": hashlib.sha256(
-            canonical_json_bytes([definition["observed_source"], definition["calendar_ref"]])
-        ).hexdigest(),
-    }
-    rows = _mapped_rows(workspace, transform)
-    for row in rows:
-        if row["instrument_id"] not in identities:
-            raise ValueError("source row lacks an explicitly supplied instrument identity")
-    _observation_values(rows, expected, definition)
-    document = _input_document(transform, rows)
     put_raw(workspace.paths.raw, transform.raw)
     _store_feature_contract(
         workspace, definition, inputs, name=contract, record_schema=OBSERVATION_DEFINITION_SCHEMA
