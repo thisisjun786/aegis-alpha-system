@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import tracemalloc
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 import pytest
@@ -420,3 +420,140 @@ def test_negative_read_cap_is_refused_rather_than_read_as_empty(tmp_path: Path) 
         tree.atomic_write_bytes("payload", b"content")
         with pytest.raises(DescriptorTreeError, match="must not be negative"):
             tree.read_bytes("payload", max_bytes=-1)
+
+
+class _HostileText(str):
+    """A str whose every lexical answer disagrees with the text it presents."""
+
+    __slots__ = ()
+
+    def __str__(self) -> str:
+        return "innocent"
+
+    def __contains__(self, value: object) -> bool:
+        return False
+
+    def startswith(self, *args: object, **kwargs: object) -> bool:  # noqa: ARG002
+        return False
+
+    def endswith(self, *args: object, **kwargs: object) -> bool:  # noqa: ARG002
+        return False
+
+    def split(self, *args: object, **kwargs: object) -> list[str]:  # noqa: ARG002
+        # An absolute component, which os.open would walk from the root rather than
+        # from the tree's descriptor.
+        return ["/etc"]
+
+
+class _HostilePathLike:
+    def __init__(self, answer: object) -> None:
+        self._answer = answer
+
+    def __fspath__(self) -> object:
+        return self._answer
+
+
+TEXT_WITHOUT_NUL = "relative descriptor path must be text without NUL"
+NAMES_A_CHILD = "relative descriptor path must name a child"
+MUST_BE_RELATIVE = "descriptor path must be relative"
+EXACT_SPELLING = "descriptor path must use its exact lexical spelling"
+ALIAS_COMPONENT = "descriptor path contains an alias component"
+
+
+@pytest.mark.parametrize(
+    ("relative", "message"),
+    [
+        ("\x00", TEXT_WITHOUT_NUL),
+        ("a\x00b", TEXT_WITHOUT_NUL),
+        ("", NAMES_A_CHILD),
+        (".", NAMES_A_CHILD),
+        ("/a", MUST_BE_RELATIVE),
+        ("~", MUST_BE_RELATIVE),
+        ("~user", MUST_BE_RELATIVE),
+        ("~/a", MUST_BE_RELATIVE),
+        ("a//b", EXACT_SPELLING),
+        ("a/", EXACT_SPELLING),
+        ("a/./b", EXACT_SPELLING),
+        ("./a", EXACT_SPELLING),
+        ("a/./", EXACT_SPELLING),
+        ("a/../b", ALIAS_COMPONENT),
+        ("..", ALIAS_COMPONENT),
+        ("a/~", ALIAS_COMPONENT),
+    ],
+)
+def test_relative_paths_are_refused_with_their_own_message(
+    tmp_path: Path, relative: str, message: str
+) -> None:
+    """The refusals a caller depends on, and which message reports each one.
+
+    A "." component is a spelling error rather than an alias component because the
+    previous implementation only ever saw it as a difference between the text it was
+    handed and the path pathlib parsed out of it.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    with DescriptorTree.open_path(root) as tree, pytest.raises(DescriptorTreeError) as raised:
+        # A reader rather than exists(), which answers False for an unusable path.
+        tree.read_bytes(relative)
+    assert str(raised.value) == message
+
+
+def test_a_path_like_that_answers_with_bytes_is_refused(tmp_path: Path) -> None:
+    """Validation applies to what os.fspath returned, not to the object handed in."""
+    root = tmp_path / "root"
+    root.mkdir()
+    with DescriptorTree.open_path(root) as tree, pytest.raises(DescriptorTreeError) as raised:
+        tree.read_bytes(_HostilePathLike(b"a"))  # ty: ignore[invalid-argument-type]
+    assert str(raised.value) == TEXT_WITHOUT_NUL
+
+
+@pytest.mark.parametrize("wrap", [lambda text: text, _HostilePathLike])
+def test_a_hostile_string_cannot_answer_for_text_it_does_not_contain(
+    tmp_path: Path, wrap: object
+) -> None:
+    """Checks must read the text itself, not whatever the object says about it.
+
+    An overridden split can hand back components the text never contained, including an
+    absolute one, and those components are what os.open walks with dir_fd.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    relative = wrap(_HostileText("a/./b"))  # ty: ignore[call-non-callable]
+    with DescriptorTree.open_path(root) as tree, pytest.raises(DescriptorTreeError) as raised:
+        tree.read_bytes(relative)
+    assert str(raised.value) == EXACT_SPELLING
+
+
+def test_ordinary_and_path_shaped_relatives_are_admitted(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    with DescriptorTree.open_path(root) as tree:
+        tree.mkdir("a")
+        tree.atomic_write_bytes("a/b", b"content")
+        assert tree.read_bytes("a/b") == b"content"
+        # A path object normalizes its own spelling before the validator sees it.
+        assert tree.read_bytes(PurePosixPath("a/./b")) == b"content"
+        assert tree.read_bytes(Path("a/b")) == b"content"
+        assert tree.stat(".").st_ino == os.fstat(tree.descriptor).st_ino
+
+
+def test_root_components_come_from_the_root_text_itself(tmp_path: Path) -> None:
+    """open_path walks the path it was named, not the components an object reports."""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "sentinel").write_bytes(b"owned")
+
+    class _HostileRoot(Path):
+        __slots__ = ()
+
+        @property
+        def anchor(self) -> str:
+            return "/"
+
+        @property
+        def parts(self) -> tuple[str, ...]:
+            return ("/", "tmp")
+
+    with DescriptorTree.open_path(_HostileRoot(root)) as tree:
+        assert tree.read_bytes("sentinel") == b"owned"
+        assert tree.logical_root == root

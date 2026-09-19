@@ -59,8 +59,15 @@ def _token(value: os.stat_result, *, label: str) -> DirectoryToken:
 
 
 def _parts(value: str | os.PathLike[str], *, allow_root: bool = False) -> tuple[str, ...]:
-    text = os.fspath(value)
-    if not isinstance(text, str) or "\x00" in text:
+    raw = os.fspath(value)
+    if not isinstance(raw, str):
+        raise DescriptorTreeError("relative descriptor path must be text without NUL")
+    # A str subclass may answer split, startswith, endswith or __contains__ with something
+    # its text never contained, which would let components reach os.open(dir_fd=...) that no
+    # check here ever saw. Invoking the base descriptor cannot be interposed, so every check
+    # below reads an exact str.
+    text = str.__str__(raw)
+    if "\x00" in text:
         raise DescriptorTreeError("relative descriptor path must be text without NUL")
     if text in {"", "."}:
         if allow_root:
@@ -113,16 +120,23 @@ class DescriptorTree(AbstractContextManager["DescriptorTree"]):
 
     @classmethod
     def open_path(cls, path: Path) -> Self:
-        if not path.is_absolute():
+        # Read the root's own text once and rebuild an ordinary Path from it: a Path
+        # subclass can report an anchor and parts that disagree with the path it names,
+        # and those components are what os.open walks below.
+        raw = os.fspath(path)
+        if not isinstance(raw, str):
+            raise DescriptorTreeError("descriptor tree root must be text")
+        root = Path(str.__str__(raw))
+        if not root.is_absolute():
             raise DescriptorTreeError("descriptor tree root must be absolute")
         descriptor: int | None = None
         try:
-            descriptor = os.open(path.anchor, _directory_flags())
-            for component in path.parts[1:]:
+            descriptor = os.open(root.anchor, _directory_flags())
+            for component in root.parts[1:]:
                 child = os.open(component, _directory_flags(), dir_fd=descriptor)
                 os.close(descriptor)
                 descriptor = child
-            return cls(path, descriptor, duplicate=False)
+            return cls(root, descriptor, duplicate=False)
         except OSError as error:
             if descriptor is not None:
                 with suppress(OSError):
