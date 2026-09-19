@@ -1090,7 +1090,7 @@ def verify_observation_publications(workspace: Workspace, *, budget: ComputeBudg
     if not contracts:
         return
     retained: set[tuple[str, str]] = set()
-    chains: dict[str, History] = {}
+    chains: dict[str, dict[str, History]] = {}
     for catalog in workspace.state.execute(
         "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash "
         "FROM dataset_versions WHERE status='committed' ORDER BY dataset_id, sequence"
@@ -1107,11 +1107,7 @@ def verify_observation_publications(workspace: Workspace, *, budget: ComputeBudg
             continue
         if document.sha256 != pin.manifest_hash:
             raise ValueError("observation catalog conflicts with publication evidence")
-        delta = tuple(
-            row
-            for row in _observation_chain(workspace, pin, chains, budget)
-            if row["generation_id"] == pin.generation_id
-        )
+        delta = _observation_chain(workspace, pin, chains, budget).get(pin.generation_id, ())
         for identity in sorted(referenced):
             rows = tuple(
                 row for row in delta if (row["contract_id"], row["contract_version"]) == identity
@@ -1123,17 +1119,24 @@ def verify_observation_publications(workspace: Workspace, *, budget: ComputeBudg
 
 
 def _observation_chain(
-    workspace: Workspace, pin: GenerationPin, chains: dict[str, History], budget: ComputeBudget
-) -> History:
-    """Load and verify each dataset's chain once, retaining only the current one.
+    workspace: Workspace,
+    pin: GenerationPin,
+    chains: dict[str, dict[str, History]],
+    budget: ComputeBudget,
+) -> dict[str, History]:
+    """Load and verify each dataset's chain once, grouped, retaining only the current one.
 
     The caller owns the materialization allowance, so keeping every dataset's
     history alive would multiply that allowance by the number of datasets even
     though each chain fits on its own. The catalog is walked in dataset order, so
     holding a single chain still costs one load per dataset.
+
+    Rows are grouped by generation once here: the caller looks up one generation per
+    catalog row, and rescanning the whole chain each time would cost generations
+    times rows.
     """
-    history = chains.get(pin.dataset_id)
-    if history is None:
+    grouped = chains.get(pin.dataset_id)
+    if grouped is None:
         chains.clear()
         head = workspace.state.execute(
             "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash "
@@ -1144,13 +1147,23 @@ def _observation_chain(
         history = _load(workspace, GenerationPin(*head), budget.component(2), "feature_values")
         # A chain this route owns must be observations end to end. Another writer can
         # append to an observation head because the domain matches, and each delta
-        # then verifies alone while both readers reject the mixed head.
+        # then verifies alone while both readers reject the mixed head. The transform
+        # must also name this marker, because a hash can be reused from an ancestor.
         for marker in market.generation_chain(workspace.market, str(head["generation_id"])):
             _, transform = _transform(workspace, str(marker["generation_id"]), budget)
-            if transform.get("schema_version") != "aas-observation-transform-v1":
+            destination = transform.get("dataset")
+            if (
+                transform.get("schema_version") != "aas-observation-transform-v1"
+                or not isinstance(destination, dict)
+                or destination.get("generation_id") != marker["generation_id"]
+            ):
                 raise ValueError("observation chain contains a generation from another route")
-        chains[pin.dataset_id] = history
-    return history
+        collected: dict[str, list[Row]] = {}
+        for row in history:
+            collected.setdefault(str(row["generation_id"]), []).append(row)
+        grouped = {key: tuple(value) for key, value in collected.items()}
+        chains[pin.dataset_id] = grouped
+    return grouped
 
 
 def _reference_cells(history: History) -> list[CoverageCell]:
