@@ -31,7 +31,10 @@ from aegis_alpha.storage.membership_pins import (
     UniversePin,
     read_membership_pins,
 )
-from aegis_alpha.storage.research_inputs import native_input_document
+from aegis_alpha.storage.research_inputs import (
+    OBSERVATION_DEFINITION_SCHEMA,
+    native_input_document,
+)
 from aegis_alpha.storage.source_reader import SourcePin
 
 if TYPE_CHECKING:
@@ -42,6 +45,8 @@ type History = tuple[Row, ...]
 type ReaderMode = Literal["strict_pit", "observed_snapshot_research"]
 
 _PROXY_REFS = ("donor_source", "target_source", "basis_ref", "calendar_ref", "cost_ref")
+_OBSERVATION_REFS = ("observed_source", "calendar_ref")
+_FEATURE_DOMAINS = frozenset({"proxy", "observation"})
 
 
 def _text(value: object) -> None:
@@ -292,10 +297,10 @@ def _history_cells(
             reasons.extend(_session_reasons(row))
         else:
             if _unknown(row):
-                reasons.append("unknown_proxy_evidence")
+                reasons.append("unknown_" + domain + "_evidence")
             if row["value_state"] != "present":
                 reasons.append(str(row["value_state"]))
-        if domain == "proxy" and _integer(retained, "feature_at_us") > decision.at_us:
+        if domain in _FEATURE_DOMAINS and _integer(retained, "feature_at_us") > decision.at_us:
             reasons = ["future_observation"]
         cells.append(
             CoverageCell(
@@ -806,18 +811,23 @@ def load_pinned_proxy(
 
 
 def _proxy_publication(
-    workspace: Workspace, transform_hash: str, transform: dict[str, object], budget: ComputeBudget
+    workspace: Workspace,
+    transform_hash: str,
+    transform: dict[str, object],
+    budget: ComputeBudget,
+    *,
+    label: str = "proxy",
 ) -> History:
     """Authenticate the transform pointer with the independently sealed import bytes."""
     destination = transform.get("dataset")
     if not isinstance(destination, dict):
-        raise TypeError("proxy transform lacks publication identity")
+        raise TypeError(label + " transform lacks publication identity")
     catalog = workspace.state.execute(
         "SELECT * FROM dataset_versions WHERE generation_id=? AND status='committed'",
         (destination.get("generation_id"),),
     ).fetchone()
     if catalog is None or catalog["transform_hash"] != transform_hash:
-        raise ValueError("proxy transform/catalog mismatch")
+        raise ValueError(label + " transform/catalog mismatch")
     pin = GenerationPin(
         *(
             catalog[key]
@@ -842,7 +852,7 @@ def _proxy_publication(
             for key in ("provider", "publication_at_us", "normalizer_version", "instruments")
         )
     ):
-        raise ValueError("proxy transform conflicts with publication evidence")
+        raise ValueError(label + " transform conflicts with publication evidence")
     return _proxy_publication_delta(workspace, pin, document, budget)
 
 
@@ -899,13 +909,15 @@ def verify_proxy_publications(workspace: Workspace, *, budget: ComputeBudget) ->
         raise ValueError("proxy definition has no retained feature generation")
 
 
-def _verify_proxy_catalog(workspace: Workspace, generation: str, transform_hash: str) -> None:
+def _verify_proxy_catalog(
+    workspace: Workspace, generation: str, transform_hash: str, *, label: str = "proxy"
+) -> None:
     _verify_catalog(workspace, market.marker_for(workspace.market, generation))
     catalog = workspace.state.execute(
         "SELECT transform_hash FROM dataset_versions WHERE generation_id=?", (generation,)
     ).fetchone()
     if catalog[0] != transform_hash:
-        raise ValueError("proxy transform/catalog mismatch")
+        raise ValueError(label + " transform/catalog mismatch")
 
 
 def verify_proxy_content(workspace: Workspace, history: History, *, budget: ComputeBudget) -> str:
@@ -997,4 +1009,185 @@ def verify_proxy_content(workspace: Workspace, history: History, *, budget: Comp
     ).fetchone()
     if identity is None or identity[0] != "proxy":
         raise ValueError("proxy requires a non-executable logical exposure identity")
+    return contract["definition"]
+
+
+@dataclass(frozen=True, slots=True)
+class PinnedObservationSeries:
+    """Stored binary64 observed prices; uncertified research, never executable."""
+
+    pin: GenerationPin
+    history: History
+    definition: str
+    non_executable: bool = field(default=True, init=False)
+    certified: bool = field(default=False, init=False)
+
+    def project_as_of(self, at_us: int, *, mode: ReaderMode = "strict_pit") -> ProjectedInputs:
+        decision = _Decision(at_us=at_us, mode=mode)
+        rows = tuple(
+            row
+            for row in _project(self.history, decision)
+            if _integer(row, "feature_at_us") <= at_us
+        )
+        cells = _history_cells(self.history, rows, decision, "observation")
+        reasons = [
+            "catalog_unverified",
+            "observation_non_executable",
+            "observation_uncertified",
+            "calendar_unverified",
+        ]
+        if mode == "observed_snapshot_research":
+            reasons.append("observed_snapshot_research")
+        return ProjectedInputs(rows, _coverage(cells, reasons))
+
+
+def load_pinned_observations(
+    workspace: Workspace, pin: GenerationPin, *, budget: ComputeBudget
+) -> PinnedObservationSeries:
+    """Verify one observation definition against every retained feature revision."""
+    history = _load(workspace, pin, budget.component(2), "feature_values")
+    definition = verify_observation_content(workspace, history, budget=budget)
+    return PinnedObservationSeries(pin, history, definition)
+
+
+def verify_observation_publications(workspace: Workspace, *, budget: ComputeBudget) -> None:
+    """Discover referencing rows from sealed imports, never mutable feature identities."""
+    contracts: set[tuple[str, str]] = {
+        (row[0], row[1])
+        for row in workspace.state.execute(
+            "SELECT name,version FROM feature_contracts WHERE record_schema=?",
+            (OBSERVATION_DEFINITION_SCHEMA,),
+        )
+    }
+    if not contracts:
+        return
+    retained: set[tuple[str, str]] = set()
+    for catalog in workspace.state.execute(
+        "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash "
+        "FROM dataset_versions WHERE status='committed'"
+    ):
+        pin = GenerationPin(*catalog)
+        marker = market.marker_for(workspace.market, pin.generation_id)
+        if marker["domain"] != "feature_values":
+            continue
+        document = parse_import(_raw_payload(workspace, str(marker["request_hash"]), budget))
+        referenced = contracts.intersection(
+            (row["contract_id"], row["contract_version"]) for row in document.rows
+        )
+        if not referenced:
+            continue
+        delta = _proxy_publication_delta(workspace, pin, document, budget)
+        for identity in sorted(referenced):
+            rows = tuple(
+                row for row in delta if (row["contract_id"], row["contract_version"]) == identity
+            )
+            verify_observation_content(workspace, rows, budget=budget)
+        retained.update(referenced)
+    if contracts - retained:
+        raise ValueError("observation definition has no retained feature generation")
+
+
+def _observation_generations(
+    workspace: Workspace,
+    history: History,
+    definition: dict[str, object],
+    expected: dict[str, object],
+    budget: ComputeBudget,
+) -> None:
+    """Authenticate every contributing generation's own transform and sealed delta."""
+    for generation in dict.fromkeys(str(row["generation_id"]) for row in history):
+        transform_hash, transform = _transform(workspace, generation, budget)
+        if (
+            transform.get("observation") != definition
+            or transform.get("schema_version") != "aas-observation-transform-v1"
+        ):
+            raise ValueError("observation transform conflicts with feature contract")
+        delta = _proxy_publication(
+            workspace, transform_hash, transform, budget, label="observation"
+        )
+        if any(row[key] != value for row in delta for key, value in expected.items()):
+            raise ValueError("observation points conflict with pinned definition/inputs")
+        _verify_proxy_catalog(workspace, generation, transform_hash, label="observation")
+
+
+def _observation_identities(workspace: Workspace, history: History) -> None:
+    """Every observed instrument must exist and must not be a research return proxy."""
+    for instrument in dict.fromkeys(str(row["instrument_id"]) for row in history):
+        identity = workspace.state.execute(
+            "SELECT asset_type FROM instruments WHERE instrument_id=?", (instrument,)
+        ).fetchone()
+        if identity is None or identity[0] == "proxy":
+            raise ValueError("observation requires a non-proxy observed instrument identity")
+
+
+def verify_observation_content(
+    workspace: Workspace, history: History, *, budget: ComputeBudget
+) -> str:
+    """Verify one observation definition, its publication and the supplied revisions.
+
+    SELECT-only. This proves contract, transform, publication and row agreement for
+    an explicitly uncertified observed research series. It grants no PIT eligibility,
+    provider authority or execution readiness, and never promotes the series to an
+    executable price. calendar_ref stays a preserved reference, never a resolved
+    calendar, so nothing here infers a session, a knowledge time or a publication time.
+    """
+    first = history[0]
+    size = workspace.state.execute(
+        "SELECT length(CAST(definition AS BLOB)) FROM feature_contracts WHERE name=? AND version=?",
+        (first["contract_id"], first["contract_version"]),
+    ).fetchone()
+    if size is not None and size[0] * 256 > budget.available_bytes:
+        raise ComputeResourceError("observation contract exceeds admitted materialization budget")
+    contract = workspace.state.execute(
+        "SELECT definition, content_hash, record_schema FROM feature_contracts "
+        "WHERE name=? AND version=?",
+        (first["contract_id"], first["contract_version"]),
+    ).fetchone()
+    if (
+        contract is None
+        or contract["record_schema"] != OBSERVATION_DEFINITION_SCHEMA
+        or hashlib.sha256(contract["definition"].encode()).hexdigest() != contract["content_hash"]
+    ):
+        raise ValueError("observation feature contract is absent or corrupt")
+    definition = decode_json(contract["definition"].encode())
+    if (
+        not isinstance(definition, dict)
+        or canonical_json_bytes(definition).decode() != contract["definition"]
+    ):
+        raise ValueError("observation feature contract identity mismatch")
+    identity = str(definition.get("series_id")) + "/" + str(definition.get("observation_role"))
+    if identity != first["contract_id"] or definition.get("version") != first["contract_version"]:
+        raise ValueError("observation feature contract identity mismatch")
+    registered = workspace.state.execute(
+        "SELECT ordinal, ref_kind, ref_id, ref_version, content_hash FROM feature_inputs "
+        "WHERE name=? AND version=? ORDER BY ordinal",
+        (first["contract_id"], first["contract_version"]),
+    ).fetchall()
+    if len(registered) != len(_OBSERVATION_REFS):
+        raise ValueError("observation feature inputs mismatch")
+    source = definition["observed_source"]
+    reference = definition["calendar_ref"]
+    inputs = [
+        (
+            "observed_source:" + source["table"],
+            source["source_id"],
+            source["source_sha256"],
+            source["table_digest"],
+        ),
+        ("calendar_ref", reference["id"], reference["version"], reference["sha256"]),
+    ]
+    if [tuple(row) for row in registered] != [
+        (ordinal, *item) for ordinal, item in enumerate(inputs)
+    ]:
+        raise ValueError("observation feature inputs mismatch")
+    expected = {
+        "contract_id": identity,
+        "contract_version": definition["version"],
+        "contract_hash": contract["content_hash"],
+        "input_bundle_hash": hashlib.sha256(canonical_json_bytes([source, reference])).hexdigest(),
+    }
+    if any(row[key] != value for row in history for key, value in expected.items()):
+        raise ValueError("observation points conflict with pinned definition/inputs")
+    _observation_generations(workspace, history, definition, expected, budget)
+    _observation_identities(workspace, history)
     return contract["definition"]
