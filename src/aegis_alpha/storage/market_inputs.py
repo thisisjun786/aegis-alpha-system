@@ -278,6 +278,11 @@ def _history_cells(
 ) -> list[CoverageCell]:
     records = {str(row["record_id"]): row for row in history}
     projected = {str(row["record_id"]): row for row in rows}
+    # One pass: an absent record needs its own revision chain, and rescanning the
+    # whole history per record costs records times revisions on a large panel.
+    chains: dict[str, list[Row]] = {}
+    for row in history:
+        chains.setdefault(str(row["record_id"]), []).append(row)
     cells = []
     for record, retained in sorted(
         records.items(),
@@ -291,8 +296,7 @@ def _history_cells(
         row = projected.get(record)
         reasons = []
         if row is None:
-            chain = tuple(item for item in history if item["record_id"] == record)
-            reasons.append(_absence(chain, decision, domain))
+            reasons.append(_absence(tuple(chains[record]), decision, domain))
         elif domain == "session":
             reasons.extend(_session_reasons(row))
         else:
