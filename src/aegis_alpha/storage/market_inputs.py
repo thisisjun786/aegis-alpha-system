@@ -1089,12 +1089,22 @@ def load_pinned_observations(
 
 
 def _retained_bytes(history: History) -> int:
-    """Estimate what a loaded feature history holds live, as the chain admission does."""
+    """Estimate what a loaded feature history holds live, as the chain admission does.
+
+    Mirrors market's chain estimate term for term: a fixed base, 1024 per
+    contributing generation, and the per-row and per-character terms. The
+    per-generation term is not optional here, because the grouped index this reader
+    keeps beside the rows also costs one entry per generation, and omitting it
+    undercharges a panel published as many bounded chunks by exactly that much.
+    """
     schema = COMMON + DOMAINS["feature_values"]
+    generations = len({str(row["generation_id"]) for row in history})
     characters = sum(
         len(value) for row in history for value in row.values() if isinstance(value, str)
     )
-    return 64 * 1024 + len(history) * (1024 + 256 * len(schema)) + 32 * characters
+    return (
+        64 * 1024 + 1024 * generations + len(history) * (1024 + 256 * len(schema)) + 32 * characters
+    )
 
 
 def verify_observation_publications(workspace: Workspace, *, budget: ComputeBudget) -> None:
