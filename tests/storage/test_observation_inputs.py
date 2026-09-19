@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
 import struct
 from decimal import Decimal, localcontext
@@ -10,6 +12,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from aegis_alpha.application.data_cli import execute_native_data
+from aegis_alpha.application.storage_cli import add_commands
 from aegis_alpha.compute_resources import ComputeBudget
 from aegis_alpha.storage import market, market_inputs, publication
 from aegis_alpha.storage.verification import verify_workspace
@@ -334,3 +338,27 @@ def test_observation_extension_cannot_switch_contract(tmp_path: Path) -> None:
             ).fetchone()[0]
             == 0
         )
+
+
+def test_cli_registers_an_observation_transform(tmp_path: Path) -> None:
+    # Given the same spec the Python route accepts.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        spec = _observation_spec(workspace, tmp_path / "viacli.sqlite3")
+        digest = hashlib.sha256(spec.read_bytes()).hexdigest()
+        # When the data command dispatches it, Then the same publication happens.
+        result = execute_native_data(
+            workspace,
+            argparse.Namespace(data_command="register-observations", spec=spec, sha256=digest),
+        )
+        assert result["published"] is True
+        assert result["certified"] is False
+        assert result["non_executable"] is True
+        assert result["transform_sha256"] == digest
+    # The parser accepts the subcommand alongside its sibling registration routes.
+    parser = argparse.ArgumentParser()
+    add_commands(parser.add_subparsers(dest="command", required=True))
+    parsed = parser.parse_args(
+        ["data", "register-observations", "--spec", str(spec), "--sha256", digest]
+    )
+    assert parsed.data_command == "register-observations"

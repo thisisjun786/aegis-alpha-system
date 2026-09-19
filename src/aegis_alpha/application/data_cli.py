@@ -316,7 +316,7 @@ def import_binding(
 
 
 def execute_native_data(workspace: Workspace, args: argparse.Namespace) -> dict[str, object]:
-    """Delegate exact aas-{price,sessions,proxy}-transform-v1 specs to their sole owner.
+    """Delegate exact aas-{price,sessions,proxy,observation}-transform-v1 specs to their owner.
 
     All transforms require schema_version, source, dataset, columns, instruments,
     publication_at_us (nullable), provider and normalizer_version. source requires
@@ -342,11 +342,18 @@ def execute_native_data(workspace: Workspace, args: argparse.Namespace) -> dict[
     transition requires donor_id/target_id/logical_exposure_id/switch_decision_date/
     mode (signal_only/observed_instrument_switch), donor_source/target_source
     (SourcePins), basis_ref/calendar_ref/cost_ref (each {id,version,sha256}).
+    Observation maps the same feature columns as proxy and instead requires
+    observation {series_id,version,observation_role (open/close),basis,currency,
+    price_role (always reference),adjustment,value_domain (positive/real),
+    certified (always false),normalization,observed_source (a SourcePin),
+    calendar_ref {id,version,sha256}}. It publishes uncertified, non-executable
+    research observations; strict PIT selects none of them.
     storage.research_inputs owns validation, numeric policies and feature hashes;
     its bounded read and strict schema are reused without a parallel publication
     path. Other native data commands retain publication.execute_data unchanged.
     """
     from aegis_alpha.storage.research_inputs import (
+        register_observation_input,
         register_price_input,
         register_proxy_input,
         register_sessions_input,
@@ -359,6 +366,8 @@ def execute_native_data(workspace: Workspace, args: argparse.Namespace) -> dict[
             return register_sessions_input(workspace, args.spec, args.sha256)
         case "register-proxy":
             return register_proxy_input(workspace, args.spec, args.sha256)
+        case "register-observations":
+            return register_observation_input(workspace, args.spec, args.sha256)
         case _:
             from aegis_alpha.storage.publication import execute_data
 
