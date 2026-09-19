@@ -417,6 +417,17 @@ def _allocation_report(
 def metadata_allocation_bound(
     workspace: Workspace, max_bytes: int = METADATA_BUDGET.memory_limit_bytes
 ) -> Iterator[None]:
+    """Bound what the body materializes in Python, in bytes.
+
+    The measured quantity is the process-wide traced peak, so it is the body's own
+    materialization only to the extent that nothing else allocates inside it. An
+    interpreter-level structure counts too: a dictionary that grows here is charged
+    here in full, which is how a 3,844,800 byte interned-string keys table once
+    appeared inside a window that had materialized a few kilobytes. Keep the body
+    free of first-touch process-global growth rather than widening the bound; the
+    bound is what the tampered value costs once decoded into Python, and widening
+    it would stop catching the case the window exists for.
+    """
     assert workspace.strategies is not None
     with select_only(workspace.state), select_only(workspace.strategies):
         # Build the module inventory before tracing starts. A set of every module
@@ -1106,6 +1117,72 @@ def test_arrow_source_native_admission_survives_fresh_restore(tmp_path: Path) ->
             )
             == expected
         )
+
+
+def test_admission_interns_nothing_inside_the_measured_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No content identifier may be interned inside the window.
+
+    sys.intern inserts into one process-global dictionary, and tracemalloc charges
+    a dictionary's growth to the frame that triggered the insertion. One insertion
+    crossing a doubling threshold therefore put an entire new keys table inside
+    this window: 3,844,800 bytes at the 2**18 step, against a 2,097,152 byte
+    bound, for an admission that had materialized a few kilobytes. What makes a
+    digest different from the module names a first import interns is cardinality:
+    the import interns a fixed set once per process, while a fresh digest arrives
+    with every stored object and drives the table up without limit.
+    """
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        seed_native(workspace, tmp_path)
+        selected = pin(workspace)
+        digest = workspace.state.execute(
+            "SELECT transform_hash FROM dataset_versions WHERE generation_id=?",
+            (selected.generation_id,),
+        ).fetchone()[0]
+    interned: list[str] = []
+    original_intern = sys.intern
+
+    def recording_intern(value: str) -> str:
+        interned.append(value)
+        return original_intern(value)
+
+    with open_workspace(home) as workspace:
+        monkeypatch.setattr(sys, "intern", recording_intern)
+        with metadata_allocation_bound(workspace):
+            assert api().admit_native_input(
+                workspace,
+                selected,
+                expected_schema="aas-price-transform-v1",
+                budget=METADATA_BUDGET,
+            )
+    # Every call is recorded, whether or not it inserts, so this does not depend on
+    # what an earlier test left in the table.
+    assert [value for value in interned if digest in value] == []
+
+
+def test_metadata_allocation_bound_still_reports_a_deliberate_violation(
+    stored: Workspace,
+) -> None:
+    """The bound keeps the sensitivity it is there for.
+
+    Its job is to catch a body that materializes more than the window admits, and
+    the tampered cases above depend on that: a value stored as size UTF-8 bytes of
+    Latin-1 text costs size // 2 bytes once it reaches Python, which is exactly
+    the bound those cases assert. This injects a materialization above an explicit
+    bound and requires the window to report it.
+    """
+    materialized = 512 * 1024
+
+    def materialize_above_the_bound() -> None:
+        with metadata_allocation_bound(stored, materialized // 2):
+            held = b"\x00" * materialized
+            assert len(held) == materialized
+
+    with pytest.raises(AssertionError, match="metadata allocation peak"):
+        materialize_above_the_bound()
 
 
 @pytest.mark.parametrize("version", ["latest", "LATEST"])

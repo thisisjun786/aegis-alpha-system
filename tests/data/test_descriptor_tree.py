@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import sys
+import tracemalloc
 from pathlib import Path
 from typing import Literal
 
@@ -336,3 +338,85 @@ def test_closed_descriptor_tree_refuses_use(tmp_path: Path) -> None:
         tree.listdir()
     with pytest.raises(OSError, match="Bad file descriptor"):
         os.fstat(descriptor)
+
+
+def test_relative_path_components_are_never_interned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller's content identifier must not be inserted into the interned table.
+
+    pathlib interns every component it parses, so routing content-addressed names
+    through it inserted each distinct digest into one process-global dictionary.
+    The insertion that crosses that dictionary's next doubling threshold allocates
+    the whole new keys table at the calling frame: 3,844,800 bytes at the 2**18
+    step, which any allocation measurement open at that moment is charged for.
+    Interning is observed here as it happens, because 3.13 interns mortally and a
+    component whose last reference dies leaves the table again.
+    """
+    interned: list[str] = []
+    original_intern = sys.intern
+
+    def recording_intern(value: str) -> str:
+        interned.append(value)
+        return original_intern(value)
+
+    root = tmp_path / "root"
+    root.mkdir()
+    # Built at runtime so no compile-time literal is interned on its behalf.
+    digest = "".join(f"{index % 10}" for index in range(64))
+    relative = digest[:2] + "/" + digest
+    with DescriptorTree.open_path(root) as tree:
+        # Recording starts after the tree is open: opening parses the caller's own
+        # absolute root, which is one fixed installation path rather than a fresh
+        # identifier per stored object.
+        monkeypatch.setattr(sys, "intern", recording_intern)
+        tree.mkdir(digest[:2])
+        tree.atomic_write_bytes(relative, b"content")
+        assert tree.read_bytes(relative) == b"content"
+        assert tree.exists(relative)
+        assert tree.stat(relative).st_size == len(b"content")
+    assert interned == []
+
+
+def test_capped_read_allocates_within_the_cap_it_was_given(tmp_path: Path) -> None:
+    """The executed read must stay inside the size the caller approved.
+
+    Decision 0016 requires approval before reading. A fixed megabyte request
+    allocated that megabyte whatever the cap said, so a 128 KiB admission paid
+    eight times its approved charge and dominated every allocation measurement
+    taken around it.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    cap = 8 * 1024
+    stored_bytes = 4096
+    with DescriptorTree.open_path(root) as tree:
+        tree.atomic_write_bytes("payload", b"x" * stored_bytes)
+        tracemalloc.start()
+        try:
+            assert len(tree.read_bytes("payload", max_bytes=cap)) == stored_bytes
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+    assert peak < cap + 64 * 1024
+
+
+@pytest.mark.parametrize("size", [0, 1, 4096])
+def test_exact_cap_is_admitted_and_one_byte_more_is_refused(tmp_path: Path, size: int) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    with DescriptorTree.open_path(root) as tree:
+        tree.atomic_write_bytes("payload", b"y" * size)
+        assert tree.read_bytes("payload", max_bytes=size) == b"y" * size
+        tree.atomic_write_bytes("payload", b"y" * (size + 1))
+        with pytest.raises(DescriptorTreeError, match="exceeds size cap"):
+            tree.read_bytes("payload", max_bytes=size)
+
+
+def test_negative_read_cap_is_refused_rather_than_read_as_empty(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    with DescriptorTree.open_path(root) as tree:
+        tree.atomic_write_bytes("payload", b"content")
+        with pytest.raises(DescriptorTreeError, match="must not be negative"):
+            tree.read_bytes("payload", max_bytes=-1)

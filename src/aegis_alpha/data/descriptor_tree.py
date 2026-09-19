@@ -13,7 +13,7 @@ import stat
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, Self
 
 if TYPE_CHECKING:
@@ -22,6 +22,9 @@ if TYPE_CHECKING:
 
 class DescriptorTreeError(ValueError):
     """A descriptor tree could not perform an alias-safe operation."""
+
+
+_READ_CHUNK_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,14 +66,22 @@ def _parts(value: str | os.PathLike[str], *, allow_root: bool = False) -> tuple[
         if allow_root:
             return ()
         raise DescriptorTreeError("relative descriptor path must name a child")
-    path = PurePosixPath(text)
-    if path.is_absolute() or text.startswith("~"):
+    # Split the relative path here instead of routing it through PurePosixPath.
+    # pathlib interns every component it parses, and these components are
+    # caller-supplied content identifiers: a content-addressed digest parsed this
+    # way becomes an immortal interned string for the life of the process, and the
+    # insertion that crosses the interned dictionary's next doubling threshold
+    # charges the whole new keys table to whatever code happened to make it.
+    if text.startswith(("/", "~")):
         raise DescriptorTreeError("descriptor path must be relative")
-    if "//" in text or text.endswith("/") or path.as_posix() != text:
+    parts = tuple(text.split("/"))
+    # PurePosixPath used to drop "." components, so a path spelled with them
+    # differed from its parsed form and was refused here rather than below.
+    if "//" in text or text.endswith("/") or "." in parts:
         raise DescriptorTreeError("descriptor path must use its exact lexical spelling")
-    if any(part in {"", ".", "..", "~"} for part in path.parts):
+    if any(part in {"", "..", "~"} for part in parts):
         raise DescriptorTreeError("descriptor path contains an alias component")
-    return path.parts
+    return parts
 
 
 def _write_all(descriptor: int, payload: bytes) -> None:
@@ -332,10 +343,22 @@ class DescriptorTree(AbstractContextManager["DescriptorTree"]):
         *,
         max_bytes: int | None = None,
     ) -> bytes:
+        if max_bytes is not None and max_bytes < 0:
+            raise DescriptorTreeError("descriptor read cap must not be negative")
         with self.binary_reader(relative) as handle:
             chunks: list[bytes] = []
             total = 0
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            while True:
+                # Ask for at most what the cap still allows, plus the single byte
+                # that proves the file is over it. A fixed megabyte request
+                # allocates that megabyte whatever the cap says, so a caller that
+                # approved 128 KiB was charged eight times the size it admitted.
+                allowed = _READ_CHUNK_BYTES
+                if max_bytes is not None:
+                    allowed = min(allowed, max_bytes + 1 - total)
+                chunk = handle.read(allowed)
+                if not chunk:
+                    break
                 total += len(chunk)
                 if max_bytes is not None and total > max_bytes:
                     raise DescriptorTreeError(f"descriptor file exceeds size cap: {relative}")
