@@ -395,3 +395,49 @@ def test_observation_extension_requires_an_ancestor_from_this_route(tmp_path: Pa
             ).fetchone()[0]
             == 0
         )
+
+
+def test_extending_a_chain_leaves_the_earlier_pin_byte_identical(tmp_path: Path) -> None:
+    # Given a registered generation and a pinned read of it.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        first = _observation_spec(workspace, tmp_path / "ext.sqlite3")
+        _ = _register_domain(workspace, first, "observation")
+        origin = _pin(workspace, "ext")
+        before = market_inputs.load_pinned_observations(workspace, origin, budget=BUDGET)
+        # When the same contract is extended in place, as a bounded panel chunk is,
+        later = _observation_spec(
+            workspace,
+            tmp_path / "ext2.sqlite3",
+            value=51.25,
+            options={
+                "feature_at_us": 40,
+                "dataset": {
+                    "dataset_id": "ext",
+                    "version": "2",
+                    "generation_id": "ext2",
+                    "operation_id": "op-ext2",
+                    "parent_id": "ext",
+                },
+            },
+        )
+        _ = _register_domain(workspace, later, "observation")
+        # Then the earlier pin still reads exactly what it read before,
+        assert (
+            market_inputs.load_pinned_observations(workspace, origin, budget=BUDGET).history
+            == before.history
+        )
+        # and the new head carries both generations.
+        head = publication.read_dataset(workspace, "ext", "2")
+        extended = market_inputs.load_pinned_observations(
+            workspace,
+            market_inputs.GenerationPin(
+                str(head["dataset_id"]),
+                str(head["version"]),
+                str(head["generation_id"]),
+                str(head["chain_hash"]),
+                str(head["manifest_hash"]),
+            ),
+            budget=BUDGET,
+        )
+        assert len(extended.history) == len(before.history) + 1

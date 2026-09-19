@@ -38,6 +38,16 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   unknown publication time is never filled in from a session date, and a panel
   without knowledge times keeps NULL knowledge columns, so strict PIT selects
   nothing from it. Research return proxies keep their own route.
+- An observation extension continues one contract all the way down: each ancestor's
+  pinned transform is re-read and must declare the same definition, because matching
+  contract columns alone can come from the generic import route. Reads and
+  `verify_observation_publications` load each chain once and group rows by
+  generation, and that verifier's scan is ordered by `dataset_id, sequence` because
+  its one-entry cache depends on a dataset's rows being contiguous. Those are
+  correctness-adjacent: without them an ordinary read and `aas db verify` become
+  quadratic in the number of chunks a panel was published as.
+- `aas data register-observations --spec <file> --sha256 <digest>` is the CLI
+  surface, alongside `register-prices`, `register-sessions` and `register-proxy`.
 - `market_inputs` reads pinned generations with explicit pins and a caller-owned
   compute budget, replaying the full chain per decision. Strict PIT excludes later
   revisions, unknown knowledge and reference prices; observed snapshot research is
