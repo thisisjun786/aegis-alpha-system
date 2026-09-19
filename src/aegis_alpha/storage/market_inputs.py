@@ -899,7 +899,7 @@ def verify_proxy_publications(workspace: Workspace, *, budget: ComputeBudget) ->
     retained: set[tuple[str, str]] = set()
     for catalog in workspace.state.execute(
         "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash "
-        "FROM dataset_versions WHERE status='committed'"
+        "FROM dataset_versions WHERE status='committed' ORDER BY dataset_id, sequence"
     ):
         pin = GenerationPin(*catalog)
         marker = market.marker_for(workspace.market, pin.generation_id)
@@ -1125,9 +1125,16 @@ def verify_observation_publications(workspace: Workspace, *, budget: ComputeBudg
 def _observation_chain(
     workspace: Workspace, pin: GenerationPin, chains: dict[str, History], budget: ComputeBudget
 ) -> History:
-    """Load and verify each dataset's chain once, at its committed head."""
+    """Load and verify each dataset's chain once, retaining only the current one.
+
+    The caller owns the materialization allowance, so keeping every dataset's
+    history alive would multiply that allowance by the number of datasets even
+    though each chain fits on its own. The catalog is walked in dataset order, so
+    holding a single chain still costs one load per dataset.
+    """
     history = chains.get(pin.dataset_id)
     if history is None:
+        chains.clear()
         head = workspace.state.execute(
             "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash "
             "FROM dataset_versions WHERE status='committed' AND dataset_id=? "
@@ -1162,10 +1169,13 @@ def _observation_generations(
 
     The caller has already verified the whole chain once, so each delta is selected
     from that history rather than reloaded. Reloading per generation would replay
-    every chain prefix and make an ordinary read quadratic in the number of
-    generations, which a panel published as several bounded chunks always is.
+    every chain prefix, and rescanning the history per generation would cost
+    generations times rows, so the rows are grouped by generation in one pass.
     """
-    for generation in dict.fromkeys(str(row["generation_id"]) for row in history):
+    grouped: dict[str, list[Row]] = {}
+    for row in history:
+        grouped.setdefault(str(row["generation_id"]), []).append(row)
+    for generation, rows in grouped.items():
         transform_hash, transform = _transform(workspace, generation, budget)
         if (
             transform.get("observation") != definition
@@ -1175,7 +1185,7 @@ def _observation_generations(
         _, document = _feature_publication_document(
             workspace, transform_hash, transform, budget, label="observation"
         )
-        delta = tuple(row for row in history if row["generation_id"] == generation)
+        delta = tuple(rows)
         if len(delta) != len(document.rows):
             raise ValueError("observation delta conflicts with its sealed publication")
         if any(row[key] != value for row in delta for key, value in expected.items()):

@@ -725,10 +725,28 @@ def _observation_values(
             raise ValueError("observation value leaves its declared value domain")
 
 
+def _ancestor_transform(workspace: Workspace, digest: str) -> object:
+    """Read one ancestor's pinned transform from immutable raw bytes, hash-checked."""
+    with DescriptorTree.open_path(workspace.paths.raw) as tree:
+        raw = tree.read_bytes(digest[:2] + "/" + digest, max_bytes=_MAX_BYTES)
+    if hashlib.sha256(raw).hexdigest() != digest:
+        raise ValueError("observation ancestor transform bytes do not match the catalog")
+    return _decode_transform(raw)
+
+
 def _check_observation_parent(
-    workspace: Workspace, parent: object, contract: str, version: object
+    workspace: Workspace,
+    parent: object,
+    contract: str,
+    version: object,
+    definition: dict[str, object],
 ) -> None:
-    """An extension continues one contract; it never switches series, role or version."""
+    """An extension continues one contract, published by this route, all the way down.
+
+    Matching row identities is not enough: a generation written through the generic
+    import route can carry the same contract columns without ever having an
+    observation transform, and that chain only fails later, when it is read.
+    """
     if parent is None:
         return
     for ancestor in generation_chain(workspace.market, _text(parent)):
@@ -739,6 +757,19 @@ def _check_observation_parent(
         ).fetchone()
         if conflict:
             raise ValueError("observation extensions must continue the same contract and version")
+        catalog = workspace.state.execute(
+            "SELECT transform_hash FROM dataset_versions WHERE generation_id=? AND status=?",
+            (ancestor["generation_id"], "committed"),
+        ).fetchone()
+        if catalog is None:
+            raise ValueError("observation ancestor has no committed catalog entry")
+        body = _ancestor_transform(workspace, _text(catalog[0]))
+        if (
+            not isinstance(body, dict)
+            or body.get("schema_version") != "aas-observation-transform-v1"
+            or body.get("observation") != definition
+        ):
+            raise ValueError("observation ancestor was not published by this contract's route")
 
 
 def register_observation_input(
@@ -790,7 +821,7 @@ def register_observation_input(
         raise ValueError("research return proxies belong in feature contracts of their own")
     _check_identities(workspace, transform.body["instruments"])
     _check_observation_parent(
-        workspace, transform.dataset["parent_id"], contract, definition["version"]
+        workspace, transform.dataset["parent_id"], contract, definition["version"], definition
     )
     expected = {
         "contract_id": contract,

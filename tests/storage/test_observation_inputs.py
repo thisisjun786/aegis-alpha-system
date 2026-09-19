@@ -362,3 +362,36 @@ def test_cli_registers_an_observation_transform(tmp_path: Path) -> None:
         ["data", "register-observations", "--spec", str(spec), "--sha256", digest]
     )
     assert parsed.data_command == "register-observations"
+
+
+def test_observation_extension_requires_an_ancestor_from_this_route(tmp_path: Path) -> None:
+    # Given a registered generation, and an extension that keeps its contract identity
+    # but declares a different observation definition.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        first = _observation_spec(workspace, tmp_path / "root.sqlite3")
+        _ = _register_domain(workspace, first, "observation")
+        later = _observation_spec(
+            workspace,
+            tmp_path / "root2.sqlite3",
+            changes={"adjustment": "a-different-adjustment"},
+            options={
+                "feature_at_us": 40,
+                "dataset": {
+                    "dataset_id": "root",
+                    "version": "2",
+                    "generation_id": "root2",
+                    "operation_id": "op-root2",
+                    "parent_id": "root",
+                },
+            },
+        )
+        # Then the ancestor's own transform is checked, not just its row identities.
+        with pytest.raises(ValueError, match="ancestor"):
+            _ = _register_domain(workspace, later, "observation")
+        assert (
+            workspace.state.execute(
+                "SELECT count(*) FROM dataset_versions WHERE dataset_id='root' AND version='2'"
+            ).fetchone()[0]
+            == 0
+        )
