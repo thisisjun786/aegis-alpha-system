@@ -122,16 +122,17 @@ DuckDB의 메모리 설정은 전체 Python 프로세스의 메모리 한도가 
 aas data register-prices --spec /path/to/prices-transform.json --sha256 SHA256
 aas data register-sessions --spec /path/to/sessions-transform.json --sha256 SHA256
 aas data register-proxy --spec /path/to/proxy-transform.json --sha256 SHA256
+aas data register-observations --spec /path/to/observation-transform.json --sha256 SHA256
 aas data read-prices --request /path/to/price-request.json --sha256 SHA256
 ```
 
-원본 자료실의 테이블은 저절로 시장 generation이 되지 않는다. 세 등록 명령은 명시한 변환
+원본 자료실의 테이블은 저절로 시장 generation이 되지 않는다. 네 등록 명령은 명시한 변환
 문서를 읽어 `db source-import`로 보존한 원본 테이블에서 새 generation을 게시한다. 문서는
 UTF-8 JSON이고 `--sha256`과 바이트가 다르면 거부한다. 스키마는 각각 `aas-price-transform-v1`,
-`aas-sessions-transform-v1`, `aas-proxy-transform-v1`이며 필드 검증은
+`aas-sessions-transform-v1`, `aas-proxy-transform-v1`, `aas-observation-transform-v1`이며 필드 검증은
 [research_inputs.py](../src/aegis_alpha/storage/research_inputs.py)가 소유한다.
 
-세 문서의 공통 필드는 `source`(source_id·source_sha256·table·table_digest), `dataset`
+네 문서의 공통 필드는 `source`(source_id·source_sha256·table·table_digest), `dataset`
 (dataset_id·version·generation_id·operation_id·parent_id, 부모가 없으면 null), `columns`,
 `instruments`, `publication_at_us`(모르면 null), `provider`, `normalizer_version`이다.
 `columns`는 공통 revision 열(generation_id, record_id, revision_id, supersedes_revision_id,
@@ -173,6 +174,25 @@ donor_source·target_source(SourcePin), basis_ref·calendar_ref·cost_ref(id·ve
 원본 자료실에 남는다. 이 저장을 Decimal 정확 저장으로 표시하지 않는다. 결과는
 `non_executable=true`다. 프록시 지수로 체결하지 않고, 보유 여부도 프록시나 요청 필드가 아니라
 실제 이전 체결에서 정한다. 체결 재원은 실제 ETF OHLC뿐이다.
+
+`register-observations`는 관측한 시가 또는 종가만 있고 고가·저가·거래량이 없는 보존 연구
+패널을 `feature_values`에 저장한다. 실행용 OHLC가 아니므로 `prices`로 가지 않으며,
+DECIMAL(38,12) 정확 승인과 부분 OHLCV 거부는 그대로다. `observation`에는 `series_id`,
+`version`, `observation_role`(`open` 또는 `close`), `basis`, `currency`,
+`price_role`(항상 `reference`), `adjustment`, `value_domain`(`positive` 또는 `real`),
+`certified`(항상 `false`), `normalization`(입력 숫자 형식과 `ieee754_binary64` 출력),
+`observed_source`(상위 패널을 가리키는 SourcePin), `calendar_ref`(id·version·sha256)를
+명시한다. `contract_id`는 `series_id/observation_role`이므로 한 series의 시가와 종가는
+서로 다른 행으로 남고 결측도 따로 갖는다. 열 연결은 `register-proxy`와 같은
+`feature_values` 열을 쓰고, `value_state`는 `present` 또는 `missing`만 허용한다.
+`ieee_float`는 비트를 그대로 보존하고 `decimal_string`은 binary64로 반올림되므로 원본
+값은 원본 자료실에 남는다. `asset_type`이 `proxy`인 종목은 이 경로에 넣을 수 없다.
+`publication_at_us`를 모르면 null로 두며 거래일로 채우지 않는다. 패널은 여러 개의 제한된
+generation으로 나눠 등록할 수 있고, 확장은 `parent_id`로 같은 contract를 이어야 하며 조상의
+변환까지 같은 정의여야 한다. 결과는 `non_executable=true`, `certified=false`다. 이
+계약은 언제나 참조 자료이므로 strict PIT는 인지 시각이 모두 알려져 있어도 한 행도 고르지
+않는다. 읽기는 `market_inputs.load_pinned_observations`이며, 파생 series 입력으로는 받지
+않는다. 연구 수익률 프록시와는 계속 다른 계약이고 체결 재원은 여전히 실제 ETF OHLC뿐이다.
 
 `read-prices`는 `aas-price-input-request-v1` 요청을 읽는다. `prices`에는 `pin`,
 `sessions_pin`, `identity_pin`, `universe_pin`(없으면 명시적 null), `instrument_ids`,
