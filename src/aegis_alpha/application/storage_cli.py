@@ -7,6 +7,11 @@ import argparse
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+# Every research registration route: each one mutates and needs the private store.
+_REGISTER_COMMANDS = frozenset(
+    {"register-prices", "register-sessions", "register-proxy", "register-observations"}
+)
+
 if TYPE_CHECKING:
     import sqlite3
 
@@ -70,6 +75,7 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
         "register-prices",
         "register-sessions",
         "register-proxy",
+        "register-observations",
         "read-prices",
         "convention-import",
         "binding-import",
@@ -165,11 +171,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
                     return read_price_input(workspace, args.request, args.sha256, budget=budget)
         mutation = (
             (args.command == "strategy" and args.strategy_command == "import")
-            or (
-                args.command == "data"
-                and args.data_command
-                in {"import", "register-prices", "register-sessions", "register-proxy"}
-            )
+            or (args.command == "data" and args.data_command in _REGISTER_COMMANDS | {"import"})
             or (
                 args.command == "db"
                 and args.db_command in {"recover", "quarantine", "source-import"}
@@ -180,10 +182,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             writable=mutation,
             strategy_write=mutation,
             require_strategies=args.command == "strategy"
-            or (
-                args.command == "data"
-                and args.data_command in {"register-prices", "register-sessions", "register-proxy"}
-            )
+            or (args.command == "data" and args.data_command in _REGISTER_COMMANDS)
             or (
                 args.command == "db"
                 and args.db_command

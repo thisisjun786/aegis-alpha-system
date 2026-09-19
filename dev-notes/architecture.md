@@ -133,9 +133,21 @@ generation에 게시한다. 문서가 원본 pin, 대상 dataset, 열 연결, �
 만들어 채우지 않는다. 십진 변환은 정확해야 하고 일부만 있는 OHLCV는 거부한다. 프록시 지수
 점은 `feature_values`에 DOUBLE로 저장하며 정의별 contract ID·버전과 입력 pin을
 `feature_contracts`·`feature_inputs`에 남긴다. 프록시는 실행 불가이고 체결 재원은 실제 ETF
-OHLC뿐이다. `storage/market_inputs`는 명시한 generation pin과 compute 예산으로 전체 revision
+OHLC뿐이다. 관측 open·close만 있고 고가·저가·거래량이 없는 보존 연구 패널은 실행용
+OHLC가 아니므로 `prices`에 들어가지 않는다. 정확한 DECIMAL(38,12) 승인과 부분 OHLCV
+거부는 그대로 두고, 관측 연구 경로가 그 값을 `feature_values`에 binary64로 보존한다.
+원본이 이미 binary64인 `ieee_float`는 비트가 그대로 남는다. `decimal_string`은
+binary64가 표현하지 못하는 십진수를 변환하면서 반올림하며, 이는 표현 손실을 허용한다는
+선언이지 몰래 일어나는 일이 아니다. 이 계약은 price_role을 reference로, certified를 false로 고정하고 값 범위를
+명시하며, contract 이름은 series와 open·close 역할을 합쳐 두 역할을 서로 다른 행으로
+남긴다. 공개 시각이 불명확하면 null로 남기고 거래일로 채우지 않는다. 패널은 여러 개의
+제한된 generation으로 나뉘어 오므로 `feature_inputs`는 변환 하나를 고정하지 않고, 확장은
+조상의 변환까지 같은 정의인지 확인한 뒤에만 게시된다. 검증은 그 chain이 끝까지 관측
+generation인지도 확인하므로 다른 경로가 관측 head에 덧붙인 generation은 거부된다. 연구 수익률 프록시와 관측 가격은
+계속 서로 다른 계약이다. `storage/market_inputs`는 명시한 generation pin과 compute 예산으로 전체 revision
 chain을 준비하고 각 결정 시각을 그 chain에서 투영한다. strict PIT는 이후 revision, 알 수 없는
-인지 시각, 참조 가격을 제외한다. 명시한 observed snapshot 연구 모드는 인증되지 않은 채 남고
+인지 시각, 참조 가격을 제외한다. 관측 연구 계약은 언제나 reference이므로 strict PIT는 인지
+시각이 모두 알려져 있어도 한 행도 고르지 않는다. 명시한 observed snapshot 연구 모드는 인증되지 않은 채 남고
 strict 읽기를 바꾸지 않는다. coverage는 요청 격자 전체를 기록하며 잘린 이력을 성공으로
 돌려주지 않는다. 등록·조회 명령과 문서 필드는
 [operations](operations.md#원본-자료의-연구-입력-등록과-고정-조회)가 소유한다. 이 경로는
