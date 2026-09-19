@@ -1115,7 +1115,7 @@ def verify_observation_publications(workspace: Workspace, *, budget: ComputeBudg
     if not contracts:
         return
     retained: set[tuple[str, str]] = set()
-    chains: dict[str, dict[str, History]] = {}
+    chains: dict[str, tuple[dict[str, History], int]] = {}
     for catalog in workspace.state.execute(
         "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash "
         "FROM dataset_versions WHERE status='committed' ORDER BY dataset_id, sequence"
@@ -1132,12 +1132,16 @@ def verify_observation_publications(workspace: Workspace, *, budget: ComputeBudg
             continue
         if document.sha256 != pin.manifest_hash:
             raise ValueError("observation catalog conflicts with publication evidence")
-        delta = _observation_chain(workspace, pin, chains, budget).get(pin.generation_id, ())
+        chain, live_bytes = _observation_chain(workspace, pin, chains, budget)
+        delta = chain.get(pin.generation_id, ())
+        # The cached chain stays live while each delta is re-derived, so it is
+        # charged here exactly as the reader charges the history it returns.
+        reserved = replace(budget, reserved_bytes=budget.reserved_bytes + live_bytes)
         for identity in sorted(referenced):
             rows = tuple(
                 row for row in delta if (row["contract_id"], row["contract_version"]) == identity
             )
-            verify_observation_content(workspace, rows, budget=budget)
+            verify_observation_content(workspace, rows, budget=reserved)
         retained.update(referenced)
     if contracts - retained:
         raise ValueError("observation definition has no retained feature generation")
@@ -1146,9 +1150,9 @@ def verify_observation_publications(workspace: Workspace, *, budget: ComputeBudg
 def _observation_chain(
     workspace: Workspace,
     pin: GenerationPin,
-    chains: dict[str, dict[str, History]],
+    chains: dict[str, tuple[dict[str, History], int]],
     budget: ComputeBudget,
-) -> dict[str, History]:
+) -> tuple[dict[str, History], int]:
     """Load and verify each dataset's chain once, grouped, retaining only the current one.
 
     The caller owns the materialization allowance, so keeping every dataset's
@@ -1160,8 +1164,8 @@ def _observation_chain(
     catalog row, and rescanning the whole chain each time would cost generations
     times rows.
     """
-    grouped = chains.get(pin.dataset_id)
-    if grouped is None:
+    cached = chains.get(pin.dataset_id)
+    if cached is None:
         chains.clear()
         head = workspace.state.execute(
             "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash "
@@ -1187,8 +1191,9 @@ def _observation_chain(
         for row in history:
             collected.setdefault(str(row["generation_id"]), []).append(row)
         grouped = {key: tuple(value) for key, value in collected.items()}
-        chains[pin.dataset_id] = grouped
-    return grouped
+        cached = (grouped, _retained_bytes(history))
+        chains[pin.dataset_id] = cached
+    return cached
 
 
 def _reference_cells(history: History) -> list[CoverageCell]:
