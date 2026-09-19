@@ -726,6 +726,8 @@ def _auxiliary(
             pin = _generation(_row(item["pin"]))
             domain, history = loader.generation(pin)
             _check_derived_domain(domain, history, binding.series, binding.field)
+            if domain == "feature_values":
+                _reject_observation_contract(loader.workspace, history)
             prices = None
             if domain == "prices":
                 history = loader.native(pin, "aas-price-transform-v1")
@@ -752,6 +754,27 @@ def _auxiliary(
                 )
             )
     return tuple(result)
+
+
+def _reject_observation_contract(workspace: Workspace, history: History) -> None:
+    """Keep observed research observations out of the generic derived reader.
+
+    An observation contract is always reference data and its own reader selects
+    none of it under strict PIT. The derived path projects feature_values directly
+    and never consults that contract, so admitting one here would let a
+    known-timestamp reference observation reach a replay through the back door.
+    """
+    from aegis_alpha.storage.research_inputs import (  # noqa: PLC0415 -- contract owner
+        OBSERVATION_DEFINITION_SCHEMA,
+    )
+
+    first = history[0]
+    observed = workspace.state.execute(
+        "SELECT 1 FROM feature_contracts WHERE name=? AND version=? AND record_schema=?",
+        (first["contract_id"], first["contract_version"], OBSERVATION_DEFINITION_SCHEMA),
+    ).fetchone()
+    if observed is not None:
+        raise ValueError("observed research observations are not derived-series inputs")
 
 
 def _check_derived_domain(domain: str, history: History, series: str, field_name: str) -> None:
