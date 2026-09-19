@@ -899,7 +899,7 @@ def verify_proxy_publications(workspace: Workspace, *, budget: ComputeBudget) ->
     retained: set[tuple[str, str]] = set()
     for catalog in workspace.state.execute(
         "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash "
-        "FROM dataset_versions WHERE status='committed' ORDER BY dataset_id, sequence"
+        "FROM dataset_versions WHERE status='committed'"
     ):
         pin = GenerationPin(*catalog)
         marker = market.marker_for(workspace.market, pin.generation_id)
@@ -1093,7 +1093,7 @@ def verify_observation_publications(workspace: Workspace, *, budget: ComputeBudg
     chains: dict[str, History] = {}
     for catalog in workspace.state.execute(
         "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash "
-        "FROM dataset_versions WHERE status='committed'"
+        "FROM dataset_versions WHERE status='committed' ORDER BY dataset_id, sequence"
     ):
         pin = GenerationPin(*catalog)
         marker = market.marker_for(workspace.market, pin.generation_id)
