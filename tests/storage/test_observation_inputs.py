@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import struct
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from fractions import Fraction
 from typing import TYPE_CHECKING
 
@@ -31,7 +31,7 @@ BUDGET = ComputeBudget(Fraction(1), 64 * 1024 * 1024)
 NUMBERS = ("open", "high", "low", "close", "volume")
 # Exactly a promoted binary32, like every value in the retained research panel.
 PANEL_OPEN = 49.29364776611328
-DECIMAL_SCALE = 12
+DECIMAL_SCALE = Decimal("0.000000000001")
 COMMON_FIELDS = frozenset(
     {
         "generation_id",
@@ -140,17 +140,20 @@ def _observation_spec(
 def _pin(workspace: Workspace, dataset: str) -> market_inputs.GenerationPin:
     row = publication.read_dataset(workspace, dataset, "1")
     return market_inputs.GenerationPin(
-        **{
-            key: row[key]
-            for key in ("dataset_id", "version", "generation_id", "chain_hash", "manifest_hash")
-        }
+        str(row["dataset_id"]),
+        str(row["version"]),
+        str(row["generation_id"]),
+        str(row["chain_hash"]),
+        str(row["manifest_hash"]),
     )
 
 
 def test_panel_refused_as_price_is_admitted_as_uncertified_observation(tmp_path: Path) -> None:
     # Given the retained panel's own number, which is exactly a promoted binary32.
     assert struct.unpack("<f", struct.pack("<f", PANEL_OPEN))[0] == PANEL_OPEN
-    assert -Decimal(PANEL_OPEN).as_tuple().exponent > DECIMAL_SCALE
+    with localcontext() as context:
+        context.prec = 50
+        assert Decimal(PANEL_OPEN) != Decimal(PANEL_OPEN).quantize(DECIMAL_SCALE)
     initialize(tmp_path / "home")
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
         # The executable price route still refuses it, for its documented reason.
@@ -221,25 +224,27 @@ def test_workspace_verification_admits_the_observation_definition_schema(tmp_pat
 
 
 @pytest.mark.parametrize(
-    ("changes", "kwargs", "message"),
+    ("changes", "options", "message"),
     [
         ({"price_role": "canonical"}, {}, "reference"),
         ({"certified": True}, {}, "never certified"),
         ({"observation_role": "high"}, {}, "observed open or close"),
         ({"value_domain": "unbounded"}, {}, "value domain"),
-        ({}, {"options": {"asset_type": "proxy"}}, "proxies"),
+        ({}, {"asset_type": "proxy"}, "proxies"),
     ],
 )
 def test_invalid_observation_contracts_fail_before_publication(
     tmp_path: Path,
     changes: dict[str, object],
-    kwargs: dict[str, object],
+    options: dict[str, object],
     message: str,
 ) -> None:
     # Given a retained source that is otherwise registrable.
     initialize(tmp_path / "home")
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
-        spec = _observation_spec(workspace, tmp_path / "bad.sqlite3", changes=changes, **kwargs)
+        spec = _observation_spec(
+            workspace, tmp_path / "bad.sqlite3", changes=changes, options=options
+        )
         # When the contract breaks an invariant, Then nothing is published.
         with pytest.raises((ValueError, TypeError), match=message):
             _ = _register_domain(workspace, spec, "observation")
