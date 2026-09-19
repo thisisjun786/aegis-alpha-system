@@ -1073,7 +1073,13 @@ def load_pinned_observations(
 
 
 def verify_observation_publications(workspace: Workspace, *, budget: ComputeBudget) -> None:
-    """Discover referencing rows from sealed imports, never mutable feature identities."""
+    """Discover referencing rows from sealed imports, never mutable feature identities.
+
+    Each dataset's chain is loaded once, at its committed head, and every
+    contributing generation's delta is selected from that history. Loading per
+    generation would replay every chain prefix, so a panel published as several
+    bounded chunks would make workspace verification quadratic in its own length.
+    """
     contracts: set[tuple[str, str]] = {
         (row[0], row[1])
         for row in workspace.state.execute(
@@ -1084,6 +1090,7 @@ def verify_observation_publications(workspace: Workspace, *, budget: ComputeBudg
     if not contracts:
         return
     retained: set[tuple[str, str]] = set()
+    chains: dict[str, History] = {}
     for catalog in workspace.state.execute(
         "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash "
         "FROM dataset_versions WHERE status='committed'"
@@ -1098,7 +1105,13 @@ def verify_observation_publications(workspace: Workspace, *, budget: ComputeBudg
         )
         if not referenced:
             continue
-        delta = _proxy_publication_delta(workspace, pin, document, budget)
+        if document.sha256 != pin.manifest_hash:
+            raise ValueError("observation catalog conflicts with publication evidence")
+        delta = tuple(
+            row
+            for row in _observation_chain(workspace, pin, chains, budget)
+            if row["generation_id"] == pin.generation_id
+        )
         for identity in sorted(referenced):
             rows = tuple(
                 row for row in delta if (row["contract_id"], row["contract_version"]) == identity
@@ -1107,6 +1120,23 @@ def verify_observation_publications(workspace: Workspace, *, budget: ComputeBudg
         retained.update(referenced)
     if contracts - retained:
         raise ValueError("observation definition has no retained feature generation")
+
+
+def _observation_chain(
+    workspace: Workspace, pin: GenerationPin, chains: dict[str, History], budget: ComputeBudget
+) -> History:
+    """Load and verify each dataset's chain once, at its committed head."""
+    history = chains.get(pin.dataset_id)
+    if history is None:
+        head = workspace.state.execute(
+            "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash "
+            "FROM dataset_versions WHERE status='committed' AND dataset_id=? "
+            "ORDER BY sequence DESC LIMIT 1",
+            (pin.dataset_id,),
+        ).fetchone()
+        history = _load(workspace, GenerationPin(*head), budget.component(2), "feature_values")
+        chains[pin.dataset_id] = history
+    return history
 
 
 def _reference_cells(history: History) -> list[CoverageCell]:
