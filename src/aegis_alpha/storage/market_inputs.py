@@ -1134,14 +1134,9 @@ def verify_observation_publications(workspace: Workspace, *, budget: ComputeBudg
         marker = market.marker_for(workspace.market, pin.generation_id)
         if marker["domain"] != "feature_values":
             continue
-        document = parse_import(_raw_payload(workspace, str(marker["request_hash"]), budget))
-        referenced = contracts.intersection(
-            (row["contract_id"], row["contract_version"]) for row in document.rows
-        )
+        referenced = _referenced_observations(workspace, pin, marker, contracts, budget)
         if not referenced:
             continue
-        if document.sha256 != pin.manifest_hash:
-            raise ValueError("observation catalog conflicts with publication evidence")
         chain, live_bytes = _observation_chain(workspace, pin, chains, budget)
         delta = chain.get(pin.generation_id, ())
         # The cached chain stays live while each delta is re-derived, so it is
@@ -1155,6 +1150,28 @@ def verify_observation_publications(workspace: Workspace, *, budget: ComputeBudg
         retained.update(referenced)
     if contracts - retained:
         raise ValueError("observation definition has no retained feature generation")
+
+
+def _referenced_observations(
+    workspace: Workspace,
+    pin: GenerationPin,
+    marker: Row,
+    contracts: set[tuple[str, str]],
+    budget: ComputeBudget,
+) -> set[tuple[str, str]]:
+    """Return which observation contracts a sealed import references, holding nothing.
+
+    The parsed document is a whole generation of rows. It dies with this frame, so
+    it is not alive while the chain is loaded and each delta is re-derived, which
+    would put an uncharged document beside the charged chain on the same lease.
+    """
+    document = parse_import(_raw_payload(workspace, str(marker["request_hash"]), budget))
+    referenced = contracts.intersection(
+        (row["contract_id"], row["contract_version"]) for row in document.rows
+    )
+    if referenced and document.sha256 != pin.manifest_hash:
+        raise ValueError("observation catalog conflicts with publication evidence")
+    return referenced
 
 
 def _observation_chain(
@@ -1255,7 +1272,10 @@ def _observation_generations(
             or destination.get("generation_id") != generation
         ):
             raise ValueError("observation transform conflicts with feature contract")
-        _ = _feature_publication_document(
+        # Authenticate the pointer, then let that parsed document go before the
+        # re-derivation builds another one: the lease reserves the cached chain, not
+        # two full documents alive at the same time.
+        _feature_publication_document(
             workspace, transform_hash, transform, budget, label="observation"
         )
         marker = market.marker_for(workspace.market, generation)
@@ -1352,6 +1372,14 @@ def verify_observation_content(
     }
     if any(row[key] != value for row in history for key, value in expected.items()):
         raise ValueError("observation points conflict with pinned definition/inputs")
-    _observation_generations(workspace, history, definition, expected, budget)
+    # The decoded definition stays live while every generation is re-derived, so it
+    # is charged rather than spent twice on the same lease.
+    _observation_generations(
+        workspace,
+        history,
+        definition,
+        expected,
+        replace(budget, reserved_bytes=budget.reserved_bytes + 256 * len(contract["definition"])),
+    )
     _observation_identities(workspace, history)
     return contract["definition"]

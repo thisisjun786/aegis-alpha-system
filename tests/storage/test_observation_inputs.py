@@ -14,7 +14,7 @@ import pytest
 
 from aegis_alpha.application.data_cli import execute_native_data
 from aegis_alpha.application.storage_cli import add_commands
-from aegis_alpha.compute_resources import ComputeBudget
+from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.storage import (
     import_document,
@@ -96,15 +96,22 @@ def _observation_spec(
         "instrument": "ASSET_A",
         "role": "close",
         "feature_at_us": 20,
+        "panel_rows": 1,
         "knowledge": None,
         "dataset": None,
         **(options or {}),
     }
     instrument = str(settings["instrument"])
     # One shared observed panel, so every generation pins the same provenance and contract.
-    panel = path.parent / "observed-panel.json"
+    name = path.parent.name + "-observed-panel"
+    panel = path.parent / (name + ".json")
     if not panel.exists():
-        panel = _spec(workspace, path.parent / "observed-panel.sqlite3", [_source_row()])
+        # The panel is only ever pinned and hashed, so extra rows just make it bigger.
+        wide = [
+            {**_source_row(), "record_id": "panel-" + str(n), "revision_id": "pr-" + str(n)}
+            for n in range(int(str(settings["panel_rows"])))
+        ]
+        panel = _spec(workspace, path.parent / (name + ".sqlite3"), wide)
     definition = _definition(json.loads(panel.read_bytes())["source"], str(settings["role"]))
     definition.update(changes or {})
     row = {key: item for key, item in _source_row().items() if key in COMMON_FIELDS}
@@ -586,3 +593,40 @@ def test_chunked_panel_resolves_its_upstream_source_once(
         # Then the upstream panel digest is recomputed once, not once per generation.
         assert len(series.history) == CHUNKS
         assert len(calls) == 1
+
+
+def test_upstream_panel_is_admitted_before_it_is_hashed(tmp_path: Path) -> None:
+    # Given an upstream panel much larger than the transform's mapped point table.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        large = tmp_path / "wide"
+        large.mkdir()
+        spec = _observation_spec(workspace, large / "big.sqlite3", options={"panel_rows": 4000})
+        _ = _register_domain(workspace, spec, "observation")
+        # When re-derivation would hash that panel under a caller-owned lease,
+        # Then it is refused before the hash instead of allocating outside the lease.
+        with pytest.raises(ComputeResourceError, match="source table"):
+            _ = research_inputs.native_input_document(
+                workspace,
+                spec.read_bytes(),
+                expected_schema="aas-observation-transform-v1",
+                budget=BUDGET,
+            )
+        # The bound is proportional, not a blanket refusal: a panel the lease covers
+        # still re-derives.
+        small = tmp_path / "narrow"
+        small.mkdir()
+        modest = _observation_spec(
+            workspace,
+            small / "ok.sqlite3",
+            changes={"series_id": "OBSERVED-NARROW"},
+            options={"panel_rows": 4},
+        )
+        _ = _register_domain(workspace, modest, "observation")
+        document, _source = research_inputs.native_input_document(
+            workspace,
+            modest.read_bytes(),
+            expected_schema="aas-observation-transform-v1",
+            budget=BUDGET,
+        )
+        assert document.rows

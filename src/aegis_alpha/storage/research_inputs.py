@@ -464,9 +464,9 @@ def native_input_document(
     if expected_schema == "aas-price-transform-v1":
         return _price_document(workspace, raw)[0], source
     if expected_schema == "aas-observation-transform-v1":
-        document = _observation_document(workspace, raw, hashlib.sha256(raw).hexdigest(), resolved)[
-            0
-        ]
+        document = _observation_document(
+            workspace, raw, hashlib.sha256(raw).hexdigest(), resolved, budget
+        )[0]
         return document, source
     transform = _parse_transform(raw, hashlib.sha256(raw).hexdigest(), "sessions")
     return _sessions_document(workspace, transform), source
@@ -681,8 +681,38 @@ def _check_identities(workspace: Workspace, supplied: object) -> None:
             raise ValueError("instrument identity conflicts with registered definition")
 
 
+def _admit_upstream(
+    workspace: Workspace,
+    pin: SourcePin,
+    resolved: set[SourcePin] | None,
+    budget: ComputeBudget | None,
+) -> None:
+    """Resolve one upstream panel pin at most once per pass, under admission.
+
+    Resolving recomputes that table's digest, which is real work on a caller-owned
+    lease, so it is admitted before it happens rather than after it has allocated.
+    Every generation of one panel shares this pin, so a chunked panel would
+    otherwise rehash the same upstream table once per generation.
+    """
+    if resolved is not None and pin in resolved:
+        return
+    if budget is not None:
+        admit_source_table(
+            workspace,
+            pin.source_id,
+            pin.table,
+            max_materialization_bytes=budget.available_bytes,
+        )
+    resolve_source(workspace, pin)
+    if resolved is not None:
+        resolved.add(pin)
+
+
 def _observation_definition(
-    workspace: Workspace, body: dict[str, object], resolved: set[SourcePin] | None = None
+    workspace: Workspace,
+    body: dict[str, object],
+    resolved: set[SourcePin] | None = None,
+    budget: ComputeBudget | None = None,
 ) -> tuple[dict[str, object], str, list[tuple[str, str, str, str]]]:
     """Admit one observation contract: identity, price semantics and its pinned inputs.
 
@@ -709,10 +739,7 @@ def _observation_definition(
     ):
         raise ValueError("observation normalization must declare its source type and output")
     pin = _source_pin(definition["observed_source"])
-    if resolved is None or pin not in resolved:
-        resolve_source(workspace, pin)
-        if resolved is not None:
-            resolved.add(pin)
+    _admit_upstream(workspace, pin, resolved, budget)
     inputs = [("observed_source:" + pin.table, pin.source_id, pin.source_sha256, pin.table_digest)]
     reference = _object(definition["calendar_ref"], frozenset({"id", "version", "sha256"}))
     # Reuse SourcePin's lowercase digest admission without resolving a convention as a table.
@@ -797,7 +824,11 @@ def _check_observation_parent(
 
 
 def _observation_document(
-    workspace: Workspace, raw: bytes, sha256: str, resolved: set[SourcePin] | None = None
+    workspace: Workspace,
+    raw: bytes,
+    sha256: str,
+    resolved: set[SourcePin] | None = None,
+    budget: ComputeBudget | None = None,
 ) -> tuple[ImportDocument, _Transform, dict[str, object], str, list[tuple[str, str, str, str]]]:
     """Rebuild one observation publication from its pinned source, without publishing.
 
@@ -806,7 +837,9 @@ def _observation_document(
     generation actually committed instead of trusting its metadata.
     """
     transform = _parse_transform(raw, sha256, "observation")
-    definition, contract, inputs = _observation_definition(workspace, transform.body, resolved)
+    definition, contract, inputs = _observation_definition(
+        workspace, transform.body, resolved, budget
+    )
     identities = _instruments(transform.body["instruments"])
     if any(
         item["asset_type"] == "proxy"
