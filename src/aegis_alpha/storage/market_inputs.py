@@ -1014,7 +1014,13 @@ def verify_proxy_content(workspace: Workspace, history: History, *, budget: Comp
 
 @dataclass(frozen=True, slots=True)
 class PinnedObservationSeries:
-    """Stored binary64 observed prices; uncertified research, never executable."""
+    """Stored binary64 observed prices; uncertified research, never executable.
+
+    An observation contract fixes price_role to reference, so strict PIT selects
+    none of it no matter how complete its knowledge times are. feature_values rows
+    carry no price_role column, so the exclusion the prices reader gets from
+    project_heads has to be applied here instead of inferred from a row.
+    """
 
     pin: GenerationPin
     history: History
@@ -1024,20 +1030,21 @@ class PinnedObservationSeries:
 
     def project_as_of(self, at_us: int, *, mode: ReaderMode = "strict_pit") -> ProjectedInputs:
         decision = _Decision(at_us=at_us, mode=mode)
-        rows = tuple(
-            row
-            for row in _project(self.history, decision)
-            if _integer(row, "feature_at_us") <= at_us
-        )
-        cells = _history_cells(self.history, rows, decision, "observation")
         reasons = [
             "catalog_unverified",
             "observation_non_executable",
             "observation_uncertified",
             "calendar_unverified",
         ]
-        if mode == "observed_snapshot_research":
-            reasons.append("observed_snapshot_research")
+        if mode != "observed_snapshot_research":
+            return ProjectedInputs((), _coverage(_reference_cells(self.history), reasons))
+        rows = tuple(
+            row
+            for row in _project(self.history, decision)
+            if _integer(row, "feature_at_us") <= at_us
+        )
+        cells = _history_cells(self.history, rows, decision, "observation")
+        reasons.append("observed_snapshot_research")
         return ProjectedInputs(rows, _coverage(cells, reasons))
 
 
@@ -1085,6 +1092,18 @@ def verify_observation_publications(workspace: Workspace, *, budget: ComputeBudg
         retained.update(referenced)
     if contracts - retained:
         raise ValueError("observation definition has no retained feature generation")
+
+
+def _reference_cells(history: History) -> list[CoverageCell]:
+    """Account for every retained record while selecting none of it under strict PIT."""
+    records = {str(row["record_id"]): row for row in history}
+    absent = False
+    return [
+        CoverageCell(
+            str(row["instrument_id"]), None, absent, ("reference_observation",), record_id=record
+        )
+        for record, row in sorted(records.items(), key=lambda item: item[0])
+    ]
 
 
 def _observation_generations(

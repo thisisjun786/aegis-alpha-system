@@ -721,8 +721,24 @@ def _observation_values(
         value = row["value"]
         if (value is not None) != (row["value_state"] == "present"):
             raise ValueError("observation value and missing state disagree")
-        if value is not None and (value < 0 or (positive and value == 0)):
+        if value is not None and positive and value <= 0:
             raise ValueError("observation value leaves its declared value domain")
+
+
+def _check_observation_parent(
+    workspace: Workspace, parent: object, contract: str, version: object
+) -> None:
+    """An extension continues one contract; it never switches series, role or version."""
+    if parent is None:
+        return
+    for ancestor in generation_chain(workspace.market, _text(parent)):
+        conflict = workspace.market.execute(
+            "SELECT 1 FROM feature_values WHERE generation_id=? "
+            "AND (contract_id<>? OR contract_version<>?) LIMIT 1",
+            [ancestor["generation_id"], contract, version],
+        ).fetchone()
+        if conflict:
+            raise ValueError("observation extensions must continue the same contract and version")
 
 
 def register_observation_input(
@@ -773,6 +789,9 @@ def register_observation_input(
     ):
         raise ValueError("research return proxies belong in feature contracts of their own")
     _check_identities(workspace, transform.body["instruments"])
+    _check_observation_parent(
+        workspace, transform.dataset["parent_id"], contract, definition["version"]
+    )
     expected = {
         "contract_id": contract,
         "contract_version": definition["version"],

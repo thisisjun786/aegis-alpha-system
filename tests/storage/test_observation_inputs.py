@@ -32,6 +32,8 @@ NUMBERS = ("open", "high", "low", "close", "volume")
 # Exactly a promoted binary32, like every value in the retained research panel.
 PANEL_OPEN = 49.29364776611328
 DECIMAL_SCALE = Decimal("0.000000000001")
+# An additively adjusted series legitimately falls below zero.
+NEGATIVE_OBSERVATION = -1.5
 COMMON_FIELDS = frozenset(
     {
         "generation_id",
@@ -79,6 +81,8 @@ def _observation_spec(
         "instrument": "ASSET_A",
         "role": "close",
         "feature_at_us": 20,
+        "knowledge": None,
+        "dataset": None,
         **(options or {}),
     }
     instrument = str(settings["instrument"])
@@ -98,8 +102,8 @@ def _observation_spec(
         feature_at_us=settings["feature_at_us"],
         value=value,
         value_state="missing" if value is None else "present",
-        available_at_us=None,
-        revision_known_at_us=None,
+        available_at_us=settings["knowledge"],
+        revision_known_at_us=settings["knowledge"],
     )
     natural = [
         "contract_id",
@@ -126,7 +130,7 @@ def _observation_spec(
             }
         ],
     )
-    document["dataset"] = {
+    document["dataset"] = settings["dataset"] or {
         "dataset_id": path.stem,
         "version": "1",
         "generation_id": path.stem,
@@ -193,10 +197,10 @@ def test_uncertified_reader_reports_unknown_evidence_and_survives_a_later_genera
         assert "observation_uncertified" in projected.coverage.reasons
         assert "observation_non_executable" in projected.coverage.reasons
         assert projected.coverage.certified is False
-        # The panel carries no knowledge time, so nothing is promoted to PIT evidence.
-        assert "unknown_observation_evidence" in projected.coverage.reasons
         research = series.project_as_of(30, mode="observed_snapshot_research")
         assert "observed_snapshot_research" in research.coverage.reasons
+        # The panel carries no knowledge time, so nothing is promoted to PIT evidence.
+        assert "unknown_observation_evidence" in research.coverage.reasons
         # When an independent later generation is added,
         later = _observation_spec(
             workspace, tmp_path / "second.sqlite3", value=50.5, options={"feature_at_us": 40}
@@ -251,6 +255,82 @@ def test_invalid_observation_contracts_fail_before_publication(
         assert (
             workspace.state.execute(
                 "SELECT count(*) FROM dataset_versions WHERE dataset_id='bad'"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_strict_pit_never_selects_reference_observations(tmp_path: Path) -> None:
+    # Given an observation whose knowledge times are fully known, not null.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        spec = _observation_spec(workspace, tmp_path / "known.sqlite3", options={"knowledge": 10})
+        _ = _register_domain(workspace, spec, "observation")
+        series = market_inputs.load_pinned_observations(
+            workspace, _pin(workspace, "known"), budget=BUDGET
+        )
+        # When strict PIT projects well after every stored timestamp,
+        strict = series.project_as_of(30)
+        # Then the always-reference contract selects none of it, and says so.
+        assert strict.rows == ()
+        assert "reference_observation" in strict.coverage.reasons
+        assert strict.coverage.present_count == 0
+        assert strict.coverage.expected_count == 1
+        # Only the explicit research mode projects it.
+        research = series.project_as_of(30, mode="observed_snapshot_research")
+        assert len(research.rows) == 1
+        assert "observed_snapshot_research" in research.coverage.reasons
+
+
+def test_real_value_domain_admits_a_negative_observation(tmp_path: Path) -> None:
+    # Given an additively adjusted series, which legitimately falls below zero.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        spec = _observation_spec(
+            workspace,
+            tmp_path / "real.sqlite3",
+            value=NEGATIVE_OBSERVATION,
+            changes={"value_domain": "real"},
+        )
+        result = _register_domain(workspace, spec, "observation")
+        assert result["certified"] is False
+        assert market.read_generation(workspace.market, "real")[0]["value"] == NEGATIVE_OBSERVATION
+        # The positive domain still refuses the same value.
+        positive = _observation_spec(
+            workspace, tmp_path / "pos.sqlite3", value=NEGATIVE_OBSERVATION
+        )
+        with pytest.raises(ValueError, match="value domain"):
+            _ = _register_domain(workspace, positive, "observation")
+
+
+def test_observation_extension_cannot_switch_contract(tmp_path: Path) -> None:
+    # Given a registered observation generation.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        first = _observation_spec(workspace, tmp_path / "chain.sqlite3")
+        _ = _register_domain(workspace, first, "observation")
+        # When a later generation names it as parent but changes the observed role,
+        later = _observation_spec(
+            workspace,
+            tmp_path / "chain2.sqlite3",
+            options={
+                "role": "open",
+                "feature_at_us": 40,
+                "dataset": {
+                    "dataset_id": "chain",
+                    "version": "2",
+                    "generation_id": "chain2",
+                    "operation_id": "op-chain2",
+                    "parent_id": "chain",
+                },
+            },
+        )
+        # Then the mixed chain is refused before it is published.
+        with pytest.raises(ValueError, match="same contract"):
+            _ = _register_domain(workspace, later, "observation")
+        assert (
+            workspace.state.execute(
+                "SELECT count(*) FROM dataset_versions WHERE dataset_id='chain' AND version='2'"
             ).fetchone()[0]
             == 0
         )
