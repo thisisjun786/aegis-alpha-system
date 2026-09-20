@@ -48,6 +48,16 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   quadratic in the number of chunks a panel was published as.
 - `aas data register-observations --spec <file> --sha256 <digest>` is the CLI
   surface, alongside `register-prices`, `register-sessions` and `register-proxy`.
+- A native route declares the retained transform it was built from in its sealed
+  import document, as the optional `transform_schema` field of
+  `aas-market-import-v1`. That document's SHA-256 is the marker `request_hash` the
+  generation chain covers, so `verify_feature_publications` classifies a committed
+  `feature_values` publication from evidence an edit cannot move, and never from
+  `dataset_versions.transform_hash`: that column is `NOT NULL` for every route, and a
+  generic offline import commits an opaque digest whose preimage it never retained.
+  Discovery starts at the publications rather than the contract table, because a lost
+  contract would otherwise hide a committed generation behind an empty scan while the
+  integrity checks still pass.
 - `market_inputs` reads pinned generations with explicit pins and a caller-owned
   compute budget, replaying the full chain per decision. Strict PIT excludes later
   revisions, unknown knowledge and reference prices; observed snapshot research is
