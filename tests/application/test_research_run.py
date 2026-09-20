@@ -14,6 +14,7 @@ import pytest
 
 from aegis_alpha.application.research_run import (
     EXECUTION_MODE,
+    FILL_CONVENTION,
     RESEARCH_RUN_SCHEMA,
     TIE_RULE,
     ResearchRunError,
@@ -38,9 +39,9 @@ def _provenance(request: object) -> dict[str, object]:
     return json.loads(
         declared_provenance(
             cast("ResearchRunRequest", request),
-            request_hash=DIGEST_A,
             envelope_sha256=DIGEST_B,
-            registered={"initial_cash": 10000.0, "currency": "USD"},
+            engine={"schema": "aas-engine-identity-v1"},
+            environment={"schema": "aas-environment-identity-v1"},
         )
     )
 
@@ -58,6 +59,7 @@ def _pin(generation: str = "obs-synthetic-open", role: str = "open") -> dict[str
 
 def _strategy() -> dict[str, str]:
     return {
+        "strategy_store_id": "synthetic-store",
         "strategy_id": "synthetic-strategy",
         "version": "1",
         "raw_sha256": DIGEST_A,
@@ -87,7 +89,7 @@ def _semantics() -> dict[str, object]:
         "expand": "extended-history-not-used",
         "expand_source": None,
         "rebalance_timing": "previous-month result applied at the following month start",
-        "fill_price": "next-session-open",
+        "fill_price": FILL_CONVENTION,
         "tie_rule": TIE_RULE,
     }
 
@@ -98,10 +100,26 @@ def _body() -> dict[str, object]:
         "execution_mode": EXECUTION_MODE,
         "strategy": _strategy(),
         "observations": [_pin(), _pin("obs-synthetic-close", "close")],
+        "sessions": {
+            "dataset_id": "sessions",
+            "version": "1",
+            "generation_id": "sessions",
+            "chain_hash": DIGEST_C,
+            "manifest_hash": DIGEST_D,
+        },
+        "membership": {
+            "kind": "membership",
+            "id": "synthetic-membership",
+            "version": "1",
+            "hash": DIGEST_A,
+        },
+        "period": {"start": "2026-01-29", "end": "2026-03-30"},
+        "history": {"start": "2025-11-28", "end": "2026-02-26"},
+        "execution": {"cost": 0.0003, "initial_cash": 10000.0},
         "instrument_map": {"aas-obs-1": "SYN1", "aas-obs-2": "SYN2"},
         "conventions": _conventions(),
         "semantics": _semantics(),
-        "unsettled": ["fill_price"],
+        "unsettled": [],
         "uncertainty": ["reference observations, not executable prices"],
     }
 
@@ -127,8 +145,8 @@ def test_the_recorded_sidecar_states_its_own_uncertified_status() -> None:
     assert recorded["point_in_time_certified"] is False
     assert recorded["executable_prices"] is False
     assert recorded["uncertainty"]
-    assert recorded["request_hash"] == DIGEST_A
     assert recorded["envelope_sha256"] == DIGEST_B
+    assert recorded["declaration_sha256"] == request.request_sha256
 
 
 def test_the_declared_knowledge_time_is_an_exact_utc_instant() -> None:
@@ -265,7 +283,9 @@ def test_the_sidecar_records_the_declared_semantics_and_unknown_parity() -> None
     assert recorded["semantics"]["tie_rule"] == TIE_RULE
     assert recorded["semantics"]["data_basis"] == "M"
     assert recorded["semantics"]["source_parity"] == "unknown"
-    assert recorded["unsettled"] == ["fill_price"]
+    assert recorded["unsettled"] == []
+    assert recorded["semantics"]["fill_price"] == FILL_CONVENTION
+    assert recorded["semantics"]["source_parity"] == "unknown"
 
 
 @pytest.mark.parametrize("basis", ["either", "d", "daily", "DM"])
@@ -304,16 +324,95 @@ def test_the_tie_rule_is_fixed_and_cannot_be_renamed() -> None:
         parse_research_run_request(_raw(body))
 
 
-def test_a_run_cannot_present_the_fill_convention_as_settled() -> None:
-    body = _body()
+def _daily(body: dict[str, object]) -> dict[str, object]:
+    """The same declaration on the daily basis, where nothing settled the fill."""
+    body["semantics"] = _semantics() | {"data_basis": "D", "fill_price": "next-session-open"}
+    body["unsettled"] = ["fill_price"]
+    return body
+
+
+def test_a_daily_run_still_cannot_present_the_fill_convention_as_settled() -> None:
+    """R1 resolved the monthly path only. The daily one keeps the question open."""
+    body = _daily(_body())
     body["unsettled"] = []
     with pytest.raises(ResearchRunError, match="unsettled must list: fill_price"):
         parse_research_run_request(_raw(body))
 
 
-@pytest.mark.parametrize("price", ["next-session-close", "vwap", "open"])
-def test_an_unsupported_fill_price_is_refused(price: str) -> None:
+def test_a_daily_run_declares_a_hypothesis_and_records_it_as_open() -> None:
+    request = parse_research_run_request(_raw(_daily(_body())))
+    assert request.semantics.data_basis == "D"
+    assert request.unsettled == ("fill_price",)
+
+
+@pytest.mark.parametrize("price", ["next-session-close", "vwap", "open", FILL_CONVENTION])
+def test_an_unsupported_daily_fill_price_is_refused(price: str) -> None:
+    body = _daily(_body())
+    body["semantics"] = _semantics() | {"data_basis": "D", "fill_price": price}
+    with pytest.raises(ResearchRunError, match="fill_price must be"):
+        parse_research_run_request(_raw(body))
+
+
+@pytest.mark.parametrize("price", ["next-session-open", "decision-close", "vwap"])
+def test_a_monthly_run_must_name_the_adopted_convention(price: str) -> None:
+    """A monthly run that still names a hypothesis is refused, not quietly upgraded."""
     body = _body()
     body["semantics"] = _semantics() | {"fill_price": price}
-    with pytest.raises(ResearchRunError, match="fill_price must be"):
+    with pytest.raises(ResearchRunError, match="must declare fill_price " + FILL_CONVENTION):
+        parse_research_run_request(_raw(body))
+
+
+def test_a_monthly_run_cannot_keep_reporting_the_settled_axis_as_open() -> None:
+    body = _body()
+    body["unsettled"] = ["fill_price"]
+    with pytest.raises(ResearchRunError, match="cannot list fill_price"):
+        parse_research_run_request(_raw(body))
+
+
+@pytest.mark.parametrize(
+    ("terms", "message"),
+    [
+        ({"cost": -0.0001, "initial_cash": 10000.0}, "cost must not be negative"),
+        ({"cost": 0.0003, "initial_cash": 0.0}, "initial_cash must be positive"),
+        ({"cost": 0.0003, "initial_cash": -1.0}, "initial_cash must be positive"),
+        ({"cost": True, "initial_cash": 10000.0}, "cost must be a number"),
+    ],
+)
+def test_execution_terms_are_refused_rather_than_corrected(
+    terms: dict[str, object], message: str
+) -> None:
+    """A run with no account is still a run that produces a number, so it is refused."""
+    body = _body()
+    body["execution"] = terms
+    with pytest.raises(ResearchRunError, match=message):
+        parse_research_run_request(_raw(body))
+
+
+@pytest.mark.parametrize("field", ["period", "history"])
+def test_a_window_that_ends_before_it_starts_is_refused(field: str) -> None:
+    body = _body()
+    body[field] = {"start": "2026-03-30", "end": "2026-01-29"}
+    with pytest.raises(ResearchRunError, match="must not follow its end"):
+        parse_research_run_request(_raw(body))
+
+
+def test_a_membership_of_another_kind_is_refused() -> None:
+    """The reference has to be the ensemble membership, not some other definition."""
+    body = _body()
+    body["membership"] = {
+        "kind": "derived",
+        "id": "synthetic-membership",
+        "version": "1",
+        "hash": DIGEST_A,
+    }
+    with pytest.raises(ResearchRunError, match="membership kind must be membership"):
+        parse_research_run_request(_raw(body))
+
+
+@pytest.mark.parametrize("field", ["sessions", "membership"])
+def test_a_floating_version_is_refused(field: str) -> None:
+    """latest is not a pin: the same declaration would name different bytes over time."""
+    body = _body()
+    body[field] = cast("dict[str, object]", _body()[field]) | {"version": "latest"}
+    with pytest.raises(ResearchRunError, match="must be exact, not latest"):
         parse_research_run_request(_raw(body))

@@ -1212,6 +1212,18 @@ def _target_memberships(
 
 
 @dataclass(frozen=True, slots=True)
+class _Period:
+    """What a preparation asks of the calendar, apart from the sessions themselves."""
+
+    sessions_pin: GenerationPin
+    calendar: Row | None
+    start: date
+    end: date
+    latency: int
+    explicit: tuple[date, ...] | None
+
+
+@dataclass(frozen=True, slots=True)
 class _Plan:
     """The calendar every preparation shares: sessions, the grid, the slots, the period."""
 
@@ -1223,10 +1235,9 @@ class _Plan:
 
 def _plan(
     loader: _Loader,
-    body: Row,
-    calendar: Row,
     definition: ExecutionDefinition,
     visibility: _Visibility,
+    period: _Period,
 ) -> _Plan:
     """Resolve the pinned sessions into a validated schedule and outcome calendar.
 
@@ -1234,22 +1245,23 @@ def _plan(
     calendar to the same checks. Only the price side differs between them, so the
     schedule lives here once rather than as two copies that could drift apart.
     """
-    period = _row(body["period"])
-    sessions_pin = _generation(loader.bindings["sessions", 0])
-    loader.native(sessions_pin, "aas-sessions-transform-v1")
-    sessions = load_pinned_sessions(loader.workspace, sessions_pin, budget=loader.budget).history
+    loader.native(period.sessions_pin, "aas-sessions-transform-v1")
+    sessions = load_pinned_sessions(
+        loader.workspace, period.sessions_pin, budget=loader.budget
+    ).history
+    # A declared run names no calendar convention, so the pinned sessions supply their
+    # own identity rather than a caller asserting one over them.
+    calendar = period.calendar if period.calendar is not None else _session_calendar(sessions)
     schedule = ScheduleRequest(
         definition.calendar,
         _text(calendar["calendar_id"]),
         _text(calendar["venue"]),
         _text(calendar["timezone_version"]),
-        _day(period["start"]),
-        _day(period["end"]),
-        cast("int", body["decision_latency_us"]),
+        period.start,
+        period.end,
+        period.latency,
         visibility.ceiling,
-        None
-        if body["explicit_decision_dates"] is None
-        else tuple(_day(day) for day in cast("tuple[str, ...]", body["explicit_decision_dates"])),
+        period.explicit,
     )
     grid = _sessions(sessions, visibility, visibility.ceiling)
     slots = _schedule(sessions, visibility, schedule)
@@ -1271,6 +1283,18 @@ def _plan(
     decision_slots(grid, request=replace(schedule, explicit_decision_dates=()))
     _complete_calendar(grid, visibility.history_start, schedule.period_end)
     return _Plan(sessions, grid, slots, dates)
+
+
+def _session_calendar(sessions: History) -> Row:
+    """Take the calendar from the registered sessions generation, never from prose."""
+    named = {
+        tuple(_text(row[key]) for key in ("calendar_id", "venue", "timezone_version"))
+        for row in sessions
+    }
+    if len(named) != 1:
+        raise ValueError("the pinned sessions generation names more than one calendar")
+    calendar_id, venue, timezone_version = next(iter(named))
+    return {"calendar_id": calendar_id, "venue": venue, "timezone_version": timezone_version}
 
 
 def prepare_backtest(
@@ -1316,7 +1340,24 @@ def prepare_backtest(
         _day(history["end"]),
     )
     loader = _Loader(workspace, budget, bindings)
-    plan = _plan(loader, body, calendar, definition, visibility)
+    period = _row(body["period"])
+    plan = _plan(
+        loader,
+        definition,
+        visibility,
+        _Period(
+            _generation(bindings["sessions", 0]),
+            calendar,
+            _day(period["start"]),
+            _day(period["end"]),
+            cast("int", body["decision_latency_us"]),
+            None
+            if body["explicit_decision_dates"] is None
+            else tuple(
+                _day(day) for day in cast("tuple[str, ...]", body["explicit_decision_dates"])
+            ),
+        ),
+    )
     slots, dates = plan.slots, plan.dates
     membership = _membership(loader, bundle)
     prices = _prices(loader, body, calendar, plan.sessions)
@@ -1380,24 +1421,43 @@ def prepare_backtest(
     )
 
 
+# A declared run is named by its own content, so two identical declarations over one
+# installation name one run rather than looking like two results.
+RESEARCH_RUN_ID_SCHEMA = "aas-research-run-id-v1"
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedResearchRun:
-    """A declared uncertified research run, prepared and not yet recorded."""
+    """A declared uncertified research run: its decisions, its envelope, its declaration."""
 
     declaration: ResearchRunRequest
-    request: PrepareRequest
     definition: ExecutionDefinition
     slots: tuple[DecisionSlot, ...]
     decisions: tuple[ReplayReceipt, ...]
     inputs: EnvelopeInputs
-    projection: RequestProjection
     envelope: EnvelopeExport
     provenance: bytes
     certified: bool = field(default=False, init=False)
 
     @property
-    def request_hash(self) -> str:
-        return self.projection.request_hash
+    def run_id(self) -> str:
+        """The run's own content, not a fresh name.
+
+        A generated identifier would make two identical runs look like two results. This
+        one is derived from the declaration, the envelope it produced and the sealed
+        provenance, so the same declaration over the same installation always names the
+        same run, and any change to inputs, conventions or engine identity names a
+        different one. That is what makes a requery meaningful without a run record.
+        """
+        return "research-" + content_sha256(
+            {
+                "schema": RESEARCH_RUN_ID_SCHEMA,
+                "hash_format": _J,
+                "declaration_sha256": self.declaration.request_sha256,
+                "envelope_sha256": self.envelope.envelope_sha256,
+                "provenance_sha256": hashlib.sha256(self.provenance).hexdigest(),
+            }
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1415,46 +1475,13 @@ class _Observed:
     known_us: Mapping[str, Mapping[date, int]]
 
 
-def _require_declaration(body: Row, strategy: StrategyPin, declaration: ResearchRunRequest) -> None:
-    """Hold the declaration and the registered request to the same facts.
-
-    Every check here compares two documents the caller wrote separately. A declaration
-    that disagrees with the request it accompanies would make the stored sidecar
-    describe a calculation the run did not perform, which is the one failure this whole
-    path exists to prevent.
-    """
-    cutoff = _row(body["cutoff"])
-    if cutoff["mode"] != "observed_snapshot_research":
-        # Strict PIT selects nothing from rows without knowledge times, so a request
-        # asking for it would record an empty run rather than refuse one.
-        raise ValueError("a declared research run requires the observed_snapshot_research cutoff")
-    if cutoff["knowledge_cutoff_us"] != declaration.conventions.knowledge_time_us:
-        raise ValueError("declared knowledge_time is not the registered knowledge cutoff")
-    if _text(_row(body["account"])["currency"]) != declaration.conventions.currency:
-        raise ValueError("declared currency is not the registered account currency")
-    if any(
-        _text(selection["price_role"]) != "reference" for selection in _rows(body["price_inputs"])
-    ):
-        # A canonical price input belongs to the strict path, which admits it through
-        # the native price transform this path never calls.
-        raise ValueError("a declared research run admits only reference price inputs")
-    if any(body[field] for field in ("macro_inputs", "derived_inputs", "proxy_rules")):
-        # The observation panel supplies none of these, so a request naming one would
-        # reach the engine short of an input it was told to expect.
-        raise ValueError("a declared research run supplies no macro, derived or proxy inputs")
-    declared = (
-        strategy.strategy_id,
-        strategy.version,
-        strategy.raw_sha256,
-        strategy.contract_sha256,
+def _declared_pin(reference: object) -> GenerationPin:
+    return GenerationPin(
+        *(
+            getattr(reference, name)
+            for name in ("dataset_id", "version", "generation_id", "chain_hash", "manifest_hash")
+        )
     )
-    if declared != (
-        declaration.strategy_id,
-        declaration.strategy_version,
-        declaration.strategy_raw_sha256,
-        declaration.strategy_contract_sha256,
-    ):
-        raise ValueError("declared strategy pin is not the registered strategy pin")
 
 
 def _mapped_panel(
@@ -1479,48 +1506,68 @@ def _mapped_panel(
         if session in values.setdefault(instrument, {}):
             raise ValueError("observation panel repeats one session for " + instrument)
         values[instrument][session] = _number(row["value"])
-        # No knowledge time is manufactured: the panel carries none, so the row's own
-        # economic session stands and the declaration records that as uncertified.
+        # No knowledge time is manufactured: the panel carries none, so each row's own
+        # economic session stands and the declaration records that axis as uncertified.
         observed.setdefault(instrument, {})[session] = visibility.observed(row, session)
         known.setdefault(instrument, {})[session] = at_us
     return _Observed(role, values, observed, known)
 
 
 def _observation_panels(
-    loader: _Loader, body: Row, declaration: ResearchRunRequest, visibility: _Visibility
+    loader: _Loader, declaration: ResearchRunRequest, visibility: _Visibility
 ) -> dict[str, _Observed]:
-    """Read every bound observation generation through its own uncertified reader."""
-    declared = {
-        (pin.dataset_id, pin.version, pin.generation_id, pin.chain_hash, pin.manifest_hash): pin
-        for pin in declaration.observations
-    }
+    """Read every declared observation generation through its own uncertified reader."""
     loaded: dict[str, _Observed] = {}
-    bound: set[tuple[str, ...]] = set()
-    for selection in _rows(body["price_inputs"]):
-        pin = _generation(_selection_ref(selection, loader.bindings))
-        key = (pin.dataset_id, pin.version, pin.generation_id, pin.chain_hash, pin.manifest_hash)
-        if key not in declared:
-            raise ValueError("price input binds a generation the declaration does not pin")
-        bound.add(key)
-        if pin.generation_id in loaded:
-            continue
+    for declared in declaration.observations:
+        pin = _declared_pin(declared)
         series = load_pinned_observations(loader.workspace, pin, budget=loader.budget)
         contract = _row(decode_json(series.definition.encode()))
         role = _text(contract["observation_role"])
-        if role != declared[key].observation_role:
+        if role != declared.observation_role:
             raise ValueError("observation role disagrees with the declared pin")
         if (contract["price_role"], contract["certified"]) != ("reference", False):
+            # A certified or canonical series belongs on the strict path, which admits
+            # it through the native price transform this preparation never calls.
             raise ValueError("a research run admits only uncertified reference observations")
+        if _text(contract["currency"]) != declaration.conventions.currency:
+            raise ValueError("observation currency is not the declared account currency")
         loader.retain(pin.generation_id, series.history)
-        loaded[pin.generation_id] = _mapped_panel(series, declaration, visibility, role)
-    if bound != set(declared):
-        raise ValueError("declaration pins an observation the request does not bind")
-    panels = {panel.role: panel for panel in loaded.values()}
-    if sorted(panels) != ["close", "open"]:
+        if role in loaded:
+            raise ValueError("two declared observations carry the same role")
+        loaded[role] = _mapped_panel(series, declaration, visibility, role)
+    if sorted(loaded) != ["close", "open"]:
         # Signals read the close panel and fills read the open one. Without both, the
         # accounting would have to reuse one for the other and call it an execution.
         raise ValueError("a declared research run needs one open and one close panel")
-    return panels
+    return loaded
+
+
+def _research_membership(
+    loader: _Loader, declaration: ResearchRunRequest, bundle: EngineBundle
+) -> EnsembleMembership:
+    """Resolve the membership the strategy's own contract already names."""
+    reference = declaration.membership
+    raw = read_definition(
+        loader.workspace,
+        DefinitionPin(reference.kind, reference.id, reference.version, reference.hash),
+        budget=loader.budget,
+    )
+    body = _row(decode_json(raw))
+    membership = EnsembleMembership(
+        tuple(
+            MembershipRow(_text(row["name"]), Decimal(_text(row["weight"])))
+            for row in _rows(body["rows"])
+        ),
+        _text(body["membership_sha256"]),
+    )
+    if {row.name for row in membership.rows} != {
+        strategy.name for strategy in bundle.contract.pack
+    }:
+        raise ValueError("ensemble membership must name the exact strategy pack")
+    if bundle.contract.ensemble_membership_reference != "ensemble:" + membership.membership_sha256:
+        raise ValueError("ensemble membership digest disagrees with strategy")
+    loader.retain("membership:" + reference.id, body)
+    return membership
 
 
 def _research_decisions(
@@ -1588,67 +1635,86 @@ def _research_targets(
     return MappingProxyType(result)
 
 
+def _research_envelope(declaration: ResearchRunRequest, inputs: EnvelopeInputs) -> EnvelopeExport:
+    """Write the accounting envelope directly, because no executable request can hold it.
+
+    An aas-backtest-request-v1 refuses to name a reference series as an execution input,
+    which is correct and stays that way. The declaration is what stands behind these
+    bytes instead, and the sealed provenance says so.
+    """
+    document = {
+        "schema_version": "aas-etf-backtest-v1",
+        "module": "aegis",
+        "instrument_types": dict(sorted(inputs.instrument_types.items())),
+        "dates": [day.isoformat() for day in inputs.dates],
+        "opens": [dict(sorted(row.items())) for row in inputs.opens],
+        "closes": [dict(sorted(row.items())) for row in inputs.closes],
+        "targets": {
+            day.isoformat(): dict(sorted(weights.items()))
+            for day, weights in sorted(inputs.targets.items())
+        },
+        "initial_cash": declaration.execution.initial_cash,
+        "cost": declaration.execution.cost,
+        "source_pins": [],
+        "research_mode": "observed_etf_research",
+    }
+    raw = canonical_json_bytes(document)
+    return EnvelopeExport(raw, hashlib.sha256(raw).hexdigest())
+
+
 def prepare_research_run(
-    workspace: Workspace,
-    request: PrepareRequest,
-    declaration: ResearchRunRequest,
-    *,
-    budget: ComputeBudget,
+    workspace: Workspace, declaration: ResearchRunRequest, *, budget: ComputeBudget
 ) -> PreparedResearchRun:
     """Prepare one declared uncertified research run over pinned observations.
 
-    This is the opt-in counterpart of prepare_backtest, and it is opt-in in the only
-    way that matters: it is a separate entry point. Nothing it does makes the strict
-    path admit an observation. admit_native_input still refuses the observation
-    transform, the price reader still refuses the pin for domain, and
-    _reject_observation_contract still closes the derived route. This function calls
-    none of them, reading the panel through load_pinned_observations instead, which is
-    the reader that was written for reference data and returns nothing under strict PIT.
+    This is the opt-in counterpart of prepare_backtest, and it is opt-in in the only way
+    that matters: it is a separate entry point the executable path never reaches.
+    admit_native_input still refuses the observation transform, the price reader still
+    refuses the pin for domain, and _reject_observation_contract still closes the derived
+    route. None of them is called here. The panel is read through
+    load_pinned_observations, the reader written for reference data, which returns
+    nothing at all under strict PIT.
 
-    What makes the result legible rather than eligible is the declaration. The caller
-    writes down the conventions the strict path would otherwise take from a certified
-    source, and every one of them is checked against the registered request rather than
-    believed. Does not install schemas, register requests, execute accounting, record a
-    run, fabricate a price, a knowledge time or a session, or certify anything.
+    The declaration is the whole provenance. An aas-backtest-request-v1 cannot describe
+    this run, because that contract requires execution prices to be canonical and
+    unadjusted and a reference observation is neither, so nothing here pretends one
+    stands behind it. Does not register a request, record a run, install a schema,
+    execute accounting, or fabricate a price, a knowledge time or a session.
     """
-    body = _row(request.parsed.document)
-    _require_declaration(body, request.strategy, declaration)
     engine, environment = calculation_identity(), environment_identity()
-    bundle, definition = _stored_strategy(workspace, request.strategy)
-    bindings = _bindings(body)
-    conventions = read_execution_conventions(
-        workspace.state,
-        tuple(
-            _convention(ref)
-            for ref in _rows(body["refs"])
-            if _text(ref["ref_kind"]).startswith("convention:")
+    bundle, definition = _stored_strategy(
+        workspace,
+        StrategyPin(
+            declaration.strategy_store_id,
+            declaration.strategy_id,
+            declaration.strategy_version,
+            declaration.strategy_raw_sha256,
+            declaration.strategy_contract_sha256,
         ),
-        definition=definition,
     )
-    projection = request_projection(
-        request.parsed,
-        definition=definition,
-        convention_documents=conventions,
-        engine_identity=engine,
-        environment_identity=environment,
-    )
-    calendar = next(
-        _row(_row(decode_json(raw))["payload"])
-        for raw in conventions
-        if _row(decode_json(raw))["kind"] == "calendar"
-    )
-    cutoff, history = (_row(body[key]) for key in ("cutoff", "history"))
     visibility = _Visibility(
-        cast("ReaderMode", cutoff["mode"]),
-        cast("int", cutoff["knowledge_cutoff_us"]),
-        cast("int | None", cutoff["ingestion_cutoff_us"]),
-        _day(history["start"]),
-        _day(history["end"]),
+        "observed_snapshot_research",
+        declaration.conventions.knowledge_time_us,
+        None,
+        declaration.history.start,
+        declaration.history.end,
     )
-    loader = _Loader(workspace, budget, bindings)
-    plan = _plan(loader, body, calendar, definition, visibility)
-    membership = _membership(loader, bundle)
-    panels = _observation_panels(loader, body, declaration, visibility)
+    loader = _Loader(workspace, budget, {})
+    plan = _plan(
+        loader,
+        definition,
+        visibility,
+        _Period(
+            _declared_pin(declaration.sessions),
+            None,
+            declaration.period.start,
+            declaration.period.end,
+            0,
+            None,
+        ),
+    )
+    membership = _research_membership(loader, declaration, bundle)
+    panels = _observation_panels(loader, declaration, visibility)
     decisions = _research_decisions(
         bundle, definition, plan.slots, visibility, (membership, panels)
     )
@@ -1658,47 +1724,21 @@ def prepare_research_run(
         opening,
         closing,
         {receipt.as_of: _research_targets(receipt, definition) for receipt in decisions},
-        _instrument_types(workspace, sorted(declaration.instrument_map.values())),
+        _instrument_types(workspace, sorted(set(declaration.instrument_map.values()))),
         (),
     )
-    envelope = export_envelope(request.parsed, projection=projection, inputs=inputs)
+    envelope = _research_envelope(declaration, inputs)
     if environment_identity() != environment:
         raise ValueError("calculation context changed during preparation")
     provenance = declared_provenance(
         declaration,
-        request_hash=projection.request_hash,
         envelope_sha256=envelope.envelope_sha256,
-        registered=_registered(body, projection),
+        engine=engine,
+        environment=environment,
     )
     return PreparedResearchRun(
-        declaration,
-        request,
-        definition,
-        plan.slots,
-        decisions,
-        inputs,
-        projection,
-        envelope,
-        provenance,
+        declaration, definition, plan.slots, decisions, inputs, envelope, provenance
     )
-
-
-def _registered(body: Row, projection: RequestProjection) -> Mapping[str, object]:
-    """The numbers the run actually used, beside the prose that declared them.
-
-    A declaration is text and text cannot be recomputed. Recording the registered
-    values next to it means a later reader can check the run against its own request
-    without having to interpret a sentence.
-    """
-    account, period = _row(body["account"]), _row(body["period"])
-    return {
-        "initial_cash": account["initial_cash"],
-        "currency": _text(account["currency"]),
-        "execution_cost": projection.execution_cost,
-        "period": {"start": _text(period["start"]), "end": _text(period["end"])},
-        "knowledge_cutoff_us": _row(body["cutoff"])["knowledge_cutoff_us"],
-        "cutoff_mode": _text(_row(body["cutoff"])["mode"]),
-    }
 
 
 def _decisions(
