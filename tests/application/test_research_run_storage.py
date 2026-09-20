@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
-from aegis_alpha.application.backtest_cli import run_document
+from aegis_alpha.application.backtest_cli import DECLARED_RESEARCH_MODE, run_document
 from aegis_alpha.application.backtest_prepare import PreparedResearchRun, prepare_research_run
 from aegis_alpha.application.research_run import (
     PREPARED_SCHEMA,
@@ -392,6 +392,63 @@ def test_the_stored_run_does_not_make_its_observations_executable(
 def _stored_result(home: Path, run_id: str) -> bytes:
     with open_workspace(home) as workspace:
         return _read_sealed(workspace, run_id, "backtest.json")
+
+
+# What the runner stamps on a declared result. A later reader has to be able to take
+# these at face value, which is what makes them worth checking through storage rather
+# than only where they are produced.
+DECLARED_STATUS = {"certified": False, "non_executable": True, "executable_prices": False}
+
+
+def test_the_declared_status_survives_recording_requery_and_restore(
+    research: tuple[Path, Document, Document], tmp_path: Path
+) -> None:
+    """The runner says this run is uncertified; storage has to keep saying it.
+
+    Checked on the produced response, on the sealed artifact read back through the run
+    record, and on the same artifact after a restore into a new root. The caller's own
+    copy is never the evidence: each read comes from what storage actually holds.
+    """
+    home, _body, declaration = research
+    migrated(home)
+    prepared = prepare(home, declaration)
+    produced = run_document(prepared.envelope.canonical_bytes, prepared.envelope.envelope_sha256)
+    assert produced["research_mode"] == DECLARED_RESEARCH_MODE
+    assert {key: produced[key] for key in DECLARED_STATUS} == DECLARED_STATUS
+    record(home, prepared, declaration)
+    sealed = cast("Document", json.loads(_stored_result(home, prepared.run_id)))
+    assert {key: sealed[key] for key in DECLARED_STATUS} == DECLARED_STATUS
+    assert read(home, prepared.run_id)["research_only"] is True
+    _ = backup(home, tmp_path / "status-backup", budget=BUDGET)
+    restored = tmp_path / "status-restored"
+    _ = restore(tmp_path / "status-backup", restored, budget=BUDGET)
+    assert cast("Document", json.loads(_stored_result(restored, prepared.run_id))) == sealed
+    assert read(restored, prepared.run_id)["request_schema"] == RESEARCH_RUN_SCHEMA
+
+
+def test_a_flipped_uncertified_claim_stops_the_run_reading_back(
+    research: tuple[Path, Document, Document],
+) -> None:
+    """The claim is covered by the recorded result identity, not just written beside it.
+
+    Carrying the words is not enough: an edited artifact that still reads as valid JSON
+    and still names the right envelope must stop verifying, or a stored run could report
+    itself executable and every later check would agree.
+    """
+    home, _body, declaration = research
+    migrated(home)
+    prepared = prepare(home, declaration)
+    record(home, prepared, declaration)
+    with open_workspace(home) as workspace:
+        artifact = workspace.paths.runs / prepared.run_id / "backtest.json"
+    claimed = cast("Document", json.loads(artifact.read_bytes())) | {"non_executable": False}
+    # Rewritten canonically, so what fails is the changed claim rather than its spelling.
+    _ = artifact.write_bytes(canonical_json_bytes(claimed))
+    with (
+        open_workspace(home) as workspace,
+        pytest.raises(RunStorageError, match=r"disagrees with the sealed evidence"),
+    ):
+        _ = read_run(workspace, prepared.run_id, budget=BUDGET)
 
 
 @pytest.mark.parametrize(
