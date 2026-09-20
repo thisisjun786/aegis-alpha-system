@@ -259,7 +259,7 @@ def test_the_switch_moves_decisions_between_the_two_sleeves(
     """
     home, base, offense, defense = composed
     prepared = _prepared_composition(home, _composition(base, offense, defense))
-    roles = [decision.sleeve.role for decision in prepared.decisions]
+    roles = list(prepared.sleeve_roles)
     assert set(roles) == {"offense", "defense"}
     block = cast("Document", json.loads(prepared.provenance)["composition"])
     assert block["switch"] == SWITCH_RULE
@@ -267,9 +267,9 @@ def test_the_switch_moves_decisions_between_the_two_sleeves(
     # The sealed record names the dates the defensive sleeve supplied, so it can be held
     # against the envelope's own targets rather than merely counted.
     defensive = [
-        decision.receipt.as_of.isoformat()
-        for decision in prepared.decisions
-        if decision.sleeve.role == "defense"
+        receipt.as_of.isoformat()
+        for receipt, role in zip(prepared.decisions, prepared.sleeve_roles, strict=True)
+        if role == "defense"
     ]
     assert cast("list[str]", block["defensive_decisions"]) == defensive
     targets = cast("Document", json.loads(prepared.envelope.canonical_bytes)["targets"])
@@ -293,7 +293,7 @@ def test_a_composition_that_never_switches_still_records_that_honestly(
         "period": {"start": DAYS[2].isoformat(), "end": DAYS[4].isoformat()},
     }
     prepared = _prepared_composition(home, _composition(narrow, offense, defense))
-    assert {decision.sleeve.role for decision in prepared.decisions} == {"offense"}
+    assert set(prepared.sleeve_roles) == {"offense"}
     block = cast("Document", json.loads(prepared.provenance)["composition"])
     assert block["defensive_decisions"] == []
     assert block["defensive_decision_count"] == 0
@@ -391,3 +391,110 @@ def test_the_composition_schema_and_the_run_schema_do_not_admit_each_other(
     versioned = body | {"schema_version": "aas-research-run-v2"}
     with pytest.raises(ResearchRunError, match="is not " + RESEARCH_COMPOSITION_SCHEMA):
         parse_research_composition_request(canonical_json_bytes(versioned))
+
+
+def test_a_sleeve_run_still_hands_back_replay_receipts(
+    composed: tuple[Path, Document, Document, Document],
+) -> None:
+    """Composition did not change what an ordinary run returns.
+
+    PreparedResearchRun is exported, so a consumer reading a decision's own fields kept
+    working: the sleeve that supplied each decision is recorded beside the receipts
+    rather than wrapped around them.
+    """
+    home, base, offense, _defense = composed
+    prepared = _prepared(home, _as_sleeve_run(base, offense))
+    assert prepared.decisions
+    assert all(receipt.as_of is not None for receipt in prepared.decisions)
+    assert all(receipt.ensemble is not None for receipt in prepared.decisions)
+    assert set(prepared.sleeve_roles) == {"offense"}
+    assert len(prepared.sleeve_roles) == len(prepared.decisions)
+
+
+def _two_member_defense() -> tuple[bytes, Document]:
+    """A defensive bundle whose second pack member carries the canary."""
+    quiet, loud = _record("syn-pair-a", ["REF_X"], []), _record("syn-pair-b", ["REF_X"], [CANARY])
+    rows = (
+        MembershipRow("syn-pair-a", Decimal("0.5")),
+        MembershipRow("syn-pair-b", Decimal("0.5")),
+    )
+    digest = membership_hash(rows)
+    contract = EngineContract(
+        contract_version=ENGINE_CONTRACT_VERSION_V1,
+        pack=(quiet, loud),
+        feature_matrix=FeatureMatrixSpec(
+            momentum_scores=(),
+            moving_average_months=(),
+            ma_window_includes_current_month=True,
+            return_months=(2,),
+            includes_latest_price=True,
+        ),
+        macro_signals=(),
+        calendar=CalendarConventions(
+            "calendar_month_end",
+            "prior_calendar_month_end",
+            1,
+            3,
+            "synthetic",
+            "synthetic",
+            "synthetic",
+            "synthetic",
+        ),
+        stale_gates=StaleGateSpec(50, 50),
+        ensemble_membership_reference="ensemble:" + digest,
+        derived_series=(),
+    )
+    raw = canonical_json_bytes(
+        {
+            "schema_version": ENGINE_BUNDLE_SCHEMA_V1,
+            "bundle_id": "syn-defense-pair",
+            "bundle_version": "1",
+            "contract": contract,
+        }
+    )
+    member = {
+        "schema": "aas-ensemble-membership-v1",
+        "hash_format": J,
+        "id": "syn-defense-pair-membership",
+        "version": "1",
+        "membership_sha256": digest,
+        "rows": [{"name": "syn-pair-a", "weight": "0.5"}, {"name": "syn-pair-b", "weight": "0.5"}],
+    }
+    return raw, member
+
+
+def test_a_later_pack_member_with_a_canary_is_refused(
+    composed: tuple[Path, Document, Document, Document], tmp_path: Path
+) -> None:
+    """replay evaluates every pack member, so the guard reads every pack member.
+
+    Reading only the first would let a defensive sleeve carry a canary on its second
+    strategy and switch inside the branch this contract says has no switch.
+    """
+    home, base, offense, _defense = composed
+    raw, member = _two_member_defense()
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        recursive = _register(workspace, tmp_path, "syn-defense-pair", raw, member)
+        workspace.state.commit()
+        assert workspace.strategies is not None
+        workspace.strategies.commit()
+    _refused(home, _composition(base, offense, recursive), "declares its own canary")
+
+
+def test_two_pinned_versions_of_one_strategy_compose(
+    composed: tuple[Path, Document, Document, Document],
+) -> None:
+    """Distinctness is the whole pin, not the identifier.
+
+    Two versions of one strategy are different bundles, so composing them is a
+    legitimate declaration. Only the very same pin twice is a switch that could never
+    change anything, and that is what the contract refuses.
+    """
+    _home, base, offense, defense = composed
+    same_id = cast("Document", json.loads(json.dumps(defense)))
+    same_id["strategy_id"] = offense["strategy_id"]
+    parsed = parse_research_composition_request(
+        canonical_json_bytes(_composition(base, offense, same_id))
+    )
+    assert parsed.composition is not None
+    assert parsed.composition.defense.strategy_id == offense["strategy_id"]

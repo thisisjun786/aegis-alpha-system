@@ -1467,7 +1467,10 @@ class PreparedResearchRun:
     declaration: ResearchRunRequest
     definition: ExecutionDefinition
     slots: tuple[DecisionSlot, ...]
-    decisions: tuple[ResearchDecision, ...]
+    decisions: tuple[ReplayReceipt, ...]
+    # Which sleeve supplied each decision, positionally against decisions. A sleeve run
+    # is all offense; only a composition ever reads defense here.
+    sleeve_roles: tuple[str, ...]
     inputs: EnvelopeInputs
     envelope: EnvelopeExport
     provenance: bytes
@@ -1711,11 +1714,14 @@ def _require_composable(offense: _Sleeve, defense: _Sleeve) -> None:
     this contract names one switch. Two sleeves evaluated on different calendar
     conventions would also be two different runs reported as one, so they have to agree.
     """
-    declared_canary = defense.bundle.contract.pack[0].canary_config.get("assets", ())
-    if not isinstance(declared_canary, (list, tuple)) or declared_canary:
-        raise ValueError(
-            "the defensive sleeve declares its own canary; this composition names one switch"
-        )
+    # Every pack member, not the first: replay evaluates all of them, so a canary on a
+    # later strategy would fire inside the defensive sleeve just the same.
+    for strategy in defense.bundle.contract.pack:
+        declared_canary = strategy.canary_config.get("assets", ())
+        if not isinstance(declared_canary, (list, tuple)) or declared_canary:
+            raise ValueError(
+                "the defensive sleeve declares its own canary; this composition names one switch"
+            )
     if canonical_json_bytes(offense.definition.calendar) != canonical_json_bytes(
         defense.definition.calendar
     ):
@@ -2061,7 +2067,14 @@ def prepare_research_run(
         ),
     )
     return PreparedResearchRun(
-        declaration, sleeves[0].definition, plan.slots, decisions, inputs, envelope, provenance
+        declaration,
+        sleeves[0].definition,
+        plan.slots,
+        tuple(decision.receipt for decision in decisions),
+        tuple(decision.sleeve.role for decision in decisions),
+        inputs,
+        envelope,
+        provenance,
     )
 
 

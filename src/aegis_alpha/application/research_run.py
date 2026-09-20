@@ -626,9 +626,11 @@ def parse_research_composition_request(raw: bytes) -> ResearchRunRequest:
         raise ResearchRunError("composition switch must be " + SWITCH_RULE)
     sleeves = _object(block["sleeves"], "composition sleeves", _SLEEVES)
     offense, defense = (_sleeve(sleeves[role], role) for role in ("offense", "defense"))
-    if offense.strategy_id == defense.strategy_id:
-        # One sleeve named twice would compose a sample out of a single strategy and
-        # report a switch that could never change the outcome.
+    if offense == defense:
+        # The same pin twice would report a switch that could never change the outcome.
+        # Compared on the whole pin rather than the identifier, because two pinned
+        # versions of one strategy are genuinely different bundles and composing them is
+        # a legitimate thing to declare.
         raise ResearchRunError("a composition needs two distinct sleeves")
     composition = Composition(
         _text(block["sample_id"], "composition sample_id"), SWITCH_RULE, defense
