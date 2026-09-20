@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -35,7 +36,7 @@ from aegis_alpha.storage.backtest_requests import (
 from aegis_alpha.storage.backup import backup, restore
 from aegis_alpha.storage.input_pins import BUNDLE_SCHEMA, HASH_FORMAT, register_input_bundle
 from aegis_alpha.storage.market_inputs import GenerationPin, admit_native_input
-from aegis_alpha.storage.run_schema import migrate_run_schema
+from aegis_alpha.storage.run_schema import RESEARCH_REQUEST_SCHEMA, migrate_run_schema
 from aegis_alpha.storage.runs import (
     RunIntent,
     RunResult,
@@ -48,7 +49,7 @@ from aegis_alpha.storage.runs import (
     read_run,
 )
 from aegis_alpha.storage.verification import verify_workspace
-from aegis_alpha.storage.workspace import open_workspace
+from aegis_alpha.storage.workspace import Workspace, open_workspace
 from tests.application.test_backtest_prepare import BUDGET
 from tests.application.test_research_execution import (  # noqa: F401 -- shared fixtures
     SERIES,
@@ -113,43 +114,53 @@ def strategy_pin(prepared: PreparedResearchRun) -> RunStrategyPin:
     )
 
 
+def register_declared(
+    workspace: Workspace, prepared: PreparedResearchRun, declaration: Document
+) -> str:
+    """Put the declaration's bundle and the declaration itself into the request store."""
+    bundle_raw = bundle_bytes(declaration)
+    bundle = register_input_bundle(
+        workspace,
+        bundle_raw,
+        expected_file_sha256=hashlib.sha256(bundle_raw).hexdigest(),
+        budget=BUDGET,
+    )
+    _ = register_backtest_request(
+        workspace,
+        bundle,
+        canonical_json_bytes(declaration),
+        expected_request_hash=prepared.declaration.request_sha256,
+        budget=BUDGET,
+    )
+    return bundle.bundle_id
+
+
+def declared_intent(prepared: PreparedResearchRun, bundle_id: str) -> RunIntent:
+    """The intent a declared run opens under; its identities come from the preparation.
+
+    The declaration names neither an engine nor an environment, because no certified
+    request stands behind it, so both are read from the document it sealed.
+    """
+    sealed = cast("Document", json.loads(prepared.provenance))
+    return RunIntent(
+        request_hash=prepared.declaration.request_sha256,
+        bundle_id=bundle_id,
+        engine_hash=content_sha256(cast("Document", sealed["engine"])),
+        environment_hash=content_sha256(cast("Document", sealed["environment"])),
+        reason="declared uncertified research run",
+        envelope_bytes=prepared.envelope.canonical_bytes,
+        preparation_bytes=prepared.provenance,
+        strategy_pins=(strategy_pin(prepared),),
+        run_id=prepared.run_id,
+    )
+
+
 def record(home: Path, prepared: PreparedResearchRun, declaration: Document) -> dict[str, object]:
     """Register the declaration, open the run against its sealed inputs, commit the result."""
-    raw = canonical_json_bytes(declaration)
-    sealed = cast("Document", json.loads(prepared.provenance))
-    bundle_raw = bundle_bytes(declaration)
     result = run_document(prepared.envelope.canonical_bytes, prepared.envelope.envelope_sha256)
     with open_workspace(home, writable=True) as workspace:
-        bundle = register_input_bundle(
-            workspace,
-            bundle_raw,
-            expected_file_sha256=hashlib.sha256(bundle_raw).hexdigest(),
-            budget=BUDGET,
-        )
-        register_backtest_request(
-            workspace,
-            bundle,
-            raw,
-            expected_request_hash=prepared.declaration.request_sha256,
-            budget=BUDGET,
-        )
-        handle = open_run(
-            workspace,
-            RunIntent(
-                request_hash=prepared.declaration.request_sha256,
-                bundle_id=bundle.bundle_id,
-                # The declaration names neither, because no certified request stands
-                # behind it. Both come from the preparation it sealed.
-                engine_hash=content_sha256(cast("Document", sealed["engine"])),
-                environment_hash=content_sha256(cast("Document", sealed["environment"])),
-                reason="declared uncertified research run",
-                envelope_bytes=prepared.envelope.canonical_bytes,
-                preparation_bytes=prepared.provenance,
-                strategy_pins=(strategy_pin(prepared),),
-                run_id=prepared.run_id,
-            ),
-            budget=BUDGET,
-        )
+        bundle_id = register_declared(workspace, prepared, declaration)
+        handle = open_run(workspace, declared_intent(prepared, bundle_id), budget=BUDGET)
         return commit_run(workspace, handle, RunResult(canonical_json_bytes(result)), budget=BUDGET)
 
 
@@ -426,14 +437,15 @@ def test_the_declared_status_survives_recording_requery_and_restore(
     assert read(restored, prepared.run_id)["request_schema"] == RESEARCH_RUN_SCHEMA
 
 
-def test_a_flipped_uncertified_claim_stops_the_run_reading_back(
+def test_an_edited_result_stops_the_run_reading_back(
     research: tuple[Path, Document, Document],
 ) -> None:
-    """The claim is covered by the recorded result identity, not just written beside it.
+    """The stored result is bound twice: by what it may claim, and by its own identity.
 
-    Carrying the words is not enough: an edited artifact that still reads as valid JSON
-    and still names the right envelope must stop verifying, or a stored run could report
-    itself executable and every later check would agree.
+    A flipped status claim is refused by the declared-run rule; an edit those rules say
+    nothing about is refused by the recorded result identity. Carrying the words is not
+    enough on its own, so both are exercised, and restoring the sealed bytes restores the
+    run, which shows the refusal was about the content rather than a latch that stays shut.
     """
     home, _body, declaration = research
     migrated(home)
@@ -441,14 +453,104 @@ def test_a_flipped_uncertified_claim_stops_the_run_reading_back(
     record(home, prepared, declaration)
     with open_workspace(home) as workspace:
         artifact = workspace.paths.runs / prepared.run_id / "backtest.json"
-    claimed = cast("Document", json.loads(artifact.read_bytes())) | {"non_executable": False}
-    # Rewritten canonically, so what fails is the changed claim rather than its spelling.
-    _ = artifact.write_bytes(canonical_json_bytes(claimed))
-    with (
-        open_workspace(home) as workspace,
-        pytest.raises(RunStorageError, match=r"disagrees with the sealed evidence"),
+    original = artifact.read_bytes()
+    sealed = cast("Document", json.loads(original))
+    for edit, refusal in (
+        ({"non_executable": False}, r"uncertified status"),
+        ({"live_orders": True}, r"disagrees with the sealed evidence"),
     ):
-        _ = read_run(workspace, prepared.run_id, budget=BUDGET)
+        # Rewritten canonically, so what fails is the change rather than its spelling.
+        _ = artifact.write_bytes(canonical_json_bytes(sealed | edit))
+        with (
+            open_workspace(home) as workspace,
+            pytest.raises(RunStorageError, match=refusal),
+        ):
+            _ = read_run(workspace, prepared.run_id, budget=BUDGET)
+    _ = artifact.write_bytes(original)
+    assert read(home, prepared.run_id)["status"] == "SUCCESS"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("research_mode", "synthetic"),
+        ("certified", True),
+        ("non_executable", False),
+        ("executable_prices", True),
+    ],
+)
+def test_a_result_claiming_more_than_a_declared_run_may_seals_nothing(
+    research: tuple[Path, Document, Document], field: str, value: object
+) -> None:
+    """A run opened under a declaration cannot commit a result that says it was certified.
+
+    The manifest authenticates whatever the artifact holds, so a contradiction accepted
+    here would be confirmed by every later read rather than refused by them. The candidate
+    is judged before anything is sealed, so the rejected run stays open for a corrected
+    retry instead of being stranded behind a file nothing can replace.
+    """
+    home, _body, declaration = research
+    migrated(home)
+    prepared = prepare(home, declaration)
+    produced = run_document(prepared.envelope.canonical_bytes, prepared.envelope.envelope_sha256)
+    claimed = canonical_json_bytes(dict(produced) | {field: value})
+    with open_workspace(home, writable=True) as workspace:
+        bundle_id = register_declared(workspace, prepared, declaration)
+        handle = open_run(workspace, declared_intent(prepared, bundle_id), budget=BUDGET)
+        with pytest.raises(RunStorageError, match=r"declared run|uncertified status"):
+            _ = commit_run(workspace, handle, RunResult(claimed), budget=BUDGET)
+        assert not (workspace.paths.runs / prepared.run_id / "backtest.json").exists()
+        assert (
+            workspace.state.execute(
+                "SELECT status FROM runs WHERE run_id=?", (prepared.run_id,)
+            ).fetchone()[0]
+            == "RUNNING"
+        )
+
+
+def test_a_declared_preparation_that_cannot_name_its_own_source_seals_no_run(
+    research: tuple[Path, Document, Document],
+) -> None:
+    """A sealed record has to be able to say what code produced it.
+
+    The engine identity covers the calculation modules, and the declared path's own
+    decisions are made elsewhere, which is why the contract names that source as well. A
+    record without it cannot answer the question it exists to answer.
+    """
+    home, _body, declaration = research
+    migrated(home)
+    prepared = prepare(home, declaration)
+    stripped = cast("Document", json.loads(prepared.provenance))
+    del stripped["preparation_source_sha256"]
+    with open_workspace(home, writable=True) as workspace:
+        bundle_id = register_declared(workspace, prepared, declaration)
+        with pytest.raises(RunStorageError, match="preparation source"):
+            _ = open_run(
+                workspace,
+                replace(
+                    declared_intent(prepared, bundle_id),
+                    preparation_bytes=canonical_json_bytes(stripped),
+                ),
+                budget=BUDGET,
+            )
+
+
+def test_storage_mirrors_the_declaration_contract_without_drifting() -> None:
+    """Storage mirrors this contract instead of importing it, and the mirror is checked.
+
+    Keeping the store free of an application import means the root shape and the fixed
+    status words live in two places. This is what makes that a mirror rather than a fork:
+    a contract change that does not reach storage fails here instead of drifting quietly.
+    """
+    from aegis_alpha.application import research_run as contract  # noqa: PLC0415
+    from aegis_alpha.storage import backtest_requests, runs  # noqa: PLC0415
+
+    assert backtest_requests._RESEARCH_ROOT == contract._ROOT  # noqa: SLF001
+    assert backtest_requests._MEMBERSHIP == contract._MEMBERSHIP  # noqa: SLF001
+    assert backtest_requests.RESEARCH_EXECUTION_MODE == contract.EXECUTION_MODE
+    assert RESEARCH_REQUEST_SCHEMA == contract.RESEARCH_RUN_SCHEMA
+    assert runs._RESEARCH_PREPARATION == contract.PREPARED_SCHEMA  # noqa: SLF001
+    assert runs._DECLARED_RESEARCH_MODE == DECLARED_RESEARCH_MODE  # noqa: SLF001
 
 
 @pytest.mark.parametrize(

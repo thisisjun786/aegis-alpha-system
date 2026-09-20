@@ -69,6 +69,11 @@ _PREPARATION_LINK = {
 # three as false, so a document claiming otherwise is describing a different run than
 # the one it says it is.
 _RESEARCH_STATUS = ("certified", "point_in_time_certified", "executable_prices")
+# What the runner stamps on a declared run's result. Written down here rather than
+# imported, like every other document literal this module knows, because storage never
+# imports application code.
+_DECLARED_RESEARCH_MODE = "declared_uncertified_research"
+_DECLARED_RESULT_STATUS = {"certified": False, "non_executable": True, "executable_prices": False}
 _MEDIA_TYPE = "application/json"
 _SHA_LENGTH = 64
 # A sealed document is decoded whole, so it is charged at the expansion the state
@@ -1119,6 +1124,31 @@ def _require_research_status(preparation: dict[str, object]) -> None:
         raise RunStorageError("research preparation must declare " + RESEARCH_EXECUTION_MODE)
     if any(preparation.get(field) is not False for field in _RESEARCH_STATUS):
         raise RunStorageError("research preparation contradicts its own uncertified status")
+    # The declared path's own decisions are made in code the engine identity does not
+    # cover, so the record names that code as well. A sealed record that cannot say what
+    # produced it is not answerable on its own terms, which is the whole point of it.
+    _digest(
+        _text(preparation.get("preparation_source_sha256"), "preparation source"),
+        "preparation source",
+    )
+
+
+def _require_declared_result(document: dict[str, object]) -> None:
+    """Refuse a declared run's result that claims to be anything else.
+
+    The sealed result is what a later reader is shown, and the manifest authenticates
+    whatever it holds. Without this, a run opened under a declaration could commit a
+    result stamped certified and executable, and every later read and verification would
+    confirm it, because the hash covers the contradiction rather than rejecting it.
+
+    The status is what gets checked, not the inputs the result repeats. The declaration
+    is the authority on those and is stored beside the run, so a reader compares the two
+    documents; storage does not become a second copy of that contract.
+    """
+    if document.get("research_mode") != _DECLARED_RESEARCH_MODE:
+        raise RunStorageError("a declared run's result must name " + _DECLARED_RESEARCH_MODE)
+    if any(document.get(field) is not value for field, value in _DECLARED_RESULT_STATUS.items()):
+        raise RunStorageError("declared run result contradicts its own uncertified status")
 
 
 def _require_linked_inputs(
@@ -1161,6 +1191,10 @@ def _require_linked_evidence(
     )
     document = _mapping(json.loads(backtest_bytes), "backtest result")
     _require_link(document, "input_sha256", envelope_sha256, "backtest envelope")
+    if prepared is not None:
+        # The preparation's own kind decides this, so a declared run's three documents
+        # have to agree with each other rather than only two of them agreeing.
+        _require_declared_result(document)
     return prepared
 
 
