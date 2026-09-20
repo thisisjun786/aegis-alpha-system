@@ -1503,6 +1503,29 @@ class PreparedResearchRun:
     provenance: bytes
     certified: bool = field(default=False, init=False)
 
+    def __post_init__(self) -> None:
+        """Freeze what a caller could otherwise edit after the bytes were sealed.
+
+        The envelope and the declaration are already immutable bytes. The decision and
+        price mappings beside them were not, so a caller could change what the result
+        appears to have run on while its sealed hashes stayed the same.
+        """
+        object.__setattr__(self, "slots", tuple(self.slots))
+        object.__setattr__(self, "decisions", tuple(self.decisions))
+        values = self.inputs
+        object.__setattr__(
+            self,
+            "inputs",
+            EnvelopeInputs(
+                tuple(values.dates),
+                cast("tuple[Mapping[str, float], ...]", _frozen(values.opens)),
+                cast("tuple[Mapping[str, float], ...]", _frozen(values.closes)),
+                cast("Mapping[date, Mapping[str, float]]", _frozen(values.targets)),
+                cast("Mapping[str, str]", _frozen(values.instrument_types)),
+                tuple(values.source_pins),
+            ),
+        )
+
     @property
     def run_id(self) -> str:
         """The run's own content, not a fresh name.
@@ -1747,6 +1770,31 @@ def _research_envelope(declaration: ResearchRunRequest, inputs: EnvelopeInputs) 
     return EnvelopeExport(raw, hashlib.sha256(raw).hexdigest())
 
 
+def _require_fillable(inputs: EnvelopeInputs) -> None:
+    """Refuse a target the panel cannot fill, before the accounting has to discover it.
+
+    A sparse panel produces an envelope the accounting rejects, which is the right
+    outcome reached the wrong way: the message names an arithmetic failure rather than
+    the missing observation. Nothing is filled in here; the run is refused instead.
+    """
+    following = dict(pairwise(inputs.dates))
+    for day, weights in sorted(inputs.targets.items()):
+        execution = following.get(day)
+        if execution is None:
+            # The last decision has no session to fill on, which the accounting treats
+            # as no trade rather than as an error.
+            continue
+        prices = inputs.opens[inputs.dates.index(execution)]
+        missing = sorted(set(weights) - set(prices))
+        if missing:
+            raise ValueError(
+                "the open panel has no observation on "
+                + execution.isoformat()
+                + " for: "
+                + ", ".join(missing)
+            )
+
+
 def prepare_research_run(
     workspace: Workspace, declaration: ResearchRunRequest, *, budget: ComputeBudget
 ) -> PreparedResearchRun:
@@ -1831,6 +1879,7 @@ def prepare_research_run(
         _instrument_types(workspace, sorted(set(declaration.instrument_map.values()))),
         (),
     )
+    _require_fillable(inputs)
     envelope = _research_envelope(declaration, inputs)
     if environment_identity() != environment:
         raise ValueError("calculation context changed during preparation")

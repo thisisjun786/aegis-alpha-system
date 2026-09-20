@@ -20,6 +20,7 @@ rather than defaulted.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -329,7 +330,7 @@ def _observations(value: object) -> tuple[ObservationPinRef, ...]:
         pins.append(
             ObservationPinRef(
                 _text(row["dataset_id"], "dataset_id"),
-                _text(row["version"], "version"),
+                _exact_version(row["version"], "observation version"),
                 _text(row["generation_id"], "generation_id"),
                 _digest(row["chain_hash"], "chain_hash"),
                 _digest(row["manifest_hash"], "manifest_hash"),
@@ -489,6 +490,10 @@ def _execution(value: object) -> ExecutionTerms:
         number = row[name]
         if isinstance(number, bool) or not isinstance(number, (int, float)):
             raise ResearchRunError("execution " + name + " must be a number")
+        if not math.isfinite(number):
+            # NaN compares false against every bound below, so it would pass each check
+            # and then fail somewhere inside the accounting instead of here.
+            raise ResearchRunError("execution " + name + " must be finite")
         terms.append(float(number))
     if terms[0] < 0:
         raise ResearchRunError("execution cost must not be negative")
@@ -513,7 +518,7 @@ def parse_research_run_request(raw: bytes) -> ResearchRunRequest:
     return ResearchRunRequest(
         strategy_store_id=_text(strategy["strategy_store_id"], "strategy_store_id"),
         strategy_id=_text(strategy["strategy_id"], "strategy_id"),
-        strategy_version=_text(strategy["version"], "strategy version"),
+        strategy_version=_exact_version(strategy["version"], "strategy version"),
         strategy_raw_sha256=_digest(strategy["raw_sha256"], "raw_sha256"),
         strategy_contract_sha256=_digest(strategy["contract_sha256"], "contract_sha256"),
         observations=_observations(body["observations"]),

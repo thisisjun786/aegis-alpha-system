@@ -23,6 +23,7 @@ from aegis_alpha.application.research_run import (
     declared_provenance,
     parse_research_run_request,
 )
+from aegis_alpha.engine.errors import ContractParseError
 
 DIGEST_A = "a" * 64
 DIGEST_B = "b" * 64
@@ -450,3 +451,32 @@ def test_the_knowledge_time_keeps_every_microsecond() -> None:
             (parse_research_run_request(_raw(body)).conventions.knowledge_time_us, expected)
         )
     assert [observed for observed, _ in pairs] == [expected for _, expected in pairs]
+
+
+@pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity"])
+def test_non_finite_account_terms_never_reach_the_contract(token: str) -> None:
+    """The codec refuses a non-finite constant before the declaration is parsed.
+
+    Worth pinning because NaN compares false against every bound, so if one ever did
+    arrive it would pass each check in turn and fail somewhere inside the accounting.
+    The contract keeps its own finiteness guard for a caller that does not come through
+    JSON; this test records where the refusal actually happens today.
+    """
+    raw = _raw(_body()).replace(b'"cost": 0.0003', b'"cost": ' + token.encode())
+    with pytest.raises(ContractParseError, match="non-finite JSON constant"):
+        parse_research_run_request(raw)
+
+
+def test_a_floating_strategy_version_is_refused() -> None:
+    """An exact request cannot name a version whose bytes change underneath it."""
+    body = _body()
+    body["strategy"] = _strategy() | {"version": "latest"}
+    with pytest.raises(ResearchRunError, match="strategy version must be exact"):
+        parse_research_run_request(_raw(body))
+
+
+def test_a_floating_observation_version_is_refused() -> None:
+    body = _body()
+    body["observations"] = [_pin() | {"version": "latest"}, _pin("obs-synthetic-close", "close")]
+    with pytest.raises(ResearchRunError, match="observation version must be exact"):
+        parse_research_run_request(_raw(body))
