@@ -19,14 +19,29 @@ if TYPE_CHECKING:
 _HASH_FORMAT = "aas-canonical-json-sha256-v1"
 BACKTEST_REQUEST_SCHEMA = "aas-backtest-request-v1"
 RESEARCH_REQUEST_SCHEMA = "aas-research-run-v2"
+COMPOSITION_REQUEST_SCHEMA = "aas-research-composition-v1"
 # The explicit allow-list run_details carries, in the order its CHECK spells them. A
 # run is described by exactly one of these documents and the store never infers which:
 # the schema is recorded from the request that was actually registered.
-REQUEST_SCHEMAS = (BACKTEST_REQUEST_SCHEMA, RESEARCH_REQUEST_SCHEMA)
+REQUEST_SCHEMAS = (
+    BACKTEST_REQUEST_SCHEMA,
+    RESEARCH_REQUEST_SCHEMA,
+    COMPOSITION_REQUEST_SCHEMA,
+)
 # The state add-on version whose CHECK actually holds each request schema. v1 named one
 # schema as a literal, so recording a declared research run is a versioned migration of
 # an installed add-on rather than a write the old CHECK would have accepted.
-REQUEST_SCHEMA_VERSION = {BACKTEST_REQUEST_SCHEMA: 1, RESEARCH_REQUEST_SCHEMA: 2}
+#
+# Both declared contracts sit at 2. v2 has not shipped — it exists only on this unmerged
+# change — so widening its CHECK is still defining that version rather than rewriting
+# bytes an installation carries. v1's DDL and checksum are untouched, which is what keeps
+# every add-on already on disk recognisable. Once v2 is merged, a further schema needs
+# its own version and its own migration.
+REQUEST_SCHEMA_VERSION = {
+    BACKTEST_REQUEST_SCHEMA: 1,
+    RESEARCH_REQUEST_SCHEMA: 2,
+    COMPOSITION_REQUEST_SCHEMA: 2,
+}
 STATE_VERSION = 2
 # The market add-on's DDL is untouched here, so its receipt stays at 1. Bumping it for
 # symmetry would make a version number stop meaning that something actually changed.

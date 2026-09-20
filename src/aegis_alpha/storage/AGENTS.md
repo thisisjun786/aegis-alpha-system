@@ -83,7 +83,8 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
 - The run add-on is versioned per store. `run_details.request_schema` carries an explicit
   allow-list, `REQUEST_SCHEMAS`, and `_open_intent` records the schema of the request that
   was actually registered rather than a constant. v1 named `aas-backtest-request-v1` alone,
-  so admitting `aas-research-run-v2` is `aas db run-migrate`: backup, durable intent, one
+  so admitting the declared contracts (`aas-research-run-v2` and
+  `aas-research-composition-v1`) is `aas db run-migrate`: backup, durable intent, one
   transactional `run_details` rebuild, verification, then completion. `run_schema` receipts
   are append-only, so a migrated store shows `(1, v1), (2, v2)` and a store installed after
   the migration shows `(2, v2)`; the recorded v1 checksum stays exact, because an
@@ -94,7 +95,13 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   `quarantine` refuses the migration intent, as it already refuses a run intent: a
   quarantined intent can never be prepared again, so ending this one would leave the
   add-on unusable with nothing able to clear it.
-- A declared run's three documents are held to agreeing with each other. The preparation
+- A declared run's three documents are held to agreeing with each other, and to being the
+  same kind. Each declared contract has exactly one sealed preparation —
+  `aas-prepared-research-run-v1` for a sleeve run and
+  `aas-prepared-research-composition-v1` for a sample composition — so the pair is matched
+  exactly rather than by family, on schema, `declaration_schema` and `scope` together. A
+  composition's preparation under a sleeve declaration, or the reverse, would otherwise
+  supply identities for a calculation it never describes. The preparation
   must carry the status its own contract fixes (`certified`, `point_in_time_certified` and
   `executable_prices` all false under `research-uncertified`) and must name its own
   `preparation_source_sha256`, because the engine identity does not cover the code that
@@ -109,15 +116,18 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   claims and not the inputs a document repeats: the declaration is the authority on its
   own pins and is stored beside the run, so a reader compares the two documents instead
   of storage becoming a second copy of that contract.
-- `backtest_requests` stores both request contracts under one content identity: exactly
+- `backtest_requests` stores every request contract under one content identity: exactly
   canonical bytes, a hash over those bytes, and bindings that agree with the registered
-  bundle. An `aas-research-run-v2` declaration carries no bindings array, so its bundle is
-  required to be exactly the membership it pins, which is the only pin the binding
-  vocabulary can express. Its observation panels cannot be bound, because there is no role
-  for reference observations and adding one would put adjusted reference data in the
-  namespace the executable price roles use; its calendar cannot be bound either, because
-  it is a declared name over the panel's own dates rather than a published generation.
-  Both stay covered by the declaration's own hash. A declaration also has no engine or
+  bundle. A declaration carries no bindings array, so its bundle is derived from the pins
+  it does name. Observation panels cannot be bound, because there is no role for reference
+  observations and adding one would put adjusted reference data in the namespace the
+  executable price roles use; a calendar cannot be bound either, because it is a declared
+  name over the panel's own dates rather than a published generation. An
+  `aas-research-run-v2` bundle is therefore required to be exactly the membership it pins.
+  An `aas-research-composition-v1` pins one membership per sleeve while the vocabulary
+  holds a single membership, so binding one of the two would leave `bundle_id` describing
+  half the run while looking complete; a composition binds nothing. Whatever stays unbound
+  stays covered by the declaration's own hash. A declaration also has no engine or
   environment, because no certified request stands behind it, so a declared run takes both
   from the `aas-prepared-research-run-v1` preparation sealed beside its envelope, and that
   preparation names `declaration_sha256` where an executable one names `request_hash`.

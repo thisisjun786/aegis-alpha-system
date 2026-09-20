@@ -26,6 +26,7 @@ from aegis_alpha.storage.input_pins import (
 )
 from aegis_alpha.storage.run_schema import (
     BACKTEST_REQUEST_SCHEMA,
+    COMPOSITION_REQUEST_SCHEMA,
     RESEARCH_REQUEST_SCHEMA,
     require_request_schema,
     require_run_schema,
@@ -84,13 +85,18 @@ _RESEARCH_ROOT = frozenset(
         "unsettled",
     }
 )
+# A sample composition is the same declaration with two pinned sleeves in place of one
+# strategy, so it names neither a root strategy nor a root membership. Derived from the
+# sleeve root the way the contract derives it, which keeps one mirror rather than two.
+_COMPOSITION_ROOT = (_RESEARCH_ROOT - {"strategy", "membership"}) | {"composition"}
 
 
 def request_schema(body: dict[str, object]) -> str:
     """Name the one request contract this document is, from its own root shape.
 
-    The two roots are disjoint, so a document is one contract or neither. Nothing here
-    guesses: a root that is not exactly one of them is refused rather than defaulted.
+    The roots are disjoint, so a document is exactly one contract or none of them.
+    Nothing here guesses: a root that is not exactly one of them is refused, never
+    defaulted, and a declared root must also say in its own bytes that it is uncertified.
     """
     if body.keys() == _ROOT:
         if body["schema"] != BACKTEST_REQUEST_SCHEMA or body["hash_format"] != HASH_FORMAT:
@@ -102,6 +108,14 @@ def request_schema(body: dict[str, object]) -> str:
         if body["execution_mode"] != RESEARCH_EXECUTION_MODE:
             raise ValueError("a stored research run must declare " + RESEARCH_EXECUTION_MODE)
         return RESEARCH_REQUEST_SCHEMA
+    if body.keys() == _COMPOSITION_ROOT:
+        if body["schema_version"] != COMPOSITION_REQUEST_SCHEMA:
+            raise ValueError("invalid research composition root/schema")
+        if body["execution_mode"] != RESEARCH_EXECUTION_MODE:
+            raise ValueError(
+                "a stored research composition must declare " + RESEARCH_EXECUTION_MODE
+            )
+        return COMPOSITION_REQUEST_SCHEMA
     raise ValueError("invalid backtest request root/schema")
 
 
@@ -120,15 +134,21 @@ def research_bindings(body: dict[str, object]) -> list[dict[str, object]]:
     """The exact bundle a declared research run must be registered against.
 
     A declaration carries no bindings array, so the tie to its bundle is derived from
-    the pins it does name, and the membership is the only one the binding vocabulary can
-    express. The observation panels cannot be bound, because there is no role for
-    reference observations and inventing one would put adjusted reference data in the
-    namespace the executable price roles use. The calendar cannot be bound either: it is
-    a declared name over the panel's own dates rather than a published generation, so
-    there is no pin to authenticate. Both stay covered by the declaration's own content
-    hash. The bundle is held to exactly this, so a declaration cannot be filed under
-    inputs it never named.
+    the pins it does name, and only some of those can be expressed as bindings. The
+    observation panels cannot: there is no role for reference observations, and inventing
+    one would put adjusted reference data in the namespace the executable price roles
+    use. The calendar cannot: it is a declared name over the panel's own dates rather
+    than a published generation, so there is no pin to authenticate.
+
+    A sleeve run's membership can, and is required to be the whole bundle. A sample
+    composition pins one membership per sleeve while the binding vocabulary holds a
+    single membership, so binding one of the two would leave `run.bundle_id` describing
+    half the run while looking complete; a composition binds nothing instead. Whatever
+    stays unbound stays covered by the declaration's own content hash, which the run
+    records as its `request_hash`.
     """
+    if request_schema(body) == COMPOSITION_REQUEST_SCHEMA:
+        return []
     membership = _pin(body["membership"], "membership", _MEMBERSHIP)
     if membership.get("kind") != "membership":
         raise ValueError("research membership pin must name the membership kind")

@@ -36,7 +36,11 @@ from aegis_alpha.storage.backtest_requests import (
 from aegis_alpha.storage.backup import backup, restore
 from aegis_alpha.storage.input_pins import BUNDLE_SCHEMA, HASH_FORMAT, register_input_bundle
 from aegis_alpha.storage.market_inputs import GenerationPin, admit_native_input
-from aegis_alpha.storage.run_schema import RESEARCH_REQUEST_SCHEMA, migrate_run_schema
+from aegis_alpha.storage.run_schema import (
+    COMPOSITION_REQUEST_SCHEMA,
+    RESEARCH_REQUEST_SCHEMA,
+    migrate_run_schema,
+)
 from aegis_alpha.storage.runs import (
     _DECLARED_RESULT_STATUS,
     RunIntent,
@@ -555,7 +559,12 @@ def test_storage_mirrors_the_declaration_contract_without_drifting() -> None:
     assert backtest_requests._MEMBERSHIP == contract._MEMBERSHIP  # noqa: SLF001
     assert backtest_requests.RESEARCH_EXECUTION_MODE == contract.EXECUTION_MODE
     assert RESEARCH_REQUEST_SCHEMA == contract.RESEARCH_RUN_SCHEMA
-    assert runs._RESEARCH_PREPARATION == contract.PREPARED_SCHEMA  # noqa: SLF001
+    assert runs._RESEARCH_PREPARATIONS == {  # noqa: SLF001
+        contract.RESEARCH_RUN_SCHEMA: contract.PREPARED_SCHEMA,
+        contract.RESEARCH_COMPOSITION_SCHEMA: contract.PREPARED_COMPOSITION_SCHEMA,
+    }
+    assert backtest_requests._COMPOSITION_ROOT == contract._COMPOSITION_ROOT  # noqa: SLF001
+    assert COMPOSITION_REQUEST_SCHEMA == contract.RESEARCH_COMPOSITION_SCHEMA
     assert runs._DECLARED_RESEARCH_MODE == DECLARED_RESEARCH_MODE  # noqa: SLF001
 
 

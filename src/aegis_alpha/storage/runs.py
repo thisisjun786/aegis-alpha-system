@@ -30,6 +30,7 @@ from aegis_alpha.storage.backtest_requests import RESEARCH_EXECUTION_MODE, reque
 from aegis_alpha.storage.rowset import rowset_hash
 from aegis_alpha.storage.run_schema import (
     BACKTEST_REQUEST_SCHEMA,
+    COMPOSITION_REQUEST_SCHEMA,
     RESEARCH_REQUEST_SCHEMA,
     require_request_schema,
     require_run_schema,
@@ -56,14 +57,27 @@ _ENVELOPE = "envelope.json"
 _PREPARATION = "preparation.json"
 _BACKTEST = "backtest.json"
 _ARTIFACTS = (_ENVELOPE, _PREPARATION, _BACKTEST)
-# The sealed preparation of a declared research run. A declaration carries no engine or
+# The sealed preparation of each declared contract. A declaration carries no engine or
 # environment of its own, because no certified request stands behind that calculation,
 # so those identities are read from the document sealed beside the envelope.
-_RESEARCH_PREPARATION = "aas-prepared-research-run-v1"
+_RESEARCH_PREPARATIONS = {
+    RESEARCH_REQUEST_SCHEMA: "aas-prepared-research-run-v1",
+    COMPOSITION_REQUEST_SCHEMA: "aas-prepared-research-composition-v1",
+}
+_DECLARED_BY_PREPARATION = {
+    prepared: declared for declared, prepared in _RESEARCH_PREPARATIONS.items()
+}
+# What each declared preparation calls its own run. Checked beside the schema, so one
+# kind's schema cannot arrive carrying the other kind's scope.
+_DECLARED_SCOPE = {
+    RESEARCH_REQUEST_SCHEMA: "sleeve",
+    COMPOSITION_REQUEST_SCHEMA: "sample-composition",
+}
 # Where each request contract's preparation names the request it was prepared for.
 _PREPARATION_LINK = {
     BACKTEST_REQUEST_SCHEMA: "request_hash",
     RESEARCH_REQUEST_SCHEMA: "declaration_sha256",
+    COMPOSITION_REQUEST_SCHEMA: "declaration_sha256",
 }
 # What a declared preparation fixes about itself. The contract that seals it writes all
 # three as false, so a document claiming otherwise is describing a different run than
@@ -612,39 +626,69 @@ def _sealed_request(
     return _mapping(json.loads(row[0]), "backtest request")
 
 
+def _strategy_identity(sealed: dict[str, object], label: str) -> tuple[str, ...]:
+    """The five fields that name one admitted strategy version."""
+    return (
+        _text(sealed.get("strategy_store_id"), label + " store"),
+        _text(sealed.get("strategy_id"), label + " strategy_id"),
+        _text(sealed.get("version"), label + " version"),
+        _digest(_text(sealed.get("raw_sha256"), label + " raw_sha256"), label + " raw_sha256"),
+        _digest(
+            _text(sealed.get("contract_sha256"), label + " contract_sha256"),
+            label + " contract_sha256",
+        ),
+    )
+
+
+def _declared_strategies(request: dict[str, object], schema: str) -> tuple[tuple[str, ...], ...]:
+    """The strategy identities the request seals, in the order a run records them.
+
+    A sleeve run names one. A composition names two and both of them run, because the
+    switch chooses between the sleeves decision by decision, so a record naming only the
+    offense would describe a calculation the defense also took part in.
+    """
+    if schema != COMPOSITION_REQUEST_SCHEMA:
+        sealed = _mapping(request.get("strategy"), "request strategy")
+        return (_strategy_identity(sealed, "request"),)
+    sleeves = _mapping(
+        _mapping(request.get("composition"), "request composition").get("sleeves"),
+        "composition sleeves",
+    )
+    return tuple(
+        _strategy_identity(
+            _mapping(sleeves.get(role), "composition " + role), "composition " + role
+        )
+        for role in ("offense", "defense")
+    )
+
+
 def _sealed_identities(
-    request: dict[str, object], prepared: tuple[str, str] | None
-) -> tuple[str, str, tuple[str, ...]]:
+    request: dict[str, object], prepared: _Prepared | None
+) -> tuple[str, str, tuple[tuple[str, ...], ...]]:
     """The engine, environment and strategy identities this run's evidence seals.
 
-    Both contracts name the strategy in the request itself. An executable request also
-    names the engine and environment it was written against; a declaration does not, so
-    a declared run takes those from the preparation that produced its envelope. That
+    Every contract names its strategies in the request itself. An executable request also
+    names the engine and environment it was written against; a declaration does not, so a
+    declared run takes those from the preparation that produced its envelope. That
     document is sealed under the same durable intent as the envelope, so it is no more
     replaceable than the request, and it is the only place those identities exist.
 
-    The two are paired rather than tried in turn: a preparation of the wrong kind under
-    a request would otherwise supply an identity for a calculation it never describes.
+    The kinds are paired exactly rather than by family. A composition's preparation under
+    a sleeve declaration, or the reverse, would supply an identity for a calculation it
+    never describes, and both are declared documents, so a looser check would admit it.
     """
-    if (request_schema(request) == RESEARCH_REQUEST_SCHEMA) != (prepared is not None):
+    schema = request_schema(request)
+    if (schema in _RESEARCH_PREPARATIONS) != (prepared is not None) or (
+        prepared is not None and prepared.declaration_schema != schema
+    ):
         raise RunStorageError("the sealed preparation does not match the request contract")
-    sealed = _mapping(request.get("strategy"), "request strategy")
-    identity = (
-        _text(sealed.get("strategy_store_id"), "request strategy store"),
-        _text(sealed.get("strategy_id"), "request strategy_id"),
-        _text(sealed.get("version"), "request strategy version"),
-        _digest(_text(sealed.get("raw_sha256"), "request raw_sha256"), "request raw_sha256"),
-        _digest(
-            _text(sealed.get("contract_sha256"), "request contract_sha256"),
-            "request contract_sha256",
-        ),
-    )
+    identities = _declared_strategies(request, schema)
     if prepared is not None:
-        return (*prepared, identity)
+        return prepared.engine_hash, prepared.environment_hash, identities
     return (
         content_sha256(_mapping(request.get("engine"), "request engine")),
         content_sha256(_mapping(request.get("environment"), "request environment")),
-        identity,
+        identities,
     )
 
 
@@ -715,7 +759,7 @@ def _require_recorded_provenance(
             (derived.run_id,),
         )
     ]
-    if pins != [(derived.module, 0, *strategy)]:
+    if pins != [(derived.module, ordinal, *identity) for ordinal, identity in enumerate(strategy)]:
         raise RunStorageError("recorded strategy pins disagree with the registered request")
     _require_recorded_metadata(workspace, derived.run_id)
 
@@ -750,7 +794,7 @@ def _require_sealed_provenance(
     intent: RunIntent,
     request: dict[str, object],
     module: str,
-    prepared: tuple[str, str] | None,
+    prepared: _Prepared | None,
 ) -> None:
     """Refuse provenance the registered request does not already seal.
 
@@ -764,11 +808,14 @@ def _require_sealed_provenance(
     if intent.environment_hash != environment:
         raise RunStorageError("environment_hash does not match the registered request")
     pins = _pin_rows(intent.strategy_pins)
-    if len(pins) != 1 or tuple(pins[0][2:]) != expected:
+    if len(pins) != len(expected) or any(
+        tuple(row[2:]) != identity for row, identity in zip(pins, expected, strict=True)
+    ):
         raise RunStorageError("strategy pins do not match the registered request")
-    if (pins[0][0], pins[0][1]) != (module, 0):
-        # run_strategies is keyed on (run_id, module, ordinal). A pin filed under
-        # another module would make read_run report provenance the manifest contradicts.
+    if any((row[0], row[1]) != (module, ordinal) for ordinal, row in enumerate(pins)):
+        # run_strategies is keyed on (run_id, module, ordinal). A pin filed under another
+        # module would make read_run report provenance the manifest contradicts, and a
+        # composition's two sleeves are told apart by nothing except their ordinal.
         raise RunStorageError("strategy pin is not placed on the run module")
 
 
@@ -1071,10 +1118,10 @@ class _Derived:
     counts: dict[str, int]
     manifest: str
     metrics: dict[str, tuple[Decimal | None, str]]
-    # The engine and environment a declared run's preparation sealed, or None when the
-    # request names them itself. Two digests rather than the decoded document, so the
-    # projection keeps holding derived facts instead of a second copy of an artifact.
-    prepared: tuple[str, str] | None = None
+    # What a declared run's preparation sealed, or None when the request names it itself.
+    # Its kind and two digests rather than the decoded document, so the projection keeps
+    # holding derived facts instead of a second copy of an artifact.
+    prepared: _Prepared | None = None
 
 
 def _derive(
@@ -1122,7 +1169,16 @@ def _require_link(document: dict[str, object], field: str, expected: str, label:
         raise RunStorageError(label + " names different evidence")
 
 
-def _require_research_status(preparation: dict[str, object]) -> None:
+@dataclass(frozen=True, slots=True)
+class _Prepared:
+    """A declared preparation's own kind, and the identities only it carries."""
+
+    declaration_schema: str
+    engine_hash: str
+    environment_hash: str
+
+
+def _require_research_status(preparation: dict[str, object], declared: str) -> None:
     """Refuse a declared preparation that contradicts what its own contract fixes.
 
     Absent and wrong are refused alike: a document that omits its status proves nothing
@@ -1130,8 +1186,12 @@ def _require_research_status(preparation: dict[str, object]) -> None:
     cannot grant. Without this, storage would record a research run whose only sealed
     evidence says it was certified, and then keep verifying that record.
     """
-    if preparation.get("declaration_schema") != RESEARCH_REQUEST_SCHEMA:
+    if preparation.get("declaration_schema") != declared:
         raise RunStorageError("research preparation does not name the declaration contract")
+    if preparation.get("scope") != _DECLARED_SCOPE[declared]:
+        # Its schema and its scope are two statements about the same thing, so a document
+        # carrying one kind's schema under the other kind's scope describes neither.
+        raise RunStorageError("research preparation does not name the scope of its own kind")
     if preparation.get("execution_mode") != RESEARCH_EXECUTION_MODE:
         raise RunStorageError("research preparation must declare " + RESEARCH_EXECUTION_MODE)
     if any(preparation.get(field) is not False for field in _RESEARCH_STATUS):
@@ -1165,7 +1225,7 @@ def _require_declared_result(document: dict[str, object]) -> None:
 
 def _require_linked_inputs(
     envelope_bytes: bytes, preparation_bytes: bytes, request_hash: str
-) -> tuple[str, tuple[str, str] | None]:
+) -> tuple[str, _Prepared | None]:
     """Refuse artifacts that do not name this run request and envelope.
 
     The preparation document records the request it was prepared for and the envelope
@@ -1182,14 +1242,16 @@ def _require_linked_inputs(
     """
     envelope_sha256 = hashlib.sha256(envelope_bytes).hexdigest()
     preparation = _mapping(json.loads(preparation_bytes), "preparation")
-    research = preparation.get("schema") == _RESEARCH_PREPARATION
-    contract = RESEARCH_REQUEST_SCHEMA if research else BACKTEST_REQUEST_SCHEMA
+    kind = preparation.get("schema")
+    declared = _DECLARED_BY_PREPARATION.get(kind) if isinstance(kind, str) else None
+    contract = declared if declared is not None else BACKTEST_REQUEST_SCHEMA
     _require_link(preparation, _PREPARATION_LINK[contract], request_hash, "preparation request")
     _require_link(preparation, "envelope_sha256", envelope_sha256, "preparation envelope")
-    if not research:
+    if declared is None:
         return envelope_sha256, None
-    _require_research_status(preparation)
-    return envelope_sha256, (
+    _require_research_status(preparation, declared)
+    return envelope_sha256, _Prepared(
+        declared,
         content_sha256(_mapping(preparation.get("engine"), "preparation engine")),
         content_sha256(_mapping(preparation.get("environment"), "preparation environment")),
     )
@@ -1197,7 +1259,7 @@ def _require_linked_inputs(
 
 def _require_linked_evidence(
     envelope_bytes: bytes, preparation_bytes: bytes, backtest_bytes: bytes, request_hash: str
-) -> tuple[str, str] | None:
+) -> _Prepared | None:
     envelope_sha256, prepared = _require_linked_inputs(
         envelope_bytes, preparation_bytes, request_hash
     )
@@ -1219,7 +1281,7 @@ class _Projection:
     hashes: dict[str, str]
     counts: dict[str, int]
     metrics: dict[str, tuple[Decimal | None, str]]
-    prepared: tuple[str, str] | None = None
+    prepared: _Prepared | None = None
 
 
 def _project(

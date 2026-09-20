@@ -17,7 +17,9 @@ from aegis_alpha.storage import run_schema
 from aegis_alpha.storage.publication import quarantine, recover_operations
 from aegis_alpha.storage.run_schema import (
     BACKTEST_REQUEST_SCHEMA,
+    COMPOSITION_REQUEST_SCHEMA,
     MIGRATION_OPERATION,
+    REQUEST_SCHEMAS,
     RESEARCH_REQUEST_SCHEMA,
     STATE_CHECKSUMS,
     STATE_VERSION,
@@ -122,8 +124,8 @@ def test_the_recorded_v1_schema_is_still_the_one_installations_carry() -> None:
     assert STATE_CHECKSUMS[1] == RECORDED_V1
     assert "CHECK(request_schema='aas-backtest-request-v1')" in run_schema._RUN_DETAILS[1]  # noqa: SLF001
     assert (
-        "CHECK(request_schema IN ('aas-backtest-request-v1','aas-research-run-v2'))"
-        in run_schema._RUN_DETAILS[STATE_VERSION]  # noqa: SLF001
+        "CHECK(request_schema IN ('aas-backtest-request-v1','aas-research-run-v2',"
+        "'aas-research-composition-v1'))" in run_schema._RUN_DETAILS[STATE_VERSION]  # noqa: SLF001
     )
 
 
@@ -154,7 +156,9 @@ def test_migration_carries_an_existing_run_and_leaves_it_readable(tmp_path: Path
     report = migrate_run_schema(fx.home)
     assert report["migrated"] is True
     assert report["state_version"] == STATE_VERSION
-    assert report["request_schemas"] == [BACKTEST_REQUEST_SCHEMA, RESEARCH_REQUEST_SCHEMA]
+    # Compared against the allow-list itself, so adding a contract does not need this
+    # assertion rewritten while still failing if the report stops reporting it.
+    assert report["request_schemas"] == list(REQUEST_SCHEMAS)
     assert receipts(fx.home) == [(1, STATE_CHECKSUMS[1]), (2, STATE_CHECKSUMS[2])]
     assert read(fx.home, "run-old") == before
     assert before["request_schema"] == BACKTEST_REQUEST_SCHEMA
@@ -316,6 +320,7 @@ def test_a_declared_research_run_is_refused_before_the_migration(tmp_path: Path)
     migrate_run_schema(fx.home)
     with open_workspace(fx.home) as workspace:
         require_request_schema(workspace, RESEARCH_REQUEST_SCHEMA)
+        require_request_schema(workspace, COMPOSITION_REQUEST_SCHEMA)
 
 
 def test_the_widened_check_is_an_allow_list_and_not_an_opening(tmp_path: Path) -> None:
