@@ -471,11 +471,18 @@ def _sealed_publication(
 
 def _admit_publication_chain(
     workspace: Workspace, generation_id: str, budget: ComputeBudget
-) -> None:
-    """Admit variable-width marker identities before the market owner builds its chain."""
+) -> str:
+    """Admit variable-width marker identities before the market owner builds its chain.
+
+    The widest domain in the chain comes back with the admission because the caller has
+    to size what the chain will hold live before it materializes any of it. Reading the
+    chain again later to learn that would materialize it on a lease the history already
+    occupies, which is the thing this admission exists to prevent.
+    """
     current: object = generation_id
     seen: set[object] = set()
     estimated = 0
+    domains: set[str] = set()
     while current is not None:
         if current in seen:
             raise ValueError("market generation cycle")
@@ -492,7 +499,10 @@ def _admit_publication_chain(
         if estimated > (budget.available_bytes) // 8:
             raise ComputeResourceError("publication chain exceeds materialization budget")
         seen.add(current)
-        current = market.marker_for(workspace.market, str(current))["parent_id"]
+        marker = market.marker_for(workspace.market, str(current))
+        domains.add(str(marker["domain"]))
+        current = marker["parent_id"]
+    return max(domains, key=lambda name: len(DOMAINS[name]))
 
 
 def verify_sealed_publication(
@@ -504,20 +514,20 @@ def verify_sealed_publication(
     content/intent/catalog/row and opaque transform-hash equality, not an unrecorded
     native registration route, provider authority or execution eligibility.
     """
-    _admit_publication_chain(workspace, generation_id, budget)
+    # The admission walks the markers before anything is materialized, so the widest
+    # schema in the chain is known before the history exists to be charged for.
+    widest = _admit_publication_chain(workspace, generation_id, budget)
     history = market.read_chain_rows(workspace.market, generation_id, budget=budget)
     deltas: dict[str, list[Row]] = {}
     for row in history:
         deltas.setdefault(str(row["generation_id"]), []).append(row)
-    chain = market.generation_chain(workspace.market, generation_id)
     # The whole history and its per-generation index stay live while every delta is
     # matched to its sealed import, and that match reads, decodes and re-normalizes on
     # the same lease, so what is already held is charged before the first of those reads.
     # This verifier serves every domain, so the widest schema in the chain sets the
     # per-row term rather than the narrowest one this module happens to default to.
-    widest = max((str(marker["domain"]) for marker in chain), key=lambda name: len(DOMAINS[name]))
     held = replace(budget, reserved_bytes=budget.reserved_bytes + _retained_bytes(history, widest))
-    for marker in chain:
+    for marker in market.generation_chain(workspace.market, generation_id):
         _verify_catalog(workspace, marker)
         delta = tuple(deltas.get(str(marker["generation_id"]), ()))
         _sealed_publication(workspace, marker, delta, held)
