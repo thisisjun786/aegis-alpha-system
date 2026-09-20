@@ -43,7 +43,7 @@ from tests.storage.test_research_inputs import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from aegis_alpha.storage.market_inputs import History
+    from aegis_alpha.storage.market_inputs import History, Row
     from aegis_alpha.storage.source_reader import SourcePin
     from aegis_alpha.storage.workspace import Workspace
 
@@ -1045,3 +1045,33 @@ def test_the_second_identity_set_is_admitted_against_the_first(
         assert seen[0][0] == BUDGET.reserved_bytes
         assert seen[0][1] > 0
         assert seen[1][0] == BUDGET.reserved_bytes + seen[0][1]
+
+
+def test_a_price_chain_is_charged_with_its_own_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Given a committed prices generation, whose rows are wider than a feature row.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        spec = _spec(workspace, tmp_path / "prices.sqlite3", [_source_row()])
+        _ = _register_domain(workspace, spec, "price")
+        generation = str(
+            publication.read_dataset(workspace, "synthetic-prices", "1")["generation_id"]
+        )
+        seen: list[ComputeBudget] = []
+        original = market_inputs._sealed_publication  # noqa: SLF001 -- accounting under test
+
+        def record(
+            target: Workspace, marker: Row, delta: History, budget: ComputeBudget
+        ) -> import_document.ImportDocument:
+            seen.append(budget)
+            return original(target, marker, delta, budget)
+
+        monkeypatch.setattr(market_inputs, "_sealed_publication", record)
+        # When its sealed deltas are verified,
+        history = market_inputs.verify_sealed_publication(workspace, generation, budget=BUDGET)
+        # Then the retained history is charged with the prices schema, which is wider
+        # than the feature schema this module defaults to.
+        charged = market_inputs._retained_bytes(history, "prices")  # noqa: SLF001 -- accounting under test
+        assert charged > market_inputs._retained_bytes(history)  # noqa: SLF001 -- accounting under test
+        assert seen[0].reserved_bytes == BUDGET.reserved_bytes + charged

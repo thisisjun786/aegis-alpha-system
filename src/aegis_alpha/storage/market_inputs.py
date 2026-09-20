@@ -509,11 +509,15 @@ def verify_sealed_publication(
     deltas: dict[str, list[Row]] = {}
     for row in history:
         deltas.setdefault(str(row["generation_id"]), []).append(row)
+    chain = market.generation_chain(workspace.market, generation_id)
     # The whole history and its per-generation index stay live while every delta is
     # matched to its sealed import, and that match reads, decodes and re-normalizes on
     # the same lease, so what is already held is charged before the first of those reads.
-    held = replace(budget, reserved_bytes=budget.reserved_bytes + _retained_bytes(history))
-    for marker in market.generation_chain(workspace.market, generation_id):
+    # This verifier serves every domain, so the widest schema in the chain sets the
+    # per-row term rather than the narrowest one this module happens to default to.
+    widest = max((str(marker["domain"]) for marker in chain), key=lambda name: len(DOMAINS[name]))
+    held = replace(budget, reserved_bytes=budget.reserved_bytes + _retained_bytes(history, widest))
+    for marker in chain:
         _verify_catalog(workspace, marker)
         delta = tuple(deltas.get(str(marker["generation_id"]), ()))
         _sealed_publication(workspace, marker, delta, held)
@@ -1202,16 +1206,20 @@ def load_pinned_observations(
     return PinnedObservationSeries(pin, history, definition)
 
 
-def _retained_bytes(history: History) -> int:
-    """Estimate what a loaded feature history holds live, as the chain admission does.
+def _retained_bytes(history: History, domain: str = "feature_values") -> int:
+    """Estimate what a loaded history holds live, as the chain admission does.
 
     Mirrors market's chain estimate term for term: a fixed base, 1024 per
     contributing generation, and the per-row and per-character terms. The
     per-generation term is not optional here, because the grouped index this reader
     keeps beside the rows also costs one entry per generation, and omitting it
     undercharges a panel published as many bounded chunks by exactly that much.
+
+    The per-row term is the domain's own column count: prices and fundamentals are
+    wider than feature_values, and charging every domain with the narrowest schema
+    would undercharge them by the difference on every row.
     """
-    schema = COMMON + DOMAINS["feature_values"]
+    schema = COMMON + DOMAINS[domain]
     generations = len({str(row["generation_id"]) for row in history})
     characters = sum(
         len(value) for row in history for value in row.values() if isinstance(value, str)
