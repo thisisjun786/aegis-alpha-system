@@ -99,13 +99,16 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   `executable_prices` all false under `research-uncertified`) and must name its own
   `preparation_source_sha256`, because the engine identity does not cover the code that
   makes the declared path's decisions. The result must name `declared_uncertified_research`
-  and repeat `certified` false, `non_executable` true and `executable_prices` false. Both
-  are checked on the candidate before anything is sealed and again on re-derivation, so a
-  rejected result leaves the run open for a corrected retry rather than being
-  authenticated by the manifest built over it. Storage checks those claims and not the
-  inputs a document repeats: the declaration is the authority on its own pins and is
-  stored beside the run, so a reader compares the two documents instead of storage
-  becoming a second copy of that contract.
+  and carry every fixed claim such a response holds: `non_executable` true, and
+  `certified`, `executable_prices`, `source_pins_verified`, `observed_prices_verified`,
+  `point_in_time_verified` and `live_orders` all false. All seven, because pinning a
+  subset would leave the rest free to say the opposite while the pinned ones still read
+  correctly. Both documents are checked on the candidate before anything is sealed and
+  again on re-derivation, so a rejected result leaves the run open for a corrected retry
+  rather than being authenticated by the manifest built over it. Storage checks those
+  claims and not the inputs a document repeats: the declaration is the authority on its
+  own pins and is stored beside the run, so a reader compares the two documents instead
+  of storage becoming a second copy of that contract.
 - `backtest_requests` stores both request contracts under one content identity: exactly
   canonical bytes, a hash over those bytes, and bindings that agree with the registered
   bundle. An `aas-research-run-v2` declaration carries no bindings array, so its bundle is

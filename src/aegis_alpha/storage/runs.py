@@ -73,7 +73,19 @@ _RESEARCH_STATUS = ("certified", "point_in_time_certified", "executable_prices")
 # imported, like every other document literal this module knows, because storage never
 # imports application code.
 _DECLARED_RESEARCH_MODE = "declared_uncertified_research"
-_DECLARED_RESULT_STATUS = {"certified": False, "non_executable": True, "executable_prices": False}
+# Every fixed claim such a result carries, not only the ones the declared mode adds. The
+# first four are stamped on any response and the last three only on a declared one, but a
+# declared result carries all seven, so pinning a subset would leave the rest free to say
+# the opposite while the pinned ones still read correctly.
+_DECLARED_RESULT_STATUS = {
+    "source_pins_verified": False,
+    "observed_prices_verified": False,
+    "point_in_time_verified": False,
+    "live_orders": False,
+    "certified": False,
+    "non_executable": True,
+    "executable_prices": False,
+}
 _MEDIA_TYPE = "application/json"
 _SHA_LENGTH = 64
 # A sealed document is decoded whole, so it is charged at the expansion the state

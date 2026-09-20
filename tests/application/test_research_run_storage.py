@@ -38,6 +38,7 @@ from aegis_alpha.storage.input_pins import BUNDLE_SCHEMA, HASH_FORMAT, register_
 from aegis_alpha.storage.market_inputs import GenerationPin, admit_native_input
 from aegis_alpha.storage.run_schema import RESEARCH_REQUEST_SCHEMA, migrate_run_schema
 from aegis_alpha.storage.runs import (
+    _DECLARED_RESULT_STATUS,
     RunIntent,
     RunResult,
     RunStorageError,
@@ -405,10 +406,10 @@ def _stored_result(home: Path, run_id: str) -> bytes:
         return _read_sealed(workspace, run_id, "backtest.json")
 
 
-# What the runner stamps on a declared result. A later reader has to be able to take
-# these at face value, which is what makes them worth checking through storage rather
-# than only where they are produced.
-DECLARED_STATUS = {"certified": False, "non_executable": True, "executable_prices": False}
+# What storage pins on a declared result. Used here against a real response rather than
+# restated, because the runner writes these as literals and a live document is the only
+# honest mirror: if either side moves, this fails instead of drifting.
+DECLARED_STATUS = _DECLARED_RESULT_STATUS
 
 
 def test_the_declared_status_survives_recording_requery_and_restore(
@@ -457,7 +458,8 @@ def test_an_edited_result_stops_the_run_reading_back(
     sealed = cast("Document", json.loads(original))
     for edit, refusal in (
         ({"non_executable": False}, r"uncertified status"),
-        ({"live_orders": True}, r"disagrees with the sealed evidence"),
+        # Prose the status rules say nothing about, so this one has to fail on identity.
+        ({"execution_convention": "something nobody sealed"}, r"disagrees with the sealed"),
     ):
         # Rewritten canonically, so what fails is the change rather than its spelling.
         _ = artifact.write_bytes(canonical_json_bytes(sealed | edit))
@@ -477,6 +479,10 @@ def test_an_edited_result_stops_the_run_reading_back(
         ("certified", True),
         ("non_executable", False),
         ("executable_prices", True),
+        ("source_pins_verified", True),
+        ("observed_prices_verified", True),
+        ("point_in_time_verified", True),
+        ("live_orders", True),
     ],
 )
 def test_a_result_claiming_more_than_a_declared_run_may_seals_nothing(
