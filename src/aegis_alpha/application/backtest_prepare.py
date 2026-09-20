@@ -8,10 +8,11 @@ legacy export; the engine receives only explicit, decision-local values.
 from __future__ import annotations
 
 import hashlib
+import math
 import platform
 import re
 import sys
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, getcontext
@@ -21,6 +22,13 @@ from itertools import pairwise
 from types import MappingProxyType
 from typing import Literal, cast
 
+from aegis_alpha.application.backtest_cli import DECLARED_RESEARCH_MODE
+from aegis_alpha.application.research_run import (
+    FILL_CONVENTION,
+    PreparationRecord,
+    ResearchRunRequest,
+    declared_provenance,
+)
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
@@ -60,10 +68,12 @@ from aegis_alpha.storage.input_pins import (
 from aegis_alpha.storage.market_inputs import (
     GenerationPin,
     History,
+    PinnedObservationSeries,
     PinnedPriceSeries,
     PriceInputRequest,
     ReaderMode,
     admit_native_input,
+    load_pinned_observations,
     load_pinned_prices,
     load_pinned_proxy,
     load_pinned_sessions,
@@ -80,9 +90,12 @@ from aegis_alpha.storage.workspace import Workspace
 __all__ = [
     "PrepareRequest",
     "PreparedBacktest",
+    "PreparedResearchRun",
     "StrategyPin",
     "parse_prepare_request",
     "prepare_backtest",
+    "prepare_research_run",
+    "research_source_identity",
 ]
 
 _J = "aas-canonical-json-sha256-v1"
@@ -1008,16 +1021,59 @@ def _outcomes(
 
 
 def _types(workspace: Workspace, prices: tuple[_Prices, ...]) -> dict[str, str]:
+    return _instrument_types(
+        workspace,
+        (
+            instrument
+            for item in prices
+            if item.role == "execution_prices"
+            for instrument in item.series.request.instrument_ids
+        ),
+    )
+
+
+def _instrument_types(workspace: Workspace, instruments: Iterable[str]) -> dict[str, str]:
+    """Classify every execution instrument from the store, never from the request."""
     result = {}
-    for item in prices:
-        if item.role == "execution_prices":
-            for instrument in item.series.request.instrument_ids:
-                row = workspace.state.execute(
-                    "SELECT asset_type FROM instruments WHERE instrument_id=?", (instrument,)
-                ).fetchone()
-                if row is None or row[0] != "etf":
-                    raise ValueError("execution instrument is not an explicitly classified ETF")
-                result[instrument] = "ETF"
+    for instrument in instruments:
+        row = workspace.state.execute(
+            "SELECT asset_type FROM instruments WHERE instrument_id=?", (instrument,)
+        ).fetchone()
+        if row is None or row[0] != "etf":
+            raise ValueError("execution instrument is not an explicitly classified ETF")
+        result[instrument] = "ETF"
+    return result
+
+
+def _observation_types(
+    workspace: Workspace, mapping: Mapping[str, str], observed: set[str]
+) -> dict[str, str]:
+    """Classify a declared run's instruments from the series they were read from.
+
+    The declaration renames an observation series to the asset id a strategy knows, but
+    it cannot change what the series is. The type therefore travels with the source: the
+    store says research_observation and the envelope says OBSERVATION. Nothing is
+    relabelled as an ETF to make the accounting accept it.
+
+    A mapping entry naming a registered series that neither panel carries would put an
+    instrument in the envelope that no observation stands behind, so the map has to name
+    what was actually read and nothing else.
+    """
+    absent = sorted(set(mapping) - observed)
+    if absent:
+        raise ValueError(
+            "instrument_map names series no pinned panel carries: " + ", ".join(absent)
+        )
+    result = {}
+    for series, instrument in sorted(mapping.items()):
+        row = workspace.state.execute(
+            "SELECT asset_type FROM instruments WHERE instrument_id=?", (series,)
+        ).fetchone()
+        if row is None or row[0] != "research_observation":
+            raise ValueError(
+                "observation series is not a classified research observation: " + series
+            )
+        result[instrument] = "OBSERVATION"
     return result
 
 
@@ -1231,7 +1287,7 @@ def prepare_backtest(
         for raw in conventions
         if _row(decode_json(raw))["kind"] == "calendar"
     )
-    cutoff, history, period = (_row(body[key]) for key in ("cutoff", "history", "period"))
+    cutoff, history = (_row(body[key]) for key in ("cutoff", "history"))
     visibility = _Visibility(
         cast("ReaderMode", cutoff["mode"]),
         cast("int", cutoff["knowledge_cutoff_us"]),
@@ -1240,6 +1296,7 @@ def prepare_backtest(
         _day(history["end"]),
     )
     loader = _Loader(workspace, budget, bindings)
+    period = _row(body["period"])
     sessions_pin = _generation(bindings["sessions", 0])
     loader.native(sessions_pin, "aas-sessions-transform-v1")
     sessions = load_pinned_sessions(workspace, sessions_pin, budget=budget).history
@@ -1334,6 +1391,581 @@ def prepare_backtest(
     )
     return PreparedBacktest(
         request, definition, slots, decisions, features, inputs, projection, envelope, provenance
+    )
+
+
+# A declared run is named by its own content, so two identical declarations over one
+# installation name one run rather than looking like two results.
+RESEARCH_RUN_ID_SCHEMA = "aas-research-run-id-v1"
+# The declared path's own decisions are made here and in the contract module, and the
+# engine identity covers neither, so a declared run names their source itself.
+RESEARCH_SOURCE_SCHEMA = "aas-research-sources-v1"
+# A decision needs a session to fill on, so one observed session is not a period.
+_MINIMUM_RESEARCH_SESSIONS = 2
+RESEARCH_SOURCE_MODULES = (
+    "aegis_alpha.application.backtest_prepare",
+    "aegis_alpha.application.research_run",
+)
+# What this installation can actually carry out. The engine contract evaluates at the
+# prior calendar month end and the accounting fills at the next supplied session open,
+# so a declaration naming anything else would be sealed over a different calculation.
+_HONOURED_BASIS = "M"
+
+
+def research_source_identity() -> str:
+    """Hash the modules that decide a declared run, so its identity tracks its code."""
+    root = files("aegis_alpha")
+    return content_sha256(
+        {
+            "schema": RESEARCH_SOURCE_SCHEMA,
+            "hash_format": _J,
+            "files": [
+                {
+                    "module": module,
+                    "sha256": hashlib.sha256(
+                        root.joinpath(
+                            module.removeprefix("aegis_alpha.").replace(".", "/") + ".py"
+                        ).read_bytes()
+                    ).hexdigest(),
+                }
+                for module in RESEARCH_SOURCE_MODULES
+            ],
+        }
+    )
+
+
+def _require_honourable(declaration: ResearchRunRequest) -> None:
+    """Refuse a declaration this installation cannot actually carry out.
+
+    A declaration that runs but is not what ran is worse than a refusal: the sealed
+    document would describe one calculation while the envelope performed another. The
+    engine evaluates at the prior calendar month end, so a daily basis would be sealed
+    over a monthly schedule, and the accounting fills at the next supplied session
+    open, so a decision-close fill would be sealed over a next-open execution.
+    """
+    if declaration.semantics.data_basis != _HONOURED_BASIS:
+        raise ValueError(
+            "this installation evaluates at month end; a "
+            + declaration.semantics.data_basis
+            + " basis cannot be honoured"
+        )
+    if declaration.semantics.fill_price != FILL_CONVENTION:
+        raise ValueError(
+            "the accounting fills at the next supplied session open; "
+            + declaration.semantics.fill_price
+            + " cannot be honoured"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedResearchRun:
+    """A declared uncertified research run: its decisions, its envelope, its declaration."""
+
+    declaration: ResearchRunRequest
+    definition: ExecutionDefinition
+    slots: tuple[DecisionSlot, ...]
+    decisions: tuple[ReplayReceipt, ...]
+    inputs: EnvelopeInputs
+    envelope: EnvelopeExport
+    provenance: bytes
+    certified: bool = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        """Freeze what a caller could otherwise edit after the bytes were sealed.
+
+        The envelope and the declaration are already immutable bytes. The decision and
+        price mappings beside them were not, so a caller could change what the result
+        appears to have run on while its sealed hashes stayed the same.
+        """
+        object.__setattr__(self, "slots", tuple(self.slots))
+        object.__setattr__(self, "decisions", tuple(self.decisions))
+        values = self.inputs
+        object.__setattr__(
+            self,
+            "inputs",
+            EnvelopeInputs(
+                tuple(values.dates),
+                cast("tuple[Mapping[str, float], ...]", _frozen(values.opens)),
+                cast("tuple[Mapping[str, float], ...]", _frozen(values.closes)),
+                cast("Mapping[date, Mapping[str, float]]", _frozen(values.targets)),
+                cast("Mapping[str, str]", _frozen(values.instrument_types)),
+                tuple(values.source_pins),
+            ),
+        )
+
+    @property
+    def run_id(self) -> str:
+        """The run's own content, not a fresh name.
+
+        A generated identifier would make two identical runs look like two results. This
+        one is derived from the declaration, the envelope it produced and the sealed
+        provenance, so the same declaration over the same installation always names the
+        same run, and any change to inputs, conventions or engine identity names a
+        different one. That is what makes a requery meaningful without a run record.
+        """
+        return "research-" + content_sha256(
+            {
+                "schema": RESEARCH_RUN_ID_SCHEMA,
+                "hash_format": _J,
+                "declaration_sha256": self.declaration.request_sha256,
+                "envelope_sha256": self.envelope.envelope_sha256,
+                "provenance_sha256": hashlib.sha256(self.provenance).hexdigest(),
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _Observed:
+    """One pinned observation panel, already resolved onto declared instruments.
+
+    The engine never sees an aas-obs- series identifier. Mapping happens here, once,
+    against the declaration, so an unmapped series is a refusal rather than a silently
+    dropped asset the calculation would then run without.
+    """
+
+    role: str
+    values: Mapping[str, Mapping[date, float]]
+    observed: Mapping[str, Mapping[date, date]]
+    known_us: Mapping[str, Mapping[date, int]]
+    series: frozenset[str]
+    calendar_ref: str
+
+
+def _declared_pin(reference: object) -> GenerationPin:
+    return GenerationPin(
+        *(
+            getattr(reference, name)
+            for name in ("dataset_id", "version", "generation_id", "chain_hash", "manifest_hash")
+        )
+    )
+
+
+def _mapped_panel(
+    series: PinnedObservationSeries,
+    declaration: ResearchRunRequest,
+    visibility: _Visibility,
+    role: str,
+    calendar_ref: str,
+) -> _Observed:
+    """Project one panel at the declared ceiling and resolve its series onto instruments."""
+    values: dict[str, dict[date, float]] = {}
+    observed: dict[str, dict[date, date]] = {}
+    known: dict[str, dict[date, int]] = {}
+    read: set[str] = set()
+    # Observed-snapshot projection deliberately ignores knowledge times, so the declared
+    # ceiling has to be applied before head selection rather than after. Filtering later
+    # would drop a future-known revision and lose the value it superseded; filtering here
+    # leaves the older revision as the head, which is what was knowable at the ceiling.
+    admissible = replace(series, history=visibility.candidates(series.history, visibility.ceiling))
+    for row in admissible.project_as_of(visibility.ceiling, mode=visibility.mode).rows:
+        name = _text(row["instrument_id"])
+        instrument = declaration.instrument_map.get(name)
+        if instrument is None:
+            raise ValueError("observation series " + name + " has no declared instrument mapping")
+        read.add(name)
+        if row["value_state"] != "present":
+            continue
+        if row["available_at_us"] is not None and cast("int", row["available_at_us"]) > (
+            visibility.ceiling
+        ):
+            # A row the panel itself says was unavailable at the declared instant is not
+            # admitted by the declaration, which claims every row precedes it.
+            continue
+        at_us = cast("int", row["feature_at_us"])
+        session = _utc_day(at_us)
+        if session in values.setdefault(instrument, {}):
+            raise ValueError("observation panel repeats one session for " + instrument)
+        values[instrument][session] = _number(row["value"])
+        # No knowledge time is manufactured: the panel carries none, so each row's own
+        # economic session stands and the declaration records that axis as uncertified.
+        observed.setdefault(instrument, {})[session] = visibility.observed(row, session)
+        known.setdefault(instrument, {})[session] = at_us
+    return _Observed(role, values, observed, known, frozenset(read), calendar_ref)
+
+
+def _observation_panels(
+    loader: _Loader, declaration: ResearchRunRequest, visibility: _Visibility
+) -> dict[str, _Observed]:
+    """Read every declared observation generation through its own uncertified reader."""
+    loaded: dict[str, _Observed] = {}
+    semantics: dict[str, tuple[str, ...]] = {}
+    for declared in declaration.observations:
+        pin = _declared_pin(declared)
+        series = load_pinned_observations(loader.workspace, pin, budget=loader.budget)
+        contract = _row(decode_json(series.definition.encode()))
+        role = _text(contract["observation_role"])
+        if role != declared.observation_role:
+            raise ValueError("observation role disagrees with the declared pin")
+        if (contract["price_role"], contract["certified"]) != ("reference", False):
+            # A certified or canonical series belongs on the strict path, which admits
+            # it through the native price transform this preparation never calls.
+            raise ValueError("a research run admits only uncertified reference observations")
+        if _text(contract["currency"]) != declaration.conventions.currency:
+            raise ValueError("observation currency is not the declared account currency")
+        loader.retain(pin.generation_id, series.history)
+        if role in loaded:
+            raise ValueError("two declared observations carry the same role")
+        loaded[role] = _mapped_panel(
+            series,
+            declaration,
+            visibility,
+            role,
+            canonical_json_bytes(contract["calendar_ref"]).decode(),
+        )
+        semantics[role] = (
+            *(_text(contract[key]) for key in ("basis", "adjustment", "value_domain")),
+            canonical_json_bytes(contract["calendar_ref"]).decode(),
+        )
+    if sorted(loaded) != ["close", "open"]:
+        # Signals read the close panel and fills read the open one. Without both, the
+        # accounting would have to reuse one for the other and call it an execution.
+        raise ValueError("a declared research run needs one open and one close panel")
+    if len(set(semantics.values())) != 1:
+        # Signals come from one panel and fills from the other, into one account. If the
+        # two disagree on basis, adjustment or calendar, that account is marked in a
+        # mixture nobody declared and the envelope would not say so.
+        raise ValueError("the open and close panels disagree on basis, adjustment or calendar")
+    return loaded
+
+
+def _research_membership(
+    loader: _Loader, declaration: ResearchRunRequest, bundle: EngineBundle
+) -> EnsembleMembership:
+    """Resolve the membership the strategy's own contract already names."""
+    reference = declaration.membership
+    raw = read_definition(
+        loader.workspace,
+        DefinitionPin(reference.kind, reference.id, reference.version, reference.hash),
+        budget=loader.budget,
+    )
+    body = _row(decode_json(raw))
+    membership = EnsembleMembership(
+        tuple(
+            MembershipRow(_text(row["name"]), Decimal(_text(row["weight"])))
+            for row in _rows(body["rows"])
+        ),
+        _text(body["membership_sha256"]),
+    )
+    if {row.name for row in membership.rows} != {
+        strategy.name for strategy in bundle.contract.pack
+    }:
+        raise ValueError("ensemble membership must name the exact strategy pack")
+    if bundle.contract.ensemble_membership_reference != "ensemble:" + membership.membership_sha256:
+        raise ValueError("ensemble membership digest disagrees with strategy")
+    loader.retain("membership:" + reference.id, body)
+    return membership
+
+
+def _research_decisions(
+    bundle: EngineBundle,
+    definition: ExecutionDefinition,
+    slots: tuple[DecisionSlot, ...],
+    visibility: _Visibility,
+    loaded: tuple[EnsembleMembership, Mapping[str, _Observed]],
+) -> tuple[ReplayReceipt, ...]:
+    """Evaluate the registered strategy at each decision through the ordinary engine.
+
+    Each decision sees only the sessions at or before its own cutoff, so nothing later
+    than the decision reaches its features. The knowledge axis stays declared and the
+    economic axis stays honest, which is exactly the split the declaration records.
+    """
+    membership, panels = loaded
+    close = panels["close"]
+    receipts = []
+    for slot in slots:
+        points = {
+            instrument: tuple(
+                PricePoint(session, value, close.observed[instrument][session])
+                for session, value in sorted(series.items())
+                # The declared history window bounds what a signal may look back on, as
+                # it does on the executable path. It does not bound the marking panels:
+                # a period legitimately extends past the lookback window it warmed up on.
+                if visibility.history_start <= session <= visibility.history_end
+                and close.known_us[instrument][session] <= slot.cutoff_us
+            )
+            for instrument, series in close.values.items()
+        }
+        _warmup(definition, points, slot, visibility)
+        receipts.append(
+            replay(
+                bundle,
+                ReplayRequest(slot.decision_date, slot.decision_date, points, {}, {}, membership),
+                knowledge_as_of=_utc_day(slot.cutoff_us),
+            )
+        )
+    return tuple(receipts)
+
+
+def _research_outcomes(
+    panels: Mapping[str, _Observed], dates: tuple[date, ...]
+) -> tuple[tuple[Mapping[str, float], ...], tuple[Mapping[str, float], ...]]:
+    """Mark the period from the separately pinned open and close panels."""
+    marked = {
+        role: tuple(
+            {
+                instrument: series[day]
+                for instrument, series in panels[role].values.items()
+                if day in series
+            }
+            for day in dates
+        )
+        for role in ("open", "close")
+    }
+    return marked["open"], marked["close"]
+
+
+def _research_targets(
+    receipt: ReplayReceipt, definition: ExecutionDefinition
+) -> Mapping[str, float]:
+    """Take the ensemble weights as instruments. No proxy stands in for a logical asset."""
+    result: dict[str, float] = {}
+    for logical, weight in receipt.ensemble.items():
+        if logical not in definition.cash_asset_ids and weight > 0:
+            result[logical] = result.get(logical, 0.0) + weight
+    return MappingProxyType(result)
+
+
+def _research_envelope(declaration: ResearchRunRequest, inputs: EnvelopeInputs) -> EnvelopeExport:
+    """Write the accounting envelope directly, because no executable request can hold it.
+
+    An aas-backtest-request-v1 refuses to name a reference series as an execution input,
+    which is correct and stays that way. The declaration is what stands behind these
+    bytes instead, and the sealed provenance says so.
+    """
+    document = {
+        "schema_version": "aas-etf-backtest-v1",
+        "module": "aegis",
+        "instrument_types": dict(sorted(inputs.instrument_types.items())),
+        "dates": [day.isoformat() for day in inputs.dates],
+        "opens": [dict(sorted(row.items())) for row in inputs.opens],
+        "closes": [dict(sorted(row.items())) for row in inputs.closes],
+        "targets": {
+            day.isoformat(): dict(sorted(weights.items()))
+            for day, weights in sorted(inputs.targets.items())
+        },
+        "initial_cash": declaration.execution.initial_cash,
+        "cost": declaration.execution.cost,
+        "source_pins": [],
+        # The declared mode, which the strict request schema does not list, so the
+        # executable path cannot emit this envelope even by accident.
+        "research_mode": DECLARED_RESEARCH_MODE,
+    }
+    raw = canonical_json_bytes(document)
+    return EnvelopeExport(raw, hashlib.sha256(raw).hexdigest())
+
+
+def _require_fillable(inputs: EnvelopeInputs) -> None:
+    """Refuse what the panel cannot fill or mark, before the accounting discovers it.
+
+    A newly targeted symbol is not the whole requirement. On a rebalance session the
+    accounting also needs an open for everything already held, because a position
+    leaving the book is sold at that open, and on every session it needs a close for
+    everything still held, because that is what marks the account. A panel missing any
+    of those fails deep inside the replay with an arithmetic message that names neither
+    the session nor the instrument. This walks the same holdings the replay walks and
+    refuses with both. Nothing is filled in.
+    """
+    held: set[str] = set()
+    for index in range(1, len(inputs.dates)):
+        session, decision = inputs.dates[index], inputs.dates[index - 1]
+        weights = inputs.targets.get(decision)
+        if weights is not None:
+            wanted = {symbol for symbol, weight in weights.items() if weight > 0}
+            # Exactly the set the replay demands at a rebalance: what is on the book
+            # plus what is being bought, because the difference is what gets sold.
+            _require_observed(inputs.opens[index], held | wanted, session, "open")
+            held = wanted
+        _require_observed(inputs.closes[index], held, session, "close")
+
+
+def _require_observed(
+    prices: Mapping[str, float], symbols: set[str], session: date, role: str
+) -> None:
+    """Hold the panel to what the accounting calls usable: present, finite and positive."""
+    missing = sorted(
+        symbol
+        for symbol in symbols
+        if not isinstance(prices.get(symbol), (int, float))
+        or not math.isfinite(prices[symbol])
+        or prices[symbol] <= 0
+    )
+    if missing:
+        raise ValueError(
+            "the "
+            + role
+            + " panel has no usable observation on "
+            + session.isoformat()
+            + " for: "
+            + ", ".join(missing)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ResearchPlan:
+    """A schedule built from dates alone, because the panel carries no clock times."""
+
+    dates: tuple[date, ...]
+    slots: tuple[DecisionSlot, ...]
+
+
+def _panel_sessions(panel: _Observed) -> set[date]:
+    return {session for series in panel.values.values() for session in series}
+
+
+def _panel_cutoff(panel: _Observed, day: date) -> int:
+    """The last instant the panel actually recorded on this session.
+
+    Taken from the observations rather than from a clock nobody supplied. It is what
+    makes a decision see its own session and nothing after it.
+    """
+    return max(
+        at_us
+        for series in panel.known_us.values()
+        for session, at_us in series.items()
+        if session == day
+    )
+
+
+def _research_plan(
+    declaration: ResearchRunRequest, panels: Mapping[str, _Observed]
+) -> _ResearchPlan:
+    """Schedule month-end decisions over the sessions the panel itself observed.
+
+    engine.schedule requires an open and a close instant for every open session, and the
+    retained panel has neither; the declared calendar convention supplies none either.
+    Inventing hours would be wrong twice over, once because they are not observed and
+    again because daylight saving moves them. So the research path schedules on dates,
+    and each decision's cutoff is the last observation the panel recorded that day.
+    Nothing about the executable schedule changes: this path simply does not use it.
+    """
+    period = declaration.period
+    # Compared inside the declared period only. That is where the two panels are used
+    # together, so a difference outside it says nothing about this run.
+    observed = {
+        role: {day for day in _panel_sessions(panel) if period.start <= day <= period.end}
+        for role, panel in panels.items()
+    }
+    if observed["open"] != observed["close"]:
+        # Signals and fills would otherwise run on two different calendars.
+        raise ValueError("the open and close panels observe different sessions in the period")
+    dates = tuple(sorted(observed["close"]))
+    if len(dates) < _MINIMUM_RESEARCH_SESSIONS:
+        raise ValueError("the declared period holds fewer than two observed sessions")
+    following = dict(pairwise(dates))
+    month_end: dict[tuple[int, int], date] = {}
+    for day in dates:
+        month_end[day.year, day.month] = day
+    slots = tuple(
+        DecisionSlot(decision, following[decision], _panel_cutoff(panels["close"], decision))
+        for decision in sorted(month_end.values())
+        # The last observed session has nothing to fill on, and the accounting treats a
+        # decision without a following session as no trade rather than as an error.
+        if decision in following
+    )
+    if not slots:
+        raise ValueError("the declared period holds no month end with a session to fill on")
+    return _ResearchPlan(dates, slots)
+
+
+def prepare_research_run(
+    workspace: Workspace, declaration: ResearchRunRequest, *, budget: ComputeBudget
+) -> PreparedResearchRun:
+    """Prepare one declared uncertified research run over pinned observations.
+
+    This is the opt-in counterpart of prepare_backtest, and it is opt-in in the only way
+    that matters: it is a separate entry point the executable path never reaches.
+    admit_native_input still refuses the observation transform, the price reader still
+    refuses the pin for domain, and _reject_observation_contract still closes the derived
+    route. None of them is called here. The panel is read through
+    load_pinned_observations, the reader written for reference data, which returns
+    nothing at all under strict PIT.
+
+    The declaration is the whole provenance. An aas-backtest-request-v1 cannot describe
+    this run, because that contract requires execution prices to be canonical and
+    unadjusted and a reference observation is neither, so nothing here pretends one
+    stands behind it. Does not register a request, record a run, install a schema,
+    execute accounting, or fabricate a price, a knowledge time or a session.
+
+    Not every declared field is checkable, and the ones that are not stay assertions
+    rather than being presented as verified. Checked against stored evidence: the
+    knowledge time against the projection ceiling, the currency and role against each
+    observation contract, the instrument map against the series the panel actually
+    carries, the strategy pin against the private store, the membership digest against
+    the strategy contract, and the basis and fill convention against what this
+    installation can carry out. Recorded and not checked: the prose conventions and the
+    strategy semantics the engine does not consume, which is why the sealed document
+    keeps source_parity at unknown.
+    """
+    engine, environment = calculation_identity(), environment_identity()
+    _require_honourable(declaration)
+    bundle, definition = _stored_strategy(
+        workspace,
+        StrategyPin(
+            declaration.strategy_store_id,
+            declaration.strategy_id,
+            declaration.strategy_version,
+            declaration.strategy_raw_sha256,
+            declaration.strategy_contract_sha256,
+        ),
+    )
+    visibility = _Visibility(
+        "observed_snapshot_research",
+        declaration.conventions.knowledge_time_us,
+        None,
+        declaration.history.start,
+        declaration.history.end,
+    )
+    loader = _Loader(workspace, budget, {})
+    membership = _research_membership(loader, declaration, bundle)
+    if definition.derived_series or bundle.contract.macro_signals:
+        # The declaration pins observations and nothing else, so a strategy that reads a
+        # macro series or a derived one would reach the engine short of an input it was
+        # told to expect. Refused here rather than failing inside replay.
+        raise ValueError(
+            "a declared research run supplies only observed prices; "
+            "this strategy also requires macro or derived inputs"
+        )
+    panels = _observation_panels(loader, declaration, visibility)
+    read = {series for panel in panels.values() for series in panel.series}
+    plan = _research_plan(declaration, panels)
+    decisions = _research_decisions(
+        bundle, definition, plan.slots, visibility, (membership, panels)
+    )
+    opening, closing = _research_outcomes(panels, plan.dates)
+    inputs = EnvelopeInputs(
+        plan.dates,
+        opening,
+        closing,
+        {receipt.as_of: _research_targets(receipt, definition) for receipt in decisions},
+        _observation_types(workspace, declaration.instrument_map, read),
+        (),
+    )
+    _require_fillable(inputs)
+    envelope = _research_envelope(declaration, inputs)
+    if environment_identity() != environment:
+        raise ValueError("calculation context changed during preparation")
+    provenance = declared_provenance(
+        declaration,
+        PreparationRecord(
+            envelope_sha256=envelope.envelope_sha256,
+            engine=engine,
+            environment=environment,
+            preparation_source_sha256=research_source_identity(),
+            resolved_calendar={
+                "calendar_id": declaration.calendar.calendar_id,
+                "basis": declaration.calendar.basis,
+                # The caller names the research calendar; this is the reference the
+                # panels themselves carry, so the label cannot stand in for it.
+                "observed_calendar_ref": panels["close"].calendar_ref,
+                "sessions": len(plan.dates),
+                "first_session": plan.dates[0].isoformat(),
+                "last_session": plan.dates[-1].isoformat(),
+                "decisions": len(plan.slots),
+            },
+        ),
+    )
+    return PreparedResearchRun(
+        declaration, definition, plan.slots, decisions, inputs, envelope, provenance
     )
 
 
