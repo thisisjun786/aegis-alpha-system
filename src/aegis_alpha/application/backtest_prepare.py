@@ -1534,6 +1534,11 @@ def _mapped_panel(
             continue
         at_us = cast("int", row["feature_at_us"])
         session = _utc_day(at_us)
+        if not visibility.history_start <= session <= visibility.history_end:
+            # The declaration names the window this run read, and the sealed document
+            # records it. An observation outside it would reach the features while the
+            # provenance said it could not.
+            continue
         if session in values.setdefault(instrument, {}):
             raise ValueError("observation panel repeats one session for " + instrument)
         values[instrument][session] = _number(row["value"])

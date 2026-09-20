@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
@@ -351,7 +352,7 @@ def _observations(value: object) -> tuple[ObservationPinRef, ...]:
     return tuple(pins)
 
 
-def _instrument_map(value: object) -> dict[str, str]:
+def _instrument_map(value: object) -> Mapping[str, str]:
     if not isinstance(value, dict) or not value:
         raise ResearchRunError("instrument_map must be a non-empty object")
     mapped = {}
@@ -366,7 +367,10 @@ def _instrument_map(value: object) -> dict[str, str]:
         # Two series collapsing onto one instrument would silently pick a winner
         # inside the calculation, so refuse the ambiguity before it gets there.
         raise ResearchRunError("instrument_map maps two series onto one instrument")
-    return mapped
+    # Freezing a dataclass does not freeze what its fields hold. A caller that edited
+    # this mapping after parsing would have the run sealed under a declaration digest
+    # and a run identity computed from inputs it no longer uses.
+    return MappingProxyType(mapped)
 
 
 def _uncertainty(value: object) -> tuple[str, ...]:

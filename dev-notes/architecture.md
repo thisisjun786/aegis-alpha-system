@@ -96,8 +96,9 @@ identity·universe·입력 묶음 문서를 불변으로 등록·재해시하고
 거부하고 엄격 PIT는 여전히 아무것도 고르지 않으며, 패널은 참조 자료 전용 판독기인
 `load_pinned_observations` 로만 읽는다. `aas-backtest-request-v1` 은 체결 가격을
 조정 없는 canonical 자료로 묶어 두므로 참조 관측을 체결 입력으로 이름 붙일 수 없고, 그 거부는
-그대로 둔다. 그래서 선언 문서 `aas-research-run-v1` 이 세션 pin·membership·기간·이력·계정
-조건을 직접 들고 실행 근거가 된다. 결과는 `aas backtest` 봉투와
+그대로 둔다. 그래서 선언 문서 `aas-research-run-v2` 가 달력·membership·기간·이력·계정
+조건을 직접 들고 실행 근거가 된다. 패널은 세션 날짜만 있고 시각이 없으므로 달력은 관측된 날짜 집합으로
+선언하고(`observed-sessions-date-only`), 일정도 그 날짜 위에서 만든다. 결과는 `aas backtest` 봉투와
 `aas-prepared-research-run-v1` 봉인 문서이며, 실행 모드는 `research-uncertified` 로
 고정돼 소비자가 뒤집을 수 없다. run 식별자는 선언과 그것이 만든 봉투의 내용에서 나오므로 같은
 선언은 같은 run을 가리키고, 복원한 설치본에서 바이트 단위로 재현된다. 월별 기준 실행은
