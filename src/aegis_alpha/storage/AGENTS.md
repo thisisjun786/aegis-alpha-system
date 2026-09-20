@@ -41,7 +41,7 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
 - An observation extension continues one contract all the way down: each ancestor's
   pinned transform is re-read and must declare the same definition, because matching
   contract columns alone can come from the generic import route. Reads and
-  `verify_observation_publications` load each chain once and group rows by
+  `verify_feature_publications` load each chain once and group rows by
   generation, and that verifier's scan is ordered by `dataset_id, sequence` because
   its one-entry cache depends on a dataset's rows being contiguous. Those are
   correctness-adjacent: without them an ordinary read and `aas db verify` become

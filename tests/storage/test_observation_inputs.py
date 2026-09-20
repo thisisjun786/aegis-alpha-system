@@ -26,6 +26,7 @@ from aegis_alpha.storage import (
     publication,
     research_inputs,
 )
+from aegis_alpha.storage.backup import backup, restore
 from aegis_alpha.storage.raw import put_raw
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace
@@ -52,6 +53,10 @@ DECIMAL_SCALE = Decimal("0.000000000001")
 # An additively adjusted series legitimately falls below zero.
 NEGATIVE_OBSERVATION = -1.5
 CHUNKS = 2
+# Enough published points that the sealed document is worth about as much as the
+# retained chain once decoded, which is what separates a charged lease from an
+# uncharged one.
+POINTS = 150
 COMMON_FIELDS = frozenset(
     {
         "generation_id",
@@ -103,6 +108,7 @@ def _observation_spec(
         "extra_instruments": 0,
         "knowledge": None,
         "dataset": None,
+        "points": 1,
         **(options or {}),
     }
     instrument = str(settings["instrument"])
@@ -141,7 +147,18 @@ def _observation_spec(
     row["record_id"] = _hash_json(
         ["aas-record-v1", "feature_values", [[key, row[key]] for key in natural]]
     )
-    spec = _spec(workspace, path, [row])
+    # Extra points only make the published document larger, which is what the charge
+    # for the sealed document a verifier holds live is measured against. One point
+    # reproduces the single-row spec exactly.
+    points = [row]
+    for offset in range(1, int(str(settings["points"]))):
+        extra = {**row, "feature_at_us": int(str(settings["feature_at_us"])) + offset}
+        extra["revision_id"] = str(row["revision_id"]) + "-" + str(offset)
+        extra["record_id"] = _hash_json(
+            ["aas-record-v1", "feature_values", [[key, extra[key]] for key in natural]]
+        )
+        points.append(extra)
+    spec = _spec(workspace, path, points)
     document = json.loads(spec.read_bytes())
     for key in ("price", "calendar", "decimal_conversion"):
         del document[key]
@@ -646,6 +663,79 @@ def test_upstream_panel_is_admitted_before_it_is_hashed(tmp_path: Path) -> None:
         assert document.rows
 
 
+def _lose_observation_contract(state_path: Path, name: str) -> None:
+    """Lose one contract and its child inputs on the closed file, schema intact.
+
+    Losing rows is an external event, so it is simulated on the closed file. The
+    immutability triggers are restored so the schema still matches its checksum and only
+    the rows are missing, which is the situation being tested.
+    """
+    with closing(sqlite3.connect(state_path)) as raw_state:
+        triggers = [
+            row[0]
+            for row in raw_state.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name IN "
+                "('feature_contracts','feature_inputs') AND sql LIKE '%DELETE%'"
+            )
+        ]
+        for table in ("feature_contracts", "feature_inputs"):
+            _ = raw_state.execute("DROP TRIGGER IF EXISTS immutable_" + table + "_delete")
+        for table in ("feature_inputs", "feature_contracts"):
+            _ = raw_state.execute(
+                "DELETE FROM " + table + " WHERE name=?",  # noqa: S608 -- fixed table names
+                (name,),
+            )
+        for statement in triggers:
+            _ = raw_state.execute(statement)
+        raw_state.commit()
+
+
+def _generic_feature_import(workspace: Workspace) -> None:
+    """Commit one generic feature_values import: an opaque commitment, no preimage kept.
+
+    This is what the offline import route leaves behind. dataset_versions.transform_hash
+    is NOT NULL, so this generation carries a 64-hex pointer exactly like a native one,
+    while raw/ holds nothing under it.
+    """
+    raw = canonical_json_bytes(
+        {
+            "schema_version": "aas-market-import-v1",
+            "dataset_id": "generic-features",
+            "version": "1",
+            "generation_id": "generic-features",
+            "operation_id": "op-generic-features",
+            "parent_id": None,
+            "domain": "feature_values",
+            "provider": "synthetic",
+            "publication_at_us": None,
+            "normalizer_version": "synthetic-v1",
+            "transform_sha256": hashlib.sha256(b"unretained generic transform").hexdigest(),
+            "instruments": [
+                {"instrument_id": "ASSET_G", "asset_type": "equity", "venue": "SYNTHETIC"}
+            ],
+            "rows": [
+                {
+                    "contract_id": "GENERIC",
+                    "contract_version": "1",
+                    "contract_hash": "b" * 64,
+                    "input_bundle_hash": "c" * 64,
+                    "instrument_id": "ASSET_G",
+                    "feature_at_us": 20,
+                    "value": 1.5,
+                    "value_state": "present",
+                    "revision_id": "generic-r1",
+                    "supersedes_revision_id": None,
+                    "op": "ASSERT",
+                    "available_at_us": 20,
+                    "revision_known_at_us": 20,
+                    "ingested_at_us": 30,
+                }
+            ],
+        }
+    )
+    _ = publication.publish_document(workspace, import_document.parse_import(raw))
+
+
 def test_db_verify_fails_when_an_observation_contract_is_lost(tmp_path: Path) -> None:
     # Given a committed observation publication whose SQLite contract rows are later
     # lost while the DuckDB generation and its catalog entry remain.
@@ -655,27 +745,7 @@ def test_db_verify_fails_when_an_observation_contract_is_lost(tmp_path: Path) ->
         _ = _register_domain(workspace, spec, "observation")
         assert verify_workspace(workspace, budget=BUDGET)
         state_path = workspace.paths.state
-    # Losing rows is an external event, so it is simulated on the closed file. The
-    # immutability triggers are restored so the schema still matches its checksum
-    # and only the rows are missing, which is the situation being tested.
-    with closing(sqlite3.connect(state_path)) as raw_state:
-        triggers = [
-            row[0]
-            for row in raw_state.execute(
-                "SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name IN "
-                "('feature_contracts','feature_inputs') AND sql LIKE '%DELETE%'"
-            )
-        ]
-        for name in ("feature_contracts", "feature_inputs"):
-            _ = raw_state.execute("DROP TRIGGER IF EXISTS immutable_" + name + "_delete")
-        for table in ("feature_inputs", "feature_contracts"):
-            _ = raw_state.execute(
-                "DELETE FROM " + table + " WHERE name=?",  # noqa: S608 -- fixed table names
-                ("OBSERVED/close",),
-            )
-        for statement in triggers:
-            _ = raw_state.execute(statement)
-        raw_state.commit()
+    _lose_observation_contract(state_path, "OBSERVED/close")
     # When the workspace is verified, Then the orphaned publication fails instead of
     # an empty contract scan reporting success.
     with (
@@ -718,3 +788,81 @@ def test_live_transform_is_charged_before_the_upstream_is_admitted(tmp_path: Pat
                 expected_schema="aas-observation-transform-v1",
                 budget=BUDGET,
             )
+
+
+def _sealed_bytes(workspace: Workspace, pin: market_inputs.GenerationPin) -> bytes:
+    marker = market.marker_for(workspace.market, pin.generation_id)
+    digest = str(marker["request_hash"])
+    return (workspace.paths.raw / digest[:2] / digest).read_bytes()
+
+
+def _lease(materialization_bytes: int) -> ComputeBudget:
+    """One lease whose Python materialization allowance is exactly the measured size.
+
+    DuckDB keeps three quarters of a budget's memory limit, so the allowance a caller
+    can materialize under is the remaining quarter.
+    """
+    budget = ComputeBudget(Fraction(1), 4 * materialization_bytes)
+    assert budget.available_bytes == materialization_bytes
+    return budget
+
+
+def test_a_generic_feature_import_coexists_with_an_observation_publication(
+    tmp_path: Path,
+) -> None:
+    # Given one observation publication and one generic feature_values import, whose
+    # transform_sha256 is an opaque commitment no preimage was ever retained for.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        spec = _observation_spec(workspace, tmp_path / "mixed.sqlite3")
+        _ = _register_domain(workspace, spec, "observation")
+        _generic_feature_import(workspace)
+        # When the workspace is verified, Then the opaque commitment is left closed
+        # rather than opened as a native transform, and the observation publication
+        # beside it is still authenticated.
+        assert verify_workspace(workspace, budget=BUDGET)["verified"]
+        state_path = workspace.paths.state
+    # Backup and restore run the same verifier, so they carry the same coexistence.
+    archive, target = tmp_path / "backup", tmp_path / "restored"
+    backup(tmp_path / "home", archive)
+    assert restore(archive, target)["restored"]
+    _lose_observation_contract(state_path, "OBSERVED/close")
+    # And when the contract rows are lost, the scan still fails: a generic import in
+    # the same workspace does not hide the orphaned publication.
+    with (
+        open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace,
+        pytest.raises(ValueError, match="no registered contract"),
+    ):
+        _ = verify_workspace(workspace, budget=BUDGET)
+
+
+def test_the_sealed_document_is_charged_while_its_publication_is_verified(
+    tmp_path: Path,
+) -> None:
+    # Given a committed observation publication whose sealed import document is
+    # significant against the lease that classifies and verifies it.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        spec = _observation_spec(workspace, tmp_path / "sealed.sqlite3", options={"points": POINTS})
+        _ = _register_domain(workspace, spec, "observation")
+        pin = _pin(workspace, "sealed")
+        sealed = len(_sealed_bytes(workspace, pin))
+        history = market_inputs.load_pinned_observations(workspace, pin, budget=BUDGET).history
+        retained = market_inputs._retained_bytes(history)  # noqa: SLF001 -- accounting under test
+        identity = ("OBSERVED/close", "v1")
+        # A lease that carries the retained chain and one read of that document, but
+        # cannot also hold the document live while the chain is verified.
+        lease = _lease(32 * sealed + 3 * retained // 2)
+        # Ignoring what the classifier holds live, the publication verifies.
+        assert (
+            market_inputs._verify_observation_publication(  # noqa: SLF001 -- the charge is under test
+                workspace, pin, {identity}, {}, lease
+            )
+            == identity
+        )
+        # Charging it, as the scan now does before it hands the lease down, refuses
+        # inside the lease instead of allocating outside it.
+        with pytest.raises(ComputeResourceError, match="chain memory estimate"):
+            market_inputs.verify_feature_publications(workspace, budget=lease)
+        # A lease that can carry both still verifies the whole workspace.
+        assert verify_workspace(workspace, budget=BUDGET)["verified"]

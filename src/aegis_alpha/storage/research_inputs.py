@@ -73,6 +73,7 @@ _KINDS = {
     "observation": ("feature_values", "observation"),
 }
 OBSERVATION_DEFINITION_SCHEMA = "aas-observation-definition-v1"
+OBSERVATION_TRANSFORM_SCHEMA = "aas-observation-transform-v1"
 _OBSERVATION = frozenset(
     {
         "series_id",
@@ -349,29 +350,40 @@ def _mapped_rows(workspace: Workspace, transform: _Transform) -> list[dict[str, 
     return rows
 
 
-def _input_document(transform: _Transform, rows: list[dict[str, object]]) -> ImportDocument:
+def _input_document(
+    transform: _Transform, rows: list[dict[str, object]], *, declared_schema: str | None = None
+) -> ImportDocument:
+    """Seal one publication, optionally declaring the retained transform behind it.
+
+    A route that retains its exact transform bytes declares that transform's schema
+    here, so a later reader classifies the publication from evidence the generation
+    chain already covers instead of from catalog state anybody can edit. A generic
+    offline import declares nothing, because its transform_sha256 is an opaque
+    commitment whose preimage it never retained.
+    """
     for row in rows:
         normalize_rows(transform.domain, _text(row["generation_id"]), [row])
-    payload = canonical_json_bytes(
-        {
-            **transform.dataset,
-            "schema_version": "aas-market-import-v1",
-            "domain": transform.domain,
-            **{
-                key: transform.body[key]
-                for key in ("provider", "publication_at_us", "normalizer_version", "instruments")
-            },
-            "transform_sha256": transform.sha256,
-            "rows": [
-                {
-                    key: value
-                    for key, value in row.items()
-                    if key not in {"generation_id", "source_snapshot_id", "source_row_hash"}
-                }
-                for row in rows
-            ],
-        }
-    )
+    body: dict[str, object] = {
+        **transform.dataset,
+        "schema_version": "aas-market-import-v1",
+        "domain": transform.domain,
+        **{
+            key: transform.body[key]
+            for key in ("provider", "publication_at_us", "normalizer_version", "instruments")
+        },
+        "transform_sha256": transform.sha256,
+        "rows": [
+            {
+                key: value
+                for key, value in row.items()
+                if key not in {"generation_id", "source_snapshot_id", "source_row_hash"}
+            }
+            for row in rows
+        ],
+    }
+    if declared_schema is not None:
+        body["transform_schema"] = declared_schema
+    payload = canonical_json_bytes(body)
     _check_size(len(payload))
     return parse_import(payload)
 
@@ -863,7 +875,13 @@ def _observation_document(
         if row["instrument_id"] not in identities:
             raise ValueError("source row lacks an explicitly supplied instrument identity")
     _observation_values(rows, expected, definition)
-    return _input_document(transform, rows), transform, definition, contract, inputs
+    return (
+        _input_document(transform, rows, declared_schema=OBSERVATION_TRANSFORM_SCHEMA),
+        transform,
+        definition,
+        contract,
+        inputs,
+    )
 
 
 def register_observation_input(

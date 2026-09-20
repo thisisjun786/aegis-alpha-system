@@ -27,7 +27,12 @@ _REQUIRED = frozenset(
         "rows",
     }
 )
-_OPTIONAL = frozenset({"instruments"})
+# transform_schema is how a native route declares the retained transform its
+# publication was built from. The sealed document's SHA-256 is the marker request hash
+# the generation chain covers, so that declaration is authenticated evidence rather
+# than mutable catalog state. A generic offline import omits it, because it commits an
+# opaque transform_sha256 whose preimage it never retained.
+_OPTIONAL = frozenset({"instruments", "transform_schema"})
 _MAX_IMPORT_BYTES = 64 * 1024 * 1024
 
 
@@ -68,6 +73,11 @@ def parse_import(raw: bytes) -> ImportDocument:  # noqa: C901 -- strict external
     publication = body["publication_at_us"]
     if publication is not None and (type(publication) is not int or publication < 0):
         raise ValueError("publication_at_us must be null or UTC microseconds")
+    declared = body.get("transform_schema")
+    if declared is not None and (
+        not isinstance(declared, str) or not declared or declared != declared.strip()
+    ):
+        raise ValueError("transform_schema must be the exact retained transform schema")
     raw_rows = body["rows"]
     if not isinstance(raw_rows, list) or not raw_rows:
         raise ValueError("market import needs a nonempty array of typed rows")

@@ -292,8 +292,7 @@ def _verify_input_documents(workspace: Workspace, budget: ComputeBudget) -> None
         read_backtest_request,
     )
     from aegis_alpha.storage.market_inputs import (  # noqa: PLC0415
-        verify_observation_publications,
-        verify_proxy_publications,
+        verify_feature_publications,
     )
 
     status = inspect_run_schema(workspace)
@@ -305,8 +304,7 @@ def _verify_input_documents(workspace: Workspace, budget: ComputeBudget) -> None
             read_definition(workspace, DefinitionPin(schemas[row[3]], *row[:3]), budget=budget)
         elif row[3] not in {"aas-market-rowset-v1", "aas-observation-definition-v1"}:
             raise ValueError("unsupported feature definition schema")
-    verify_proxy_publications(workspace, budget=budget)
-    verify_observation_publications(workspace, budget=budget)
+    verify_feature_publications(workspace, budget=budget)
     for row in workspace.state.execute("SELECT bundle_id,content_hash FROM input_bundles"):
         pin = InputBundleRef(*row)
         read_input_bundle(workspace, pin, budget=budget)
