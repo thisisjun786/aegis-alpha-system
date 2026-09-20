@@ -80,6 +80,33 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   invisible to the PREPARED-only scan. Every receipt is derived from the sealed files,
   never from caller-supplied values, and a strategy pin must name a version the private
   store admitted. Result `at_us` encodes a session date as midnight UTC, not an instant.
+- The run add-on is versioned per store. `run_details.request_schema` carries an explicit
+  allow-list, `REQUEST_SCHEMAS`, and `_open_intent` records the schema of the request that
+  was actually registered rather than a constant. v1 named `aas-backtest-request-v1` alone,
+  so admitting `aas-research-run-v1` is `aas db run-migrate`: backup, durable intent, one
+  transactional `run_details` rebuild, verification, then completion. `run_schema` receipts
+  are append-only, so a migrated store shows `(1, v1), (2, v2)` and a store installed after
+  the migration shows `(2, v2)`; the recorded v1 checksum stays exact, because an
+  installation on disk is recognised by those bytes. The market add-on is unchanged and
+  stays at 1. An interrupted migration is finished by repeating the command, or by
+  `db recover`, which completes a rebuild that already landed and never starts one. A run
+  recorded under the old CHECK is carried across and stays readable; nothing is rewritten.
+- `backtest_requests` stores both request contracts under one content identity: exactly
+  canonical bytes, a hash over those bytes, and bindings that agree with the registered
+  bundle. An `aas-research-run-v2` declaration carries no bindings array, so its bundle is
+  required to be exactly the membership it pins, which is the only pin the binding
+  vocabulary can express. Its observation panels cannot be bound, because there is no role
+  for reference observations and adding one would put adjusted reference data in the
+  namespace the executable price roles use; its calendar cannot be bound either, because
+  it is a declared name over the panel's own dates rather than a published generation.
+  Both stay covered by the declaration's own hash. A declaration also has no engine or
+  environment, because no certified request stands behind it, so a declared run takes both
+  from the `aas-prepared-research-run-v1` preparation sealed beside its envelope, and that
+  preparation names `declaration_sha256` where an executable one names `request_hash`.
+  Request contract and preparation kind are paired at open and re-checked at verification.
+  None of this changes execution admission: `aas-backtest-request-v1` still holds execution
+  prices to canonical unadjusted data, and a stored declared run reads back as
+  `research_only` under its own schema.
 - A sealed envelope must carry the `dates` it was exported from: at least two sessions,
   increasing, without repeats, each spelled `YYYY-MM-DD` like every other date the
   runner emits. `open_run` checks them before the envelope becomes an artifact, and
