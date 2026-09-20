@@ -213,20 +213,15 @@ class DescriptorTree(AbstractContextManager["DescriptorTree"]):
         # would open one directory and label it with another, and any failure after the
         # open must not leave the descriptor behind.
         components = _parts(relative)
+        # Name the subtree before opening it. Adoption with duplicate=False hands the
+        # descriptor to DescriptorTree, which closes it itself when validation fails, so an
+        # outer handler closing the same number could close whatever reused it meanwhile.
+        logical_root = self.logical_root.joinpath(*components)
         try:
             descriptor = self._open_components(components)
         except OSError as error:
             raise DescriptorTreeError("subtree cannot be opened without aliases") from error
-        try:
-            return DescriptorTree(
-                self.logical_root.joinpath(*components),
-                descriptor,
-                duplicate=False,
-            )
-        except BaseException:
-            with suppress(OSError):
-                os.close(descriptor)
-            raise
+        return DescriptorTree(logical_root, descriptor, duplicate=False)
 
     @contextmanager
     def _parent(self, relative: str | os.PathLike[str]) -> Iterator[tuple[int, str]]:
