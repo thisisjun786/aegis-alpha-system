@@ -33,6 +33,7 @@ from aegis_alpha.storage.workspace import initialize, open_workspace
 from tests.storage.test_research_inputs import (
     _change,
     _hash_json,
+    _proxy_spec,
     _register_domain,
     _source_row,
     _spec,
@@ -866,3 +867,128 @@ def test_the_sealed_document_is_charged_while_its_publication_is_verified(
             market_inputs.verify_feature_publications(workspace, budget=lease)
         # A lease that can carry both still verifies the whole workspace.
         assert verify_workspace(workspace, budget=BUDGET)["verified"]
+
+
+def test_contract_identities_are_admitted_before_they_are_fetched(tmp_path: Path) -> None:
+    # Given a registered observation contract, whose name and version are TEXT with no
+    # length bound in the schema.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        spec = _observation_spec(workspace, tmp_path / "admit.sqlite3")
+        _ = _register_domain(workspace, spec, "observation")
+        identities, live = market_inputs._feature_contracts(  # noqa: SLF001 -- admission under test
+            workspace, "aas-observation-definition-v1", BUDGET
+        )
+        assert identities == {("OBSERVED/close", "v1")}
+        assert live > 0
+        # When the lease cannot hold that set, Then it is refused before the fetch rather
+        # than materialized first and accounted for afterwards.
+        starved = replace(BUDGET, reserved_bytes=BUDGET.available_bytes - live + 1)
+        with pytest.raises(ComputeResourceError, match="contract identities"):
+            _ = market_inputs._feature_contracts(  # noqa: SLF001 -- admission under test
+                workspace, "aas-observation-definition-v1", starved
+            )
+
+
+def test_the_loaded_chain_is_charged_before_its_transforms_are_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Given a committed observation chain the verifier loads and then walks.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        spec = _observation_spec(workspace, tmp_path / "walk.sqlite3", options={"points": POINTS})
+        _ = _register_domain(workspace, spec, "observation")
+        pin = _pin(workspace, "walk")
+        history = market_inputs.load_pinned_observations(workspace, pin, budget=BUDGET).history
+        retained = market_inputs._retained_bytes(history)  # noqa: SLF001 -- accounting under test
+        seen: list[ComputeBudget] = []
+        original = market_inputs._transform  # noqa: SLF001 -- accounting under test
+
+        def record(
+            target: Workspace, generation: str, budget: ComputeBudget
+        ) -> tuple[str, dict[str, object], ComputeBudget]:
+            seen.append(budget)
+            return original(target, generation, budget)
+
+        monkeypatch.setattr(market_inputs, "_transform", record)
+        # When that publication is verified,
+        _ = market_inputs._verify_observation_publication(  # noqa: SLF001 -- accounting under test
+            workspace, pin, {("OBSERVED/close", "v1")}, {}, BUDGET
+        )
+        # Then the walk's transform reads run on a lease charged for the history that is
+        # still live, while the classifying read before the load is not.
+        assert seen[0].reserved_bytes == BUDGET.reserved_bytes
+        assert seen[1].reserved_bytes >= BUDGET.reserved_bytes + retained
+
+
+def test_a_cached_chain_is_charged_while_the_next_publication_is_classified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Given two observation datasets, so the scan classifies the second one while the
+    # first dataset's verified chain is still cached.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        first = _observation_spec(workspace, tmp_path / "one.sqlite3", options={"points": POINTS})
+        _ = _register_domain(workspace, first, "observation")
+        second = _observation_spec(
+            workspace,
+            tmp_path / "two.sqlite3",
+            changes={"series_id": "OBSERVED-TWO"},
+            options={"points": POINTS},
+        )
+        _ = _register_domain(workspace, second, "observation")
+        pins = [_pin(workspace, "one"), _pin(workspace, "two")]
+        cached = market_inputs._retained_bytes(  # noqa: SLF001 -- accounting under test
+            market_inputs.load_pinned_observations(workspace, pins[0], budget=BUDGET).history
+        )
+        reads: dict[str, int] = {}
+        original = market_inputs._raw_payload  # noqa: SLF001 -- accounting under test
+
+        def record(target: Workspace, digest: str, budget: ComputeBudget) -> bytes:
+            reads.setdefault(digest, budget.reserved_bytes)
+            return original(target, digest, budget)
+
+        monkeypatch.setattr(market_inputs, "_raw_payload", record)
+        # When the whole scan runs,
+        market_inputs.verify_feature_publications(workspace, budget=BUDGET)
+        # Then the second dataset's sealed document is read on a lease that already
+        # charges the chain the first dataset left live.
+        assert reads[pins[1].manifest_hash] >= reads[pins[0].manifest_hash] + cached
+
+
+def test_the_proxy_delta_and_transform_are_charged_where_they_stay_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Given a registered proxy publication, verified through the same merged pass.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        path = _proxy_spec(workspace, tmp_path / "proxy.sqlite3", ("PROXY", "v1", "0.1"))
+        _ = _register_domain(workspace, path, "proxy")
+        sealed = len(_sealed_bytes(workspace, _pin(workspace, "proxy")))
+        outer: list[ComputeBudget] = []
+        inner: list[ComputeBudget] = []
+        original_content = market_inputs.verify_proxy_content
+        original_publication = market_inputs._proxy_publication  # noqa: SLF001 -- accounting under test
+
+        def record_content(target: Workspace, history: History, *, budget: ComputeBudget) -> str:
+            outer.append(budget)
+            return original_content(target, history, budget=budget)
+
+        def record_publication(
+            target: Workspace,
+            transform_hash: str,
+            transform: dict[str, object],
+            budget: ComputeBudget,
+        ) -> History:
+            inner.append(budget)
+            return original_publication(target, transform_hash, transform, budget)
+
+        monkeypatch.setattr(market_inputs, "verify_proxy_content", record_content)
+        monkeypatch.setattr(market_inputs, "_proxy_publication", record_publication)
+        # When the scan verifies it,
+        market_inputs.verify_feature_publications(workspace, budget=BUDGET)
+        # Then the definition is verified on a lease charged beyond the sealed document
+        # alone, because the whole delta stays live, and the publication is rebuilt on a
+        # lease that also charges the decoded transform it was rebuilt from.
+        assert outer[0].reserved_bytes > BUDGET.reserved_bytes + 32 * sealed
+        assert inner[0].reserved_bytes > outer[0].reserved_bytes

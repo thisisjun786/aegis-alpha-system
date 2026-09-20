@@ -905,13 +905,32 @@ def _proxy_publication_delta(
     return tuple(row for row in history if row["generation_id"] == pin.generation_id)
 
 
-def _feature_contracts(workspace: Workspace, record_schema: str) -> set[tuple[str, str]]:
-    return {
-        (row[0], row[1])
-        for row in workspace.state.execute(
-            "SELECT name,version FROM feature_contracts WHERE record_schema=?", (record_schema,)
-        )
-    }
+def _feature_contracts(
+    workspace: Workspace, record_schema: str, budget: ComputeBudget
+) -> tuple[set[tuple[str, str]], int]:
+    """Admit one contract-identity set before fetching it, and report what it holds live.
+
+    feature_contracts.name and .version are TEXT with no length bound, so the set is
+    sized from stored bytes and admitted before it is materialized, not after.
+    """
+    stored = workspace.state.execute(
+        "SELECT coalesce(sum(64 + length(CAST(name AS BLOB)) + length(CAST(version AS BLOB))),0) "
+        "FROM feature_contracts WHERE record_schema=?",
+        (record_schema,),
+    ).fetchone()
+    live = 32 * int(stored[0])
+    if live > budget.available_bytes:
+        raise ComputeResourceError("feature contract identities exceed admitted materialization")
+    return (
+        {
+            (row[0], row[1])
+            for row in workspace.state.execute(
+                "SELECT name,version FROM feature_contracts WHERE record_schema=?",
+                (record_schema,),
+            )
+        },
+        live,
+    )
 
 
 def verify_feature_publications(workspace: Workspace, *, budget: ComputeBudget) -> None:
@@ -931,9 +950,19 @@ def verify_feature_publications(workspace: Workspace, *, budget: ComputeBudget) 
 
     One pass serves both routes because both read the same sealed documents, and each
     dataset's chain is loaded once at its committed head.
+
+    Everything the pass holds live is charged before the step that would allocate next:
+    both identity sets, the chain a verified dataset leaves cached, the sealed document,
+    and a proxy delta while its definitions are verified.
     """
-    proxies = _feature_contracts(workspace, "aas-market-rowset-v1")
-    observations = _feature_contracts(workspace, OBSERVATION_DEFINITION_SCHEMA)
+    proxies, proxy_bytes = _feature_contracts(workspace, "aas-market-rowset-v1", budget)
+    observations, observation_bytes = _feature_contracts(
+        workspace, OBSERVATION_DEFINITION_SCHEMA, budget
+    )
+    # Both sets, and the kept subsets built from them, stay live for the whole scan.
+    scan = replace(
+        budget, reserved_bytes=budget.reserved_bytes + 2 * (proxy_bytes + observation_bytes)
+    )
     kept_proxies: set[tuple[str, str]] = set()
     kept_observations: set[tuple[str, str]] = set()
     chains: dict[str, tuple[dict[str, History], int]] = {}
@@ -944,13 +973,19 @@ def verify_feature_publications(workspace: Workspace, *, budget: ComputeBudget) 
         marker = market.marker_for(workspace.market, str(catalog["generation_id"]))
         if marker["domain"] != "feature_values":
             continue
+        # A verified dataset's grouped chain stays cached until the scan reaches another
+        # dataset, so it is charged against every later step rather than only the delta
+        # it was loaded for.
+        lease = replace(
+            scan, reserved_bytes=scan.reserved_bytes + sum(live for _, live in chains.values())
+        )
         # The marker's original request is independent of both live row fields
         # and catalog transform pointers. _load below also checks the manifest.
-        payload = _raw_payload(workspace, str(marker["request_hash"]), budget)
+        payload = _raw_payload(workspace, str(marker["request_hash"]), lease)
         document = parse_import(payload)
         # The parsed document stays live for every step below, so what is handed down is
         # the remaining allowance rather than the caller's whole lease.
-        held = replace(budget, reserved_bytes=budget.reserved_bytes + 32 * len(payload))
+        held = replace(lease, reserved_bytes=lease.reserved_bytes + 32 * len(payload))
         if document.body.get("transform_schema") == OBSERVATION_TRANSFORM_SCHEMA:
             # Classified before any pin is built: a historical generic publication can
             # carry the literal catalog version "latest", which GenerationPin refuses,
@@ -968,11 +1003,13 @@ def verify_feature_publications(workspace: Workspace, *, budget: ComputeBudget) 
             continue
         pin = GenerationPin(*catalog)
         delta = _proxy_publication_delta(workspace, pin, document, held)
+        # The whole delta stays live while each referencing definition is verified.
+        charged = replace(held, reserved_bytes=held.reserved_bytes + _retained_bytes(delta))
         for identity in sorted(referenced):
             rows = tuple(
                 row for row in delta if (row["contract_id"], row["contract_version"]) == identity
             )
-            verify_proxy_content(workspace, rows, budget=held)
+            verify_proxy_content(workspace, rows, budget=charged)
         kept_proxies.update(referenced)
     if proxies - kept_proxies:
         raise ValueError("proxy definition has no retained feature generation")
@@ -1055,14 +1092,21 @@ def verify_proxy_content(workspace: Workspace, history: History, *, budget: Comp
         (ordinal, *item) for ordinal, item in enumerate(inputs)
     ]:
         raise ValueError("proxy feature inputs mismatch")
-    transform = decode_json(_raw_payload(workspace, transform_hash, budget))
+    payload = _raw_payload(workspace, transform_hash, budget)
+    transform = decode_json(payload)
     if (
         not isinstance(transform, dict)
         or transform.get("proxy") != definition
         or transform.get("schema_version") != "aas-proxy-transform-v1"
     ):
         raise ValueError("proxy transform conflicts with feature contract")
-    delta = _proxy_publication(workspace, transform_hash, transform, budget)
+    # The decoded transform stays live while the publication is rebuilt from it.
+    delta = _proxy_publication(
+        workspace,
+        transform_hash,
+        transform,
+        replace(budget, reserved_bytes=budget.reserved_bytes + 32 * len(payload)),
+    )
     expected = {
         "contract_id": definition["proxy_id"],
         "contract_version": definition["version"],
@@ -1224,12 +1268,15 @@ def _observation_chain(
             (pin.dataset_id,),
         ).fetchone()
         history = _load(workspace, GenerationPin(*head), budget.component(2), "feature_values")
+        # The loaded history stays live for the whole walk below, so each transform is
+        # read and decoded on what is left rather than on the lease that loaded it.
+        walk = replace(budget, reserved_bytes=budget.reserved_bytes + _retained_bytes(history))
         # A chain this route owns must be observations end to end. Another writer can
         # append to an observation head because the domain matches, and each delta
         # then verifies alone while both readers reject the mixed head. The transform
         # must also name this marker, because a hash can be reused from an ancestor.
         for marker in market.generation_chain(workspace.market, str(head["generation_id"])):
-            _, transform, _ = _transform(workspace, str(marker["generation_id"]), budget)
+            _, transform, _ = _transform(workspace, str(marker["generation_id"]), walk)
             destination = transform.get("dataset")
             if (
                 transform.get("schema_version") != OBSERVATION_TRANSFORM_SCHEMA
