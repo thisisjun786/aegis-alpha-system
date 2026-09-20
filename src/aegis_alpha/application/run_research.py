@@ -133,12 +133,15 @@ class _Declared:
 
     The file may be formatted however its author left it. What gets registered, hashed
     and bound is the canonical form, which is the only one the request store accepts and
-    the only one the declaration's own content hash covers.
+    the only one the declaration's own content hash covers. The file's own digest is kept
+    beside it because that is what a caller passed on the command line and what every
+    receipt reports as `declaration_sha256`; the canonical identity is `request_hash`.
     """
 
     request: ResearchRunRequest
     canonical: bytes
     bindings: list[dict[str, object]]
+    file_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,7 +196,7 @@ def _declared(raw: bytes) -> _Declared:
     body = json_object(decode_json(raw), "declaration")
     canonical = canonical_json_bytes(body)
     request = parse_declared_request(canonical)
-    return _Declared(request, canonical, research_bindings(body))
+    return _Declared(request, canonical, research_bindings(body), hashlib.sha256(raw).hexdigest())
 
 
 def _binding_report(declared: _Declared) -> dict[str, object]:
@@ -622,6 +625,8 @@ def _repreparation(
     return {
         "reproduced": all(matches.values()),
         "matches": matches,
-        "declaration_sha256": hashlib.sha256(declared.canonical).hexdigest(),
+        # The file's digest, the same thing the command took and the run's receipt
+        # reported, so a caller can hold the three against each other.
+        "declaration_sha256": declared.file_sha256,
         "request_hash": declared.request.request_sha256,
     }

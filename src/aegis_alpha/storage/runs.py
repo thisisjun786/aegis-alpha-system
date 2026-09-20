@@ -1089,9 +1089,12 @@ def read_run_evidence(
 
     A deterministic rerun has to start from exactly the bytes the run sealed, and those
     bytes exist only under the managed runs directory. The three names are the store's
-    own, so a caller never spells a path or a filename, and every file is charged before
-    it is read and checked against the size and digest recorded for it, so a replaced
-    artifact is refused rather than replayed as though it were the evidence.
+    own, so a caller never spells a path or a filename.
+
+    Every file is measured by streaming it before any of it is materialized, and what is
+    charged and returned is the measured size rather than the recorded one. A file that
+    grew past its row is refused on the measurement, so a replaced or corrupted artifact
+    cannot exhaust the allowance on its way to being rejected.
 
     This re-derives nothing and proves nothing on its own. `read_run` is what holds a
     record to its manifest; this hands a caller the inputs to reproduce it with.
@@ -1105,17 +1108,22 @@ def read_run_evidence(
     }
     if set(recorded) != set(_ARTIFACTS):
         raise RunStorageError("run does not record the three artifacts it must seal")
+    # Streams each file: constant memory whatever the file on disk turned out to be.
+    measured = {name: _artifact_digest(workspace, run_id, name) for name in _ARTIFACTS}
+    if {name: (size, digest) for name, (digest, size) in measured.items()} != recorded:
+        raise RunStorageError("recorded artifact disagrees with the file on disk")
     _admit(
         budget,
-        _DOCUMENT_OVERHEAD + sum(size for size, _digest in recorded.values()),
+        _DOCUMENT_OVERHEAD + sum(size for _digest, size in measured.values()),
         "run artifacts exceed materialization budget",
     )
-    read = {}
-    for name, (size, digest) in recorded.items():
-        raw = _read_sealed(workspace, run_id, name)
-        if (len(raw), hashlib.sha256(raw).hexdigest()) != (size, digest):
-            raise RunStorageError("recorded artifact disagrees with the file on disk")
-        read[name] = raw
+    read = {name: _read_sealed(workspace, run_id, name) for name in _ARTIFACTS}
+    if any(
+        (len(read[name]), hashlib.sha256(read[name]).hexdigest()) != (size, digest)
+        for name, (digest, size) in measured.items()
+    ):
+        # The file changed between the measurement and the read.
+        raise RunStorageError("sealed artifact changed while it was being read")
     return RunEvidence(read[_ENVELOPE], read[_PREPARATION], read[_BACKTEST])
 
 

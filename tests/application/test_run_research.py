@@ -35,6 +35,8 @@ from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
 from aegis_alpha.storage.backtest_requests import read_backtest_request
 from aegis_alpha.storage.input_pins import InputBundleRef
 from aegis_alpha.storage.market_inputs import GenerationPin, admit_native_input
+from aegis_alpha.storage.paths import load_paths
+from aegis_alpha.storage.runs import RunStorageError, read_run_evidence
 from aegis_alpha.storage.workspace import open_workspace
 from tests.application.test_backtest_prepare import BUDGET
 from tests.application.test_prepare_cli import sha
@@ -315,6 +317,67 @@ def test_a_rerun_takes_a_declaration_and_its_digest_together_or_not_at_all(
     path = _write(tmp_path, "sleeve.json", _as_sleeve_run(base, offense))
     with pytest.raises(ValueError, match="supplied together or not at all"):
         _ = rerun_research_run("whatever", home=home, declaration=path)
+
+
+def test_a_rerun_reports_the_digest_of_the_file_it_was_given(
+    sample: tuple[Path, Document, Document, Document],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """One name, one meaning: declaration_sha256 is the file, request_hash is the content.
+
+    A declaration formatted by hand hashes differently from its canonical form, so a
+    report that mixed the two would give a caller a digest matching neither what it
+    passed on the command line nor what the run's own receipt recorded.
+    """
+    home, base, offense, _defense = sample
+    _installed(home)
+    declaration = _as_sleeve_run(base, offense)
+    path = tmp_path / "pretty.json"
+    _ = path.write_text(json.dumps(declaration, indent=2), encoding="utf-8")
+    file_digest = sha(path.read_bytes())
+    receipt = _execute(home, path, capsys)
+    report = _rerun(
+        home, _run_id(receipt), capsys, "--declaration", str(path), "--sha256", file_digest
+    )
+    preparation = cast("Document", cast("Document", report["checks"])["preparation"])
+    assert preparation["declaration_sha256"] == file_digest
+    assert preparation["declaration_sha256"] != sha(canonical_json_bytes(declaration))
+    assert preparation["request_hash"] == receipt["request_hash"]
+    assert receipt["declaration_sha256"] == file_digest
+
+
+def test_an_artifact_that_outgrew_its_row_is_refused_on_the_measurement(
+    sample: tuple[Path, Document, Document, Document],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A replaced artifact must be refused, and refused without being materialized first.
+
+    The measurement streams the file, so the size it charges is the size on disk rather
+    than the size the row claims. Without that, an artifact that grew could be read whole
+    against an allowance admitted for the smaller recorded size.
+
+    Checked on the reader itself. A rerun reaches it only after `read_run` has re-derived
+    the record, and that refuses the same file first, so going through the command would
+    prove the earlier refusal rather than this one.
+    """
+    home, base, offense, _defense = sample
+    _installed(home)
+    path = _write(tmp_path, "sleeve.json", _as_sleeve_run(base, offense))
+    run_id = _run_id(_execute(home, path, capsys))
+    sealed = load_paths(home).runs / run_id / "backtest.json"
+    sealed.chmod(0o600)
+    with sealed.open("ab") as handle:
+        _ = handle.write(b" " * 4096)
+    with (
+        open_workspace(home) as workspace,
+        pytest.raises(RunStorageError, match="disagrees with the file on disk"),
+    ):
+        _ = read_run_evidence(workspace, run_id, budget=BUDGET)
+    # The command that would use it refuses the same run before it gets there.
+    with pytest.raises(RunStorageError, match="disagrees with the sealed evidence"):
+        _ = rerun_research_run(run_id, home=home)
 
 
 def test_only_a_declared_run_is_re_prepared_from_a_declaration(
