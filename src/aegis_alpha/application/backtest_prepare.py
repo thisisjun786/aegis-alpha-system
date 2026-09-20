@@ -25,8 +25,10 @@ from typing import Literal, cast
 from aegis_alpha.application.backtest_cli import DECLARED_RESEARCH_MODE
 from aegis_alpha.application.research_run import (
     FILL_CONVENTION,
+    MembershipRef,
     PreparationRecord,
     ResearchRunRequest,
+    SleeveRef,
     declared_provenance,
 )
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
@@ -91,6 +93,7 @@ __all__ = [
     "PrepareRequest",
     "PreparedBacktest",
     "PreparedResearchRun",
+    "ResearchDecision",
     "StrategyPin",
     "parse_prepare_request",
     "prepare_backtest",
@@ -1465,6 +1468,9 @@ class PreparedResearchRun:
     definition: ExecutionDefinition
     slots: tuple[DecisionSlot, ...]
     decisions: tuple[ReplayReceipt, ...]
+    # Which sleeve supplied each decision, positionally against decisions. A sleeve run
+    # is all offense; only a composition ever reads defense here.
+    sleeve_roles: tuple[str, ...]
     inputs: EnvelopeInputs
     envelope: EnvelopeExport
     provenance: bytes
@@ -1479,6 +1485,7 @@ class PreparedResearchRun:
         """
         object.__setattr__(self, "slots", tuple(self.slots))
         object.__setattr__(self, "decisions", tuple(self.decisions))
+        object.__setattr__(self, "sleeve_roles", tuple(self.sleeve_roles))
         values = self.inputs
         object.__setattr__(
             self,
@@ -1629,10 +1636,9 @@ def _observation_panels(
 
 
 def _research_membership(
-    loader: _Loader, declaration: ResearchRunRequest, bundle: EngineBundle
+    loader: _Loader, reference: MembershipRef, bundle: EngineBundle
 ) -> EnsembleMembership:
     """Resolve the membership the strategy's own contract already names."""
-    reference = declaration.membership
     raw = read_definition(
         loader.workspace,
         DefinitionPin(reference.kind, reference.id, reference.version, reference.hash),
@@ -1656,21 +1662,108 @@ def _research_membership(
     return membership
 
 
+@dataclass(frozen=True, slots=True)
+class _Sleeve:
+    """One registered sleeve, loaded: what it is and what it needs to be evaluated."""
+
+    role: str
+    bundle: EngineBundle
+    definition: ExecutionDefinition
+    membership: EnsembleMembership
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchDecision:
+    """One decision and the sleeve that actually supplied it."""
+
+    receipt: ReplayReceipt
+    sleeve: _Sleeve
+
+
+def _load_sleeve(workspace: Workspace, loader: _Loader, role: str, sleeve: SleeveRef) -> _Sleeve:
+    """Load one registered sleeve and refuse one this path cannot feed.
+
+    The declaration pins observations and nothing else, so a sleeve reading a macro
+    series or a derived one would reach the engine short of an input it was told to
+    expect. Refused here rather than failing inside replay.
+    """
+    bundle, definition = _stored_strategy(
+        workspace,
+        StrategyPin(
+            sleeve.strategy_store_id,
+            sleeve.strategy_id,
+            sleeve.version,
+            sleeve.raw_sha256,
+            sleeve.contract_sha256,
+        ),
+    )
+    if definition.derived_series or bundle.contract.macro_signals:
+        raise ValueError(
+            "a declared research run supplies only observed prices; the "
+            + role
+            + " sleeve also requires macro or derived inputs"
+        )
+    return _Sleeve(
+        role, bundle, definition, _research_membership(loader, sleeve.membership, bundle)
+    )
+
+
+def _require_composable(offense: _Sleeve, defense: _Sleeve) -> None:
+    """Hold a composition to exactly two levels and one calendar.
+
+    A defensive sleeve that declares its own canary would make the switch recursive, and
+    this contract names one switch. Two sleeves evaluated on different calendar
+    conventions would also be two different runs reported as one, so they have to agree.
+
+    The offensive sleeve may declare no regular signals either. evaluate_signals folds
+    them into the same master switch the composition routes on, so a sleeve carrying one
+    would send decisions to the defensive sleeve for a condition that is not the canary,
+    and the sealed record would name a switch that is not the one that fired.
+
+    Any declared signal is refused, not only one that would have evaluated true. Reading
+    the enablement rule here would copy an engine internal into application code, and a
+    copy that drifts turns the contract's own claim false in the one place where being
+    wrong is worst. What the declaration reaches for is what this checks.
+    """
+    for strategy in offense.bundle.contract.pack:
+        if strategy.signals_config:
+            raise ValueError(
+                "the offensive sleeve declares regular signals, enabled or not; "
+                "this composition switches on the canary alone"
+            )
+    # Every pack member, not the first: replay evaluates all of them, so a canary on a
+    # later strategy would fire inside the defensive sleeve just the same.
+    for strategy in defense.bundle.contract.pack:
+        declared_canary = strategy.canary_config.get("assets", ())
+        if not isinstance(declared_canary, (list, tuple)) or declared_canary:
+            raise ValueError(
+                "the defensive sleeve declares its own canary; this composition names one switch"
+            )
+    if canonical_json_bytes(offense.definition.calendar) != canonical_json_bytes(
+        defense.definition.calendar
+    ):
+        raise ValueError("the two sleeves declare different calendar conventions")
+
+
 def _research_decisions(
-    bundle: EngineBundle,
-    definition: ExecutionDefinition,
+    sleeves: tuple[_Sleeve, ...],
     slots: tuple[DecisionSlot, ...],
     visibility: _Visibility,
-    loaded: tuple[EnsembleMembership, Mapping[str, _Observed]],
-) -> tuple[ReplayReceipt, ...]:
+    panels: Mapping[str, _Observed],
+) -> tuple[ResearchDecision, ...]:
     """Evaluate the registered strategy at each decision through the ordinary engine.
 
     Each decision sees only the sessions at or before its own cutoff, so nothing later
     than the decision reaches its features. The knowledge axis stays declared and the
     economic axis stays honest, which is exactly the split the declaration records.
+
+    A composition adds one step and no new logic: the offense sleeve is evaluated first
+    and the engine's own master switch, computed from that sleeve's declared canary
+    configuration, decides whether the defense sleeve supplies the decision instead.
+    Nothing here interprets a condition a declaration wrote.
     """
-    membership, panels = loaded
     close = panels["close"]
+    offense = sleeves[0]
     receipts = []
     for slot in slots:
         points = {
@@ -1685,15 +1778,29 @@ def _research_decisions(
             )
             for instrument, series in close.values.items()
         }
-        _warmup(definition, points, slot, visibility)
-        receipts.append(
-            replay(
-                bundle,
-                ReplayRequest(slot.decision_date, slot.decision_date, points, {}, {}, membership),
-                knowledge_as_of=_utc_day(slot.cutoff_us),
-            )
-        )
+        chosen, receipt = offense, _replay_sleeve(offense, points, slot, visibility)
+        if len(sleeves) > 1 and any(receipt.master_switch.values()):
+            # The switch fired, so the defensive sleeve supplies this decision. The
+            # offense receipt is discarded rather than blended: a sample takes one
+            # sleeve's weights at a time, which is what the private runner does.
+            chosen = sleeves[1]
+            receipt = _replay_sleeve(chosen, points, slot, visibility)
+        receipts.append(ResearchDecision(receipt, chosen))
     return tuple(receipts)
+
+
+def _replay_sleeve(
+    sleeve: _Sleeve,
+    points: Mapping[str, tuple[PricePoint, ...]],
+    slot: DecisionSlot,
+    visibility: _Visibility,
+) -> ReplayReceipt:
+    _warmup(sleeve.definition, points, slot, visibility)
+    return replay(
+        sleeve.bundle,
+        ReplayRequest(slot.decision_date, slot.decision_date, points, {}, {}, sleeve.membership),
+        knowledge_as_of=_utc_day(slot.cutoff_us),
+    )
 
 
 def _research_outcomes(
@@ -1867,6 +1974,30 @@ def _research_plan(
     return _ResearchPlan(dates, slots)
 
 
+def _research_sleeves(
+    workspace: Workspace, loader: _Loader, declaration: ResearchRunRequest
+) -> tuple[_Sleeve, ...]:
+    """Load the one sleeve a run declares, or the two a composition does."""
+    offense = _load_sleeve(
+        workspace,
+        loader,
+        "offense",
+        SleeveRef(
+            declaration.strategy_store_id,
+            declaration.strategy_id,
+            declaration.strategy_version,
+            declaration.strategy_raw_sha256,
+            declaration.strategy_contract_sha256,
+            declaration.membership,
+        ),
+    )
+    if declaration.composition is None:
+        return (offense,)
+    defense = _load_sleeve(workspace, loader, "defense", declaration.composition.defense)
+    _require_composable(offense, defense)
+    return (offense, defense)
+
+
 def prepare_research_run(
     workspace: Workspace, declaration: ResearchRunRequest, *, budget: ComputeBudget
 ) -> PreparedResearchRun:
@@ -1898,16 +2029,6 @@ def prepare_research_run(
     """
     engine, environment = calculation_identity(), environment_identity()
     _require_honourable(declaration)
-    bundle, definition = _stored_strategy(
-        workspace,
-        StrategyPin(
-            declaration.strategy_store_id,
-            declaration.strategy_id,
-            declaration.strategy_version,
-            declaration.strategy_raw_sha256,
-            declaration.strategy_contract_sha256,
-        ),
-    )
     visibility = _Visibility(
         "observed_snapshot_research",
         declaration.conventions.knowledge_time_us,
@@ -1916,27 +2037,20 @@ def prepare_research_run(
         declaration.history.end,
     )
     loader = _Loader(workspace, budget, {})
-    membership = _research_membership(loader, declaration, bundle)
-    if definition.derived_series or bundle.contract.macro_signals:
-        # The declaration pins observations and nothing else, so a strategy that reads a
-        # macro series or a derived one would reach the engine short of an input it was
-        # told to expect. Refused here rather than failing inside replay.
-        raise ValueError(
-            "a declared research run supplies only observed prices; "
-            "this strategy also requires macro or derived inputs"
-        )
+    sleeves = _research_sleeves(workspace, loader, declaration)
     panels = _observation_panels(loader, declaration, visibility)
     read = {series for panel in panels.values() for series in panel.series}
     plan = _research_plan(declaration, panels)
-    decisions = _research_decisions(
-        bundle, definition, plan.slots, visibility, (membership, panels)
-    )
+    decisions = _research_decisions(sleeves, plan.slots, visibility, panels)
     opening, closing = _research_outcomes(panels, plan.dates)
     inputs = EnvelopeInputs(
         plan.dates,
         opening,
         closing,
-        {receipt.as_of: _research_targets(receipt, definition) for receipt in decisions},
+        {
+            decision.receipt.as_of: _research_targets(decision.receipt, decision.sleeve.definition)
+            for decision in decisions
+        },
         _observation_types(workspace, declaration.instrument_map, read),
         (),
     )
@@ -1951,6 +2065,11 @@ def prepare_research_run(
             engine=engine,
             environment=environment,
             preparation_source_sha256=research_source_identity(),
+            defensive_decisions=tuple(
+                decision.receipt.as_of.isoformat()
+                for decision in decisions
+                if decision.sleeve.role == "defense"
+            ),
             resolved_calendar={
                 "calendar_id": declaration.calendar.calendar_id,
                 "basis": declaration.calendar.basis,
@@ -1965,7 +2084,14 @@ def prepare_research_run(
         ),
     )
     return PreparedResearchRun(
-        declaration, definition, plan.slots, decisions, inputs, envelope, provenance
+        declaration,
+        sleeves[0].definition,
+        plan.slots,
+        tuple(decision.receipt for decision in decisions),
+        tuple(decision.sleeve.role for decision in decisions),
+        inputs,
+        envelope,
+        provenance,
     )
 
 
