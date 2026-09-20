@@ -14,6 +14,7 @@ import pytest
 from aegis_alpha.application.research_run import (
     EXECUTION_MODE,
     RESEARCH_RUN_SCHEMA,
+    TIE_RULE,
     ResearchRunError,
     declared_provenance,
     parse_research_run_request,
@@ -56,6 +57,23 @@ def _conventions() -> dict[str, str]:
     }
 
 
+def _semantics() -> dict[str, object]:
+    return {
+        "data_basis": "M",
+        "abs_compare": "default-sign",
+        "defensive_rule": (
+            "DUAL_SWITCH: equal weight across the top relative-momentum defensive "
+            "assets; a chosen asset with negative absolute momentum has its share "
+            "held as cash"
+        ),
+        "expand": "extended-history-not-used",
+        "expand_source": None,
+        "rebalance_timing": "previous-month result applied at the following month start",
+        "fill_price": "next-session-open",
+        "tie_rule": TIE_RULE,
+    }
+
+
 def _body() -> dict[str, object]:
     return {
         "schema_version": RESEARCH_RUN_SCHEMA,
@@ -64,6 +82,8 @@ def _body() -> dict[str, object]:
         "observations": [_pin(), _pin("obs-synthetic-close", "close")],
         "instrument_map": {"aas-obs-1": "SYN1", "aas-obs-2": "SYN2"},
         "conventions": _conventions(),
+        "semantics": _semantics(),
+        "unsettled": ["fill_price"],
         "uncertainty": ["reference observations, not executable prices"],
     }
 
@@ -192,3 +212,62 @@ def test_the_same_request_hashes_the_same_way_twice() -> None:
     second = parse_research_run_request(_raw(_body()))
     assert first.request_sha256 == second.request_sha256
     assert declared_provenance(first) == declared_provenance(second)
+
+
+def test_the_sidecar_records_the_declared_semantics_and_unknown_parity() -> None:
+    recorded = json.loads(declared_provenance(parse_research_run_request(_raw(_body()))))
+    assert recorded["semantics"]["tie_rule"] == TIE_RULE
+    assert recorded["semantics"]["data_basis"] == "M"
+    assert recorded["semantics"]["source_parity"] == "unknown"
+    assert recorded["unsettled"] == ["fill_price"]
+
+
+@pytest.mark.parametrize("basis", ["either", "d", "daily", "DM"])
+def test_data_basis_names_one_confirmed_identity(basis: str) -> None:
+    body = _body()
+    body["semantics"] = _semantics() | {"data_basis": basis}
+    with pytest.raises(ResearchRunError, match="data_basis must be D or M"):
+        parse_research_run_request(_raw(body))
+
+
+def test_a_null_abs_compare_is_refused_because_null_does_not_disable_it() -> None:
+    body = _body()
+    body["semantics"] = _semantics() | {"abs_compare": None}
+    with pytest.raises(ResearchRunError, match="abs_compare must be nonempty"):
+        parse_research_run_request(_raw(body))
+
+
+def test_claiming_extended_history_requires_naming_its_source() -> None:
+    body = _body()
+    body["semantics"] = _semantics() | {"expand": "extended-history-used"}
+    with pytest.raises(ResearchRunError, match="expand_source must be nonempty"):
+        parse_research_run_request(_raw(body))
+
+
+def test_an_expand_source_without_extended_history_is_refused() -> None:
+    body = _body()
+    body["semantics"] = _semantics() | {"expand_source": "some-index"}
+    with pytest.raises(ResearchRunError, match="belongs only to extended-history-used"):
+        parse_research_run_request(_raw(body))
+
+
+def test_the_tie_rule_is_fixed_and_cannot_be_renamed() -> None:
+    body = _body()
+    body["semantics"] = _semantics() | {"tie_rule": "holding-preference"}
+    with pytest.raises(ResearchRunError, match="tie_rule must be " + TIE_RULE):
+        parse_research_run_request(_raw(body))
+
+
+def test_a_run_cannot_present_the_fill_convention_as_settled() -> None:
+    body = _body()
+    body["unsettled"] = []
+    with pytest.raises(ResearchRunError, match="unsettled must list: fill_price"):
+        parse_research_run_request(_raw(body))
+
+
+@pytest.mark.parametrize("price", ["next-session-close", "vwap", "open"])
+def test_an_unsupported_fill_price_is_refused(price: str) -> None:
+    body = _body()
+    body["semantics"] = _semantics() | {"fill_price": price}
+    with pytest.raises(ResearchRunError, match="fill_price must be"):
+        parse_research_run_request(_raw(body))

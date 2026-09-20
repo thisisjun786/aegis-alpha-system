@@ -32,8 +32,11 @@ if TYPE_CHECKING:
 __all__ = [
     "EXECUTION_MODE",
     "OBSERVATION_NAMESPACE",
+    "REQUIRED_UNSETTLED",
     "RESEARCH_RUN_SCHEMA",
+    "TIE_RULE",
     "DeclaredConventions",
+    "DeclaredSemantics",
     "ObservationPinRef",
     "ResearchRunError",
     "ResearchRunRequest",
@@ -46,6 +49,22 @@ RESEARCH_RUN_SCHEMA = "aas-research-run-v1"
 # stored run reports is the mode its author actually wrote down.
 EXECUTION_MODE = "research-uncertified"
 OBSERVATION_NAMESPACE = "aas-obs-"
+# Resolved as research policy, not as Snowball parity: the public documentation and
+# frontend code carry no server tie rule, so this names our own deterministic choice
+# and says so. engine.allocation._top already orders by descending score then
+# ascending asset id, which is exactly this rule; nothing is reimplemented here.
+TIE_RULE = "momentum-tie-canonical-id-asc-v1"
+# D and M are a confirmed identity, not an equivalence: the exact backend sampling,
+# lookback and lag behind each remain unverified, so a request names one of them.
+_DATA_BASIS = frozenset({"D", "M"})
+# Supported by the audit probe over next-session-open against decision-close, which
+# did not test next-session close or exhaust the alternatives. A run therefore has to
+# list fill_price as unsettled rather than present it as established.
+_FILL_PRICE = frozenset({"next-session-open", "decision-close"})
+_EXPAND = frozenset({"extended-history-used", "extended-history-not-used"})
+# The one axis the research left open. Naming it here means a stored run cannot
+# quietly present a fill convention as settled.
+REQUIRED_UNSETTLED = frozenset({"fill_price"})
 
 _ROOT = frozenset(
     {
@@ -56,6 +75,8 @@ _ROOT = frozenset(
         "instrument_map",
         "conventions",
         "uncertainty",
+        "semantics",
+        "unsettled",
     }
 )
 _STRATEGY = frozenset({"strategy_id", "version", "raw_sha256", "contract_sha256"})
@@ -66,6 +87,18 @@ _OBSERVATION = frozenset(
 # source. Each must be written down; none is inferred and none defaults.
 _CONVENTIONS = frozenset({"knowledge_time", "calendar", "cost", "capital", "currency"})
 _ROLES = frozenset({"open", "close"})
+_SEMANTICS = frozenset(
+    {
+        "data_basis",
+        "abs_compare",
+        "defensive_rule",
+        "expand",
+        "expand_source",
+        "rebalance_timing",
+        "fill_price",
+        "tie_rule",
+    }
+)
 _HEX = frozenset("0123456789abcdef")
 _DIGEST_CHARS = 64
 
@@ -98,6 +131,25 @@ class DeclaredConventions:
 
 
 @dataclass(frozen=True, slots=True)
+class DeclaredSemantics:
+    """Strategy semantics the caller declares, with the unverified ones named.
+
+    Each field was established from public documentation and frontend code rather
+    than from the original backend, so the declaration records what this run assumes
+    and never asserts parity with the source system.
+    """
+
+    data_basis: str
+    abs_compare: str
+    defensive_rule: str
+    expand: str
+    expand_source: str
+    rebalance_timing: str
+    fill_price: str
+    tie_rule: str
+
+
+@dataclass(frozen=True, slots=True)
 class ResearchRunRequest:
     """A parsed request. Its mode is fixed and its declarations are complete."""
 
@@ -108,6 +160,8 @@ class ResearchRunRequest:
     observations: tuple[ObservationPinRef, ...]
     instrument_map: Mapping[str, str]
     conventions: DeclaredConventions
+    semantics: DeclaredSemantics
+    unsettled: tuple[str, ...]
     uncertainty: tuple[str, ...]
     execution_mode: str
     request_sha256: str
@@ -194,6 +248,54 @@ def _uncertainty(value: object) -> tuple[str, ...]:
     return tuple(_text(note, "uncertainty note") for note in value)
 
 
+def _semantics(value: object) -> DeclaredSemantics:
+    row = _object(value, "semantics", _SEMANTICS)
+    basis = _text(row["data_basis"], "data_basis")
+    if basis not in _DATA_BASIS:
+        raise ResearchRunError("data_basis must be D or M")
+    # null is not a disabled comparator: the public tooltip describes abs_compare as
+    # replacing the default sign test, so an absent value would silently choose one.
+    compare = _text(row["abs_compare"], "abs_compare")
+    expand = _text(row["expand"], "expand")
+    if expand not in _EXPAND:
+        raise ResearchRunError("expand must name extended-history use")
+    source = row["expand_source"]
+    if expand == "extended-history-used":
+        # Storing the flag is not implementing the feature, so claiming the extended
+        # history requires naming where it came from.
+        source_text = _text(source, "expand_source")
+    else:
+        if source not in (None, ""):
+            raise ResearchRunError("expand_source belongs only to extended-history-used")
+        source_text = ""
+    fill = _text(row["fill_price"], "fill_price")
+    if fill not in _FILL_PRICE:
+        raise ResearchRunError("fill_price must be next-session-open or decision-close")
+    if row["tie_rule"] != TIE_RULE:
+        raise ResearchRunError("tie_rule must be " + TIE_RULE)
+    return DeclaredSemantics(
+        data_basis=basis,
+        abs_compare=compare,
+        defensive_rule=_text(row["defensive_rule"], "defensive_rule"),
+        expand=expand,
+        expand_source=source_text,
+        rebalance_timing=_text(row["rebalance_timing"], "rebalance_timing"),
+        fill_price=fill,
+        tie_rule=TIE_RULE,
+    )
+
+
+def _unsettled(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise ResearchRunError("unsettled must be an array")
+    named = tuple(_text(item, "unsettled entry") for item in value)
+    missing = sorted(REQUIRED_UNSETTLED - set(named))
+    if missing:
+        # The audit did not settle these, so a run may not present them as settled.
+        raise ResearchRunError("unsettled must list: " + ", ".join(missing))
+    return named
+
+
 def parse_research_run_request(raw: bytes) -> ResearchRunRequest:
     """Parse and validate an exact request. Refuses before anything durable is written."""
     decoded = decode_json(raw)
@@ -218,6 +320,8 @@ def parse_research_run_request(raw: bytes) -> ResearchRunRequest:
             capital=_text(conventions["capital"], "capital"),
             currency=_text(conventions["currency"], "currency"),
         ),
+        semantics=_semantics(body["semantics"]),
+        unsettled=_unsettled(body["unsettled"]),
         uncertainty=_uncertainty(body["uncertainty"]),
         execution_mode=EXECUTION_MODE,
         request_sha256=content_sha256(decoded),
@@ -258,6 +362,18 @@ def declared_provenance(request: ResearchRunRequest) -> bytes:
                 "capital": request.conventions.capital,
                 "currency": request.conventions.currency,
             },
+            "semantics": {
+                "data_basis": request.semantics.data_basis,
+                "abs_compare": request.semantics.abs_compare,
+                "defensive_rule": request.semantics.defensive_rule,
+                "expand": request.semantics.expand,
+                "expand_source": request.semantics.expand_source,
+                "rebalance_timing": request.semantics.rebalance_timing,
+                "fill_price": request.semantics.fill_price,
+                "tie_rule": request.semantics.tie_rule,
+                "source_parity": "unknown",
+            },
+            "unsettled": list(request.unsettled),
             "uncertainty": list(request.uncertainty),
             "request_sha256": request.request_sha256,
         }
