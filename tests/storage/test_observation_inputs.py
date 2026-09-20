@@ -964,11 +964,30 @@ def test_the_proxy_delta_and_transform_are_charged_where_they_stay_live(
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
         path = _proxy_spec(workspace, tmp_path / "proxy.sqlite3", ("PROXY", "v1", "0.1"))
         _ = _register_domain(workspace, path, "proxy")
-        sealed = len(_sealed_bytes(workspace, _pin(workspace, "proxy")))
+        pin = _pin(workspace, "proxy")
+        sealed = len(_sealed_bytes(workspace, pin))
+        reads: dict[str, int] = {}
+        deltas: list[History] = []
         outer: list[ComputeBudget] = []
         inner: list[ComputeBudget] = []
+        original_payload = market_inputs._raw_payload  # noqa: SLF001 -- accounting under test
+        original_delta = market_inputs._proxy_publication_delta  # noqa: SLF001 -- accounting under test
         original_content = market_inputs.verify_proxy_content
         original_publication = market_inputs._proxy_publication  # noqa: SLF001 -- accounting under test
+
+        def record_payload(target: Workspace, digest: str, budget: ComputeBudget) -> bytes:
+            _ = reads.setdefault(digest, budget.reserved_bytes)
+            return original_payload(target, digest, budget)
+
+        def record_delta(
+            target: Workspace,
+            generation: market_inputs.GenerationPin,
+            document: import_document.ImportDocument,
+            budget: ComputeBudget,
+        ) -> History:
+            selected = original_delta(target, generation, document, budget)
+            deltas.append(selected)
+            return selected
 
         def record_content(target: Workspace, history: History, *, budget: ComputeBudget) -> str:
             outer.append(budget)
@@ -983,12 +1002,46 @@ def test_the_proxy_delta_and_transform_are_charged_where_they_stay_live(
             inner.append(budget)
             return original_publication(target, transform_hash, transform, budget)
 
+        monkeypatch.setattr(market_inputs, "_raw_payload", record_payload)
+        monkeypatch.setattr(market_inputs, "_proxy_publication_delta", record_delta)
         monkeypatch.setattr(market_inputs, "verify_proxy_content", record_content)
         monkeypatch.setattr(market_inputs, "_proxy_publication", record_publication)
         # When the scan verifies it,
         market_inputs.verify_feature_publications(workspace, budget=BUDGET)
-        # Then the definition is verified on a lease charged beyond the sealed document
-        # alone, because the whole delta stays live, and the publication is rebuilt on a
-        # lease that also charges the decoded transform it was rebuilt from.
-        assert outer[0].reserved_bytes > BUDGET.reserved_bytes + 32 * sealed
+        # Then between reading the sealed document and verifying the definition the lease
+        # grew by exactly that document plus the whole delta, both of which stay live,
+        # and the rebuild below it charges the decoded transform on top.
+        held = market_inputs._retained_bytes(deltas[0])  # noqa: SLF001 -- accounting under test
+        assert held > 0
+        assert outer[0].reserved_bytes - reads[pin.manifest_hash] == 32 * sealed + held
         assert inner[0].reserved_bytes > outer[0].reserved_bytes
+
+
+def test_the_second_identity_set_is_admitted_against_the_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Given both a proxy and an observation contract, so neither identity set is empty.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        path = _proxy_spec(workspace, tmp_path / "proxy.sqlite3", ("PROXY", "v1", "0.1"))
+        _ = _register_domain(workspace, path, "proxy")
+        spec = _observation_spec(workspace, tmp_path / "pair.sqlite3")
+        _ = _register_domain(workspace, spec, "observation")
+        seen: list[tuple[int, int]] = []
+        original = market_inputs._feature_contracts  # noqa: SLF001 -- admission under test
+
+        def record(
+            target: Workspace, record_schema: str, budget: ComputeBudget
+        ) -> tuple[set[tuple[str, str]], int]:
+            identities, live = original(target, record_schema, budget)
+            seen.append((budget.reserved_bytes, live))
+            return identities, live
+
+        monkeypatch.setattr(market_inputs, "_feature_contracts", record)
+        # When the scan admits them,
+        market_inputs.verify_feature_publications(workspace, budget=BUDGET)
+        # Then the first set is admitted on the caller's lease and the second on what is
+        # left once the first one is already live.
+        assert seen[0][0] == BUDGET.reserved_bytes
+        assert seen[0][1] > 0
+        assert seen[1][0] == BUDGET.reserved_bytes + seen[0][1]

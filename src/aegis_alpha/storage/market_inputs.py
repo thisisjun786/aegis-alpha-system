@@ -887,7 +887,13 @@ def _proxy_publication(
     pin, document = _feature_publication_document(
         workspace, transform_hash, transform, budget, label=label
     )
-    return _proxy_publication_delta(workspace, pin, document, budget)
+    # That parsed document stays live while its delta is loaded and matched.
+    return _proxy_publication_delta(
+        workspace,
+        pin,
+        document,
+        replace(budget, reserved_bytes=budget.reserved_bytes + 32 * len(document.payload)),
+    )
 
 
 def _proxy_publication_delta(
@@ -956,8 +962,12 @@ def verify_feature_publications(workspace: Workspace, *, budget: ComputeBudget) 
     and a proxy delta while its definitions are verified.
     """
     proxies, proxy_bytes = _feature_contracts(workspace, "aas-market-rowset-v1", budget)
+    # The first set is live by the time the second one is admitted, so the second
+    # admission runs on what is left rather than on the caller's whole lease.
     observations, observation_bytes = _feature_contracts(
-        workspace, OBSERVATION_DEFINITION_SCHEMA, budget
+        workspace,
+        OBSERVATION_DEFINITION_SCHEMA,
+        replace(budget, reserved_bytes=budget.reserved_bytes + proxy_bytes),
     )
     # Both sets, and the kept subsets built from them, stay live for the whole scan.
     scan = replace(
@@ -1092,7 +1102,12 @@ def verify_proxy_content(workspace: Workspace, history: History, *, budget: Comp
         (ordinal, *item) for ordinal, item in enumerate(inputs)
     ]:
         raise ValueError("proxy feature inputs mismatch")
-    payload = _raw_payload(workspace, transform_hash, budget)
+    # The decoded definition stays live for every step below, so the transform is read
+    # and decoded on what is left of the lease rather than on all of it.
+    definition_held = replace(
+        budget, reserved_bytes=budget.reserved_bytes + 256 * len(contract["definition"])
+    )
+    payload = _raw_payload(workspace, transform_hash, definition_held)
     transform = decode_json(payload)
     if (
         not isinstance(transform, dict)
@@ -1105,7 +1120,7 @@ def verify_proxy_content(workspace: Workspace, history: History, *, budget: Comp
         workspace,
         transform_hash,
         transform,
-        replace(budget, reserved_bytes=budget.reserved_bytes + 32 * len(payload)),
+        replace(definition_held, reserved_bytes=definition_held.reserved_bytes + 32 * len(payload)),
     )
     expected = {
         "contract_id": definition["proxy_id"],
@@ -1333,36 +1348,62 @@ def _observation_generations(
     # it recomputes that table's digest, so it is checked once for the whole pass.
     resolved: set[SourcePin] = set()
     for generation, rows in grouped.items():
-        transform_hash, transform, held = _transform(workspace, generation, budget)
-        destination = transform.get("dataset")
-        if (
-            transform.get("observation") != definition
-            or transform.get("schema_version") != OBSERVATION_TRANSFORM_SCHEMA
-            or not isinstance(destination, dict)
-            or destination.get("generation_id") != generation
-        ):
-            raise ValueError("observation transform conflicts with feature contract")
-        # Authenticate the pointer, then let that parsed document go before the
-        # re-derivation builds another one: the lease reserves the cached chain, not
-        # two full documents alive at the same time. The decoded transform itself stays
-        # live for both, so both run on the lease that already charges it.
-        _feature_publication_document(
-            workspace, transform_hash, transform, held, label="observation"
-        )
-        marker = market.marker_for(workspace.market, generation)
-        derived, _ = native_input_document(
+        # One generation per frame, so the transform and the two documents it needed are
+        # released before the next generation reads anything. Keeping them alive across
+        # the loop would leave the next iteration's lease charging none of them.
+        _observation_generation(
             workspace,
-            _raw_payload(workspace, transform_hash, held),
-            expected_schema=OBSERVATION_TRANSFORM_SCHEMA,
-            budget=held,
-            resolved=resolved,
+            generation,
+            tuple(rows),
+            _ObservationCheck(definition, expected, resolved),
+            budget,
         )
-        if derived.sha256 != marker["request_hash"]:
-            raise ValueError("observation delta was not derived from its pinned source")
-        delta = tuple(rows)
-        if any(row[key] != value for row in delta for key, value in expected.items()):
-            raise ValueError("observation points conflict with pinned definition/inputs")
-        _verify_proxy_catalog(workspace, generation, transform_hash, label="observation")
+
+
+@dataclass(frozen=True, slots=True)
+class _ObservationCheck:
+    """What every generation of one contract is checked against, resolved once."""
+
+    definition: dict[str, object]
+    expected: dict[str, object]
+    resolved: set[SourcePin]
+
+
+def _observation_generation(
+    workspace: Workspace,
+    generation: str,
+    delta: History,
+    check: _ObservationCheck,
+    budget: ComputeBudget,
+) -> None:
+    """Re-derive one generation from its pinned source and match the committed delta."""
+    transform_hash, transform, held = _transform(workspace, generation, budget)
+    destination = transform.get("dataset")
+    if (
+        transform.get("observation") != check.definition
+        or transform.get("schema_version") != OBSERVATION_TRANSFORM_SCHEMA
+        or not isinstance(destination, dict)
+        or destination.get("generation_id") != generation
+    ):
+        raise ValueError("observation transform conflicts with feature contract")
+    # Authenticate the pointer, then let that parsed document go before the
+    # re-derivation builds another one: the lease reserves the cached chain, not
+    # two full documents alive at the same time. The decoded transform itself stays
+    # live for both, so both run on the lease that already charges it.
+    _feature_publication_document(workspace, transform_hash, transform, held, label="observation")
+    marker = market.marker_for(workspace.market, generation)
+    derived, _ = native_input_document(
+        workspace,
+        _raw_payload(workspace, transform_hash, held),
+        expected_schema=OBSERVATION_TRANSFORM_SCHEMA,
+        budget=held,
+        resolved=check.resolved,
+    )
+    if derived.sha256 != marker["request_hash"]:
+        raise ValueError("observation delta was not derived from its pinned source")
+    if any(row[key] != value for row in delta for key, value in check.expected.items()):
+        raise ValueError("observation points conflict with pinned definition/inputs")
+    _verify_proxy_catalog(workspace, generation, transform_hash, label="observation")
 
 
 def _observation_identities(workspace: Workspace, history: History) -> None:
