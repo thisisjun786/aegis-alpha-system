@@ -16,6 +16,7 @@ from typing import Any, cast
 import pytest
 
 from aegis_alpha.application import run_backtest as run_module
+from aegis_alpha.application import run_staging
 from aegis_alpha.application.cli import main
 from aegis_alpha.application.run_backtest import RunBacktestRequest, run_backtest
 from aegis_alpha.compute_resources import ComputeBudget
@@ -239,7 +240,7 @@ def test_identity_change_after_preparation_fails_the_run(
 ) -> None:
     home, request = case
     _cli(home, "db", "run-install")
-    genuine = run_module._installation  # noqa: SLF001 -- staged identity injection point
+    genuine = run_module.installation_identity
     seen: list[object] = []
 
     def moved(workspace: object) -> tuple[str, str, str, str | None]:
@@ -249,7 +250,12 @@ def test_identity_change_after_preparation_fails_the_run(
             return recorded
         return (recorded[0], "a-different-state-store", recorded[2], recorded[3])
 
-    monkeypatch.setattr(run_module, "_installation", moved)
+    # Both reads are patched because they live in different namespaces: stage A reads it
+    # as a global of this command's own module and stage C reads it inside the shared
+    # staging both run entry points commit through. Patching one would leave the other
+    # reporting the genuine identity, and the mismatch this test needs would never form.
+    monkeypatch.setattr(run_module, "installation_identity", moved)
+    monkeypatch.setattr(run_staging, "installation_identity", moved)
     with pytest.raises(ValueError, match="installation identity changed"):
         _api(home, request)
     assert len(seen) == _IDENTITY_READS
@@ -292,8 +298,8 @@ def test_interrupted_run_is_recovered_as_interrupted(
         raise RuntimeError("process lost before the commit")
 
     # A crash ends no run: the intent and the RUNNING row are all that survive.
-    monkeypatch.setattr(run_module, "_abandon", lambda *_args: "left RUNNING by the test")
-    monkeypatch.setattr(run_module, "_record", lost)
+    monkeypatch.setattr(run_module, "abandon", lambda *_args: "left RUNNING by the test")
+    monkeypatch.setattr(run_module, "record", lost)
     with pytest.raises(RuntimeError, match="process lost"):
         _api(home, request)
     assert _statuses(home) == ["RUNNING"]
@@ -375,7 +381,9 @@ def test_a_failed_cleanup_never_replaces_the_original_failure(
         raise cleanup_error
 
     monkeypatch.setattr(run_module, "run_document", refuse)
-    monkeypatch.setattr(run_module, "fail_run", unavailable)
+    # fail_run is looked up inside the shared staging module, so that is where the
+    # cleanup failure has to be injected.
+    monkeypatch.setattr(run_staging, "fail_run", unavailable)
     with pytest.raises(ValueError, match="injected accounting failure") as failure:
         _api(home, request)
     notes = getattr(failure.value, "__notes__", [])
@@ -402,7 +410,7 @@ def test_later_stages_reserve_what_preparation_keeps_live(
     home, request = case
     _cli(home, "db", "run-install")
     genuine_open = run_module._open  # noqa: SLF001 -- stage budget observation point
-    genuine_record = run_module._record  # noqa: SLF001 -- stage budget observation point
+    genuine_record = run_module.record
     seen: dict[str, int] = {}
 
     def watched_open(root: Path, opening: object, wanted: object, budget: ComputeBudget) -> object:
@@ -424,7 +432,7 @@ def test_later_stages_reserve_what_preparation_keeps_live(
         return genuine_record(root, cast("Any", opened), cast("Any", result), request_hash, budget)
 
     monkeypatch.setattr(run_module, "_open", watched_open)
-    monkeypatch.setattr(run_module, "_record", watched_record)
+    monkeypatch.setattr(run_module, "record", watched_record)
     receipt = _api(home, request)
 
     assert receipt["run"]["status"] == "SUCCESS"
@@ -504,7 +512,7 @@ def test_cli_failure_reports_what_happened_to_the_run(
         raise cleanup_error("injected cleanup failure")
 
     monkeypatch.setattr(run_module, "run_document", refuse)
-    monkeypatch.setattr(run_module, "fail_run", unavailable)
+    monkeypatch.setattr(run_staging, "fail_run", unavailable)
     assert main(["--home", str(home), *_arguments(request)]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -527,9 +535,12 @@ def test_a_driver_fault_keeps_its_run_diagnostic(
     def refuse(*_args: object, **_kwargs: object) -> dict[str, object]:
         raise sqlite3.OperationalError("injected driver fault")
 
-    monkeypatch.setattr(
-        run_module, "run_document" if stage == "calculation" else "commit_run", refuse
-    )
+    if stage == "calculation":
+        monkeypatch.setattr(run_module, "run_document", refuse)
+    else:
+        # The commit is made by the shared staging, so that is the namespace the fault
+        # has to be injected into.
+        monkeypatch.setattr(run_staging, "commit_run", refuse)
     with pytest.raises(ValueError, match="local database operation failed") as failure:
         _api(home, request)
     notes = getattr(failure.value, "__notes__", [])

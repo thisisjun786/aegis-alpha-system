@@ -57,6 +57,7 @@ __all__ = [
     "SleeveRef",
     "Window",
     "declared_provenance",
+    "parse_declared_request",
     "parse_research_composition_request",
     "parse_research_run_request",
 ]
@@ -636,6 +637,33 @@ def parse_research_composition_request(raw: bytes) -> ResearchRunRequest:
         _text(block["sample_id"], "composition sample_id"), SWITCH_RULE, defense
     )
     return _declared(decoded, body, RESEARCH_COMPOSITION_SCHEMA, offense, composition)
+
+
+def parse_declared_request(raw: bytes) -> ResearchRunRequest:
+    """Parse whichever of the two declared contracts this document says it is.
+
+    A caller holding a declaration cannot be asked which contract to use, because the
+    document already names it. The version is read and exactly that parser runs: nothing
+    is tried in turn, so a document naming neither contract is refused for what it is
+    rather than by whichever parser happened to fail on it first. Both roots are closed
+    and disjoint, so this never has to choose between two that could match.
+
+    Decoding the document twice is deliberate. A declaration is a few kilobytes and
+    bounded well below the request store's own limit, and each parser owns the whole of
+    its contract including the decode, which is what keeps this dispatcher from becoming
+    a third place that knows how a declaration is shaped.
+    """
+    body = decode_json(raw)
+    if not isinstance(body, dict):
+        raise ResearchRunError("declaration must be a JSON object")
+    version = body.get("schema_version")
+    if version == RESEARCH_RUN_SCHEMA:
+        return parse_research_run_request(raw)
+    if version == RESEARCH_COMPOSITION_SCHEMA:
+        return parse_research_composition_request(raw)
+    raise ResearchRunError(
+        "declaration must name " + RESEARCH_RUN_SCHEMA + " or " + RESEARCH_COMPOSITION_SCHEMA
+    )
 
 
 def _sleeve(value: object, role: str) -> SleeveRef:
