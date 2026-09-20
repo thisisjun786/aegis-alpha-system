@@ -500,7 +500,12 @@ def _admit_publication_chain(
             raise ComputeResourceError("publication chain exceeds materialization budget")
         seen.add(current)
         marker = market.marker_for(workspace.market, str(current))
-        domains.add(str(marker["domain"]))
+        domain = str(marker["domain"])
+        if domain not in DOMAINS:
+            # The chain read raises this for a stored domain it does not know; sizing
+            # the schema here must not turn that into a KeyError from a dict lookup.
+            raise ValueError("invalid generation schema/chain sequence")
+        domains.add(domain)
         current = marker["parent_id"]
     return max(domains, key=lambda name: len(DOMAINS[name]))
 

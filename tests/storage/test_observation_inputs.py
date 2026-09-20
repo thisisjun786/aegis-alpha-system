@@ -13,6 +13,7 @@ from decimal import Decimal, localcontext
 from fractions import Fraction
 from typing import TYPE_CHECKING
 
+import duckdb
 import pytest
 
 from aegis_alpha.application.data_cli import execute_native_data
@@ -1075,3 +1076,24 @@ def test_a_price_chain_is_charged_with_its_own_schema(
         charged = market_inputs._retained_bytes(history, "prices")  # noqa: SLF001 -- accounting under test
         assert charged > market_inputs._retained_bytes(history)  # noqa: SLF001 -- accounting under test
         assert seen[0].reserved_bytes == BUDGET.reserved_bytes + charged
+
+
+def test_an_unknown_stored_domain_keeps_its_invalid_schema_error(tmp_path: Path) -> None:
+    # Given a committed generation whose stored domain is not one this build knows,
+    # which is what a corrupted or forward-dated market file looks like.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        spec = _observation_spec(workspace, tmp_path / "domain.sqlite3")
+        _ = _register_domain(workspace, spec, "observation")
+        generation = str(publication.read_dataset(workspace, "domain", "1")["generation_id"])
+    with duckdb.connect(str(tmp_path / "home" / "market.duckdb")) as connection:
+        _ = connection.execute(
+            "UPDATE market_generations SET domain='unknown' WHERE generation_id=?", [generation]
+        )
+    # When its sealed deltas are verified, Then sizing the chain's schema keeps the
+    # established invalid-schema error instead of failing on a dictionary lookup.
+    with (
+        open_workspace(tmp_path / "home") as workspace,
+        pytest.raises(ValueError, match="invalid generation schema"),
+    ):
+        _ = market_inputs.verify_sealed_publication(workspace, generation, budget=BUDGET)
