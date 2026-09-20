@@ -14,7 +14,15 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
 
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
-from aegis_alpha.storage.market_schema import COMMON, DDL, DOMAINS, NATURAL_KEYS
+from aegis_alpha.storage.market_schema import (
+    COMMON,
+    DDL,
+    DOMAINS,
+    NATURAL_KEYS,
+    rowset_encoding_bytes,
+    text_bytes,
+    text_columns,
+)
 
 if TYPE_CHECKING:
     import duckdb
@@ -564,6 +572,10 @@ def _admit_chain_memory(
     # Fixed row/cell allowances cover Python objects, maps, indexes and copies;
     # text has room for four-byte Unicode plus simultaneous rowset encodings.
     estimated_bytes = 64 * 1024
+    # The codec's buffers do not outlive the delta they hash. _verified_chain_rows
+    # digests one generation at a time and keeps only the digest, so the widest
+    # generation sets this term instead of the chain summing it.
+    workspace_bytes = 0
     for marker in chain:
         domain = str(marker["domain"])
         if domain not in DOMAINS:
@@ -584,7 +596,18 @@ def _admit_chain_memory(
         )
         if count != marker["row_count"]:
             raise ValueError("market generation logical hash/count mismatch")
-        estimated_bytes += 1024 + count * (1024 + 256 * len(schema)) + 32 * characters
+        # At most one text value per VARCHAR cell, which is an upper bound because a
+        # NULL holds none. Charged by value and by character rather than by character
+        # alone; see market_schema.text_bytes for why a flat per-character rate is
+        # wrong at both ends of the range this history actually contains. This read
+        # also hashes what it fetches, so it carries the rowset codec's encoded copies
+        # beside the decoded values rather than only the values.
+        values = count * text_columns(schema)
+        estimated_bytes += (
+            1024 + count * (1024 + 256 * len(schema)) + text_bytes(values, characters)
+        )
+        workspace_bytes = max(workspace_bytes, rowset_encoding_bytes(values, characters))
+    estimated_bytes += workspace_bytes
     available_bytes = budget.available_bytes
     if estimated_bytes > available_bytes:
         raise ComputeResourceError(

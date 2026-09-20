@@ -26,7 +26,7 @@ from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.engine.codec import decode_json
 from aegis_alpha.storage import market
 from aegis_alpha.storage.import_document import ImportDocument, parse_import
-from aegis_alpha.storage.market_schema import COMMON, DOMAINS
+from aegis_alpha.storage.market_schema import COMMON, DOMAINS, text_bytes
 from aegis_alpha.storage.membership_pins import (
     IdentityPin,
     UniversePin,
@@ -1237,11 +1237,17 @@ def _retained_bytes(history: History, domain: str = "feature_values") -> int:
     """
     schema = COMMON + DOMAINS[domain]
     generations = len({str(row["generation_id"]) for row in history})
-    characters = sum(
-        len(value) for row in history for value in row.values() if isinstance(value, str)
-    )
+    values = characters = 0
+    for row in history:
+        for value in row.values():
+            if isinstance(value, str):
+                values += 1
+                characters += len(value)
     return (
-        64 * 1024 + 1024 * generations + len(history) * (1024 + 256 * len(schema)) + 32 * characters
+        64 * 1024
+        + 1024 * generations
+        + len(history) * (1024 + 256 * len(schema))
+        + text_bytes(values, characters)
     )
 
 
