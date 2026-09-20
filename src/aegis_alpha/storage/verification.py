@@ -291,7 +291,9 @@ def _verify_input_documents(workspace: Workspace, budget: ComputeBudget) -> None
     from aegis_alpha.storage.backtest_requests import (  # noqa: PLC0415 -- optional content owner
         read_backtest_request,
     )
-    from aegis_alpha.storage.market_inputs import verify_proxy_publications  # noqa: PLC0415
+    from aegis_alpha.storage.market_inputs import (  # noqa: PLC0415
+        verify_feature_publications,
+    )
 
     status = inspect_run_schema(workspace)
     schemas = {"aas-derived-definition-v1": "derived", "aas-ensemble-membership-v1": "membership"}
@@ -300,9 +302,9 @@ def _verify_input_documents(workspace: Workspace, budget: ComputeBudget) -> None
     ):
         if row[3] in schemas:
             read_definition(workspace, DefinitionPin(schemas[row[3]], *row[:3]), budget=budget)
-        elif row[3] != "aas-market-rowset-v1":
+        elif row[3] not in {"aas-market-rowset-v1", "aas-observation-definition-v1"}:
             raise ValueError("unsupported feature definition schema")
-    verify_proxy_publications(workspace, budget=budget)
+    verify_feature_publications(workspace, budget=budget)
     for row in workspace.state.execute("SELECT bundle_id,content_hash FROM input_bundles"):
         pin = InputBundleRef(*row)
         read_input_bundle(workspace, pin, budget=budget)

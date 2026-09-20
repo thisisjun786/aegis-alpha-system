@@ -16,11 +16,48 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
 - Backup takes SQLite snapshots and closes DuckDB after checkpoint while retaining
   installation admission. Restore targets a new root; secrets are excluded.
 - `research_inputs` publishes a retained source table as a new generation only
-  through an exact hashed transform document (`aas-{price,sessions,proxy}-transform-v1`).
+  through an exact hashed transform document
+  (`aas-{price,sessions,proxy,observation}-transform-v1`).
   Every common revision field maps to a real source column; never fabricate
   revision links, record identity or row hashes. Decimal admission is exact and
   partial OHLCV rejects. Proxy points are DOUBLE `feature_values` under their own
   contract ID/version and stay non-executable. The raw spec is provenance.
+- `research_inputs.register_observation_input` is the explicit observed research
+  route for a retained panel that carries real session opens or closes without the
+  complete OHLCV an executable bar needs. It writes DOUBLE `feature_values` under
+  `aas-observation-definition-v1`, so the exact DECIMAL(38,12) admission and the
+  partial-OHLCV refusal keep refusing precisely what they refused before while the
+  retained binary64 bits survive unrounded. The contract fixes price_role
+  `reference`, `certified: false` and an explicit `value_domain`; its name is
+  `series_id/observation_role`, so one series' open and close stay distinct rows
+  and carry their own missingness. `observed_source` pins the upstream panel as
+  provenance while the transform's own source pins the mapped point table.
+  `feature_inputs` pins no single transform, because a panel legitimately arrives
+  as several bounded generations; each contributing generation's transform is
+  authenticated on read. `publication_at_us` stays as declared, including null: an
+  unknown publication time is never filled in from a session date, and a panel
+  without knowledge times keeps NULL knowledge columns, so strict PIT selects
+  nothing from it. Research return proxies keep their own route.
+- An observation extension continues one contract all the way down: each ancestor's
+  pinned transform is re-read and must declare the same definition, because matching
+  contract columns alone can come from the generic import route. Reads and
+  `verify_feature_publications` load each chain once and group rows by
+  generation, and that verifier's scan is ordered by `dataset_id, sequence` because
+  its one-entry cache depends on a dataset's rows being contiguous. Those are
+  correctness-adjacent: without them an ordinary read and `aas db verify` become
+  quadratic in the number of chunks a panel was published as.
+- `aas data register-observations --spec <file> --sha256 <digest>` is the CLI
+  surface, alongside `register-prices`, `register-sessions` and `register-proxy`.
+- A native route declares the retained transform it was built from in its sealed
+  import document, as the optional `transform_schema` field of
+  `aas-market-import-v1`. That document's SHA-256 is the marker `request_hash` the
+  generation chain covers, so `verify_feature_publications` classifies a committed
+  `feature_values` publication from evidence an edit cannot move, and never from
+  `dataset_versions.transform_hash`: that column is `NOT NULL` for every route, and a
+  generic offline import commits an opaque digest whose preimage it never retained.
+  Discovery starts at the publications rather than the contract table, because a lost
+  contract would otherwise hide a committed generation behind an empty scan while the
+  integrity checks still pass.
 - `market_inputs` reads pinned generations with explicit pins and a caller-owned
   compute budget, replaying the full chain per decision. Strict PIT excludes later
   revisions, unknown knowledge and reference prices; observed snapshot research is
