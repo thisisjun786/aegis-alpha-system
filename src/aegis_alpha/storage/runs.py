@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
-from aegis_alpha.storage.backtest_requests import request_schema
+from aegis_alpha.storage.backtest_requests import RESEARCH_EXECUTION_MODE, request_schema
 from aegis_alpha.storage.rowset import rowset_hash
 from aegis_alpha.storage.run_schema import (
     BACKTEST_REQUEST_SCHEMA,
@@ -65,6 +65,10 @@ _PREPARATION_LINK = {
     BACKTEST_REQUEST_SCHEMA: "request_hash",
     RESEARCH_REQUEST_SCHEMA: "declaration_sha256",
 }
+# What a declared preparation fixes about itself. The contract that seals it writes all
+# three as false, so a document claiming otherwise is describing a different run than
+# the one it says it is.
+_RESEARCH_STATUS = ("certified", "point_in_time_certified", "executable_prices")
 _MEDIA_TYPE = "application/json"
 _SHA_LENGTH = 64
 # A sealed document is decoded whole, so it is charged at the expansion the state
@@ -1101,6 +1105,22 @@ def _require_link(document: dict[str, object], field: str, expected: str, label:
         raise RunStorageError(label + " names different evidence")
 
 
+def _require_research_status(preparation: dict[str, object]) -> None:
+    """Refuse a declared preparation that contradicts what its own contract fixes.
+
+    Absent and wrong are refused alike: a document that omits its status proves nothing
+    about the calculation, and one that claims certification claims something this path
+    cannot grant. Without this, storage would record a research run whose only sealed
+    evidence says it was certified, and then keep verifying that record.
+    """
+    if preparation.get("declaration_schema") != RESEARCH_REQUEST_SCHEMA:
+        raise RunStorageError("research preparation does not name the declaration contract")
+    if preparation.get("execution_mode") != RESEARCH_EXECUTION_MODE:
+        raise RunStorageError("research preparation must declare " + RESEARCH_EXECUTION_MODE)
+    if any(preparation.get(field) is not False for field in _RESEARCH_STATUS):
+        raise RunStorageError("research preparation contradicts its own uncertified status")
+
+
 def _require_linked_inputs(
     envelope_bytes: bytes, preparation_bytes: bytes, request_hash: str
 ) -> tuple[str, tuple[str, str] | None]:
@@ -1126,6 +1146,7 @@ def _require_linked_inputs(
     _require_link(preparation, "envelope_sha256", envelope_sha256, "preparation envelope")
     if not research:
         return envelope_sha256, None
+    _require_research_status(preparation)
     return envelope_sha256, (
         content_sha256(_mapping(preparation.get("engine"), "preparation engine")),
         content_sha256(_mapping(preparation.get("environment"), "preparation environment")),

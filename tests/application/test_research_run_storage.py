@@ -392,3 +392,69 @@ def test_the_stored_run_does_not_make_its_observations_executable(
 def _stored_result(home: Path, run_id: str) -> bytes:
     with open_workspace(home) as workspace:
         return _read_sealed(workspace, run_id, "backtest.json")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("certified", True),
+        ("point_in_time_certified", True),
+        ("executable_prices", True),
+        ("execution_mode", "certified-backtest"),
+        ("declaration_schema", "aas-backtest-request-v1"),
+    ],
+)
+def test_a_preparation_that_contradicts_its_own_kind_seals_no_run(
+    research: tuple[Path, Document, Document], field: str, value: object
+) -> None:
+    """The links still match; only the claim changed. Storage refuses it anyway.
+
+    A declared run's whole provenance is this document, so a copy that keeps the same
+    declaration and envelope while claiming certification would record an uncertified
+    calculation as a certified one, and every later verification would agree with it.
+    """
+    home, _body, declaration = research
+    migrated(home)
+    prepared = prepare(home, declaration)
+    raw = canonical_json_bytes(declaration)
+    bundle_raw = bundle_bytes(declaration)
+    tampered = canonical_json_bytes(
+        cast("Document", json.loads(prepared.provenance)) | {field: value}
+    )
+    with open_workspace(home, writable=True) as workspace:
+        bundle = register_input_bundle(
+            workspace,
+            bundle_raw,
+            expected_file_sha256=hashlib.sha256(bundle_raw).hexdigest(),
+            budget=BUDGET,
+        )
+        register_backtest_request(
+            workspace,
+            bundle,
+            raw,
+            expected_request_hash=prepared.declaration.request_sha256,
+            budget=BUDGET,
+        )
+        sealed = cast("Document", json.loads(prepared.provenance))
+        with pytest.raises(RunStorageError, match=r"research preparation|uncertified status"):
+            open_run(
+                workspace,
+                RunIntent(
+                    request_hash=prepared.declaration.request_sha256,
+                    bundle_id=bundle.bundle_id,
+                    engine_hash=content_sha256(cast("Document", sealed["engine"])),
+                    environment_hash=content_sha256(cast("Document", sealed["environment"])),
+                    reason="declared uncertified research run",
+                    envelope_bytes=prepared.envelope.canonical_bytes,
+                    preparation_bytes=tampered,
+                    strategy_pins=(strategy_pin(prepared),),
+                    run_id=prepared.run_id,
+                ),
+                budget=BUDGET,
+            )
+        assert (
+            workspace.state.execute(
+                "SELECT count(*) FROM runs WHERE run_id=?", (prepared.run_id,)
+            ).fetchone()[0]
+            == 0
+        )
