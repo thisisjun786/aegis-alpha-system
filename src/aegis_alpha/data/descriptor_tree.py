@@ -13,7 +13,7 @@ import stat
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, Self
 
 if TYPE_CHECKING:
@@ -22,6 +22,9 @@ if TYPE_CHECKING:
 
 class DescriptorTreeError(ValueError):
     """A descriptor tree could not perform an alias-safe operation."""
+
+
+_READ_CHUNK_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,21 +59,36 @@ def _token(value: os.stat_result, *, label: str) -> DirectoryToken:
 
 
 def _parts(value: str | os.PathLike[str], *, allow_root: bool = False) -> tuple[str, ...]:
-    text = os.fspath(value)
-    if not isinstance(text, str) or "\x00" in text:
+    raw = os.fspath(value)
+    if not isinstance(raw, str):
+        raise DescriptorTreeError("relative descriptor path must be text without NUL")
+    # A str subclass may answer split, startswith, endswith or __contains__ with something
+    # its text never contained, which would let components reach os.open(dir_fd=...) that no
+    # check here ever saw. Invoking the base descriptor cannot be interposed, so every check
+    # below reads an exact str.
+    text = str.__str__(raw)
+    if "\x00" in text:
         raise DescriptorTreeError("relative descriptor path must be text without NUL")
     if text in {"", "."}:
         if allow_root:
             return ()
         raise DescriptorTreeError("relative descriptor path must name a child")
-    path = PurePosixPath(text)
-    if path.is_absolute() or text.startswith("~"):
+    # Split the relative path here instead of routing it through PurePosixPath.
+    # pathlib interns every component it parses, and these components are
+    # caller-supplied content identifiers: a content-addressed digest parsed this
+    # way becomes an immortal interned string for the life of the process, and the
+    # insertion that crosses the interned dictionary's next doubling threshold
+    # charges the whole new keys table to whatever code happened to make it.
+    if text.startswith(("/", "~")):
         raise DescriptorTreeError("descriptor path must be relative")
-    if "//" in text or text.endswith("/") or path.as_posix() != text:
+    parts = tuple(text.split("/"))
+    # PurePosixPath used to drop "." components, so a path spelled with them
+    # differed from its parsed form and was refused here rather than below.
+    if "//" in text or text.endswith("/") or "." in parts:
         raise DescriptorTreeError("descriptor path must use its exact lexical spelling")
-    if any(part in {"", ".", "..", "~"} for part in path.parts):
+    if any(part in {"", "..", "~"} for part in parts):
         raise DescriptorTreeError("descriptor path contains an alias component")
-    return path.parts
+    return parts
 
 
 def _write_all(descriptor: int, payload: bytes) -> None:
@@ -102,16 +120,23 @@ class DescriptorTree(AbstractContextManager["DescriptorTree"]):
 
     @classmethod
     def open_path(cls, path: Path) -> Self:
-        if not path.is_absolute():
+        # Read the root's own text once and rebuild an ordinary Path from it: a Path
+        # subclass can report an anchor and parts that disagree with the path it names,
+        # and those components are what os.open walks below.
+        raw = os.fspath(path)
+        if not isinstance(raw, str):
+            raise DescriptorTreeError("descriptor tree root must be text")
+        root = Path(str.__str__(raw))
+        if not root.is_absolute():
             raise DescriptorTreeError("descriptor tree root must be absolute")
         descriptor: int | None = None
         try:
-            descriptor = os.open(path.anchor, _directory_flags())
-            for component in path.parts[1:]:
+            descriptor = os.open(root.anchor, _directory_flags())
+            for component in root.parts[1:]:
                 child = os.open(component, _directory_flags(), dir_fd=descriptor)
                 os.close(descriptor)
                 descriptor = child
-            return cls(path, descriptor, duplicate=False)
+            return cls(root, descriptor, duplicate=False)
         except OSError as error:
             if descriptor is not None:
                 with suppress(OSError):
@@ -155,7 +180,9 @@ class DescriptorTree(AbstractContextManager["DescriptorTree"]):
             raise DescriptorTreeError("descriptor tree root identity changed")
 
     def _open_directory_fd(self, relative: str | os.PathLike[str] = ".") -> int:
-        components = _parts(relative, allow_root=True)
+        return self._open_components(_parts(relative, allow_root=True))
+
+    def _open_components(self, components: tuple[str, ...]) -> int:
         descriptor = os.dup(self.descriptor)
         try:
             for component in components:
@@ -182,15 +209,19 @@ class DescriptorTree(AbstractContextManager["DescriptorTree"]):
                 os.close(descriptor)
 
     def subtree(self, relative: str | os.PathLike[str]) -> DescriptorTree:
+        # Parse once. A stateful path-like can answer differently on a second call, which
+        # would open one directory and label it with another, and any failure after the
+        # open must not leave the descriptor behind.
+        components = _parts(relative)
+        # Name the subtree before opening it. Adoption with duplicate=False hands the
+        # descriptor to DescriptorTree, which closes it itself when validation fails, so an
+        # outer handler closing the same number could close whatever reused it meanwhile.
+        logical_root = self.logical_root.joinpath(*components)
         try:
-            descriptor = self._open_directory_fd(relative)
+            descriptor = self._open_components(components)
         except OSError as error:
             raise DescriptorTreeError("subtree cannot be opened without aliases") from error
-        return DescriptorTree(
-            self.logical_root.joinpath(*_parts(relative)),
-            descriptor,
-            duplicate=False,
-        )
+        return DescriptorTree(logical_root, descriptor, duplicate=False)
 
     @contextmanager
     def _parent(self, relative: str | os.PathLike[str]) -> Iterator[tuple[int, str]]:
@@ -332,10 +363,22 @@ class DescriptorTree(AbstractContextManager["DescriptorTree"]):
         *,
         max_bytes: int | None = None,
     ) -> bytes:
+        if max_bytes is not None and max_bytes < 0:
+            raise DescriptorTreeError("descriptor read cap must not be negative")
         with self.binary_reader(relative) as handle:
             chunks: list[bytes] = []
             total = 0
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            while True:
+                # Ask for at most what the cap still allows, plus the single byte
+                # that proves the file is over it. A fixed megabyte request
+                # allocates that megabyte whatever the cap says, so a caller that
+                # approved 128 KiB was charged eight times the size it admitted.
+                allowed = _READ_CHUNK_BYTES
+                if max_bytes is not None:
+                    allowed = min(allowed, max_bytes + 1 - total)
+                chunk = handle.read(allowed)
+                if not chunk:
+                    break
                 total += len(chunk)
                 if max_bytes is not None and total > max_bytes:
                     raise DescriptorTreeError(f"descriptor file exceeds size cap: {relative}")
