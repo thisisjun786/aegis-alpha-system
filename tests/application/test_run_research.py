@@ -317,6 +317,72 @@ def test_a_rerun_takes_a_declaration_and_its_digest_together_or_not_at_all(
         _ = rerun_research_run("whatever", home=home, declaration=path)
 
 
+def test_only_a_declared_run_is_re_prepared_from_a_declaration(
+    sample: tuple[Path, Document, Document, Document],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Re-preparing is something a declaration supports and a certified request does not.
+
+    Asked against a run opened under another contract, this refuses rather than answering
+    with a comparison that would report "not reproduced" for a reason that has nothing to
+    do with determinism.
+    """
+    home, base, offense, _defense = sample
+    _installed(home)
+    sleeve = _write(tmp_path, "sleeve.json", _as_sleeve_run(base, offense))
+    composition = _write(tmp_path, "sample.json", _composition(base, offense, _defense))
+    run_id = _run_id(_execute(home, sleeve, capsys))
+    # The stored run is a sleeve run, so its own declaration re-prepares and matches.
+    assert (
+        _rerun(
+            home, run_id, capsys, "--declaration", str(sleeve), "--sha256", sha(sleeve.read_bytes())
+        )["reproduced"]
+        is True
+    )
+    # Another declaration prepares to another identity, which is a real disagreement.
+    other = rerun_research_run(
+        run_id,
+        home=home,
+        declaration=composition,
+        declaration_sha256=sha(composition.read_bytes()),
+    )
+    assert other["reproduced"] is False
+    preparation = cast("Document", cast("Document", other["checks"])["preparation"])
+    assert cast("Document", preparation["matches"])["run_id"] is False
+
+
+def test_a_run_cannot_be_recorded_as_its_own_predecessor(
+    sample: tuple[Path, Document, Document, Document],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Refused before stage A registers anything, so a bad run field strands nothing.
+
+    A declaration always prepares to the same identity, so naming that identity as the
+    predecessor is how a caller reaches this. The run store refuses it too, but only
+    once the declaration is already filed under a bundle name it keeps for good.
+    """
+    home, base, offense, _defense = sample
+    _installed(home)
+    path = _write(tmp_path, "sleeve.json", _as_sleeve_run(base, offense))
+    run_id = _run_id(_execute(home, path, capsys))
+    with open_workspace(home) as workspace:
+        before = workspace.state.execute("SELECT count(*) FROM input_bundles").fetchone()[0]
+    with pytest.raises(ValueError, match="its own predecessor"):
+        _ = run_research(
+            RunResearchRequest(
+                declaration=path,
+                declaration_sha256=sha(path.read_bytes()),
+                home=home,
+                bundle_id="a-name-of-its-own",
+                prior_run_id=run_id,
+            )
+        )
+    with open_workspace(home) as workspace:
+        assert workspace.state.execute("SELECT count(*) FROM input_bundles").fetchone()[0] == before
+
+
 def test_backup_and_restore_carry_the_declared_run_into_a_fresh_root(
     sample: tuple[Path, Document, Document, Document],
     tmp_path: Path,

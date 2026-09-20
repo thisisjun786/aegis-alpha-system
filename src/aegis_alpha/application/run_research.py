@@ -30,7 +30,12 @@ from aegis_alpha.application.backtest_cli import run_document
 from aegis_alpha.application.backtest_prepare import prepare_research_run
 from aegis_alpha.application.compute_cli import price_compute
 from aegis_alpha.application.prepare_cli import admitted_path, require_new_outputs, seal_outputs
-from aegis_alpha.application.research_run import EXECUTION_MODE, parse_declared_request
+from aegis_alpha.application.research_run import (
+    EXECUTION_MODE,
+    RESEARCH_COMPOSITION_SCHEMA,
+    RESEARCH_RUN_SCHEMA,
+    parse_declared_request,
+)
 from aegis_alpha.application.run_staging import (
     MAX_REASON_BYTES,
     Opened,
@@ -84,6 +89,8 @@ _BUNDLE_PREFIX = "research-inputs-"
 # The request store refuses a registered request above this size, so a declaration too
 # large to record is refused before anything is prepared rather than after.
 _MAX_DECLARATION_BYTES = 1024 * 1024
+# The two contracts a declaration can be, as the run records them.
+_DECLARED_SCHEMAS = frozenset({RESEARCH_RUN_SCHEMA, RESEARCH_COMPOSITION_SCHEMA})
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,9 +361,13 @@ def _open(
     )
     with open_workspace(home, writable=True) as workspace:
         # Registration is durable and a bundle name binds one request for good, so the
-        # run-only field is checked first. open_run cannot run inside another
+        # run-only fields are checked first. open_run cannot run inside another
         # transaction, so stage A cannot be one atomic write; refusing a predecessor
-        # nobody recorded is what keeps a bad run field from stranding a registration.
+        # nobody recorded, or one that is this run itself, is what keeps a bad run field
+        # from stranding a registration. The run store refuses both too, but only after
+        # the declaration is already filed.
+        if request.prior_run_id == carried.run_id:
+            raise ValueError("a run cannot be its own predecessor")
         if (
             request.prior_run_id is not None
             and not workspace.state.execute(
@@ -556,6 +567,11 @@ def _reproduced(
     with open_workspace(home) as workspace:
         payload = read_run(workspace, run_id, budget=budget)
         evidence = read_run_evidence(workspace, run_id, budget=budget)
+    if declared is not None and payload.get("request_schema") not in _DECLARED_SCHEMAS:
+        # Re-preparing is something a declaration supports and a certified request does
+        # not, so asking for it against another contract's run is refused rather than
+        # answered with a comparison that would report false for the wrong reason.
+        raise ValueError("only a declared research run can be re-prepared from its declaration")
     retained = retaining(budget, evidence.envelope, evidence.backtest, evidence.preparation)
     admit(retained, len(evidence.envelope))
     recomputed = canonical_json_bytes(
