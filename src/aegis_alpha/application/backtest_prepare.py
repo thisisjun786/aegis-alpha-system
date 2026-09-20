@@ -1534,11 +1534,6 @@ def _mapped_panel(
             continue
         at_us = cast("int", row["feature_at_us"])
         session = _utc_day(at_us)
-        if not visibility.history_start <= session <= visibility.history_end:
-            # The declaration names the window this run read, and the sealed document
-            # records it. An observation outside it would reach the features while the
-            # provenance said it could not.
-            continue
         if session in values.setdefault(instrument, {}):
             raise ValueError("observation panel repeats one session for " + instrument)
         values[instrument][session] = _number(row["value"])
@@ -1637,7 +1632,11 @@ def _research_decisions(
             instrument: tuple(
                 PricePoint(session, value, close.observed[instrument][session])
                 for session, value in sorted(series.items())
-                if close.known_us[instrument][session] <= slot.cutoff_us
+                # The declared history window bounds what a signal may look back on, as
+                # it does on the executable path. It does not bound the marking panels:
+                # a period legitimately extends past the lookback window it warmed up on.
+                if visibility.history_start <= session <= visibility.history_end
+                and close.known_us[instrument][session] <= slot.cutoff_us
             )
             for instrument, series in close.values.items()
         }
