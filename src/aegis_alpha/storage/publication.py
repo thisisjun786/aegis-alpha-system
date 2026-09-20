@@ -9,6 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.storage.import_document import ImportDocument, parse_import, read_import
 from aegis_alpha.storage.raw import put_raw, verify_raw
 
@@ -47,6 +48,7 @@ def publish_document(workspace: Workspace, document: ImportDocument) -> dict[str
     pending = set(cast("list[str]", recovery["pending"])) - {_field(document, "operation_id")}
     if pending:
         raise ValueError("recover or quarantine pending operations before a new import")
+    _check_retained_transform(workspace, document)
     previous = get_operation(workspace.state, _field(document, "operation_id"))
     ingested = cast("int", previous["created_at_us"]) if previous else time.time_ns() // 1000
     rows = [{**row, "ingested_at_us": ingested} for row in document.rows]
@@ -96,6 +98,25 @@ def publish_document(workspace: Workspace, document: ImportDocument) -> dict[str
         "backtest_eligible": False,
         "marker": marker,
     }
+
+
+def _check_retained_transform(workspace: Workspace, document: ImportDocument) -> None:
+    """A declared retained transform has to be retained, before anything is committed.
+
+    Only a native route can honour this declaration, because only it writes the exact
+    transform bytes under raw/ before publishing. Letting a generic import declare it
+    without them would commit a generation every later verification refuses, and a
+    committed generation cannot be withdrawn.
+    """
+    if document.body.get("transform_schema") is None:
+        return
+    digest = _field(document, "transform_sha256")
+    relative = digest[:2] + "/" + digest
+    with DescriptorTree.open_path(workspace.paths.raw) as tree:
+        if not tree.exists(relative):
+            raise ValueError("declared retained transform is absent from this workspace")
+        size = tree.stat(relative).st_size
+    verify_raw(workspace.paths.raw, relative, digest, size)
 
 
 def _check_parent(workspace: Workspace, document: ImportDocument) -> None:

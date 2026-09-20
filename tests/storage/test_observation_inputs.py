@@ -629,6 +629,76 @@ def test_chunked_panel_resolves_its_upstream_source_once(
         assert len(calls) == 1
 
 
+def test_verification_resolves_a_chunked_panel_upstream_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Given one panel published as two bounded generations of the same contract, which
+    # is how a chunked panel arrives, both sharing one upstream pin.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        first = _observation_spec(workspace, tmp_path / "chunked.sqlite3")
+        _ = _register_domain(workspace, first, "observation")
+        later = _observation_spec(
+            workspace,
+            tmp_path / "chunked2.sqlite3",
+            value=52.5,
+            options={
+                "feature_at_us": 40,
+                "dataset": {
+                    "dataset_id": "chunked",
+                    "version": "2",
+                    "generation_id": "chunked2",
+                    "operation_id": "op-chunked2",
+                    "parent_id": "chunked",
+                },
+            },
+        )
+        _ = _register_domain(workspace, later, "observation")
+        calls: list[SourcePin] = []
+        original = research_inputs.resolve_source
+
+        def counted(target: Workspace, source: SourcePin) -> dict[str, object]:
+            calls.append(source)
+            return original(target, source)
+
+        monkeypatch.setattr(research_inputs, "resolve_source", counted)
+        # When the workspace is verified,
+        market_inputs.verify_feature_publications(workspace, budget=BUDGET)
+        # Then the shared upstream panel is digested once for the dataset rather than
+        # once per chunk: the scan verifies one chunk per catalog row and carries that
+        # dataset's resolved set across them.
+        assert len(calls) == 1
+
+
+def test_an_unknown_transform_declaration_is_refused(tmp_path: Path) -> None:
+    # Given a workspace and an import declaring a transform schema nothing can honour.
+    initialize(tmp_path / "home")
+    with (
+        open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace,
+        pytest.raises(ValueError, match="known retained transform schema"),
+    ):
+        # When it is parsed, Then the envelope refuses it rather than letting a verifier
+        # read it as an opaque commitment.
+        _generic_feature_import(workspace, declared="aas-invented-transform-v1")
+
+
+def test_a_declared_retained_transform_must_actually_be_retained(tmp_path: Path) -> None:
+    # Given a generic import that declares this route's transform schema while
+    # committing an opaque digest whose bytes it never retained.
+    initialize(tmp_path / "home")
+    with (
+        open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace,
+        pytest.raises(ValueError, match="declared retained transform"),
+    ):
+        # When it is published, Then it is refused before anything commits, because a
+        # committed generation cannot be withdrawn and every later verification of this
+        # workspace would fail on it.
+        _generic_feature_import(workspace, declared="aas-observation-transform-v1")
+    # And nothing was committed.
+    with open_workspace(tmp_path / "home") as workspace:
+        assert verify_workspace(workspace, budget=BUDGET)["dataset_versions"] == 0
+
+
 def test_upstream_panel_is_admitted_before_it_is_hashed(tmp_path: Path) -> None:
     # Given an upstream panel much larger than the transform's mapped point table.
     initialize(tmp_path / "home")
@@ -693,7 +763,7 @@ def _lose_observation_contract(state_path: Path, name: str) -> None:
         raw_state.commit()
 
 
-def _generic_feature_import(workspace: Workspace) -> None:
+def _generic_feature_import(workspace: Workspace, *, declared: str | None = None) -> None:
     """Commit one generic feature_values import: an opaque commitment, no preimage kept.
 
     This is what the offline import route leaves behind. dataset_versions.transform_hash
@@ -713,6 +783,7 @@ def _generic_feature_import(workspace: Workspace) -> None:
             "publication_at_us": None,
             "normalizer_version": "synthetic-v1",
             "transform_sha256": hashlib.sha256(b"unretained generic transform").hexdigest(),
+            **({} if declared is None else {"transform_schema": declared}),
             "instruments": [
                 {"instrument_id": "ASSET_G", "asset_type": "equity", "venue": "SYNTHETIC"}
             ],
@@ -799,6 +870,11 @@ def _sealed_bytes(workspace: Workspace, pin: market_inputs.GenerationPin) -> byt
     return (workspace.paths.raw / digest[:2] / digest).read_bytes()
 
 
+def _scan_cache() -> market_inputs._ScanCache:
+    """One empty scan cache, as verify_feature_publications builds per pass."""
+    return market_inputs._ScanCache({}, {})  # noqa: SLF001 -- the scan's own carrier
+
+
 def _lease(materialization_bytes: int) -> ComputeBudget:
     """One lease whose Python materialization allowance is exactly the measured size.
 
@@ -860,7 +936,7 @@ def test_the_sealed_document_is_charged_while_its_publication_is_verified(
         # only stops further in, at the bounded read of a sealed delta.
         with pytest.raises(DescriptorTreeError, match="size cap"):
             _ = market_inputs._verify_observation_publication(  # noqa: SLF001 -- the charge is under test
-                workspace, pin, {identity}, {}, lease
+                workspace, pin, {identity}, _scan_cache(), lease
             )
         # Charging it, as the scan now does before it hands the lease down, moves the
         # refusal onto the admission itself instead of spending the allowance twice.
@@ -914,7 +990,7 @@ def test_the_loaded_chain_is_charged_before_its_transforms_are_read(
         monkeypatch.setattr(market_inputs, "_transform", record)
         # When that publication is verified,
         _ = market_inputs._verify_observation_publication(  # noqa: SLF001 -- accounting under test
-            workspace, pin, {("OBSERVED/close", "v1")}, {}, BUDGET
+            workspace, pin, {("OBSERVED/close", "v1")}, _scan_cache(), BUDGET
         )
         # Then the walk's transform reads run on a lease charged for the history that is
         # still live, while the classifying read before the load is not.

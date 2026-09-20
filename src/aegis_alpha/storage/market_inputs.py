@@ -998,7 +998,7 @@ def verify_feature_publications(workspace: Workspace, *, budget: ComputeBudget) 
     )
     kept_proxies: set[tuple[str, str]] = set()
     kept_observations: set[tuple[str, str]] = set()
-    chains: dict[str, tuple[dict[str, History], int]] = {}
+    cache = _ScanCache({}, {})
     for catalog in workspace.state.execute(
         "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash "
         "FROM dataset_versions WHERE status='committed' ORDER BY dataset_id, sequence"
@@ -1010,7 +1010,8 @@ def verify_feature_publications(workspace: Workspace, *, budget: ComputeBudget) 
         # dataset, so it is charged against every later step rather than only the delta
         # it was loaded for.
         lease = replace(
-            scan, reserved_bytes=scan.reserved_bytes + sum(live for _, live in chains.values())
+            scan,
+            reserved_bytes=scan.reserved_bytes + sum(live for _, live in cache.chains.values()),
         )
         # The marker's original request is independent of both live row fields
         # and catalog transform pointers. _load below also checks the manifest.
@@ -1025,7 +1026,7 @@ def verify_feature_publications(workspace: Workspace, *, budget: ComputeBudget) 
             # and an observation destination never does.
             kept_observations.add(
                 _verify_observation_publication(
-                    workspace, GenerationPin(*catalog), observations, chains, held
+                    workspace, GenerationPin(*catalog), observations, cache, held
                 )
             )
             continue
@@ -1244,11 +1245,19 @@ def _retained_bytes(history: History, domain: str = "feature_values") -> int:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _ScanCache:
+    """What one scan keeps between catalog rows: a dataset's chain and its upstream set."""
+
+    chains: dict[str, tuple[dict[str, History], int]]
+    resolved: dict[str, set[SourcePin]]
+
+
 def _verify_observation_publication(
     workspace: Workspace,
     pin: GenerationPin,
     contracts: set[tuple[str, str]],
-    chains: dict[str, tuple[dict[str, History], int]],
+    cache: _ScanCache,
     budget: ComputeBudget,
 ) -> tuple[str, str]:
     """Authenticate one declared observation publication and return its contract identity.
@@ -1270,7 +1279,10 @@ def _verify_observation_publication(
     )
     if identity not in contracts:
         raise ValueError("observation publication has no registered contract")
-    chain, live_bytes = _observation_chain(workspace, pin, chains, held)
+    chain, live_bytes = _observation_chain(workspace, pin, cache.chains, held)
+    # The chain cache retains one dataset at a time, and the upstream set follows it.
+    for stale in [key for key in cache.resolved if key not in cache.chains]:
+        del cache.resolved[stale]
     # The cached chain stays live while the delta is re-derived, so it is charged here
     # exactly as the reader charges the history it returns.
     reserved = replace(held, reserved_bytes=held.reserved_bytes + live_bytes)
@@ -1279,7 +1291,13 @@ def _verify_observation_publication(
         for row in chain.get(pin.generation_id, ())
         if (row["contract_id"], row["contract_version"]) == identity
     )
-    verify_observation_content(workspace, rows, budget=reserved)
+    # Every chunk of one panel shares its upstream pin, and the scan verifies one chunk
+    # per catalog row, so the resolved set is the dataset's rather than each call's:
+    # otherwise a panel published as a hundred bounded generations digests the same
+    # retained panel a hundred times during one aas db verify.
+    verify_observation_content(
+        workspace, rows, budget=reserved, resolved=cache.resolved.setdefault(pin.dataset_id, set())
+    )
     return identity
 
 
@@ -1350,8 +1368,7 @@ def _reference_cells(history: History) -> list[CoverageCell]:
 def _observation_generations(
     workspace: Workspace,
     history: History,
-    definition: dict[str, object],
-    expected: dict[str, object],
+    check: _ObservationCheck,
     budget: ComputeBudget,
 ) -> None:
     """Re-derive every contributing generation from its pinned source and match it.
@@ -1371,9 +1388,6 @@ def _observation_generations(
     grouped: dict[str, list[Row]] = {}
     for row in history:
         grouped.setdefault(str(row["generation_id"]), []).append(row)
-    # Every generation of one panel shares the contract's upstream pin, and resolving
-    # it recomputes that table's digest, so it is checked once for the whole pass.
-    resolved: set[SourcePin] = set()
     for generation, rows in grouped.items():
         # One generation per frame, so the transform and the two documents it needed are
         # released before the next generation reads anything. Keeping them alive across
@@ -1382,7 +1396,7 @@ def _observation_generations(
             workspace,
             generation,
             tuple(rows),
-            _ObservationCheck(definition, expected, resolved),
+            check,
             budget,
         )
 
@@ -1444,7 +1458,11 @@ def _observation_identities(workspace: Workspace, history: History) -> None:
 
 
 def verify_observation_content(
-    workspace: Workspace, history: History, *, budget: ComputeBudget
+    workspace: Workspace,
+    history: History,
+    *,
+    budget: ComputeBudget,
+    resolved: set[SourcePin] | None = None,
 ) -> str:
     """Verify one observation definition, its publication and the supplied revisions.
 
@@ -1516,8 +1534,11 @@ def verify_observation_content(
     _observation_generations(
         workspace,
         history,
-        definition,
-        expected,
+        # Every chunk of one panel shares the contract's upstream pin, and resolving it
+        # recomputes that table's digest. A caller verifying one chunk at a time passes
+        # its dataset's set, so a panel published as many bounded generations digests
+        # the retained panel once for the whole pass rather than once per chunk.
+        _ObservationCheck(definition, expected, set() if resolved is None else resolved),
         replace(budget, reserved_bytes=budget.reserved_bytes + 256 * len(contract["definition"])),
     )
     _observation_identities(workspace, history)
