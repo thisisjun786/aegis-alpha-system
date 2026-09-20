@@ -17,6 +17,7 @@ from aegis_alpha.application.research_run import (
     FILL_CONVENTION,
     RESEARCH_RUN_SCHEMA,
     TIE_RULE,
+    PreparationRecord,
     ResearchRunError,
     ResearchRunRequest,
     declared_provenance,
@@ -39,10 +40,13 @@ def _provenance(request: object) -> dict[str, object]:
     return json.loads(
         declared_provenance(
             cast("ResearchRunRequest", request),
-            envelope_sha256=DIGEST_B,
-            engine={"schema": "aas-engine-identity-v1"},
-            environment={"schema": "aas-environment-identity-v1"},
-            preparation_source_sha256=DIGEST_C,
+            PreparationRecord(
+                envelope_sha256=DIGEST_B,
+                engine={"schema": "aas-engine-identity-v1"},
+                environment={"schema": "aas-environment-identity-v1"},
+                preparation_source_sha256=DIGEST_C,
+                resolved_calendar={"calendar_id": "synthetic-calendar"},
+            ),
         )
     )
 

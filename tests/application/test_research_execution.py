@@ -99,14 +99,22 @@ def _definition(source: Document, role: str) -> Document:
     }
 
 
-def _panel(workspace: Workspace, root: Path, name: str, role: str) -> Document:
+def _panel(
+    workspace: Workspace,
+    root: Path,
+    name: str,
+    role: str,
+    options: Document | None = None,
+) -> Document:
     """Register one observation generation carrying the fixture's own numbers."""
+    settings: Document = {"changes": {}, "known": None, **(options or {})}
     retained = _spec(
         workspace,
         root / (name + "-panel.sqlite3"),
         [{**_source_row(), "record_id": "panel-0", "revision_id": "pr-0"}],
     )
     definition = _definition(json.loads(retained.read_bytes())["source"], role)
+    definition.update(cast("Document", settings["changes"]))
     observed = {
         (str(row["instrument_id"]), str(row["session_date"])): float(str(row[role]))
         for row in price_rows(signal=True)
@@ -127,8 +135,8 @@ def _panel(workspace: Workspace, root: Path, name: str, role: str) -> Document:
                 value=observed[instrument, day.isoformat()],
                 value_state="present",
                 # The retained panel carries no knowledge times, so none is invented.
-                available_at_us=None,
-                revision_known_at_us=None,
+                available_at_us=settings["known"],
+                revision_known_at_us=settings["known"],
                 ingested_at_us=KNOWLEDGE_US,
             )
             row["record_id"] = _hash_json(
@@ -489,3 +497,64 @@ def test_the_sealed_document_names_the_code_that_decided_the_run(
     home, _body, declaration = installation
     sealed = json.loads(_prepared(home, declaration).provenance)
     assert sealed["preparation_source_sha256"] == research_source_identity()
+
+
+def test_the_sealed_document_records_the_calendar_the_run_actually_used(
+    installation: tuple[Path, Document, Document],
+) -> None:
+    """The declared calendar is prose, so the identity that ran is recorded beside it."""
+    home, _body, declaration = installation
+    sealed = json.loads(_prepared(home, declaration).provenance)
+    assert sealed["resolved_calendar"] == {
+        "calendar_id": "synthetic-calendar",
+        "timezone_version": "synthetic-utc-1",
+        "venue": "SYN",
+    }
+    assert (
+        sealed["conventions"]["calendar"]
+        == cast("Document", declaration["conventions"])["calendar"]
+    )
+
+
+def test_panels_that_disagree_on_adjustment_are_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Signals from one basis and fills from another mark one account in a mixture."""
+    monkeypatch.setattr(time, "time_ns", lambda: micros(date(2026, 6, 1)) * 1000)
+    home = tmp_path / "home"
+    _ = initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        body = stored_request(workspace, tmp_path)
+        close = _panel(workspace, tmp_path, "obs-close", "close")
+        opening = _panel(
+            workspace, tmp_path, "obs-open", "open", {"changes": {"adjustment": "capital"}}
+        )
+        workspace.state.commit()
+        assert workspace.strategies is not None
+        workspace.strategies.commit()
+        _ = workspace.market.execute("CHECKPOINT")
+    _refused(home, _declaration(body, close, opening), "disagree on basis, adjustment or calendar")
+
+
+def test_a_row_the_panel_calls_unavailable_at_the_ceiling_is_not_admitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The declaration claims every row precedes its instant; a later row is not one."""
+    monkeypatch.setattr(time, "time_ns", lambda: micros(date(2026, 6, 1)) * 1000)
+    home = tmp_path / "home"
+    _ = initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        body = stored_request(workspace, tmp_path)
+        close = _panel(workspace, tmp_path, "obs-close", "close", {"known": KNOWLEDGE_US})
+        opening = _panel(workspace, tmp_path, "obs-open", "open", {"known": KNOWLEDGE_US})
+        workspace.state.commit()
+        assert workspace.strategies is not None
+        workspace.strategies.commit()
+        _ = workspace.market.execute("CHECKPOINT")
+    # The declaration names an instant one microsecond before every row became known, so
+    # the panel it claims to have had is empty and the run has no history to warm up on.
+    declaration = _declaration(body, close, opening)
+    conventions = cast("Document", declaration["conventions"]) | {
+        "knowledge_time": datetime.fromtimestamp((KNOWLEDGE_US - 1) / 1_000_000, UTC).isoformat()
+    }
+    _refused(home, declaration | {"conventions": conventions}, "insufficient|history window")

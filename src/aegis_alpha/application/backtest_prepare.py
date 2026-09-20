@@ -23,6 +23,7 @@ from typing import Literal, cast
 
 from aegis_alpha.application.research_run import (
     FILL_CONVENTION,
+    PreparationRecord,
     ResearchRunRequest,
     declared_provenance,
 )
@@ -87,9 +88,12 @@ from aegis_alpha.storage.workspace import Workspace
 __all__ = [
     "PrepareRequest",
     "PreparedBacktest",
+    "PreparedResearchRun",
     "StrategyPin",
     "parse_prepare_request",
     "prepare_backtest",
+    "prepare_research_run",
+    "research_source_identity",
 ]
 
 _J = "aas-canonical-json-sha256-v1"
@@ -1554,12 +1558,23 @@ def _mapped_panel(
     values: dict[str, dict[date, float]] = {}
     observed: dict[str, dict[date, date]] = {}
     known: dict[str, dict[date, int]] = {}
-    for row in series.project_as_of(visibility.ceiling, mode=visibility.mode).rows:
+    # Observed-snapshot projection deliberately ignores knowledge times, so the declared
+    # ceiling has to be applied before head selection rather than after. Filtering later
+    # would drop a future-known revision and lose the value it superseded; filtering here
+    # leaves the older revision as the head, which is what was knowable at the ceiling.
+    admissible = replace(series, history=visibility.candidates(series.history, visibility.ceiling))
+    for row in admissible.project_as_of(visibility.ceiling, mode=visibility.mode).rows:
         name = _text(row["instrument_id"])
         instrument = declaration.instrument_map.get(name)
         if instrument is None:
             raise ValueError("observation series " + name + " has no declared instrument mapping")
         if row["value_state"] != "present":
+            continue
+        if row["available_at_us"] is not None and cast("int", row["available_at_us"]) > (
+            visibility.ceiling
+        ):
+            # A row the panel itself says was unavailable at the declared instant is not
+            # admitted by the declaration, which claims every row precedes it.
             continue
         at_us = cast("int", row["feature_at_us"])
         session = _utc_day(at_us)
@@ -1578,6 +1593,7 @@ def _observation_panels(
 ) -> dict[str, _Observed]:
     """Read every declared observation generation through its own uncertified reader."""
     loaded: dict[str, _Observed] = {}
+    semantics: dict[str, tuple[str, ...]] = {}
     for declared in declaration.observations:
         pin = _declared_pin(declared)
         series = load_pinned_observations(loader.workspace, pin, budget=loader.budget)
@@ -1595,10 +1611,19 @@ def _observation_panels(
         if role in loaded:
             raise ValueError("two declared observations carry the same role")
         loaded[role] = _mapped_panel(series, declaration, visibility, role)
+        semantics[role] = (
+            *(_text(contract[key]) for key in ("basis", "adjustment", "value_domain")),
+            canonical_json_bytes(contract["calendar_ref"]).decode(),
+        )
     if sorted(loaded) != ["close", "open"]:
         # Signals read the close panel and fills read the open one. Without both, the
         # accounting would have to reuse one for the other and call it an execution.
         raise ValueError("a declared research run needs one open and one close panel")
+    if len(set(semantics.values())) != 1:
+        # Signals come from one panel and fills from the other, into one account. If the
+        # two disagree on basis, adjustment or calendar, that account is marked in a
+        # mixture nobody declared and the envelope would not say so.
+        raise ValueError("the open and close panels disagree on basis, adjustment or calendar")
     return loaded
 
 
@@ -1785,6 +1810,14 @@ def prepare_research_run(
         ),
     )
     membership = _research_membership(loader, declaration, bundle)
+    if definition.derived_series or bundle.contract.macro_signals:
+        # The declaration pins observations and nothing else, so a strategy that reads a
+        # macro series or a derived one would reach the engine short of an input it was
+        # told to expect. Refused here rather than failing inside replay.
+        raise ValueError(
+            "a declared research run supplies only observed prices; "
+            "this strategy also requires macro or derived inputs"
+        )
     panels = _observation_panels(loader, declaration, visibility)
     decisions = _research_decisions(
         bundle, definition, plan.slots, visibility, (membership, panels)
@@ -1803,10 +1836,13 @@ def prepare_research_run(
         raise ValueError("calculation context changed during preparation")
     provenance = declared_provenance(
         declaration,
-        envelope_sha256=envelope.envelope_sha256,
-        engine=engine,
-        environment=environment,
-        preparation_source_sha256=research_source_identity(),
+        PreparationRecord(
+            envelope_sha256=envelope.envelope_sha256,
+            engine=engine,
+            environment=environment,
+            preparation_source_sha256=research_source_identity(),
+            resolved_calendar=_session_calendar(plan.sessions),
+        ),
     )
     return PreparedResearchRun(
         declaration, definition, plan.slots, decisions, inputs, envelope, provenance

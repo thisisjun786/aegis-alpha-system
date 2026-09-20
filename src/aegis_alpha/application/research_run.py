@@ -44,6 +44,7 @@ __all__ = [
     "GenerationRef",
     "MembershipRef",
     "ObservationPinRef",
+    "PreparationRecord",
     "ResearchRunError",
     "ResearchRunRequest",
     "Window",
@@ -186,6 +187,22 @@ class ExecutionTerms:
 
     cost: float
     initial_cash: float
+
+
+@dataclass(frozen=True, slots=True)
+class PreparationRecord:
+    """What one preparation produced, beside what its declaration asserted.
+
+    Kept together because these travel as one fact: the run's own outputs and the
+    identities of everything that decided them. A caller that forgets one of these is
+    sealing a record that cannot be checked.
+    """
+
+    envelope_sha256: str
+    engine: Mapping[str, object]
+    environment: Mapping[str, object]
+    preparation_source_sha256: str
+    resolved_calendar: Mapping[str, object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -528,14 +545,7 @@ def _knowledge_time(value: object) -> str:
     return declared
 
 
-def declared_provenance(
-    request: ResearchRunRequest,
-    *,
-    envelope_sha256: str,
-    engine: Mapping[str, object],
-    environment: Mapping[str, object],
-    preparation_source_sha256: str,
-) -> bytes:
+def declared_provenance(request: ResearchRunRequest, prepared: PreparationRecord) -> bytes:
     """The sealed record of one declared run: what was asserted, and what it produced.
 
     The declaration is the whole provenance here. No certified request stands behind
@@ -548,20 +558,20 @@ def declared_provenance(
             "schema": PREPARED_SCHEMA,
             "declaration_schema": RESEARCH_RUN_SCHEMA,
             "declaration_sha256": request.request_sha256,
-            "envelope_sha256": _digest(envelope_sha256, "envelope_sha256"),
+            "envelope_sha256": _digest(prepared.envelope_sha256, "envelope_sha256"),
             "execution_mode": request.execution_mode,
             "certified": request.certified,
             "point_in_time_certified": False,
             "executable_prices": False,
-            "engine": dict(engine),
+            "engine": dict(prepared.engine),
             # The engine identity covers the calculation modules. The declared path's
             # own decisions are made in the preparation, so its source is named too;
             # otherwise a stored run would keep its identity across a change to the
             # code that produced it.
             "preparation_source_sha256": _digest(
-                preparation_source_sha256, "preparation_source_sha256"
+                prepared.preparation_source_sha256, "preparation_source_sha256"
             ),
-            "environment": dict(environment),
+            "environment": dict(prepared.environment),
             "strategy": {
                 "strategy_store_id": request.strategy_store_id,
                 "strategy_id": request.strategy_id,
@@ -606,6 +616,9 @@ def declared_provenance(
                 "initial_cash": request.execution.initial_cash,
             },
             "instrument_map": dict(sorted(request.instrument_map.items())),
+            # The declared calendar is prose. This is the identity the run actually used,
+            # taken from the pinned sessions, so a reader can hold one against the other.
+            "resolved_calendar": dict(sorted(prepared.resolved_calendar.items())),
             "conventions": {
                 "knowledge_time": request.conventions.knowledge_time,
                 "knowledge_time_us": request.conventions.knowledge_time_us,
