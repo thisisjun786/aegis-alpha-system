@@ -180,7 +180,9 @@ class DescriptorTree(AbstractContextManager["DescriptorTree"]):
             raise DescriptorTreeError("descriptor tree root identity changed")
 
     def _open_directory_fd(self, relative: str | os.PathLike[str] = ".") -> int:
-        components = _parts(relative, allow_root=True)
+        return self._open_components(_parts(relative, allow_root=True))
+
+    def _open_components(self, components: tuple[str, ...]) -> int:
         descriptor = os.dup(self.descriptor)
         try:
             for component in components:
@@ -207,15 +209,24 @@ class DescriptorTree(AbstractContextManager["DescriptorTree"]):
                 os.close(descriptor)
 
     def subtree(self, relative: str | os.PathLike[str]) -> DescriptorTree:
+        # Parse once. A stateful path-like can answer differently on a second call, which
+        # would open one directory and label it with another, and any failure after the
+        # open must not leave the descriptor behind.
+        components = _parts(relative)
         try:
-            descriptor = self._open_directory_fd(relative)
+            descriptor = self._open_components(components)
         except OSError as error:
             raise DescriptorTreeError("subtree cannot be opened without aliases") from error
-        return DescriptorTree(
-            self.logical_root.joinpath(*_parts(relative)),
-            descriptor,
-            duplicate=False,
-        )
+        try:
+            return DescriptorTree(
+                self.logical_root.joinpath(*components),
+                descriptor,
+                duplicate=False,
+            )
+        except BaseException:
+            with suppress(OSError):
+                os.close(descriptor)
+            raise
 
     @contextmanager
     def _parent(self, relative: str | os.PathLike[str]) -> Iterator[tuple[int, str]]:

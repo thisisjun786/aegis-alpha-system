@@ -453,6 +453,23 @@ class _HostilePathLike:
         return self._answer
 
 
+class _ShiftingPathLike:
+    """Answers with a different path on every call."""
+
+    def __init__(self, *answers: str) -> None:
+        self._answers = list(answers)
+        self.calls = 0
+
+    def __fspath__(self) -> str:
+        answer = self._answers[min(self.calls, len(self._answers) - 1)]
+        self.calls += 1
+        return answer
+
+
+def _open_descriptors() -> set[str]:
+    return {entry.name for entry in Path("/proc/self/fd").iterdir()}
+
+
 TEXT_WITHOUT_NUL = "relative descriptor path must be text without NUL"
 NAMES_A_CHILD = "relative descriptor path must name a child"
 MUST_BE_RELATIVE = "descriptor path must be relative"
@@ -564,6 +581,33 @@ def test_the_root_itself_is_reachable_where_a_caller_allows_it(
     with DescriptorTree.open_path(root) as tree:
         assert tree.stat(root_name).st_ino == os.fstat(tree.descriptor).st_ino
         assert tree.listdir(root_name) == ("sentinel",)
+
+
+def test_a_subtree_is_named_by_the_path_it_actually_opened(tmp_path: Path) -> None:
+    """One answer selects the directory and labels it, and nothing leaks if it is refused.
+
+    A path-like is free to answer differently on each call. Parsing twice let the first
+    answer choose which directory was opened while the second supplied the name it was
+    given, and a refusal on the second left the opened descriptor behind.
+    """
+    root = tmp_path / "root"
+    (root / "staged").mkdir(parents=True)
+    (root / "published").mkdir()
+    (root / "staged" / "sentinel").write_bytes(b"staged")
+    with DescriptorTree.open_path(root) as tree:
+        shifting = _ShiftingPathLike("staged", "published")
+        with tree.subtree(shifting) as opened:
+            assert opened.read_bytes("sentinel") == b"staged"
+            assert opened.logical_root == root / "staged"
+        assert shifting.calls == 1
+        before = _open_descriptors()
+        # The first answer is the only one that counts, so a later one cannot redirect a
+        # subtree that was already admitted; an alias in that first answer is refused, and
+        # so is a path that names no child, neither leaving a descriptor behind.
+        for refused in (_ShiftingPathLike("..", "staged"), ".", ""):
+            with pytest.raises(DescriptorTreeError):
+                tree.subtree(refused)
+        assert _open_descriptors() == before
 
 
 def test_root_components_come_from_the_root_text_itself(tmp_path: Path) -> None:
