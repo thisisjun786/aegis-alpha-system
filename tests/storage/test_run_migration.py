@@ -14,7 +14,7 @@ import pytest
 
 from aegis_alpha.compute_resources import ComputeBudget
 from aegis_alpha.storage import run_schema
-from aegis_alpha.storage.publication import recover_operations
+from aegis_alpha.storage.publication import quarantine, recover_operations
 from aegis_alpha.storage.run_schema import (
     BACKTEST_REQUEST_SCHEMA,
     MIGRATION_OPERATION,
@@ -352,3 +352,26 @@ def test_migrating_an_installation_without_the_add_on_is_refused(tmp_path: Path)
     initialize(home)
     with pytest.raises(RunSchemaError, match="install the run add-on"):
         migrate_run_schema(home)
+
+
+def test_a_migration_intent_cannot_be_quarantined_into_a_dead_end(tmp_path: Path) -> None:
+    """A quarantined intent is never prepared again, so ending this one would strand it."""
+    fx = prepared_v1(tmp_path)
+    record_run(fx, "run-old")
+    with open_workspace(fx.home, writable=True) as workspace:
+        recorded = run_schema._migration_intent(workspace)  # noqa: SLF001
+        prepare_operation(
+            workspace.state,
+            operation_id=MIGRATION_OPERATION,
+            kind=str(recorded["kind"]),
+            request_hash=str(recorded["request_hash"]),
+            target_id=workspace.installation_id,
+            expected_parent=recorded["expected_parent"],
+            payload_hash=str(recorded["payload_hash"]),
+        )
+        with pytest.raises(ValueError, match="finished by aas db run-migrate"):
+            quarantine(workspace, MIGRATION_OPERATION, "operator gave up")
+        workspace.state.commit()
+    # Still finishable, and the run it protects is still there.
+    assert migrate_run_schema(fx.home)["migrated"] is True
+    assert read(fx.home, "run-old")["run_id"] == "run-old"

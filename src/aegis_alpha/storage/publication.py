@@ -437,6 +437,7 @@ def execute_data(workspace: Workspace, args: argparse.Namespace) -> dict[str, ob
 
 
 def quarantine(workspace: Workspace, operation_id: str, reason: str) -> dict[str, object]:
+    from aegis_alpha.storage.run_schema import MIGRATION_KIND  # noqa: PLC0415
     from aegis_alpha.storage.runs import RUN_OPERATION_KIND  # noqa: PLC0415
     from aegis_alpha.storage.state import get_operation, quarantine_operation  # noqa: PLC0415
 
@@ -445,6 +446,11 @@ def quarantine(workspace: Workspace, operation_id: str, reason: str) -> dict[str
         # Ending the intent alone would leave its run RUNNING and invisible to the
         # PREPARED-only recovery scan.
         raise ValueError("a run intent is ended by recovery, which also ends its run")
+    if intent is not None and intent["kind"] == MIGRATION_KIND:
+        # A quarantined intent can never be prepared again, so ending this one would
+        # neither undo a rebuild that already landed nor leave any way to finish one
+        # that did not. The add-on would stay unusable with nothing able to clear it.
+        raise ValueError("a run add-on migration is finished by aas db run-migrate")
     if (
         workspace.market.execute(
             "SELECT 1 FROM market_generations WHERE operation_id=?", [operation_id]
