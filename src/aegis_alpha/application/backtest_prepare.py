@@ -21,7 +21,11 @@ from itertools import pairwise
 from types import MappingProxyType
 from typing import Literal, cast
 
-from aegis_alpha.application.research_run import ResearchRunRequest, declared_provenance
+from aegis_alpha.application.research_run import (
+    FILL_CONVENTION,
+    ResearchRunRequest,
+    declared_provenance,
+)
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
@@ -1424,6 +1428,62 @@ def prepare_backtest(
 # A declared run is named by its own content, so two identical declarations over one
 # installation name one run rather than looking like two results.
 RESEARCH_RUN_ID_SCHEMA = "aas-research-run-id-v1"
+# The declared path's own decisions are made here and in the contract module, and the
+# engine identity covers neither, so a declared run names their source itself.
+RESEARCH_SOURCE_SCHEMA = "aas-research-sources-v1"
+RESEARCH_SOURCE_MODULES = (
+    "aegis_alpha.application.backtest_prepare",
+    "aegis_alpha.application.research_run",
+)
+# What this installation can actually carry out. The engine contract evaluates at the
+# prior calendar month end and the accounting fills at the next supplied session open,
+# so a declaration naming anything else would be sealed over a different calculation.
+_HONOURED_BASIS = "M"
+
+
+def research_source_identity() -> str:
+    """Hash the modules that decide a declared run, so its identity tracks its code."""
+    root = files("aegis_alpha")
+    return content_sha256(
+        {
+            "schema": RESEARCH_SOURCE_SCHEMA,
+            "hash_format": _J,
+            "files": [
+                {
+                    "module": module,
+                    "sha256": hashlib.sha256(
+                        root.joinpath(
+                            module.removeprefix("aegis_alpha.").replace(".", "/") + ".py"
+                        ).read_bytes()
+                    ).hexdigest(),
+                }
+                for module in RESEARCH_SOURCE_MODULES
+            ],
+        }
+    )
+
+
+def _require_honourable(declaration: ResearchRunRequest) -> None:
+    """Refuse a declaration this installation cannot actually carry out.
+
+    A declaration that runs but is not what ran is worse than a refusal: the sealed
+    document would describe one calculation while the envelope performed another. The
+    engine evaluates at the prior calendar month end, so a daily basis would be sealed
+    over a monthly schedule, and the accounting fills at the next supplied session
+    open, so a decision-close fill would be sealed over a next-open execution.
+    """
+    if declaration.semantics.data_basis != _HONOURED_BASIS:
+        raise ValueError(
+            "this installation evaluates at month end; a "
+            + declaration.semantics.data_basis
+            + " basis cannot be honoured"
+        )
+    if declaration.semantics.fill_price != FILL_CONVENTION:
+        raise ValueError(
+            "the accounting fills at the next supplied session open; "
+            + declaration.semantics.fill_price
+            + " cannot be honoured"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1680,8 +1740,19 @@ def prepare_research_run(
     unadjusted and a reference observation is neither, so nothing here pretends one
     stands behind it. Does not register a request, record a run, install a schema,
     execute accounting, or fabricate a price, a knowledge time or a session.
+
+    Not every declared field is checkable, and the ones that are not stay assertions
+    rather than being presented as verified. Checked against stored evidence: the
+    knowledge time against the projection ceiling, the currency and role against each
+    observation contract, the instrument map against the series the panel actually
+    carries, the strategy pin against the private store, the membership digest against
+    the strategy contract, and the basis and fill convention against what this
+    installation can carry out. Recorded and not checked: the prose conventions and the
+    strategy semantics the engine does not consume, which is why the sealed document
+    keeps source_parity at unknown.
     """
     engine, environment = calculation_identity(), environment_identity()
+    _require_honourable(declaration)
     bundle, definition = _stored_strategy(
         workspace,
         StrategyPin(
@@ -1735,6 +1806,7 @@ def prepare_research_run(
         envelope_sha256=envelope.envelope_sha256,
         engine=engine,
         environment=environment,
+        preparation_source_sha256=research_source_identity(),
     )
     return PreparedResearchRun(
         declaration, definition, plan.slots, decisions, inputs, envelope, provenance

@@ -21,7 +21,7 @@ rather than defaulted.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
@@ -111,6 +111,10 @@ _MEMBERSHIP = frozenset({"kind", "id", "version", "hash"})
 _WINDOW = frozenset({"start", "end"})
 # The two numbers the retained panel cannot supply and the engine will not guess.
 _EXECUTION = frozenset({"cost", "initial_cash"})
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+# A proportional rate of one consumes the whole fill, and anything at or above it makes
+# the accounting produce a number no account could have reached.
+_MAX_COST = 1.0
 # Every one of these is a value the strict path would otherwise take from a certified
 # source. Each must be written down; none is inferred and none defaults.
 _CONVENTIONS = frozenset({"knowledge_time", "calendar", "cost", "capital", "currency"})
@@ -217,7 +221,10 @@ def _knowledge_us(value: str) -> int:
         raise ResearchRunError("knowledge_time must be an ISO-8601 instant") from error
     if moment.utcoffset() != timedelta(0):
         raise ResearchRunError("knowledge_time must carry a UTC offset")
-    return int(moment.timestamp() * 1_000_000)
+    # Integer arithmetic throughout: seconds since the epoch multiplied as a float
+    # rounds a distant instant, and a cutoff that moves by a microsecond can move
+    # which revision a projection admits.
+    return (moment - _EPOCH) // timedelta(microseconds=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -468,6 +475,8 @@ def _execution(value: object) -> ExecutionTerms:
         terms.append(float(number))
     if terms[0] < 0:
         raise ResearchRunError("execution cost must not be negative")
+    if terms[0] >= _MAX_COST:
+        raise ResearchRunError("execution cost must be below 1")
     if terms[1] <= 0:
         raise ResearchRunError("execution initial_cash must be positive")
     return ExecutionTerms(terms[0], terms[1])
@@ -525,6 +534,7 @@ def declared_provenance(
     envelope_sha256: str,
     engine: Mapping[str, object],
     environment: Mapping[str, object],
+    preparation_source_sha256: str,
 ) -> bytes:
     """The sealed record of one declared run: what was asserted, and what it produced.
 
@@ -544,6 +554,13 @@ def declared_provenance(
             "point_in_time_certified": False,
             "executable_prices": False,
             "engine": dict(engine),
+            # The engine identity covers the calculation modules. The declared path's
+            # own decisions are made in the preparation, so its source is named too;
+            # otherwise a stored run would keep its identity across a change to the
+            # code that produced it.
+            "preparation_source_sha256": _digest(
+                preparation_source_sha256, "preparation_source_sha256"
+            ),
             "environment": dict(environment),
             "strategy": {
                 "strategy_store_id": request.strategy_store_id,

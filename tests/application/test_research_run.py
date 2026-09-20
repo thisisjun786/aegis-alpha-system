@@ -42,6 +42,7 @@ def _provenance(request: object) -> dict[str, object]:
             envelope_sha256=DIGEST_B,
             engine={"schema": "aas-engine-identity-v1"},
             environment={"schema": "aas-environment-identity-v1"},
+            preparation_source_sha256=DIGEST_C,
         )
     )
 
@@ -416,3 +417,32 @@ def test_a_floating_version_is_refused(field: str) -> None:
     body[field] = cast("dict[str, object]", _body()[field]) | {"version": "latest"}
     with pytest.raises(ResearchRunError, match="must be exact, not latest"):
         parse_research_run_request(_raw(body))
+
+
+@pytest.mark.parametrize("cost", [1.0, 1.5, 42.0])
+def test_a_cost_that_consumes_the_whole_fill_is_refused(cost: float) -> None:
+    """A rate at or above one produces a number no account could have reached."""
+    body = _body()
+    body["execution"] = {"cost": cost, "initial_cash": 10000.0}
+    with pytest.raises(ResearchRunError, match="cost must be below 1"):
+        parse_research_run_request(_raw(body))
+
+
+def test_the_knowledge_time_keeps_every_microsecond() -> None:
+    """The cutoff decides which revisions a projection admits, so it must be exact.
+
+    Seconds since the epoch multiplied as a float rounds a distant instant. These two
+    declarations are one microsecond apart and must stay one microsecond apart.
+    """
+    body = _body()
+    conventions = _conventions()
+    pairs = []
+    for moment, expected in (
+        ("2262-04-11T23:47:16.854775+00:00", 9223372036854775),
+        ("2262-04-11T23:47:16.854776+00:00", 9223372036854776),
+    ):
+        body["conventions"] = conventions | {"knowledge_time": moment}
+        pairs.append(
+            (parse_research_run_request(_raw(body)).conventions.knowledge_time_us, expected)
+        )
+    assert [observed for observed, _ in pairs] == [expected for _, expected in pairs]

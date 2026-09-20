@@ -19,6 +19,7 @@ from aegis_alpha.application.backtest_cli import run_document
 from aegis_alpha.application.backtest_prepare import (
     PreparedResearchRun,
     prepare_research_run,
+    research_source_identity,
 )
 from aegis_alpha.application.research_run import (
     PREPARED_SCHEMA,
@@ -459,3 +460,32 @@ def test_a_restored_installation_reproduces_the_same_run(
     ) == canonical_json_bytes(
         run_document(original.envelope.canonical_bytes, original.envelope.envelope_sha256)
     )
+
+
+def test_a_daily_basis_declaration_is_refused_rather_than_run_monthly(
+    installation: tuple[Path, Document, Document],
+) -> None:
+    """The engine evaluates at month end, so a daily declaration cannot be honoured.
+
+    Accepting it would seal a document describing a daily calculation over a monthly
+    schedule, which is worse than refusing: the record would be wrong rather than absent.
+    """
+    home, _body, declaration = installation
+    semantics = cast("Document", declaration["semantics"]) | {
+        "data_basis": "D",
+        "fill_price": "decision-close",
+    }
+    _refused(
+        home,
+        declaration | {"semantics": semantics, "unsettled": ["fill_price"]},
+        "a D basis cannot be honoured",
+    )
+
+
+def test_the_sealed_document_names_the_code_that_decided_the_run(
+    installation: tuple[Path, Document, Document],
+) -> None:
+    """The engine identity covers engine/ only, so the preparation names its own source."""
+    home, _body, declaration = installation
+    sealed = json.loads(_prepared(home, declaration).provenance)
+    assert sealed["preparation_source_sha256"] == research_source_identity()
