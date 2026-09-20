@@ -11,7 +11,7 @@ import hashlib
 import platform
 import re
 import sys
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, getcontext
@@ -21,6 +21,7 @@ from itertools import pairwise
 from types import MappingProxyType
 from typing import Literal, cast
 
+from aegis_alpha.application.research_run import ResearchRunRequest, declared_provenance
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
@@ -60,10 +61,12 @@ from aegis_alpha.storage.input_pins import (
 from aegis_alpha.storage.market_inputs import (
     GenerationPin,
     History,
+    PinnedObservationSeries,
     PinnedPriceSeries,
     PriceInputRequest,
     ReaderMode,
     admit_native_input,
+    load_pinned_observations,
     load_pinned_prices,
     load_pinned_proxy,
     load_pinned_sessions,
@@ -1008,16 +1011,27 @@ def _outcomes(
 
 
 def _types(workspace: Workspace, prices: tuple[_Prices, ...]) -> dict[str, str]:
+    return _instrument_types(
+        workspace,
+        (
+            instrument
+            for item in prices
+            if item.role == "execution_prices"
+            for instrument in item.series.request.instrument_ids
+        ),
+    )
+
+
+def _instrument_types(workspace: Workspace, instruments: Iterable[str]) -> dict[str, str]:
+    """Classify every execution instrument from the store, never from the request."""
     result = {}
-    for item in prices:
-        if item.role == "execution_prices":
-            for instrument in item.series.request.instrument_ids:
-                row = workspace.state.execute(
-                    "SELECT asset_type FROM instruments WHERE instrument_id=?", (instrument,)
-                ).fetchone()
-                if row is None or row[0] != "etf":
-                    raise ValueError("execution instrument is not an explicitly classified ETF")
-                result[instrument] = "ETF"
+    for instrument in instruments:
+        row = workspace.state.execute(
+            "SELECT asset_type FROM instruments WHERE instrument_id=?", (instrument,)
+        ).fetchone()
+        if row is None or row[0] != "etf":
+            raise ValueError("execution instrument is not an explicitly classified ETF")
+        result[instrument] = "ETF"
     return result
 
 
@@ -1197,6 +1211,68 @@ def _target_memberships(
                 raise ValueError("selected target outside pinned universe at decision")
 
 
+@dataclass(frozen=True, slots=True)
+class _Plan:
+    """The calendar every preparation shares: sessions, the grid, the slots, the period."""
+
+    sessions: History
+    grid: tuple[Session, ...]
+    slots: tuple[DecisionSlot, ...]
+    dates: tuple[date, ...]
+
+
+def _plan(
+    loader: _Loader,
+    body: Row,
+    calendar: Row,
+    definition: ExecutionDefinition,
+    visibility: _Visibility,
+) -> _Plan:
+    """Resolve the pinned sessions into a validated schedule and outcome calendar.
+
+    Both preparations read the same registered sessions generation and hold the same
+    calendar to the same checks. Only the price side differs between them, so the
+    schedule lives here once rather than as two copies that could drift apart.
+    """
+    period = _row(body["period"])
+    sessions_pin = _generation(loader.bindings["sessions", 0])
+    loader.native(sessions_pin, "aas-sessions-transform-v1")
+    sessions = load_pinned_sessions(loader.workspace, sessions_pin, budget=loader.budget).history
+    schedule = ScheduleRequest(
+        definition.calendar,
+        _text(calendar["calendar_id"]),
+        _text(calendar["venue"]),
+        _text(calendar["timezone_version"]),
+        _day(period["start"]),
+        _day(period["end"]),
+        cast("int", body["decision_latency_us"]),
+        visibility.ceiling,
+        None
+        if body["explicit_decision_dates"] is None
+        else tuple(_day(day) for day in cast("tuple[str, ...]", body["explicit_decision_dates"])),
+    )
+    grid = _sessions(sessions, visibility, visibility.ceiling)
+    slots = _schedule(sessions, visibility, schedule)
+    dates = tuple(
+        session.session_date
+        for session in grid
+        if session.status == "open"
+        and schedule.period_start <= session.session_date <= schedule.period_end
+    )
+    # Legacy accounting fills on the next grid date, including all-cash targets.
+    # Reject an unrepresentable slot rather than rewriting either calendar.
+    next_open = dict(pairwise(dates))
+    for slot in slots:
+        if next_open.get(slot.decision_date) != slot.execution_date:
+            message = f"incompatible outcome calendar projection: decision {slot.decision_date} "
+            message += f"requires next open {slot.execution_date}, "
+            raise ValueError(message + f"projected {next_open.get(slot.decision_date)}")
+    # Validate even an intentionally empty schedule and all supplied session values.
+    decision_slots(grid, request=replace(schedule, explicit_decision_dates=()))
+    _complete_calendar(grid, visibility.history_start, schedule.period_end)
+    return _Plan(sessions, grid, slots, dates)
+
+
 def prepare_backtest(
     workspace: Workspace, request: PrepareRequest, *, budget: ComputeBudget
 ) -> PreparedBacktest:
@@ -1231,7 +1307,7 @@ def prepare_backtest(
         for raw in conventions
         if _row(decode_json(raw))["kind"] == "calendar"
     )
-    cutoff, history, period = (_row(body[key]) for key in ("cutoff", "history", "period"))
+    cutoff, history = (_row(body[key]) for key in ("cutoff", "history"))
     visibility = _Visibility(
         cast("ReaderMode", cutoff["mode"]),
         cast("int", cutoff["knowledge_cutoff_us"]),
@@ -1240,43 +1316,10 @@ def prepare_backtest(
         _day(history["end"]),
     )
     loader = _Loader(workspace, budget, bindings)
-    sessions_pin = _generation(bindings["sessions", 0])
-    loader.native(sessions_pin, "aas-sessions-transform-v1")
-    sessions = load_pinned_sessions(workspace, sessions_pin, budget=budget).history
-    schedule = ScheduleRequest(
-        definition.calendar,
-        _text(calendar["calendar_id"]),
-        _text(calendar["venue"]),
-        _text(calendar["timezone_version"]),
-        _day(period["start"]),
-        _day(period["end"]),
-        cast("int", body["decision_latency_us"]),
-        visibility.ceiling,
-        None
-        if body["explicit_decision_dates"] is None
-        else tuple(_day(day) for day in cast("tuple[str, ...]", body["explicit_decision_dates"])),
-    )
-    grid = _sessions(sessions, visibility, visibility.ceiling)
-    slots = _schedule(sessions, visibility, schedule)
-    dates = tuple(
-        session.session_date
-        for session in grid
-        if session.status == "open"
-        and schedule.period_start <= session.session_date <= schedule.period_end
-    )
-    # Legacy accounting fills on the next grid date, including all-cash targets.
-    # Reject an unrepresentable slot rather than rewriting either calendar.
-    next_open = dict(pairwise(dates))
-    for slot in slots:
-        if next_open.get(slot.decision_date) != slot.execution_date:
-            message = f"incompatible outcome calendar projection: decision {slot.decision_date} "
-            message += f"requires next open {slot.execution_date}, "
-            raise ValueError(message + f"projected {next_open.get(slot.decision_date)}")
-    # Validate even an intentionally empty schedule and all supplied session values.
-    decision_slots(grid, request=replace(schedule, explicit_decision_dates=()))
-    _complete_calendar(grid, visibility.history_start, schedule.period_end)
+    plan = _plan(loader, body, calendar, definition, visibility)
+    slots, dates = plan.slots, plan.dates
     membership = _membership(loader, bundle)
-    prices = _prices(loader, body, calendar, sessions)
+    prices = _prices(loader, body, calendar, plan.sessions)
     auxiliary = _auxiliary(loader, body, definition, prices[0].series.request)
     proxies = _proxies(loader, body, prices)
     _execution_selection(prices, proxies, definition)
@@ -1299,7 +1342,7 @@ def prepare_backtest(
         _types(workspace, prices),
         sources,
     )
-    _target_memberships(inputs.targets, slots, prices, sessions, visibility)
+    _target_memberships(inputs.targets, slots, prices, plan.sessions, visibility)
     envelope = export_envelope(request.parsed, projection=projection, inputs=inputs)
     if environment_identity() != environment:
         raise ValueError("calculation context changed during preparation")
@@ -1335,6 +1378,327 @@ def prepare_backtest(
     return PreparedBacktest(
         request, definition, slots, decisions, features, inputs, projection, envelope, provenance
     )
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedResearchRun:
+    """A declared uncertified research run, prepared and not yet recorded."""
+
+    declaration: ResearchRunRequest
+    request: PrepareRequest
+    definition: ExecutionDefinition
+    slots: tuple[DecisionSlot, ...]
+    decisions: tuple[ReplayReceipt, ...]
+    inputs: EnvelopeInputs
+    projection: RequestProjection
+    envelope: EnvelopeExport
+    provenance: bytes
+    certified: bool = field(default=False, init=False)
+
+    @property
+    def request_hash(self) -> str:
+        return self.projection.request_hash
+
+
+@dataclass(frozen=True, slots=True)
+class _Observed:
+    """One pinned observation panel, already resolved onto declared instruments.
+
+    The engine never sees an aas-obs- series identifier. Mapping happens here, once,
+    against the declaration, so an unmapped series is a refusal rather than a silently
+    dropped asset the calculation would then run without.
+    """
+
+    role: str
+    values: Mapping[str, Mapping[date, float]]
+    observed: Mapping[str, Mapping[date, date]]
+    known_us: Mapping[str, Mapping[date, int]]
+
+
+def _require_declaration(body: Row, strategy: StrategyPin, declaration: ResearchRunRequest) -> None:
+    """Hold the declaration and the registered request to the same facts.
+
+    Every check here compares two documents the caller wrote separately. A declaration
+    that disagrees with the request it accompanies would make the stored sidecar
+    describe a calculation the run did not perform, which is the one failure this whole
+    path exists to prevent.
+    """
+    cutoff = _row(body["cutoff"])
+    if cutoff["mode"] != "observed_snapshot_research":
+        # Strict PIT selects nothing from rows without knowledge times, so a request
+        # asking for it would record an empty run rather than refuse one.
+        raise ValueError("a declared research run requires the observed_snapshot_research cutoff")
+    if cutoff["knowledge_cutoff_us"] != declaration.conventions.knowledge_time_us:
+        raise ValueError("declared knowledge_time is not the registered knowledge cutoff")
+    if _text(_row(body["account"])["currency"]) != declaration.conventions.currency:
+        raise ValueError("declared currency is not the registered account currency")
+    if any(
+        _text(selection["price_role"]) != "reference" for selection in _rows(body["price_inputs"])
+    ):
+        # A canonical price input belongs to the strict path, which admits it through
+        # the native price transform this path never calls.
+        raise ValueError("a declared research run admits only reference price inputs")
+    if any(body[field] for field in ("macro_inputs", "derived_inputs", "proxy_rules")):
+        # The observation panel supplies none of these, so a request naming one would
+        # reach the engine short of an input it was told to expect.
+        raise ValueError("a declared research run supplies no macro, derived or proxy inputs")
+    declared = (
+        strategy.strategy_id,
+        strategy.version,
+        strategy.raw_sha256,
+        strategy.contract_sha256,
+    )
+    if declared != (
+        declaration.strategy_id,
+        declaration.strategy_version,
+        declaration.strategy_raw_sha256,
+        declaration.strategy_contract_sha256,
+    ):
+        raise ValueError("declared strategy pin is not the registered strategy pin")
+
+
+def _mapped_panel(
+    series: PinnedObservationSeries,
+    declaration: ResearchRunRequest,
+    visibility: _Visibility,
+    role: str,
+) -> _Observed:
+    """Project one panel at the declared ceiling and resolve its series onto instruments."""
+    values: dict[str, dict[date, float]] = {}
+    observed: dict[str, dict[date, date]] = {}
+    known: dict[str, dict[date, int]] = {}
+    for row in series.project_as_of(visibility.ceiling, mode=visibility.mode).rows:
+        name = _text(row["instrument_id"])
+        instrument = declaration.instrument_map.get(name)
+        if instrument is None:
+            raise ValueError("observation series " + name + " has no declared instrument mapping")
+        if row["value_state"] != "present":
+            continue
+        at_us = cast("int", row["feature_at_us"])
+        session = _utc_day(at_us)
+        if session in values.setdefault(instrument, {}):
+            raise ValueError("observation panel repeats one session for " + instrument)
+        values[instrument][session] = _number(row["value"])
+        # No knowledge time is manufactured: the panel carries none, so the row's own
+        # economic session stands and the declaration records that as uncertified.
+        observed.setdefault(instrument, {})[session] = visibility.observed(row, session)
+        known.setdefault(instrument, {})[session] = at_us
+    return _Observed(role, values, observed, known)
+
+
+def _observation_panels(
+    loader: _Loader, body: Row, declaration: ResearchRunRequest, visibility: _Visibility
+) -> dict[str, _Observed]:
+    """Read every bound observation generation through its own uncertified reader."""
+    declared = {
+        (pin.dataset_id, pin.version, pin.generation_id, pin.chain_hash, pin.manifest_hash): pin
+        for pin in declaration.observations
+    }
+    loaded: dict[str, _Observed] = {}
+    bound: set[tuple[str, ...]] = set()
+    for selection in _rows(body["price_inputs"]):
+        pin = _generation(_selection_ref(selection, loader.bindings))
+        key = (pin.dataset_id, pin.version, pin.generation_id, pin.chain_hash, pin.manifest_hash)
+        if key not in declared:
+            raise ValueError("price input binds a generation the declaration does not pin")
+        bound.add(key)
+        if pin.generation_id in loaded:
+            continue
+        series = load_pinned_observations(loader.workspace, pin, budget=loader.budget)
+        contract = _row(decode_json(series.definition.encode()))
+        role = _text(contract["observation_role"])
+        if role != declared[key].observation_role:
+            raise ValueError("observation role disagrees with the declared pin")
+        if (contract["price_role"], contract["certified"]) != ("reference", False):
+            raise ValueError("a research run admits only uncertified reference observations")
+        loader.retain(pin.generation_id, series.history)
+        loaded[pin.generation_id] = _mapped_panel(series, declaration, visibility, role)
+    if bound != set(declared):
+        raise ValueError("declaration pins an observation the request does not bind")
+    panels = {panel.role: panel for panel in loaded.values()}
+    if sorted(panels) != ["close", "open"]:
+        # Signals read the close panel and fills read the open one. Without both, the
+        # accounting would have to reuse one for the other and call it an execution.
+        raise ValueError("a declared research run needs one open and one close panel")
+    return panels
+
+
+def _research_decisions(
+    bundle: EngineBundle,
+    definition: ExecutionDefinition,
+    slots: tuple[DecisionSlot, ...],
+    visibility: _Visibility,
+    loaded: tuple[EnsembleMembership, Mapping[str, _Observed]],
+) -> tuple[ReplayReceipt, ...]:
+    """Evaluate the registered strategy at each decision through the ordinary engine.
+
+    Each decision sees only the sessions at or before its own cutoff, so nothing later
+    than the decision reaches its features. The knowledge axis stays declared and the
+    economic axis stays honest, which is exactly the split the declaration records.
+    """
+    membership, panels = loaded
+    close = panels["close"]
+    receipts = []
+    for slot in slots:
+        points = {
+            instrument: tuple(
+                PricePoint(session, value, close.observed[instrument][session])
+                for session, value in sorted(series.items())
+                if close.known_us[instrument][session] <= slot.cutoff_us
+            )
+            for instrument, series in close.values.items()
+        }
+        _warmup(definition, points, slot, visibility)
+        receipts.append(
+            replay(
+                bundle,
+                ReplayRequest(slot.decision_date, slot.decision_date, points, {}, {}, membership),
+                knowledge_as_of=_utc_day(slot.cutoff_us),
+            )
+        )
+    return tuple(receipts)
+
+
+def _research_outcomes(
+    panels: Mapping[str, _Observed], dates: tuple[date, ...]
+) -> tuple[tuple[Mapping[str, float], ...], tuple[Mapping[str, float], ...]]:
+    """Mark the period from the separately pinned open and close panels."""
+    marked = {
+        role: tuple(
+            {
+                instrument: series[day]
+                for instrument, series in panels[role].values.items()
+                if day in series
+            }
+            for day in dates
+        )
+        for role in ("open", "close")
+    }
+    return marked["open"], marked["close"]
+
+
+def _research_targets(
+    receipt: ReplayReceipt, definition: ExecutionDefinition
+) -> Mapping[str, float]:
+    """Take the ensemble weights as instruments. No proxy stands in for a logical asset."""
+    result: dict[str, float] = {}
+    for logical, weight in receipt.ensemble.items():
+        if logical not in definition.cash_asset_ids and weight > 0:
+            result[logical] = result.get(logical, 0.0) + weight
+    return MappingProxyType(result)
+
+
+def prepare_research_run(
+    workspace: Workspace,
+    request: PrepareRequest,
+    declaration: ResearchRunRequest,
+    *,
+    budget: ComputeBudget,
+) -> PreparedResearchRun:
+    """Prepare one declared uncertified research run over pinned observations.
+
+    This is the opt-in counterpart of prepare_backtest, and it is opt-in in the only
+    way that matters: it is a separate entry point. Nothing it does makes the strict
+    path admit an observation. admit_native_input still refuses the observation
+    transform, the price reader still refuses the pin for domain, and
+    _reject_observation_contract still closes the derived route. This function calls
+    none of them, reading the panel through load_pinned_observations instead, which is
+    the reader that was written for reference data and returns nothing under strict PIT.
+
+    What makes the result legible rather than eligible is the declaration. The caller
+    writes down the conventions the strict path would otherwise take from a certified
+    source, and every one of them is checked against the registered request rather than
+    believed. Does not install schemas, register requests, execute accounting, record a
+    run, fabricate a price, a knowledge time or a session, or certify anything.
+    """
+    body = _row(request.parsed.document)
+    _require_declaration(body, request.strategy, declaration)
+    engine, environment = calculation_identity(), environment_identity()
+    bundle, definition = _stored_strategy(workspace, request.strategy)
+    bindings = _bindings(body)
+    conventions = read_execution_conventions(
+        workspace.state,
+        tuple(
+            _convention(ref)
+            for ref in _rows(body["refs"])
+            if _text(ref["ref_kind"]).startswith("convention:")
+        ),
+        definition=definition,
+    )
+    projection = request_projection(
+        request.parsed,
+        definition=definition,
+        convention_documents=conventions,
+        engine_identity=engine,
+        environment_identity=environment,
+    )
+    calendar = next(
+        _row(_row(decode_json(raw))["payload"])
+        for raw in conventions
+        if _row(decode_json(raw))["kind"] == "calendar"
+    )
+    cutoff, history = (_row(body[key]) for key in ("cutoff", "history"))
+    visibility = _Visibility(
+        cast("ReaderMode", cutoff["mode"]),
+        cast("int", cutoff["knowledge_cutoff_us"]),
+        cast("int | None", cutoff["ingestion_cutoff_us"]),
+        _day(history["start"]),
+        _day(history["end"]),
+    )
+    loader = _Loader(workspace, budget, bindings)
+    plan = _plan(loader, body, calendar, definition, visibility)
+    membership = _membership(loader, bundle)
+    panels = _observation_panels(loader, body, declaration, visibility)
+    decisions = _research_decisions(
+        bundle, definition, plan.slots, visibility, (membership, panels)
+    )
+    opening, closing = _research_outcomes(panels, plan.dates)
+    inputs = EnvelopeInputs(
+        plan.dates,
+        opening,
+        closing,
+        {receipt.as_of: _research_targets(receipt, definition) for receipt in decisions},
+        _instrument_types(workspace, sorted(declaration.instrument_map.values())),
+        (),
+    )
+    envelope = export_envelope(request.parsed, projection=projection, inputs=inputs)
+    if environment_identity() != environment:
+        raise ValueError("calculation context changed during preparation")
+    provenance = declared_provenance(
+        declaration,
+        request_hash=projection.request_hash,
+        envelope_sha256=envelope.envelope_sha256,
+        registered=_registered(body, projection),
+    )
+    return PreparedResearchRun(
+        declaration,
+        request,
+        definition,
+        plan.slots,
+        decisions,
+        inputs,
+        projection,
+        envelope,
+        provenance,
+    )
+
+
+def _registered(body: Row, projection: RequestProjection) -> Mapping[str, object]:
+    """The numbers the run actually used, beside the prose that declared them.
+
+    A declaration is text and text cannot be recomputed. Recording the registered
+    values next to it means a later reader can check the run against its own request
+    without having to interpret a sentence.
+    """
+    account, period = _row(body["account"]), _row(body["period"])
+    return {
+        "initial_cash": account["initial_cash"],
+        "currency": _text(account["currency"]),
+        "execution_cost": projection.execution_cost,
+        "period": {"start": _text(period["start"]), "end": _text(period["end"])},
+        "knowledge_cutoff_us": _row(body["cutoff"])["knowledge_cutoff_us"],
+        "cutoff_mode": _text(_row(body["cutoff"])["mode"]),
+    }
 
 
 def _decisions(

@@ -21,6 +21,7 @@ rather than defaulted.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
@@ -128,6 +129,31 @@ class DeclaredConventions:
     cost: str
     capital: str
     currency: str
+
+    @property
+    def knowledge_time_us(self) -> int:
+        """The declared knowledge moment in microseconds, as the request cutoff states it.
+
+        The declaration exists to put every retained row before one named instant, so it
+        has to be the same instant the registered request cuts at. Returning it as an
+        integer is what lets the preparation compare the two rather than trust the prose.
+        """
+        return _knowledge_us(self.knowledge_time)
+
+
+def _knowledge_us(value: str) -> int:
+    """Read an exact UTC instant. A local or second-precision time is refused.
+
+    A declared knowledge time is compared against a stored microsecond cutoff, so an
+    offset-free or coarser timestamp would silently compare against a different moment.
+    """
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ResearchRunError("knowledge_time must be an ISO-8601 instant") from error
+    if moment.utcoffset() != timedelta(0):
+        raise ResearchRunError("knowledge_time must carry a UTC offset")
+    return int(moment.timestamp() * 1_000_000)
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,7 +340,7 @@ def parse_research_run_request(raw: bytes) -> ResearchRunRequest:
         observations=_observations(body["observations"]),
         instrument_map=_instrument_map(body["instrument_map"]),
         conventions=DeclaredConventions(
-            knowledge_time=_text(conventions["knowledge_time"], "knowledge_time"),
+            knowledge_time=_knowledge_time(conventions["knowledge_time"]),
             calendar=_text(conventions["calendar"], "calendar"),
             cost=_text(conventions["cost"], "cost"),
             capital=_text(conventions["capital"], "capital"),
@@ -328,12 +354,37 @@ def parse_research_run_request(raw: bytes) -> ResearchRunRequest:
     )
 
 
-def declared_provenance(request: ResearchRunRequest) -> bytes:
-    """The sidecar a stored run carries, so the record states its own status."""
+def _knowledge_time(value: object) -> str:
+    """Refuse an unreadable knowledge time while parsing, not when a run reads it."""
+    declared = _text(value, "knowledge_time")
+    _knowledge_us(declared)
+    return declared
+
+
+def declared_provenance(
+    request: ResearchRunRequest,
+    *,
+    request_hash: str,
+    envelope_sha256: str,
+    registered: Mapping[str, object],
+) -> bytes:
+    """The sidecar a stored run carries, so the record states its own status.
+
+    The run store requires every sealed artifact to name the evidence it came from, so
+    the declaration carries the request it was prepared for and the envelope it
+    produced. Without both links a manifest would be internally consistent while
+    sealing a declaration that belongs to another calculation.
+    """
     return canonical_json_bytes(
         {
             "schema": RESEARCH_RUN_SCHEMA,
+            "request_hash": _digest(request_hash, "request_hash"),
+            "envelope_sha256": _digest(envelope_sha256, "envelope_sha256"),
             "execution_mode": request.execution_mode,
+            # The prose above is what the caller asserted. This is what the registered
+            # request actually carried, so a later reader can check one against the
+            # other instead of interpreting a sentence.
+            "registered": dict(sorted(registered.items())),
             "certified": request.certified,
             "point_in_time_certified": False,
             "executable_prices": False,

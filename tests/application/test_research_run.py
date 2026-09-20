@@ -8,6 +8,7 @@ a silent instrument collision, or no recorded reservation at all.
 from __future__ import annotations
 
 import json
+from typing import cast
 
 import pytest
 
@@ -16,6 +17,7 @@ from aegis_alpha.application.research_run import (
     RESEARCH_RUN_SCHEMA,
     TIE_RULE,
     ResearchRunError,
+    ResearchRunRequest,
     declared_provenance,
     parse_research_run_request,
 )
@@ -25,6 +27,22 @@ DIGEST_B = "b" * 64
 DIGEST_C = "c" * 64
 DIGEST_D = "d" * 64
 EXPECTED_PINS = 2
+# The later of the two ingest moments the retained pins carry, so every retained row
+# precedes it. Declaring it is a convention and creates no time certification.
+KNOWLEDGE_TIME = "2026-09-20T00:53:46.583764+00:00"
+KNOWLEDGE_US = 1789865626583764
+
+
+def _provenance(request: object) -> dict[str, object]:
+    """Build the sidecar with fixed links, so a test compares declarations not hashes."""
+    return json.loads(
+        declared_provenance(
+            cast("ResearchRunRequest", request),
+            request_hash=DIGEST_A,
+            envelope_sha256=DIGEST_B,
+            registered={"initial_cash": 10000.0, "currency": "USD"},
+        )
+    )
 
 
 def _pin(generation: str = "obs-synthetic-open", role: str = "open") -> dict[str, object]:
@@ -49,7 +67,7 @@ def _strategy() -> dict[str, str]:
 
 def _conventions() -> dict[str, str]:
     return {
-        "knowledge_time": "declared: panel carries no knowledge times",
+        "knowledge_time": KNOWLEDGE_TIME,
         "calendar": "synthetic-month-end",
         "cost": "0.0003 per side",
         "capital": "10000",
@@ -103,12 +121,40 @@ def test_a_complete_request_parses_and_is_never_certified() -> None:
 
 def test_the_recorded_sidecar_states_its_own_uncertified_status() -> None:
     request = parse_research_run_request(_raw(_body()))
-    recorded = json.loads(declared_provenance(request))
+    recorded = _provenance(request)
     assert recorded["execution_mode"] == EXECUTION_MODE
     assert recorded["certified"] is False
     assert recorded["point_in_time_certified"] is False
     assert recorded["executable_prices"] is False
     assert recorded["uncertainty"]
+    assert recorded["request_hash"] == DIGEST_A
+    assert recorded["envelope_sha256"] == DIGEST_B
+
+
+def test_the_declared_knowledge_time_is_an_exact_utc_instant() -> None:
+    request = parse_research_run_request(_raw(_body()))
+    assert request.conventions.knowledge_time_us == KNOWLEDGE_US
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        "declared: the panel carries no knowledge times",
+        "2026-09-20T00:53:46.583764",
+        "2026-09-20",
+        "2026-09-20T09:53:46.583764+09:00",
+    ],
+)
+def test_a_knowledge_time_that_is_not_an_exact_utc_instant_is_refused(declared: str) -> None:
+    """A declaration compared against a microsecond cutoff has to be one.
+
+    Prose, a naive timestamp and a local offset all read as plausible and none of them
+    can be compared against the stored cutoff the run is supposed to match.
+    """
+    body = _body()
+    body["conventions"] = _conventions() | {"knowledge_time": declared}
+    with pytest.raises(ResearchRunError, match="knowledge_time must"):
+        parse_research_run_request(_raw(body))
 
 
 def test_a_missing_execution_mode_is_refused_rather_than_defaulted() -> None:
@@ -211,11 +257,11 @@ def test_the_same_request_hashes_the_same_way_twice() -> None:
     first = parse_research_run_request(_raw(_body()))
     second = parse_research_run_request(_raw(_body()))
     assert first.request_sha256 == second.request_sha256
-    assert declared_provenance(first) == declared_provenance(second)
+    assert _provenance(first) == _provenance(second)
 
 
 def test_the_sidecar_records_the_declared_semantics_and_unknown_parity() -> None:
-    recorded = json.loads(declared_provenance(parse_research_run_request(_raw(_body()))))
+    recorded = _provenance(parse_research_run_request(_raw(_body())))
     assert recorded["semantics"]["tie_rule"] == TIE_RULE
     assert recorded["semantics"]["data_basis"] == "M"
     assert recorded["semantics"]["source_parity"] == "unknown"
