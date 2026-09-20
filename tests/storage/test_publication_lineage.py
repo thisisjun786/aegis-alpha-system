@@ -1182,6 +1182,44 @@ def test_metadata_allocation_bound_still_reports_a_deliberate_violation(
         materialize_above_the_bound()
 
 
+def test_admission_never_interns_a_content_identifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The admission path itself must keep content identifiers out of the interned table.
+
+    Every stored object arrives with a fresh digest, so interning them grows one
+    process-global dictionary without limit, and the insertion that crosses its next
+    doubling threshold is charged in full to whatever allocation measurement is open.
+    Interning is observed as it happens because 3.13 interns mortally: a component whose
+    last reference dies leaves the table, so probing it afterwards proves nothing.
+    """
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        seed_native(workspace, tmp_path)
+        selected = pin(workspace)
+        transform_hash = workspace.state.execute(
+            "SELECT transform_hash FROM dataset_versions WHERE generation_id=?",
+            (selected.generation_id,),
+        ).fetchone()[0]
+    identifiers = (str(transform_hash), str(selected.manifest_hash))
+    module = api()
+    interned: list[str] = []
+    original_intern = sys.intern
+
+    def recording_intern(value: str) -> str:
+        interned.append(value)
+        return original_intern(value)
+
+    with open_workspace(home) as workspace:
+        monkeypatch.setattr(sys, "intern", recording_intern)
+        admitted = module.admit_native_input(
+            workspace, selected, expected_schema="aas-price-transform-v1", budget=METADATA_BUDGET
+        )
+    assert admitted.source_pins[0].source_id == "source1"
+    assert [value for value in interned if any(name in value for name in identifiers)] == []
+
+
 @pytest.mark.parametrize("version", ["latest", "LATEST"])
 def test_historical_generic_versions_retain_ordinary_content_semantics(
     tmp_path: Path, version: str

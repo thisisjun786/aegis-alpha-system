@@ -471,6 +471,7 @@ ALIAS_COMPONENT = "descriptor path contains an alias component"
         ("~", MUST_BE_RELATIVE),
         ("~user", MUST_BE_RELATIVE),
         ("~/a", MUST_BE_RELATIVE),
+        ("//", MUST_BE_RELATIVE),
         ("a//b", EXACT_SPELLING),
         ("a/", EXACT_SPELLING),
         ("a/./b", EXACT_SPELLING),
@@ -535,6 +536,34 @@ def test_ordinary_and_path_shaped_relatives_are_admitted(tmp_path: Path) -> None
         assert tree.read_bytes(PurePosixPath("a/./b")) == b"content"
         assert tree.read_bytes(Path("a/b")) == b"content"
         assert tree.stat(".").st_ino == os.fstat(tree.descriptor).st_ino
+
+
+@pytest.mark.parametrize("name", ["a/~b", "..a", "a..b", ".hidden"])
+def test_names_that_merely_resemble_an_alias_are_ordinary(tmp_path: Path, name: str) -> None:
+    """Only an exact alias component is refused, not a name that contains those characters.
+
+    A leading "~" is the exception and stays refused wherever it starts the path, which the
+    "~user" case above pins.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    with DescriptorTree.open_path(root) as tree:
+        if "/" in name:
+            tree.mkdir(name.split("/", maxsplit=1)[0])
+        tree.atomic_write_bytes(name, b"ordinary")
+        assert tree.read_bytes(name) == b"ordinary"
+
+
+@pytest.mark.parametrize("root_name", ["", "."])
+def test_the_root_itself_is_reachable_where_a_caller_allows_it(
+    tmp_path: Path, root_name: str
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "sentinel").write_bytes(b"owned")
+    with DescriptorTree.open_path(root) as tree:
+        assert tree.stat(root_name).st_ino == os.fstat(tree.descriptor).st_ino
+        assert tree.listdir(root_name) == ("sentinel",)
 
 
 def test_root_components_come_from_the_root_text_itself(tmp_path: Path) -> None:
