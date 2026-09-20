@@ -482,3 +482,10 @@ def test_a_floating_observation_version_is_refused() -> None:
     body["observations"] = [_pin() | {"version": "latest"}, _pin("obs-synthetic-close", "close")]
     with pytest.raises(ResearchRunError, match="observation version must be exact"):
         parse_research_run_request(_raw(body))
+
+
+def test_an_account_term_too_large_for_a_float_is_refused_not_raised() -> None:
+    """A huge JSON integer overflows the finiteness check; that is a refusal, not a leak."""
+    raw = _raw(_body()).replace(b'"initial_cash": 10000.0', b'"initial_cash": ' + b"9" * 400)
+    with pytest.raises(ResearchRunError, match="initial_cash must be finite"):
+        parse_research_run_request(raw)

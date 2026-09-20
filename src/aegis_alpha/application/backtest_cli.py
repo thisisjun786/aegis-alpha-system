@@ -203,6 +203,12 @@ def run_document(raw: bytes, expected_sha256: str) -> dict[str, object]:  # noqa
             "explicit cashflows at supplied session open before rebalancing; "
             "withdrawals use existing cash only; unit NAV removes external flow effects"
         )
+    if declared:
+        # This mode computes fills and NAV over reference observations, so the response
+        # says what it is rather than leaving a reader to infer it from a mode name.
+        response["certified"] = False
+        response["non_executable"] = True
+        response["executable_prices"] = False
     return response
 
 

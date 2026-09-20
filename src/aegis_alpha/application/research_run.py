@@ -240,7 +240,10 @@ def _knowledge_us(value: str) -> int:
     """Read an exact UTC instant. A local or second-precision time is refused.
 
     A declared knowledge time is compared against a stored microsecond cutoff, so an
-    offset-free or coarser timestamp would silently compare against a different moment.
+    offset-free timestamp would silently name a different moment depending on who reads
+    it. Precision below the offset is the caller's to choose: this value is the
+    projection ceiling itself, so a coarser declaration declares a coarser ceiling, and
+    the sealed document records the microseconds it resolved to.
     """
     try:
         moment = datetime.fromisoformat(value)
@@ -500,7 +503,14 @@ def _execution(value: object) -> ExecutionTerms:
         number = row[name]
         if isinstance(number, bool) or not isinstance(number, (int, float)):
             raise ResearchRunError("execution " + name + " must be a number")
-        if not math.isfinite(number):
+        try:
+            finite = math.isfinite(number)
+        except OverflowError:
+            # An integer too large for a float is not a rejected value, it is an
+            # unhandled exception leaking out of the parser. Refuse it like any other
+            # number the accounting could not use.
+            finite = False
+        if not finite:
             # NaN compares false against every bound below, so it would pass each check
             # and then fail somewhere inside the accounting instead of here.
             raise ResearchRunError("execution " + name + " must be finite")

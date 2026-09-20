@@ -681,3 +681,37 @@ def test_a_price_the_accounting_cannot_use_is_refused_like_an_absent_one(price: 
     )
     with pytest.raises(ValueError, match="close panel has no usable observation on 2026-01-05"):
         _require_fillable(inputs)
+
+
+def test_a_mapping_naming_a_series_no_panel_carries_is_refused(
+    installation: tuple[Path, Document, Document],
+) -> None:
+    """An extra map entry would put an instrument in the envelope with nothing behind it."""
+    home, _body, declaration = installation
+    mapping = dict(cast("Document", declaration["instrument_map"]))
+    mapping["aas-obs-absent"] = "SYN_PHANTOM"
+    _refused(home, declaration | {"instrument_map": mapping}, "series no pinned panel carries")
+
+
+def test_the_sealed_calendar_carries_the_reference_the_panels_hold(
+    installation: tuple[Path, Document, Document],
+) -> None:
+    """The caller names the research calendar; the panels' own reference sits beside it."""
+    home, _body, declaration = installation
+    resolved = cast(
+        "Document", json.loads(_prepared(home, declaration).provenance)["resolved_calendar"]
+    )
+    assert resolved["calendar_id"] == "synthetic-research-calendar"
+    assert json.loads(cast("str", resolved["observed_calendar_ref"]))["id"] == "synthetic-calendar"
+
+
+def test_the_declared_response_states_its_own_status(
+    installation: tuple[Path, Document, Document],
+) -> None:
+    """A reader holding only the accounting response can still tell what it is."""
+    home, _body, declaration = installation
+    prepared = _prepared(home, declaration)
+    result = run_document(prepared.envelope.canonical_bytes, prepared.envelope.envelope_sha256)
+    assert result["certified"] is False
+    assert result["non_executable"] is True
+    assert result["executable_prices"] is False

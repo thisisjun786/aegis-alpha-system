@@ -1045,14 +1045,25 @@ def _instrument_types(workspace: Workspace, instruments: Iterable[str]) -> dict[
     return result
 
 
-def _observation_types(workspace: Workspace, mapping: Mapping[str, str]) -> dict[str, str]:
+def _observation_types(
+    workspace: Workspace, mapping: Mapping[str, str], observed: set[str]
+) -> dict[str, str]:
     """Classify a declared run's instruments from the series they were read from.
 
     The declaration renames an observation series to the asset id a strategy knows, but
     it cannot change what the series is. The type therefore travels with the source: the
     store says research_observation and the envelope says OBSERVATION. Nothing is
     relabelled as an ETF to make the accounting accept it.
+
+    A mapping entry naming a registered series that neither panel carries would put an
+    instrument in the envelope that no observation stands behind, so the map has to name
+    what was actually read and nothing else.
     """
+    absent = sorted(set(mapping) - observed)
+    if absent:
+        raise ValueError(
+            "instrument_map names series no pinned panel carries: " + ", ".join(absent)
+        )
     result = {}
     for series, instrument in sorted(mapping.items()):
         row = workspace.state.execute(
@@ -1516,6 +1527,8 @@ class _Observed:
     values: Mapping[str, Mapping[date, float]]
     observed: Mapping[str, Mapping[date, date]]
     known_us: Mapping[str, Mapping[date, int]]
+    series: frozenset[str]
+    calendar_ref: str
 
 
 def _declared_pin(reference: object) -> GenerationPin:
@@ -1532,11 +1545,13 @@ def _mapped_panel(
     declaration: ResearchRunRequest,
     visibility: _Visibility,
     role: str,
+    calendar_ref: str,
 ) -> _Observed:
     """Project one panel at the declared ceiling and resolve its series onto instruments."""
     values: dict[str, dict[date, float]] = {}
     observed: dict[str, dict[date, date]] = {}
     known: dict[str, dict[date, int]] = {}
+    read: set[str] = set()
     # Observed-snapshot projection deliberately ignores knowledge times, so the declared
     # ceiling has to be applied before head selection rather than after. Filtering later
     # would drop a future-known revision and lose the value it superseded; filtering here
@@ -1547,6 +1562,7 @@ def _mapped_panel(
         instrument = declaration.instrument_map.get(name)
         if instrument is None:
             raise ValueError("observation series " + name + " has no declared instrument mapping")
+        read.add(name)
         if row["value_state"] != "present":
             continue
         if row["available_at_us"] is not None and cast("int", row["available_at_us"]) > (
@@ -1564,7 +1580,7 @@ def _mapped_panel(
         # economic session stands and the declaration records that axis as uncertified.
         observed.setdefault(instrument, {})[session] = visibility.observed(row, session)
         known.setdefault(instrument, {})[session] = at_us
-    return _Observed(role, values, observed, known)
+    return _Observed(role, values, observed, known, frozenset(read), calendar_ref)
 
 
 def _observation_panels(
@@ -1589,7 +1605,13 @@ def _observation_panels(
         loader.retain(pin.generation_id, series.history)
         if role in loaded:
             raise ValueError("two declared observations carry the same role")
-        loaded[role] = _mapped_panel(series, declaration, visibility, role)
+        loaded[role] = _mapped_panel(
+            series,
+            declaration,
+            visibility,
+            role,
+            canonical_json_bytes(contract["calendar_ref"]).decode(),
+        )
         semantics[role] = (
             *(_text(contract[key]) for key in ("basis", "adjustment", "value_domain")),
             canonical_json_bytes(contract["calendar_ref"]).decode(),
@@ -1904,6 +1926,7 @@ def prepare_research_run(
             "this strategy also requires macro or derived inputs"
         )
     panels = _observation_panels(loader, declaration, visibility)
+    read = {series for panel in panels.values() for series in panel.series}
     plan = _research_plan(declaration, panels)
     decisions = _research_decisions(
         bundle, definition, plan.slots, visibility, (membership, panels)
@@ -1914,7 +1937,7 @@ def prepare_research_run(
         opening,
         closing,
         {receipt.as_of: _research_targets(receipt, definition) for receipt in decisions},
-        _observation_types(workspace, declaration.instrument_map),
+        _observation_types(workspace, declaration.instrument_map, read),
         (),
     )
     _require_fillable(inputs)
@@ -1931,6 +1954,9 @@ def prepare_research_run(
             resolved_calendar={
                 "calendar_id": declaration.calendar.calendar_id,
                 "basis": declaration.calendar.basis,
+                # The caller names the research calendar; this is the reference the
+                # panels themselves carry, so the label cannot stand in for it.
+                "observed_calendar_ref": panels["close"].calendar_ref,
                 "sessions": len(plan.dates),
                 "first_session": plan.dates[0].isoformat(),
                 "last_session": plan.dates[-1].isoformat(),
