@@ -1719,11 +1719,16 @@ def _require_composable(offense: _Sleeve, defense: _Sleeve) -> None:
     them into the same master switch the composition routes on, so a sleeve carrying one
     would send decisions to the defensive sleeve for a condition that is not the canary,
     and the sealed record would name a switch that is not the one that fired.
+
+    Any declared signal is refused, not only one that would have evaluated true. Reading
+    the enablement rule here would copy an engine internal into application code, and a
+    copy that drifts turns the contract's own claim false in the one place where being
+    wrong is worst. What the declaration reaches for is what this checks.
     """
     for strategy in offense.bundle.contract.pack:
         if strategy.signals_config:
             raise ValueError(
-                "the offensive sleeve declares regular signals; "
+                "the offensive sleeve declares regular signals, enabled or not; "
                 "this composition switches on the canary alone"
             )
     # Every pack member, not the first: replay evaluates all of them, so a canary on a

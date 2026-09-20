@@ -544,3 +544,32 @@ def test_sleeve_roles_cannot_be_edited_after_the_bytes_are_sealed(
     assert isinstance(prepared.sleeve_roles, tuple)
     assert isinstance(prepared.decisions, tuple)
     assert isinstance(prepared.slots, tuple)
+
+
+def test_even_an_inert_regular_signal_is_refused(
+    composed: tuple[Path, Document, Document, Document], tmp_path: Path
+) -> None:
+    """Deliberate strictness, recorded so it reads as a choice rather than an oversight.
+
+    A disabled signal evaluates false today, so this composition would run correctly.
+    Admitting it would mean deciding here which signal kinds and flags contribute to the
+    master switch, which is an engine internal; a copy of that rule that drifts makes the
+    sealed record name a switch that is not the one that fired. The declaration is
+    refused for what it reaches for.
+    """
+    home, base, _offense, defense = composed
+    raw, member = _bundle(
+        "syn-offense-inert",
+        ["ASSET_B", "REF_X"],
+        [CANARY],
+        # The engine's own contract validation refuses a disabled signal that still
+        # carries a threshold or scoring, which is further reason not to reimplement
+        # its enablement rules out here.
+        {"drawdown": {"kind": "negative_abs_momentum", "enabled": False}},
+    )
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        inert = _register(workspace, tmp_path, "syn-offense-inert", raw, member)
+        workspace.state.commit()
+        assert workspace.strategies is not None
+        workspace.strategies.commit()
+    _refused(home, _composition(base, inert, defense), "enabled or not")
