@@ -365,6 +365,11 @@ class _PeakWatcher:
         self.threads[index] = threading.get_ident()
 
 
+def _no_interning(value: str) -> str:
+    """Stand in for sys.intern inside a measured window; see the bound's docstring."""
+    return value
+
+
 def _describe_owner(owner: object, event: str) -> str:
     if isinstance(owner, CodeType):
         return f"{owner.co_filename}:{owner.co_firstlineno} {owner.co_qualname} [{event}]"
@@ -417,6 +422,25 @@ def _allocation_report(
 def metadata_allocation_bound(
     workspace: Workspace, max_bytes: int = METADATA_BUDGET.memory_limit_bytes
 ) -> Iterator[None]:
+    """Bound what the body materializes in Python, in bytes.
+
+    The measured quantity is the process-wide traced peak, so it is the body's own
+    materialization only to the extent that nothing else allocates inside it. An
+    interpreter-level structure counts too: a dictionary that grows here is charged
+    here in full, which is how a 3,844,800 byte interned-string keys table once
+    appeared inside a window that had materialized a few kilobytes. Keep the body
+    free of first-touch process-global growth rather than widening the bound; the
+    bound is what the tampered value costs once decoded into Python, and widening
+    it would stop catching the case the window exists for.
+
+    The interned-string table is the one such structure the body cannot avoid
+    touching, because any import attempt or path parse inside it interns, so the
+    window declines to grow that table at all: sys.intern returns its argument
+    here and is restored on the way out. Interning is an optimization, and a
+    window that pays for the interpreter's global table is not measuring the
+    body. A C-level interning call would still bypass this, which is why the
+    readers under measurement also stop interning content identifiers.
+    """
     assert workspace.strategies is not None
     with select_only(workspace.state), select_only(workspace.strategies):
         # Build the module inventory before tracing starts. A set of every module
@@ -430,12 +454,15 @@ def metadata_allocation_bound(
         # chaining to it instead would run two hooks per event and double the
         # observer effect this measurement is trying to keep small.
         previous = sys.getprofile()
+        interning = sys.intern
+        sys.intern = _no_interning  # ty: ignore[invalid-assignment] -- see the docstring
         tracemalloc.start()
         sys.setprofile(watcher)
         try:
             yield
         finally:
             sys.setprofile(previous)
+            sys.intern = interning
             _, peak = tracemalloc.get_traced_memory()
             # Only a failing window pays for a snapshot; taking one on every window
             # would change what the passing windows measure.
@@ -1106,6 +1133,91 @@ def test_arrow_source_native_admission_survives_fresh_restore(tmp_path: Path) ->
             )
             == expected
         )
+
+
+def test_metadata_window_does_not_let_the_interned_table_grow(stored: Workspace) -> None:
+    """The window must not be chargeable for the interpreter's interned table.
+
+    sys.intern inserts into one process-global dictionary, and tracemalloc charges
+    that dictionary's growth to the frame that triggered the insertion. An
+    insertion crossing a doubling threshold therefore put an entire new keys table
+    inside a window that had materialized a few kilobytes: 3,844,800 bytes at the
+    2**18 step against a 2,097,152 byte bound, which is the intermittent failure
+    this file carried. The body cannot promise never to reach interning, since any
+    import attempt or path parse inside it does, so the window declines to grow
+    that table instead.
+    """
+    # Built at runtime, so nothing interned this text when the module was compiled.
+    fresh = "".join(f"aas5-{index}" for index in range(8))
+    with metadata_allocation_bound(stored, 256 * 1024):
+        returned = sys.intern(fresh)
+    assert returned is fresh
+    assert sys.intern is not _no_interning
+    # An equal but distinct object: intern returns it only when the table has no
+    # entry for that text, so identity proves the window inserted nothing.
+    probe = "".join(fresh)
+    assert probe is not fresh
+    assert sys.intern(probe) is probe
+
+
+def test_metadata_allocation_bound_still_reports_a_deliberate_violation(
+    stored: Workspace,
+) -> None:
+    """The bound keeps the sensitivity it is there for.
+
+    Its job is to catch a body that materializes more than the window admits, and
+    the tampered cases above depend on that: a value stored as size UTF-8 bytes of
+    Latin-1 text costs size // 2 bytes once it reaches Python, which is exactly
+    the bound those cases assert. This injects a materialization above an explicit
+    bound and requires the window to report it.
+    """
+    materialized = 512 * 1024
+
+    def materialize_above_the_bound() -> None:
+        with metadata_allocation_bound(stored, materialized // 2):
+            held = b"\x00" * materialized
+            assert len(held) == materialized
+
+    with pytest.raises(AssertionError, match="metadata allocation peak"):
+        materialize_above_the_bound()
+
+
+def test_admission_never_interns_a_content_identifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The admission path itself must keep content identifiers out of the interned table.
+
+    Every stored object arrives with a fresh digest, so interning them grows one
+    process-global dictionary without limit, and the insertion that crosses its next
+    doubling threshold is charged in full to whatever allocation measurement is open.
+    Interning is observed as it happens because 3.13 interns mortally: a component whose
+    last reference dies leaves the table, so probing it afterwards proves nothing.
+    """
+    home = tmp_path / "home"
+    initialize(home)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        seed_native(workspace, tmp_path)
+        selected = pin(workspace)
+        transform_hash = workspace.state.execute(
+            "SELECT transform_hash FROM dataset_versions WHERE generation_id=?",
+            (selected.generation_id,),
+        ).fetchone()[0]
+    identifiers = (str(transform_hash), str(selected.manifest_hash))
+    module = api()
+    interned: list[str] = []
+    original_intern = sys.intern
+
+    def recording_intern(value: str) -> str:
+        interned.append(value)
+        return original_intern(value)
+
+    with open_workspace(home) as workspace:
+        monkeypatch.setattr(sys, "intern", recording_intern)
+        admitted = module.admit_native_input(
+            workspace, selected, expected_schema="aas-price-transform-v1", budget=METADATA_BUDGET
+        )
+    assert admitted.source_pins[0].source_id == "source1"
+    assert [value for value in interned if any(name in value for name in identifiers)] == []
 
 
 @pytest.mark.parametrize("version", ["latest", "LATEST"])
