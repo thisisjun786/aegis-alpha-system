@@ -32,6 +32,31 @@ def text_columns(schema: tuple[tuple[str, str], ...]) -> int:
     return sum(1 for _name, kind in schema if kind.rstrip("?") == "VARCHAR")
 
 
+# Hashing a delta is not free of the text it hashes. _encode_rowset holds three UTF-8
+# pictures of the same values at once: the buffer one row's cells encode into, the list
+# of encoded rows it sorts, and the joined rowset the digest reads. UTF-8 never spends
+# more than four bytes on a code point, and each value carries a tag, a length and a
+# bytes header on top of its characters.
+ROWSET_ENCODING_COPIES = 3
+ROWSET_FRAMING_BYTES = 48
+
+
+def rowset_encoding_bytes(values: int, characters: int) -> int:
+    """Bound the encoding workspace a rowset digest needs beside the retained values.
+
+    This is separate from text_bytes on purpose. A history that is merely held costs
+    what its decoded values hold; a history being hashed costs that plus the encoded
+    copies the codec builds, and only the read that hashes should be charged for them.
+    Four-byte text is the case that decides it, because there the encoded copies cost
+    as much as the strings they came from rather than a quarter as much.
+    """
+    if values < 0 or characters < 0:
+        raise ValueError("rowset encoding counts must be non-negative")
+    return ROWSET_ENCODING_COPIES * (
+        TEXT_CHARACTER_BYTES * characters + ROWSET_FRAMING_BYTES * values
+    )
+
+
 COMMON = (
     ("generation_id", "VARCHAR"),
     ("record_id", "VARCHAR"),

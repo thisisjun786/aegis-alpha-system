@@ -306,20 +306,23 @@ def test_full_chain_rejects_ancestor_or_head_tampering(
         )
 
 
-@pytest.mark.parametrize("wide_text", [False, True])
+@pytest.mark.parametrize("shape", ["many-rows", "wide-ascii", "wide-four-byte"])
 def test_chain_materialization_rejected_before_fetch(
     monkeypatch: pytest.MonkeyPatch,
-    *,
-    wide_text: bool,
+    shape: str,
 ) -> None:
     with duckdb.connect() as connection:
         initialize_market(connection, "synthetic")
         row = parse_import(document()).rows[0]
-        rows = (
-            [{**row, "instrument_id": "A" * 2000000}]
-            if wide_text
-            else [{**row, "instrument_id": f"ASSET_{i}"} for i in range(808)]
-        )
+        if shape == "many-rows":
+            rows = [{**row, "instrument_id": f"ASSET_{i}"} for i in range(808)]
+        elif shape == "wide-ascii":
+            rows = [{**row, "instrument_id": "A" * 800000}]
+        else:
+            # Four-byte text that the decoded value's own charge would admit: three
+            # hundred thousand characters hold about 1.2MB against a 4MB allowance,
+            # while hashing them holds three UTF-8 copies of 1.2MB each besides.
+            rows = [{**row, "instrument_id": "\U0001f642" * 300000}]
         publish(connection, rows, version="1")
         assert callable(getattr(market, "read_chain_rows", None)), "memory admission is unavailable"
 
@@ -339,15 +342,15 @@ def test_chain_materialization_budget_covers_all_generations() -> None:
         initialize_market(connection, "synthetic")
         row = parse_import(document()).rows[0]
         # Scale rows with the budget so DuckDB itself has room for this in-memory store.
-        publish(connection, [{**row, "instrument_id": f"A_{i}"} for i in range(400)], version="1")
+        publish(connection, [{**row, "instrument_id": f"A_{i}"} for i in range(160)], version="1")
         publish(
             connection,
-            [{**row, "instrument_id": f"B_{i}"} for i in range(400)],
+            [{**row, "instrument_id": f"B_{i}"} for i in range(160)],
             version="2",
             parent="g1",
         )
         budget = ComputeBudget(Fraction(1), 16 * 1024 * 1024)
-        expected_parent_count = 400
+        expected_parent_count = 160
         assert len(market.read_chain_rows(connection, "g1", budget=budget)) == expected_parent_count
         with pytest.raises(ComputeResourceError, match="memory"):
             market.read_chain_rows(connection, "g2", budget=budget)

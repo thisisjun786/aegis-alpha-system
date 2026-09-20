@@ -19,6 +19,7 @@ from aegis_alpha.storage.market_schema import (
     DDL,
     DOMAINS,
     NATURAL_KEYS,
+    rowset_encoding_bytes,
     text_bytes,
     text_columns,
 )
@@ -594,11 +595,15 @@ def _admit_chain_memory(
         # At most one text value per VARCHAR cell, which is an upper bound because a
         # NULL holds none. Charged by value and by character rather than by character
         # alone; see market_schema.text_bytes for why a flat per-character rate is
-        # wrong at both ends of the range this history actually contains.
+        # wrong at both ends of the range this history actually contains. This read
+        # also hashes what it fetches, so it carries the rowset codec's encoded copies
+        # beside the decoded values rather than only the values.
+        values = count * text_columns(schema)
         estimated_bytes += (
             1024
             + count * (1024 + 256 * len(schema))
-            + text_bytes(count * text_columns(schema), characters)
+            + text_bytes(values, characters)
+            + rowset_encoding_bytes(values, characters)
         )
     available_bytes = budget.available_bytes
     if estimated_bytes > available_bytes:

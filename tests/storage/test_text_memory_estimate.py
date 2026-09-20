@@ -18,9 +18,11 @@ from aegis_alpha.storage.market_schema import (
     COMMON,
     DOMAINS,
     TEXT_OVERHEAD_BYTES,
+    rowset_encoding_bytes,
     text_bytes,
     text_columns,
 )
+from aegis_alpha.storage.rowset import _encode_rowset
 
 # What the estimate charged before: a flat rate per character, with nothing per value.
 FLAT_PER_CHARACTER = 32
@@ -33,6 +35,26 @@ def held(values: list[str]) -> int:
 
 def charged(values: list[str]) -> int:
     return text_bytes(len(values), sum(len(value) for value in values))
+
+
+def test_hashing_wide_four_byte_text_is_charged_for_the_copies_the_codec_holds() -> None:
+    """What a retained value holds is not what hashing it costs.
+
+    UTF-8 spends four bytes on an astral character and one on an ASCII character, so
+    four-byte text is where the encoded copies stop being a rounding error and cost as
+    much as the strings they came from. The codec keeps its list of encoded rows alive
+    while it joins them, so two full pictures of the text coexist at the peak.
+    """
+    fields = (("wide", "text"), ("plain", "text"))
+    row: dict[str, object] = {"wide": "\U0001f642" * 100_000, "plain": "x" * 100_000}
+    values: list[str] = [str(row["wide"]), str(row["plain"])]
+    characters = sum(len(value) for value in values)
+    peak = held(values) + 2 * len(_encode_rowset(fields, [row]))
+    # Admitting on what the decoded values hold would pass this and then overrun it.
+    assert text_bytes(len(values), characters) < peak
+    assert (
+        text_bytes(len(values), characters) + rowset_encoding_bytes(len(values), characters) >= peak
+    )
 
 
 def test_the_estimate_stays_above_every_representation_cpython_picks() -> None:
