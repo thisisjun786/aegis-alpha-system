@@ -316,7 +316,7 @@ def test_chain_materialization_rejected_before_fetch(
         initialize_market(connection, "synthetic")
         row = parse_import(document()).rows[0]
         rows = (
-            [{**row, "instrument_id": "A" * 800000}]
+            [{**row, "instrument_id": "A" * 2000000}]
             if wide_text
             else [{**row, "instrument_id": f"ASSET_{i}"} for i in range(808)]
         )
@@ -339,15 +339,15 @@ def test_chain_materialization_budget_covers_all_generations() -> None:
         initialize_market(connection, "synthetic")
         row = parse_import(document()).rows[0]
         # Scale rows with the budget so DuckDB itself has room for this in-memory store.
-        publish(connection, [{**row, "instrument_id": f"A_{i}"} for i in range(160)], version="1")
+        publish(connection, [{**row, "instrument_id": f"A_{i}"} for i in range(400)], version="1")
         publish(
             connection,
-            [{**row, "instrument_id": f"B_{i}"} for i in range(160)],
+            [{**row, "instrument_id": f"B_{i}"} for i in range(400)],
             version="2",
             parent="g1",
         )
         budget = ComputeBudget(Fraction(1), 16 * 1024 * 1024)
-        expected_parent_count = 160
+        expected_parent_count = 400
         assert len(market.read_chain_rows(connection, "g1", budget=budget)) == expected_parent_count
         with pytest.raises(ComputeResourceError, match="memory"):
             market.read_chain_rows(connection, "g2", budget=budget)

@@ -14,7 +14,14 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
 
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
-from aegis_alpha.storage.market_schema import COMMON, DDL, DOMAINS, NATURAL_KEYS
+from aegis_alpha.storage.market_schema import (
+    COMMON,
+    DDL,
+    DOMAINS,
+    NATURAL_KEYS,
+    text_bytes,
+    text_columns,
+)
 
 if TYPE_CHECKING:
     import duckdb
@@ -584,7 +591,15 @@ def _admit_chain_memory(
         )
         if count != marker["row_count"]:
             raise ValueError("market generation logical hash/count mismatch")
-        estimated_bytes += 1024 + count * (1024 + 256 * len(schema)) + 32 * characters
+        # At most one text value per VARCHAR cell, which is an upper bound because a
+        # NULL holds none. Charged by value and by character rather than by character
+        # alone; see market_schema.text_bytes for why a flat per-character rate is
+        # wrong at both ends of the range this history actually contains.
+        estimated_bytes += (
+            1024
+            + count * (1024 + 256 * len(schema))
+            + text_bytes(count * text_columns(schema), characters)
+        )
     available_bytes = budget.available_bytes
     if estimated_bytes > available_bytes:
         raise ComputeResourceError(

@@ -924,6 +924,12 @@ def test_the_sealed_document_is_charged_while_its_publication_is_verified(
     with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
         spec = _observation_spec(workspace, tmp_path / "sealed.sqlite3", options={"points": POINTS})
         _ = _register_domain(workspace, spec, "observation")
+    # The publication is written through one connection and accounted through another.
+    # A starved lease lowers DuckDB's own limit, and the connection that just wrote the
+    # fixture still holds that write's allocations, so reading the chain back on it can
+    # exhaust the lowered limit before the Python accounting under test is ever reached.
+    # Reopening measures the charge rather than the writer it happened to follow.
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
         pin = _pin(workspace, "sealed")
         sealed = len(_sealed_bytes(workspace, pin))
         history = market_inputs.load_pinned_observations(workspace, pin, budget=BUDGET).history

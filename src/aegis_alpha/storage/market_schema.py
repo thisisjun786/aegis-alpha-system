@@ -2,6 +2,36 @@
 
 from __future__ import annotations
 
+# One decoded text value costs a fixed object header plus its characters: CPython
+# allocates 49 + n bytes for compact ASCII, 74 + 2n for UCS-2 and 76 + 4n for UCS-4.
+# These sit above all three, so an estimate built from them stays an upper bound on
+# what the values actually hold.
+TEXT_OVERHEAD_BYTES = 80
+TEXT_CHARACTER_BYTES = 4
+
+
+def text_bytes(values: int, characters: int) -> int:
+    """Bound what decoded text values hold live, counting values and characters apart.
+
+    A flat per-character charge is wrong in both directions. Almost all of a short
+    value's cost is its header, so charging only for characters undercharges it: a
+    one-character string costs about fifty bytes and a per-character model charges
+    tens. Almost none of a long value's cost is its header, so the same charge
+    overcharges by more than an order of magnitude: a sixty-four character digest
+    costs about a hundred and thirteen bytes. Counting both terms is what makes the
+    bound hold at each end, which decides real cases because retained market history
+    is mostly digests and identifiers.
+    """
+    if values < 0 or characters < 0:
+        raise ValueError("text estimate counts must be non-negative")
+    return TEXT_OVERHEAD_BYTES * values + TEXT_CHARACTER_BYTES * characters
+
+
+def text_columns(schema: tuple[tuple[str, str], ...]) -> int:
+    """How many columns of a domain schema can hold a text value."""
+    return sum(1 for _name, kind in schema if kind.rstrip("?") == "VARCHAR")
+
+
 COMMON = (
     ("generation_id", "VARCHAR"),
     ("record_id", "VARCHAR"),
