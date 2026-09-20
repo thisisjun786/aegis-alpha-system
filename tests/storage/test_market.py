@@ -342,18 +342,40 @@ def test_chain_materialization_budget_covers_all_generations() -> None:
         initialize_market(connection, "synthetic")
         row = parse_import(document()).rows[0]
         # Scale rows with the budget so DuckDB itself has room for this in-memory store.
-        publish(connection, [{**row, "instrument_id": f"A_{i}"} for i in range(160)], version="1")
+        # One generation has to fit and two have to not, and what a generation costs is
+        # now its rows rather than a flat charge per character of their text.
+        publish(connection, [{**row, "instrument_id": f"A_{i}"} for i in range(240)], version="1")
         publish(
             connection,
-            [{**row, "instrument_id": f"B_{i}"} for i in range(160)],
+            [{**row, "instrument_id": f"B_{i}"} for i in range(240)],
             version="2",
             parent="g1",
         )
         budget = ComputeBudget(Fraction(1), 16 * 1024 * 1024)
-        expected_parent_count = 160
+        expected_parent_count = 240
         assert len(market.read_chain_rows(connection, "g1", budget=budget)) == expected_parent_count
         with pytest.raises(ComputeResourceError, match="memory"):
             market.read_chain_rows(connection, "g2", budget=budget)
+
+
+def test_chain_encoding_workspace_is_the_widest_generation_not_their_sum() -> None:
+    # Two generations of equally wide four-byte text. Both deltas' decoded rows are
+    # returned together, so they accumulate, but the codec hashes one delta at a time
+    # and keeps only the digest, so one encoding workspace is live at the peak. This
+    # budget holds that peak; it would not hold one workspace per generation.
+    with duckdb.connect() as connection:
+        initialize_market(connection, "synthetic")
+        row = parse_import(document()).rows[0]
+        publish(connection, [{**row, "instrument_id": "\U0001f642" * 150000}], version="1")
+        publish(
+            connection,
+            [{**row, "instrument_id": "\U0001f643" * 150000}],
+            version="2",
+            parent="g1",
+        )
+        budget = ComputeBudget(Fraction(1), 16 * 1024 * 1024)
+        expected_chain_count = 2
+        assert len(market.read_chain_rows(connection, "g2", budget=budget)) == expected_chain_count
 
 
 class QueryObserver:

@@ -572,6 +572,10 @@ def _admit_chain_memory(
     # Fixed row/cell allowances cover Python objects, maps, indexes and copies;
     # text has room for four-byte Unicode plus simultaneous rowset encodings.
     estimated_bytes = 64 * 1024
+    # The codec's buffers do not outlive the delta they hash. _verified_chain_rows
+    # digests one generation at a time and keeps only the digest, so the widest
+    # generation sets this term instead of the chain summing it.
+    workspace_bytes = 0
     for marker in chain:
         domain = str(marker["domain"])
         if domain not in DOMAINS:
@@ -600,11 +604,10 @@ def _admit_chain_memory(
         # beside the decoded values rather than only the values.
         values = count * text_columns(schema)
         estimated_bytes += (
-            1024
-            + count * (1024 + 256 * len(schema))
-            + text_bytes(values, characters)
-            + rowset_encoding_bytes(values, characters)
+            1024 + count * (1024 + 256 * len(schema)) + text_bytes(values, characters)
         )
+        workspace_bytes = max(workspace_bytes, rowset_encoding_bytes(values, characters))
+    estimated_bytes += workspace_bytes
     available_bytes = budget.available_bytes
     if estimated_bytes > available_bytes:
         raise ComputeResourceError(
