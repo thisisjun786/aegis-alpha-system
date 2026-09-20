@@ -8,6 +8,7 @@ so a future change that loosens any of them fails here rather than quietly succe
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from datetime import UTC, date, datetime
@@ -18,6 +19,7 @@ import pytest
 from aegis_alpha.application.backtest_cli import run_document
 from aegis_alpha.application.backtest_prepare import (
     PreparedResearchRun,
+    _require_fillable,
     prepare_research_run,
     research_source_identity,
 )
@@ -27,7 +29,7 @@ from aegis_alpha.application.research_run import (
     parse_research_run_request,
 )
 from aegis_alpha.data.serialization import canonical_json_bytes
-from aegis_alpha.engine.backtest_request import parse_prepare_request
+from aegis_alpha.engine.backtest_request import EnvelopeInputs, parse_prepare_request
 from aegis_alpha.storage import publication
 from aegis_alpha.storage.backup import backup, restore
 from aegis_alpha.storage.market_inputs import (
@@ -152,7 +154,7 @@ def _panel(
         schema_version="aas-observation-transform-v1",
         observation=definition,
         instruments=[
-            {"instrument_id": series, "asset_type": "etf", "venue": "SYN"}
+            {"instrument_id": series, "asset_type": "research_observation", "venue": "SYN"}
             for series in sorted(SERIES)
         ],
         dataset={
@@ -561,3 +563,121 @@ def test_a_row_the_panel_calls_unavailable_at_the_ceiling_is_not_admitted(
         "knowledge_time": datetime.fromtimestamp((KNOWLEDGE_US - 1) / 1_000_000, UTC).isoformat()
     }
     _refused(home, declaration | {"conventions": conventions}, "fewer than two observed sessions")
+
+
+def test_the_envelope_names_the_declared_mode_and_observation_instruments(
+    installation: tuple[Path, Document, Document],
+) -> None:
+    """The panel is reference data by the store's own classification, and says so.
+
+    Nothing is relabelled as an ETF to make the accounting accept it: the type travels
+    with the series the values were read from, and the mode is the one that admits it.
+    """
+    home, _body, declaration = installation
+    envelope = json.loads(_prepared(home, declaration).envelope.canonical_bytes)
+    assert envelope["research_mode"] == "declared_uncertified_research"
+    assert set(cast("Document", envelope["instrument_types"]).values()) == {"OBSERVATION"}
+    weighted = {
+        symbol
+        for weights in cast("Document", envelope["targets"]).values()
+        for symbol, weight in cast("Document", weights).items()
+        if weight > 0
+    }
+    assert weighted
+    result = run_document(
+        _prepared(home, declaration).envelope.canonical_bytes,
+        _prepared(home, declaration).envelope.envelope_sha256,
+    )
+    assert result["research_mode"] == "declared_uncertified_research"
+    assert result["observed_prices_verified"] is False
+    assert result["point_in_time_verified"] is False
+    assert result["live_orders"] is False
+
+
+@pytest.mark.parametrize("mode", ["observed_etf_research", "synthetic"])
+def test_an_observation_weight_is_still_refused_in_the_established_modes(
+    installation: tuple[Path, Document, Document], mode: str
+) -> None:
+    """The guard the declared mode relaxes stays exactly where it was for the others.
+
+    Two layers hold here and this pins the outer one: an established mode does not admit
+    the OBSERVATION type at all, so the same envelope under a different label is refused
+    before its weights are read.
+    """
+    home, _body, declaration = installation
+    envelope = json.loads(_prepared(home, declaration).envelope.canonical_bytes)
+    envelope["research_mode"] = mode
+    raw = canonical_json_bytes(envelope)
+    with pytest.raises(ValueError, match="unsupported instrument type"):
+        run_document(raw, hashlib.sha256(raw).hexdigest())
+
+
+@pytest.mark.parametrize("mode", ["observed_etf_research", "synthetic"])
+def test_a_nontradeable_type_still_cannot_carry_weight_in_the_established_modes(
+    installation: tuple[Path, Document, Document], mode: str
+) -> None:
+    """The inner guard too: an admitted but untradeable type still refuses a weight.
+
+    INDEX passes the type gate in both established modes, so this is the check that
+    would have been weakened if the declared mode had been added carelessly.
+    """
+    home, _body, declaration = installation
+    envelope = json.loads(_prepared(home, declaration).envelope.canonical_bytes)
+    envelope["research_mode"] = mode
+    envelope["instrument_types"] = dict.fromkeys(
+        cast("Document", envelope["instrument_types"]), "INDEX"
+    )
+    raw = canonical_json_bytes(envelope)
+    with pytest.raises(ValueError, match="require an explicit ETF instrument type"):
+        run_document(raw, hashlib.sha256(raw).hexdigest())
+
+
+def _inputs(opens: list[Document], closes: list[Document], targets: Document) -> EnvelopeInputs:
+    days = [date(2026, 1, 2), date(2026, 1, 5), date(2026, 1, 6)]
+    return EnvelopeInputs(
+        tuple(days),
+        tuple(opens),
+        tuple(closes),
+        {date.fromisoformat(day): weights for day, weights in targets.items()},
+        {"AAA": "OBSERVATION"},
+        (),
+    )
+
+
+def test_a_held_position_without_a_marking_close_is_refused_by_name() -> None:
+    """A position stays on the book after the session that bought it.
+
+    The replay marks it at every following close, so a panel that stops observing it
+    fails on arithmetic deep inside the accounting unless admission walks the same
+    holdings. This is that walk.
+    """
+    inputs = _inputs(
+        [{"AAA": 10.0}, {"AAA": 10.0}, {"AAA": 10.0}],
+        [{"AAA": 10.0}, {"AAA": 10.0}, {}],
+        {"2026-01-02": {"AAA": 1.0}},
+    )
+    with pytest.raises(ValueError, match="close panel has no usable observation on 2026-01-06"):
+        _require_fillable(inputs)
+
+
+def test_a_liquidation_without_an_open_is_refused_by_name() -> None:
+    """Selling out of a position needs the open it is sold at, not only the buy leg."""
+    inputs = _inputs(
+        [{"AAA": 10.0}, {"AAA": 10.0}, {}],
+        [{"AAA": 10.0}, {"AAA": 10.0}, {"AAA": 10.0}],
+        {"2026-01-02": {"AAA": 1.0}, "2026-01-05": {"AAA": 0.0}},
+    )
+    with pytest.raises(ValueError, match="open panel has no usable observation on 2026-01-06"):
+        _require_fillable(inputs)
+
+
+@pytest.mark.parametrize("price", [0.0, -1.0, float("nan")])
+def test_a_price_the_accounting_cannot_use_is_refused_like_an_absent_one(price: float) -> None:
+    """Present is not usable: the replay requires positive finite observed prices."""
+    inputs = _inputs(
+        [{"AAA": 10.0}, {"AAA": 10.0}, {"AAA": 10.0}],
+        [{"AAA": 10.0}, {"AAA": price}, {"AAA": 10.0}],
+        {"2026-01-02": {"AAA": 1.0}},
+    )
+    with pytest.raises(ValueError, match="close panel has no usable observation on 2026-01-05"):
+        _require_fillable(inputs)

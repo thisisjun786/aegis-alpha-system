@@ -19,6 +19,13 @@ if TYPE_CHECKING:
     from aegis_alpha.engine.execution import CashFlow
 
 _MAX_INPUT_BYTES = 64 * 1024 * 1024
+# The one mode whose inputs are reference observations by the store's own
+# classification. Named separately so the two established modes keep the guard that
+# stops a target resting on a series nobody can trade.
+DECLARED_RESEARCH_MODE = "declared_uncertified_research"
+_RESEARCH_MODES = ("observed_etf_research", "synthetic", DECLARED_RESEARCH_MODE)
+_INSTRUMENT_TYPES = ("ETF", "INDEX", "SPOT")
+_OBSERVATION_TYPE = "OBSERVATION"
 _FIELDS = frozenset(
     {
         "schema_version",
@@ -133,18 +140,31 @@ def run_document(raw: bytes, expected_sha256: str) -> dict[str, object]:  # noqa
         raise ValueError("unsupported backtest schema or missing/unknown fields")
     if body["module"] != "aegis":
         raise ValueError("this backtest contract belongs to aegis")
-    if body["research_mode"] not in ("observed_etf_research", "synthetic"):
+    mode = body["research_mode"]
+    if mode not in _RESEARCH_MODES:
         raise ValueError("unsupported research mode")
+    # A declared uncertified run is explicitly not executable: its own envelope says so
+    # and the response below repeats it. That is the only reason a target may rest on an
+    # observation here, and the reason it still may not anywhere else.
+    declared = mode == DECLARED_RESEARCH_MODE
     types = _mapping(body["instrument_types"])
-    if any(value not in ("ETF", "INDEX", "SPOT") for value in types.values()):
+    admitted = (*_INSTRUMENT_TYPES, _OBSERVATION_TYPE) if declared else _INSTRUMENT_TYPES
+    if any(value not in admitted for value in types.values()):
         raise ValueError("unsupported instrument type")
     if not isinstance(body["dates"], list):
         raise TypeError("dates must be an array")
     dates = tuple(_day(day) for day in body["dates"])
     targets = {_day(day): _numbers(weights) for day, weights in _mapping(body["targets"]).items()}
+    weighted = ("ETF", _OBSERVATION_TYPE) if declared else ("ETF",)
     for weights in targets.values():
-        if any(weight > 0 and types.get(symbol) != "ETF" for symbol, weight in weights.items()):
-            raise ValueError("positive aegis target weights require explicit ETF instrument type")
+        if any(
+            weight > 0 and types.get(symbol) not in weighted for symbol, weight in weights.items()
+        ):
+            raise ValueError(
+                "positive aegis target weights require an explicit "
+                + " or ".join(weighted)
+                + " instrument type"
+            )
     pins = _pins(body["source_pins"])
     opens = _prices(body["opens"])
     closes = _prices(body["closes"])

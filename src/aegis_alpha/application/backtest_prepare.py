@@ -8,6 +8,7 @@ legacy export; the engine receives only explicit, decision-local values.
 from __future__ import annotations
 
 import hashlib
+import math
 import platform
 import re
 import sys
@@ -21,6 +22,7 @@ from itertools import pairwise
 from types import MappingProxyType
 from typing import Literal, cast
 
+from aegis_alpha.application.backtest_cli import DECLARED_RESEARCH_MODE
 from aegis_alpha.application.research_run import (
     FILL_CONVENTION,
     PreparationRecord,
@@ -1043,6 +1045,27 @@ def _instrument_types(workspace: Workspace, instruments: Iterable[str]) -> dict[
     return result
 
 
+def _observation_types(workspace: Workspace, mapping: Mapping[str, str]) -> dict[str, str]:
+    """Classify a declared run's instruments from the series they were read from.
+
+    The declaration renames an observation series to the asset id a strategy knows, but
+    it cannot change what the series is. The type therefore travels with the source: the
+    store says research_observation and the envelope says OBSERVATION. Nothing is
+    relabelled as an ETF to make the accounting accept it.
+    """
+    result = {}
+    for series, instrument in sorted(mapping.items()):
+        row = workspace.state.execute(
+            "SELECT asset_type FROM instruments WHERE instrument_id=?", (series,)
+        ).fetchone()
+        if row is None or row[0] != "research_observation":
+            raise ValueError(
+                "observation series is not a classified research observation: " + series
+            )
+        result[instrument] = "OBSERVATION"
+    return result
+
+
 def _targets(
     receipt: ReplayReceipt, proxies: tuple[_Proxy, ...], definition: ExecutionDefinition
 ) -> Mapping[str, float]:
@@ -1701,35 +1724,58 @@ def _research_envelope(declaration: ResearchRunRequest, inputs: EnvelopeInputs) 
         "initial_cash": declaration.execution.initial_cash,
         "cost": declaration.execution.cost,
         "source_pins": [],
-        "research_mode": "observed_etf_research",
+        # The declared mode, which the strict request schema does not list, so the
+        # executable path cannot emit this envelope even by accident.
+        "research_mode": DECLARED_RESEARCH_MODE,
     }
     raw = canonical_json_bytes(document)
     return EnvelopeExport(raw, hashlib.sha256(raw).hexdigest())
 
 
 def _require_fillable(inputs: EnvelopeInputs) -> None:
-    """Refuse a target the panel cannot fill, before the accounting has to discover it.
+    """Refuse what the panel cannot fill or mark, before the accounting discovers it.
 
-    A sparse panel produces an envelope the accounting rejects, which is the right
-    outcome reached the wrong way: the message names an arithmetic failure rather than
-    the missing observation. Nothing is filled in here; the run is refused instead.
+    A newly targeted symbol is not the whole requirement. On a rebalance session the
+    accounting also needs an open for everything already held, because a position
+    leaving the book is sold at that open, and on every session it needs a close for
+    everything still held, because that is what marks the account. A panel missing any
+    of those fails deep inside the replay with an arithmetic message that names neither
+    the session nor the instrument. This walks the same holdings the replay walks and
+    refuses with both. Nothing is filled in.
     """
-    following = dict(pairwise(inputs.dates))
-    for day, weights in sorted(inputs.targets.items()):
-        execution = following.get(day)
-        if execution is None:
-            # The last decision has no session to fill on, which the accounting treats
-            # as no trade rather than as an error.
-            continue
-        prices = inputs.opens[inputs.dates.index(execution)]
-        missing = sorted(set(weights) - set(prices))
-        if missing:
-            raise ValueError(
-                "the open panel has no observation on "
-                + execution.isoformat()
-                + " for: "
-                + ", ".join(missing)
-            )
+    held: set[str] = set()
+    for index in range(1, len(inputs.dates)):
+        session, decision = inputs.dates[index], inputs.dates[index - 1]
+        weights = inputs.targets.get(decision)
+        if weights is not None:
+            wanted = {symbol for symbol, weight in weights.items() if weight > 0}
+            # Exactly the set the replay demands at a rebalance: what is on the book
+            # plus what is being bought, because the difference is what gets sold.
+            _require_observed(inputs.opens[index], held | wanted, session, "open")
+            held = wanted
+        _require_observed(inputs.closes[index], held, session, "close")
+
+
+def _require_observed(
+    prices: Mapping[str, float], symbols: set[str], session: date, role: str
+) -> None:
+    """Hold the panel to what the accounting calls usable: present, finite and positive."""
+    missing = sorted(
+        symbol
+        for symbol in symbols
+        if not isinstance(prices.get(symbol), (int, float))
+        or not math.isfinite(prices[symbol])
+        or prices[symbol] <= 0
+    )
+    if missing:
+        raise ValueError(
+            "the "
+            + role
+            + " panel has no usable observation on "
+            + session.isoformat()
+            + " for: "
+            + ", ".join(missing)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1868,7 +1914,7 @@ def prepare_research_run(
         opening,
         closing,
         {receipt.as_of: _research_targets(receipt, definition) for receipt in decisions},
-        _instrument_types(workspace, sorted(set(declaration.instrument_map.values()))),
+        _observation_types(workspace, declaration.instrument_map),
         (),
     )
     _require_fillable(inputs)
