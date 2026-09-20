@@ -565,6 +565,9 @@ def test_storage_mirrors_the_declaration_contract_without_drifting() -> None:
     }
     assert backtest_requests._COMPOSITION_ROOT == contract._COMPOSITION_ROOT  # noqa: SLF001
     assert COMPOSITION_REQUEST_SCHEMA == contract.RESEARCH_COMPOSITION_SCHEMA
+    assert backtest_requests._COMPOSITION == contract._COMPOSITION  # noqa: SLF001
+    assert backtest_requests._SLEEVES == contract._SLEEVES  # noqa: SLF001
+    assert backtest_requests.COMPOSITION_SWITCH == contract.SWITCH_RULE
     assert runs._DECLARED_RESEARCH_MODE == DECLARED_RESEARCH_MODE  # noqa: SLF001
 
 

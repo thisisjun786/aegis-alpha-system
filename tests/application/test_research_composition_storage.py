@@ -27,7 +27,11 @@ from aegis_alpha.application.research_run import (
     RESEARCH_COMPOSITION_SCHEMA,
 )
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
-from aegis_alpha.storage.backtest_requests import register_backtest_request, research_bindings
+from aegis_alpha.storage.backtest_requests import (
+    COMPOSITION_SWITCH,
+    register_backtest_request,
+    research_bindings,
+)
 from aegis_alpha.storage.input_pins import BUNDLE_SCHEMA, HASH_FORMAT, register_input_bundle
 from aegis_alpha.storage.runs import (
     RunIntent,
@@ -260,3 +264,53 @@ def test_a_sleeve_preparation_under_a_composition_declaration_is_refused(
                 ),
                 budget=BUDGET,
             )
+
+
+@pytest.mark.parametrize(
+    ("break_it", "refusal"),
+    [
+        ("same sleeve twice", r"two distinct sleeves"),
+        ("another switch", r"must declare switch"),
+    ],
+)
+def test_a_composition_that_contradicts_its_own_shape_is_never_registered(
+    sample: tuple[Path, Document, Document, Document], break_it: str, refusal: str
+) -> None:
+    """Refused at registration, so the malformed document never becomes a stored request.
+
+    These two are claims the record makes about itself: a composition is two distinct
+    sleeves chosen between by the one rule the installed engine computes. The rest of the
+    contract stays with the application parser, the same way an executable request's own
+    admission stays with the engine.
+    """
+    home, base, offense, defense = sample
+    migrated(home)
+    honest = _composition(base, offense, defense)
+    prepared = _prepared_composition(home, honest)
+    block = cast("Document", json.loads(json.dumps(honest["composition"])))
+    if break_it == "same sleeve twice":
+        block["sleeves"] = {"offense": offense, "defense": offense}
+    else:
+        block["switch"] = "a-rule-nobody-computes-v1"
+    broken = honest | {"composition": block}
+    raw = canonical_json_bytes(broken)
+    with open_workspace(home, writable=True) as workspace:
+        bundle_raw = bundle_bytes(honest, "composition-inputs-1")
+        bundle = register_input_bundle(
+            workspace,
+            bundle_raw,
+            expected_file_sha256=hashlib.sha256(bundle_raw).hexdigest(),
+            budget=BUDGET,
+        )
+        with pytest.raises(ValueError, match=refusal):
+            _ = register_backtest_request(
+                workspace,
+                bundle,
+                raw,
+                expected_request_hash=content_sha256(cast("Document", json.loads(raw))),
+                budget=BUDGET,
+            )
+        assert not workspace.state.execute("SELECT 1 FROM backtest_requests").fetchone()
+    # The honest declaration over the same installation still registers and records.
+    assert record(home, prepared, honest, (offense, defense))["result_hash"]
+    assert cast("Document", honest["composition"])["switch"] == COMPOSITION_SWITCH

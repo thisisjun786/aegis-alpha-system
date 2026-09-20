@@ -40,6 +40,10 @@ if TYPE_CHECKING:
 # A declared run states its mode in its own bytes. A stored declaration that says
 # anything else would be a research record claiming a status nobody granted.
 RESEARCH_EXECUTION_MODE = "research-uncertified"
+# The one rule that can choose between a composition's sleeves. A literal, because the
+# installed engine computes it from the offense sleeve's own declared canary; a stored
+# composition naming another rule would describe a choice nothing makes.
+COMPOSITION_SWITCH = "offense-master-switch-v1"
 _ROOT = frozenset(
     {
         "schema",
@@ -115,6 +119,7 @@ def request_schema(body: dict[str, object]) -> str:
             raise ValueError(
                 "a stored research composition must declare " + RESEARCH_EXECUTION_MODE
             )
+        _require_composition(body)
         return COMPOSITION_REQUEST_SCHEMA
     raise ValueError("invalid backtest request root/schema")
 
@@ -122,6 +127,28 @@ def request_schema(body: dict[str, object]) -> str:
 # The exact pin shape the declaration spells. Checked here rather than assumed, so a
 # binding is never built from a document that is missing or renaming a field.
 _MEMBERSHIP = {"kind", "id", "version", "hash"}
+_COMPOSITION = {"sample_id", "switch", "sleeves"}
+_SLEEVES = {"offense", "defense"}
+
+
+def _require_composition(body: dict[str, object]) -> None:
+    """Hold a stored composition to the two things it claims about its own shape.
+
+    A composition is two distinct sleeves and the one switch the installed engine
+    computes. Both are claims the record makes about itself, so a document naming another
+    rule describes a choice nothing makes, and one naming the same sleeve twice reports a
+    pair that is not a pair and would record that sleeve twice as the run's provenance.
+
+    Everything else a declaration must satisfy — window validity, the shape of each
+    nested pin, the rest of the contract — stays with the application parser that owns
+    it, exactly as an executable request's own admission stays with the engine.
+    """
+    block = _pin(body["composition"], "composition", _COMPOSITION)
+    if block["switch"] != COMPOSITION_SWITCH:
+        raise ValueError("a stored composition must declare switch " + COMPOSITION_SWITCH)
+    sleeves = _pin(block["sleeves"], "composition sleeves", _SLEEVES)
+    if sleeves["offense"] == sleeves["defense"]:
+        raise ValueError("a stored composition needs two distinct sleeves")
 
 
 def _pin(value: object, field: str, keys: set[str]) -> dict[str, object]:
