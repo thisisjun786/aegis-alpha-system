@@ -1219,92 +1219,6 @@ def _target_memberships(
                 raise ValueError("selected target outside pinned universe at decision")
 
 
-@dataclass(frozen=True, slots=True)
-class _Period:
-    """What a preparation asks of the calendar, apart from the sessions themselves."""
-
-    sessions_pin: GenerationPin
-    calendar: Row | None
-    start: date
-    end: date
-    latency: int
-    explicit: tuple[date, ...] | None
-
-
-@dataclass(frozen=True, slots=True)
-class _Plan:
-    """The calendar every preparation shares: sessions, the grid, the slots, the period."""
-
-    sessions: History
-    grid: tuple[Session, ...]
-    slots: tuple[DecisionSlot, ...]
-    dates: tuple[date, ...]
-
-
-def _plan(
-    loader: _Loader,
-    definition: ExecutionDefinition,
-    visibility: _Visibility,
-    period: _Period,
-) -> _Plan:
-    """Resolve the pinned sessions into a validated schedule and outcome calendar.
-
-    Both preparations read the same registered sessions generation and hold the same
-    calendar to the same checks. Only the price side differs between them, so the
-    schedule lives here once rather than as two copies that could drift apart.
-    """
-    loader.native(period.sessions_pin, "aas-sessions-transform-v1")
-    sessions = load_pinned_sessions(
-        loader.workspace, period.sessions_pin, budget=loader.budget
-    ).history
-    # A declared run names no calendar convention, so the pinned sessions supply their
-    # own identity rather than a caller asserting one over them.
-    calendar = period.calendar if period.calendar is not None else _session_calendar(sessions)
-    schedule = ScheduleRequest(
-        definition.calendar,
-        _text(calendar["calendar_id"]),
-        _text(calendar["venue"]),
-        _text(calendar["timezone_version"]),
-        period.start,
-        period.end,
-        period.latency,
-        visibility.ceiling,
-        period.explicit,
-    )
-    grid = _sessions(sessions, visibility, visibility.ceiling)
-    slots = _schedule(sessions, visibility, schedule)
-    dates = tuple(
-        session.session_date
-        for session in grid
-        if session.status == "open"
-        and schedule.period_start <= session.session_date <= schedule.period_end
-    )
-    # Legacy accounting fills on the next grid date, including all-cash targets.
-    # Reject an unrepresentable slot rather than rewriting either calendar.
-    next_open = dict(pairwise(dates))
-    for slot in slots:
-        if next_open.get(slot.decision_date) != slot.execution_date:
-            message = f"incompatible outcome calendar projection: decision {slot.decision_date} "
-            message += f"requires next open {slot.execution_date}, "
-            raise ValueError(message + f"projected {next_open.get(slot.decision_date)}")
-    # Validate even an intentionally empty schedule and all supplied session values.
-    decision_slots(grid, request=replace(schedule, explicit_decision_dates=()))
-    _complete_calendar(grid, visibility.history_start, schedule.period_end)
-    return _Plan(sessions, grid, slots, dates)
-
-
-def _session_calendar(sessions: History) -> Row:
-    """Take the calendar from the registered sessions generation, never from prose."""
-    named = {
-        tuple(_text(row[key]) for key in ("calendar_id", "venue", "timezone_version"))
-        for row in sessions
-    }
-    if len(named) != 1:
-        raise ValueError("the pinned sessions generation names more than one calendar")
-    calendar_id, venue, timezone_version = next(iter(named))
-    return {"calendar_id": calendar_id, "venue": venue, "timezone_version": timezone_version}
-
-
 def prepare_backtest(
     workspace: Workspace, request: PrepareRequest, *, budget: ComputeBudget
 ) -> PreparedBacktest:
@@ -1349,26 +1263,43 @@ def prepare_backtest(
     )
     loader = _Loader(workspace, budget, bindings)
     period = _row(body["period"])
-    plan = _plan(
-        loader,
-        definition,
-        visibility,
-        _Period(
-            _generation(bindings["sessions", 0]),
-            calendar,
-            _day(period["start"]),
-            _day(period["end"]),
-            cast("int", body["decision_latency_us"]),
-            None
-            if body["explicit_decision_dates"] is None
-            else tuple(
-                _day(day) for day in cast("tuple[str, ...]", body["explicit_decision_dates"])
-            ),
-        ),
+    sessions_pin = _generation(bindings["sessions", 0])
+    loader.native(sessions_pin, "aas-sessions-transform-v1")
+    sessions = load_pinned_sessions(workspace, sessions_pin, budget=budget).history
+    schedule = ScheduleRequest(
+        definition.calendar,
+        _text(calendar["calendar_id"]),
+        _text(calendar["venue"]),
+        _text(calendar["timezone_version"]),
+        _day(period["start"]),
+        _day(period["end"]),
+        cast("int", body["decision_latency_us"]),
+        visibility.ceiling,
+        None
+        if body["explicit_decision_dates"] is None
+        else tuple(_day(day) for day in cast("tuple[str, ...]", body["explicit_decision_dates"])),
     )
-    slots, dates = plan.slots, plan.dates
+    grid = _sessions(sessions, visibility, visibility.ceiling)
+    slots = _schedule(sessions, visibility, schedule)
+    dates = tuple(
+        session.session_date
+        for session in grid
+        if session.status == "open"
+        and schedule.period_start <= session.session_date <= schedule.period_end
+    )
+    # Legacy accounting fills on the next grid date, including all-cash targets.
+    # Reject an unrepresentable slot rather than rewriting either calendar.
+    next_open = dict(pairwise(dates))
+    for slot in slots:
+        if next_open.get(slot.decision_date) != slot.execution_date:
+            message = f"incompatible outcome calendar projection: decision {slot.decision_date} "
+            message += f"requires next open {slot.execution_date}, "
+            raise ValueError(message + f"projected {next_open.get(slot.decision_date)}")
+    # Validate even an intentionally empty schedule and all supplied session values.
+    decision_slots(grid, request=replace(schedule, explicit_decision_dates=()))
+    _complete_calendar(grid, visibility.history_start, schedule.period_end)
     membership = _membership(loader, bundle)
-    prices = _prices(loader, body, calendar, plan.sessions)
+    prices = _prices(loader, body, calendar, sessions)
     auxiliary = _auxiliary(loader, body, definition, prices[0].series.request)
     proxies = _proxies(loader, body, prices)
     _execution_selection(prices, proxies, definition)
@@ -1391,7 +1322,7 @@ def prepare_backtest(
         _types(workspace, prices),
         sources,
     )
-    _target_memberships(inputs.targets, slots, prices, plan.sessions, visibility)
+    _target_memberships(inputs.targets, slots, prices, sessions, visibility)
     envelope = export_envelope(request.parsed, projection=projection, inputs=inputs)
     if environment_identity() != environment:
         raise ValueError("calculation context changed during preparation")
@@ -1435,6 +1366,8 @@ RESEARCH_RUN_ID_SCHEMA = "aas-research-run-id-v1"
 # The declared path's own decisions are made here and in the contract module, and the
 # engine identity covers neither, so a declared run names their source itself.
 RESEARCH_SOURCE_SCHEMA = "aas-research-sources-v1"
+# A decision needs a session to fill on, so one observed session is not a period.
+_MINIMUM_RESEARCH_SESSIONS = 2
 RESEARCH_SOURCE_MODULES = (
     "aegis_alpha.application.backtest_prepare",
     "aegis_alpha.application.research_run",
@@ -1795,6 +1728,68 @@ def _require_fillable(inputs: EnvelopeInputs) -> None:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class _ResearchPlan:
+    """A schedule built from dates alone, because the panel carries no clock times."""
+
+    dates: tuple[date, ...]
+    slots: tuple[DecisionSlot, ...]
+
+
+def _panel_sessions(panel: _Observed) -> set[date]:
+    return {session for series in panel.values.values() for session in series}
+
+
+def _panel_cutoff(panel: _Observed, day: date) -> int:
+    """The last instant the panel actually recorded on this session.
+
+    Taken from the observations rather than from a clock nobody supplied. It is what
+    makes a decision see its own session and nothing after it.
+    """
+    return max(
+        at_us
+        for series in panel.known_us.values()
+        for session, at_us in series.items()
+        if session == day
+    )
+
+
+def _research_plan(
+    declaration: ResearchRunRequest, panels: Mapping[str, _Observed]
+) -> _ResearchPlan:
+    """Schedule month-end decisions over the sessions the panel itself observed.
+
+    engine.schedule requires an open and a close instant for every open session, and the
+    retained panel has neither; the declared calendar convention supplies none either.
+    Inventing hours would be wrong twice over, once because they are not observed and
+    again because daylight saving moves them. So the research path schedules on dates,
+    and each decision's cutoff is the last observation the panel recorded that day.
+    Nothing about the executable schedule changes: this path simply does not use it.
+    """
+    observed = {role: _panel_sessions(panel) for role, panel in panels.items()}
+    if observed["open"] != observed["close"]:
+        # Signals and fills would otherwise run on two different calendars.
+        raise ValueError("the open and close panels observe different sessions")
+    period = declaration.period
+    dates = tuple(day for day in sorted(observed["close"]) if period.start <= day <= period.end)
+    if len(dates) < _MINIMUM_RESEARCH_SESSIONS:
+        raise ValueError("the declared period holds fewer than two observed sessions")
+    following = dict(pairwise(dates))
+    month_end: dict[tuple[int, int], date] = {}
+    for day in dates:
+        month_end[day.year, day.month] = day
+    slots = tuple(
+        DecisionSlot(decision, following[decision], _panel_cutoff(panels["close"], decision))
+        for decision in sorted(month_end.values())
+        # The last observed session has nothing to fill on, and the accounting treats a
+        # decision without a following session as no trade rather than as an error.
+        if decision in following
+    )
+    if not slots:
+        raise ValueError("the declared period holds no month end with a session to fill on")
+    return _ResearchPlan(dates, slots)
+
+
 def prepare_research_run(
     workspace: Workspace, declaration: ResearchRunRequest, *, budget: ComputeBudget
 ) -> PreparedResearchRun:
@@ -1844,19 +1839,6 @@ def prepare_research_run(
         declaration.history.end,
     )
     loader = _Loader(workspace, budget, {})
-    plan = _plan(
-        loader,
-        definition,
-        visibility,
-        _Period(
-            _declared_pin(declaration.sessions),
-            None,
-            declaration.period.start,
-            declaration.period.end,
-            0,
-            None,
-        ),
-    )
     membership = _research_membership(loader, declaration, bundle)
     if definition.derived_series or bundle.contract.macro_signals:
         # The declaration pins observations and nothing else, so a strategy that reads a
@@ -1867,6 +1849,7 @@ def prepare_research_run(
             "this strategy also requires macro or derived inputs"
         )
     panels = _observation_panels(loader, declaration, visibility)
+    plan = _research_plan(declaration, panels)
     decisions = _research_decisions(
         bundle, definition, plan.slots, visibility, (membership, panels)
     )
@@ -1890,7 +1873,14 @@ def prepare_research_run(
             engine=engine,
             environment=environment,
             preparation_source_sha256=research_source_identity(),
-            resolved_calendar=_session_calendar(plan.sessions),
+            resolved_calendar={
+                "calendar_id": declaration.calendar.calendar_id,
+                "basis": declaration.calendar.basis,
+                "sessions": len(plan.dates),
+                "first_session": plan.dates[0].isoformat(),
+                "last_session": plan.dates[-1].isoformat(),
+                "decisions": len(plan.slots),
+            },
         ),
     )
     return PreparedResearchRun(

@@ -192,7 +192,7 @@ def _reference(body: Document, role: str) -> Document:
 def _declaration(body: Document, close: Document, opening: Document) -> Document:
     strategy = body["strategy"]
     return {
-        "schema_version": "aas-research-run-v1",
+        "schema_version": "aas-research-run-v2",
         "execution_mode": "research-uncertified",
         "strategy": {
             key: strategy[key]
@@ -220,7 +220,10 @@ def _declaration(body: Document, close: Document, opening: Document) -> Document
             }
             for pin, role in ((opening, "open"), (close, "close"))
         ],
-        "sessions": _reference(body, "sessions"),
+        "calendar": {
+            "calendar_id": "synthetic-research-calendar",
+            "basis": "observed-sessions-date-only",
+        },
         "membership": _reference(body, "membership"),
         "period": body["period"],
         "history": body["history"],
@@ -505,11 +508,11 @@ def test_the_sealed_document_records_the_calendar_the_run_actually_used(
     """The declared calendar is prose, so the identity that ran is recorded beside it."""
     home, _body, declaration = installation
     sealed = json.loads(_prepared(home, declaration).provenance)
-    assert sealed["resolved_calendar"] == {
-        "calendar_id": "synthetic-calendar",
-        "timezone_version": "synthetic-utc-1",
-        "venue": "SYN",
-    }
+    resolved = cast("Document", sealed["resolved_calendar"])
+    assert resolved["calendar_id"] == "synthetic-research-calendar"
+    assert resolved["basis"] == "observed-sessions-date-only"
+    # The session count is the panel's own, not a calendar anyone published.
+    assert resolved["sessions"] == len(cast("Any", _prepared(home, declaration)).inputs.dates)
     assert (
         sealed["conventions"]["calendar"]
         == cast("Document", declaration["conventions"])["calendar"]
@@ -552,9 +555,9 @@ def test_a_row_the_panel_calls_unavailable_at_the_ceiling_is_not_admitted(
         workspace.strategies.commit()
         _ = workspace.market.execute("CHECKPOINT")
     # The declaration names an instant one microsecond before every row became known, so
-    # the panel it claims to have had is empty and the run has no history to warm up on.
+    # the panel it claims to have had is empty and the schedule has nothing to build on.
     declaration = _declaration(body, close, opening)
     conventions = cast("Document", declaration["conventions"]) | {
         "knowledge_time": datetime.fromtimestamp((KNOWLEDGE_US - 1) / 1_000_000, UTC).isoformat()
     }
-    _refused(home, declaration | {"conventions": conventions}, "insufficient|history window")
+    _refused(home, declaration | {"conventions": conventions}, "fewer than two observed sessions")

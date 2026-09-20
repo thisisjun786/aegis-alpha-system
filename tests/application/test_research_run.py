@@ -13,6 +13,7 @@ from typing import cast
 import pytest
 
 from aegis_alpha.application.research_run import (
+    CALENDAR_BASIS,
     EXECUTION_MODE,
     FILL_CONVENTION,
     RESEARCH_RUN_SCHEMA,
@@ -106,13 +107,7 @@ def _body() -> dict[str, object]:
         "execution_mode": EXECUTION_MODE,
         "strategy": _strategy(),
         "observations": [_pin(), _pin("obs-synthetic-close", "close")],
-        "sessions": {
-            "dataset_id": "sessions",
-            "version": "1",
-            "generation_id": "sessions",
-            "chain_hash": DIGEST_C,
-            "manifest_hash": DIGEST_D,
-        },
+        "calendar": {"calendar_id": "synthetic-research-calendar", "basis": CALENDAR_BASIS},
         "membership": {
             "kind": "membership",
             "id": "synthetic-membership",
@@ -415,12 +410,19 @@ def test_a_membership_of_another_kind_is_refused() -> None:
         parse_research_run_request(_raw(body))
 
 
-@pytest.mark.parametrize("field", ["sessions", "membership"])
-def test_a_floating_version_is_refused(field: str) -> None:
+def test_a_floating_membership_version_is_refused() -> None:
     """latest is not a pin: the same declaration would name different bytes over time."""
     body = _body()
-    body[field] = cast("dict[str, object]", _body()[field]) | {"version": "latest"}
+    body["membership"] = cast("dict[str, object]", _body()["membership"]) | {"version": "latest"}
     with pytest.raises(ResearchRunError, match="must be exact, not latest"):
+        parse_research_run_request(_raw(body))
+
+
+def test_a_calendar_that_claims_another_basis_is_refused() -> None:
+    """The only calendar this path can supply is the dates the panel was recorded on."""
+    body = _body()
+    body["calendar"] = {"calendar_id": "XNYS", "basis": "exchange-certified"}
+    with pytest.raises(ResearchRunError, match="calendar basis must be"):
         parse_research_run_request(_raw(body))
 
 

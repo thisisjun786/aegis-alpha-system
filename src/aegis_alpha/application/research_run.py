@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 __all__ = [
+    "CALENDAR_BASIS",
     "EXECUTION_MODE",
     "FILL_CONVENTION",
     "OBSERVATION_NAMESPACE",
@@ -42,10 +43,10 @@ __all__ = [
     "DeclaredConventions",
     "DeclaredSemantics",
     "ExecutionTerms",
-    "GenerationRef",
     "MembershipRef",
     "ObservationPinRef",
     "PreparationRecord",
+    "ResearchCalendar",
     "ResearchRunError",
     "ResearchRunRequest",
     "Window",
@@ -53,7 +54,12 @@ __all__ = [
     "parse_research_run_request",
 ]
 
-RESEARCH_RUN_SCHEMA = "aas-research-run-v1"
+RESEARCH_RUN_SCHEMA = "aas-research-run-v2"
+# The retained panel carries session dates and no clock times, and the calendar
+# convention declares none. The engine's session schedule requires an open and a close
+# instant per session, so a declared run schedules on the panel's own observed dates
+# instead. Fixed literal: no other basis can be claimed under this schema.
+CALENDAR_BASIS = "observed-sessions-date-only"
 # What a prepared declared run seals beside its envelope. The declaration is the whole
 # provenance, so the sealed document names its own source rather than a certified one.
 PREPARED_SCHEMA = "aas-prepared-research-run-v1"
@@ -90,7 +96,7 @@ _ROOT = frozenset(
         "execution_mode",
         "strategy",
         "observations",
-        "sessions",
+        "calendar",
         "membership",
         "period",
         "history",
@@ -108,7 +114,7 @@ _STRATEGY = frozenset(
 _OBSERVATION = frozenset(
     {"dataset_id", "version", "generation_id", "chain_hash", "manifest_hash", "observation_role"}
 )
-_GENERATION = frozenset({"dataset_id", "version", "generation_id", "chain_hash", "manifest_hash"})
+_CALENDAR = frozenset({"calendar_id", "basis"})
 _MEMBERSHIP = frozenset({"kind", "id", "version", "hash"})
 _WINDOW = frozenset({"start", "end"})
 # The two numbers the retained panel cannot supply and the engine will not guess.
@@ -154,14 +160,16 @@ class ObservationPinRef:
 
 
 @dataclass(frozen=True, slots=True)
-class GenerationRef:
-    """An exact published generation. Never a version alias and never latest."""
+class ResearchCalendar:
+    """A date-only calendar named by the caller and supplied by the panel itself.
 
-    dataset_id: str
-    version: str
-    generation_id: str
-    chain_hash: str
-    manifest_hash: str
+    Nothing here asserts an exchange calendar. The sessions are whatever the pinned
+    observations were recorded on, and the identifier exists so a stored run can say
+    which research calendar it meant rather than leaving it unnamed.
+    """
+
+    calendar_id: str
+    basis: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,7 +282,7 @@ class ResearchRunRequest:
     strategy_raw_sha256: str
     strategy_contract_sha256: str
     observations: tuple[ObservationPinRef, ...]
-    sessions: GenerationRef
+    calendar: ResearchCalendar
     membership: MembershipRef
     period: Window
     history: Window
@@ -434,15 +442,13 @@ def _unsettled(value: object, semantics: DeclaredSemantics) -> tuple[str, ...]:
     return named
 
 
-def _generation(value: object) -> GenerationRef:
-    row = _object(value, "sessions", _GENERATION)
-    return GenerationRef(
-        _text(row["dataset_id"], "sessions dataset_id"),
-        _exact_version(row["version"], "sessions version"),
-        _text(row["generation_id"], "sessions generation_id"),
-        _digest(row["chain_hash"], "sessions chain_hash"),
-        _digest(row["manifest_hash"], "sessions manifest_hash"),
-    )
+def _calendar(value: object) -> ResearchCalendar:
+    row = _object(value, "calendar", _CALENDAR)
+    if row["basis"] != CALENDAR_BASIS:
+        # Fixed literal, so a declaration cannot claim an exchange calendar it does not
+        # have. The only calendar this path can supply is the panel's own dates.
+        raise ResearchRunError("calendar basis must be " + CALENDAR_BASIS)
+    return ResearchCalendar(_text(row["calendar_id"], "calendar_id"), CALENDAR_BASIS)
 
 
 def _membership(value: object) -> MembershipRef:
@@ -522,7 +528,7 @@ def parse_research_run_request(raw: bytes) -> ResearchRunRequest:
         strategy_raw_sha256=_digest(strategy["raw_sha256"], "raw_sha256"),
         strategy_contract_sha256=_digest(strategy["contract_sha256"], "contract_sha256"),
         observations=_observations(body["observations"]),
-        sessions=_generation(body["sessions"]),
+        calendar=_calendar(body["calendar"]),
         membership=_membership(body["membership"]),
         period=_window(body["period"], "period"),
         history=_window(body["history"], "history"),
@@ -595,12 +601,9 @@ def declared_provenance(request: ResearchRunRequest, prepared: PreparationRecord
                 }
                 for pin in request.observations
             ],
-            "sessions": {
-                "dataset_id": request.sessions.dataset_id,
-                "version": request.sessions.version,
-                "generation_id": request.sessions.generation_id,
-                "chain_hash": request.sessions.chain_hash,
-                "manifest_hash": request.sessions.manifest_hash,
+            "calendar": {
+                "calendar_id": request.calendar.calendar_id,
+                "basis": request.calendar.basis,
             },
             "membership": {
                 "kind": request.membership.kind,
