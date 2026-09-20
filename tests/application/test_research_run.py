@@ -280,12 +280,12 @@ def test_the_same_request_hashes_the_same_way_twice() -> None:
 
 def test_the_sidecar_records_the_declared_semantics_and_unknown_parity() -> None:
     recorded = _provenance(parse_research_run_request(_raw(_body())))
-    assert recorded["semantics"]["tie_rule"] == TIE_RULE
-    assert recorded["semantics"]["data_basis"] == "M"
-    assert recorded["semantics"]["source_parity"] == "unknown"
+    assert cast("dict[str, object]", recorded["semantics"])["tie_rule"] == TIE_RULE
+    assert cast("dict[str, object]", recorded["semantics"])["data_basis"] == "M"
+    assert cast("dict[str, object]", recorded["semantics"])["source_parity"] == "unknown"
     assert recorded["unsettled"] == []
-    assert recorded["semantics"]["fill_price"] == FILL_CONVENTION
-    assert recorded["semantics"]["source_parity"] == "unknown"
+    assert cast("dict[str, object]", recorded["semantics"])["fill_price"] == FILL_CONVENTION
+    assert cast("dict[str, object]", recorded["semantics"])["source_parity"] == "unknown"
 
 
 @pytest.mark.parametrize("basis", ["either", "d", "daily", "DM"])
