@@ -83,7 +83,7 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
 - The run add-on is versioned per store. `run_details.request_schema` carries an explicit
   allow-list, `REQUEST_SCHEMAS`, and `_open_intent` records the schema of the request that
   was actually registered rather than a constant. v1 named `aas-backtest-request-v1` alone,
-  so admitting `aas-research-run-v1` is `aas db run-migrate`: backup, durable intent, one
+  so admitting `aas-research-run-v2` is `aas db run-migrate`: backup, durable intent, one
   transactional `run_details` rebuild, verification, then completion. `run_schema` receipts
   are append-only, so a migrated store shows `(1, v1), (2, v2)` and a store installed after
   the migration shows `(2, v2)`; the recorded v1 checksum stays exact, because an
@@ -91,6 +91,12 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   stays at 1. An interrupted migration is finished by repeating the command, or by
   `db recover`, which completes a rebuild that already landed and never starts one. A run
   recorded under the old CHECK is carried across and stays readable; nothing is rewritten.
+  `quarantine` refuses the migration intent, as it already refuses a run intent: a
+  quarantined intent can never be prepared again, so ending this one would leave the
+  add-on unusable with nothing able to clear it. A declared preparation is also held to
+  the status its own contract fixes — `certified`, `point_in_time_certified` and
+  `executable_prices` all false under `research-uncertified` — so a sealed document that
+  contradicts its own kind seals no run.
 - `backtest_requests` stores both request contracts under one content identity: exactly
   canonical bytes, a hash over those bytes, and bindings that agree with the registered
   bundle. An `aas-research-run-v2` declaration carries no bindings array, so its bundle is
