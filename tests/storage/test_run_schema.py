@@ -528,14 +528,14 @@ def test_one_admission_spans_closed_market_backup_and_install(
             phases.append("closed_market_copy")
         return copied(source, target)
 
-    def state(workspace: object) -> None:
+    def state(workspace: object, version: int) -> None:
         from aegis_alpha.storage.workspace import Workspace  # noqa: PLC0415
 
         assert isinstance(workspace, Workspace)
         retained()
         assert workspace.market.execute("SELECT 1").fetchone() == (1,)
         phases.append("reopened_market_install")
-        install(workspace)
+        install(workspace, version)
 
     monkeypatch.setattr(backup_owner, "_copy_file", copy)
     monkeypatch.setattr(run_schema, "_install_state", state)

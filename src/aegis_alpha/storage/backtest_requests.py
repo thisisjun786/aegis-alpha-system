@@ -1,27 +1,49 @@
-"""Canonical request CONTENT store. Financial execution admission belongs to engine/application."""
+"""Canonical request CONTENT store. Financial execution admission belongs to engine/application.
+
+Two root shapes are stored here, and the store never converts one into the other. An
+aas-backtest-request-v1 describes an executable run and keeps every refusal the engine
+puts on it. An aas-research-run-v1 describes a declared uncertified research run over
+reference observations, which no executable request can describe. Both are held to the
+same content identity: exactly canonical bytes, a hash over those bytes, and bindings
+that agree with the bundle the request is registered against.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.storage.input_pins import (
     HASH_FORMAT,
+    InputBinding,
     InputBundleRef,
     binding_document,
     decode_pin_document,
     parse_bindings,
     read_input_bundle,
 )
-from aegis_alpha.storage.run_schema import require_run_schema
+from aegis_alpha.storage.run_schema import (
+    BACKTEST_REQUEST_SCHEMA,
+    COMPOSITION_REQUEST_SCHEMA,
+    RESEARCH_REQUEST_SCHEMA,
+    require_request_schema,
+    require_run_schema,
+)
 from aegis_alpha.storage.state import atomic
 
 if TYPE_CHECKING:
     from aegis_alpha.compute_resources import ComputeBudget
     from aegis_alpha.storage.workspace import Workspace
 
+# A declared run states its mode in its own bytes. A stored declaration that says
+# anything else would be a research record claiming a status nobody granted.
+RESEARCH_EXECUTION_MODE = "research-uncertified"
+# The one rule that can choose between a composition's sleeves. A literal, because the
+# installed engine computes it from the offense sleeve's own declared canary; a stored
+# composition naming another rule would describe a choice nothing makes.
+COMPOSITION_SWITCH = "offense-master-switch-v1"
 _ROOT = frozenset(
     {
         "schema",
@@ -46,28 +68,156 @@ _ROOT = frozenset(
         "environment",
     }
 )
+# The declared research root, mirrored from aegis_alpha.application.research_run so this
+# store stays free of an application import. A change to that contract's root belongs in
+# the same change as this set; an unlisted field would otherwise be stored unread.
+_RESEARCH_ROOT = frozenset(
+    {
+        "schema_version",
+        "execution_mode",
+        "strategy",
+        "observations",
+        "calendar",
+        "membership",
+        "period",
+        "history",
+        "execution",
+        "instrument_map",
+        "conventions",
+        "uncertainty",
+        "semantics",
+        "unsettled",
+    }
+)
+# A sample composition is the same declaration with two pinned sleeves in place of one
+# strategy, so it names neither a root strategy nor a root membership. Derived from the
+# sleeve root the way the contract derives it, which keeps one mirror rather than two.
+_COMPOSITION_ROOT = (_RESEARCH_ROOT - {"strategy", "membership"}) | {"composition"}
+
+
+def request_schema(body: dict[str, object]) -> str:
+    """Name the one request contract this document is, from its own root shape.
+
+    The roots are disjoint, so a document is exactly one contract or none of them.
+    Nothing here guesses: a root that is not exactly one of them is refused, never
+    defaulted, and a declared root must also say in its own bytes that it is uncertified.
+    """
+    if body.keys() == _ROOT:
+        if body["schema"] != BACKTEST_REQUEST_SCHEMA or body["hash_format"] != HASH_FORMAT:
+            raise ValueError("invalid backtest request root/schema")
+        return BACKTEST_REQUEST_SCHEMA
+    if body.keys() == _RESEARCH_ROOT:
+        if body["schema_version"] != RESEARCH_REQUEST_SCHEMA:
+            raise ValueError("invalid research run root/schema")
+        if body["execution_mode"] != RESEARCH_EXECUTION_MODE:
+            raise ValueError("a stored research run must declare " + RESEARCH_EXECUTION_MODE)
+        return RESEARCH_REQUEST_SCHEMA
+    if body.keys() == _COMPOSITION_ROOT:
+        if body["schema_version"] != COMPOSITION_REQUEST_SCHEMA:
+            raise ValueError("invalid research composition root/schema")
+        if body["execution_mode"] != RESEARCH_EXECUTION_MODE:
+            raise ValueError(
+                "a stored research composition must declare " + RESEARCH_EXECUTION_MODE
+            )
+        _require_composition(body)
+        return COMPOSITION_REQUEST_SCHEMA
+    raise ValueError("invalid backtest request root/schema")
+
+
+# The exact pin shape the declaration spells. Checked here rather than assumed, so a
+# binding is never built from a document that is missing or renaming a field.
+_MEMBERSHIP = {"kind", "id", "version", "hash"}
+_COMPOSITION = {"sample_id", "switch", "sleeves"}
+_SLEEVES = {"offense", "defense"}
+
+
+def _require_composition(body: dict[str, object]) -> None:
+    """Hold a stored composition to the two things it claims about its own shape.
+
+    A composition is two distinct sleeves and the one switch the installed engine
+    computes. Both are claims the record makes about itself, so a document naming another
+    rule describes a choice nothing makes, and one naming the same sleeve twice reports a
+    pair that is not a pair and would record that sleeve twice as the run's provenance.
+
+    Everything else a declaration must satisfy — window validity, the shape of each
+    nested pin, the rest of the contract — stays with the application parser that owns
+    it, exactly as an executable request's own admission stays with the engine.
+    """
+    block = _pin(body["composition"], "composition", _COMPOSITION)
+    if block["switch"] != COMPOSITION_SWITCH:
+        raise ValueError("a stored composition must declare switch " + COMPOSITION_SWITCH)
+    sleeves = _pin(block["sleeves"], "composition sleeves", _SLEEVES)
+    if sleeves["offense"] == sleeves["defense"]:
+        raise ValueError("a stored composition needs two distinct sleeves")
+
+
+def _pin(value: object, field: str, keys: set[str]) -> dict[str, object]:
+    if not isinstance(value, dict) or value.keys() != keys:
+        raise ValueError("research request " + field + " has missing or unknown fields")
+    return cast("dict[str, object]", value)
+
+
+def research_bindings(body: dict[str, object]) -> list[dict[str, object]]:
+    """The exact bundle a declared research run must be registered against.
+
+    A declaration carries no bindings array, so the tie to its bundle is derived from
+    the pins it does name, and only some of those can be expressed as bindings. The
+    observation panels cannot: there is no role for reference observations, and inventing
+    one would put adjusted reference data in the namespace the executable price roles
+    use. The calendar cannot: it is a declared name over the panel's own dates rather
+    than a published generation, so there is no pin to authenticate.
+
+    A sleeve run's membership can, and is required to be the whole bundle. A sample
+    composition pins one membership per sleeve while the binding vocabulary holds a
+    single membership, so binding one of the two would leave `run.bundle_id` describing
+    half the run while looking complete; a composition binds nothing instead. Whatever
+    stays unbound stays covered by the declaration's own content hash, which the run
+    records as its `request_hash`.
+    """
+    if request_schema(body) == COMPOSITION_REQUEST_SCHEMA:
+        return []
+    membership = _pin(body["membership"], "membership", _MEMBERSHIP)
+    if membership.get("kind") != "membership":
+        raise ValueError("research membership pin must name the membership kind")
+    return [
+        binding_document(
+            InputBinding(
+                "membership",
+                0,
+                "membership",
+                membership["id"],  # ty: ignore[invalid-argument-type]
+                membership["version"],  # ty: ignore[invalid-argument-type]
+                membership["hash"],  # ty: ignore[invalid-argument-type]
+            )
+        ),
+    ]
 
 
 def _validate(
     workspace: Workspace, bundle: InputBundleRef, raw: bytes, digest: str, budget: ComputeBudget
-) -> None:
+) -> str:
     if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
         raise ValueError("request hash must be lowercase SHA-256")
     body = decode_pin_document(raw)
-    if (
-        body.keys() != _ROOT
-        or body["schema"] != "aas-backtest-request-v1"
-        or body["hash_format"] != HASH_FORMAT
-    ):
-        raise ValueError("invalid backtest request root/schema")
+    schema = request_schema(body)
+    # The installed add-on has to be able to record a run under this contract before its
+    # request becomes a stored fact; otherwise the refusal only arrives at open_run, on
+    # an installation that already accepted the document.
+    require_request_schema(workspace, schema)
     if canonical_json_bytes(body) != raw:
         raise ValueError("request bytes must be exactly canonical")
     if hashlib.sha256(raw).hexdigest() != digest:
         raise ValueError("request content hash mismatch")
-    bindings = [binding_document(item) for item in parse_bindings(body["bindings"])]
+    executable = schema == BACKTEST_REQUEST_SCHEMA
+    bindings = (
+        [binding_document(item) for item in parse_bindings(body["bindings"])]
+        if executable
+        else research_bindings(body)
+    )
     stored = decode_pin_document(read_input_bundle(workspace, bundle, budget=budget))
-    if body["bindings"] != bindings or bindings != stored["bindings"]:
+    if (executable and body["bindings"] != bindings) or bindings != stored["bindings"]:
         raise ValueError("request binding order/complete bundle content mismatch")
+    return schema
 
 
 def register_backtest_request(

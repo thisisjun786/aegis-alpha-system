@@ -48,6 +48,7 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
         "backup": "Copy the quiesced stores and run artifacts, excluding secrets",
         "restore": "Rebuild an installation from a backup into a new home",
         "run-install": "Install the formal run add-on schema, after a backup",
+        "run-migrate": "Migrate the installed run add-on to the current version, after a backup",
     }
     for name, description in maintenance.items():
         command = sub.add_parser(name, help=description)
@@ -57,7 +58,7 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
             command.add_argument("--reason", required=True)
         if name == "backup":
             command.add_argument("--output", type=Path)
-        if name == "run-install":
+        if name in ("run-install", "run-migrate"):
             command.add_argument("--backup-output", type=Path)
         if name == "restore":
             command.add_argument("--backup", type=Path, required=True)
@@ -152,6 +153,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             "backup",
             "restore",
             "run-install",
+            "run-migrate",
         }:
             return _maintenance(home, args)
         if args.command == "data" and args.data_command == "read-prices":
@@ -199,7 +201,7 @@ def _maintenance(home: Path, args: argparse.Namespace) -> dict[str, object]:
     from aegis_alpha.storage.backup import backup, restore
     from aegis_alpha.storage.locks import private_directory, storage_lock_targets
     from aegis_alpha.storage.paths import DEFAULT_PATHS, load_paths
-    from aegis_alpha.storage.run_schema import install_run_schema
+    from aegis_alpha.storage.run_schema import install_run_schema, migrate_run_schema
     from aegis_alpha.storage.verification import verify_workspace
     from aegis_alpha.storage.workspace import open_workspace
 
@@ -219,6 +221,8 @@ def _maintenance(home: Path, args: argparse.Namespace) -> dict[str, object]:
             return restore(args.backup.absolute(), home, budget=budget)
         if args.db_command == "run-install":
             return install_run_schema(home, backup_output=args.backup_output, budget=budget)
+        if args.db_command == "run-migrate":
+            return migrate_run_schema(home, backup_output=args.backup_output, budget=budget)
         with open_workspace(home) as workspace:
             return verify_workspace(workspace, budget=budget)
 

@@ -341,11 +341,39 @@ def source_snapshots(
     return headers
 
 
+def _recover_one(
+    workspace: Workspace, operation: sqlite3.Row, budget: ComputeBudget | None
+) -> bool:
+    """Route one prepared operation to the module that owns finishing it."""
+    from aegis_alpha.storage.run_schema import (  # noqa: PLC0415
+        MIGRATION_KIND,
+        recover_run_schema_migration,
+    )
+    from aegis_alpha.storage.runs import RUN_OPERATION_KIND  # noqa: PLC0415
+
+    kind = operation["kind"]
+    if kind == "strategy_import":
+        from aegis_alpha.storage.strategy_import import recover_strategy_import  # noqa: PLC0415
+
+        return recover_strategy_import(workspace, operation)
+    if kind == "source_import":
+        from aegis_alpha.storage.source_library import recover_source  # noqa: PLC0415
+
+        return recover_source(workspace, str(operation["operation_id"]))
+    if kind == "market_publish":
+        return _recover_publication(workspace, operation)
+    if kind == RUN_OPERATION_KIND:
+        from aegis_alpha.storage.runs import recover_run  # noqa: PLC0415
+
+        return recover_run(workspace, operation, budget=budget)
+    if kind == MIGRATION_KIND:
+        return recover_run_schema_migration(workspace, operation)
+    return False
+
+
 def recover_operations(
     workspace: Workspace, *, budget: ComputeBudget | None = None
 ) -> dict[str, object]:
-    from aegis_alpha.storage.runs import RUN_OPERATION_KIND  # noqa: PLC0415
-
     recovered: list[str] = []
     pending: list[str] = []
     rows = workspace.state.execute(
@@ -354,32 +382,7 @@ def recover_operations(
     ).fetchall()
     for operation in rows:
         op_id = operation["operation_id"]
-        if operation["kind"] == "strategy_import":
-            from aegis_alpha.storage.strategy_import import recover_strategy_import  # noqa: PLC0415
-
-            if not recover_strategy_import(workspace, operation):
-                pending.append(op_id)
-                continue
-        elif operation["kind"] == "source_import":
-            from aegis_alpha.storage.source_library import recover_source  # noqa: PLC0415
-
-            if not recover_source(workspace, op_id):
-                pending.append(op_id)
-                continue
-        elif operation["kind"] == "market_publish":
-            if not _recover_publication(workspace, operation):
-                pending.append(op_id)
-                continue
-        elif operation["kind"] == RUN_OPERATION_KIND:
-            from aegis_alpha.storage.runs import recover_run  # noqa: PLC0415
-
-            if not recover_run(workspace, operation, budget=budget):
-                pending.append(op_id)
-                continue
-        else:
-            pending.append(op_id)
-            continue
-        recovered.append(op_id)
+        (recovered if _recover_one(workspace, operation, budget) else pending).append(op_id)
     return {"recovered": recovered, "pending": pending, "provider_calls": 0}
 
 
@@ -434,6 +437,7 @@ def execute_data(workspace: Workspace, args: argparse.Namespace) -> dict[str, ob
 
 
 def quarantine(workspace: Workspace, operation_id: str, reason: str) -> dict[str, object]:
+    from aegis_alpha.storage.run_schema import MIGRATION_KIND  # noqa: PLC0415
     from aegis_alpha.storage.runs import RUN_OPERATION_KIND  # noqa: PLC0415
     from aegis_alpha.storage.state import get_operation, quarantine_operation  # noqa: PLC0415
 
@@ -442,6 +446,11 @@ def quarantine(workspace: Workspace, operation_id: str, reason: str) -> dict[str
         # Ending the intent alone would leave its run RUNNING and invisible to the
         # PREPARED-only recovery scan.
         raise ValueError("a run intent is ended by recovery, which also ends its run")
+    if intent is not None and intent["kind"] == MIGRATION_KIND:
+        # A quarantined intent can never be prepared again, so ending this one would
+        # neither undo a rebuild that already landed nor leave any way to finish one
+        # that did not. The add-on would stay unusable with nothing able to clear it.
+        raise ValueError("a run add-on migration is finished by aas db run-migrate")
     if (
         workspace.market.execute(
             "SELECT 1 FROM market_generations WHERE operation_id=?", [operation_id]

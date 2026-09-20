@@ -26,8 +26,15 @@ from typing import TYPE_CHECKING
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
+from aegis_alpha.storage.backtest_requests import RESEARCH_EXECUTION_MODE, request_schema
 from aegis_alpha.storage.rowset import rowset_hash
-from aegis_alpha.storage.run_schema import require_run_schema
+from aegis_alpha.storage.run_schema import (
+    BACKTEST_REQUEST_SCHEMA,
+    COMPOSITION_REQUEST_SCHEMA,
+    RESEARCH_REQUEST_SCHEMA,
+    require_request_schema,
+    require_run_schema,
+)
 from aegis_alpha.storage.state import (
     atomic,
     complete_operation,
@@ -50,6 +57,49 @@ _ENVELOPE = "envelope.json"
 _PREPARATION = "preparation.json"
 _BACKTEST = "backtest.json"
 _ARTIFACTS = (_ENVELOPE, _PREPARATION, _BACKTEST)
+# The sealed preparation of each declared contract. A declaration carries no engine or
+# environment of its own, because no certified request stands behind that calculation,
+# so those identities are read from the document sealed beside the envelope.
+_RESEARCH_PREPARATIONS = {
+    RESEARCH_REQUEST_SCHEMA: "aas-prepared-research-run-v1",
+    COMPOSITION_REQUEST_SCHEMA: "aas-prepared-research-composition-v1",
+}
+_DECLARED_BY_PREPARATION = {
+    prepared: declared for declared, prepared in _RESEARCH_PREPARATIONS.items()
+}
+# What each declared preparation calls its own run. Checked beside the schema, so one
+# kind's schema cannot arrive carrying the other kind's scope.
+_DECLARED_SCOPE = {
+    RESEARCH_REQUEST_SCHEMA: "sleeve",
+    COMPOSITION_REQUEST_SCHEMA: "sample-composition",
+}
+# Where each request contract's preparation names the request it was prepared for.
+_PREPARATION_LINK = {
+    BACKTEST_REQUEST_SCHEMA: "request_hash",
+    RESEARCH_REQUEST_SCHEMA: "declaration_sha256",
+    COMPOSITION_REQUEST_SCHEMA: "declaration_sha256",
+}
+# What a declared preparation fixes about itself. The contract that seals it writes all
+# three as false, so a document claiming otherwise is describing a different run than
+# the one it says it is.
+_RESEARCH_STATUS = ("certified", "point_in_time_certified", "executable_prices")
+# What the runner stamps on a declared run's result. Written down here rather than
+# imported, like every other document literal this module knows, because storage never
+# imports application code.
+_DECLARED_RESEARCH_MODE = "declared_uncertified_research"
+# Every fixed claim such a result carries, not only the ones the declared mode adds. The
+# first four are stamped on any response and the last three only on a declared one, but a
+# declared result carries all seven, so pinning a subset would leave the rest free to say
+# the opposite while the pinned ones still read correctly.
+_DECLARED_RESULT_STATUS = {
+    "source_pins_verified": False,
+    "observed_prices_verified": False,
+    "point_in_time_verified": False,
+    "live_orders": False,
+    "certified": False,
+    "non_executable": True,
+    "executable_prices": False,
+}
 _MEDIA_TYPE = "application/json"
 _SHA_LENGTH = 64
 # A sealed document is decoded whole, so it is charged at the expansion the state
@@ -576,22 +626,69 @@ def _sealed_request(
     return _mapping(json.loads(row[0]), "backtest request")
 
 
-def _sealed_identities(request: dict[str, object]) -> tuple[str, str, tuple[str, ...]]:
-    """The engine, environment and strategy identities the request already seals."""
-    sealed = _mapping(request.get("strategy"), "request strategy")
+def _strategy_identity(sealed: dict[str, object], label: str) -> tuple[str, ...]:
+    """The five fields that name one admitted strategy version."""
+    return (
+        _text(sealed.get("strategy_store_id"), label + " store"),
+        _text(sealed.get("strategy_id"), label + " strategy_id"),
+        _text(sealed.get("version"), label + " version"),
+        _digest(_text(sealed.get("raw_sha256"), label + " raw_sha256"), label + " raw_sha256"),
+        _digest(
+            _text(sealed.get("contract_sha256"), label + " contract_sha256"),
+            label + " contract_sha256",
+        ),
+    )
+
+
+def _declared_strategies(request: dict[str, object], schema: str) -> tuple[tuple[str, ...], ...]:
+    """The strategy identities the request seals, in the order a run records them.
+
+    A sleeve run names one. A composition names two and both of them run, because the
+    switch chooses between the sleeves decision by decision, so a record naming only the
+    offense would describe a calculation the defense also took part in.
+    """
+    if schema != COMPOSITION_REQUEST_SCHEMA:
+        sealed = _mapping(request.get("strategy"), "request strategy")
+        return (_strategy_identity(sealed, "request"),)
+    sleeves = _mapping(
+        _mapping(request.get("composition"), "request composition").get("sleeves"),
+        "composition sleeves",
+    )
+    return tuple(
+        _strategy_identity(
+            _mapping(sleeves.get(role), "composition " + role), "composition " + role
+        )
+        for role in ("offense", "defense")
+    )
+
+
+def _sealed_identities(
+    request: dict[str, object], prepared: _Prepared | None
+) -> tuple[str, str, tuple[tuple[str, ...], ...]]:
+    """The engine, environment and strategy identities this run's evidence seals.
+
+    Every contract names its strategies in the request itself. An executable request also
+    names the engine and environment it was written against; a declaration does not, so a
+    declared run takes those from the preparation that produced its envelope. That
+    document is sealed under the same durable intent as the envelope, so it is no more
+    replaceable than the request, and it is the only place those identities exist.
+
+    The kinds are paired exactly rather than by family. A composition's preparation under
+    a sleeve declaration, or the reverse, would supply an identity for a calculation it
+    never describes, and both are declared documents, so a looser check would admit it.
+    """
+    schema = request_schema(request)
+    if (schema in _RESEARCH_PREPARATIONS) != (prepared is not None) or (
+        prepared is not None and prepared.declaration_schema != schema
+    ):
+        raise RunStorageError("the sealed preparation does not match the request contract")
+    identities = _declared_strategies(request, schema)
+    if prepared is not None:
+        return prepared.engine_hash, prepared.environment_hash, identities
     return (
         content_sha256(_mapping(request.get("engine"), "request engine")),
         content_sha256(_mapping(request.get("environment"), "request environment")),
-        (
-            _text(sealed.get("strategy_store_id"), "request strategy store"),
-            _text(sealed.get("strategy_id"), "request strategy_id"),
-            _text(sealed.get("version"), "request strategy version"),
-            _digest(_text(sealed.get("raw_sha256"), "request raw_sha256"), "request raw_sha256"),
-            _digest(
-                _text(sealed.get("contract_sha256"), "request contract_sha256"),
-                "request contract_sha256",
-            ),
-        ),
+        identities,
     )
 
 
@@ -640,11 +737,18 @@ def _require_recorded_provenance(
     if operation is None or operation["payload_hash"] != expected_inputs:
         raise RunStorageError("recorded bundle or sealed inputs disagree with the durable intent")
     # The projection stays live while the request is decoded beside it.
-    engine, environment, strategy = _sealed_identities(
-        _sealed_request(
-            workspace, row["bundle_id"], derived.request_hash, _reserved(budget, derived)
-        )
+    request = _sealed_request(
+        workspace, row["bundle_id"], derived.request_hash, _reserved(budget, derived)
     )
+    recorded_schema = workspace.state.execute(
+        "SELECT request_schema FROM run_details WHERE run_id=?", (derived.run_id,)
+    ).fetchone()
+    # run_details is immutable, so this is the contract the run was opened under. A
+    # registered request that is now a different contract would make a stored run
+    # describe a kind of calculation nobody recorded.
+    if recorded_schema is None or recorded_schema[0] != request_schema(request):
+        raise RunStorageError("recorded request schema disagrees with the registered request")
+    engine, environment, strategy = _sealed_identities(request, derived.prepared)
     if (row["engine_hash"], row["environment_hash"]) != (engine, environment):
         raise RunStorageError("recorded engine identity disagrees with the registered request")
     pins = [
@@ -655,7 +759,7 @@ def _require_recorded_provenance(
             (derived.run_id,),
         )
     ]
-    if pins != [(derived.module, 0, *strategy)]:
+    if pins != [(derived.module, ordinal, *identity) for ordinal, identity in enumerate(strategy)]:
         raise RunStorageError("recorded strategy pins disagree with the registered request")
     _require_recorded_metadata(workspace, derived.run_id)
 
@@ -686,24 +790,32 @@ def _require_recorded_metadata(workspace: Workspace, run_id: str) -> None:
         raise RunStorageError("recorded run metadata disagrees with its opening evidence")
 
 
-def _require_sealed_provenance(intent: RunIntent, request: dict[str, object], module: str) -> None:
+def _require_sealed_provenance(
+    intent: RunIntent,
+    request: dict[str, object],
+    module: str,
+    prepared: _Prepared | None,
+) -> None:
     """Refuse provenance the registered request does not already seal.
 
     read_run returns the engine, environment and strategy identities as the run
     immutable provenance. The request already seals all three, so accepting whatever a
     caller passes would let a successful run describe a calculation nobody performed.
     """
-    engine, environment, expected = _sealed_identities(request)
+    engine, environment, expected = _sealed_identities(request, prepared)
     if intent.engine_hash != engine:
         raise RunStorageError("engine_hash does not match the registered request")
     if intent.environment_hash != environment:
         raise RunStorageError("environment_hash does not match the registered request")
     pins = _pin_rows(intent.strategy_pins)
-    if len(pins) != 1 or tuple(pins[0][2:]) != expected:
+    if len(pins) != len(expected) or any(
+        tuple(row[2:]) != identity for row, identity in zip(pins, expected, strict=True)
+    ):
         raise RunStorageError("strategy pins do not match the registered request")
-    if (pins[0][0], pins[0][1]) != (module, 0):
-        # run_strategies is keyed on (run_id, module, ordinal). A pin filed under
-        # another module would make read_run report provenance the manifest contradicts.
+    if any((row[0], row[1]) != (module, ordinal) for ordinal, row in enumerate(pins)):
+        # run_strategies is keyed on (run_id, module, ordinal). A pin filed under another
+        # module would make read_run report provenance the manifest contradicts, and a
+        # composition's two sleeves are told apart by nothing except their ordinal.
         raise RunStorageError("strategy pin is not placed on the run module")
 
 
@@ -732,7 +844,7 @@ def _require_admitted_pins(workspace: Workspace, pins: tuple[RunStrategyPin, ...
 
 
 def _require_same_intent(
-    workspace: Workspace, intent: RunIntent, run_id: str, request_hash: str
+    workspace: Workspace, intent: RunIntent, run_id: str, request_hash: str, schema: str
 ) -> None:
     """Accept an identical reopen; refuse a different request under the same name.
 
@@ -741,7 +853,7 @@ def _require_same_intent(
     """
     existing = workspace.state.execute(
         "SELECT r.bundle_id,r.engine_hash,r.environment_hash,r.reason,r.status,r.prior_run_id,"
-        "d.request_hash FROM runs r LEFT JOIN run_details d ON d.run_id=r.run_id "
+        "d.request_hash,d.request_schema FROM runs r LEFT JOIN run_details d ON d.run_id=r.run_id "
         "WHERE r.run_id=?",
         (run_id,),
     ).fetchone()
@@ -761,6 +873,7 @@ def _require_same_intent(
         or existing["reason"] != intent.reason
         or existing["prior_run_id"] != intent.prior_run_id
         or existing["request_hash"] != request_hash
+        or existing["request_schema"] != schema
         or stored_pins != _pin_rows(intent.strategy_pins)
     ):
         raise RunStorageError("run ID already identifies a different or finished run")
@@ -808,15 +921,21 @@ def open_run(
     held = _allowance(budget)
     held = replace(held, reserved_bytes=held.reserved_bytes + inputs)
     request = _sealed_request(workspace, intent.bundle_id, request_hash, held)
+    schema = request_schema(request)
+    # The installed add-on decides which request contracts it can record at all, so an
+    # unmigrated installation refuses here rather than at the CHECK.
+    require_request_schema(workspace, schema)
     envelope = _mapping(json.loads(intent.envelope_bytes), "envelope")
     module = _envelope_module(envelope)
-    _require_sealed_provenance(intent, request, module)
     # Every later check reads the result's fills against this list, so an envelope
     # without one is refused before it becomes an artifact nothing can replace.
     _envelope_sessions(envelope)
     # Checked before anything durable happens, so a preparation that belongs to another
     # request or another envelope is never sealed under this run.
-    _require_linked_inputs(intent.envelope_bytes, intent.preparation_bytes, request_hash)
+    _, prepared = _require_linked_inputs(
+        intent.envelope_bytes, intent.preparation_bytes, request_hash
+    )
+    _require_sealed_provenance(intent, request, module, prepared)
     _require_admitted_pins(workspace, intent.strategy_pins)
     run_id = intent.run_id or "run-" + uuid.uuid4().hex
     if len(_text(intent.reason, "reason").encode()) > _MAX_REASON_BYTES:
@@ -843,10 +962,10 @@ def open_run(
     if workspace.state.execute("SELECT 1 FROM runs WHERE run_id=?", (run_id,)).fetchone():
         # A resumed open: prepare_operation refuses a different or quarantined intent
         # under the same ID, and the run rows are compared rather than rewritten.
-        _require_same_intent(workspace, intent, run_id, request_hash)
+        _require_same_intent(workspace, intent, run_id, request_hash, schema)
         durable.prepare(workspace.state)
     else:
-        _open_intent(workspace, intent, durable)
+        _open_intent(workspace, intent, durable, schema)
     # The intent is durable now, so a crash during sealing leaves a discoverable run.
     sealed_envelope = _seal(workspace, run_id, _ENVELOPE, intent.envelope_bytes)
     sealed_preparation = _seal(workspace, run_id, _PREPARATION, intent.preparation_bytes)
@@ -859,7 +978,9 @@ def open_run(
     )
 
 
-def _open_intent(workspace: Workspace, intent: RunIntent, durable: _DurableIntent) -> None:
+def _open_intent(
+    workspace: Workspace, intent: RunIntent, durable: _DurableIntent, schema: str
+) -> None:
     """Transaction A: the run, its request, its pins and its intent, or none of them."""
     run_id = durable.target_id
     now = time.time_ns() // 1000
@@ -880,8 +1001,10 @@ def _open_intent(workspace: Workspace, intent: RunIntent, durable: _DurableInten
         )
         workspace.state.execute(
             "INSERT INTO run_details(run_id,request_hash,prior_run_id,request_schema) "
-            "VALUES (?,?,?,'aas-backtest-request-v1')",
-            (run_id, durable.request_hash, intent.prior_run_id),
+            "VALUES (?,?,?,?)",
+            # The request's own contract, not a constant: a run records which document
+            # describes it, and the add-on CHECK holds that to its allow-list.
+            (run_id, durable.request_hash, intent.prior_run_id, schema),
         )
         for pin in _pin_rows(intent.strategy_pins):
             workspace.state.execute(
@@ -995,6 +1118,10 @@ class _Derived:
     counts: dict[str, int]
     manifest: str
     metrics: dict[str, tuple[Decimal | None, str]]
+    # What a declared run's preparation sealed, or None when the request names it itself.
+    # Its kind and two digests rather than the decoded document, so the projection keeps
+    # holding derived facts instead of a second copy of an artifact.
+    prepared: _Prepared | None = None
 
 
 def _derive(
@@ -1024,6 +1151,7 @@ def _derive(
         counts=projected.counts,
         manifest=manifest_hash(request_hash, artifacts, (projected.hashes, projected.counts)),
         metrics=projected.metrics,
+        prepared=projected.prepared,
     )
 
 
@@ -1041,9 +1169,63 @@ def _require_link(document: dict[str, object], field: str, expected: str, label:
         raise RunStorageError(label + " names different evidence")
 
 
+@dataclass(frozen=True, slots=True)
+class _Prepared:
+    """A declared preparation's own kind, and the identities only it carries."""
+
+    declaration_schema: str
+    engine_hash: str
+    environment_hash: str
+
+
+def _require_research_status(preparation: dict[str, object], declared: str) -> None:
+    """Refuse a declared preparation that contradicts what its own contract fixes.
+
+    Absent and wrong are refused alike: a document that omits its status proves nothing
+    about the calculation, and one that claims certification claims something this path
+    cannot grant. Without this, storage would record a research run whose only sealed
+    evidence says it was certified, and then keep verifying that record.
+    """
+    if preparation.get("declaration_schema") != declared:
+        raise RunStorageError("research preparation does not name the declaration contract")
+    if preparation.get("scope") != _DECLARED_SCOPE[declared]:
+        # Its schema and its scope are two statements about the same thing, so a document
+        # carrying one kind's schema under the other kind's scope describes neither.
+        raise RunStorageError("research preparation does not name the scope of its own kind")
+    if preparation.get("execution_mode") != RESEARCH_EXECUTION_MODE:
+        raise RunStorageError("research preparation must declare " + RESEARCH_EXECUTION_MODE)
+    if any(preparation.get(field) is not False for field in _RESEARCH_STATUS):
+        raise RunStorageError("research preparation contradicts its own uncertified status")
+    # The declared path's own decisions are made in code the engine identity does not
+    # cover, so the record names that code as well. A sealed record that cannot say what
+    # produced it is not answerable on its own terms, which is the whole point of it.
+    _digest(
+        _text(preparation.get("preparation_source_sha256"), "preparation source"),
+        "preparation source",
+    )
+
+
+def _require_declared_result(document: dict[str, object]) -> None:
+    """Refuse a declared run's result that claims to be anything else.
+
+    The sealed result is what a later reader is shown, and the manifest authenticates
+    whatever it holds. Without this, a run opened under a declaration could commit a
+    result stamped certified and executable, and every later read and verification would
+    confirm it, because the hash covers the contradiction rather than rejecting it.
+
+    The status is what gets checked, not the inputs the result repeats. The declaration
+    is the authority on those and is stored beside the run, so a reader compares the two
+    documents; storage does not become a second copy of that contract.
+    """
+    if document.get("research_mode") != _DECLARED_RESEARCH_MODE:
+        raise RunStorageError("a declared run's result must name " + _DECLARED_RESEARCH_MODE)
+    if any(document.get(field) is not value for field, value in _DECLARED_RESULT_STATUS.items()):
+        raise RunStorageError("declared run result contradicts its own uncertified status")
+
+
 def _require_linked_inputs(
     envelope_bytes: bytes, preparation_bytes: bytes, request_hash: str
-) -> str:
+) -> tuple[str, _Prepared | None]:
     """Refuse artifacts that do not name this run request and envelope.
 
     The preparation document records the request it was prepared for and the envelope
@@ -1051,20 +1233,43 @@ def _require_linked_inputs(
     required rather than compared only when present: a document that omits its link
     proves nothing about which calculation produced it, and the manifest built over it
     would be internally consistent while certifying unrelated evidence.
+
+    A declared research preparation names the declaration it sealed rather than a
+    certified request hash, and carries the engine and environment that produced the
+    envelope. Which link to require is read from the preparation's own schema, so the
+    document is checked against the contract it says it is rather than against whichever
+    request happens to be registered beside it.
     """
     envelope_sha256 = hashlib.sha256(envelope_bytes).hexdigest()
     preparation = _mapping(json.loads(preparation_bytes), "preparation")
-    _require_link(preparation, "request_hash", request_hash, "preparation request")
+    kind = preparation.get("schema")
+    declared = _DECLARED_BY_PREPARATION.get(kind) if isinstance(kind, str) else None
+    contract = declared if declared is not None else BACKTEST_REQUEST_SCHEMA
+    _require_link(preparation, _PREPARATION_LINK[contract], request_hash, "preparation request")
     _require_link(preparation, "envelope_sha256", envelope_sha256, "preparation envelope")
-    return envelope_sha256
+    if declared is None:
+        return envelope_sha256, None
+    _require_research_status(preparation, declared)
+    return envelope_sha256, _Prepared(
+        declared,
+        content_sha256(_mapping(preparation.get("engine"), "preparation engine")),
+        content_sha256(_mapping(preparation.get("environment"), "preparation environment")),
+    )
 
 
 def _require_linked_evidence(
     envelope_bytes: bytes, preparation_bytes: bytes, backtest_bytes: bytes, request_hash: str
-) -> None:
-    envelope_sha256 = _require_linked_inputs(envelope_bytes, preparation_bytes, request_hash)
+) -> _Prepared | None:
+    envelope_sha256, prepared = _require_linked_inputs(
+        envelope_bytes, preparation_bytes, request_hash
+    )
     document = _mapping(json.loads(backtest_bytes), "backtest result")
     _require_link(document, "input_sha256", envelope_sha256, "backtest envelope")
+    if prepared is not None:
+        # The preparation's own kind decides this, so a declared run's three documents
+        # have to agree with each other rather than only two of them agreeing.
+        _require_declared_result(document)
+    return prepared
 
 
 @dataclass(frozen=True, slots=True)
@@ -1076,6 +1281,7 @@ class _Projection:
     hashes: dict[str, str]
     counts: dict[str, int]
     metrics: dict[str, tuple[Decimal | None, str]]
+    prepared: _Prepared | None = None
 
 
 def _project(
@@ -1087,7 +1293,9 @@ def _project(
     it again from disk, so a document that fails any check never becomes an artifact
     that a corrected retry could not replace.
     """
-    _require_linked_evidence(envelope_bytes, preparation_bytes, backtest_bytes, request_hash)
+    prepared = _require_linked_evidence(
+        envelope_bytes, preparation_bytes, backtest_bytes, request_hash
+    )
     rows = project_result_rows(backtest_bytes, envelope_bytes)
     hashes, counts = table_receipts(rows)
     document = _mapping(json.loads(backtest_bytes), "backtest result")
@@ -1097,6 +1305,7 @@ def _project(
         hashes=hashes,
         counts=counts,
         metrics=project_metrics(backtest_bytes),
+        prepared=prepared,
     )
 
 
@@ -1554,8 +1763,8 @@ def read_run(
     require_run_schema(workspace)
     row = workspace.state.execute(
         "SELECT r.run_id,r.prior_run_id,r.bundle_id,r.engine_hash,r.environment_hash,r.reason,"
-        "r.status,r.created_at_us,r.completed_at_us,r.result_hash,d.request_hash FROM runs r "
-        "JOIN run_details d ON d.run_id=r.run_id WHERE r.run_id=?",
+        "r.status,r.created_at_us,r.completed_at_us,r.result_hash,d.request_hash,"
+        "d.request_schema FROM runs r JOIN run_details d ON d.run_id=r.run_id WHERE r.run_id=?",
         (run_id,),
     ).fetchone()
     if row is None:
@@ -1569,6 +1778,8 @@ def read_run(
         "bundle_id": row["bundle_id"],
         "prior_run_id": row["prior_run_id"],
         "request_hash": row["request_hash"],
+        # Which contract describes this run. A declared research run reads back as one.
+        "request_schema": row["request_schema"],
         "engine_hash": row["engine_hash"],
         "environment_hash": row["environment_hash"],
         "reason": row["reason"],
