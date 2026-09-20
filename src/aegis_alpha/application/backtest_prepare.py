@@ -1770,12 +1770,17 @@ def _research_plan(
     and each decision's cutoff is the last observation the panel recorded that day.
     Nothing about the executable schedule changes: this path simply does not use it.
     """
-    observed = {role: _panel_sessions(panel) for role, panel in panels.items()}
+    period = declaration.period
+    # Compared inside the declared period only. That is where the two panels are used
+    # together, so a difference outside it says nothing about this run.
+    observed = {
+        role: {day for day in _panel_sessions(panel) if period.start <= day <= period.end}
+        for role, panel in panels.items()
+    }
     if observed["open"] != observed["close"]:
         # Signals and fills would otherwise run on two different calendars.
-        raise ValueError("the open and close panels observe different sessions")
-    period = declaration.period
-    dates = tuple(day for day in sorted(observed["close"]) if period.start <= day <= period.end)
+        raise ValueError("the open and close panels observe different sessions in the period")
+    dates = tuple(sorted(observed["close"]))
     if len(dates) < _MINIMUM_RESEARCH_SESSIONS:
         raise ValueError("the declared period holds fewer than two observed sessions")
     following = dict(pairwise(dates))
