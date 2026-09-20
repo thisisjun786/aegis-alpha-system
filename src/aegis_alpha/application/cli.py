@@ -19,6 +19,13 @@ from aegis_alpha.application import (
 )
 from aegis_alpha.application.contracts import parse_request
 from aegis_alpha.application.portfolio import compose_portfolio
+from aegis_alpha.application.research_run import (
+    CALENDAR_BASIS,
+    EXECUTION_MODE,
+    FILL_CONVENTION,
+    RESEARCH_COMPOSITION_SCHEMA,
+    RESEARCH_RUN_SCHEMA,
+)
 from aegis_alpha.modules.catalog import module_catalog
 
 
@@ -54,6 +61,7 @@ def _status() -> dict[str, object]:
             "strategy_execution": False,
             "aegis_etf_target_replay": True,
             "aegis_registered_strategy_run": True,
+            "aegis_declared_research_run": True,
             "research_proxy_returns": True,
             "research_candidate_generation": True,
             "database_adapter": True,
@@ -84,6 +92,25 @@ def _status() -> dict[str, object]:
             "execution_eligibility": False,
             "live_trading_approval": False,
             "point_in_time_certified": False,
+        },
+        # The declared path is reported beside the run store rather than inside it: an
+        # installation can record a declared run only once the add-on is migrated, and
+        # nothing about it is eligibility. Every claim here is negative on purpose, and
+        # the two schema names are read from the contract rather than written twice.
+        "declared_research_run": {
+            "command": "aas run research",
+            "reproduction_command": "aas run rerun",
+            "request_schemas": [RESEARCH_RUN_SCHEMA, RESEARCH_COMPOSITION_SCHEMA],
+            "execution_mode": EXECUTION_MODE,
+            "calendar_basis": CALENDAR_BASIS,
+            "fill_convention": FILL_CONVENTION,
+            "migration_command": "aas db run-migrate",
+            "certified": False,
+            "non_executable": True,
+            "executable_prices": False,
+            "point_in_time_certified": False,
+            "observed_prices_verified": False,
+            "source_parity": "unknown",
         },
         "provider_storage": "legacy_adapter_pending_migration",
     }

@@ -558,6 +558,56 @@ run 이력에 남는다. 어느 쪽이든 성공 영수증은 없다. 그 run을
 오류로 실패한다. 잘못된 결과가 저장되지는 않지만 실행은 버려진다. 이는 복구 계약 자체의
 성질이며 통합 명령이 새로 만든 것이 아니다.
 
+### 선언한 미인증 연구 실행
+
+`aas run research`는 위의 단계 구조를 그대로 쓰되, 인증된 요청 대신 선언 문서 하나를 받는다.
+보존 관측 패널에는 실행 경로가 없고 이 명령도 열지 않는다. 회계는 자기 응답 바이트에 미인증·
+비실행을 적는 모드로만 돌고, run 저장소는 선언을 그 선언이 봉인한 준비 문서와 짝지어 받는다.
+
+`aas-research-run-v2` 슬리브 선언과 `aas-research-composition-v1` 표본 조합 선언을 모두 받는다.
+어느 쪽인지는 문서의 `schema_version`이 말하므로 호출자가 고르지 않는다.
+
+run 저장 표는 기본 설치에 없고, 선언된 계약을 담으려면 add-on이 v1보다 높아야 한다. 둘 다
+0단계에서 확인하므로 설치가 부족하면 계산 전에 실행할 명령을 알려주고 끝난다.
+
+```bash
+aas db run-install
+aas db run-migrate
+aas run research --declaration "$LAB/declaration.json" --sha256 "$DECLARATION_SHA256"
+aas run show --run-id <선언이 정한 run ID>
+aas run rerun --run-id <같은 run ID>
+aas run rerun --run-id <같은 run ID> --declaration "$LAB/declaration.json" --sha256 "$DECLARATION_SHA256"
+```
+
+선택 인자는 `--reason`, `--bundle-id`, `--prior-run-id`, `--envelope-output PATH`로 `aas run execute`와
+같다. `--run-id`는 없다. 선언과 그것이 만든 봉투의 내용이 run 식별자를 정하므로 같은 선언은 늘
+같은 run을 가리키고, 이름을 고를 수 있으면 한 계산을 다른 이름으로 접수하게 된다. 같은 선언을
+두 번 실행하면 두 번째는 끝난 run을 다시 열지 못하고 거부된다.
+
+선언 파일은 원하는 대로 써도 된다. 등록·해시·묶음의 기준은 canonical 형식이고 `--sha256`은
+파일 바이트를 확인한다. 응답의 `declaration_sha256`은 파일의 것, `request_hash`는 canonical
+내용의 것이다.
+
+성공 응답에는 `request_schema`·`scope`, `bundle_id`와 무엇이 실제로 묶였는지 적은 `bindings`,
+`envelope.sha256`·`preparation.sha256`, 판단별 `target_weights`, 조합이면 전환이 일어난 날짜를
+담은 `composition`, 회계 응답 전체와 run 기록이 들어 있다. 이 경로가 자기에 대해 말하는 것은
+모두 부정형이다: `certified=false`, `non_executable=true`, `executable_prices=false`,
+`point_in_time_certified=false`, `observed_prices_verified=false`, `source_parity=unknown`.
+
+표본 조합은 묶음 층에서 membership을 묶지 않는다. 묶음 어휘가 membership 하나만 들 수 있어
+두 슬리브 중 하나만 묶으면 절반짜리 묶음이 완전해 보이므로, 조합은 아무것도 묶지 않고 선언의
+내용 해시가 둘을 함께 덮는다. 영수증의 `bindings`가 `membership_bound=false`와 해시만이 덮는
+항목을 그대로 적는다.
+
+`aas run rerun`은 아무것도 쓰지 않는다. `--run-id`만 주면 봉인한 봉투를 같은 회계에 다시 넣어
+저장한 결과 바이트와 맞춰 보고, 선언을 함께 주면 준비까지 다시 해서 run 식별자·봉투·봉인 문서를
+각각 비교한다. 결과 재현과 준비 재현은 서로 다른 주장이므로 `checked`에 실제로 확인한 것만
+올리고 각각의 결과를 따로 적는다. 바뀐 봉투에서 결과만 재현되는 경우가 있으므로 한쪽을 다른
+쪽의 근거로 쓰지 않는다.
+
+기록은 가독성이지 자격이 아니다. 저장한 run이 있어도 `admit_native_input`은 같은 pin을 도메인에서
+거부하고, 같은 문서를 `aas run execute`에 넘기면 거부된다.
+
 ### 저장소 checkout 실습
 
 아래는 설치된 앱의 사용 절차가 아니라 저장소 checkout에서 공개 합성 fixture로 전체 흐름을

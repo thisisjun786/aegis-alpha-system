@@ -1073,6 +1073,52 @@ def _read_sealed(workspace: Workspace, run_id: str, name: str) -> bytes:
         return handle.read()
 
 
+@dataclass(frozen=True, slots=True)
+class RunEvidence:
+    """The three documents a recorded run sealed, read back as their exact bytes."""
+
+    envelope: bytes
+    preparation: bytes
+    backtest: bytes
+
+
+def read_run_evidence(
+    workspace: Workspace, run_id: str, *, budget: ComputeBudget | None = None
+) -> RunEvidence:
+    """Read back the evidence a recorded run sealed, each file against its recorded row.
+
+    A deterministic rerun has to start from exactly the bytes the run sealed, and those
+    bytes exist only under the managed runs directory. The three names are the store's
+    own, so a caller never spells a path or a filename, and every file is charged before
+    it is read and checked against the size and digest recorded for it, so a replaced
+    artifact is refused rather than replayed as though it were the evidence.
+
+    This re-derives nothing and proves nothing on its own. `read_run` is what holds a
+    record to its manifest; this hands a caller the inputs to reproduce it with.
+    """
+    recorded = {
+        str(row[0]): (int(row[1]), str(row[2]))
+        for row in workspace.state.execute(
+            "SELECT relative_path,size_bytes,content_hash FROM artifacts WHERE run_id=?",
+            (run_id,),
+        )
+    }
+    if set(recorded) != set(_ARTIFACTS):
+        raise RunStorageError("run does not record the three artifacts it must seal")
+    _admit(
+        budget,
+        _DOCUMENT_OVERHEAD + sum(size for size, _digest in recorded.values()),
+        "run artifacts exceed materialization budget",
+    )
+    read = {}
+    for name, (size, digest) in recorded.items():
+        raw = _read_sealed(workspace, run_id, name)
+        if (len(raw), hashlib.sha256(raw).hexdigest()) != (size, digest):
+            raise RunStorageError("recorded artifact disagrees with the file on disk")
+        read[name] = raw
+    return RunEvidence(read[_ENVELOPE], read[_PREPARATION], read[_BACKTEST])
+
+
 def _comparable(value: object) -> tuple[int, Decimal, str]:
     """Give every stored field one total order across its own type."""
     if value is None:
