@@ -37,10 +37,14 @@ __all__ = [
     "EXECUTION_MODE",
     "FILL_CONVENTION",
     "OBSERVATION_NAMESPACE",
+    "PREPARED_COMPOSITION_SCHEMA",
     "PREPARED_SCHEMA",
     "REQUIRED_UNSETTLED",
+    "RESEARCH_COMPOSITION_SCHEMA",
     "RESEARCH_RUN_SCHEMA",
+    "SWITCH_RULE",
     "TIE_RULE",
+    "Composition",
     "DeclaredConventions",
     "DeclaredSemantics",
     "ExecutionTerms",
@@ -50,8 +54,10 @@ __all__ = [
     "ResearchCalendar",
     "ResearchRunError",
     "ResearchRunRequest",
+    "SleeveRef",
     "Window",
     "declared_provenance",
+    "parse_research_composition_request",
     "parse_research_run_request",
 ]
 
@@ -64,6 +70,15 @@ CALENDAR_BASIS = "observed-sessions-date-only"
 # What a prepared declared run seals beside its envelope. The declaration is the whole
 # provenance, so the sealed document names its own source rather than a certified one.
 PREPARED_SCHEMA = "aas-prepared-research-run-v1"
+# A sample is not a sleeve. Composing two sleeves is a different declaration with its
+# own identity, so a sleeve run and a sample composition can never be read as each
+# other even when every other input matches.
+RESEARCH_COMPOSITION_SCHEMA = "aas-research-composition-v1"
+PREPARED_COMPOSITION_SCHEMA = "aas-prepared-research-composition-v1"
+# The condition between the two sleeves, named rather than expressed. The installed
+# engine already computes it from the offense sleeve's own declared canary
+# configuration, so a composition selects that rule; it does not carry one.
+SWITCH_RULE = "offense-master-switch-v1"
 # Fixed, not a default. A request that omits or changes it is refused, so the mode a
 # stored run reports is the mode its author actually wrote down.
 EXECUTION_MODE = "research-uncertified"
@@ -120,6 +135,19 @@ _MEMBERSHIP = frozenset({"kind", "id", "version", "hash"})
 _WINDOW = frozenset({"start", "end"})
 # The two numbers the retained panel cannot supply and the engine will not guess.
 _EXECUTION = frozenset({"cost", "initial_cash"})
+_SLEEVE = frozenset(
+    {
+        "strategy_store_id",
+        "strategy_id",
+        "version",
+        "raw_sha256",
+        "contract_sha256",
+        "membership",
+    }
+)
+_SLEEVES = frozenset({"offense", "defense"})
+_COMPOSITION = frozenset({"sample_id", "switch", "sleeves"})
+_COMPOSITION_ROOT = (_ROOT - {"strategy", "membership"}) | {"composition"}
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 # A proportional rate of one consumes the whole fill, and anything at or above it makes
 # the accounting produce a number no account could have reached.
@@ -184,6 +212,33 @@ class MembershipRef:
 
 
 @dataclass(frozen=True, slots=True)
+class SleeveRef:
+    """One registered sleeve: the strategy the store admitted and its membership."""
+
+    strategy_store_id: str
+    strategy_id: str
+    version: str
+    raw_sha256: str
+    contract_sha256: str
+    membership: MembershipRef
+
+
+@dataclass(frozen=True, slots=True)
+class Composition:
+    """Two pinned sleeves and the named rule that chooses between them.
+
+    The rule is a literal, not an expression. Nothing in a declaration can describe a
+    new condition, so composing a sample cannot become a way to run arbitrary logic:
+    the only switch available is the one the installed engine already computes from the
+    offense sleeve's declared canary configuration.
+    """
+
+    sample_id: str
+    switch: str
+    defense: SleeveRef
+
+
+@dataclass(frozen=True, slots=True)
 class Window:
     """An inclusive date window, start before end."""
 
@@ -213,6 +268,9 @@ class PreparationRecord:
     environment: Mapping[str, object]
     preparation_source_sha256: str
     resolved_calendar: Mapping[str, object]
+    # Which sleeve supplied each decision, for a composition. Empty for a sleeve run,
+    # so the sealed record always states what actually ran rather than what could have.
+    defensive_decisions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,11 +356,20 @@ class ResearchRunRequest:
     uncertainty: tuple[str, ...]
     execution_mode: str
     request_sha256: str
+    schema_version: str = RESEARCH_RUN_SCHEMA
+    # Absent for a sleeve run. Present only under the composition schema, which is what
+    # separates a sample-level record from a sleeve-level one.
+    composition: Composition | None = None
 
     @property
     def certified(self) -> bool:
         """Always false. A research run states its own status rather than carrying one."""
         return False
+
+    @property
+    def scope(self) -> str:
+        """What this declaration is a record of, named rather than inferred."""
+        return "sample-composition" if self.composition is not None else "sleeve"
 
 
 def _object(value: object, field: str, allowed: frozenset[str]) -> dict[str, object]:
@@ -530,20 +597,78 @@ def parse_research_run_request(raw: bytes) -> ResearchRunRequest:
     body = _object(decoded, "request", _ROOT)
     if body["schema_version"] != RESEARCH_RUN_SCHEMA:
         raise ResearchRunError("request is not " + RESEARCH_RUN_SCHEMA)
+    strategy = _object(body["strategy"], "strategy", _STRATEGY)
+    offense = SleeveRef(
+        _text(strategy["strategy_store_id"], "strategy_store_id"),
+        _text(strategy["strategy_id"], "strategy_id"),
+        _exact_version(strategy["version"], "strategy version"),
+        _digest(strategy["raw_sha256"], "raw_sha256"),
+        _digest(strategy["contract_sha256"], "contract_sha256"),
+        _membership(body["membership"]),
+    )
+    return _declared(decoded, body, RESEARCH_RUN_SCHEMA, offense, None)
+
+
+def parse_research_composition_request(raw: bytes) -> ResearchRunRequest:
+    """Parse a sample composition: two pinned sleeves and the named switch between them.
+
+    Its own schema rather than a flag on a run, so a sleeve record and a sample record
+    cannot be mistaken for one another and a consumer admitting one does not silently
+    admit the other.
+    """
+    decoded = decode_json(raw)
+    body = _object(decoded, "request", _COMPOSITION_ROOT)
+    if body["schema_version"] != RESEARCH_COMPOSITION_SCHEMA:
+        raise ResearchRunError("request is not " + RESEARCH_COMPOSITION_SCHEMA)
+    block = _object(body["composition"], "composition", _COMPOSITION)
+    if block["switch"] != SWITCH_RULE:
+        # A literal, so a declaration cannot describe a condition of its own.
+        raise ResearchRunError("composition switch must be " + SWITCH_RULE)
+    sleeves = _object(block["sleeves"], "composition sleeves", _SLEEVES)
+    offense, defense = (_sleeve(sleeves[role], role) for role in ("offense", "defense"))
+    if offense.strategy_id == defense.strategy_id:
+        # One sleeve named twice would compose a sample out of a single strategy and
+        # report a switch that could never change the outcome.
+        raise ResearchRunError("a composition needs two distinct sleeves")
+    composition = Composition(
+        _text(block["sample_id"], "composition sample_id"), SWITCH_RULE, defense
+    )
+    return _declared(decoded, body, RESEARCH_COMPOSITION_SCHEMA, offense, composition)
+
+
+def _sleeve(value: object, role: str) -> SleeveRef:
+    row = _object(value, "sleeve " + role, _SLEEVE)
+    return SleeveRef(
+        _text(row["strategy_store_id"], role + " strategy_store_id"),
+        _text(row["strategy_id"], role + " strategy_id"),
+        _exact_version(row["version"], role + " strategy version"),
+        _digest(row["raw_sha256"], role + " raw_sha256"),
+        _digest(row["contract_sha256"], role + " contract_sha256"),
+        _membership(row["membership"]),
+    )
+
+
+def _declared(
+    decoded: object,
+    body: dict[str, object],
+    schema: str,
+    offense: SleeveRef,
+    composition: Composition | None,
+) -> ResearchRunRequest:
+    """Everything both schemas declare. Only the strategy block differs between them."""
     if body["execution_mode"] != EXECUTION_MODE:
         raise ResearchRunError("execution_mode must be " + EXECUTION_MODE)
-    strategy = _object(body["strategy"], "strategy", _STRATEGY)
     conventions = _object(body["conventions"], "conventions", _CONVENTIONS)
     semantics = _semantics(body["semantics"])
     return ResearchRunRequest(
-        strategy_store_id=_text(strategy["strategy_store_id"], "strategy_store_id"),
-        strategy_id=_text(strategy["strategy_id"], "strategy_id"),
-        strategy_version=_exact_version(strategy["version"], "strategy version"),
-        strategy_raw_sha256=_digest(strategy["raw_sha256"], "raw_sha256"),
-        strategy_contract_sha256=_digest(strategy["contract_sha256"], "contract_sha256"),
+        strategy_store_id=offense.strategy_store_id,
+        strategy_id=offense.strategy_id,
+        strategy_version=offense.version,
+        strategy_raw_sha256=offense.raw_sha256,
+        strategy_contract_sha256=offense.contract_sha256,
         observations=_observations(body["observations"]),
         calendar=_calendar(body["calendar"]),
-        membership=_membership(body["membership"]),
+        membership=offense.membership,
         period=_window(body["period"], "period"),
         history=_window(body["history"], "history"),
         execution=_execution(body["execution"]),
@@ -560,6 +685,8 @@ def parse_research_run_request(raw: bytes) -> ResearchRunRequest:
         uncertainty=_uncertainty(body["uncertainty"]),
         execution_mode=EXECUTION_MODE,
         request_sha256=content_sha256(decoded),
+        schema_version=schema,
+        composition=composition,
     )
 
 
@@ -568,6 +695,54 @@ def _knowledge_time(value: object) -> str:
     declared = _text(value, "knowledge_time")
     _knowledge_us(declared)
     return declared
+
+
+def _sealed_composition(
+    request: ResearchRunRequest, prepared: PreparationRecord
+) -> Mapping[str, object] | None:
+    """What the composition was, and which decisions the switch actually moved.
+
+    Counts alone would let a record agree with a different computation, so the dates
+    the defense sleeve supplied are listed. A reader can hold the sealed document
+    against the envelope's own targets and see that they describe the same run.
+    """
+    if request.composition is None:
+        return None
+    defense = request.composition.defense
+    return {
+        "sample_id": request.composition.sample_id,
+        "switch": request.composition.switch,
+        "sleeves": {
+            "offense": {
+                "strategy_store_id": request.strategy_store_id,
+                "strategy_id": request.strategy_id,
+                "version": request.strategy_version,
+                "raw_sha256": request.strategy_raw_sha256,
+                "contract_sha256": request.strategy_contract_sha256,
+                "membership": {
+                    "kind": request.membership.kind,
+                    "id": request.membership.id,
+                    "version": request.membership.version,
+                    "hash": request.membership.hash,
+                },
+            },
+            "defense": {
+                "strategy_store_id": defense.strategy_store_id,
+                "strategy_id": defense.strategy_id,
+                "version": defense.version,
+                "raw_sha256": defense.raw_sha256,
+                "contract_sha256": defense.contract_sha256,
+                "membership": {
+                    "kind": defense.membership.kind,
+                    "id": defense.membership.id,
+                    "version": defense.membership.version,
+                    "hash": defense.membership.hash,
+                },
+            },
+        },
+        "defensive_decisions": list(prepared.defensive_decisions),
+        "defensive_decision_count": len(prepared.defensive_decisions),
+    }
 
 
 def declared_provenance(request: ResearchRunRequest, prepared: PreparationRecord) -> bytes:
@@ -580,8 +755,11 @@ def declared_provenance(request: ResearchRunRequest, prepared: PreparationRecord
     """
     return canonical_json_bytes(
         {
-            "schema": PREPARED_SCHEMA,
-            "declaration_schema": RESEARCH_RUN_SCHEMA,
+            "schema": (
+                PREPARED_COMPOSITION_SCHEMA if request.composition is not None else PREPARED_SCHEMA
+            ),
+            "declaration_schema": request.schema_version,
+            "scope": request.scope,
             "declaration_sha256": request.request_sha256,
             "envelope_sha256": _digest(prepared.envelope_sha256, "envelope_sha256"),
             "execution_mode": request.execution_mode,
@@ -604,6 +782,7 @@ def declared_provenance(request: ResearchRunRequest, prepared: PreparationRecord
                 "raw_sha256": request.strategy_raw_sha256,
                 "contract_sha256": request.strategy_contract_sha256,
             },
+            "composition": _sealed_composition(request, prepared),
             "observations": [
                 {
                     "dataset_id": pin.dataset_id,
