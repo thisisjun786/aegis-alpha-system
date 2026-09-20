@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
@@ -464,8 +464,12 @@ def native_input_document(
     if expected_schema == "aas-price-transform-v1":
         return _price_document(workspace, raw)[0], source
     if expected_schema == "aas-observation-transform-v1":
+        # raw and its decoded body stay live through the rest of this call, so the
+        # upstream admission below must see the remaining allowance, not the whole
+        # lease. The root source above is already charged the same way.
+        charged = replace(budget, reserved_bytes=budget.reserved_bytes + len(raw) * 32)
         document = _observation_document(
-            workspace, raw, hashlib.sha256(raw).hexdigest(), resolved, budget
+            workspace, raw, hashlib.sha256(raw).hexdigest(), resolved, charged
         )[0]
         return document, source
     transform = _parse_transform(raw, hashlib.sha256(raw).hexdigest(), "sessions")

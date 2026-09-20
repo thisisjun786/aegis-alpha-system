@@ -5,7 +5,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sqlite3
 import struct
+from contextlib import closing
+from dataclasses import replace
 from decimal import Decimal, localcontext
 from fractions import Fraction
 from typing import TYPE_CHECKING
@@ -97,6 +100,7 @@ def _observation_spec(
         "role": "close",
         "feature_at_us": 20,
         "panel_rows": 1,
+        "extra_instruments": 0,
         "knowledge": None,
         "dataset": None,
         **(options or {}),
@@ -149,7 +153,17 @@ def _observation_spec(
                 "instrument_id": instrument,
                 "asset_type": settings["asset_type"],
                 "venue": "SYNTHETIC",
-            }
+            },
+            # Declared-but-unused identities only make the transform document larger,
+            # which is what the live-transform charge is measured against.
+            *(
+                {
+                    "instrument_id": "PAD_" + str(n),
+                    "asset_type": settings["asset_type"],
+                    "venue": "SYNTHETIC",
+                }
+                for n in range(int(str(settings["extra_instruments"])))
+            ),
         ],
     )
     document["dataset"] = settings["dataset"] or {
@@ -630,3 +644,77 @@ def test_upstream_panel_is_admitted_before_it_is_hashed(tmp_path: Path) -> None:
             budget=BUDGET,
         )
         assert document.rows
+
+
+def test_db_verify_fails_when_an_observation_contract_is_lost(tmp_path: Path) -> None:
+    # Given a committed observation publication whose SQLite contract rows are later
+    # lost while the DuckDB generation and its catalog entry remain.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        spec = _observation_spec(workspace, tmp_path / "lost.sqlite3")
+        _ = _register_domain(workspace, spec, "observation")
+        assert verify_workspace(workspace, budget=BUDGET)
+        state_path = workspace.paths.state
+    # Losing rows is an external event, so it is simulated on the closed file. The
+    # immutability triggers are restored so the schema still matches its checksum
+    # and only the rows are missing, which is the situation being tested.
+    with closing(sqlite3.connect(state_path)) as raw_state:
+        triggers = [
+            row[0]
+            for row in raw_state.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name IN "
+                "('feature_contracts','feature_inputs') AND sql LIKE '%DELETE%'"
+            )
+        ]
+        for name in ("feature_contracts", "feature_inputs"):
+            _ = raw_state.execute("DROP TRIGGER IF EXISTS immutable_" + name + "_delete")
+        for table in ("feature_inputs", "feature_contracts"):
+            _ = raw_state.execute(
+                "DELETE FROM " + table + " WHERE name=?",  # noqa: S608 -- fixed table names
+                ("OBSERVED/close",),
+            )
+        for statement in triggers:
+            _ = raw_state.execute(statement)
+        raw_state.commit()
+    # When the workspace is verified, Then the orphaned publication fails instead of
+    # an empty contract scan reporting success.
+    with (
+        open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace,
+        pytest.raises(ValueError, match="no registered contract"),
+    ):
+        _ = verify_workspace(workspace, budget=BUDGET)
+
+
+def test_live_transform_is_charged_before_the_upstream_is_admitted(tmp_path: Path) -> None:
+    # Given a transform whose own decoded bytes are significant against the lease,
+    # and an upstream panel that fits only while that charge is ignored.
+    initialize(tmp_path / "home")
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        spec = _observation_spec(
+            workspace,
+            tmp_path / "wide.sqlite3",
+            options={"panel_rows": 700, "extra_instruments": 3000},
+        )
+        _ = _register_domain(workspace, spec, "observation")
+        raw = spec.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        # Ignoring what the transform holds live, the upstream admission passes.
+        document, *_rest = research_inputs._observation_document(  # noqa: SLF001 -- the charge is under test
+            workspace, raw, digest, None, BUDGET
+        )
+        assert document.rows
+        # Charging it, as the entrypoint now does, refuses before the panel is hashed.
+        charged = replace(BUDGET, reserved_bytes=BUDGET.reserved_bytes + len(raw) * 32)
+        with pytest.raises(ComputeResourceError, match="source table"):
+            _ = research_inputs._observation_document(  # noqa: SLF001 -- the charge is under test
+                workspace, raw, digest, None, charged
+            )
+        # And native_input_document applies that charge itself rather than relying
+        # on the caller to have subtracted it.
+        with pytest.raises(ComputeResourceError, match="source table"):
+            _ = research_inputs.native_input_document(
+                workspace,
+                raw,
+                expected_schema="aas-observation-transform-v1",
+                budget=BUDGET,
+            )

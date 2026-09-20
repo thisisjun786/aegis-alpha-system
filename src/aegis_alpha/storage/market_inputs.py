@@ -1108,12 +1108,16 @@ def _retained_bytes(history: History) -> int:
 
 
 def verify_observation_publications(workspace: Workspace, *, budget: ComputeBudget) -> None:
-    """Discover referencing rows from sealed imports, never mutable feature identities.
+    """Discover observation publications from sealed evidence, never from the contract table.
+
+    Scanning the contracts first and returning when there are none lets a lost
+    SQLite contract hide a committed DuckDB generation: integrity checks still pass
+    while the generation can no longer be authenticated. Each committed
+    feature_values publication is therefore classified by its own pinned transform,
+    and an observation publication whose contract is absent fails here.
 
     Each dataset's chain is loaded once, at its committed head, and every
-    contributing generation's delta is selected from that history. Loading per
-    generation would replay every chain prefix, so a panel published as several
-    bounded chunks would make workspace verification quadratic in its own length.
+    contributing generation's delta is selected from that history.
     """
     contracts: set[tuple[str, str]] = {
         (row[0], row[1])
@@ -1122,56 +1126,54 @@ def verify_observation_publications(workspace: Workspace, *, budget: ComputeBudg
             (OBSERVATION_DEFINITION_SCHEMA,),
         )
     }
-    if not contracts:
-        return
     retained: set[tuple[str, str]] = set()
     chains: dict[str, tuple[dict[str, History], int]] = {}
     for catalog in workspace.state.execute(
         "SELECT dataset_id,version,generation_id,chain_hash,manifest_hash "
         "FROM dataset_versions WHERE status='committed' ORDER BY dataset_id, sequence"
     ):
-        pin = GenerationPin(*catalog)
-        marker = market.marker_for(workspace.market, pin.generation_id)
+        # Classify before building a pin. A historical generic publication can carry
+        # the literal catalog version "latest", which GenerationPin refuses, so
+        # constructing one for every committed row would fail on publications this
+        # route has nothing to say about.
+        generation = str(catalog["generation_id"])
+        marker = market.marker_for(workspace.market, generation)
         if marker["domain"] != "feature_values":
             continue
-        referenced = _referenced_observations(workspace, pin, marker, contracts, budget)
-        if not referenced:
+        # A generic import carries no transform pointer, so it cannot be an
+        # observation publication; only a pointed generation is classified.
+        pointer = workspace.state.execute(
+            "SELECT transform_hash FROM dataset_versions WHERE generation_id=?",
+            (generation,),
+        ).fetchone()
+        if pointer is None or pointer[0] is None:
             continue
+        _, transform = _transform(workspace, generation, budget)
+        if transform.get("schema_version") != "aas-observation-transform-v1":
+            continue
+        definition = transform.get("observation")
+        if not isinstance(definition, dict):
+            raise TypeError("observation publication has no usable definition")
+        identity = (
+            str(definition.get("series_id")) + "/" + str(definition.get("observation_role")),
+            str(definition.get("version")),
+        )
+        if identity not in contracts:
+            raise ValueError("observation publication has no registered contract")
+        # Only now, and an observation destination is never the literal "latest".
+        pin = GenerationPin(*catalog)
         chain, live_bytes = _observation_chain(workspace, pin, chains, budget)
-        delta = chain.get(pin.generation_id, ())
+        delta = chain.get(generation, ())
         # The cached chain stays live while each delta is re-derived, so it is
         # charged here exactly as the reader charges the history it returns.
         reserved = replace(budget, reserved_bytes=budget.reserved_bytes + live_bytes)
-        for identity in sorted(referenced):
-            rows = tuple(
-                row for row in delta if (row["contract_id"], row["contract_version"]) == identity
-            )
-            verify_observation_content(workspace, rows, budget=reserved)
-        retained.update(referenced)
+        rows = tuple(
+            row for row in delta if (row["contract_id"], row["contract_version"]) == identity
+        )
+        verify_observation_content(workspace, rows, budget=reserved)
+        retained.add(identity)
     if contracts - retained:
         raise ValueError("observation definition has no retained feature generation")
-
-
-def _referenced_observations(
-    workspace: Workspace,
-    pin: GenerationPin,
-    marker: Row,
-    contracts: set[tuple[str, str]],
-    budget: ComputeBudget,
-) -> set[tuple[str, str]]:
-    """Return which observation contracts a sealed import references, holding nothing.
-
-    The parsed document is a whole generation of rows. It dies with this frame, so
-    it is not alive while the chain is loaded and each delta is re-derived, which
-    would put an uncharged document beside the charged chain on the same lease.
-    """
-    document = parse_import(_raw_payload(workspace, str(marker["request_hash"]), budget))
-    referenced = contracts.intersection(
-        (row["contract_id"], row["contract_version"]) for row in document.rows
-    )
-    if referenced and document.sha256 != pin.manifest_hash:
-        raise ValueError("observation catalog conflicts with publication evidence")
-    return referenced
 
 
 def _observation_chain(
