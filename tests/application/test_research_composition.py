@@ -62,7 +62,9 @@ J = "aas-canonical-json-sha256-v1"
 CANARY = "ASSET_A"
 
 
-def _record(name: str, assets: list[str], canary: list[str]) -> StrategyRecord:
+def _record(
+    name: str, assets: list[str], canary: list[str], signals: Document | None = None
+) -> StrategyRecord:
     return StrategyRecord(
         name=name,
         description="synthetic sleeve",
@@ -87,19 +89,21 @@ def _record(name: str, assets: list[str], canary: list[str]) -> StrategyRecord:
             if canary
             else {"canary_mode": "OR", "assets": [], "enabled": []}
         ),
-        signals_config={},
+        signals_config=signals or {},
         variant_of=None,
         variant_spec=None,
     )
 
 
-def _bundle(name: str, assets: list[str], canary: list[str]) -> tuple[bytes, Document]:
+def _bundle(
+    name: str, assets: list[str], canary: list[str], signals: Document | None = None
+) -> tuple[bytes, Document]:
     """One sleeve's exact bundle bytes and the membership its contract names."""
     rows = (MembershipRow(name, Decimal(1)),)
     digest = membership_hash(rows)
     contract = EngineContract(
         contract_version=ENGINE_CONTRACT_VERSION_V1,
-        pack=(_record(name, assets, canary),),
+        pack=(_record(name, assets, canary, signals),),
         feature_matrix=FeatureMatrixSpec(
             momentum_scores=(),
             moving_average_months=(),
@@ -498,3 +502,45 @@ def test_two_pinned_versions_of_one_strategy_compose(
     )
     assert parsed.composition is not None
     assert parsed.composition.defense.strategy_id == offense["strategy_id"]
+
+
+def test_an_offensive_sleeve_with_regular_signals_is_refused(
+    composed: tuple[Path, Document, Document, Document], tmp_path: Path
+) -> None:
+    """The master switch folds regular signals in, and this composition routes on it.
+
+    A sleeve carrying one would hand decisions to the defensive sleeve for a condition
+    that is not the canary, and the sealed record would name a switch that is not the one
+    that fired. Refused rather than reinterpreted.
+    """
+    home, base, _offense, defense = composed
+    raw, member = _bundle(
+        "syn-offense-signals",
+        ["ASSET_B", "REF_X"],
+        [CANARY],
+        {
+            "drawdown": {
+                "kind": "negative_abs_momentum",
+                "enabled": True,
+                "threshold": 1,
+                "scoring": {"method": "return_rate", "horizon": 2},
+            }
+        },
+    )
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        signalled = _register(workspace, tmp_path, "syn-offense-signals", raw, member)
+        workspace.state.commit()
+        assert workspace.strategies is not None
+        workspace.strategies.commit()
+    _refused(home, _composition(base, signalled, defense), "declares regular signals")
+
+
+def test_sleeve_roles_cannot_be_edited_after_the_bytes_are_sealed(
+    composed: tuple[Path, Document, Document, Document],
+) -> None:
+    """A frozen dataclass does not freeze what its fields hold."""
+    home, base, offense, defense = composed
+    prepared = _prepared_composition(home, _composition(base, offense, defense))
+    assert isinstance(prepared.sleeve_roles, tuple)
+    assert isinstance(prepared.decisions, tuple)
+    assert isinstance(prepared.slots, tuple)

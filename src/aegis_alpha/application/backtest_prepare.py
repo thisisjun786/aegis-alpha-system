@@ -1485,6 +1485,7 @@ class PreparedResearchRun:
         """
         object.__setattr__(self, "slots", tuple(self.slots))
         object.__setattr__(self, "decisions", tuple(self.decisions))
+        object.__setattr__(self, "sleeve_roles", tuple(self.sleeve_roles))
         values = self.inputs
         object.__setattr__(
             self,
@@ -1713,7 +1714,18 @@ def _require_composable(offense: _Sleeve, defense: _Sleeve) -> None:
     A defensive sleeve that declares its own canary would make the switch recursive, and
     this contract names one switch. Two sleeves evaluated on different calendar
     conventions would also be two different runs reported as one, so they have to agree.
+
+    The offensive sleeve may declare no regular signals either. evaluate_signals folds
+    them into the same master switch the composition routes on, so a sleeve carrying one
+    would send decisions to the defensive sleeve for a condition that is not the canary,
+    and the sealed record would name a switch that is not the one that fired.
     """
+    for strategy in offense.bundle.contract.pack:
+        if strategy.signals_config:
+            raise ValueError(
+                "the offensive sleeve declares regular signals; "
+                "this composition switches on the canary alone"
+            )
     # Every pack member, not the first: replay evaluates all of them, so a canary on a
     # later strategy would fire inside the defensive sleeve just the same.
     for strategy in defense.bundle.contract.pack:
