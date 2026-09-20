@@ -509,10 +509,14 @@ def verify_sealed_publication(
     deltas: dict[str, list[Row]] = {}
     for row in history:
         deltas.setdefault(str(row["generation_id"]), []).append(row)
+    # The whole history and its per-generation index stay live while every delta is
+    # matched to its sealed import, and that match reads, decodes and re-normalizes on
+    # the same lease, so what is already held is charged before the first of those reads.
+    held = replace(budget, reserved_bytes=budget.reserved_bytes + _retained_bytes(history))
     for marker in market.generation_chain(workspace.market, generation_id):
         _verify_catalog(workspace, marker)
         delta = tuple(deltas.get(str(marker["generation_id"]), ()))
-        _sealed_publication(workspace, marker, delta, budget)
+        _sealed_publication(workspace, marker, delta, held)
     return history
 
 

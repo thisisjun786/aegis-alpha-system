@@ -18,6 +18,7 @@ import pytest
 from aegis_alpha.application.data_cli import execute_native_data
 from aegis_alpha.application.storage_cli import add_commands
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
+from aegis_alpha.data.descriptor_tree import DescriptorTreeError
 from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.storage import (
     import_document,
@@ -851,18 +852,17 @@ def test_the_sealed_document_is_charged_while_its_publication_is_verified(
         history = market_inputs.load_pinned_observations(workspace, pin, budget=BUDGET).history
         retained = market_inputs._retained_bytes(history)  # noqa: SLF001 -- accounting under test
         identity = ("OBSERVED/close", "v1")
-        # A lease that carries the retained chain and one read of that document, but
-        # cannot also hold the document live while the chain is verified.
-        lease = _lease(32 * sealed + 3 * retained // 2)
-        # Ignoring what the classifier holds live, the publication verifies.
-        assert (
-            market_inputs._verify_observation_publication(  # noqa: SLF001 -- the charge is under test
+        # A lease that admits the retained chain, and cannot also hold the sealed
+        # document live while that chain is authenticated.
+        lease = _lease(32 * sealed + 2 * retained)
+        # Ignoring what the classifier holds live, the chain is admitted and the run
+        # only stops further in, at the bounded read of a sealed delta.
+        with pytest.raises(DescriptorTreeError, match="size cap"):
+            _ = market_inputs._verify_observation_publication(  # noqa: SLF001 -- the charge is under test
                 workspace, pin, {identity}, {}, lease
             )
-            == identity
-        )
-        # Charging it, as the scan now does before it hands the lease down, refuses
-        # inside the lease instead of allocating outside it.
+        # Charging it, as the scan now does before it hands the lease down, moves the
+        # refusal onto the admission itself instead of spending the allowance twice.
         with pytest.raises(ComputeResourceError, match="chain memory estimate"):
             market_inputs.verify_feature_publications(workspace, budget=lease)
         # A lease that can carry both still verifies the whole workspace.
