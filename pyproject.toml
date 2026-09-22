@@ -12,7 +12,7 @@ license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 requires-python = ">=3.12"
 dependencies = [
     "cryptography>=50.0.1,<51",
-    "duckdb==1.6.0.dev365",
+    "duckdb==2.0.0.dev2609121639",
 ]
 
 # Transitional collectors retain their old storage until their owned adapters migrate.
