@@ -60,7 +60,7 @@ DuckDB 안에서 흐르고 Python으로 통째로 올라오지 않는다. 엄격
 | `time_rules` | `available_at_us`, `revision_known_at_us` 각각의 `id@version`과 그 규칙의 인자 |
 | `decimal_rule` | 숫자 열별 `id@version` |
 | `quality_rules` | 적용할 품질 규칙 `id@version` 목록 |
-| `tombstone_policy` | `never` 또는 `absent_in_full_snapshot` |
+| `tombstone_policy` | `never`, 또는 `absent_in_full_snapshot`과 그 원천이 빠짐없이 담는 범위(`scope`: instrument 집합과 날짜 구간) |
 | `identity_snapshot` | instrument·issuer를 해석한 identity snapshot pin. instrument가 없는 도메인(거시·FX·달력)은 null |
 
 `request_hash = sha256(정규 JSON ["aas-promotion-request-v1", 명세 SHA-256, 원천 digest 목록, parent])`다.
@@ -114,7 +114,7 @@ identity snapshot으로 instrument를 해석하지 못한 행은 승격하지 �
 | `supersedes_revision_id` | head 조인에서 온다. ASSERT만 null |
 | `revision_id` | `sha256(정규 JSON ["aas-revision-v1", record_id, op, supersedes_revision_id, source_row_hash])` |
 | `available_at_us`, `revision_known_at_us` | 명세의 시간 규칙이 원천 열에서 계산한다. 규칙이 없으면 null |
-| `ingested_at_us` | 원천 snapshot의 수집 시각. 원천 행에 수집 시각 열이 있으면 그 열 |
+| `ingested_at_us` | 원천 행의 수집 시각 열, 없으면 원천 snapshot의 수집 시각, 그것도 없으면 원천 자료실 commit manifest의 적재 시각 |
 | `source_snapshot_id` | `'sl:' + source_id` |
 | `source_row_hash` | 위 매퍼 규칙 |
 
@@ -131,7 +131,7 @@ op는 원천 행과 head를 도메인 열과 두 시점 열로 비교해 정한�
 | ASSERT·SUPERSEDE, 비교 값 같음 | 있음 | 행 없음(멱등) |
 | ASSERT·SUPERSEDE, 비교 값 다름 | 있음 | SUPERSEDE |
 | TOMBSTONE | 있음 | SUPERSEDE(재등장) |
-| ASSERT·SUPERSEDE | 없음, `absent_in_full_snapshot`이고 원천이 해당 범위 전체 snapshot | TOMBSTONE |
+| ASSERT·SUPERSEDE | 없음, `absent_in_full_snapshot`이고 record가 명세의 `scope` 안 | TOMBSTONE |
 | ASSERT·SUPERSEDE | 없음, 그 밖의 경우 | 행 없음 |
 
 TOMBSTONE의 `source_row_hash`는 `sha256(정규 JSON ["aas-tombstone-v1", source_id, table, digest])`,
@@ -151,6 +151,11 @@ delta는 비어 있다.
 | `local_day_end@1` | 명세의 IANA 시간대에서 그 날짜의 23:59:59.999999를 UTC로 변환. 행에 `time_precision_day` flag | 날짜만 있는 공시·거시 vintage(`realtime_start`) |
 | `exdate_open@1` | pin한 달력에서 ex-date 세션의 `open_at_us`. 세션이 없으면 null | 기업행동 |
 | `unknown_null@1` | 항상 null | 근거가 없는 원천 |
+
+규칙 값이 그 행의 `ingested_at_us`보다 늦으면, 곧 AAS가 그 bytes를 규칙의 상한보다 먼저 받았으면
+시점은 `ingested_at_us`로 내려가고 행에 `time_clamped_to_ingestion` flag가 남는다. 받은 시각에는 이미
+그 값이 공개돼 있었으므로 이 값도 상한이다. 수집 시각은 이 경우에만 시점에 들어가며, 규칙이 null을
+낸 행을 채우지 않는다.
 
 규칙 ID와 버전은 명세에 있으므로 transform hash에 포함된다. 규칙의 계산을 바꾸면 새 버전이 된다.
 같은 generation의 모든 행은 열마다 같은 규칙으로 계산되며, reader는 generation의 명세에서
@@ -203,6 +208,7 @@ quality_flags(generation_id, record_id, revision_id, rule_id, rule_version, flag
 | `provider_reported_partial` | 공급자가 경고와 함께 보낸 부분 응답 파티션의 행 |
 | `volume_precision_limited` | 원천 거래량의 유효숫자가 잘려 있음 |
 | `time_precision_day` | 시점이 `local_day_end@1`의 날짜 단위 상한임 |
+| `time_clamped_to_ingestion` | 규칙 상한이 수집 시각보다 늦어 수집 시각으로 내려감 |
 | `cross_provider_mismatch` | 같은 instrument·세션의 다른 공급자 값과 명세의 허용오차를 넘게 다름 |
 
 dataset version 단위의 판정(행 수 대조, coverage 종료, 교차 대조율)은 기존 state
@@ -370,3 +376,5 @@ state v2:
 | DV-33 | 참조 중이거나 동치가 아니거나 백업이 없는 원천은 은퇴하지 않는다 | `tests/storage/test_source_retirement.py::test_retirement_requires_proof` | 예정 |
 | DV-34 | 은퇴는 `raw/` 원본을 지우지 않는다 | `tests/storage/test_source_retirement.py::test_retirement_keeps_raw_bytes` | 예정 |
 | DV-35 | 대응표의 구현 행은 존재하는 테스트를, 예정 행은 아직 없는 테스트를 가리킨다 | `tests/tools/test_data_vertical_contract.py::test_contract_rows_match_tests` | 구현 |
+| DV-36 | 수집 시각보다 늦은 규칙 시점은 수집 시각으로 내려가 flag를 달고, null은 채우지 않는다 | `tests/storage/test_time_rules.py::test_rule_after_ingestion_is_clamped_and_flagged` | 예정 |
+| DV-37 | 명세 `scope` 밖의 record는 원천에서 빠져도 TOMBSTONE되지 않는다 | `tests/storage/test_promotion_engine.py::test_tombstone_stays_within_declared_scope` | 예정 |
