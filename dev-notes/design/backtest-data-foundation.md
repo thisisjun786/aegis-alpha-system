@@ -205,15 +205,15 @@ source hash와 schema version을 결합한다. 같은 행 중복, 반올림, row
 
 경제 유효 시각, 공개 시각, 수정 인지 시각, 수집 시각을 별도 열로 유지한다.
 `available_at_us` 또는 `revision_known_at_us`가 불명확하면 inspection만 허용하며 PIT 입력에서
-배제한다. 최초 ASSERT의 revision 시각도 source 공개 근거에서 결정한다. 수집 시각으로 채우지 않는다.
+배제한다. 최초 ASSERT의 revision 시각도 source 공개 근거에서 결정한다. 수집 시각으로 빈 시점을 채우지 않는다.
 오늘 수집한 과거 공시의 근거가 확인되면 과거 knowledge로 사용할 수 있고, 오늘 발표된 수정본은
 발표 이전의 판단에 사용할 수 없다. strict observed 시스템 재생은 추가로 ingested cutoff를 고정한다.
 
 날짜 단위로만 공개 시점을 알 수 있는 원천은 버전 있는 [시간 규칙](data-vertical.md#시간-규칙과-소비자-grant)이
 보수적 상한으로 시점을 정한다. 규칙에서 나온 시점은 소비자 binding의 grant가 허용한 규칙일 때만
 strict 경로에 쓰이며, grant 밖의 규칙 시점은 알 수 없는 시점과 같다. run 영수증은 grant를 기록한다.
-record 날짜에서 계산하는 규칙의 정정·삭제 revision은 그것을 담은 원천의 수집 시각보다 이르게 알려지지
-않는다. 수집 시각은 이 하한으로만 쓰이며 ASSERT 시점이나 null을 채우지 않는다.
+받은 bytes는 받은 시각에 이미 공개돼 있었으므로 규칙 값은 수집 시각을 넘지 않게 내려간다. record
+날짜에서 계산하는 규칙의 정정·삭제 revision은 그것을 담은 원천의 수집 시각에 알려진 것으로 본다.
 
 각 판단 시각 T에서 조회 순서는 다음과 같다.
 

@@ -150,15 +150,21 @@ TOMBSTONE의 `source_row_hash`는 `sha256(정규 JSON ["aas-tombstone-v1", sourc
 
 날짜 단위로만 공개 시점을 알 수 있는 원천은 버전 있는 시간 규칙으로 `available_at_us`와
 `revision_known_at_us`를 정한다. 규칙 값은 그 규칙의 전제 아래에서 실제 공개 시각보다 이르지
-않은 **보수적 상한**이다. ASSERT의 시점은 규칙에서만 나오며 수집 시각으로 채우거나 낮추지 않는다.
+않은 **보수적 상한**이다. 수집 시각으로 빈 시점을 채우지 않는다.
 
-| 규칙 | 계산 | 사용처 |
-| --- | --- | --- |
-| `source_column@1` | 원천의 시각 열을 UTC microsecond로 그대로 사용(SEC `acceptanceDateTime` 등) | 시각을 직접 싣는 원천 |
-| `session_close_plus_lag@1` | pin한 `calendar_sessions` generation의 해당 세션 `close_at_us` + 명세의 `lag_us`(0 이상). 세션이 없거나 종료 시각이 알려지지 않았으면 null | 일봉 가격 |
-| `local_day_end@1` | 명세의 IANA 시간대에서 그 날짜의 23:59:59.999999를 UTC로 변환. 행에 `time_precision_day` flag | 날짜만 있는 공시·거시 vintage(`realtime_start`) |
-| `exdate_open@1` | pin한 달력에서 ex-date 세션의 `open_at_us`. 세션이 없으면 null | 기업행동 |
-| `unknown_null@1` | 항상 null | 근거가 없는 원천 |
+| 규칙 | 계산 | 물리 기준 | 사용처 |
+| --- | --- | --- | --- |
+| `source_column@1` | 원천의 시각 열을 UTC microsecond로 그대로 사용(SEC `acceptanceDateTime` 등) | 계산 값 | 시각을 직접 싣는 원천 |
+| `session_close_plus_lag@1` | pin한 `calendar_sessions` generation의 해당 세션 `close_at_us` + 명세의 `lag_us`(0 이상). 세션이 없거나 종료 시각이 알려지지 않았으면 null | 세션 `close_at_us` | 일봉 가격 |
+| `local_day_end@1` | 명세의 IANA 시간대에서 그 날짜의 23:59:59.999999를 UTC로 변환. 행에 `time_precision_day` flag | 그 날짜의 현지 0시 | 날짜만 있는 공시·거시 vintage(`realtime_start`) |
+| `exdate_open@1` | pin한 달력에서 ex-date 세션의 `open_at_us`. 세션이 없으면 null | 계산 값 | 기업행동 |
+| `unknown_null@1` | 항상 null | 없음 | 근거가 없는 원천 |
+
+기록되는 시점은 그 행을 받은 시각보다 늦을 수 없다. 받은 bytes는 받은 시각에 이미 공개돼 있었기 때문이다.
+그래서 행의 `ingested_at_us`가 규칙의 물리 기준 이상이고 규칙 값보다 이르면 시점은 `ingested_at_us`로
+내려가고 행에 `time_clamped_to_ingestion` flag가 남는다. 이 값도 상한이다. `ingested_at_us`가 물리
+기준보다 이르면, 예를 들어 세션 종료 전에 받은 일봉이면, 그 행은 승격하지 않고 보류 행으로 보고한다.
+수집 시각은 시점을 낮추는 상한으로만 쓰이며 null을 채우지 않는다.
 
 명세는 시점 열마다 규칙 입력의 근거(`basis`)를 선언한다. `revision`은 입력 열이 그 행 자체의 공개
 시각이나 공개일을 담는 경우다(SEC `acceptanceDateTime`, ALFRED `realtime_start`, DART 접수일).
@@ -180,20 +186,24 @@ inspection과 연구 모드는 grant 없이도 행을 읽는다. run 영수증�
 
 ASSERT가 아닌 행은 정정이나 삭제를 담은 원천보다 먼저 알려질 수 없다. 원천의 **증거 시각**은 행이
 있으면 그 행의 `ingested_at_us`이고, 행이 없는 TOMBSTONE에서는 원천 snapshot 수집 시각 중 가장 늦은
-값(없으면 commit manifest의 적재 시각)이다. 두 시점 열은 열마다 다음과 같다.
+값(없으면 commit manifest의 적재 시각)이다. TOMBSTONE의 `ingested_at_us`도 이 증거 시각이다.
+두 시점 열은 열마다 다음과 같다.
 
 | op | 시점 |
 | --- | --- |
-| ASSERT | 규칙 값 |
-| SUPERSEDE, 근거 `revision` | max(규칙 값, 직전 revision의 같은 열) |
-| SUPERSEDE, 근거 `record` | max(규칙 값, 원천 증거 시각, 직전 revision의 같은 열) |
-| TOMBSTONE | max(원천 증거 시각, 직전 revision의 같은 열). record 날짜의 규칙은 쓰지 않는다 |
+| ASSERT | 규칙 값(위 상한 적용) |
+| SUPERSEDE, 근거 `revision` | 규칙 값(위 상한 적용) |
+| SUPERSEDE, 근거 `record` | 원천 증거 시각. 규칙 값이 null이면 null |
+| TOMBSTONE | 원천 증거 시각. record 날짜의 규칙은 쓰지 않는다 |
 
-ASSERT·SUPERSEDE에서 규칙 값이 null이면 그 행의 시점도 null이다. 직전 revision의 값이 null이면
-그 항은 max에서 빠진다. 수집 시각은 null을 채우지 않고, 규칙 값을 낮추지 않으며,
-`record` 근거의 정정과 삭제에서 하한으로만 쓰인다. 직전 revision과의 max 때문에 원천을 수집 순서와
-다르게 승격해도 시점이 거꾸로 가지 않는다. `record` 근거의 정정은 그 정정 bytes를 받은 시각 이후에,
-`revision` 근거의 정정은 원천이 기록한 그 정정의 공개 시각 이후에 strict 조회에 보인다.
+`record` 근거 규칙은 record의 날짜에서 계산하므로 정정이 언제 공개됐는지 알려 주지 않는다. 그 정정은
+AAS가 정정 bytes를 받은 시각부터 알려진 것으로 본다. 실제 공개는 그보다 이를 수 있으므로 이 값도
+보수적 상한이며, 행을 받은 시각을 넘지 않는다. `revision` 근거의 정정은 원천이 기록한 그 정정의
+공개 시각을 쓴다.
+
+새 revision의 시점이 직전 revision의 같은 열보다 이르면 그 원천 행은 head보다 오래된 관측이다.
+승격은 그 행으로 head를 대체하지 않고 stale 행으로 보고한다. 그래서 원천을 수집 순서와 다르게
+승격해도 시점이 거꾸로 가지 않는다.
 
 ## 숫자 규칙
 
@@ -234,6 +244,7 @@ quality_flags(generation_id, record_id, revision_id, rule_id, rule_version, flag
 | `provider_float_reconstructed` | 원화 가격이 정수가 아니어서 `krw_tick@1`으로 반올림함 |
 | `decimal_rounding_tie` | 반올림 나머지가 정확히 0.5였음 |
 | `provider_float_storage` | 원천이 float 저장값이어서 `float_shortest@1`을 적용함 |
+| `time_clamped_to_ingestion` | 규칙 상한이 수집 시각보다 늦어 수집 시각으로 내려감 |
 | `provider_reported_partial` | 공급자가 경고와 함께 보낸 부분 응답 파티션의 행 |
 | `volume_precision_limited` | 원천 거래량의 유효숫자가 잘려 있음 |
 | `time_precision_day` | 시점이 `local_day_end@1`의 날짜 단위 상한임 |
@@ -387,7 +398,7 @@ state v2:
 | DV-15 | `revision_id`는 직전 revision을 포함해 A→B→A에서도 유일하다 | `tests/storage/test_promotion_engine.py::test_revision_id_is_unique_across_value_return` | 예정 |
 | DV-16 | 승격 시각은 어떤 열에도 들어가지 않는다 | `tests/storage/test_promotion_engine.py::test_promotion_is_independent_of_wall_clock` | 예정 |
 | DV-17 | 승격 도중 중단은 게시 단계만 재개하고 공급자를 호출하지 않는다 | `tests/storage/test_promotion_engine.py::test_interrupted_promotion_resumes_publication_only` | 예정 |
-| DV-18 | ASSERT 시점은 규칙에서만 나오며 수집 시각으로 채우거나 낮추지 않고 근거가 없으면 null이다 | `tests/storage/test_time_rules.py::test_assert_times_never_come_from_ingestion` | 예정 |
+| DV-18 | 시간 규칙은 수집 시각으로 null을 채우지 않고 근거가 없으면 null이다 | `tests/storage/test_time_rules.py::test_rules_never_fill_null_from_ingestion` | 예정 |
 | DV-19 | `session_close_plus_lag@1`은 pin한 세션 종료 + lag이며 세션이 없으면 null이다 | `tests/storage/test_time_rules.py::test_session_close_plus_lag` | 예정 |
 | DV-20 | `local_day_end@1`은 현지 날짜 끝이며 `time_precision_day` flag를 단다 | `tests/storage/test_time_rules.py::test_local_day_end_flags_day_precision` | 예정 |
 | DV-21 | grant에 없는 규칙의 시점은 strict에서 제외되고 영수증에 grant가 남는다 | `tests/storage/test_read_heads.py::test_ungranted_rule_rows_excluded_from_strict` | 예정 |
@@ -405,11 +416,11 @@ state v2:
 | DV-33 | 참조 중이거나 동치가 아니거나 백업이 없는 원천은 은퇴하지 않는다 | `tests/storage/test_source_retirement.py::test_retirement_requires_proof` | 예정 |
 | DV-34 | 은퇴는 `raw/` 원본을 지우지 않는다 | `tests/storage/test_source_retirement.py::test_retirement_keeps_raw_bytes` | 예정 |
 | DV-35 | 대응표의 구현 행은 존재하는 테스트를, 예정 행은 아직 없는 테스트를 가리킨다 | `tests/tools/test_data_vertical_contract.py::test_contract_rows_match_tests` | 구현 |
-| DV-36 | `record` 근거 규칙의 SUPERSEDE는 정정을 담은 원천의 증거 시각보다 먼저 알려지지 않는다 | `tests/storage/test_promotion_engine.py::test_superseding_revision_is_not_known_before_its_source` | 예정 |
+| DV-36 | `record` 근거 규칙의 SUPERSEDE 시점은 정정을 담은 원천의 증거 시각이다 | `tests/storage/test_promotion_engine.py::test_superseding_revision_is_not_known_before_its_source` | 예정 |
 | DV-37 | 명세 `scope` 밖의 record는 원천에서 빠져도 TOMBSTONE되지 않는다 | `tests/storage/test_promotion_engine.py::test_tombstone_stays_within_declared_scope` | 예정 |
 | DV-38 | TOMBSTONE 시점은 부재를 증명한 snapshot의 증거 시각이며 record 날짜 규칙을 쓰지 않는다 | `tests/storage/test_promotion_engine.py::test_tombstone_time_comes_from_absence_snapshot` | 예정 |
 | DV-39 | 같은 값을 다른 수집 시각에 다시 수집해도 revision이 생기지 않는다 | `tests/storage/test_promotion_engine.py::test_recollection_at_new_ingestion_time_is_not_a_revision` | 예정 |
-| DV-40 | 수집 순서와 다르게 승격한 원천도 revision 시점을 거꾸로 만들지 않는다 | `tests/storage/test_promotion_engine.py::test_out_of_order_sources_keep_revision_times_monotone` | 예정 |
+| DV-40 | head보다 이른 시점의 원천 행은 head를 대체하지 않고 stale로 보고된다 | `tests/storage/test_promotion_engine.py::test_older_source_row_does_not_supersede_newer_head` | 예정 |
 | DV-41 | 참조가 없고 동치이며 백업된 원천은 자기 source-link 행이 있어도 은퇴하고 그 행은 남는다 | `tests/storage/test_source_retirement.py::test_unreferenced_equivalent_backed_up_source_is_retired` | 예정 |
 | DV-42 | `source_id` 형식은 고정 입력과 기대 값으로 고정돼 있다 | `tests/storage/test_source_identity.py::test_source_id_format_is_frozen` | 예정 |
 | DV-43 | `revision_id` 형식은 고정 입력과 기대 값으로 고정돼 있다 | `tests/storage/test_promotion_formats.py::test_revision_id_format_is_frozen` | 예정 |
@@ -424,3 +435,4 @@ state v2:
 | DV-52 | `cross_provider_mismatch`는 명세의 허용오차를 넘을 때만 달린다 | `tests/storage/test_promotion_engine.py::test_cross_provider_mismatch_uses_spec_tolerance` | 예정 |
 | DV-53 | 같은 parent에 다른 요청이 먼저 게시되면 부모 CAS가 실패한다 | `tests/storage/test_promotion_engine.py::test_competing_request_fails_parent_cas` | 예정 |
 | DV-54 | migration-incomplete 설치본은 정상으로 열리지 않는다 | `tests/storage/test_migration.py::test_incomplete_migration_refuses_normal_open` | 예정 |
+| DV-55 | 수집 시각보다 늦은 규칙 시점은 물리 기준 이후에 받은 행에서만 수집 시각으로 내려가 flag를 달고, 물리 기준 전에 받은 행은 보류로 보고된다 | `tests/storage/test_time_rules.py::test_rule_after_ingestion_is_clamped_above_physical_base` | 예정 |

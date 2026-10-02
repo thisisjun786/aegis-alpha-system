@@ -23,10 +23,13 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   `source_row_hash`; op comes from diffing the parent head on domain columns only,
   so re-collecting the same value at another time is no revision. No column takes
   the promotion wall clock, so re-promotion is an empty delta. Time rules are
-  conservative upper bounds. An ASSERT time never comes from ingestion; a
-  correction or deletion is never known before the source that carries it, so for
-  record-date rules its times are at least that source's ingestion time and a
-  TOMBSTONE's come from the absence snapshot. Ingestion never fills a null; strict
+  conservative upper bounds and ingestion never fills a null. A rule time later
+  than the row's ingestion is capped at ingestion and flagged
+  `time_clamped_to_ingestion`; a row ingested before the rule's physical base
+  (e.g. the session close) is held, not promoted. A correction or deletion is
+  never known before the source that carries it: a SUPERSEDE under a record-date
+  rule and every TOMBSTONE take that source's ingestion time, and a source row
+  older than the head is reported stale instead of superseding it. Strict
   reads use a rule's times only when the binding grants that `id@version`, and the
   run records the grants. Decimal rules that change a source value (`krw_tick@1`
   and others) leave a `quality_flags` row; flags never alter values. One dataset
