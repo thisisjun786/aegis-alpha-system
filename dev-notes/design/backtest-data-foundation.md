@@ -5,6 +5,8 @@
 이 문서에는 구현된 로컬 경로와 후속 수집·전체 백테스트 계약이 함께 있다. 아래 물리 테이블은
 소유 schema 파일이 정본이며, 테이블이 존재해도 호출자와 실행 흐름이 연결됐다는 뜻은 아니다.
 제품 책임은 [0015](../decisions/0015-research-engine-product-boundary.md)를 따른다.
+원천 자료실 자료를 typed generation으로 승격하는 명세·결정적 열·시간 규칙·숫자 규칙·품질 flag·
+공급자별 dataset·스키마 v2·원천 은퇴는 [데이터 수직 계약](data-vertical.md)이 소유한다.
 [전환 표](#전환-계획과-기존-코드)에서 항목별 현재 상태와 남은 검증을 구분한다. 설치는 [0013](../decisions/0013-first-install-workspace.md),
 현재 실행 상태는 [architecture](../architecture.md), 실제 명령은 [operations](../operations.md)가 소유한다.
 
@@ -109,6 +111,7 @@ PostgreSQL의 exclusion constraint나 trigger를 DuckDB에도 있다고 가정�
 | `run_metrics` | PK(run,metric,definition_version), value/state, benchmark_ref/risk_free_ref/cost_ref, comparison_condition_hash | 원래 전략 성과와 재실행 성과를 혼합하지 않음. 비교 조건 불일치 표시 |
 | `artifacts` | PK(run,relative_path), media_type, size, hash | 완료 전에 fsync·no-clobber 확정. 경로 이탈·symlink 교체 거부 |
 | `storage_operations` | operation PK, kind, request_hash, target_id, expected_parent, payload_hash, phase, failure_reason | DB 간 게시·결과 확정·전략 등록의 durable intent. 요청 해시 없는 중복 재실행 거부 |
+| `source_retirements` (v2) | source_id, digest, rows, reason, equivalent_to_source_id, equivalence_spec/digest, backup_id, operation_id, retired_at_us | 참조 없음·동치 digest·다른 장치 백업을 통과한 원천 은퇴의 불변 기록. [은퇴 계약](data-vertical.md#원천-은퇴와-동치-증명) |
 
 자주 쓰는 보조 인덱스는 provider key와 시간 구간, dataset/version/상태, job 상태·예약 시각,
 run 상태·strategy ID·생성 시각, 모든 FK child 열이다. payload JSON은 버전 있는 설정·근거의
@@ -161,12 +164,15 @@ revision을 가리키며 그 revision이 고정된 부모 generation chain에 �
 | 테이블 | 도메인 열·자연키 | 추가 계약 |
 | --- | --- | --- |
 | `market_generations` | generation PK, dataset/version, parent, sequence, schema, delta_hash/chain_hash, row_count, operation_id UNIQUE, request_hash | 단일 DuckDB transaction의 완료 영수증. state의 committed 카탈로그와 일치해야 조회 허용 |
-| `prices` | instrument, session_date, interval/bar_end, basis, currency, OHLCV, price_role | PIT 정본은 unadjusted. 공급자 snapshot 조정값은 reference로 분리. 거래량 0과 결측 구분 |
+| `prices` | instrument, session_date, interval/bar_end, basis, currency, OHLCV, price_role, fields(v2: `ohlcv`·`close`) | PIT 정본은 unadjusted. 공급자 snapshot 조정값은 reference로 분리. 거래량 0과 결측 구분. close만 있는 시리즈는 reference |
 | `corporate_actions` | instrument, action_id/type, ex/record/pay/effective dates, amount/ratio/currency | 배당·분할·합병·상폐 대금 구분. 미래 action을 과거 조정에 쓰지 않음 |
 | `instrument_status` | instrument, status_event_id, effective_from/to, status, reason | 종목별 거래정지·재개·상장·상폐 이력. 거래소 calendar와 함께 체결 가능성을 판정 |
 | `fundamentals` | 자연키: issuer/instrument, concept, period_start/end, fiscal_period, unit, dimensions_hash; revision 속성: form/accession/accepted_at, value/state | accession 변경은 새 자연키가 아님. 재공시는 같은 항목의 SUPERSEDE로 연결 |
 | `macro_observations` | 자연키: series, observation_period, unit; revision 속성: source_vintage_start/end, value/state | 원본 vintage 구간은 수집 당시 응답값 그대로 보존. 지식 종료는 revision chain에서 도출 |
 | `estimates` | instrument, metric, target_period, as_of, statistic, value/state, analyst_count nullable | 전망 대상 기간과 발표 시점을 분리. 출처·자격 미확인 추정치는 실행 입력 차단 |
+| `filings` (v2) | issuer, filing_id(accession·접수번호), form, filed_date, accepted_at nullable, period_end nullable | 재무 시점의 근거. accession 조인으로 `fundamentals`의 공개 시각을 정함 |
+| `classifications` (v2) | subject/subject_kind, scheme, code, label, effective_from/to | 분류 snapshot은 snapshot 시각부터 알려짐. 과거로 소급하지 않음 |
+| `quality_flags` (v2) | generation, record, revision, rule/version, flag, detail | revision 단위 품질 기록. 값을 바꾸지 않으며 generation manifest가 해시로 고정 |
 | `fx_rates`, `calendar_sessions` | base/quote·fixing_time·rate/state; calendar/venue·session_date·open/close/status | 환산 경로·휴장·조기 종료·time zone 버전 고정 |
 | `feature_values` | contract id/version/hash, input_bundle_hash, instrument, feature_time, value/state | 입력 핀과 계산 정의를 고정. warmup 미달을 0으로 채우지 않음 |
 | `result_commits` | run PK, operation_id UNIQUE, request_hash, manifest_hash, table_hashes/counts | 결과 전체의 DuckDB commit marker. state 완료와 맞아야 성공 결과로 노출 |
@@ -184,7 +190,8 @@ macro 원본의 vintage 종료값은 in-place로 닫지 않고 다음 revision�
 generation별 증분 행을 저장하고 카탈로그가 부모 chain과 내용 해시를 고정한다. 데이터 전체를
 새 버전마다 복사하지 않는다. 새 generation은 한 부모만 가지며 기존 chain을 바꾸지 않는다.
 조회는 bundle에 고정된 generation까지의 chain만 사용한다. 장기 실행의 pin은 수집으로 새
-head가 생겨도 바뀌지 않는다. 자동 compaction·VACUUM·이력 삭제는 첫 버전에 넣지 않는다.
+head가 생겨도 바뀌지 않는다. 자동 compaction·VACUUM·이력 삭제는 없다. 대체된 원천의 은퇴와
+새 루트로의 compact는 명시적 명령과 [동치 증명](data-vertical.md#원천-은퇴와-동치-증명)을 요구한다.
 
 DuckDB 물리 파일 hash는 논리 dataset hash가 아니다. 한 테이블이 추가돼도 전체 파일 bytes가
 달라지므로 dataset 식별에는 `aas-rowset-v1`을 쓴다. 정렬된 자연키·revision 순서로 schema와
@@ -198,9 +205,15 @@ source hash와 schema version을 결합한다. 같은 행 중복, 반올림, row
 
 경제 유효 시각, 공개 시각, 수정 인지 시각, 수집 시각을 별도 열로 유지한다.
 `available_at_us` 또는 `revision_known_at_us`가 불명확하면 inspection만 허용하며 PIT 입력에서
-배제한다. 최초 ASSERT의 revision 시각도 source 공개 근거에서 결정한다. 수집 시각으로 채우지 않는다.
+배제한다. 최초 ASSERT의 revision 시각도 source 공개 근거에서 결정한다. 수집 시각으로 빈 시점을 채우지 않는다.
 오늘 수집한 과거 공시의 근거가 확인되면 과거 knowledge로 사용할 수 있고, 오늘 발표된 수정본은
 발표 이전의 판단에 사용할 수 없다. strict observed 시스템 재생은 추가로 ingested cutoff를 고정한다.
+
+날짜 단위로만 공개 시점을 알 수 있는 원천은 버전 있는 [시간 규칙](data-vertical.md#시간-규칙과-소비자-grant)이
+보수적 상한으로 시점을 정한다. 규칙에서 나온 시점은 소비자 binding의 grant가 허용한 규칙일 때만
+strict 경로에 쓰이며, grant 밖의 규칙 시점은 알 수 없는 시점과 같다. run 영수증은 grant를 기록한다.
+받은 bytes는 받은 시각에 이미 공개돼 있었으므로 규칙 값은 수집 시각을 넘지 않게 내려간다. record
+날짜에서 계산하는 규칙의 정정·삭제 revision은 그것을 담은 원천의 수집 시각에 알려진 것으로 본다.
 
 각 판단 시각 T에서 조회 순서는 다음과 같다.
 
@@ -318,7 +331,8 @@ DB 내부 transaction만으로 세 파일의 snapshot이 일치한다고 주장�
 현재 루트에 덮어쓰지 않는다. 다른 위치로 이동해도 ID·논리 hash·입력 pin은 유지한다.
 복원된 DB의 논리 store_id는 유지하되 새 배포 인스턴스 식별자는 별도 발급해 경로·잠금을 재생성한다.
 
-schema upgrade는 미구현이다. 후속 구현은 설치 잠금+백업 이후 대상 schema version과 script checksum을 기록하며 수행한다.
+core schema 업그레이드는 [스키마 v2 계약](data-vertical.md#스키마-v2)을 따른다. 설치 잠금과 검증된 백업 뒤에
+대상 schema version과 checksum을 기록하며, 이전 버전의 checksum 행도 남긴다. 현재 설치본은 v1이다.
 SQLite와 DuckDB 중 하나만 성공하면 설치는 migration-incomplete로 남고 호환되지 않는 앱은
 기동하지 않는다. 재개 또는 새 루트 백업 복원만 허용한다. 이미지 rollback이 DB downgrade를
 자동 해결하지 않는다. DB 파일 형식과 앱 schema의 호환성 검사는 각각 수행한다.
@@ -330,9 +344,9 @@ SQLite와 DuckDB 중 하나만 성공하면 설치는 migration-incomplete로 �
 
 | 단계 | 현재 상태와 소유 코드 | 남은 작업과 완료 기준 |
 | --- | --- | --- |
-| L1 저장소 기반 | 로컬 경로 구현: `storage/paths.py`, `workspace.py`, `locks.py`, `sqlite.py`, 세 schema 파일. `tests/storage/test_workspace.py`에 초기화·잠금·정체성 거부 사례 | 현재 초기화·검증 경로 유지. 자동 schema 업그레이드와 서비스 소유권 인계는 미구현이며 별도 실패·복구 계약 검증 필요 |
+| L1 저장소 기반 | 로컬 경로 구현: `storage/paths.py`, `workspace.py`, `locks.py`, `sqlite.py`, 세 schema 파일. `tests/storage/test_workspace.py`에 초기화·잠금·정체성 거부 사례 | 현재 초기화·검증 경로 유지. 명시적 v2 업그레이드와 서비스 소유권 인계는 미구현이며 별도 실패·복구 계약 검증 필요 |
 | L2 전략·상태 | bundle 등록·로드와 영수증 구현: `strategies.py`, `strategy_import.py`, `state.py`. CLI는 등록·목록 제공; lineage·원래 성과용 schema 존재 | 원래 성과·비교 조건의 전체 입력 경로, 실행 입력 bundle·run 소비자 연결 필요. schema만으로 DB 재실행 완료를 주장하지 않음 |
-| L3 시장·publication | typed JSON import, generation·revision 조회, 중단 게시 재개 구현: `import_document.py`, `market.py`, `publication.py`; `tests/storage/test_market.py`, `test_publication.py`에 합성 사례 | 기존 `data/catalog_access.py`·`pinned_prices.py`, identity/metadata 소비자와 수집기 전환 필요. 도메인별 품질·사용 자격과 전체 입력 고정 검증은 별도 |
+| L3 시장·publication | typed JSON import, generation·revision 조회, 중단 게시 재개 구현: `import_document.py`, `market.py`, `publication.py`; `tests/storage/test_market.py`, `test_publication.py`에 합성 사례 | 원천 자료실에서의 승격·대량 게시·`read_heads`·identity 등록·스키마 v2는 [데이터 수직 대응표](data-vertical.md#계약과-테스트-대응표)의 `예정` 행이 남은 작업이다. 기존 `data/catalog_access.py`·`pinned_prices.py`, identity/metadata 소비자와 수집기 전환 필요 |
 | L4 수집·실행 | `collection/`, `data/`의 공급자 도구와 `application/daily_collection.py`는 전환 전 경로. 저장 전략→고정 입력→계산→봉투는 `application/backtest_prepare.py`·`aas prepare`가 SELECT-only로 연결(`tests/application/test_backtest_prepare.py`, `test_prepare_cli.py`에 합성 사례); 봉투 회계는 기존 `aas backtest`. `storage/run_schema.py`의 run 추가 스키마와 `backtest_requests.py`의 정규 요청 저장 API를 `application/run_backtest.py`·`aas run`이 소비해 요청 등록·`open_run`·잠금 없는 계산·`commit_run`·run ID 조회를 잇는다(`tests/application/test_run_backtest.py`에 합성 사례). 명시적 `aas db run-install` 필요 | 수집기 내장 DB 이식, 예산·watermark 결합, 결과 복원 연결 필요. 준비·실행 출력은 `certified=false`이며 불확실 호출·부분 결과·재시작 시나리오를 검증해야 완료 |
 | L5 설치·백업 | native CLI와 선택적 단일 이미지, `storage/backup.py`의 일관 백업·새 루트 복원 구현. `tests/storage/test_backup.py`에 합성 복원·손상 거부 사례 | 0013의 상시 앱·소켓·예약 실행, 자동 업그레이드, artifact 게시·실제 자료 이전은 미완료. 구현·게시·운영 검증을 각각 기록 |
 | L6 구경로 제거 | PostgreSQL adapter·Alembic chain·Parquet reader와 `legacy` 추가 의존성 유지 | 앞 단계에서 모든 호출자와 실패 계약을 대체한 뒤 미사용 코드·의존성·관련 테스트·CI 선택을 함께 정리. 현재 제거 완료로 표시하지 않음 |
@@ -359,6 +373,7 @@ L1~L6를 모두 미착수로 취급하거나 모두 완료로 묶지 않는다. 
 | 전략·결과 | 원본 삭제 후 DB 재실행, 별도 파일 교체·version 충돌, 원래 성과 보존, 무위험금리 누락·불일치 비교 차단, result_commits 후 crash는 재계산 없이 SUCCESS 복구 |
 | 병렬 실행 | 단일 DuckDB 소유 프로세스, CLI 경쟁, 수집 중 기존 generation 조회, 재시작 후 interrupted 판정 |
 | 백업·이전 | SQLite WAL이 있는 상태, pending operation, 별도 데이터 디스크, 손상 backup, migration 중단·새 루트 복구 |
+| 승격 | [데이터 수직 대응표](data-vertical.md#계약과-테스트-대응표)의 계약별 테스트: 재승격 빈 delta, 시간 규칙과 grant, 숫자 규칙 parity, 은퇴 거부 |
 | 배포·CI | wheel/sdist·단일 이미지에서 실제 전략·개인 경로·DB 없음; 합성 전체 실행; PG 없는 테스트 환경 |
 
 재현 기준은 exact 입력·논리 hash와 schema별 수치 허용오차다. 성능은 대표 합성 크기의

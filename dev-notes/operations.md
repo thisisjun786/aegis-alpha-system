@@ -219,6 +219,26 @@ dataset_id·version·generation_id·chain_hash·manifest_hash다. `decision`은 
 `data datasets`에 보이는 generation은 검증한 변환의 결과일 뿐이며 PIT 자격이나 백테스트
 입력으로 자동 승격되지 않는다.
 
+## 원천 자료의 승격과 은퇴
+
+원천 자료실 자료를 공급자별 시장 dataset으로 승격하는 명령(`aas data promote`), 원천 ID 연결
+(`aas db source-link`), core schema 업그레이드(`aas db migrate`), 원천 은퇴(`aas db source-retire`)와
+compact(`aas db compact`)의 계약은 [데이터 수직 계약](design/data-vertical.md)이 소유한다. 현재 CLI에는
+이 명령들이 없으며, 각 명령은 그 계약의 대응표 행이 `구현`이 될 때 이 절에 추가된다. 그 전까지
+원천 자료의 연구 입력은 아래 `register-*` 경로가 맡는다.
+
+실제 설치본에서 이 명령들을 실행하는 순서는 다음과 같다. 모든 단계는 같은 요청 해시로 다시
+실행하면 재사용된다.
+
+1. `[owner]` 예약 수집을 멈추고 새 루트 복원본에서 전 과정을 먼저 실행해 시간·메모리·verify를 기록한다.
+2. `[owner]` 다른 장치에 `aas db backup`을 만들고 백업 ID를 기록한다.
+3. `aas db migrate --to 2 --backup-output DIR`, 이어서 `aas db source-link --apply`.
+4. 명세마다 `aas data promote --plan`을 확인한 뒤 실행하고 generation마다 verify한다. 실패하면
+   `aas db recover`로 게시만 재개한다. 공급자를 다시 호출하지 않는다.
+5. `[owner]` 승인된 수집기를 설정의 호출 상한과 함께 예약 실행으로 켠다.
+6. `aas db source-retire --plan`으로 은퇴 후보와 거부 이유를 확인하고 `--apply`로 증명을 통과한
+   원천을 일괄 은퇴한다. `aas db compact --to NEW_ROOT`와 deep verify 뒤 설정 경로를 바꾼다.
+
 ## 검사·복구·백업
 
 ```bash

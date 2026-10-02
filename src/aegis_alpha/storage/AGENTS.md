@@ -15,6 +15,33 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   and reject unknown versions instead of implicitly adopting or upgrading files.
 - Backup takes SQLite snapshots and closes DuckDB after checkpoint while retaining
   installation admission. Restore targets a new root; secrets are excluded.
+- Promotion from the source library to typed generations follows
+  `dev-notes/design/data-vertical.md` (Decision 0017). One hashed `aas-promotion-v1`
+  spec pins sources, `mapper name@major`, time rules, decimal rules, quality rules
+  and the identity snapshot. `record_id` stays `aas-record-v1`; `revision_id`
+  hashes `aas-revision-v1` with dataset, record, op, superseded revision and
+  `source_row_hash`; op comes from diffing the parent head on domain columns only,
+  so re-collecting the same value at another time is no revision. No column takes
+  the promotion wall clock, so re-promotion is an empty delta. Time rules are
+  conservative upper bounds and ingestion never fills a null. A rule time later
+  than the row's ingestion is capped at ingestion and flagged
+  `time_clamped_to_ingestion`; a row ingested before the rule's physical base
+  (e.g. the session close) is held, not promoted. A correction or deletion is
+  never known before the source that carries it: a SUPERSEDE under a record-date
+  rule and every TOMBSTONE take that source's ingestion time, and a source row
+  older than the head is reported stale instead of superseding it. Strict
+  reads use a rule's times only when the binding grants that `id@version`, and the
+  run records the grants. Decimal rules that change a source value (`krw_tick@1`
+  and others) leave a `quality_flags` row; flags never alter values. One dataset
+  holds one provider; consumers join providers with ordered pins and cutover
+  intervals. Bulk hashing keeps byte parity with `aas-rowset-v1`; never add a new
+  rowset format. Every new hash format (`revision_id`, `source_row_hash`, tombstone,
+  `request_hash`, `source_id`) has a frozen expected digest. Source retirement
+  requires no references (the source's own `sl:` link is lineage, not a reference),
+  an equivalence digest and an other-device backup, and never removes `raw/` bytes.
+- Every contract in that document has a row in its contract/test table. A change
+  that implements a `예정` row adds the named test and flips the row to `구현` in
+  the same change; `tests/tools/test_data_vertical_contract.py` enforces both directions.
 - `research_inputs` publishes a retained source table as a new generation only
   through an exact hashed transform document
   (`aas-{price,sessions,proxy,observation}-transform-v1`).
