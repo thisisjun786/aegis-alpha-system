@@ -591,6 +591,16 @@ def test_pytest_lanes_select_marker_and_isolate_database_url(
     assert not harness.calls("docker")  # Supplied disposable DB is not provisioned or removed.
 
 
+def test_test_lane_forwards_one_shard_selector(harness: Harness) -> None:
+    token = harness.prepare()
+    result = harness.run(
+        '"$FAKE_ROOT/scripts/verify-lane-test"', AAS_VERIFY_PREPARED=token, AAS_TEST_SHARD="2/4"
+    )
+    assert result.returncode == 0, result.stderr
+    runs = [call["args"] for call in harness.calls() if call["args"][0] == "run"]
+    assert runs == [["run", "--no-sync", "pytest", "-m", "not database", "--test-shard", "2/4"]]
+
+
 def test_database_lane_propagates_pytest_failure(harness: Harness) -> None:
     result = harness.run(
         '"$FAKE_ROOT/scripts/verify-lane-database"', FAKE_FAIL="pytest -m database"

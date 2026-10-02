@@ -54,6 +54,9 @@ ignore = [
 [tool.pytest.ini_options]
 addopts = ["--strict-config", "--strict-markers"]
 testpaths = ["tests"]
+# A passing test's tmp_path is removed at teardown, so a full run's scratch stays
+# one test deep instead of accumulating every installation the suite builds.
+tmp_path_retention_policy = "failed"
 markers = [
     "database: requires disposable PostgreSQL; runs in scripts/verify-lane-database",
 ]

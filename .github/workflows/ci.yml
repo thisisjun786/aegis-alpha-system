@@ -89,8 +89,15 @@ jobs:
   tests:
     needs: changes
     if: needs.changes.outputs['tests'] == 'true'
+    name: tests (${{ matrix.shard }}/${{ strategy.job-total }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 20
+    # Deterministic file shards on separate runners (tests/sharding.py); the gate
+    # sees one aggregate `tests` result that succeeds only when every shard does.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -99,7 +106,14 @@ jobs:
       - uses: ./.github/actions/setup-python
         with:
           profile: full
+      - name: Keep disposable test stores in memory
+        run: |
+          sudo mkdir -p /mnt/aas-test-tmp
+          sudo mount -t tmpfs -o size=8g,mode=1777,nosuid,nodev aas-test-tmp /mnt/aas-test-tmp
+          printf 'TMPDIR=%s\n' /mnt/aas-test-tmp >> "$GITHUB_ENV"
       - run: ./scripts/verify-lane-test
+        env:
+          AAS_TEST_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
 
   database:
     needs: changes
