@@ -21,6 +21,7 @@ from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.storage import source_library_schema as schema
 from aegis_alpha.storage.paths import private_source_file as private_file
 from aegis_alpha.storage.paths import same_private_file
+from aegis_alpha.storage.source_identity import link_source, verify_links
 from aegis_alpha.storage.source_library_digest import BATCH_ROWS, arrow_digest, sqlite_digest
 from aegis_alpha.storage.state import complete_operation, get_operation, prepare_operation
 
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
     import duckdb
     import pyarrow as pa
 
+    from aegis_alpha.storage.source_identity import SourceContent
     from aegis_alpha.storage.workspace import Workspace
 
 
@@ -98,7 +100,12 @@ def _prepare(
         return (
             op_id,
             request,
-            {"source_id": source_id, "reused": True, "tables": manifest["tables"]},
+            {
+                "source_id": source_id,
+                "reused": True,
+                "tables": manifest["tables"],
+                "link": link_source(workspace, source_id),
+            },
         )
     return op_id, request, None
 
@@ -127,7 +134,12 @@ def _commit(  # noqa: PLR0913, PLR0917 -- explicit cross-store commit identity
     )
     conn.execute("COMMIT")
     complete_operation(workspace.state, op_id, request)
-    return {"source_id": source_id, "reused": False, "tables": tables}
+    return {
+        "source_id": source_id,
+        "reused": False,
+        "tables": tables,
+        "link": link_source(workspace, source_id),
+    }
 
 
 def import_sqlite(  # noqa: C901, PLR0912, PLR0915 -- one snapshot transaction boundary
@@ -252,9 +264,29 @@ def import_arrow(  # noqa: PLR0913 -- public provenance and reader inputs
     *,
     metadata: object = None,
 ) -> dict[str, object]:
+    """Import under an explicit source ID that an earlier commit or pin already names.
+
+    New loaders use ``import_content_arrow``, whose ID comes from the original bytes.
+    """
+    from aegis_alpha.storage.source_library_arrow import ingest_arrow_retained  # noqa: PLC0415
+
+    return ingest_arrow_retained(
+        workspace, source_id, sha256, table_name, reader, metadata=metadata
+    )
+
+
+def import_content_arrow(
+    workspace: Workspace,
+    content: SourceContent,
+    table_name: str,
+    reader: pa.RecordBatchReader,
+    *,
+    lineage: object = None,
+) -> dict[str, object]:
+    """Import under the content-addressed ID of the original bytes in ``content``."""
     from aegis_alpha.storage.source_library_arrow import ingest_arrow  # noqa: PLC0415
 
-    return ingest_arrow(workspace, source_id, sha256, table_name, reader, metadata=metadata)
+    return ingest_arrow(workspace, content, table_name, reader, lineage=lineage)
 
 
 def _admit_source_batch(
@@ -519,6 +551,7 @@ def verify_sources(
     if remaining <= 0:
         raise ComputeResourceError("source metadata leaves no verification budget")
     total = tables = sources = 0
+    committed: list[str] = []
     for conn in schema.connections(workspace).values():
         for row in conn.execute(
             "SELECT source_id,operation_id,request_hash,source_sha256,manifest_json "
@@ -535,6 +568,7 @@ def verify_sources(
             manifest = json.loads(row[4])
             _verify_manifest(workspace, manifest, remaining)
             if operation["phase"] == "COMPLETED":
+                committed.append(str(row[0]))
                 sources += 1
                 tables += len(manifest["tables"])
                 total += sum(t["rows"] for t in manifest["tables"])
@@ -543,7 +577,8 @@ def verify_sources(
     ):
         if _marker(workspace, row[0]) is None:
             raise ValueError("completed source intent lacks target marker")
-    return {"sources": sources, "tables": tables, "rows": total}
+    linked = verify_links(workspace, committed)
+    return {"sources": sources, "tables": tables, "rows": total, "linked": linked}
 
 
 def recover_source(workspace: Workspace, operation_id: str) -> bool:
@@ -564,4 +599,5 @@ def recover_source(workspace: Workspace, operation_id: str) -> bool:
         raise ValueError("source marker/intent mismatch")
     _verify_manifest(workspace, json.loads(str(marker[4])))
     complete_operation_if_pending(workspace, operation_id, str(operation["request_hash"]))
+    link_source(workspace, str(operation["target_id"]))
     return True

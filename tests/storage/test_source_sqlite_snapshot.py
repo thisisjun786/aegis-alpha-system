@@ -300,4 +300,9 @@ def test_rejects_main_change_when_writer_checkpoints_after_hash(
             source_library.import_sqlite(workspace, source, "pinned", digest)
         # Then rollback leaves no visible source or recoverable target marker.
         assert source_library.list_sources(workspace) == []
-        assert source_library.verify_sources(workspace) == {"sources": 0, "tables": 0, "rows": 0}
+        assert source_library.verify_sources(workspace) == {
+            "sources": 0,
+            "tables": 0,
+            "rows": 0,
+            "linked": 0,
+        }

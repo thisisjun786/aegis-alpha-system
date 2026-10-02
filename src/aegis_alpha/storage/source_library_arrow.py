@@ -11,13 +11,16 @@ from contextlib import suppress
 from decimal import Decimal
 from typing import TYPE_CHECKING, cast
 
+from aegis_alpha.data.descriptor_tree import DescriptorTreeError
 from aegis_alpha.storage import source_library_schema as schema
+from aegis_alpha.storage.raw import verify_raw
 from aegis_alpha.storage.source_library_digest import arrow_digest, canonical_batch, fixed_batches
 
 if TYPE_CHECKING:
     import duckdb
     import pyarrow as pa
 
+    from aegis_alpha.storage.source_identity import SourceContent
     from aegis_alpha.storage.workspace import Workspace
 
 
@@ -43,7 +46,43 @@ def _supported_type(kind: pa.DataType) -> bool:
     )
 
 
-def ingest_arrow(  # noqa: PLR0913 -- explicit provenance and reader input
+def ingest_arrow(
+    workspace: Workspace,
+    content: SourceContent,
+    table_name: str,
+    reader: pa.RecordBatchReader,
+    *,
+    lineage: object = None,
+) -> dict[str, object]:
+    """Ingest under the content-addressed ID of the original bytes the loader read.
+
+    Every original file must already be retained in ``raw/``. The ID document is
+    stored there too, so ``source_sha256`` resolves to the preimage of the ID's hex.
+    ``lineage`` (loader code and transform hashes) is recorded in the commit manifest
+    but stays out of the request, so a code-only change reuses the committed source;
+    its rows must still be identical, otherwise ``schema_major`` has to rise.
+    """
+    from aegis_alpha.storage.raw import put_raw  # noqa: PLC0415
+
+    for item in content.files:
+        try:
+            verify_raw(workspace.paths.raw, item.relative_path, item.sha256, item.size_bytes)
+        except (OSError, DescriptorTreeError):
+            raise ValueError("source file is not retained in raw storage") from None
+    put_raw(workspace.paths.raw, content.document())
+    record = content.record()
+    return _ingest(
+        workspace,
+        content.source_id,
+        content.sha256,
+        table_name,
+        reader,
+        request={"source": record},
+        metadata={"source": record, "lineage": lineage},
+    )
+
+
+def ingest_arrow_retained(  # noqa: PLR0913 -- explicit provenance and reader input
     workspace: Workspace,
     source_id: str,
     sha256: str,
@@ -51,6 +90,22 @@ def ingest_arrow(  # noqa: PLR0913 -- explicit provenance and reader input
     reader: pa.RecordBatchReader,
     *,
     metadata: object = None,
+) -> dict[str, object]:
+    """Ingest under an explicit, already-pinned source ID and request digest."""
+    return _ingest(
+        workspace, source_id, sha256, table_name, reader, request=metadata, metadata=metadata
+    )
+
+
+def _ingest(  # noqa: PLR0913 -- explicit provenance and reader input
+    workspace: Workspace,
+    source_id: str,
+    sha256: str,
+    table_name: str,
+    reader: pa.RecordBatchReader,
+    *,
+    request: object,
+    metadata: object,
 ) -> dict[str, object]:
     import duckdb  # noqa: PLC0415
     import pyarrow as pa  # noqa: PLC0415
@@ -73,8 +128,8 @@ def ingest_arrow(  # noqa: PLR0913 -- explicit provenance and reader input
         if not _supported_type(field.type):
             raise ValueError(f"unsupported Arrow source type for {field.name!r}: {field.type}")
     serialized = base64.b64encode(original.serialize().to_pybytes()).decode()
-    op_id, request, reused = _prepare(
-        workspace, source_id, sha256, "market", [table_name, serialized, metadata]
+    op_id, request_hash, reused = _prepare(
+        workspace, source_id, sha256, "market", [table_name, serialized, request]
     )
     if reused:
         observed = arrow_digest(reader)
@@ -124,7 +179,9 @@ def ingest_arrow(  # noqa: PLR0913 -- explicit provenance and reader input
             "format": "arrow",
         }
         _verify_manifest(workspace, {"store": "market", "tables": [table]})
-        return _commit(workspace, source_id, sha256, "market", op_id, request, [table], metadata)
+        return _commit(
+            workspace, source_id, sha256, "market", op_id, request_hash, [table], metadata
+        )
     except BaseException:
         # A failed state completion follows a committed target; preserve that exception.
         with suppress(duckdb.TransactionException):

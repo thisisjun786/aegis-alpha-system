@@ -163,7 +163,7 @@ def test_reads_original_order_and_values_when_opened_in_fresh_process(tmp_path: 
     )
     # Then persisted values, ordering and independently pinned digest survive readback.
     report = json.loads(result.stdout)
-    assert report["verification"] == {"sources": 1, "tables": 1, "rows": 4}
+    assert report["verification"] == {"sources": 1, "tables": 1, "rows": 4, "linked": 0}
     assert report["manifest"]["digest"] == _SUPPORTED_DIGEST
     rows = report["data"]["rows"]
     assert [row["n"] for row in rows] == [7, 2, 9, None]

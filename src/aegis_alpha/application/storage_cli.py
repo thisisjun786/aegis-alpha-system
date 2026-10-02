@@ -132,6 +132,14 @@ def _source_parsers(sub: argparse._SubParsersAction) -> None:
             command.add_argument("file", type=Path)
             command.add_argument("--id", required=True)
             command.add_argument("--sha256", required=True)
+    link = sub.add_parser(
+        "source-link",
+        help="Record each source-library commit as an sl: source snapshot with its raw files",
+    )
+    _home(link)
+    mode = link.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--plan", action="store_true", help="Report what would be linked")
+    mode.add_argument("--apply", action="store_true", help="Record the missing links")
 
 
 def execute(args: argparse.Namespace) -> dict[str, object]:
@@ -178,6 +186,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
                 args.command == "db"
                 and args.db_command in {"recover", "quarantine", "source-import"}
             )
+            or (args.command == "db" and args.db_command == "source-link" and args.apply)
         )
         with open_workspace(
             home,
@@ -188,7 +197,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             or (
                 args.command == "db"
                 and args.db_command
-                in {"verify", "recover", "sources", "source-tables", "source-read"}
+                in {"verify", "recover", "sources", "source-tables", "source-read", "source-link"}
             ),
         ) as workspace:
             return _workspace_command(workspace, args)
@@ -261,6 +270,10 @@ def _workspace_command(workspace: object, args: argparse.Namespace) -> dict[str,
     if args.command == "db":
         if args.db_command in {"sources", "source-tables", "source-read", "source-import"}:
             return _source_command(workspace, args)
+        if args.db_command == "source-link":
+            from aegis_alpha.storage.source_identity import source_link
+
+            return source_link(workspace, apply=args.apply)
         if args.db_command == "verify":
             from aegis_alpha.storage.verification import verify_workspace
 

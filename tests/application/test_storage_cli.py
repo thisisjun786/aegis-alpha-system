@@ -360,7 +360,12 @@ def test_source_catalog_cli_roundtrip(tmp_path: Path) -> None:
     assert json.loads(result.stdout)["rows"] == [{"name": "synthetic", "value": 7}]
     assert json.loads(run_cli("strategy", "list", home=home).stdout)["strategies"] == []
     result = run_cli("db", "verify", home=home)
-    assert json.loads(result.stdout)["source_library"] == {"sources": 1, "tables": 1, "rows": 1}
+    assert json.loads(result.stdout)["source_library"] == {
+        "sources": 1,
+        "tables": 1,
+        "rows": 1,
+        "linked": 0,
+    }
 
 
 @pytest.mark.parametrize(

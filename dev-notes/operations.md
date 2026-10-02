@@ -87,6 +87,8 @@ aas db source-import /path/to/private-snapshot.sqlite3 --id SOURCE_ID --sha256 S
 aas db sources
 aas db source-tables --source SOURCE_ID
 aas db source-read --source SOURCE_ID --table TABLE_NAME --limit 20
+aas db source-link --plan
+aas db source-link --apply
 ```
 
 `source-import`는 원본 SQLite 테이블을 비공개 원본 자료실에 보존한다. 먼저 읽기 전용
@@ -94,9 +96,15 @@ aas db source-read --source SOURCE_ID --table TABLE_NAME --limit 20
 원본의 실행 코드·뷰·트리거를 실행하거나 기존 엔진 bundle로 추정 변환하지 않는다.
 원본 설정, 연구용 설정, 원래 성과는 각각 원래 테이블과 열의 의미를 유지한다.
 `strategy list`는 검증된 실행 bundle 목록이며 `db sources`의 원본 자료 목록과 구분된다.
+`source-link`는 원본 자료실 commit마다 `sl:` 원천 snapshot과 원본 파일 행을 state에 남긴다.
+`--plan`은 연결할 commit 수, 이미 연결된 수, 원본 bytes가 `raw/`에 없어 연결하지 못하는 수와
+완료되지 않은 수를 보고하고 아무것도 쓰지 않는다. `--apply`는 빠진 연결만 기록하며 다시 실행하면
+바뀌는 것이 없다. 원본 bytes는 두 모드 모두 `raw/`에서 다시 해시한다.
 
-대량 분석 자료는 `storage.source_library.import_arrow`로 명시적인 Arrow reader에서
-DuckDB에 적재한다. 같은 스키마끼리 묶고 파일 경로와 원본 행 번호를 보존한다.
+대량 분석 자료는 `storage.source_library.import_content_arrow`로 명시적인 Arrow reader에서
+DuckDB에 적재한다. 원천 ID는 `raw/`에 먼저 보존한 원본 파일의 내용에서 나오고 적재 코드의 해시는
+`lineage`로만 기록되므로, 코드만 바꿔 같은 원본을 다시 적재하면 기존 원천을 재사용한다.
+`import_arrow`는 내용 ID 이전에 만든 명시 ID를 그대로 쓰는 경로다. 같은 스키마끼리 묶고 파일 경로와 원본 행 번호를 보존한다.
 원본 시각이나 숫자의 정밀도를 임의로 줄이지 않는다. 원본 자료실 등록은 PIT 사용 자격이나
 백테스트 실행 성공을 뜻하지 않으며, `data datasets`의 게시된 데이터 버전에 자동 추가되지 않는다.
 대량 이전은 원본 파일·행 번호를 유지한 여러 source로 나눠 적재할 수 있다. 행 수만으로
@@ -224,7 +232,8 @@ dataset_id·version·generation_id·chain_hash·manifest_hash다. `decision`은 
 원천 자료실 자료를 공급자별 시장 dataset으로 승격하는 명령(`aas data promote`), 원천 ID 연결
 (`aas db source-link`), core schema 업그레이드(`aas db migrate`), 원천 은퇴(`aas db source-retire`)와
 compact(`aas db compact`)의 계약은 [데이터 수직 계약](design/data-vertical.md)이 소유한다. 현재 CLI에는
-이 명령들이 없으며, 각 명령은 그 계약의 대응표 행이 `구현`이 될 때 이 절에 추가된다. 그 전까지
+위 [원본 자료 이전과 조회](#원본-자료-이전과-조회)의 `source-link`만 있으며, 나머지 명령은 그 계약의
+대응표 행이 `구현`이 될 때 이 절에 추가된다. 그 전까지
 원천 자료의 연구 입력은 아래 `register-*` 경로가 맡는다.
 
 실제 설치본에서 이 명령들을 실행하는 순서는 다음과 같다. 모든 단계는 같은 요청 해시로 다시
@@ -893,7 +902,7 @@ docker compose run --rm aas doctor
 
 `aas providers`와 기존 수집기는 유지되지만 일부는 아직 PostgreSQL/Parquet adapter를 쓴다.
 이 경로는 `uv tool install '.[legacy]'` 또는 개발 환경과 명시한 이전 설정이 필요하다.
-`storage.source_library.import_arrow`의 Arrow 적재도 같은 추가 의존성의 PyArrow를 쓴다.
+`storage.source_library.import_content_arrow`와 `import_arrow`의 Arrow 적재도 같은 추가 의존성의 PyArrow를 쓴다.
 위 준비 실습은 그 의존성이 들어 있는 잠긴 개발 환경에서 확인했으며, 기본 설치만으로
 같은 흐름이 도는지는 따로 검증하지 않았다. 의존성 목록은 `pyproject.toml`과 `uv.lock`이 정본이다.
 기존 DB 명령은 `aas legacy-db`, publication 조회는 `aas legacy-data`로 구분한다.
