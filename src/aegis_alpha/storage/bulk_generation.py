@@ -118,7 +118,9 @@ class BulkRequest:
 
     ``staged`` names a table or view visible to the connection with exactly the
     domain's typed columns except ``generation_id``, including ``record_id``, and
-    for prices optionally ``fields``. Its column types must be the domain's.
+    for prices optionally ``fields``. Its column types must be the domain's. Rows
+    staged in anything but a table are rehashed after insertion, before COMMIT,
+    because a view can evaluate differently on each read.
     """
 
     dataset_id: str
@@ -180,11 +182,37 @@ def publish_generation_bulk(
             _check_reviewed(plan, current)
             if not current.reused:
                 _insert(connection, request, current)
+                if not _is_table(connection, request.staged):
+                    _check_stored(connection, request, budget)
             _ = connection.execute("COMMIT")
         except BaseException:
             _rollback(connection)
             raise
     return dict(current.marker)
+
+
+def _is_table(connection: duckdb.DuckDBPyConnection, name: str) -> bool:
+    """Whether ``name`` is a stored table, which every statement of a transaction reads alike."""
+    found = connection.execute(
+        "SELECT EXISTS (SELECT 1 FROM duckdb_tables() WHERE table_name=?)"
+        " AND NOT EXISTS (SELECT 1 FROM duckdb_views() WHERE view_name=? AND NOT internal)",
+        [name, name],
+    ).fetchone()
+    return found is not None and bool(found[0])
+
+
+def _check_stored(
+    connection: duckdb.DuckDBPyConnection, request: BulkRequest, budget: ComputeBudget
+) -> None:
+    """Rehash the inserted rows; a view or scan can evaluate differently on each read."""
+    try:
+        _ = verify_generation_bulk(connection, request.generation_id, budget=budget)
+    except ComputeResourceError:
+        raise
+    except ValueError as error:
+        raise PlanChangedError(
+            "staged rows changed between planning and insertion; stage them in a table"
+        ) from error
 
 
 def _rollback(connection: duckdb.DuckDBPyConnection) -> None:

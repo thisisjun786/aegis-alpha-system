@@ -748,6 +748,29 @@ def test_verify_refuses_missing_foreign_and_nonfinite_rows(tmp_path: Path, damag
     connection.close()
 
 
+def test_volatile_staged_view_cannot_commit_other_rows(tmp_path: Path) -> None:
+    rows = _first(random.Random(31), "prices", 3)
+    connection = _store(tmp_path / "market.duckdb")
+    _stage(connection, "prices", rows, name="source")
+    columns = [n for n, _ in COMMON + DOMAINS["prices"] if n != "generation_id"]
+    selected = ", ".join(
+        "uuid()::VARCHAR AS source_snapshot_id" if n == "source_snapshot_id" else f'"{n}"'
+        for n in columns
+    )
+    connection.execute(f"CREATE VIEW volatile AS SELECT {selected} FROM source")
+    request = _request("1", parent=None, domain="prices", staged="volatile")
+    with pytest.raises(PlanChangedError, match="stage them in a table"):
+        publish_generation_bulk(connection, request, budget=BUDGET)
+    assert connection.execute("SELECT count(*) FROM market_generations").fetchone() == (0,)
+    assert connection.execute("SELECT count(*) FROM prices").fetchone() == (0,)
+    # A view that reads the same rows each time publishes and verifies.
+    connection.execute("CREATE VIEW stable AS SELECT * FROM source")
+    stable = _request("1", parent=None, domain="prices", staged="stable")
+    marker = publish_generation_bulk(connection, stable, budget=BUDGET)
+    assert market.verify_generation(connection, "g1") == marker
+    connection.close()
+
+
 def test_staged_relation_must_match_the_domain(tmp_path: Path) -> None:
     connection = _store(tmp_path / "market.duckdb")
     rows = _first(random.Random(23), "prices", 2)
