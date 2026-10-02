@@ -28,7 +28,7 @@ date: 2026-10-03
 
 ## 공급자별 dataset과 소비자 cutover
 
-dataset은 `<domain>.<market>.<provider>[.ref]`이고 한 chain에 한 공급자만 들어간다. 공급자를 잇는
+dataset은 `<domain>.<market>.<provider>[.ref][.r<N>]`이고 한 chain에 한 공급자와 한 시간 규칙 세대만 들어간다. 공급자를 잇는
 일은 소비자 binding의 순서 있는 pin과 cutover 구간이 한다. 공급자 정정이 다른 공급자의 이력에
 섞이지 않고, 공급자 교체는 새 binding이다. FMP는 구독이 끝난 동결 원천이며 reference 역할로만
 승격한다.

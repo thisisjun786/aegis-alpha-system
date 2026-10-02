@@ -174,8 +174,9 @@ TOMBSTONE의 `source_row_hash`는 `sha256(정규 JSON ["aas-tombstone-v1", sourc
 규칙 ID와 버전은 명세에 있으므로 transform hash에 포함된다. 규칙의 계산을 바꾸면 새 버전이 된다.
 한 chain의 모든 generation은 열마다 같은 시간 규칙(ID·버전·근거·인자)을 쓴다. op는 시점을 비교하지
 않으므로 규칙이 바뀐 명세로 이어 승격하면 이전 규칙의 시점이 새 규칙의 것처럼 남는다. 그래서 parent
-명세와 시간 규칙이 다른 승격은 거부하고, 규칙을 바꾸려면 parent가 없는 새 chain으로 승격한다. reader는
-행이 속한 chain의 명세에서 그 행의 시점이 어느 규칙에서 왔는지 안다.
+명세와 시간 규칙이 다른 승격은 거부한다. 규칙을 바꾸려면 [dataset 이름](#공급자별-dataset과-ordered-pin-cutover)에
+규칙 세대 `.r<N>`을 붙인 새 dataset을 첫 generation부터 승격한다. reader는 행이 속한 chain의 명세에서
+그 행의 시점이 어느 규칙에서 왔는지 안다.
 
 `source_column`이 아닌 규칙에서 나온 시점을 strict PIT 경로에 쓸지는 소비자가 정한다.
 입력 binding이 허용하는 규칙 `id@version` 목록(grant)을 들고, 그 목록은 bundle hash에 포함된다.
@@ -259,8 +260,9 @@ dataset version 단위의 판정(행 수 대조, coverage 종료, 교차 대조�
 
 ## 공급자별 dataset과 ordered-pin cutover
 
-dataset 이름은 `<domain>.<market>.<provider>[.ref]`다. 한 dataset의 chain에는 한 공급자의 자료만
-들어간다. 공급자의 정정은 그 공급자의 chain 안에서 SUPERSEDE로 남고 다른 공급자의 이력을 바꾸지
+dataset 이름은 `<domain>.<market>.<provider>[.ref][.r<N>]`다. 한 dataset의 chain에는 한 공급자의 자료만
+들어간다. `.r<N>`은 시간 규칙 세대다. 첫 세대는 접미사가 없고, 시간 규칙을 바꿀 때마다 N이 2부터 오른다.
+이전 세대 dataset은 그대로 남고 소비자는 새 binding으로 옮긴다. 공급자의 정정은 그 공급자의 chain 안에서 SUPERSEDE로 남고 다른 공급자의 이력을 바꾸지
 않는다. `.ref`는 `price_role='reference'` 자료(공급자 조정 가격, 기준 지수)다.
 
 여러 공급자를 잇는 일은 소비자의 binding이 한다. 한 역할이 순서 있는 pin 목록을 들고 각 pin은
@@ -438,4 +440,4 @@ state v2:
 | DV-53 | 같은 parent에 다른 요청이 먼저 게시되면 부모 CAS가 실패한다 | `tests/storage/test_promotion_engine.py::test_competing_request_fails_parent_cas` | 예정 |
 | DV-54 | migration-incomplete 설치본은 정상으로 열리지 않는다 | `tests/storage/test_migration.py::test_incomplete_migration_refuses_normal_open` | 예정 |
 | DV-55 | 수집 시각보다 늦은 규칙 시점은 물리 기준 이후에 받은 행에서만 수집 시각으로 내려가 flag를 달고, 물리 기준 전에 받은 행은 보류로 보고된다 | `tests/storage/test_time_rules.py::test_rule_after_ingestion_is_clamped_above_physical_base` | 예정 |
-| DV-56 | parent 명세와 시간 규칙이 다른 승격은 거부되고 규칙 변경은 새 chain으로만 한다 | `tests/storage/test_promotion_engine.py::test_time_rule_change_requires_new_chain` | 예정 |
+| DV-56 | parent 명세와 시간 규칙이 다른 승격은 거부되고 규칙 변경은 `.r<N>` 새 dataset으로만 한다 | `tests/storage/test_promotion_engine.py::test_time_rule_change_requires_new_chain` | 예정 |

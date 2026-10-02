@@ -164,7 +164,7 @@ universe·전략·시장 관례의 exact version/hash를 묶고, 각 의사결�
 [데이터 수직 계약](design/data-vertical.md)과 [0017](decisions/0017-data-vertical-contract.md)에 따라
 해시로 고정한 `aas-promotion-v1` 명세가 원천 pin·매퍼·시간 규칙·숫자 규칙·품질 규칙·identity
 snapshot을 선언하고, 공통 revision 열은 원천과 그 규칙에서만 계산된다. dataset은 공급자마다 따로
-두고(`<domain>.<market>.<provider>[.ref]`), 공급자를 잇는 일과 규칙 시점의 strict 사용 허용(grant)은
+두고(`<domain>.<market>.<provider>[.ref][.r<N>]`, `.r<N>`은 시간 규칙 세대), 공급자를 잇는 일과 규칙 시점의 strict 사용 허용(grant)은
 소비자 binding이 맡으며 run 영수증에 남는다. 이 경로의 구현 상태는 그 문서의 대응표가 계약별
 테스트로 판정한다. 아래의 `research_inputs` 변환 문서는 현재 쓰이는 별도 경로다.
 
