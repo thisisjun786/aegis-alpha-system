@@ -40,6 +40,20 @@ def test_independent_jobs_and_fixed_candidate() -> None:
     assert "run: ./scripts/verify-lane-database" in jobs["database"]
 
 
+def test_database_free_tests_run_as_complete_isolated_shards() -> None:
+    body = workflow_jobs()["tests"]
+    assert "fail-fast: false" in body
+    shards = re.findall(r"(?m)^        shard: \[(.*)\]$", body)
+    assert len(shards) == 1
+    assert [int(value) for value in shards[0].split(",")] == list(
+        range(1, len(shards[0].split(",")) + 1)
+    )
+    assert "AAS_TEST_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}" in body
+    assert "run: ./scripts/verify-lane-test" in body
+    assert "mount -t tmpfs" in body
+    assert "strategy:" not in workflow_jobs()["gate"]
+
+
 def test_events_and_permissions_do_not_bypass_required_checks() -> None:
     text = (ROOT / ".github/workflows/ci.yml").read_text()
     assert "branches:" not in text

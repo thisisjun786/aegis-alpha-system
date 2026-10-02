@@ -34,7 +34,7 @@ The target graph is `changes -> selected jobs in parallel -> dev-gate / release-
 | `changes` | Select checks from the complete PR diff and record the selection | Lightweight runner; no project installation |
 | `style` | Formatting and linting, including relevant shell/workflow validation | Only the required check tools |
 | `types` | Type checking | Locked Python development environment |
-| `tests` | All database-free application and retained-code tests | Isolated temporary data; no PostgreSQL |
+| `tests` | All database-free application and retained-code tests, as deterministic file shards on separate runners | Isolated memory-backed temporary data per shard; no PostgreSQL |
 | `database` | Retained PostgreSQL regression tests | Its own disposable database and runner |
 | `package` | Build the Python package and smoke-test the installed artifact | Clean build/install directories |
 | `container` | Build and smoke-test affected runtime images | Disposable image/container state |
@@ -86,7 +86,7 @@ The aggregator does no verification work beyond checking results. Keep the requi
 
 - Prepare dependencies once **per selected job**. Reuse download/build caches keyed by the relevant OS, architecture, runtime, and lock inputs. Share setup code, not a mutable `.venv`, database, or working directory between runners. Cache artifacts, not previous test verdicts.
 - Bundle short checks with similar setup costs, starting with format and lint. Separate long tests, DB work, and image builds. Parallelize independent jobs instead of chaining them through a single shell dispatcher.
-- Keep shared-fixture tests serial within a job. Separate PostgreSQL and database-free jobs may run concurrently because their state is isolated. Add test shards or multiple pytest workers only after proving fixture isolation and measuring a real bottleneck.
+- Keep shared-fixture tests serial within a job. Separate PostgreSQL and database-free jobs may run concurrently because their state is isolated. The `tests` job is a matrix of file shards, each on its own runner with its own temporary data; every shard computes the same partition from measured file weights, so the shards together run exactly the unsharded selection and a whole file stays in one shard. Size the shard count so each shard finishes in at most half of its timeout. Add shards or in-job pytest workers only after measuring the bottleneck; in-job workers additionally require proven fixture isolation.
 - Start with the supported Linux/Python environment. Add OS, Python-version, or database-version matrix entries only to cover an actual support commitment. Reuse setup code when a matrix becomes necessary.
 - Cancel obsolete runs for the same PR and gate when a new head arrives. Keep concurrency groups distinct across PRs and between development and release. Do not duplicate the same required suite on push, draft-state changes, schedules, or post-merge transitions without a specific failure mode to justify it. Do not enable a merge queue without demonstrated integration contention.
 - Give jobs bounded timeouts and preserve useful failure logs. Reap child processes and disposable resources on failure, timeout, and cancellation. Infrastructure retries must be bounded and distinguishable from test retries; never retry an assertion until it happens to pass.

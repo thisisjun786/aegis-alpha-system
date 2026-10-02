@@ -30,6 +30,14 @@ The root `conftest.py` owns network, data-root and disposable DB isolation.
 - `ruff select = ["ALL"]` applies to tests; the only per-file relief is `INP001` and `S101`.
   Subprocess calls need explicit `noqa: S603`, private access `SLF001`.
 - `addopts = ["--strict-config", "--strict-markers"]` — an unregistered marker fails the run.
+- `tmp_path_retention_policy = "failed"`: a passing test's `tmp_path` is removed at teardown,
+  so scratch (memory-backed in CI) holds one test's stores at a time. Failed tests keep theirs.
+- **Sharding is file-granular and deterministic.** `sharding.py` (registered from `conftest.py`)
+  adds `--test-shard INDEX/COUNT`. After marker selection it balances whole test files over the
+  shards by the measured seconds in `shard_weights.json`; a file the table lacks is estimated
+  from its test count at the table's mean rate. Refresh the table from an unsharded
+  `-m "not database"` run with `--test-durations-out tests/shard_weights.json` when shard
+  durations drift apart.
 
 ## ANTI-PATTERNS
 - **Never touch the network.** The autouse `block_network` fixture replaces

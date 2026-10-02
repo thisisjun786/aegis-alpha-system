@@ -4,10 +4,16 @@
 # (tests/conftest.py tags the `test_database` fixture chain) and belongs to
 # scripts/verify-lane-database.  AAS_TEST_DATABASE_URL is unset here on purpose
 # so an untagged PostgreSQL test fails loudly instead of passing by accident.
+# AAS_TEST_SHARD=INDEX/COUNT runs one deterministic file shard (tests/sharding.py);
+# unset, the lane runs every database-free test.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 . "$(dirname "${BASH_SOURCE[0]}")/verify-lib.sh"
 ensure_verify_toolchain
 
 unset AAS_TEST_DATABASE_URL
-exec uv run --no-sync pytest -m "not database"
+args=(-m "not database")
+if [[ -n "${AAS_TEST_SHARD+set}" ]]; then
+  args+=(--test-shard "$AAS_TEST_SHARD")
+fi
+exec uv run --no-sync pytest "${args[@]}"
