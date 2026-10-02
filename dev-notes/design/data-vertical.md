@@ -30,10 +30,12 @@ L3 generation으로 만든다. 13F 보유 내역, 애널리스트 추정치, 연
 원천 ID는 내용에서 나온다.
 
 ```text
-source_id = <provider>-<shape>-<sha256(원천 바이트 manifest + 출력 schema major)>
+source_id = <provider>-<shape>-<hex>
+hex = sha256(정규 JSON ["aas-source-id-v1", 출력 schema major, [[상대 경로, 크기, SHA-256], ...]])
 ```
 
-- 원천 바이트 manifest는 적재에 쓴 원본 파일의 상대 경로·크기·SHA-256 목록을 정렬한 문서다.
+- 원천 바이트 manifest는 적재에 쓴 원본 파일의 `[상대 경로, 크기, SHA-256]`을 상대 경로 순으로
+  정렬한 목록이다. `hex`는 소문자 16진수 64자 전체다.
 - 출력 schema major는 적재기가 만드는 열 집합과 타입이 바뀔 때만 오른다.
 - 적재 코드와 변환의 해시는 ID에 넣지 않고 commit manifest의 `metadata.lineage`에 기록한다.
   코드만 바뀌고 원본이 같으면 같은 ID로 재사용되고, 원본이 바뀌면 새 ID가 나온다.
@@ -57,7 +59,7 @@ DuckDB 안에서 흐르고 Python으로 통째로 올라오지 않는다. 엄격
 | `target` | `domain`, `dataset_id`, `parent`(직전 generation ID, 첫 generation은 null) |
 | `sources` | 순서 있는 원천 pin 목록. 각 항목은 `source_id`, `source_sha256`, `table`, `digest`(commit manifest의 테이블 digest) |
 | `mapper` | `name@major` |
-| `time_rules` | `available_at_us`, `revision_known_at_us` 각각의 `id@version`과 그 규칙의 인자 |
+| `time_rules` | `available_at_us`, `revision_known_at_us` 각각의 `id@version`, 입력 근거(`revision`·`record`), 그 규칙의 인자 |
 | `decimal_rule` | 숫자 열별 `id@version` |
 | `quality_rules` | 적용할 품질 규칙 `id@version` 목록 |
 | `tombstone_policy` | `never`, 또는 `absent_in_full_snapshot`과 그 원천이 빠짐없이 담는 범위(`scope`: instrument 집합과 날짜 구간) |
@@ -113,7 +115,7 @@ identity snapshot으로 instrument를 해석하지 못한 행은 승격하지 �
 | `op` | parent chain의 현재 head와 비교해 정한다(아래) |
 | `supersedes_revision_id` | head 조인에서 온다. ASSERT만 null |
 | `revision_id` | `sha256(정규 JSON ["aas-revision-v1", record_id, op, supersedes_revision_id, source_row_hash])` |
-| `available_at_us`, `revision_known_at_us` | 명세의 시간 규칙이 원천 열에서 계산한다. 규칙이 없으면 null |
+| `available_at_us`, `revision_known_at_us` | [시간 규칙](#시간-규칙과-소비자-grant)과 그 절의 revision 시점 규칙으로 정한다. 규칙이 없으면 null |
 | `ingested_at_us` | 원천 행의 수집 시각 열, 없으면 원천 snapshot의 수집 시각, 그것도 없으면 원천 자료실 commit manifest의 적재 시각 |
 | `source_snapshot_id` | `'sl:' + source_id` |
 | `source_row_hash` | 위 매퍼 규칙 |
@@ -122,8 +124,10 @@ identity snapshot으로 instrument를 해석하지 못한 행은 승격하지 �
 ID가 모두 다르다. 승격 시각은 어떤 열에도 들어가지 않으므로 같은 명세를 다른 날 다시 실행해도
 같은 행이 나온다.
 
-op는 원천 행과 head를 도메인 열과 두 시점 열로 비교해 정한다. `source_row_hash`와
-`ingested_at_us`는 비교에 넣지 않는다. 같은 값을 다시 수집했다고 새 revision이 생기지 않는다.
+op는 원천 행과 head를 도메인 열로만 비교해 정한다. 자연키가 아닌 revision 속성(재무의
+accession·`accepted_at`, 거시의 vintage 구간, `value_state`)도 도메인 열이다. 두 시점 열,
+`source_row_hash`, `ingested_at_us`는 비교에 넣지 않는다. 같은 값을 다른 시각에 다시 수집해도
+새 revision이 생기지 않고 head의 시점이 그대로 남는다. 시점만 다른 원천 행은 revision이 아니다.
 
 | head | 원천 | 결과 |
 | --- | --- | --- |
@@ -135,14 +139,18 @@ op는 원천 행과 head를 도메인 열과 두 시점 열로 비교해 정한�
 | ASSERT·SUPERSEDE | 없음, 그 밖의 경우 | 행 없음 |
 
 TOMBSTONE의 `source_row_hash`는 `sha256(정규 JSON ["aas-tombstone-v1", source_id, table, digest])`,
-곧 그 행이 없다는 사실을 담은 원천 테이블의 증거다. 같은 명세를 두 번 승격하면 두 번째
-delta는 비어 있다.
+곧 그 행이 없다는 사실을 담은 원천 테이블의 증거다. TOMBSTONE의 시점은 아래
+[revision 시점](#revision-시점)이 정한다. 같은 명세를 두 번 승격하면 두 번째 delta는 비어 있다.
+
+`revision_id`, `source_row_hash`, TOMBSTONE 해시, `request_hash`, `source_id`의 형식은 고정 입력과
+기대 16진수 값으로 각각 고정한다. 형식을 바꾸려면 새 이름(`-v2`)을 쓴다. 매퍼가 DuckDB SQL로 내는
+`source_row_hash`는 같은 행의 Python 계산과 같아야 한다.
 
 ## 시간 규칙과 소비자 grant
 
 날짜 단위로만 공개 시점을 알 수 있는 원천은 버전 있는 시간 규칙으로 `available_at_us`와
 `revision_known_at_us`를 정한다. 규칙 값은 그 규칙의 전제 아래에서 실제 공개 시각보다 이르지
-않은 **보수적 상한**이다. 수집 시각으로 시점을 채우지 않는다.
+않은 **보수적 상한**이다. ASSERT의 시점은 규칙에서만 나오며 수집 시각으로 채우거나 낮추지 않는다.
 
 | 규칙 | 계산 | 사용처 |
 | --- | --- | --- |
@@ -152,10 +160,10 @@ delta는 비어 있다.
 | `exdate_open@1` | pin한 달력에서 ex-date 세션의 `open_at_us`. 세션이 없으면 null | 기업행동 |
 | `unknown_null@1` | 항상 null | 근거가 없는 원천 |
 
-규칙 값이 그 행의 `ingested_at_us`보다 늦으면, 곧 AAS가 그 bytes를 규칙의 상한보다 먼저 받았으면
-시점은 `ingested_at_us`로 내려가고 행에 `time_clamped_to_ingestion` flag가 남는다. 받은 시각에는 이미
-그 값이 공개돼 있었으므로 이 값도 상한이다. 수집 시각은 이 경우에만 시점에 들어가며, 규칙이 null을
-낸 행을 채우지 않는다.
+명세는 시점 열마다 규칙 입력의 근거(`basis`)를 선언한다. `revision`은 입력 열이 그 행 자체의 공개
+시각이나 공개일을 담는 경우다(SEC `acceptanceDateTime`, ALFRED `realtime_start`, DART 접수일).
+`record`는 입력이 record의 날짜인 경우다(세션 날짜, ex-date). `session_close_plus_lag@1`과
+`exdate_open@1`은 항상 `record`다.
 
 규칙 ID와 버전은 명세에 있으므로 transform hash에 포함된다. 규칙의 계산을 바꾸면 새 버전이 된다.
 같은 generation의 모든 행은 열마다 같은 규칙으로 계산되며, reader는 generation의 명세에서
@@ -168,6 +176,25 @@ inspection과 연구 모드는 grant 없이도 행을 읽는다. run 영수증�
 규칙 하나를 허용하는 일은 그 규칙의 상한을 시점 근거로 받아들인다는 기록이며, 다른 규칙이나
 알 수 없는 시점을 허용하지 않는다.
 
+### revision 시점
+
+ASSERT가 아닌 행은 정정이나 삭제를 담은 원천보다 먼저 알려질 수 없다. 원천의 **증거 시각**은 행이
+있으면 그 행의 `ingested_at_us`이고, 행이 없는 TOMBSTONE에서는 원천 snapshot 수집 시각 중 가장 늦은
+값(없으면 commit manifest의 적재 시각)이다. 두 시점 열은 열마다 다음과 같다.
+
+| op | 시점 |
+| --- | --- |
+| ASSERT | 규칙 값 |
+| SUPERSEDE, 근거 `revision` | max(규칙 값, 직전 revision의 같은 열) |
+| SUPERSEDE, 근거 `record` | max(규칙 값, 원천 증거 시각, 직전 revision의 같은 열) |
+| TOMBSTONE | max(원천 증거 시각, 직전 revision의 같은 열). record 날짜의 규칙은 쓰지 않는다 |
+
+ASSERT·SUPERSEDE에서 규칙 값이 null이면 그 행의 시점도 null이다. 직전 revision의 값이 null이면
+그 항은 max에서 빠진다. 수집 시각은 null을 채우지 않고, 규칙 값을 낮추지 않으며,
+`record` 근거의 정정과 삭제에서 하한으로만 쓰인다. 직전 revision과의 max 때문에 원천을 수집 순서와
+다르게 승격해도 시점이 거꾸로 가지 않는다. `record` 근거의 정정은 그 정정 bytes를 받은 시각 이후에,
+`revision` 근거의 정정은 원천이 기록한 그 정정의 공개 시각 이후에 strict 조회에 보인다.
+
 ## 숫자 규칙
 
 원천 값이 `DECIMAL(38,12)`로 정확히 표현되지 않을 때 쓰는 변환은 명세가 열마다 이름으로
@@ -177,7 +204,7 @@ inspection과 연구 모드는 grant 없이도 행을 읽는다. run 영수증�
 | --- | --- | --- |
 | `exact@1` | 원천 값이 정확히 표현될 때만 승인. 아니면 승격 거부 | 없음 |
 | `krw_tick@1` | binary64 원천 값의 정확한 십진 전개를 원 단위 정수로 반올림(ROUND_HALF_EVEN). KRW 가격 열(open·high·low·close)에만 적용 | 정수가 아니던 행 `provider_float_reconstructed`, 나머지가 정확히 0.5이던 행 `decimal_rounding_tie` |
-| `float_shortest@1` | 원천 저장 폭(float32 또는 float64)에서 왕복하는 가장 짧은 십진 표현을 12자리로 맞춤 | `provider_float_storage` |
+| `float_shortest@1` | 원천 저장 폭(float32 또는 float64)에서 왕복하는 가장 짧은 십진 표현. 소수 12자리를 넘으면 소수 12자리로 ROUND_HALF_EVEN | `provider_float_storage`, 버린 나머지가 정확히 절반이면 `decimal_rounding_tie` |
 | `decimal_text@1` | 원천 텍스트의 십진 값을 그대로 사용. 지수 표기·유효숫자 7자리 이하이면 flag | `volume_precision_limited` |
 
 `krw_tick@1`은 원화의 최소 화폐 단위로 맞추는 규칙이다. 시기마다 달랐던 거래소 호가 단위표는
@@ -185,6 +212,8 @@ inspection과 연구 모드는 grant 없이도 행을 읽는다. run 영수증�
 남으며, 반올림은 그 잔재를 원 단위로 되돌린다. 나머지가 정확히 0.5인 값은 두 이웃 정수가 똑같이
 그럴듯하므로 짝수 쪽을 고르고 그 사실을 flag로 남긴다. DuckDB `round`(0.5에서 0에서 먼 쪽)와
 Python `ROUND_HALF_EVEN`이 다르므로 구현은 SQL과 Python 결과의 parity를 검증한다.
+모든 숫자 규칙은 결과가 `DECIMAL(38,12)` 범위(정수부 26자리)를 넘거나 원천 값이 NaN·무한대이면 그
+승격을 거부한다.
 
 ## 품질 flag와 품질 검사
 
@@ -208,8 +237,7 @@ quality_flags(generation_id, record_id, revision_id, rule_id, rule_version, flag
 | `provider_reported_partial` | 공급자가 경고와 함께 보낸 부분 응답 파티션의 행 |
 | `volume_precision_limited` | 원천 거래량의 유효숫자가 잘려 있음 |
 | `time_precision_day` | 시점이 `local_day_end@1`의 날짜 단위 상한임 |
-| `time_clamped_to_ingestion` | 규칙 상한이 수집 시각보다 늦어 수집 시각으로 내려감 |
-| `cross_provider_mismatch` | 같은 instrument·세션의 다른 공급자 값과 명세의 허용오차를 넘게 다름 |
+| `cross_provider_mismatch` | 같은 instrument·세션의 다른 공급자 값과 명세 품질 규칙의 허용오차를 넘게 다름. 허용오차 안이면 flag가 없다 |
 
 dataset version 단위의 판정(행 수 대조, coverage 종료, 교차 대조율)은 기존 state
 `quality_checks`가 맡는다. 부분 응답 파티션은 행마다 flag를 달고, 같은 파티션의 다른 원천과
@@ -324,8 +352,9 @@ state v2:
 `aas db source-retire --plan|--apply`는 다른 원천으로 대체된 원천 자료실 테이블을 지운다.
 `--apply`는 다음이 모두 성립하는 원천만 처리하고, 성립하지 않는 원천은 이유와 함께 보고한다.
 
-1. **참조 없음**: 어떤 committed generation의 명세, `dataset_sources`, 입력 binding,
-   source-link도 그 원천을 가리키지 않는다.
+1. **참조 없음**: committed generation 명세의 원천 pin, generation 행의 `source_snapshot_id`,
+   `dataset_sources`, 입력 binding 중 어느 것도 그 원천을 가리키지 않는다. 원천 자신의
+   source-link 행(`sl:` snapshot)은 참조로 세지 않는다. 그 행은 은퇴 뒤에도 계보로 남는다.
 2. **동치 증명**: `equivalence_spec`이 비교할 테이블과 열을 명시하고, 그 열들의 정규 행 multiset에
    대한 `aas-rowset-v1` digest가 은퇴할 원천과 `equivalent_to_source_id`에서 같다.
 3. **다른 장치 백업**: `backup_id`가 가리키는 검증된 백업이 그 원천을 담고 있고, 설치본과 다른 장치에 있다.
@@ -358,7 +387,7 @@ state v2:
 | DV-15 | `revision_id`는 직전 revision을 포함해 A→B→A에서도 유일하다 | `tests/storage/test_promotion_engine.py::test_revision_id_is_unique_across_value_return` | 예정 |
 | DV-16 | 승격 시각은 어떤 열에도 들어가지 않는다 | `tests/storage/test_promotion_engine.py::test_promotion_is_independent_of_wall_clock` | 예정 |
 | DV-17 | 승격 도중 중단은 게시 단계만 재개하고 공급자를 호출하지 않는다 | `tests/storage/test_promotion_engine.py::test_interrupted_promotion_resumes_publication_only` | 예정 |
-| DV-18 | 시간 규칙은 수집 시각을 쓰지 않고 근거가 없으면 null이다 | `tests/storage/test_time_rules.py::test_rules_never_use_ingestion_time` | 예정 |
+| DV-18 | ASSERT 시점은 규칙에서만 나오며 수집 시각으로 채우거나 낮추지 않고 근거가 없으면 null이다 | `tests/storage/test_time_rules.py::test_assert_times_never_come_from_ingestion` | 예정 |
 | DV-19 | `session_close_plus_lag@1`은 pin한 세션 종료 + lag이며 세션이 없으면 null이다 | `tests/storage/test_time_rules.py::test_session_close_plus_lag` | 예정 |
 | DV-20 | `local_day_end@1`은 현지 날짜 끝이며 `time_precision_day` flag를 단다 | `tests/storage/test_time_rules.py::test_local_day_end_flags_day_precision` | 예정 |
 | DV-21 | grant에 없는 규칙의 시점은 strict에서 제외되고 영수증에 grant가 남는다 | `tests/storage/test_read_heads.py::test_ungranted_rule_rows_excluded_from_strict` | 예정 |
@@ -376,5 +405,22 @@ state v2:
 | DV-33 | 참조 중이거나 동치가 아니거나 백업이 없는 원천은 은퇴하지 않는다 | `tests/storage/test_source_retirement.py::test_retirement_requires_proof` | 예정 |
 | DV-34 | 은퇴는 `raw/` 원본을 지우지 않는다 | `tests/storage/test_source_retirement.py::test_retirement_keeps_raw_bytes` | 예정 |
 | DV-35 | 대응표의 구현 행은 존재하는 테스트를, 예정 행은 아직 없는 테스트를 가리킨다 | `tests/tools/test_data_vertical_contract.py::test_contract_rows_match_tests` | 구현 |
-| DV-36 | 수집 시각보다 늦은 규칙 시점은 수집 시각으로 내려가 flag를 달고, null은 채우지 않는다 | `tests/storage/test_time_rules.py::test_rule_after_ingestion_is_clamped_and_flagged` | 예정 |
+| DV-36 | `record` 근거 규칙의 SUPERSEDE는 정정을 담은 원천의 증거 시각보다 먼저 알려지지 않는다 | `tests/storage/test_promotion_engine.py::test_superseding_revision_is_not_known_before_its_source` | 예정 |
 | DV-37 | 명세 `scope` 밖의 record는 원천에서 빠져도 TOMBSTONE되지 않는다 | `tests/storage/test_promotion_engine.py::test_tombstone_stays_within_declared_scope` | 예정 |
+| DV-38 | TOMBSTONE 시점은 부재를 증명한 snapshot의 증거 시각이며 record 날짜 규칙을 쓰지 않는다 | `tests/storage/test_promotion_engine.py::test_tombstone_time_comes_from_absence_snapshot` | 예정 |
+| DV-39 | 같은 값을 다른 수집 시각에 다시 수집해도 revision이 생기지 않는다 | `tests/storage/test_promotion_engine.py::test_recollection_at_new_ingestion_time_is_not_a_revision` | 예정 |
+| DV-40 | 수집 순서와 다르게 승격한 원천도 revision 시점을 거꾸로 만들지 않는다 | `tests/storage/test_promotion_engine.py::test_out_of_order_sources_keep_revision_times_monotone` | 예정 |
+| DV-41 | 참조가 없고 동치이며 백업된 원천은 자기 source-link 행이 있어도 은퇴하고 그 행은 남는다 | `tests/storage/test_source_retirement.py::test_unreferenced_equivalent_backed_up_source_is_retired` | 예정 |
+| DV-42 | `source_id` 형식은 고정 입력과 기대 값으로 고정돼 있다 | `tests/storage/test_source_identity.py::test_source_id_format_is_frozen` | 예정 |
+| DV-43 | `revision_id` 형식은 고정 입력과 기대 값으로 고정돼 있다 | `tests/storage/test_promotion_formats.py::test_revision_id_format_is_frozen` | 예정 |
+| DV-44 | `source_row_hash` 형식은 float·bytes·null을 포함한 고정 입력과 기대 값으로 고정되고 `_aas_ordinal`을 제외한다 | `tests/storage/test_promotion_formats.py::test_source_row_hash_format_is_frozen` | 예정 |
+| DV-45 | TOMBSTONE 해시 형식은 고정 입력과 기대 값으로 고정돼 있다 | `tests/storage/test_promotion_formats.py::test_tombstone_hash_format_is_frozen` | 예정 |
+| DV-46 | `request_hash` 형식은 고정 입력과 기대 값으로 고정돼 있다 | `tests/storage/test_promotion_formats.py::test_request_hash_format_is_frozen` | 예정 |
+| DV-47 | 매퍼의 SQL `source_row_hash`는 Python 계산과 같다 | `tests/storage/test_promotion_formats.py::test_source_row_hash_sql_matches_python` | 예정 |
+| DV-48 | `float_shortest@1`은 소수 12자리를 넘으면 HALF_EVEN으로 반올림하고 범위를 넘는 값은 거부한다 | `tests/storage/test_decimal_rules.py::test_float_shortest_rounds_half_even_and_rejects_overflow` | 예정 |
+| DV-49 | 매퍼는 자연키가 겹치는 원천 행을 거부한다 | `tests/storage/test_promotion_engine.py::test_mapper_rejects_overlapping_natural_keys` | 예정 |
+| DV-50 | identity로 해석하지 못한 행은 승격하지 않고 미해결 보고에 남는다 | `tests/storage/test_promotion_engine.py::test_unresolved_identity_rows_are_reported_not_promoted` | 예정 |
+| DV-51 | flag 제외 목록은 bundle hash와 run 영수증에 들어간다 | `tests/storage/test_read_heads.py::test_flag_exclusions_enter_bundle_hash_and_receipt` | 예정 |
+| DV-52 | `cross_provider_mismatch`는 명세의 허용오차를 넘을 때만 달린다 | `tests/storage/test_promotion_engine.py::test_cross_provider_mismatch_uses_spec_tolerance` | 예정 |
+| DV-53 | 같은 parent에 다른 요청이 먼저 게시되면 부모 CAS가 실패한다 | `tests/storage/test_promotion_engine.py::test_competing_request_fails_parent_cas` | 예정 |
+| DV-54 | migration-incomplete 설치본은 정상으로 열리지 않는다 | `tests/storage/test_migration.py::test_incomplete_migration_refuses_normal_open` | 예정 |

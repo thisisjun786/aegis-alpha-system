@@ -84,6 +84,7 @@ def test_revision_replay_tombstone_and_restart(tmp_path: Path) -> None:
     connection = duckdb.connect(str(path))
     try:
         assert read_generation(connection, "g3", cutoff_us=40)[0]["close"] == Decimal(12)
+        assert read_generation(connection, "g3", cutoff_us=60) == []
         assert verify_generation(connection, "g1")["row_count"] == 1
     finally:
         connection.close()

@@ -20,16 +20,22 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   spec pins sources, `mapper name@major`, time rules, decimal rules, quality rules
   and the identity snapshot. `record_id` stays `aas-record-v1`; `revision_id`
   hashes `aas-revision-v1` with record, op, superseded revision and
-  `source_row_hash`; op comes from diffing the parent head on domain and time
-  columns. No column takes the promotion wall clock, so re-promotion is an empty
-  delta. Time rules are conservative upper bounds and never ingestion time; strict
+  `source_row_hash`; op comes from diffing the parent head on domain columns only,
+  so re-collecting the same value at another time is no revision. No column takes
+  the promotion wall clock, so re-promotion is an empty delta. Time rules are
+  conservative upper bounds. An ASSERT time never comes from ingestion; a
+  correction or deletion is never known before the source that carries it, so for
+  record-date rules its times are at least that source's ingestion time and a
+  TOMBSTONE's come from the absence snapshot. Ingestion never fills a null; strict
   reads use a rule's times only when the binding grants that `id@version`, and the
   run records the grants. Decimal rules that change a source value (`krw_tick@1`
   and others) leave a `quality_flags` row; flags never alter values. One dataset
   holds one provider; consumers join providers with ordered pins and cutover
   intervals. Bulk hashing keeps byte parity with `aas-rowset-v1`; never add a new
-  rowset format. Source retirement requires no references, an equivalence digest
-  and an other-device backup, and never removes `raw/` bytes.
+  rowset format. Every new hash format (`revision_id`, `source_row_hash`, tombstone,
+  `request_hash`, `source_id`) has a frozen expected digest. Source retirement
+  requires no references (the source's own `sl:` link is lineage, not a reference),
+  an equivalence digest and an other-device backup, and never removes `raw/` bytes.
 - Every contract in that document has a row in its contract/test table. A change
   that implements a `예정` row adds the named test and flips the row to `구현` in
   the same change; `tests/tools/test_data_vertical_contract.py` enforces both directions.

@@ -16,7 +16,10 @@ date: 2026-10-03
 날짜 단위로만 공개 시점을 알 수 있는 원천에는 버전 있는 시간 규칙(`session_close_plus_lag`,
 `local_day_end`, `exdate_open`)이 `available_at_us`와 `revision_known_at_us`를 정한다. 규칙 값은 실제
 공개 시각보다 이르지 않은 보수적 상한이고, 규칙의 ID와 버전은 승격 명세와 transform hash에 들어간다.
-수집 시각으로 시점을 채우지 않는다는 0010의 요구는 그대로다.
+수집 시각으로 ASSERT 시점을 채우지 않는다는 0010의 요구는 그대로다. 정정·삭제 revision은 그것을 담은
+원천의 증거보다 먼저 알려질 수 없다. record 날짜에서 계산하는 규칙이면 정정·삭제의 시점은 그 원천의
+수집 시각 이상이고, TOMBSTONE의 시점은 부재를 증명한 snapshot의 수집 시각에서 온다. 수집 시각은
+이렇게 하한으로만 쓰이며 null을 채우거나 규칙 값을 낮추지 않는다.
 
 규칙에서 나온 시점을 strict 경로에 쓸지는 소비자가 binding의 grant(허용 규칙 `id@version` 목록)로
 정하고, run 영수증이 그 grant를 기록한다. grant가 없는 규칙의 시점은 알 수 없는 시점과 같게 취급된다.
