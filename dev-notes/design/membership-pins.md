@@ -2,7 +2,7 @@
 
 [`storage/membership_pins.py`](../../src/aegis_alpha/storage/membership_pins.py) owns
 exact registration and SELECT-only reconstruction of two v1 whole-document
-formats. They use the existing [state tables](../../src/aegis_alpha/storage/state_schema.py),
+formats and of the chunked manifests that bind several of them. They use the existing [state tables](../../src/aegis_alpha/storage/state_schema.py),
 not stored JSON, an extra marker, a request bundle, or an identity-resolution
 engine. This is the bounded snapshot/universe prerequisite; subsequent request
 binding work must reuse these bytes and APIs rather than define another codec.
@@ -167,6 +167,64 @@ Independent complete byte/digest vectors live in
 I1's synthetic `source_hash=a*64` is opaque. Its file is exactly empty bytes with
 SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
 
+## Chunked manifests
+
+A document larger than one v1 document is registered as consecutive v1 **parts**
+under one **manifest**. The whole document is first validated with every v1 rule
+except the byte limit and the materialization charge. Its members, in canonical
+order, then fill each part greedily up to both the 1 MiB canonical byte limit and
+the 64 MiB charge, so the same content always yields the same parts. A part carries
+exactly the instruments, assertions and sources its own members reference, and
+identity member ordinals restart at zero in each part.
+
+```text
+IdentityManifest = {
+  schema: "aas-identity-manifest-v1",
+  hash_format: "aas-canonical-json-sha256-v1",
+  snapshot_id: text,
+  parts: [{snapshot_id: text, content_hash: sha}]
+}
+UniverseManifest = {
+  schema: "aas-universe-manifest-v1",
+  hash_format: "aas-canonical-json-sha256-v1",
+  universe_id: text, version: version,
+  parts: [{version: version, content_hash: sha}]
+}
+```
+
+- Part `i` of root `R` is named `R#` plus `i` as five decimal digits, from
+  `#00000` without gaps. Identity parts are `identity_snapshots` rows with that
+  snapshot ID; universe parts are `universe_versions` rows with the root's universe ID
+  and that version. A `#` followed by five digits at the end of an ID or version is
+  reserved for parts, so single-document registration refuses it.
+- The pin's `content_hash` is SHA-256 of the canonical manifest, which must also fit
+  1 MiB. The root header row stores it; there is no stored JSON and no new table.
+  A root is either a v1 document or a manifest, never both.
+- A manifest root has no member rows of its own. A root with member rows, or whose
+  hash is that of the empty v1 document, is read as a v1 document whatever its
+  siblings are named, so v1 documents stored under part-shaped names before the
+  suffix was reserved stay readable. A member row inserted under a manifest root
+  therefore fails reconstruction, on read and on `verify_workspace` alike.
+- A part carries the complete file inventory of every source its members reference,
+  and each file row counts toward the part's charge. A member whose source lists more
+  files than one part can charge (about 2,000 with content-addressed raw paths)
+  cannot be chunked; planning and registration refuse it naming the source and its
+  file count. The total number of members is otherwise unbounded.
+- Reading a manifest pin requires the root header, contiguous parts whose headers
+  rebuild that manifest hash, every part valid as its own v1 document, part member
+  ranges in strictly increasing canonical order, and, for identity, no provider-key
+  overlap in both dimensions between members of different parts. In namespace
+  `issuer` the overlap key is the instrument rather than the token, in a v1 document
+  and across parts alike, because an issuer link names one instrument's issuer. Admission charges
+  the sum of every part against the caller's allowance before materializing any.
+  Parts fill close to the 64 MiB charge, so a manifest needs about 64 MiB of
+  allowance per part; consumer allowances are sized for that by the consumer.
+  `VerifiedMembership.canonical_bytes` is the manifest; `members` are all parts'
+  members in canonical order.
+- Registration is all-or-nothing inside `state.atomic`. A retry with the same content
+  returns the same pin and keeps the original `created_at_us`; different content
+  under an existing root fails without mutation.
+
 ## Public API and ownership
 
 ```python
@@ -181,6 +239,12 @@ register_universe_version(connection, raw: bytes, *,
 read_membership_pins(connection, identity_pin: IdentityPin | None,
                      universe_pin: UniversePin | None, *,
                      max_materialization_bytes: int) -> VerifiedMemberships
+register_identity_manifest(connection, body: Mapping, *,
+                           created_at_us: int) -> IdentityPin
+register_universe_manifest(connection, body: Mapping) -> UniversePin
+plan_membership_manifest(body: Mapping, *, identity: bool) -> MembershipPlan
+membership_parts(connection, pin) -> tuple[IdentityPin | UniversePin, ...]
+verify_membership_pin(connection, pin, *, max_materialization_bytes: int) -> None
 ```
 
 The frozen pin types retain their positional shapes and validation and are
@@ -242,7 +306,9 @@ grid allocations, compute admission ownership, and actual DuckDB limits are not
 changed. Results are complete or explicitly rejected, never truncated.
 
 `verify_workspace` verifies every header, including empty and unreferenced pins,
-one document at a time with a 64 MiB maintenance allowance. Existing backup and
+one document at a time with a 64 MiB maintenance allowance. A manifest header is
+checked from its parts' headers and member bounds; each part is reconstructed as its
+own header. Existing backup and
 new-root restore inherit that same logical verification in addition to physical
 file checks. Copied member/JOIN/interval/source-inventory corruption rejects even
 if outer backup hashes are refreshed; failed restore stays `restore-incomplete`.

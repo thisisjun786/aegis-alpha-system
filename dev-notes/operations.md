@@ -234,6 +234,25 @@ dataset_id·version·generation_id·chain_hash·manifest_hash다. `decision`은 
 `data datasets`에 보이는 generation은 검증한 변환의 결과일 뿐이며 PIT 자격이나 백테스트
 입력으로 자동 승격되지 않는다.
 
+## identity 등록
+
+```bash
+aas identity register --file registry.json --sha256 SHA256 --plan
+aas identity register --file registry.json --sha256 SHA256
+aas identity snapshot --id SNAPSHOT_ID [--provider P] [--namespace N] [--plan]
+aas identity show --instrument INSTRUMENT_ID | --anchor NAMESPACE TOKEN
+aas identity show --key PROVIDER NAMESPACE TOKEN | --snapshot SNAPSHOT_ID
+```
+
+`register`는 `aas-identity-registry-v1` 문서를 파일 SHA-256과 함께 받아 issuer·instrument·assertion을
+state에 덧붙인다. `--plan`은 아무것도 쓰지 않고 새 행·기존 행 수, 충돌, 누락 참조(원천 snapshot,
+issuer, instrument, 정정 대상)를 보고한다. 충돌이나 누락이 하나라도 있으면 적용은 문서 전체를
+거부하며, 같은 문서를 다시 적용하면 바뀌는 것이 없다. assertion이 가리키는 `sl:` 원천은 먼저
+`aas db source-link --apply`로 연결한다. `snapshot`은 선택한 assertion을 chunked identity 문서로
+등록하고 manifest pin(`snapshot_id`, `content_hash`)과 part 목록을 돌려준다. 이 pin이 실행 입력
+bundle의 identity binding이 된다. `show`는 읽기 전용이다. 문서 형식, ID 발급 규칙, 충돌 정의는
+[데이터 수직 계약](design/data-vertical.md#identity-등록과-chunked-문서)이 소유한다.
+
 ## 원천 자료의 승격과 은퇴
 
 원천 자료실 자료를 공급자별 시장 dataset으로 승격하는 명령(`aas data promote`), 원천 ID 연결
