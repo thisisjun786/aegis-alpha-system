@@ -200,11 +200,23 @@ UniverseManifest = {
 - The pin's `content_hash` is SHA-256 of the canonical manifest, which must also fit
   1 MiB. The root header row stores it; there is no stored JSON and no new table.
   A root is either a v1 document or a manifest, never both.
+- A manifest root has no member rows of its own. A root with member rows, or whose
+  hash is that of the empty v1 document, is read as a v1 document whatever its
+  siblings are named, so v1 documents stored under part-shaped names before the
+  suffix was reserved stay readable. A member row inserted under a manifest root
+  therefore fails reconstruction, on read and on `verify_workspace` alike.
+- A part carries the complete file inventory of every source its members reference,
+  and each file row counts toward the part's charge. A member whose source lists more
+  files than one part can charge (about 2,000 with content-addressed raw paths)
+  cannot be chunked; planning and registration refuse it naming the source and its
+  file count. The total number of members is otherwise unbounded.
 - Reading a manifest pin requires the root header, contiguous parts whose headers
   rebuild that manifest hash, every part valid as its own v1 document, part member
   ranges in strictly increasing canonical order, and, for identity, no provider-key
   overlap in both dimensions between members of different parts. Admission charges
   the sum of every part against the caller's allowance before materializing any.
+  Parts fill close to the 64 MiB charge, so a manifest needs about 64 MiB of
+  allowance per part; consumer allowances are sized for that by the consumer.
   `VerifiedMembership.canonical_bytes` is the manifest; `members` are all parts'
   members in canonical order.
 - Registration is all-or-nothing inside `state.atomic`. A retry with the same content

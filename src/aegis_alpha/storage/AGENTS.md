@@ -68,10 +68,14 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   `dart_corp_code`, `norgate_assetid`, `krx_isin`); a ticker, symbol, path or date is
   an assertion, never an anchor, and a non-canonical token is refused rather than
   repaired. Registration (`aas-identity-registry-v1`) appends only: identical rows are
-  reused, a correction is a new assertion naming the one it supersedes and known
-  later, and any conflict or missing reference refuses the whole document. Snapshots
+  reused, a correction is a new assertion naming the one it supersedes, known later
+  than it and never before its source's `retrieved_at_us`, and any conflict or missing
+  reference refuses the whole document. The instrument row is first-registration
+  context; a later issuer or venue is reported, and the time-bounded issuer link is a
+  namespace `issuer` assertion (`issuer_link_token`). Snapshots
   project the registry into a chunked manifest (`membership_pins.register_identity_manifest`):
   deterministic v1 parts named `<root>#NNNNN`, a suffix single documents may not use.
+  A manifest root holds no members; a root with members is read as a v1 document.
 - Every contract in that document has a row in its contract/test table. A change
   that implements a `예정` row adds the named test and flips the row to `구현` in
   the same change; `tests/tools/test_data_vertical_contract.py` enforces both directions.

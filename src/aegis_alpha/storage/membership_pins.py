@@ -489,10 +489,49 @@ def is_part_name(name: str) -> bool:
     return _PART_SUFFIX.search(name) is not None
 
 
+def _root_has_members(connection: sqlite3.Connection, pin: IdentityPin | UniversePin) -> bool:
+    if isinstance(pin, IdentityPin):
+        sql, params = (
+            "SELECT EXISTS(SELECT 1 FROM identity_snapshot_members WHERE snapshot_id=?)",
+            (pin.snapshot_id,),
+        )
+    else:
+        sql, params = (
+            "SELECT EXISTS(SELECT 1 FROM universe_members WHERE universe_id=? AND version=?)",
+            (pin.universe_id, pin.version),
+        )
+    return bool(connection.execute(sql, params).fetchone()[0])
+
+
+def _empty_document_hash(pin: IdentityPin | UniversePin) -> str:
+    body: Record = {
+        "schema": "aas-identity-snapshot-v1"
+        if isinstance(pin, IdentityPin)
+        else "aas-universe-version-v1",
+        "hash_format": _HASH_FORMAT,
+        "instruments": [],
+        "members": [],
+        "sources": [],
+    }
+    if isinstance(pin, IdentityPin):
+        body.update(snapshot_id=pin.snapshot_id, assertions=[])
+    else:
+        body.update(universe_id=pin.universe_id, version=pin.version)
+    return content_sha256(body)
+
+
 def _part_pins(
     connection: sqlite3.Connection, pin: IdentityPin | UniversePin
 ) -> tuple[IdentityPin | UniversePin, ...]:
-    """Return the parts a root names, in order; an empty tuple means a v1 document."""
+    """Return the parts a root names, in order; an empty tuple means a v1 document.
+
+    A manifest root holds no members of its own, so a root with members, or one whose
+    hash is the empty v1 document's, is a v1 document whatever its siblings are named
+    (a store may hold v1 documents named like parts from before the suffix was reserved).
+    Otherwise the siblings named as parts must be contiguous and rebuild the root's hash.
+    """
+    if _root_has_members(connection, pin) or pin.content_hash == _empty_document_hash(pin):
+        return ()
     root = pin.snapshot_id if isinstance(pin, IdentityPin) else pin.version
     width = len(root) + 1 + _PART_DIGITS
     if isinstance(pin, IdentityPin):
@@ -508,11 +547,18 @@ def _part_pins(
             (pin.universe_id, width, len(root) + 1, root + "#"),
         ).fetchall()
     found = sorted((str(name), str(digest)) for name, digest in rows if is_part_name(str(name)))
+    if not found:
+        return ()
     if [name for name, _ in found] != [part_name(root, index) for index in range(len(found))]:
         raise ValueError("membership manifest parts are not contiguous")
-    if isinstance(pin, IdentityPin):
-        return tuple(IdentityPin(name, digest) for name, digest in found)
-    return tuple(UniversePin(pin.universe_id, name, digest) for name, digest in found)
+    parts: tuple[IdentityPin | UniversePin, ...] = (
+        tuple(IdentityPin(name, digest) for name, digest in found)
+        if isinstance(pin, IdentityPin)
+        else tuple(UniversePin(pin.universe_id, name, digest) for name, digest in found)
+    )
+    if hashlib.sha256(_manifest_bytes(pin, parts)).hexdigest() != pin.content_hash:
+        raise ValueError("membership manifest content mismatch")
+    return parts
 
 
 def _manifest_body(
@@ -628,8 +674,6 @@ def _admitted(connection: sqlite3.Connection, pin: IdentityPin | UniversePin) ->
     manifest = None
     if parts:
         manifest = _manifest_bytes(pin, parts)
-        if hashlib.sha256(manifest).hexdigest() != pin.content_hash:
-            raise ValueError("membership manifest content mismatch")
         _manifest_rules(connection, parts)
     charged = []
     total = 0
@@ -710,8 +754,6 @@ def verify_membership_pin(
             max_materialization_bytes=max_materialization_bytes,
         )
         return
-    if hashlib.sha256(_manifest_bytes(pin, parts)).hexdigest() != pin.content_hash:
-        raise ValueError("membership manifest content mismatch")
     _manifest_rules(connection, parts)
 
 
@@ -913,6 +955,17 @@ def _add(part: _Part, member: Record, lookups: _Lookups, *, identity: bool) -> b
     return True
 
 
+def _oversized(member: Record, lookups: _Lookups, *, identity: bool) -> str:
+    reference = lookups.assertions[cast("str", member["assertion_id"])] if identity else member
+    source_id = cast("str", reference["source_snapshot_id"])
+    files = len(_records(lookups.sources[source_id], "files"))
+    return (
+        f"one membership member exceeds the part limits: its source {source_id} lists "
+        f"{files} files, and a part carries the whole file inventory of every source it "
+        "references"
+    )
+
+
 def chunk_membership(body: Record, *, identity: bool) -> tuple[Record, ...]:
     """Split one validated whole document into canonical v1 parts, deterministically.
 
@@ -951,7 +1004,7 @@ def chunk_membership(body: Record, *, identity: bool) -> tuple[Record, ...]:
             continue
         filled.append(_Part([], [], {}, {}, base[0], 0, base[1]))
         if not filled[-2].members or not _add(filled[-1], row, lookups, identity=identity):
-            raise ValueError("one membership member exceeds the part limits")
+            raise ValueError(_oversized(row, lookups, identity=identity))
     if len(filled) > 10**_PART_DIGITS:
         raise ValueError("membership document needs more parts than a manifest can name")
     parts = []

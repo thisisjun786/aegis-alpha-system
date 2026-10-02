@@ -16,12 +16,14 @@ SOURCE = "sl:synthetic-master"
 UNBOUNDED = -(2**63)
 
 
-def link_source(workspace: Workspace, snapshot_id: str = SOURCE, content: bytes = b"m") -> None:
+def link_source(
+    workspace: Workspace, snapshot_id: str = SOURCE, content: bytes = b"m", *, retrieved: int = 2
+) -> None:
     relative, digest, size = put_raw(workspace.paths.raw, content)
     with atomic(workspace.state):
         workspace.state.execute(
-            "INSERT INTO source_snapshots VALUES (?,'source-library',1,2,NULL,'raw_verified')",
-            (snapshot_id,),
+            "INSERT INTO source_snapshots VALUES (?,'source-library',1,?,NULL,'raw_verified')",
+            (snapshot_id, retrieved),
         )
         workspace.state.execute(
             "INSERT INTO source_files VALUES (?,?,?,?)", (snapshot_id, relative, digest, size)
@@ -41,6 +43,7 @@ def instrument(
 def assertion(  # noqa: PLR0913 -- one synthetic row spells every retained column
     token: str,
     *,
+    provider: str = "norgate",
     namespace: str = "ticker",
     value: str | None = None,
     valid: tuple[int, int | None] = (UNBOUNDED, None),
@@ -51,7 +54,7 @@ def assertion(  # noqa: PLR0913 -- one synthetic row spells every retained colum
     key = value if value is not None else token
     return {
         "instrument": anchor(token),
-        "provider": "norgate",
+        "provider": provider,
         "namespace": namespace,
         "token": key,
         "valid_from_us": valid[0],

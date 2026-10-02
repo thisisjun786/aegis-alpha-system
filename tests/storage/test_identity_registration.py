@@ -13,10 +13,12 @@ import pytest
 from aegis_alpha.application.cli import main
 from aegis_alpha.storage.identity import (
     decode_registry,
+    issuer_link_token,
     mint_instrument,
     mint_issuer,
     parse_registry,
     register_identities,
+    snapshot_identities,
 )
 from aegis_alpha.storage.workspace import initialize, open_workspace
 from tests.storage.identity_support import (
@@ -163,10 +165,104 @@ def test_overlapping_unrelated_assertions_conflict(workspace: Workspace) -> None
     assert plan(workspace, moved)["conflict_count"] == 0
 
 
-def test_instrument_attributes_are_immutable(workspace: Workspace) -> None:
+def test_correction_is_never_known_before_its_source(workspace: Workspace) -> None:
+    """A correction takes no knowledge time earlier than the collection that carries it."""
+    link_source(workspace, "sl:late", b"late", retrieved=10**15)
+    apply(workspace, document(instruments=[instrument("1")], assertions=[assertion("1")]))
+    (original,) = assertion_ids(workspace)
+    early = document(
+        assertions=[assertion("1", value="B", known=3, supersedes=original, source="sl:late")]
+    )
+    report = plan(workspace, early)
+    assert [conflict["kind"] for conflict in report["conflicts"]] == ["correction_before_source"]
+    assert report["conflicts"][0]["source_retrieved_at_us"] == 10**15
+    before = image(workspace)
+    with pytest.raises(ValueError, match="1 conflicts"):
+        apply(workspace, early)
+    assert image(workspace) == before
+    known = document(
+        assertions=[assertion("1", value="B", known=10**15, supersedes=original, source="sl:late")]
+    )
+    assert apply(workspace, known)["conflict_count"] == 0
+    # An initial assertion keeps its declared historical knowledge time.
+    history = document(
+        instruments=[instrument("2")], assertions=[assertion("2", known=3, source="sl:late")]
+    )
+    assert plan(workspace, history)["conflict_count"] == 0
+
+
+def test_instrument_row_is_first_registration_context(workspace: Workspace) -> None:
+    """A later venue or issuer is reported and kept as evidence; asset_type still conflicts."""
     apply(workspace, document(instruments=[instrument("1")]))
-    report = plan(workspace, document(instruments=[instrument("1", venue="Nasdaq")]))
+    moved = apply(workspace, document(instruments=[instrument("1", venue="Nasdaq")]))
+    assert (moved["conflict_count"], moved["instrument_difference_count"]) == (0, 1)
+    assert workspace.state.execute("SELECT venue FROM instruments").fetchone()[0] == "NYSE"
+    fund = {**instrument("1"), "asset_type": "fund"}
+    report = plan(workspace, document(instruments=[fund]))
     assert [conflict["kind"] for conflict in report["conflicts"]] == ["instrument_attributes"]
+
+
+def test_issuer_link_after_a_null_issuer(workspace: Workspace) -> None:
+    """An instrument registered without an issuer is linked to one later by assertion."""
+    cik: dict[str, object] = {"anchor_namespace": "sec_cik", "anchor_token": "0000320193"}
+    other: dict[str, object] = {"anchor_namespace": "sec_cik", "anchor_token": "0000789019"}
+    apply(workspace, document(instruments=[instrument("1"), instrument("2")]))
+    issuer, rival = mint_issuer("sec_cik", "0000320193"), mint_issuer("sec_cik", "0000789019")
+    first, second = mint_instrument("norgate_assetid", "1"), mint_instrument("norgate_assetid", "2")
+
+    def link(
+        token: str,
+        issuer_id: str,
+        instrument_id: str,
+        *,
+        known: int = 2,
+        supersedes: str | None = None,
+    ) -> dict[str, object]:
+        value = issuer_link_token(issuer_id, instrument_id)
+        return assertion(
+            token,
+            provider="sec",
+            namespace="issuer",
+            value=value,
+            known=known,
+            supersedes=supersedes,
+        )
+
+    linked = document(
+        issuers=[{**cik, "name": "Apple Inc"}],
+        instruments=[instrument("1", issuer=cik), instrument("2", issuer=cik)],
+        assertions=[link("1", issuer, first), link("2", issuer, second)],
+    )
+    report = apply(workspace, linked)
+    # Two share classes of one issuer are not an overlap; the stored rows keep NULL.
+    assert (report["conflict_count"], report["instrument_difference_count"]) == (0, 2)
+    assert report["new"] == {"issuers": 1, "instruments": 0, "assertions": 2}
+    stored = workspace.state.execute("SELECT issuer_id FROM instruments").fetchall()
+    assert [row[0] for row in stored] == [None, None]
+    # One provider never links one instrument to two issuers at once ...
+    rival_link = document(
+        issuers=[{**other, "name": "Microsoft"}], assertions=[link("1", rival, first, known=5)]
+    )
+    conflicts = plan(workspace, rival_link)["conflicts"]
+    assert [(c["kind"], c["same_instrument"]) for c in conflicts] == [("assertion_overlap", True)]
+    # ... unless the new link corrects the earlier one.
+    (earlier,) = (
+        row[0]
+        for row in workspace.state.execute(
+            "SELECT assertion_id FROM identity_assertions WHERE instrument_id=?", (first,)
+        )
+    )
+    corrected = document(
+        issuers=[{**other, "name": "Microsoft"}],
+        assertions=[link("1", rival, first, known=5, supersedes=earlier)],
+    )
+    assert apply(workspace, corrected)["conflict_count"] == 0
+    snapshot = snapshot_identities(workspace.state, "links", created_at_us=1, apply=True)
+    assert snapshot["members"] == 3  # noqa: PLR2004 -- two links and one correction
+    with pytest.raises(ValueError, match="issuer link token"):
+        parse_registry(document(assertions=[link("1", issuer, second)]))
+    missing = document(assertions=[link("1", mint_issuer("sec_cik", "0000000001"), first)])
+    assert plan(workspace, missing)["missing_count"]["issuers"] == 1
 
 
 def test_missing_references_are_reported_and_refused(workspace: Workspace) -> None:

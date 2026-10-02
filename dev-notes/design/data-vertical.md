@@ -364,6 +364,12 @@ issuer_id     = "iss-" + sha256(정규 JSON ["aas-issuer-v1", anchor_namespace, 
 - 티커·심볼·CUSIP·ISIN과 anchor 자체의 연결은 유효·지식 구간을 가진 `identity_assertions`다.
   `assertion_id`는 `"asr-" + sha256(정규 JSON ["aas-assertion-v1", 나머지 열 10개])`이므로 같은 주장은
   같은 ID다. ETF처럼 issuer가 없는 상품은 issuer null이다.
+- instrument 행(issuer, asset_type, venue)은 처음 등록한 원천의 맥락이다. instrument와 issuer의
+  시점별 연결은 namespace `issuer` assertion이고 token은 `<issuer_id>/<instrument_id>`
+  (`issuer_link_token`)다. 여러 share class가 한 issuer를 가리킬 수 있으므로, 이 namespace의 겹침은
+  token이 아니라 (provider, `issuer`, instrument)로 판정한다. 한 provider는 한 instrument를 같은
+  시점에 두 issuer에 연결하지 않는다. issuer null로 처음 등록한 instrument도 나중 원천이 이 assertion으로
+  issuer를 연결한다.
 
 **등록 문서 `aas-identity-registry-v1`.** `issuers`(anchor, name), `instruments`(anchor, issuer anchor
 또는 null, asset_type, venue), `assertions`(instrument anchor, provider, namespace, token, 유효 구간,
@@ -373,24 +379,32 @@ issuer_id     = "iss-" + sha256(정규 JSON ["aas-issuer-v1", anchor_namespace, 
 - 등록은 append-only다. 이미 있는 같은 행은 재사용하고 새 행만 한 트랜잭션에 넣는다. 같은 문서를
   다시 등록하면 아무것도 바뀌지 않는다. 어떤 경로도 identity 행을 UPDATE·DELETE하지 않는다.
 - 정정은 바꿀 assertion을 `supersedes_assertion_id`로 가리키는 새 assertion이다. 정정의
-  `known_from_us`는 앞 assertion보다 늦어야 한다.
+  `known_from_us`는 앞 assertion보다 늦어야 하고, 정정을 실은 원천 snapshot의 `retrieved_at_us`보다
+  이를 수 없다. 정정은 그 원천을 수집하기 전에는 알려지지 않았기 때문이다. 정정이 아닌 처음
+  assertion은 선언한 과거 `known_from_us`를 그대로 쓴다(시간 규칙은 보수적 상한).
 - `--plan`은 쓰지 않고 새 행·기존 행·충돌·누락 참조를 센다. 충돌이나 누락이 하나라도 있으면
   적용은 문서 전체를 거부한다.
-  - 충돌: 같은 instrument ID에 다른 issuer·asset_type·venue(`instrument_attributes`), 같은 provider
+  - 충돌: 같은 instrument ID에 다른 asset_type(`instrument_attributes`), 같은 provider
     key(provider, namespace, token)의 두 assertion이 유효·지식 구간 모두에서 겹치는데 한쪽이 다른 쪽의
-    정정 chain에 있지 않음(`assertion_overlap`), 앞 assertion보다 늦지 않은 정정(`correction_not_later`).
+    정정 chain에 있지 않음(`assertion_overlap`), 앞 assertion보다 늦지 않은 정정(`correction_not_later`),
+    원천 수집 시각보다 이른 정정(`correction_before_source`).
     assertion의 지식 구간은 `known_from_us`에서 시작해 그것을 정정한 가장 이른 assertion의
     `known_from_us`에서 끝난다.
   - 누락: 등록되지 않은 원천 snapshot(보통 `aas db source-link` 전의 `sl:` 원천), issuer, instrument,
     정정 대상.
 - issuer 이름은 처음 등록한 원천의 표시 이름이다. 다른 이름은 충돌이 아니라
-  `issuer_name_differences`로 보고하고 저장된 이름을 유지한다.
+  `issuer_name_differences`로 보고하고 저장된 이름을 유지한다. 같은 이유로 저장된 instrument와
+  issuer·venue가 다른 선언은 `instrument_differences`로 보고하고 저장된 행을 유지한다. 시점별
+  issuer는 `issuer` assertion, 상장 이전은 ticker@venue assertion이 기록한다.
 
 **snapshot.** `aas identity snapshot --id ID [--provider P] [--namespace N]`은 등록된 assertion을
 identity 문서로 투영한다. 선택한 assertion마다 member 하나이고, 유효 구간은 주장 그대로, 지식 구간은
 위 정의 그대로다. 그래서 정정 이전 cutoff에서는 정정 전 주장이 보인다.
 
-**chunked 문서.** identity와 universe 문서는 크기와 관계없이 manifest 하나와 v1 part들로 등록한다.
+**chunked 문서.** identity와 universe 문서는 manifest 하나와 v1 part들로 등록한다. 전체 member 수에는
+한도가 없지만 part 하나가 member가 참조하는 원천의 파일 목록 전체를 싣기 때문에, 파일 목록이 part
+하나의 charge를 넘는 원천(내용 주소 raw 경로 기준 약 2,000개 파일)을 참조하는 member는 등록할 수 없다.
+`--plan`과 등록은 그 원천 ID와 파일 수를 담아 거부한다.
 
 - part는 [membership pins](membership-pins.md)의 v1 문서(`aas-identity-snapshot-v1`,
   `aas-universe-version-v1`) 그대로이고 이름은 `<root>#00000`부터 이어지는 다섯 자리 번호다.
@@ -400,9 +414,13 @@ identity 문서로 투영한다. 선택한 assertion마다 member 하나이고, 
 - manifest는 `{"schema": "aas-identity-manifest-v1" | "aas-universe-manifest-v1", "hash_format",
   root 키, "parts": [{part 이름, "content_hash"}]}`의 정규 JSON이고 pin의 `content_hash`는 그
   SHA-256이다. root header는 기존 `identity_snapshots`·`universe_versions` 행이며 새 테이블은 없다.
+- manifest root header는 자기 member 행을 갖지 않는다. member가 있는 root는 v1 문서로 읽으므로,
+  manifest root 아래에 끼워 넣은 member 행은 재구성 hash가 맞지 않아 읽기와 검증에서 거부된다.
 - 읽기는 part 전부의 charge 합을 호출자 allowance에서 받은 뒤 part마다 v1으로 재구성하고, part
-  사이의 정규 순서와 identity 구간 겹침을 확인한다. `aas db verify`는 part를 각자 검증하고
-  manifest는 part header와 경계만으로 확인한다.
+  사이의 정규 순서와 identity 구간 겹침을 확인한다. part는 64 MiB charge 가까이 채워지므로 manifest
+  하나를 읽는 데 part 수 × 약 64 MiB의 allowance가 필요하다(Norgate master 110 part ≈ 7 GiB).
+  소비자 allowance를 이 크기에 맞추는 일은 소비자 연결(PR 27)의 몫이다. `aas db verify`는 part를
+  각자 검증하고 manifest는 part header와 경계만으로 확인한다.
 
 ## 대량 게시와 reader
 
@@ -555,3 +573,7 @@ state v2:
 | DV-60 | 35,603건 identity 문서의 part와 manifest hash는 다른 설치에서도 같게 재현된다 | `tests/storage/test_identity_snapshot.py::test_chunked_snapshot_hashes_reproduce` | 구현 |
 | DV-61 | part 이름은 manifest 전용이고 v1 문서와 manifest는 root를 공유하지 않는다 | `tests/storage/test_identity_snapshot.py::test_part_names_are_reserved_for_manifests` | 구현 |
 | DV-62 | 각자 유효한 part 사이의 identity 구간 겹침도 거부한다 | `tests/storage/test_identity_snapshot.py::test_cross_part_overlap_is_rejected` | 구현 |
+| DV-63 | 정정 assertion은 그것을 실은 원천의 수집 시각보다 먼저 알려질 수 없다 | `tests/storage/test_identity_registration.py::test_correction_is_never_known_before_its_source` | 구현 |
+| DV-64 | issuer 없이 등록한 instrument도 나중에 `issuer` assertion으로 issuer에 연결된다 | `tests/storage/test_identity_registration.py::test_issuer_link_after_a_null_issuer` | 구현 |
+| DV-65 | manifest root 아래에 저장된 member 행은 읽기와 검증에서 거부된다 | `tests/storage/test_identity_snapshot.py::test_manifest_root_members_are_rejected` | 구현 |
+| DV-66 | part는 참조하는 원천의 파일 목록 전체를 싣고, 한 part에 들어가지 않는 원천은 거부한다 | `tests/storage/test_identity_snapshot.py::test_source_inventory_bounds_a_part` | 구현 |

@@ -291,6 +291,97 @@ def test_manifest_detects_tampered_or_extra_parts(
         verify_workspace(workspace)
 
 
+def test_manifest_rejects_an_extra_contiguous_part(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(membership_pins, "_MAX_BYTES", 4096)
+    registered(workspace, master(30))
+    pin = register_identity_manifest(
+        workspace.state, identity_document(workspace.state, "m"), created_at_us=1
+    )
+    count = len(membership_parts(workspace.state, pin))
+    with atomic(workspace.state):
+        workspace.state.execute(
+            "INSERT INTO identity_snapshots VALUES (?,?,1)",
+            (membership_pins.part_name("m", count), "0" * 64),
+        )
+    with pytest.raises(ValueError, match="manifest content mismatch"):
+        read(workspace, pin)
+    with pytest.raises(ValueError, match="manifest content mismatch"):
+        verify_workspace(workspace)
+
+
+def test_manifest_root_members_are_rejected(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manifest root holds no members; a row stored under it fails read and verify."""
+    monkeypatch.setattr(membership_pins, "_MAX_BYTES", 4096)
+    registered(workspace, master(30))
+    pin = register_identity_manifest(
+        workspace.state, identity_document(workspace.state, "m"), created_at_us=1
+    )
+    assert len(read(workspace, pin).members) == 30  # noqa: PLR2004 -- every registered row
+    stray = workspace.state.execute("SELECT assertion_id FROM identity_assertions").fetchone()[0]
+    with atomic(workspace.state):
+        workspace.state.execute(
+            "INSERT INTO identity_snapshot_members VALUES ('m',0,?,0,NULL,2,NULL)", (stray,)
+        )
+    with pytest.raises(ValueError, match="content mismatch"):
+        read(workspace, pin)
+    with pytest.raises(ValueError, match="content mismatch"):
+        verify_workspace(workspace)
+
+
+def test_v1_documents_named_like_parts_stay_readable(workspace: Workspace) -> None:
+    """A store may hold independent v1 documents ``x`` and ``x#00000``; both still read."""
+    registered(workspace, master(2))
+    whole = identity_document(workspace.state, "x")
+    rows = {
+        name: cast("list[dict[str, object]]", whole[name])
+        for name in ("members", "assertions", "instruments")
+    }
+    pins = []
+    for name, members in (("x", 1), ("x#00000", 2), ("y", 0), ("y#00003", 1)):
+        chosen = rows["members"][:members]
+        kept = {row["assertion_id"] for row in chosen}
+        assertions = [row for row in rows["assertions"] if row["assertion_id"] in kept]
+        used = {row["instrument_id"] for row in assertions}
+        body = {
+            **whole,
+            "snapshot_id": name,
+            "members": chosen,
+            "assertions": assertions,
+            "instruments": [row for row in rows["instruments"] if row["instrument_id"] in used],
+            "sources": whole["sources"] if members else [],
+        }
+        # Stored before the suffix was reserved, so written as such a store holds them.
+        canonical = membership_pins._canonical(body, identity=True)  # noqa: SLF001 -- legacy store
+        pin = IdentityPin(name, content_sha256(canonical))
+        membership_pins._registered(  # noqa: SLF001 -- legacy store
+            workspace.state, canonical, canonical_json_bytes(canonical), pin, 1
+        )
+        pins.append((pin, members))
+    for pin, members in pins:
+        assert len(read(workspace, pin).members) == members
+        assert membership_parts(workspace.state, pin) == ()
+    assert verify_workspace(workspace)["verified"] is True
+
+
+def test_source_inventory_bounds_a_part(workspace: Workspace) -> None:
+    """A part carries every referenced source's whole inventory, which caps its file count."""
+    registered(workspace, master(1))
+    with atomic(workspace.state):
+        workspace.state.executemany(
+            "INSERT INTO source_files VALUES (?,?,?,1)",
+            (
+                (SOURCE, f"00/{index:062d}", hashlib.sha256(str(index).encode()).hexdigest())
+                for index in range(5000)
+            ),
+        )
+    with pytest.raises(ValueError, match=f"source {SOURCE} lists 5001 files"):
+        snapshot_identities(workspace.state, "wide", created_at_us=1, apply=False)
+
+
 def test_manifest_rejects_a_gap_in_its_parts(
     workspace: Workspace, monkeypatch: pytest.MonkeyPatch
 ) -> None:

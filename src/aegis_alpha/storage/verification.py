@@ -41,13 +41,13 @@ def _verify_membership(workspace: Workspace, allowance: int) -> None:
     """
     for header in workspace.state.execute(
         "SELECT snapshot_id,content_hash FROM identity_snapshots"
-    ).fetchall():
+    ):
         verify_membership_pin(
             workspace.state, IdentityPin(*header), max_materialization_bytes=allowance
         )
     for header in workspace.state.execute(
         "SELECT universe_id,version,content_hash FROM universe_versions"
-    ).fetchall():
+    ):
         verify_membership_pin(
             workspace.state, UniversePin(*header), max_materialization_bytes=allowance
         )

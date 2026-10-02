@@ -106,6 +106,31 @@ def mint_issuer(anchor_namespace: str, token: str) -> str:
     return _mint("iss-", ISSUER_FORMAT, ISSUER_ANCHORS, anchor_namespace, token)
 
 
+# An issuer link is an assertion in this namespace. Many instruments share one issuer, so
+# its token names the pair; one provider links one instrument to one issuer at a time.
+ISSUER_LINK_NAMESPACE = "issuer"
+_ISSUER_LINK_TOKEN = re.compile(r"(iss-[0-9a-f]{64})/(ins-[0-9a-f]{64})")
+
+
+def issuer_link_token(issuer_id: str, instrument_id: str) -> str:
+    """Return the token of the assertion linking ``instrument_id`` to ``issuer_id``."""
+    token = f"{issuer_id}/{instrument_id}"
+    if _ISSUER_LINK_TOKEN.fullmatch(token) is None:
+        raise IdentityAnchorError("an issuer link joins one minted issuer and one instrument")
+    return token
+
+
+def _linked_issuer(assertion: Mapping[str, object]) -> str | None:
+    if assertion["namespace"] != ISSUER_LINK_NAMESPACE:
+        return None
+    match = _ISSUER_LINK_TOKEN.fullmatch(cast("str", assertion["token"]))
+    if match is None or match[2] != assertion["instrument_id"]:
+        raise ValueError(
+            "identity registry issuer link token must be '<issuer_id>/<instrument_id>'"
+        )
+    return match[1]
+
+
 _ASSERTION_COLUMNS = (
     "assertion_id",
     "instrument_id",
@@ -222,6 +247,7 @@ def parse_registry(document: object) -> RegistryDocument:
             "source_snapshot_id": _text(row["source_snapshot_id"], "source_snapshot_id"),
             "source_hash": source_hash,
         }
+        _ = _linked_issuer(record)
         identifier = assertion_id(record)
         if identifier in assertions:
             raise ValueError("identity registry repeats an assertion")
@@ -252,6 +278,7 @@ class RegistrationPlan:
     issuers: list[Record] = field(default_factory=list)
     instruments: list[Record] = field(default_factory=list)
     assertions: list[Record] = field(default_factory=list)
+    instrument_differences: list[Record] = field(default_factory=list)
     existing: dict[str, int] = field(
         default_factory=lambda: {"issuers": 0, "instruments": 0, "assertions": 0}
     )
@@ -286,6 +313,8 @@ class RegistrationPlan:
             "missing_count": {key: len(values) for key, values in self.missing.items()},
             "issuer_name_difference_count": len(self.issuer_name_differences),
             "issuer_name_differences": self.issuer_name_differences[:_REPORT_LIMIT],
+            "instrument_difference_count": len(self.instrument_differences),
+            "instrument_differences": self.instrument_differences[:_REPORT_LIMIT],
         }
 
 
@@ -329,9 +358,9 @@ def _plan_entities(
         )
         if stored is None:
             plan.instruments.append(instrument)
-        elif _same(instrument, stored):
-            plan.existing["instruments"] += 1
-        else:
+            continue
+        plan.existing["instruments"] += 1
+        if stored["asset_type"] != instrument["asset_type"]:
             plan.conflicts.append(
                 {
                     "kind": "instrument_attributes",
@@ -340,6 +369,10 @@ def _plan_entities(
                     "new": instrument,
                 }
             )
+        elif not _same(instrument, stored):
+            # The row is first-registration context. A later issuer or venue is evidence
+            # for an issuer-link or ticker@venue assertion, so it is reported, not refused.
+            plan.instrument_differences.append({"stored": stored, "new": instrument})
 
 
 class _Assertions:
@@ -388,10 +421,12 @@ class _Assertions:
         return self.successor_known.get(identifier)
 
     def registered_with_key(self, key: tuple[object, ...]) -> list[Record]:
+        column = "instrument_id" if key[1] == ISSUER_LINK_NAMESPACE else "token"
         rows = [
             dict(row)
             for row in self.connection.execute(
-                "SELECT * FROM identity_assertions WHERE provider=? AND namespace=? AND token=?",
+                "SELECT * FROM identity_assertions "  # noqa: S608 -- fixed column choice
+                f"WHERE provider=? AND namespace=? AND {column}=?",
                 key,
             )
         ]
@@ -404,12 +439,18 @@ def _overlap(start: int, end: int | None, other_start: int, other_end: int | Non
     return (end is None or other_start < end) and (other_end is None or start < other_end)
 
 
+def _overlap_key(row: Mapping[str, object]) -> tuple[object, ...]:
+    """A provider key names one instrument at a time; an issuer link, one issuer."""
+    last = "instrument_id" if row["namespace"] == ISSUER_LINK_NAMESPACE else "token"
+    return (row["provider"], row["namespace"], row[last])
+
+
 def _plan_overlaps(plan: RegistrationPlan, graph: _Assertions, incoming: Sequence[Record]) -> None:
-    """Any two assertions of one provider key whose valid and known times overlap must be
+    """Any two assertions of one overlap key whose valid and known times overlap must be
     one correction chain; otherwise a consumer could not tell which one to believe."""
     groups: dict[tuple[object, ...], list[Record]] = {}
     for row in incoming:
-        groups.setdefault((row["provider"], row["namespace"], row["token"]), []).append(row)
+        groups.setdefault(_overlap_key(row), []).append(row)
     for key, rows in groups.items():
         new = {cast("str", row["assertion_id"]) for row in rows}
         members = [
@@ -441,41 +482,63 @@ def _plan_overlaps(plan: RegistrationPlan, graph: _Assertions, incoming: Sequenc
                             "kind": "assertion_overlap",
                             "provider": key[0],
                             "namespace": key[1],
-                            "token": key[2],
+                            "token": left["token"],
                             "assertion_ids": sorted(ids),
                             "same_instrument": left["instrument_id"] == right["instrument_id"],
                         }
                     )
 
 
+def _retrieved(connection: sqlite3.Connection, source: str) -> int | None:
+    row = _row(connection, "source_snapshots", "snapshot_id", source)
+    return None if row is None else cast("int", row["retrieved_at_us"])
+
+
 def _plan_references(
     connection: sqlite3.Connection,
     incoming: Sequence[Record],
-    declared: set[object],
+    declared: Mapping[str, set[object]],
     graph: _Assertions,
     plan: RegistrationPlan,
 ) -> None:
-    sources: dict[str, bool] = {}
+    sources: dict[str, int | None] = {}
     for assertion in incoming:
         instrument_id = cast("str", assertion["instrument_id"])
-        if instrument_id not in declared and (
+        if instrument_id not in declared["instruments"] and (
             _row(connection, "instruments", "instrument_id", instrument_id) is None
         ):
             plan.missing["instruments"].add(instrument_id)
+        issuer_id = _linked_issuer(assertion)
+        if (
+            issuer_id is not None
+            and issuer_id not in declared["issuers"]
+            and _row(connection, "issuers", "issuer_id", issuer_id) is None
+        ):
+            plan.missing["issuers"].add(issuer_id)
         source = cast("str", assertion["source_snapshot_id"])
         if source not in sources:
-            sources[source] = (
-                _row(connection, "source_snapshots", "snapshot_id", source) is not None
-            )
-        if not sources[source]:
+            sources[source] = _retrieved(connection, source)
+        retrieved = sources[source]
+        if retrieved is None:
             plan.missing["sources"].add(source)
         predecessor_id = cast("str | None", assertion["supersedes_assertion_id"])
         if predecessor_id is None:
             continue
+        known = cast("int", assertion["known_from_us"])
+        if retrieved is not None and known < retrieved:
+            # A correction is never known before the source that carries it was collected.
+            plan.conflicts.append(
+                {
+                    "kind": "correction_before_source",
+                    "assertion_id": assertion["assertion_id"],
+                    "known_from_us": known,
+                    "source_retrieved_at_us": retrieved,
+                }
+            )
         predecessor = graph.get(predecessor_id)
         if predecessor is None:
             plan.missing["predecessors"].add(predecessor_id)
-        elif cast("int", assertion["known_from_us"]) <= cast("int", predecessor["known_from_us"]):
+        elif known <= cast("int", predecessor["known_from_us"]):
             plan.conflicts.append(
                 {
                     "kind": "correction_not_later",
@@ -503,7 +566,10 @@ def _plan_assertions(
         else:
             raise ValueError("stored identity assertion disagrees with its content ID")
     graph = _Assertions(connection, incoming)
-    declared = {instrument["instrument_id"] for instrument in document.instruments}
+    declared = {
+        "instruments": {instrument["instrument_id"] for instrument in document.instruments},
+        "issuers": {issuer["issuer_id"] for issuer in document.issuers},
+    }
     _plan_references(connection, incoming, declared, graph, plan)
     plan.assertions = _dependency_order(incoming)
     _plan_overlaps(plan, graph, incoming)
