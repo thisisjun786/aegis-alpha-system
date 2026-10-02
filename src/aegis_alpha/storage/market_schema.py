@@ -166,7 +166,27 @@ DOMAINS = {
         ("value", "DOUBLE?"),
         ("value_state", "VARCHAR"),
     ),
+    "filings": (
+        ("issuer_id", "VARCHAR"),
+        ("filing_id", "VARCHAR"),
+        ("form", "VARCHAR"),
+        ("filed_date", "DATE"),
+        ("accepted_at_us", "BIGINT?"),
+        ("period_end", "DATE?"),
+    ),
+    "classifications": (
+        ("subject_id", "VARCHAR"),
+        ("subject_kind", "VARCHAR"),
+        ("scheme", "VARCHAR"),
+        ("code", "VARCHAR"),
+        ("label", "VARCHAR"),
+        ("effective_from", "DATE"),
+        ("effective_to", "DATE?"),
+    ),
 }
+# The core schema version that first holds each domain table. A v1 store has none of
+# the v2 tables, so a domain is written or scanned only where the store reached it.
+DOMAIN_VERSIONS = {name: 2 if name in {"filings", "classifications"} else 1 for name in DOMAINS}
 NATURAL_KEYS = {
     "prices": (
         "instrument_id",
@@ -200,6 +220,9 @@ NATURAL_KEYS = {
         "instrument_id",
         "feature_at_us",
     ),
+    # One accession can name several co-registrants, so the issuer is part of the key.
+    "filings": ("issuer_id", "filing_id"),
+    "classifications": ("subject_kind", "subject_id", "scheme", "effective_from"),
 }
 RESULTS = {
     "signals": (
@@ -254,7 +277,15 @@ def columns_sql(columns: tuple[tuple[str, str], ...]) -> str:
     )
 
 
-def domain_ddl(name: str, columns: tuple[tuple[str, str], ...]) -> str:
+# v2 adds which price fields a row carries. It is a stored column with a default rather
+# than one of the domain's hashed fields, because every row a v1 store holds is OHLCV and
+# its recorded delta hashes must keep verifying; see market.py for how a close-only row
+# enters the hash.
+PRICE_FIELDS = ("fields", "VARCHAR")
+PRICE_FIELD_VALUES = ("ohlcv", "close")
+
+
+def domain_ddl(name: str, columns: tuple[tuple[str, str], ...], *, fields: bool = False) -> str:
     checks = """
  PRIMARY KEY(generation_id,record_id,revision_id), UNIQUE(record_id,revision_id),
  FOREIGN KEY(generation_id) REFERENCES market_generations(generation_id),
@@ -274,10 +305,27 @@ def domain_ddl(name: str, columns: tuple[tuple[str, str], ...]) -> str:
             ", CHECK(price_role IN ('canonical','reference')), "
             "CHECK(basis='unadjusted' OR price_role='reference')"
         )
-    return f'CREATE TABLE "{name}" ({columns_sql(COMMON + columns)}, {checks});'
+    if name == "prices" and fields:
+        checks += (
+            ", CHECK(\"fields\" IN ('ohlcv','close')), "
+            "CHECK(\"fields\"='ohlcv' OR (price_role='reference' AND \"open\" IS NULL AND "
+            '"high" IS NULL AND "low" IS NULL AND "volume" IS NULL))'
+        )
+    if name == "filings":
+        checks += ", CHECK(accepted_at_us IS NULL OR accepted_at_us>=0)"
+    if name == "classifications":
+        checks += ", CHECK(effective_to IS NULL OR effective_to>effective_from)"
+    body = columns_sql(COMMON + columns)
+    if fields:
+        body += ", \"fields\" VARCHAR NOT NULL DEFAULT 'ohlcv'"
+    return f'CREATE TABLE "{name}" ({body}, {checks});'
 
 
-DDL = BASE_DDL + "\n".join(domain_ddl(name, columns) for name, columns in DOMAINS.items())
+# The v1 DDL is a recorded fact: every installed store's schema_migrations row 1 is the
+# SHA-256 of exactly these bytes, so it is built from the v1 domains alone.
+DDL = BASE_DDL + "\n".join(
+    domain_ddl(name, columns) for name, columns in DOMAINS.items() if DOMAIN_VERSIONS[name] == 1
+)
 RESULT_COMMON = (
     ("run_id", "VARCHAR"),
     ("module", "VARCHAR"),
@@ -289,3 +337,36 @@ DDL += "\n".join(
     "PRIMARY KEY(run_id,module,ordinal), FOREIGN KEY(run_id) REFERENCES result_commits(run_id));"
     for name, columns in RESULTS.items()
 )
+
+QUALITY_FLAGS_DDL = """
+CREATE TABLE quality_flags (
+ generation_id VARCHAR NOT NULL REFERENCES market_generations(generation_id),
+ record_id VARCHAR NOT NULL, revision_id VARCHAR NOT NULL, rule_id VARCHAR NOT NULL,
+ rule_version VARCHAR NOT NULL, flag VARCHAR NOT NULL, detail VARCHAR,
+ PRIMARY KEY(generation_id,record_id,revision_id,rule_id,rule_version,flag)
+);
+"""
+_PRICE_COLUMNS = ",".join(f'"{name}"' for name, _ in COMMON + DOMAINS["prices"])
+_PRICE_COPY = (
+    f'INSERT INTO "prices" ({_PRICE_COLUMNS}) SELECT {_PRICE_COLUMNS} FROM "prices_v1_rebuild";'  # noqa: S608 -- code-owned schema
+)
+# DuckDB cannot add a CHECK to an existing table, so prices is rebuilt: the v1 table is
+# renamed aside, the v2 table takes its name, every row is copied as OHLCV, and the old
+# table is dropped. The whole text runs in one transaction.
+V2_DDL = (
+    'ALTER TABLE "prices" RENAME TO "prices_v1_rebuild";\n'
+    + domain_ddl("prices", DOMAINS["prices"], fields=True)
+    + "\n"
+    + _PRICE_COPY
+    + '\nDROP TABLE "prices_v1_rebuild";\n'
+    + "\n".join(
+        domain_ddl(name, columns)
+        for name, columns in DOMAINS.items()
+        if DOMAIN_VERSIONS[name] == 2  # noqa: PLR2004 -- the version this text installs
+    )
+    + QUALITY_FLAGS_DDL
+)
+# Each version's text in order; version N's schema_migrations checksum is SHA-256 of
+# MIGRATIONS[N - 1]. A fresh store applies all of them in one transaction, so a migrated
+# store and a new one hold the same objects and the same receipts.
+MIGRATIONS = (DDL, V2_DDL)

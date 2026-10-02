@@ -332,9 +332,9 @@ DB 내부 transaction만으로 세 파일의 snapshot이 일치한다고 주장�
 복원된 DB의 논리 store_id는 유지하되 새 배포 인스턴스 식별자는 별도 발급해 경로·잠금을 재생성한다.
 
 core schema 업그레이드는 [스키마 v2 계약](data-vertical.md#스키마-v2)을 따른다. 설치 잠금과 검증된 백업 뒤에
-대상 schema version과 checksum을 기록하며, 이전 버전의 checksum 행도 남긴다. 현재 설치본은 v1이다.
-SQLite와 DuckDB 중 하나만 성공하면 설치는 migration-incomplete로 남고 호환되지 않는 앱은
-기동하지 않는다. 재개 또는 새 루트 백업 복원만 허용한다. 이미지 rollback이 DB downgrade를
+대상 schema version과 checksum을 기록하며, 이전 버전의 checksum 행도 남긴다. 새 설치본은 v2이고,
+v1 설치본은 `aas db migrate --to 2`로 올린다. SQLite와 DuckDB 중 하나만 성공하면 설치는
+migration-incomplete로 남고 앱은 그 설치본을 열지 않는다. 재개 또는 새 루트 백업 복원만 허용한다. 이미지 rollback이 DB downgrade를
 자동 해결하지 않는다. DB 파일 형식과 앱 schema의 호환성 검사는 각각 수행한다.
 
 ## 전환 계획과 기존 코드
@@ -344,9 +344,9 @@ SQLite와 DuckDB 중 하나만 성공하면 설치는 migration-incomplete로 �
 
 | 단계 | 현재 상태와 소유 코드 | 남은 작업과 완료 기준 |
 | --- | --- | --- |
-| L1 저장소 기반 | 로컬 경로 구현: `storage/paths.py`, `workspace.py`, `locks.py`, `sqlite.py`, 세 schema 파일. `tests/storage/test_workspace.py`에 초기화·잠금·정체성 거부 사례 | 현재 초기화·검증 경로 유지. 명시적 v2 업그레이드와 서비스 소유권 인계는 미구현이며 별도 실패·복구 계약 검증 필요 |
+| L1 저장소 기반 | 로컬 경로 구현: `storage/paths.py`, `workspace.py`, `locks.py`, `sqlite.py`, 세 schema 파일. `tests/storage/test_workspace.py`에 초기화·잠금·정체성 거부 사례 | 현재 초기화·검증 경로 유지. core schema v2 업그레이드는 `storage/migration.py`·`aas db migrate`(`tests/storage/test_migration.py`). 서비스 소유권 인계는 미구현이며 별도 실패·복구 계약 검증 필요 |
 | L2 전략·상태 | bundle 등록·로드와 영수증 구현: `strategies.py`, `strategy_import.py`, `state.py`. CLI는 등록·목록 제공; lineage·원래 성과용 schema 존재 | 원래 성과·비교 조건의 전체 입력 경로, 실행 입력 bundle·run 소비자 연결 필요. schema만으로 DB 재실행 완료를 주장하지 않음 |
-| L3 시장·publication | typed JSON import, generation·revision 조회, 중단 게시 재개 구현: `import_document.py`, `market.py`, `publication.py`; `tests/storage/test_market.py`, `test_publication.py`에 합성 사례 | 원천 자료실에서의 승격·대량 게시·`read_heads`·identity 등록·스키마 v2는 [데이터 수직 대응표](data-vertical.md#계약과-테스트-대응표)의 `예정` 행이 남은 작업이다. 기존 `data/catalog_access.py`·`pinned_prices.py`, identity/metadata 소비자와 수집기 전환 필요 |
+| L3 시장·publication | typed JSON import, generation·revision 조회, 중단 게시 재개 구현: `import_document.py`, `market.py`, `publication.py`; `tests/storage/test_market.py`, `test_publication.py`에 합성 사례 | 원천 자료실에서의 승격·대량 게시·`read_heads`·identity 등록은 [데이터 수직 대응표](data-vertical.md#계약과-테스트-대응표)의 `예정` 행이 남은 작업이다. 기존 `data/catalog_access.py`·`pinned_prices.py`, identity/metadata 소비자와 수집기 전환 필요 |
 | L4 수집·실행 | `collection/`, `data/`의 공급자 도구와 `application/daily_collection.py`는 전환 전 경로. 저장 전략→고정 입력→계산→봉투는 `application/backtest_prepare.py`·`aas prepare`가 SELECT-only로 연결(`tests/application/test_backtest_prepare.py`, `test_prepare_cli.py`에 합성 사례); 봉투 회계는 기존 `aas backtest`. `storage/run_schema.py`의 run 추가 스키마와 `backtest_requests.py`의 정규 요청 저장 API를 `application/run_backtest.py`·`aas run`이 소비해 요청 등록·`open_run`·잠금 없는 계산·`commit_run`·run ID 조회를 잇는다(`tests/application/test_run_backtest.py`에 합성 사례). 명시적 `aas db run-install` 필요 | 수집기 내장 DB 이식, 예산·watermark 결합, 결과 복원 연결 필요. 준비·실행 출력은 `certified=false`이며 불확실 호출·부분 결과·재시작 시나리오를 검증해야 완료 |
 | L5 설치·백업 | native CLI와 선택적 단일 이미지, `storage/backup.py`의 일관 백업·새 루트 복원 구현. `tests/storage/test_backup.py`에 합성 복원·손상 거부 사례 | 0013의 상시 앱·소켓·예약 실행, 자동 업그레이드, artifact 게시·실제 자료 이전은 미완료. 구현·게시·운영 검증을 각각 기록 |
 | L6 구경로 제거 | PostgreSQL adapter·Alembic chain·Parquet reader와 `legacy` 추가 의존성 유지 | 앞 단계에서 모든 호출자와 실패 계약을 대체한 뒤 미사용 코드·의존성·관련 테스트·CI 선택을 함께 정리. 현재 제거 완료로 표시하지 않음 |

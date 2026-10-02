@@ -7,8 +7,8 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from aegis_alpha.storage.sqlite import initialize
-from aegis_alpha.storage.state_schema import DDL
+from aegis_alpha.storage.sqlite import initialize, upgrade, validate_schema
+from aegis_alpha.storage.state_schema import MIGRATIONS
 
 
 @contextmanager
@@ -28,8 +28,23 @@ def atomic(connection: sqlite3.Connection) -> Iterator[None]:
         raise
 
 
-def initialize_state(connection: sqlite3.Connection, installation_id: str) -> None:
-    initialize(connection, installation_id, "state", DDL)
+def initialize_state(
+    connection: sqlite3.Connection, installation_id: str, *, version: int | None = None
+) -> int:
+    """Create the state store at ``version`` (the newest by default), or validate it."""
+    return initialize(
+        connection, installation_id, "state", MIGRATIONS[0], MIGRATIONS[1:], version=version
+    )
+
+
+def state_version(connection: sqlite3.Connection, installation_id: str) -> int:
+    """The state store's validated core schema version."""
+    return validate_schema(connection, installation_id, "state", MIGRATIONS)
+
+
+def upgrade_state(connection: sqlite3.Connection, installation_id: str, target: int) -> int:
+    """Apply the state core schema versions up to ``target`` in one transaction."""
+    return upgrade(connection, installation_id, "state", MIGRATIONS, target)
 
 
 def get_operation(connection: sqlite3.Connection, operation_id: str) -> dict[str, object] | None:

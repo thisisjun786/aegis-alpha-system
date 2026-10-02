@@ -287,3 +287,26 @@ DDL = _BASE + "\n".join(
     for table in _IMMUTABLE
     for action in ("UPDATE", "DELETE")
 )
+# v2 records each retired source library table once. The row is the proof that let it go:
+# the digest of what was removed, the source it was equivalent to under a named comparison,
+# and the backup that still holds it. The operation it names must exist.
+V2_DDL = """
+CREATE TABLE source_retirements (
+ source_id TEXT PRIMARY KEY, digest TEXT NOT NULL CHECK(length(digest)=64),
+ rows INTEGER NOT NULL CHECK(rows>=0), reason TEXT NOT NULL,
+ equivalent_to_source_id TEXT NOT NULL, equivalence_spec TEXT NOT NULL,
+ equivalence_digest TEXT NOT NULL CHECK(length(equivalence_digest)=64),
+ backup_id TEXT NOT NULL,
+ operation_id TEXT NOT NULL REFERENCES storage_operations(operation_id),
+ retired_at_us INTEGER NOT NULL CHECK(retired_at_us>=0),
+ CHECK(equivalent_to_source_id!=source_id)
+) STRICT;
+""" + "\n".join(
+    "CREATE TRIGGER immutable_source_retirements_"
+    + action.lower()
+    + f" BEFORE {action} ON source_retirements BEGIN SELECT RAISE(ABORT,'immutable record'); END;"
+    for action in ("UPDATE", "DELETE")
+)
+# Version N's schema_migrations checksum covers MIGRATIONS[N - 1]; version 1 also covers
+# the common identity tables sqlite.py prepends, exactly as it always has.
+MIGRATIONS = (DDL, V2_DDL)
