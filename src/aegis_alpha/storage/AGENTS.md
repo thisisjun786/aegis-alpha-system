@@ -39,6 +39,18 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   `request_hash`, `source_id`) has a frozen expected digest. Source retirement
   requires no references (the source's own `sl:` link is lineage, not a reference),
   an equivalence digest and an other-device backup, and never removes `raw/` bytes.
+- `source_identity` owns the content source ID (`aas-source-id-v1` over the raw
+  addresses, sizes and hashes of the original files plus the output schema major)
+  and the `sl:` link. Loader code and transform hashes go to `metadata.lineage`,
+  never into the ID or the request hash, so a code-only change reuses the source.
+  One ID names one file group, so a loader commits one source per complete
+  original unit whose boundary the bytes fix (one job's `complete.json` and the
+  files it lists, or one whole original manifest), never per loader-sized batch;
+  a loader that regroups files mints new IDs. The explicit-ID path cannot claim
+  the content namespace. The link is derived from the commit marker, its completed
+  intent and `raw/` alone; it never takes a new wall clock, and a differing
+  recorded link is refused. A completed content commit must be linked and keep its
+  ID document in raw; `db recover` links one interrupted before its link.
 - Every contract in that document has a row in its contract/test table. A change
   that implements a `예정` row adds the named test and flips the row to `구현` in
   the same change; `tests/tools/test_data_vertical_contract.py` enforces both directions.
