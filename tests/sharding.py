@@ -30,6 +30,7 @@ _SHARD = re.compile(r"([1-9][0-9]{0,2})/([1-9][0-9]{0,2})\Z")
 _MILLISECONDS = 1000
 _DEFAULT_TEST_MILLISECONDS = 1000
 _SHARD_SUMMARY = pytest.StashKey[str]()
+_EMPTY_SHARD = pytest.StashKey[bool]()
 
 
 def parse_shard(value: str) -> tuple[int, int]:
@@ -151,6 +152,16 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     config.stash[_SHARD_SUMMARY] = (
         f"test shard {index}/{count}: {len(files)} files, {len(kept)} tests"
     )
+    # More shards than selected files leaves this one nothing by design.
+    config.stash[_EMPTY_SHARD] = bool(dropped) and not kept
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    # An empty shard of a non-empty selection is a pass; an empty selection stays exit 5.
+    if exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED and session.config.stash.get(
+        _EMPTY_SHARD, False
+    ):
+        session.exitstatus = pytest.ExitCode.OK
 
 
 def pytest_report_collectionfinish(config: pytest.Config) -> str | None:

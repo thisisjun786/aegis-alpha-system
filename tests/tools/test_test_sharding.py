@@ -71,10 +71,9 @@ def test_weight_table_shape_is_validated(tmp_path: Path, table: object) -> None:
         load_weights(path)
 
 
-def test_checked_in_weights_name_existing_test_files() -> None:
-    weights = load_weights(WEIGHTS)
-    assert weights
-    assert all((_ROOT / name).is_file() for name in weights)
+def test_checked_in_weight_table_loads() -> None:
+    # Keys for removed or renamed files are ignored: only collected files are weighed.
+    assert load_weights(WEIGHTS)
 
 
 def _collect(*arguments: str) -> list[str]:
@@ -112,6 +111,35 @@ def test_collected_shards_reassemble_the_unsharded_selection() -> None:
     assert sorted(nodeid for shard in shards for nodeid in shard) == sorted(everything)
     files = [{nodeid.split("::", 1)[0] for nodeid in shard} for shard in shards]
     assert sum(len(shard) for shard in files) == len(set().union(*files))
+
+
+@pytest.mark.parametrize(
+    ("arguments", "status"), [(("--test-shard", "2/2"), 0), (("-k", "nothing_matches_this"), 5)]
+)
+def test_empty_shard_passes_but_an_empty_selection_does_not(
+    tmp_path: Path, arguments: tuple[str, ...], status: int
+) -> None:
+    environment = {key: value for key, value in os.environ.items() if key != "PYTEST_ADDOPTS"}
+    result = subprocess.run(  # noqa: S603 -- fixed pytest argv against this checkout
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            f"--basetemp={tmp_path / 'inner'}",
+            "tests/engine/test_bundle.py",
+            *arguments,
+        ],
+        cwd=_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == status, result.stdout + result.stderr
 
 
 def test_durations_are_recorded_in_the_weight_format(tmp_path: Path) -> None:

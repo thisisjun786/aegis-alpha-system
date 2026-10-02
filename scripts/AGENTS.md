@@ -6,7 +6,7 @@ Follow [POLICY.md](../POLICY.md) for CI composition and local verification scope
 
 | Entry point | Current behavior |
 |---|---|
-| `verify` | Full local Python regression: style, types, database-free tests, PostgreSQL tests, package build/install smoke |
+| `verify` | Full local Python regression: style, types, database-free tests (unsharded), PostgreSQL tests, package build/install smoke; the test lane budget is twice its measured serial duration |
 | `verify-lib.sh` | Shared locked preparation, validated prepared tokens, owned process handling and synthetic CLI smoke oracle |
 | `verify-lane-style` | Combined format/lint; standalone setup installs locked development tools only |
 | `verify-lane-format` / `verify-lane-lint` | Standalone ruff checks |
