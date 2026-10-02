@@ -15,6 +15,7 @@ import subprocess
 import sys
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import duckdb
@@ -33,7 +34,7 @@ from aegis_alpha.storage.migration import (
     migrate_core_schema,
     plan_core_migration,
 )
-from aegis_alpha.storage.state import prepare_operation
+from aegis_alpha.storage.state import complete_operation, prepare_operation
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace
 from tests.storage.test_publication import document
@@ -51,16 +52,73 @@ RECORDED_STATE = (
 )
 _KILLED = 137
 _HASH = "c" * 64
+_GENERATIONS = ("synthetic-generation", "mixed-generation")
+# The (delta_hash, chain_hash) markers v1 code records for the two generations
+# v1_installation publishes. They were produced by the code before v2 existed, so a
+# change to the hashed shape of a v1 row fails here rather than on an operator's store.
+V1_MARKERS = {
+    "synthetic-generation": (
+        "f877f98d647418a53ce92f3ae01eff2ad9ddfea250bd9e38e76f358cd8684ebf",
+        "1a44014585a39d0b1799cb952b95cda5fde20ab6ae1cabcf9a38cc2610fa4bba",
+    ),
+    "mixed-generation": (
+        "189c775c11945d79a7851c486795ca5b444c4a5acc0788a474dda7dfba1b8fa0",
+        "08da0282252b2bfc2345e9b8ffc06b859acf1a6744d4729f6b4d582a49c19e6d",
+    ),
+}
+
+
+def price(day: str, **changes: object) -> dict[str, object]:
+    row = json.loads(document())["rows"][0]
+    return {**row, "session_date": day, "revision_id": "r-" + day, **changes}
+
+
+def mixed_document() -> bytes:
+    """A v1 generation of a present, a missing and an adjusted reference row."""
+    imported = json.loads(document())
+    absent = dict.fromkeys(("open", "high", "low", "close", "volume"))
+    imported.update(
+        dataset_id="mixed-prices",
+        generation_id="mixed-generation",
+        operation_id="mixed-import",
+        rows=[
+            price("2026-01-05"),
+            price(
+                "2026-01-06",
+                **absent,
+                value_state="missing",
+                available_at_us=None,
+                revision_known_at_us=None,
+            ),
+            price(
+                "2026-01-07",
+                basis="split_adjusted",
+                price_role="reference",
+                open="5",
+                high="6",
+                low="4.5",
+                close="5.5",
+                volume="200",
+            ),
+        ],
+    )
+    return json.dumps(imported).encode()
 
 
 def v1_installation(root: Path) -> Path:
-    """A v1 installation holding one committed prices generation."""
+    """A v1 installation holding two committed prices generations.
+
+    The publication clock is fixed, so each generation's recorded hashes are the same
+    on every run and can be compared with the ones v1 code recorded.
+    """
     home = root / "home"
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(workspace, "_INSTALL_VERSION", 1)
         initialize(home)
-    with open_workspace(home, writable=True) as admitted:
-        publication.publish_document(admitted, parse_import(document()))
+        patch.setattr(publication, "time", SimpleNamespace(time_ns=lambda: 10**15))
+        with open_workspace(home, writable=True) as admitted:
+            for imported in (document(), mixed_document()):
+                publication.publish_document(admitted, parse_import(imported))
     return home
 
 
@@ -84,10 +142,24 @@ def file_digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def stored_v1_generation(home: Path) -> tuple[dict[str, object], list[dict[str, object]]]:
+def stored_v1_generation(home: Path) -> dict[str, object]:
+    """Each v1 generation's verified marker and rows, as the installation reads them."""
     with open_workspace(home) as admitted:
-        marker = verify_generation(admitted.market, "synthetic-generation")
-        return marker, read_generation(admitted.market, "synthetic-generation")
+        return {
+            generation: (
+                verify_generation(admitted.market, generation),
+                read_generation(admitted.market, generation),
+            )
+            for generation in _GENERATIONS
+        }
+
+
+def recorded_hashes(home: Path) -> dict[str, tuple[object, object]]:
+    stored = cast("dict[str, tuple[dict[str, object], object]]", stored_v1_generation(home))
+    return {
+        generation: (marker["delta_hash"], marker["chain_hash"])
+        for generation, (marker, _) in stored.items()
+    }
 
 
 def kill_at(home: Path, step: str, backup: Path) -> int:
@@ -234,14 +306,16 @@ def test_incomplete_migration_refuses_normal_open(tmp_path: Path) -> None:
 
 def test_migration_keeps_v1_receipt_and_rejects_unknown(tmp_path: Path) -> None:
     home = v1_installation(tmp_path)
-    marker, rows = stored_v1_generation(home)
+    before = stored_v1_generation(home)
+    assert recorded_hashes(home) == V1_MARKERS
     report = migrate_core_schema(home, to_version=2, backup_output=tmp_path / "backup")
     assert report["receipts"] == {
         "state": [[1, RECORDED_STATE[0]], [2, RECORDED_STATE[1]]],
         "market": [[1, RECORDED_MARKET[0]], [2, RECORDED_MARKET[1]]],
     }
-    # A v1 generation keeps its recorded hashes and reads back unchanged.
-    assert stored_v1_generation(home) == (marker, rows)
+    # A v1 generation keeps the hashes v1 code recorded and reads back unchanged.
+    assert recorded_hashes(home) == V1_MARKERS
+    assert stored_v1_generation(home) == before
     assert migrate_core_schema(home, to_version=2, backup_output=None)["migrated"] is False
     for target in (1, 3):
         with pytest.raises(CoreSchemaError, match="core_schema_unknown_version"):
@@ -454,6 +528,27 @@ def test_migration_refuses_beside_a_prepared_operation(tmp_path: Path) -> None:
         migrate_core_schema(home, to_version=2, backup_output=tmp_path / "backup")
     assert not (tmp_path / "backup").exists()
     assert versions(home) == {"state": 1, "market": 1}
+
+
+def test_a_completed_step_intent_outlives_later_steps(tmp_path: Path) -> None:
+    home = v1_installation(tmp_path)
+    migrate_core_schema(home, to_version=2, backup_output=tmp_path / "backup")
+    # A later step records its own intent under the same kind; the v2 intent still
+    # matches its own step, so the installation reads as current, not invalid.
+    with open_workspace(home, writable=True) as admitted:
+        prepare_operation(
+            admitted.state,
+            operation_id="core-schema-migrate-v3",
+            kind="core-schema-migrate",
+            request_hash=_HASH,
+            target_id=admitted.installation_id,
+            expected_parent=None,
+            payload_hash=_HASH,
+        )
+        complete_operation(admitted.state, "core-schema-migrate-v3", _HASH)
+    with open_workspace(home) as admitted:
+        status = inspect_core_schema(admitted)
+        assert (status.state, status.migration_phase) == ("current", "COMPLETED")
 
 
 def test_plan_writes_nothing_and_names_the_recorded_checksums(

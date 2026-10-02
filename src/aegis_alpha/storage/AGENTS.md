@@ -18,8 +18,10 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   that version's DDL text, and `store_info` and the installation receipt name the last.
   `aas init` applies every version in one transaction; `aas db migrate` is the only
   upgrade (backup, intent, market, state, receipt, completion) and a prepared intent
-  makes ordinary admission refuse the installation until the command is repeated. The
-  v1 DDL bytes are a recorded fact, so v1 is built from the v1 domains alone. A v1 store
+  makes ordinary admission refuse the installation until the command is repeated. Each
+  step's intent has its own operation id and a request bound to that step's versions
+  and checksums, so a completed step's intent still matches after later versions exist.
+  The v1 DDL bytes are a recorded fact, so v1 is built from the v1 domains alone. A v1 store
   stays usable; writes that need a v2 table or a close-only price name the migration.
   `prices.fields` defaults to `ohlcv`, an OHLCV row reads and hashes in its v1 shape,
   and a generation holding a `close` row hashes `fields` for every row.

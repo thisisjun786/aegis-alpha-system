@@ -8,7 +8,9 @@ applied version, so a migrated store records ``(1, v1), (2, v2)``.
 
 An installation stopped anywhere after the intent is migration-incomplete. Ordinary
 admission refuses it, and repeating the command finishes the remaining steps without a
-second backup. The run add-on has its own versions and is independent of this one.
+second backup. The intent is ``core-schema-migrate-v2``, and its identity is bound to
+the v1 to v2 step rather than to ``CORE_VERSION``. The run add-on has its own versions
+and is independent of this one.
 """
 
 from __future__ import annotations
@@ -44,11 +46,17 @@ if len(STATE_CHECKSUMS) != CORE_VERSION:
     raise RuntimeError("state and market core schemas must know the same versions")
 MIGRATION_KIND = "core-schema-migrate"
 MIGRATION_OPERATION = "core-schema-migrate-v2"
+# The step this operation names. Its intent identity is bound to this step, not to
+# CORE_VERSION, so a completed intent keeps matching after later versions exist.
+_STEP_FROM = 1
+_STEP_TO = 2
 _HASH_FORMAT = "aas-canonical-json-sha256-v1"
 _REQUEST_SCHEMA = "aas-core-schema-migrate-v1"
 # The exact v1 stores this migration was written against. A resumed attempt cannot apply
 # to a schema it never inspected, because the intent names these checksums.
-_EXPECTED_PARENT = content_sha256({"market": MARKET_CHECKSUMS[0], "state": STATE_CHECKSUMS[0]})
+_EXPECTED_PARENT = content_sha256(
+    {"market": MARKET_CHECKSUMS[_STEP_FROM - 1], "state": STATE_CHECKSUMS[_STEP_FROM - 1]}
+)
 _STEPS = ("backup", "intent", "market", "state", "receipt", "complete")
 
 
@@ -96,14 +104,14 @@ def require_core_migration_finished(state: sqlite3.Connection) -> None:
 
 
 def _request(workspace: Workspace) -> dict[str, object]:
-    """The deterministic identity of this installation's v1 to v2 migration."""
+    """The deterministic identity of this installation's v1 to v2 migration step."""
     return {
         "schema": _REQUEST_SCHEMA,
         "hash_format": _HASH_FORMAT,
-        "from_version": 1,
-        "to_version": CORE_VERSION,
-        "market_checksums": list(MARKET_CHECKSUMS[:CORE_VERSION]),
-        "state_checksums": list(STATE_CHECKSUMS[:CORE_VERSION]),
+        "from_version": _STEP_FROM,
+        "to_version": _STEP_TO,
+        "market_checksums": list(MARKET_CHECKSUMS[:_STEP_TO]),
+        "state_checksums": list(STATE_CHECKSUMS[:_STEP_TO]),
         "installation_id": workspace.installation_id,
         "state_store_id": workspace.state.execute("SELECT store_id FROM store_info").fetchone()[0],
         "market_store_id": workspace.market.execute("SELECT store_id FROM store_info").fetchall()[
@@ -113,25 +121,17 @@ def _request(workspace: Workspace) -> dict[str, object]:
 
 
 def _phase(workspace: Workspace) -> str | None:
-    """The migration intent's phase, refusing an intent that is not this migration."""
-    found = workspace.state.execute(
-        "SELECT operation_id FROM storage_operations WHERE kind=? OR operation_id=?",
-        (MIGRATION_KIND, MIGRATION_OPERATION),
-    ).fetchall()
-    if not found:
-        return None
+    """The v2 step intent's phase, refusing an intent that is not this step."""
     operation = get_operation(workspace.state, MIGRATION_OPERATION)
+    if operation is None:
+        return None
     expected = {
         "kind": MIGRATION_KIND,
         "request_hash": content_sha256(_request(workspace)),
         "target_id": workspace.installation_id,
         "expected_parent": _EXPECTED_PARENT,
     }
-    if (
-        len(found) != 1
-        or operation is None
-        or any(operation[key] != value for key, value in expected.items())
-    ):
+    if any(operation[key] != value for key, value in expected.items()):
         raise CoreSchemaError("core_schema_invalid", "migration intent identity mismatch")
     return str(operation["phase"])
 
