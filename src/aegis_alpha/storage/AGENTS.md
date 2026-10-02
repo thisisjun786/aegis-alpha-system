@@ -19,7 +19,7 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   `dev-notes/design/data-vertical.md` (Decision 0017). One hashed `aas-promotion-v1`
   spec pins sources, `mapper name@major`, time rules, decimal rules, quality rules
   and the identity snapshot. `record_id` stays `aas-record-v1`; `revision_id`
-  hashes `aas-revision-v1` with record, op, superseded revision and
+  hashes `aas-revision-v1` with dataset, record, op, superseded revision and
   `source_row_hash`; op comes from diffing the parent head on domain columns only,
   so re-collecting the same value at another time is no revision. No column takes
   the promotion wall clock, so re-promotion is an empty delta. Time rules are
