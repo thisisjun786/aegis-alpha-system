@@ -20,11 +20,12 @@ echo "topology=${topology}"
 export AAS_VERIFY_PROFILE=full
 ensure_verify_toolchain
 
-# Preserve existing budgets, combining format/lint for style. Build now also
-# installs the artifact; CI applies its own job timeout independently.
+# Style combines format/lint. Build also installs the artifact. The test lane runs
+# unsharded here, so its budget is twice the measured serial run (about 17 min);
+# CI shards it and applies its own job timeouts independently.
 BUDGET_STYLE=300
 BUDGET_TYPES=600
-BUDGET_TEST=150
+BUDGET_TEST=2100
 BUDGET_DATABASE=600
 BUDGET_BUILD=300
 

@@ -6,12 +6,12 @@ Follow [POLICY.md](../POLICY.md) for CI composition and local verification scope
 
 | Entry point | Current behavior |
 |---|---|
-| `verify` | Full local Python regression: style, types, database-free tests, PostgreSQL tests, package build/install smoke |
+| `verify` | Full local Python regression: style, types, database-free tests (unsharded), PostgreSQL tests, package build/install smoke; the test lane budget is twice its measured serial duration |
 | `verify-lib.sh` | Shared locked preparation, validated prepared tokens, owned process handling and synthetic CLI smoke oracle |
 | `verify-lane-style` | Combined format/lint; standalone setup installs locked development tools only |
 | `verify-lane-format` / `verify-lane-lint` | Standalone ruff checks |
 | `verify-lane-types` | ty over `src`, `tests`, the CI Python entry points and the installed-scenario driver |
-| `verify-lane-test` | All `not database` tests, with `AAS_TEST_DATABASE_URL` unset |
+| `verify-lane-test` | All `not database` tests, with `AAS_TEST_DATABASE_URL` unset; `AAS_TEST_SHARD=INDEX/COUNT` runs one deterministic file shard, as each CI `tests` matrix job does |
 | `verify-lane-database` | `database` tests using a supplied disposable test DB, or a script-owned pinned PostgreSQL container |
 | `verify-lane-build` | Build wheel/sdist, install locked dependencies and wheel in a fresh environment, smoke installed CLI outside checkout, then run the installed end-to-end scenario |
 | `verify_installed_scenario.py` | Registration, run, re-read, backup, restore, refusal and recovery against the installed wheel; `seed` under the development interpreter, `scenario` under the installed one |
