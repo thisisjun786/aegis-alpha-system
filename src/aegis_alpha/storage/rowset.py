@@ -27,6 +27,7 @@ _I64: Final = struct.Struct(">q")
 _F64: Final = struct.Struct(">d")
 _INT64_MIN: Final = -(1 << 63)
 _INT64_MAX: Final = (1 << 63) - 1
+_U32_MAX: Final = (1 << 32) - 1
 
 _TAG_NULL: Final = 0x00
 _TAG_TEXT: Final = 0x01
@@ -58,15 +59,61 @@ def _encode_rowset(
 ) -> bytes:
     fields = _validated_schema(schema)
     encoded_rows = sorted(_encode_row(fields, row) for row in rows)
+    return b"".join((_header(fields, len(encoded_rows)), *encoded_rows))
+
+
+def _header(fields: tuple[tuple[str, str], ...], count: int) -> bytes:
     return b"".join(
         (
             _MAGIC,
             _U32.pack(len(fields)),
             b"".join(_encode_field_spec(name, type_name) for name, type_name in fields),
-            _U32.pack(len(encoded_rows)),
-            *encoded_rows,
+            _U32.pack(count),
         )
     )
+
+
+class RowsetStream:
+    """Digest an aas-rowset-v1 encoding whose rows arrive already encoded and sorted.
+
+    The bytes hashed are exactly the bytes ``rowset_hash`` joins: the same header,
+    then every encoded row in ascending byte order. The caller announces the row
+    count up front, because the header carries it before the first row. Each row
+    must sort at or after the one before it, so a producer that orders rows by any
+    other collation is refused rather than hashed into a different digest, and only
+    the previous row is kept. Row encodings themselves are the producer's
+    responsibility; ``encode_row`` is the reference for one.
+    """
+
+    __slots__ = ("_digest", "_previous", "_remaining")
+
+    def __init__(self, schema: tuple[tuple[str, str], ...], count: int) -> None:
+        if type(count) is not int or not 0 <= count <= _U32_MAX:
+            raise ValueError("rowset row count must fit in unsigned 32-bit")
+        self._digest = hashlib.sha256(_header(_validated_schema(schema), count))
+        self._remaining = count
+        self._previous: bytes | None = None
+
+    def update(self, encoded_row: bytes) -> None:
+        if type(encoded_row) is not bytes or not encoded_row:
+            raise TypeError("an encoded rowset row must be nonempty bytes")
+        if self._remaining == 0:
+            raise ValueError("rowset stream received more rows than announced")
+        if self._previous is not None and encoded_row < self._previous:
+            raise ValueError("rowset stream rows must arrive in ascending byte order")
+        self._digest.update(encoded_row)
+        self._previous = encoded_row
+        self._remaining -= 1
+
+    def hexdigest(self) -> str:
+        if self._remaining:
+            raise ValueError("rowset stream received fewer rows than announced")
+        return self._digest.hexdigest()
+
+
+def encode_row(schema: tuple[tuple[str, str], ...], row: Mapping[str, object]) -> bytes:
+    """Return one row's aas-rowset-v1 encoding, as ``rowset_hash`` sorts and joins it."""
+    return _encode_row(_validated_schema(schema), row)
 
 
 def _validated_schema(schema: tuple[tuple[str, str], ...]) -> tuple[tuple[str, str], ...]:
