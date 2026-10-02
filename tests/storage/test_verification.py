@@ -1513,13 +1513,7 @@ def test_membership_verification_uses_the_caller_allowance(
         workspace.state.commit()
     seen: list[int] = []
 
-    def capture(
-        _connection: object,
-        _identity: object,
-        _universe: object,
-        *,
-        max_materialization_bytes: int,
-    ) -> None:
+    def capture(_connection: object, _pin: object, *, max_materialization_bytes: int) -> None:
         seen.append(max_materialization_bytes)
         raise ComputeResourceError("synthetic membership refusal")
 
@@ -1527,7 +1521,7 @@ def test_membership_verification_uses_the_caller_allowance(
     allowance = budget.available_bytes
     assert allowance < 64 * 1024 * 1024
     with open_workspace(home) as workspace:
-        monkeypatch.setattr(verification, "read_membership_pins", capture)
+        monkeypatch.setattr(verification, "verify_membership_pin", capture)
         with pytest.raises(ComputeResourceError, match="synthetic membership refusal"):
             verify_workspace(workspace, budget=budget)
     assert seen == [allowance]

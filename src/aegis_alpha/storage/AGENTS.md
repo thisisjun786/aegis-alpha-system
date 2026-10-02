@@ -63,6 +63,15 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   intent and `raw/` alone; it never takes a new wall clock, and a differing
   recorded link is refused. A completed content commit must be linked and keep its
   ID document in raw; `db recover` links one interrupted before its link.
+- `identity` owns the native identity registry. Issuer and instrument IDs are minted
+  only from a permanent anchor (`mint_issuer`, `mint_instrument`: `sec_cik`,
+  `dart_corp_code`, `norgate_assetid`, `krx_isin`); a ticker, symbol, path or date is
+  an assertion, never an anchor, and a non-canonical token is refused rather than
+  repaired. Registration (`aas-identity-registry-v1`) appends only: identical rows are
+  reused, a correction is a new assertion naming the one it supersedes and known
+  later, and any conflict or missing reference refuses the whole document. Snapshots
+  project the registry into a chunked manifest (`membership_pins.register_identity_manifest`):
+  deterministic v1 parts named `<root>#NNNNN`, a suffix single documents may not use.
 - Every contract in that document has a row in its contract/test table. A change
   that implements a `예정` row adds the named test and flips the row to `구현` in
   the same change; `tests/tools/test_data_vertical_contract.py` enforces both directions.
