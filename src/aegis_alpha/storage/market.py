@@ -30,7 +30,8 @@ from aegis_alpha.storage.market_schema import (
 if TYPE_CHECKING:
     import duckdb
 
-_SCHEMA = "aas-market-rowset-v1"
+RECORD_SCHEMA = "aas-market-rowset-v1"
+_SCHEMA = RECORD_SCHEMA
 # Version N's recorded checksum is the SHA-256 of MIGRATIONS[N - 1].
 MARKET_CHECKSUMS = tuple(hashlib.sha256(text.encode()).hexdigest() for text in MIGRATIONS)
 _MARKER_COLUMNS = (
@@ -170,7 +171,10 @@ def _cell(value: object, kind: str) -> object:  # noqa: C901, PLR0911, PLR0912 -
         return value
     if base == "DATE":
         if isinstance(value, str):
-            parsed = date.fromisoformat(value)
+            try:
+                parsed = date.fromisoformat(value)
+            except ValueError:
+                raise ValueError("market date must be ISO YYYY-MM-DD") from None
             if parsed.isoformat() != value:
                 raise ValueError("market date must be ISO YYYY-MM-DD")
             return parsed
@@ -189,10 +193,14 @@ def _cell(value: object, kind: str) -> object:  # noqa: C901, PLR0911, PLR0912 -
         raise TypeError("exact decimal fields reject floating point inputs")
     try:
         decimal = Decimal(value)
+        # Every step runs at 50 digits, so abs() and the bound never round a 38-digit value.
         with localcontext() as context:
             context.prec = 50
             quantized = decimal.quantize(Decimal("0.000000000001"))
-        if not decimal.is_finite() or decimal != quantized or abs(decimal) >= Decimal(10) ** 26:
+            refused = (
+                not decimal.is_finite() or decimal != quantized or abs(decimal) >= Decimal(10) ** 26
+            )
+        if refused:
             raise ValueError("decimal exceeds exact DECIMAL(38,12) representation")
     except InvalidOperation:
         raise ValueError("invalid exact decimal") from None
@@ -236,8 +244,7 @@ def normalize_rows(
         }
         if domain == "prices":
             row.update(_price_fields(input_row))
-        natural = [[name, _json_cell(row[name])] for name in NATURAL_KEYS[domain]]
-        record_id = _digest(["aas-record-v1", domain, natural])
+        record_id = record_identity(domain, [row[name] for name in NATURAL_KEYS[domain]])
         if (
             input_row.get("record_id", record_id) != record_id
             or input_row.get("generation_id", generation_id) != generation_id
@@ -247,6 +254,20 @@ def normalize_rows(
         _validate_row(domain, row)
         normalized.append(row)
     return normalized
+
+
+def record_identity(domain: str, natural: Sequence[object]) -> str:
+    """The aas-record-v1 record ID of one row's natural key values, in NATURAL_KEYS order."""
+    names = NATURAL_KEYS[domain]
+    if len(natural) != len(names):
+        raise ValueError("natural key values do not match the domain's natural key")
+    return _digest(
+        [
+            "aas-record-v1",
+            domain,
+            [[name, _json_cell(value)] for name, value in zip(names, natural, strict=True)],
+        ]
+    )
 
 
 def _price_fields(input_row: Mapping[str, object]) -> dict[str, object]:
@@ -356,28 +377,78 @@ def generation_chain(
     return chain
 
 
+_ROWSET_KINDS = {
+    "VARCHAR": "text",
+    "BIGINT": "int",
+    "DATE": "date",
+    "DOUBLE": "float",
+    "DECIMAL(38,12)": "decimal",
+}
+
+
+def delta_columns(domain: str, *, fields: bool) -> tuple[tuple[str, str], ...]:
+    """The typed columns a delta of ``domain`` hashes, in hashed order.
+
+    A prices delta that holds a close-only row hashes the fields column for every row,
+    and the column then appears in the hashed schema too. A delta of OHLCV rows alone
+    hashes exactly as it did in v1, which is what keeps every recorded hash verifying.
+    """
+    columns = COMMON + DOMAINS[domain]
+    return (*columns, PRICE_FIELDS) if fields else columns
+
+
+def rowset_schema(columns: tuple[tuple[str, str], ...]) -> tuple[tuple[str, str], ...]:
+    """The aas-rowset-v1 field types of typed market columns."""
+    return tuple(
+        (name, "utc_us" if name.endswith("_us") else _ROWSET_KINDS[kind.rstrip("?")])
+        for name, kind in columns
+    )
+
+
+def delta_digest(columns: tuple[tuple[str, str], ...], rowset_digest: str) -> str:
+    """Wrap a delta's aas-rowset-v1 digest as the marker's delta hash."""
+    return _digest([_SCHEMA, columns, rowset_digest])
+
+
+def chain_digest(  # noqa: PLR0913 -- every marker field the chain link covers
+    *,
+    parent_chain_hash: object,
+    dataset_id: object,
+    version: object,
+    generation_id: object,
+    domain: str,
+    delta_hash: str,
+    parent_id: object,
+    operation_id: object,
+    request_hash: object,
+    row_count: object,
+) -> str:
+    """The chain hash a marker records over its parent's chain hash and its own delta."""
+    return _digest(
+        [
+            _SCHEMA,
+            parent_chain_hash,
+            dataset_id,
+            version,
+            generation_id,
+            domain,
+            delta_hash,
+            parent_id,
+            operation_id,
+            request_hash,
+            row_count,
+        ]
+    )
+
+
 def _delta_hash(domain: str, rows: list[dict[str, object]]) -> str:
     from aegis_alpha.storage.rowset import rowset_hash  # noqa: PLC0415 -- shared typed codec
 
-    kinds = {
-        "VARCHAR": "text",
-        "BIGINT": "int",
-        "DATE": "date",
-        "DOUBLE": "float",
-        "DECIMAL(38,12)": "decimal",
-    }
-    columns = COMMON + DOMAINS[domain]
-    # A prices delta that holds a close-only row hashes the fields column for every row,
-    # and the column then appears in the hashed schema too. A delta of OHLCV rows alone
-    # hashes exactly as it did in v1, which is what keeps every recorded hash verifying.
-    if any(PRICE_FIELDS[0] in row for row in rows):
-        columns += (PRICE_FIELDS,)
+    fields = any(PRICE_FIELDS[0] in row for row in rows)
+    columns = delta_columns(domain, fields=fields)
+    if fields:
         rows = [{PRICE_FIELDS[0]: "ohlcv", **row} for row in rows]
-    schema = tuple(
-        (name, "utc_us" if name.endswith("_us") else kinds[kind.rstrip("?")])
-        for name, kind in columns
-    )
-    return _digest([_SCHEMA, columns, rowset_hash(schema, rows)])
+    return delta_digest(columns, rowset_hash(rowset_schema(columns), rows))
 
 
 def _validate_revisions(  # noqa: C901 -- explicit immutable chain validation
@@ -475,20 +546,17 @@ def plan_generation(  # noqa: PLR0913 -- immutable publication identity
         prior.extend(_rows(connection, domain, [str(ancestor["generation_id"])]))
     _validate_revisions(prior, normalized)
     sequence = len(chain) + 1
-    chain_hash = _digest(
-        [
-            _SCHEMA,
-            chain[-1]["chain_hash"] if chain else None,
-            dataset_id,
-            version,
-            generation_id,
-            domain,
-            delta,
-            parent_id,
-            operation_id,
-            request_hash,
-            len(normalized),
-        ]
+    chain_hash = chain_digest(
+        parent_chain_hash=chain[-1]["chain_hash"] if chain else None,
+        dataset_id=dataset_id,
+        version=version,
+        generation_id=generation_id,
+        domain=domain,
+        delta_hash=delta,
+        parent_id=parent_id,
+        operation_id=operation_id,
+        request_hash=request_hash,
+        row_count=len(normalized),
     )
     marker: dict[str, object] = dict(
         zip(
@@ -599,20 +667,17 @@ def _verified_chain_rows(
             ):
                 raise ValueError("generation contains rows in a foreign domain")
         delta = _delta_hash(domain, rows)
-        chain_hash = _digest(
-            [
-                _SCHEMA,
-                parent_hash,
-                marker["dataset_id"],
-                marker["version"],
-                marker["generation_id"],
-                domain,
-                delta,
-                marker["parent_id"],
-                marker["operation_id"],
-                marker["request_hash"],
-                marker["row_count"],
-            ]
+        chain_hash = chain_digest(
+            parent_chain_hash=parent_hash,
+            dataset_id=marker["dataset_id"],
+            version=marker["version"],
+            generation_id=marker["generation_id"],
+            domain=domain,
+            delta_hash=delta,
+            parent_id=marker["parent_id"],
+            operation_id=marker["operation_id"],
+            request_hash=marker["request_hash"],
+            row_count=marker["row_count"],
         )
         if (
             delta != marker["delta_hash"]
@@ -650,24 +715,7 @@ def read_chain_rows(
     import duckdb  # noqa: PLC0415 -- capacity errors at the budgeted query boundary
 
     try:
-        _ = connection.execute(
-            "SET threads = least(current_setting('threads'), ?)", [budget.duckdb_threads]
-        )
-        # Compare the same rounded-down display precision on both sides. Leave a
-        # clearly tighter limit untouched; in the same display bucket conservatively
-        # use its lower bound, since the exact existing bytes are not exposed.
-        memory, budget_floor = cast(
-            "tuple[int, int]",
-            connection.execute(
-                """SELECT parse_formatted_bytes(current_setting('memory_limit')),
-                          parse_formatted_bytes(format_bytes(?))""",
-                [budget.duckdb_memory_limit_bytes],
-            ).fetchone(),
-        )
-        if memory >= budget_floor:
-            _ = connection.execute(
-                "SET memory_limit = ?", [f"{min(memory, budget.duckdb_memory_limit_bytes)}B"]
-            )
+        limit_duckdb(connection, budget)
         chain = generation_chain(connection, generation_id)
         _admit_chain_memory(connection, chain, budget)
         return tuple(MappingProxyType(row) for row in _verified_chain_rows(connection, chain))
@@ -675,6 +723,31 @@ def read_chain_rows(
         raise ComputeResourceError(
             "DuckDB cannot execute chain read within admitted memory limits"
         ) from error
+
+
+def limit_duckdb(connection: duckdb.DuckDBPyConnection, budget: ComputeBudget) -> None:
+    """Lower DuckDB's threads and memory to the budget's share; never raise a tighter limit.
+
+    The limits stay lowered on success and on error; the caller owns the connection.
+    """
+    _ = connection.execute(
+        "SET threads = least(current_setting('threads'), ?)", [budget.duckdb_threads]
+    )
+    # Compare the same rounded-down display precision on both sides. Leave a
+    # clearly tighter limit untouched; in the same display bucket conservatively
+    # use its lower bound, since the exact existing bytes are not exposed.
+    memory, budget_floor = cast(
+        "tuple[int, int]",
+        connection.execute(
+            """SELECT parse_formatted_bytes(current_setting('memory_limit')),
+                      parse_formatted_bytes(format_bytes(?))""",
+            [budget.duckdb_memory_limit_bytes],
+        ).fetchone(),
+    )
+    if memory >= budget_floor:
+        _ = connection.execute(
+            "SET memory_limit = ?", [f"{min(memory, budget.duckdb_memory_limit_bytes)}B"]
+        )
 
 
 def _admit_chain_memory(

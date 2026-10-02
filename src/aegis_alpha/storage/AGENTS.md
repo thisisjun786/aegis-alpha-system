@@ -51,6 +51,20 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   `request_hash`, `source_id`) has a frozen expected digest. Source retirement
   requires no references (the source's own `sl:` link is lineage, not a reference),
   an equivalence digest and an other-device backup, and never removes `raw/` bytes.
+- `bulk_generation` publishes a staged DuckDB table as one generation: plan without
+  writing, then one transaction with the marker and `INSERT … SELECT`. DuckDB encodes and
+  sorts `aas-rowset-v1` rows and `rowset.RowsetStream` digests them in admitted batches and
+  refuses out-of-order rows, so the marker equals what `market.verify_generation` recomputes.
+  Row and revision rules are `normalize_rows`' and `_validate_revisions`' in SQL; a change to
+  either Python rule changes the SQL in the same change, and the parity tests in
+  `tests/storage/test_bulk_generation.py` hold them together. Publication recomputes the plan
+  in its transaction: a moved head is `ParentChangedError` (plan again), a reviewed plan that
+  no longer matches is `PlanChangedError`, and an existing marker is reused only for identical
+  content. `verify_generation_bulk` checks every chain link from recorded hashes and rehashes
+  the requested generation; `deep=True` rehashes every delta. Its Python batches fit the
+  allocation at any row count; DuckDB's share grows with the domain table's constraint
+  indexes and is refused as `ComputeResourceError` after a full rollback (see the bulk
+  publication section of `dev-notes/design/data-vertical.md`).
 - `source_identity` owns the content source ID (`aas-source-id-v1` over the raw
   addresses, sizes and hashes of the original files plus the output schema major)
   and the `sl:` link. Loader code and transform hashes go to `metadata.lineage`,
