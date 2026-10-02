@@ -1,4 +1,4 @@
-"""Owned SQLite connections and checksummed initial schemas."""
+"""Owned SQLite connections and checksummed, versioned schemas."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ import sqlite3
 import stat
 import time
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
 
-SCHEMA_VERSION = 1
 _COMMON_DDL = """
 CREATE TABLE store_info (
     store_id TEXT PRIMARY KEY, installation_id TEXT NOT NULL,
@@ -68,42 +68,124 @@ def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     return connection
 
 
-def initialize(connection: sqlite3.Connection, installation_id: str, kind: str, ddl: str) -> None:
-    """Apply v1 atomically, or validate its identity and exact schema checksum."""
-    checksum = hashlib.sha256((_COMMON_DDL + ddl).encode()).hexdigest()
+def schema_checksums(migrations: Sequence[str]) -> tuple[str, ...]:
+    """The recorded checksum of each schema version, oldest first.
+
+    Version 1 covers the common identity tables as well as the store's own text, exactly
+    as every installed store recorded it. A later version covers only the text it adds.
+    """
+    return tuple(
+        hashlib.sha256(((_COMMON_DDL if index == 0 else "") + text).encode()).hexdigest()
+        for index, text in enumerate(migrations)
+    )
+
+
+def validate_schema(
+    connection: sqlite3.Connection, installation_id: str, kind: str, migrations: Sequence[str]
+) -> int:
+    """Return the store's schema version after checking its whole receipt history.
+
+    A store records one schema_migrations row per version it has applied, from 1 up, and
+    store_info names the last one. A version this code does not know, a gap, or a checksum
+    that differs from the recorded text is refused rather than adopted.
+    """
+    checksums = schema_checksums(migrations)
+    rows = connection.execute(
+        "SELECT installation_id, schema_version, kind FROM store_info"
+    ).fetchall()
+    history = [
+        (int(row[0]), str(row[1]))
+        for row in connection.execute(
+            "SELECT version, checksum FROM schema_migrations ORDER BY version"
+        )
+    ]
+    if any(not 1 <= version <= len(checksums) for version, _ in history):
+        raise ValueError("unknown store schema version")
+    version = len(history)
+    if (
+        len(rows) != 1
+        or tuple(rows[0]) != (installation_id, version, kind)
+        or history != [(number, checksums[number - 1]) for number in range(1, version + 1)]
+    ):
+        raise ValueError("store identity or schema checksum mismatch")
+    return version
+
+
+def initialize(  # noqa: PLR0913 -- store identity plus its versioned schema
+    connection: sqlite3.Connection,
+    installation_id: str,
+    kind: str,
+    ddl: str,
+    upgrades: Sequence[str] = (),
+    *,
+    version: int | None = None,
+) -> int:
+    """Install every version atomically, or validate an existing store; return its version.
+
+    ``upgrades`` holds the text of versions 2 and later. A new store applies them all in
+    the one transaction that creates it, so it records the same receipts as a store that
+    was migrated. An existing store is validated and never upgraded here.
+    """
+    migrations = (ddl, *upgrades)
+    target = len(migrations) if version is None else version
+    if not 1 <= target <= len(migrations):
+        raise ValueError("unknown store schema version")
     existing = connection.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='store_info'"
     ).fetchone()
     if existing:
-        rows = connection.execute(
-            "SELECT installation_id, schema_version, kind FROM store_info"
-        ).fetchall()
-        migration = connection.execute(
-            "SELECT checksum FROM schema_migrations WHERE version=?", (SCHEMA_VERSION,)
-        ).fetchone()
-        if (
-            len(rows) != 1
-            or tuple(rows[0]) != (installation_id, SCHEMA_VERSION, kind)
-            or migration is None
-            or migration[0] != checksum
-        ):
-            raise ValueError("store identity or schema checksum mismatch")
-        return
+        return validate_schema(connection, installation_id, kind, migrations)
     tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     if tables:
         raise ValueError("refusing to initialize an unrecognized SQLite database")
+    checksums = schema_checksums(migrations)
     try:
         connection.execute("PRAGMA journal_mode=WAL")
-        connection.executescript("BEGIN IMMEDIATE;\n" + _COMMON_DDL + ddl)
+        connection.executescript("BEGIN IMMEDIATE;\n" + _COMMON_DDL + "".join(migrations[:target]))
         connection.execute(
             "INSERT INTO store_info VALUES (?, ?, ?, ?)",
-            (uuid.uuid4().hex, installation_id, SCHEMA_VERSION, kind),
+            (uuid.uuid4().hex, installation_id, target, kind),
         )
-        connection.execute(
+        applied = time.time_ns() // 1000
+        connection.executemany(
             "INSERT INTO schema_migrations VALUES (?, ?, ?)",
-            (SCHEMA_VERSION, checksum, time.time_ns() // 1000),
+            [(number, checksums[number - 1], applied) for number in range(1, target + 1)],
         )
         connection.commit()
     except BaseException:
         connection.rollback()
         raise
+    return target
+
+
+def upgrade(
+    connection: sqlite3.Connection,
+    installation_id: str,
+    kind: str,
+    migrations: Sequence[str],
+    target: int,
+) -> int:
+    """Apply the versions after the store's own up to ``target`` in one transaction.
+
+    A store already at ``target`` is left alone. Nothing is downgraded: a store newer than
+    the target is refused. The old receipts stay, and one row is added per applied version.
+    """
+    current = validate_schema(connection, installation_id, kind, migrations)
+    if not 1 <= target <= len(migrations) or current > target:
+        raise ValueError("unknown or older store schema version requested")
+    if current == target:
+        return current
+    checksums = schema_checksums(migrations)
+    try:
+        connection.executescript("BEGIN IMMEDIATE;\n" + "".join(migrations[current:target]))
+        applied = time.time_ns() // 1000
+        connection.executemany(
+            "INSERT INTO schema_migrations VALUES (?, ?, ?)",
+            [(number, checksums[number - 1], applied) for number in range(current + 1, target + 1)],
+        )
+        connection.execute("UPDATE store_info SET schema_version=?", (target,))
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    return validate_schema(connection, installation_id, kind, migrations)

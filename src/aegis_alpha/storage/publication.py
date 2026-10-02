@@ -437,6 +437,9 @@ def execute_data(workspace: Workspace, args: argparse.Namespace) -> dict[str, ob
 
 
 def quarantine(workspace: Workspace, operation_id: str, reason: str) -> dict[str, object]:
+    from aegis_alpha.storage.migration import (  # noqa: PLC0415
+        MIGRATION_KIND as CORE_MIGRATION_KIND,
+    )
     from aegis_alpha.storage.run_schema import MIGRATION_KIND  # noqa: PLC0415
     from aegis_alpha.storage.runs import RUN_OPERATION_KIND  # noqa: PLC0415
     from aegis_alpha.storage.state import get_operation, quarantine_operation  # noqa: PLC0415
@@ -451,6 +454,10 @@ def quarantine(workspace: Workspace, operation_id: str, reason: str) -> dict[str
         # neither undo a rebuild that already landed nor leave any way to finish one
         # that did not. The add-on would stay unusable with nothing able to clear it.
         raise ValueError("a run add-on migration is finished by aas db run-migrate")
+    if intent is not None and intent["kind"] == CORE_MIGRATION_KIND:
+        # The same dead end for the core stores: a half-migrated installation can only
+        # be finished by the command that started it.
+        raise ValueError("a core schema migration is finished by aas db migrate")
     if (
         workspace.market.execute(
             "SELECT 1 FROM market_generations WHERE operation_id=?", [operation_id]

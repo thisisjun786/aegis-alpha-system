@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, cast
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.storage import sqlite
 from aegis_alpha.storage.locks import file_lock, private_directory, private_file, storage_locks
+from aegis_alpha.storage.market_schema import MIGRATIONS as MARKET_MIGRATIONS
 from aegis_alpha.storage.paths import (
     DEFAULT_PATHS,
     StoragePaths,
@@ -29,6 +30,12 @@ if TYPE_CHECKING:
     import duckdb
 
 _MAX_THREADS = 256
+# The core schema version aas init gives a new state and market store; None is the newest.
+# A store is never upgraded here: an existing one is validated at the version it records.
+_INSTALL_VERSION: int | None = None
+# Core schema versions an admitted state or market store may record. The strategy store
+# has its own schema and stays at version 1.
+CORE_VERSIONS = tuple(range(1, len(MARKET_MIGRATIONS) + 1))
 
 
 def write_json(path: Path, value: object) -> None:
@@ -125,7 +132,7 @@ def market_connect(
     return connection
 
 
-def _store_info(connection: sqlite3.Connection | duckdb.DuckDBPyConnection) -> dict[str, object]:
+def store_info(connection: sqlite3.Connection | duckdb.DuckDBPyConnection) -> dict[str, object]:
     rows = connection.execute(
         "SELECT store_id, installation_id, schema_version, kind FROM store_info"
     ).fetchall()
@@ -163,15 +170,21 @@ def initialize(home: Path | None = None) -> dict[str, object]:
                 try:
                     if kind == "market":
                         initialize_market(
-                            cast("duckdb.DuckDBPyConnection", connection), installation_id
+                            cast("duckdb.DuckDBPyConnection", connection),
+                            installation_id,
+                            version=_INSTALL_VERSION,
                         )
                     elif kind == "state":
-                        initialize_state(cast("sqlite3.Connection", connection), installation_id)
+                        initialize_state(
+                            cast("sqlite3.Connection", connection),
+                            installation_id,
+                            version=_INSTALL_VERSION,
+                        )
                     else:
                         initialize_strategies(
                             cast("sqlite3.Connection", connection), installation_id
                         )
-                    info = _store_info(connection)
+                    info = store_info(connection)
                     if kind in stores and stores[kind] != info:
                         raise ValueError("store identity differs from installation receipt")
                     stores[kind] = info
@@ -210,7 +223,7 @@ class Workspace:
     def checkpointed_market(self) -> Iterator[None]:
         """Close/copy/reopen the same verified market file under retained admission."""
         _ = self._market_file()
-        if _store_info(self.market) != self._market_info:
+        if store_info(self.market) != self._market_info:
             raise ValueError("market identity changed during admitted maintenance")
         self.market.execute("CHECKPOINT")
         # Checkpoint legitimately changes metadata, but never the admitted file identity.
@@ -252,17 +265,21 @@ class Workspace:
             # actually holds, so the identifier has to be readable without opening
             # installation.json or the database by hand.
             "stores": {
-                "state": {"store_id": _store_info(self.state)["store_id"]},
-                "strategies": {"store_id": _store_info(self.strategies)["store_id"]}
+                "state": {"store_id": store_info(self.state)["store_id"]},
+                "strategies": {"store_id": store_info(self.strategies)["store_id"]}
                 if self.strategies
                 else None,
-                "market": {"store_id": _store_info(self.market)["store_id"]},
+                "market": {"store_id": store_info(self.market)["store_id"]},
             },
             "strategy_versions": self.strategies.execute(
                 "SELECT count(*) FROM strategy_versions"
             ).fetchone()[0]
             if self.strategies
             else None,
+            "schema_versions": {
+                "state": store_info(self.state)["schema_version"],
+                "market": store_info(self.market)["schema_version"],
+            },
             "market_generations": self.market.execute(
                 "SELECT count(*) FROM market_generations"
             ).fetchall()[0][0],
@@ -273,25 +290,57 @@ class Workspace:
         }
 
 
+def _admit_store(kind: str, info: dict[str, object], recorded: object, *, migrating: bool) -> None:
+    """Match one store to the installation receipt, allowing only a migration's own lag.
+
+    Identity always matches exactly. The schema version matches the receipt, except while
+    a core migration is being finished: the stores are upgraded before the receipt is
+    rewritten, so a store may then be ahead of what the receipt names, never behind.
+    """
+    if not isinstance(recorded, dict) or recorded.keys() != info.keys():
+        raise ValueError("store identity/schema mismatch")
+    if any(info[key] != recorded[key] for key in info if key != "schema_version"):
+        raise ValueError("store identity/schema mismatch")
+    versions = (1,) if kind == "strategies" else CORE_VERSIONS
+    actual, named = info["schema_version"], recorded["schema_version"]
+    if actual not in versions or named not in versions:
+        raise ValueError("store identity/schema mismatch")
+    if actual == named:
+        return
+    if not migrating and cast("int", actual) > cast("int", named):
+        raise ValueError(
+            "core schema migration is incomplete; repeat aas db migrate --to " + str(actual)
+        )
+    if cast("int", actual) < cast("int", named):
+        raise ValueError("store identity/schema mismatch")
+
+
 def _verify_reopened_market(
     connection: duckdb.DuckDBPyConnection,
     expected: dict[str, object],
     admitted: tuple[int, int],
     observed: tuple[int, int],
 ) -> None:
-    if admitted != observed or _store_info(connection) != expected:
+    if admitted != observed or store_info(connection) != expected:
         raise ValueError("market identity changed during admitted maintenance")
 
 
 @contextmanager
-def open_workspace(  # noqa: C901 -- lifecycle of all three owned stores
+def open_workspace(  # noqa: C901, PLR0913 -- lifecycle of all three owned stores
     home: Path | None = None,
     *,
     writable: bool = False,
     strategy_write: bool = False,
     require_strategies: bool = True,
     validating_restore: bool = False,
+    migrating: bool = False,
 ) -> Iterator[Workspace]:
+    """Admit the installation's stores under its locks for one connection lifetime.
+
+    A core schema migration that has not finished is refused, so nothing reads or writes
+    a store whose state and market halves may disagree. ``migrating`` admits such an
+    installation for the migration command alone, which finishes it.
+    """
     root = resolve_home(home)
     private_directory(root)
     paths = load_paths(root)
@@ -331,18 +380,19 @@ def open_workspace(  # noqa: C901 -- lifecycle of all three owned stores
         for kind, connection in (("state", state), ("strategies", strategies), ("market", market)):
             if connection is None:
                 continue
-            info = _store_info(connection)
-            if info != expected.get(kind) or info["schema_version"] != 1:
-                raise ValueError("store identity/schema mismatch")
+            _admit_store(kind, store_info(connection), expected.get(kind), migrating=migrating)
         from aegis_alpha.storage.market import validate_market  # noqa: PLC0415
-        from aegis_alpha.storage.state import initialize_state  # noqa: PLC0415
+        from aegis_alpha.storage.migration import require_core_migration_finished  # noqa: PLC0415
+        from aegis_alpha.storage.state import state_version  # noqa: PLC0415
         from aegis_alpha.storage.strategies import initialize_strategies  # noqa: PLC0415
 
         installation_id = str(receipt["installation_id"])
-        initialize_state(state, installation_id)
+        state_version(state, installation_id)
         if strategies is not None:
             initialize_strategies(strategies, installation_id)
         validate_market(market, installation_id)
+        if not migrating:
+            require_core_migration_finished(state)
         workspace = Workspace(
             paths,
             state,

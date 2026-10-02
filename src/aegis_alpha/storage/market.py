@@ -16,9 +16,12 @@ from typing import TYPE_CHECKING, cast
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.storage.market_schema import (
     COMMON,
-    DDL,
+    DOMAIN_VERSIONS,
     DOMAINS,
+    MIGRATIONS,
     NATURAL_KEYS,
+    PRICE_FIELD_VALUES,
+    PRICE_FIELDS,
     rowset_encoding_bytes,
     text_bytes,
     text_columns,
@@ -28,7 +31,8 @@ if TYPE_CHECKING:
     import duckdb
 
 _SCHEMA = "aas-market-rowset-v1"
-_SCHEMA_CHECKSUM = hashlib.sha256(DDL.encode()).hexdigest()
+# Version N's recorded checksum is the SHA-256 of MIGRATIONS[N - 1].
+MARKET_CHECKSUMS = tuple(hashlib.sha256(text.encode()).hexdigest() for text in MIGRATIONS)
 _MARKER_COLUMNS = (
     "generation_id",
     "dataset_id",
@@ -45,42 +49,109 @@ _MARKER_COLUMNS = (
 )
 _SHA256_LENGTH = 64
 _MAX_READ_ROWS = 100_000
+_CLOSE_ONLY_NULLS = ("open", "high", "low", "volume")
 
 
-def initialize_market(connection: duckdb.DuckDBPyConnection, installation_id: str) -> None:
+def initialize_market(
+    connection: duckdb.DuckDBPyConnection, installation_id: str, *, version: int | None = None
+) -> int:
+    """Create the market store at ``version`` (the newest by default), or validate it.
+
+    A new store applies every version's text in one transaction, so it holds the same
+    objects and receipts as a store that was migrated to the same version.
+    """
+    target = len(MIGRATIONS) if version is None else version
+    if not 1 <= target <= len(MIGRATIONS):
+        raise ValueError("unknown store schema version")
     tables = connection.execute(
         "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"
     ).fetchall()
     if ("store_info",) in tables:
-        validate_market(connection, installation_id)
-        return
+        return validate_market(connection, installation_id)
     if tables:
         raise ValueError("refusing to initialize an unrecognized DuckDB store")
     connection.execute("BEGIN TRANSACTION")
     try:
-        connection.execute(DDL)
+        for text in MIGRATIONS[:target]:
+            connection.execute(text)
         connection.execute(
-            "INSERT INTO store_info VALUES (?, ?, 1, 'market')", [uuid.uuid4().hex, installation_id]
+            "INSERT INTO store_info VALUES (?, ?, ?, 'market')",
+            [uuid.uuid4().hex, installation_id, target],
         )
-        connection.execute(
-            "INSERT INTO schema_migrations VALUES (1, ?, ?)",
-            [_SCHEMA_CHECKSUM, time.time_ns() // 1000],
-        )
+        applied = time.time_ns() // 1000
+        for number in range(1, target + 1):
+            connection.execute(
+                "INSERT INTO schema_migrations VALUES (?, ?, ?)",
+                [number, MARKET_CHECKSUMS[number - 1], applied],
+            )
         connection.execute("COMMIT")
     except BaseException:
         connection.execute("ROLLBACK")
         raise
+    return target
 
 
-def validate_market(connection: duckdb.DuckDBPyConnection, installation_id: str) -> None:
+def validate_market(connection: duckdb.DuckDBPyConnection, installation_id: str) -> int:
+    """Return the market store's version after checking its whole receipt history."""
     rows = connection.execute(
         "SELECT installation_id,schema_version,kind FROM store_info"
     ).fetchall()
-    checksum = connection.execute(
-        "SELECT checksum FROM schema_migrations WHERE version=1"
+    history = connection.execute(
+        "SELECT version,checksum FROM schema_migrations ORDER BY version"
     ).fetchall()
-    if rows != [(installation_id, 1, "market")] or checksum != [(_SCHEMA_CHECKSUM,)]:
+    if any(not 1 <= version <= len(MARKET_CHECKSUMS) for version, _ in history):
+        raise ValueError("unknown store schema version")
+    version = len(history)
+    if rows != [(installation_id, version, "market")] or history != [
+        (number, MARKET_CHECKSUMS[number - 1]) for number in range(1, version + 1)
+    ]:
         raise ValueError("market store identity or schema checksum mismatch")
+    return version
+
+
+def upgrade_market(connection: duckdb.DuckDBPyConnection, installation_id: str, target: int) -> int:
+    """Apply the market versions after the store's own up to ``target`` in one transaction.
+
+    A store already at ``target`` is left alone and none is downgraded. The old receipts
+    stay; one row is added per applied version and store_info names the new version.
+    """
+    current = validate_market(connection, installation_id)
+    if not 1 <= target <= len(MIGRATIONS) or current > target:
+        raise ValueError("unknown or older store schema version requested")
+    if current == target:
+        return current
+    connection.execute("BEGIN TRANSACTION")
+    try:
+        for text in MIGRATIONS[current:target]:
+            connection.execute(text)
+        applied = time.time_ns() // 1000
+        for number in range(current + 1, target + 1):
+            connection.execute(
+                "INSERT INTO schema_migrations VALUES (?, ?, ?)",
+                [number, MARKET_CHECKSUMS[number - 1], applied],
+            )
+        connection.execute("UPDATE store_info SET schema_version=?", [target])
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+    return validate_market(connection, installation_id)
+
+
+def market_version(connection: duckdb.DuckDBPyConnection) -> int:
+    """The schema version store_info names; admission has already validated it."""
+    return int(connection.execute("SELECT schema_version FROM store_info").fetchall()[0][0])
+
+
+def _domains(connection: duckdb.DuckDBPyConnection) -> tuple[str, ...]:
+    """The domain tables this store actually holds."""
+    version = market_version(connection)
+    return tuple(name for name in DOMAINS if DOMAIN_VERSIONS[name] <= version)
+
+
+def _require_version(connection: duckdb.DuckDBPyConnection, needed: int, what: str) -> None:
+    if market_version(connection) < needed:
+        raise ValueError(f"{what} needs core schema v{needed}; run aas db migrate --to {needed}")
 
 
 def _cell(value: object, kind: str) -> object:  # noqa: C901, PLR0911, PLR0912 -- fixed typed scalar boundary
@@ -151,15 +222,20 @@ def normalize_rows(
         raise ValueError("unknown market domain or empty generation")
     schema = COMMON + DOMAINS[domain]
     expected = {name for name, _ in schema} - {"generation_id", "record_id"}
+    optional = {PRICE_FIELDS[0]} if domain == "prices" else set()
     normalized = []
     for input_row in rows:
-        if set(input_row) - expected - {"record_id", "generation_id"} or expected - set(input_row):
+        if set(input_row) - expected - optional - {"record_id", "generation_id"} or expected - set(
+            input_row
+        ):
             raise ValueError("market row has missing or unknown typed fields")
         row = {
             name: _cell(input_row.get(name), kind)
             for name, kind in schema
             if name not in {"generation_id", "record_id"}
         }
+        if domain == "prices":
+            row.update(_price_fields(input_row))
         natural = [[name, _json_cell(row[name])] for name in NATURAL_KEYS[domain]]
         record_id = _digest(["aas-record-v1", domain, natural])
         if (
@@ -173,7 +249,15 @@ def normalize_rows(
     return normalized
 
 
-def _validate_row(domain: str, row: dict[str, object]) -> None:  # noqa: C901 -- domain null/time/value boundary
+def _price_fields(input_row: Mapping[str, object]) -> dict[str, object]:
+    """The fields entry a normalized price row carries: none for OHLCV, its v1 shape."""
+    fields = input_row.get(PRICE_FIELDS[0], "ohlcv")
+    if fields not in PRICE_FIELD_VALUES:
+        raise ValueError("price fields must be ohlcv or close")
+    return {} if fields == "ohlcv" else {PRICE_FIELDS[0]: fields}
+
+
+def _validate_row(domain: str, row: dict[str, object]) -> None:
     source_hash = row["source_row_hash"]
     if (
         not isinstance(source_hash, str)
@@ -207,25 +291,41 @@ def _validate_row(domain: str, row: dict[str, object]) -> None:  # noqa: C901 --
     if value_field in row and (row[value_field] is not None) != (state == "present"):
         raise ValueError("market value and missing state disagree")
     if domain == "prices":
-        for field in ("open", "high", "low", "close", "volume"):
-            value = row[field]
-            if value is not None and isinstance(value, Decimal) and value < 0:
-                raise ValueError("market prices/volume cannot be negative")
-        if row["basis"] != "unadjusted" and row["price_role"] != "reference":
-            raise ValueError("adjusted provider prices must remain reference data")
+        _validate_price(row)
+
+
+def _validate_price(row: dict[str, object]) -> None:
+    for field in ("open", "high", "low", "close", "volume"):
+        value = row[field]
+        if value is not None and isinstance(value, Decimal) and value < 0:
+            raise ValueError("market prices/volume cannot be negative")
+    if row["basis"] != "unadjusted" and row["price_role"] != "reference":
+        raise ValueError("adjusted provider prices must remain reference data")
+    if row.get(PRICE_FIELDS[0]) == "close" and (
+        row["price_role"] != "reference"
+        or any(row[field] is not None for field in _CLOSE_ONLY_NULLS)
+    ):
+        raise ValueError("a close-only price is reference data with no open, high, low or volume")
 
 
 def _rows(
     connection: duckdb.DuckDBPyConnection, domain: str, generations: list[str]
 ) -> list[dict[str, object]]:
     names = [name for name, _ in COMMON + DOMAINS[domain]]
+    if domain == "prices" and market_version(connection) >= 2:  # noqa: PLR2004 -- fields arrive in v2
+        names.append(PRICE_FIELDS[0])
     placeholders = ",".join("?" for _ in generations)
     selected = ", ".join(f'"{name}"' for name in names)
     sql = f'SELECT {selected} FROM "{domain}" WHERE generation_id IN ({placeholders})'  # noqa: S608 -- code-owned schema
-    return [
+    rows = [
         dict(zip(names, row, strict=True))
         for row in connection.execute(sql, generations).fetchall()
     ]
+    for row in rows:
+        # The stored default reads back as the v1 shape every OHLCV row was hashed in.
+        if row.get(PRICE_FIELDS[0]) == "ohlcv":
+            del row[PRICE_FIELDS[0]]
+    return rows
 
 
 def marker_for(connection: duckdb.DuckDBPyConnection, generation_id: str) -> dict[str, object]:
@@ -266,11 +366,18 @@ def _delta_hash(domain: str, rows: list[dict[str, object]]) -> str:
         "DOUBLE": "float",
         "DECIMAL(38,12)": "decimal",
     }
+    columns = COMMON + DOMAINS[domain]
+    # A prices delta that holds a close-only row hashes the fields column for every row,
+    # and the column then appears in the hashed schema too. A delta of OHLCV rows alone
+    # hashes exactly as it did in v1, which is what keeps every recorded hash verifying.
+    if any(PRICE_FIELDS[0] in row for row in rows):
+        columns += (PRICE_FIELDS,)
+        rows = [{PRICE_FIELDS[0]: "ohlcv", **row} for row in rows]
     schema = tuple(
         (name, "utc_us" if name.endswith("_us") else kinds[kind.rstrip("?")])
-        for name, kind in COMMON + DOMAINS[domain]
+        for name, kind in columns
     )
-    return _digest([_SCHEMA, COMMON + DOMAINS[domain], rowset_hash(schema, rows)])
+    return _digest([_SCHEMA, columns, rowset_hash(schema, rows)])
 
 
 def _validate_revisions(  # noqa: C901 -- explicit immutable chain validation
@@ -326,6 +433,9 @@ def plan_generation(  # noqa: PLR0913 -- immutable publication identity
     rows: list[dict[str, object]],
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
     normalized = normalize_rows(domain, generation_id, rows)
+    _require_version(connection, DOMAIN_VERSIONS[domain], f"the {domain} domain")
+    if any(PRICE_FIELDS[0] in row for row in normalized):
+        _require_version(connection, 2, "a close-only price")
     delta = _delta_hash(domain, normalized)
     existing = connection.execute(
         "SELECT generation_id FROM market_generations WHERE generation_id=? OR operation_id=?",
@@ -431,6 +541,9 @@ def publish_generation(  # noqa: PLR0913 -- exact publication pins
     ).fetchone():
         return marker
     names = [name for name, _ in COMMON + DOMAINS[domain]]
+    if any(PRICE_FIELDS[0] in row for row in normalized):
+        names.append(PRICE_FIELDS[0])
+        normalized = [{PRICE_FIELDS[0]: "ohlcv", **row} for row in normalized]
     connection.execute("BEGIN TRANSACTION")
     try:
         connection.execute(
@@ -476,7 +589,7 @@ def _verified_chain_rows(
         ):
             raise ValueError("invalid generation schema/chain sequence")
         rows = _rows(connection, domain, [str(marker["generation_id"])])
-        for other in DOMAINS:
+        for other in _domains(connection):
             if (
                 other != domain
                 and connection.execute(

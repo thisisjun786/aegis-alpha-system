@@ -49,19 +49,12 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
         "restore": "Rebuild an installation from a backup into a new home",
         "run-install": "Install the formal run add-on schema, after a backup",
         "run-migrate": "Migrate the installed run add-on to the current version, after a backup",
+        "migrate": "Migrate the state and market core schema to a version, after a backup",
     }
     for name, description in maintenance.items():
         command = sub.add_parser(name, help=description)
         _home(command)
-        if name == "quarantine":
-            command.add_argument("--operation", required=True)
-            command.add_argument("--reason", required=True)
-        if name == "backup":
-            command.add_argument("--output", type=Path)
-        if name in ("run-install", "run-migrate"):
-            command.add_argument("--backup-output", type=Path)
-        if name == "restore":
-            command.add_argument("--backup", type=Path, required=True)
+        _maintenance_options(name, command)
     _source_parsers(sub)
     _strategy_parsers(commands)
     data = commands.add_parser("data", help="Read and publish pinned local market generations")
@@ -96,6 +89,23 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
             reader.add_argument("--cutoff-us", type=int)
             reader.add_argument("--ingestion-cutoff-us", type=int)
             reader.add_argument("--limit", type=int, default=100)
+
+
+def _maintenance_options(name: str, command: argparse.ArgumentParser) -> None:
+    if name == "quarantine":
+        command.add_argument("--operation", required=True)
+        command.add_argument("--reason", required=True)
+    if name == "backup":
+        command.add_argument("--output", type=Path)
+    if name in ("run-install", "run-migrate", "migrate"):
+        command.add_argument("--backup-output", type=Path)
+    if name == "migrate":
+        command.add_argument("--to", type=int, required=True, dest="to_version")
+        command.add_argument(
+            "--plan", action="store_true", help="Report versions and steps; write nothing"
+        )
+    if name == "restore":
+        command.add_argument("--backup", type=Path, required=True)
 
 
 def _strategy_parsers(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -162,6 +172,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             "restore",
             "run-install",
             "run-migrate",
+            "migrate",
         }:
             return _maintenance(home, args)
         if args.command == "data" and args.data_command == "read-prices":
@@ -205,10 +216,11 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("local database operation failed; run aas db verify") from None
 
 
-def _maintenance(home: Path, args: argparse.Namespace) -> dict[str, object]:
+def _maintenance(home: Path, args: argparse.Namespace) -> dict[str, object]:  # noqa: PLR0911 -- CLI routing
     from aegis_alpha.application.compute_cli import price_compute
     from aegis_alpha.storage.backup import backup, restore
     from aegis_alpha.storage.locks import private_directory, storage_lock_targets
+    from aegis_alpha.storage.migration import migrate_core_schema, plan_core_migration
     from aegis_alpha.storage.paths import DEFAULT_PATHS, load_paths
     from aegis_alpha.storage.run_schema import install_run_schema, migrate_run_schema
     from aegis_alpha.storage.verification import verify_workspace
@@ -222,6 +234,9 @@ def _maintenance(home: Path, args: argparse.Namespace) -> dict[str, object]:
     else:
         private_directory(home)
         stores = load_paths(home).stores()
+    if args.db_command == "migrate" and args.plan:
+        # Read-only: no backup is taken, so no compute lease is needed either.
+        return plan_core_migration(home, to_version=args.to_version)
     # Acquire the compute lease before workspace admission, as other bulk readers do.
     with price_compute(excluded_locks=storage_lock_targets(home, stores)) as budget:
         if args.db_command == "backup":
@@ -232,6 +247,13 @@ def _maintenance(home: Path, args: argparse.Namespace) -> dict[str, object]:
             return install_run_schema(home, backup_output=args.backup_output, budget=budget)
         if args.db_command == "run-migrate":
             return migrate_run_schema(home, backup_output=args.backup_output, budget=budget)
+        if args.db_command == "migrate":
+            return migrate_core_schema(
+                home,
+                to_version=args.to_version,
+                backup_output=args.backup_output,
+                budget=budget,
+            )
         with open_workspace(home) as workspace:
             return verify_workspace(workspace, budget=budget)
 

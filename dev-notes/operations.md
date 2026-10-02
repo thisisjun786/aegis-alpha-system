@@ -239,9 +239,22 @@ dataset_id·version·generation_id·chain_hash·manifest_hash다. `decision`은 
 원천 자료실 자료를 공급자별 시장 dataset으로 승격하는 명령(`aas data promote`), 원천 ID 연결
 (`aas db source-link`), core schema 업그레이드(`aas db migrate`), 원천 은퇴(`aas db source-retire`)와
 compact(`aas db compact`)의 계약은 [데이터 수직 계약](design/data-vertical.md)이 소유한다. 현재 CLI에는
-위 [원본 자료 이전과 조회](#원본-자료-이전과-조회)의 `source-link`만 있으며, 나머지 명령은 그 계약의
-대응표 행이 `구현`이 될 때 이 절에 추가된다. 그 전까지
+`aas db migrate`와 위 [원본 자료 이전과 조회](#원본-자료-이전과-조회)의 `source-link`가 있다. 나머지
+명령은 그 계약의 대응표 행이 `구현`이 될 때 이 절에 추가되며, 그 전까지
 원천 자료의 연구 입력은 아래 `register-*` 경로가 맡는다.
+
+```bash
+aas db migrate --to 2 --plan
+aas db migrate --to 2 --backup-output /path/to/other-device/new-backup
+```
+
+`--plan`은 state·market을 읽기 전용으로 열어 각 저장소의 버전, 인식한 `schema_migrations` checksum,
+남은 단계(`backup`, `intent`, `market`, `state`, `receipt`, `complete`)를 보고하고 아무것도 쓰지 않는다.
+실행은 실행 중인 run이나 PREPARED 작업이 없을 때만 시작하고, 검증된 백업을 만든 뒤 intent를 기록하고
+market과 state를 각각 한 트랜잭션으로 올린 다음 설치 영수증을 바꾸고 intent를 완료한다. 응답은 두
+저장소의 버전과 영수증 행, 백업 경로와 manifest SHA-256을 담는다. 이미 v2인 설치본에는 아무것도 하지
+않는다. 중간에 멈춘 설치본은 다른 명령으로 열리지 않으며, 같은 명령을 다시 실행하면 백업 없이 남은
+단계부터 끝낸다. `aas db recover`와 `aas db quarantine`은 이 작업을 다루지 않는다.
 
 실제 설치본에서 이 명령들을 실행하는 순서는 다음과 같다. 모든 단계는 같은 요청 해시로 다시
 실행하면 재사용된다.
@@ -265,7 +278,7 @@ aas db backup --output /path/to/new-backup
 aas --home /path/to/new-home db restore --backup /path/to/new-backup
 ```
 
-`db verify`, `db backup`, `db restore`, `db run-install`도 설정된 공유 계산 예산을 사용한다.
+`db verify`, `db backup`, `db restore`, `db run-install`, `db migrate`도 설정된 공유 계산 예산을 사용한다.
 CLI는 저장소 잠금을 잡기 전에 계산 lease를 확보한다. Python 호출자는 검증·백업·복원과
 run-schema 설치 함수의 `budget=`에 자신이 확보한 `ComputeBudget`을 넘긴다. 설정이나
 인자를 생략하면 기존 직렬 기본 예산을 유지한다. import의 파일 크기 상한과 검증의 메모리
