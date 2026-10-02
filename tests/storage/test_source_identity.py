@@ -15,7 +15,7 @@ import pyarrow as pa
 import pytest
 
 from aegis_alpha.data.descriptor_tree import DescriptorTreeError
-from aegis_alpha.storage import source_library
+from aegis_alpha.storage import source_identity, source_library
 from aegis_alpha.storage.publication import recover_operations
 from aegis_alpha.storage.raw import put_raw
 from aegis_alpha.storage.source_identity import (
@@ -445,6 +445,7 @@ def test_interrupted_content_link_fails_verify_until_recover(
             verify_workspace(workspace)
     recovered = _db("recover", home=home)
     assert recovered["linked_sources"] == [content.source_id]
+    assert recovered["invalid_sources"] == []
     with open_workspace(home) as workspace:
         assert _linked(workspace) == 1
     assert _db("recover", home=home)["linked_sources"] == []
@@ -509,3 +510,34 @@ def test_report_without_links_keeps_its_shape(home: Path) -> None:
         report = verify_workspace(workspace)
         # Backups record this report; one taken before links existed restores unchanged.
         assert report["source_library"] == {"sources": 1, "tables": 1, "rows": 1}
+
+
+def test_recover_lists_an_invalid_content_commit_and_links_the_rest(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        contents = [
+            SourceContent("synthetic", "daily-bars", 1, (_retain(workspace, payload),))
+            for payload in (b"one", b"two")
+        ]
+        with monkeypatch.context() as patch:
+            patch.setattr(source_library, "link_source", _crash)
+            for content in contents:
+                with pytest.raises(RuntimeError, match="interruption"):
+                    source_library.import_content_arrow(
+                        workspace, content, "bars", _bars(("A", 1.0))
+                    )
+        real = link_source
+
+        def refuse_first(workspace: Workspace, source_id: str, *, apply: bool = True) -> str:
+            if source_id == min(c.source_id for c in contents):
+                raise ValueError("synthetic invalid record")
+            return real(workspace, source_id, apply=apply)
+
+        monkeypatch.setattr(source_identity, "link_source", refuse_first)
+        result = source_identity.link_content_sources(workspace)
+        first, second = sorted(c.source_id for c in contents)
+        assert result == {
+            "linked_sources": [second],
+            "invalid_sources": [{"source_id": first, "error": "synthetic invalid record"}],
+        }

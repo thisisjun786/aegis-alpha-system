@@ -374,25 +374,32 @@ def source_link(workspace: Workspace, *, apply: bool) -> dict[str, object]:
     }
 
 
-def link_content_sources(workspace: Workspace) -> list[str]:
-    """Record the missing link of every completed content commit; return their IDs.
+def link_content_sources(workspace: Workspace) -> dict[str, list[object]]:
+    """Record the missing link of every completed content commit.
 
     A content commit is linked at commit time; this finishes one interrupted between
-    completing its intent and recording its link. Explicit-ID commits are linked by
-    ``source_link`` instead, because their pinned bytes may not be in raw yet.
+    completing its intent and recording its link. A commit that cannot be linked is
+    listed under ``invalid_sources`` and never stops the others. Explicit-ID commits
+    are linked by ``source_link`` instead, because their pinned bytes may not be in
+    raw yet.
     """
-    linked: list[str] = []
-    if not schema.ensure(workspace):
-        return linked
-    for source_id in _commits(workspace):
-        if _recorded(workspace, LINK_PREFIX + source_id) is not None:
-            continue
-        marker = _marker(workspace, source_id)
-        if marker is None or not is_content_record(json.loads(str(marker[4])).get("metadata")):
-            continue
-        if link_source(workspace, source_id) == "linked":
-            linked.append(source_id)
-    return linked
+    linked: list[object] = []
+    invalid: list[object] = []
+    if schema.ensure(workspace):
+        for source_id in _commits(workspace):
+            if _recorded(workspace, LINK_PREFIX + source_id) is not None:
+                continue
+            marker = _marker(workspace, source_id)
+            if marker is None or not is_content_record(json.loads(str(marker[4])).get("metadata")):
+                continue
+            try:
+                status = link_source(workspace, source_id)
+            except ValueError as error:
+                invalid.append({"source_id": source_id, "error": str(error)})
+                continue
+            if status == "linked":
+                linked.append(source_id)
+    return {"linked_sources": linked, "invalid_sources": invalid}
 
 
 def verify_links(workspace: Workspace, source_ids: Iterable[str]) -> int:

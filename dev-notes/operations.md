@@ -103,7 +103,7 @@ aas db source-link --apply
 연결되지 못해도 나머지는 계속 처리한다. `--apply`는 빠진 연결만 기록하며 다시 실행하면 바뀌는
 것이 없다. 원본 bytes는 두 모드 모두 `raw/`에서 다시 해시한다. `corrupt` commit은 원본을 백업에서
 되살린 뒤 다시 실행한다. 내용 ID commit이 적재 도중 멈춰 연결 없이 남으면 `aas db verify`가 실패하고
-`aas db recover`가 그 연결을 기록해 `linked_sources`로 보고한다.
+`aas db recover`가 그 연결을 기록해 `linked_sources`로 보고하고, 연결할 수 없는 commit은 `invalid_sources`에 남긴 채 나머지를 계속 연결한다.
 
 대량 분석 자료는 `storage.source_library.import_content_arrow`로 명시적인 Arrow reader에서
 DuckDB에 적재한다. 원천 ID는 `raw/`에 먼저 보존한 원본 파일의 내용에서 나오고 적재 코드의 해시는
