@@ -367,8 +367,8 @@ issuer_id     = "iss-" + sha256(정규 JSON ["aas-issuer-v1", anchor_namespace, 
 - instrument 행(issuer, asset_type, venue)은 처음 등록한 원천의 맥락이다. instrument와 issuer의
   시점별 연결은 namespace `issuer` assertion이고 token은 `<issuer_id>/<instrument_id>`
   (`issuer_link_token`)다. 여러 share class가 한 issuer를 가리킬 수 있으므로, 이 namespace의 겹침은
-  token이 아니라 (provider, `issuer`, instrument)로 판정한다. 한 provider는 한 instrument를 같은
-  시점에 두 issuer에 연결하지 않는다. issuer null로 처음 등록한 instrument도 나중 원천이 이 assertion으로
+  token이 아니라 (provider, `issuer`, instrument)로 판정한다. 등록과 snapshot 문서 검증(v1 문서와
+  part 사이) 모두 같은 키를 쓰므로 한 provider는 한 instrument를 같은 시점에 두 issuer에 연결하지 않는다. issuer null로 처음 등록한 instrument도 나중 원천이 이 assertion으로
   issuer를 연결한다.
 
 **등록 문서 `aas-identity-registry-v1`.** `issuers`(anchor, name), `instruments`(anchor, issuer anchor

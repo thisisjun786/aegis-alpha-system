@@ -213,7 +213,9 @@ UniverseManifest = {
 - Reading a manifest pin requires the root header, contiguous parts whose headers
   rebuild that manifest hash, every part valid as its own v1 document, part member
   ranges in strictly increasing canonical order, and, for identity, no provider-key
-  overlap in both dimensions between members of different parts. Admission charges
+  overlap in both dimensions between members of different parts. In namespace
+  `issuer` the overlap key is the instrument rather than the token, in a v1 document
+  and across parts alike, because an issuer link names one instrument's issuer. Admission charges
   the sum of every part against the caller's allowance before materializing any.
   Parts fill close to the 64 MiB charge, so a manifest needs about 64 MiB of
   allowance per part; consumer allowances are sized for that by the consumer.

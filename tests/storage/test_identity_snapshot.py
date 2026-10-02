@@ -13,6 +13,9 @@ from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
 from aegis_alpha.storage import membership_pins
 from aegis_alpha.storage.identity import (
     identity_document,
+    issuer_link_token,
+    mint_instrument,
+    mint_issuer,
     parse_registry,
     register_identities,
     show_snapshot,
@@ -400,17 +403,43 @@ def test_manifest_rejects_a_gap_in_its_parts(
         read(workspace, pin)
 
 
-def test_cross_part_overlap_is_rejected(workspace: Workspace) -> None:
+def _issuer_link(issuer: str, *, known: int = 2) -> dict[str, object]:
+    token = issuer_link_token(
+        mint_issuer("sec_cik", issuer), mint_instrument("norgate_assetid", "1")
+    )
+    return assertion("1", provider="sec", namespace="issuer", value=token, known=known)
+
+
+_CIK_A = {"anchor_namespace": "sec_cik", "anchor_token": "0000000001", "name": "A"}
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "issuers"),
+    [
+        # One ticker on two instruments at once.
+        (assertion("1", value="X"), assertion("2", value="X", known=3), []),
+        # One instrument linked to two issuers at once by one provider.
+        (_issuer_link("0000000001"), _issuer_link("0000000002", known=3), [_CIK_A]),
+    ],
+    ids=["ticker", "issuer-link"],
+)
+def test_cross_part_overlap_is_rejected(
+    workspace: Workspace,
+    first: dict[str, object],
+    second: dict[str, object],
+    issuers: list[dict[str, object]],
+) -> None:
     """Parts that are each valid still fail when one key overlaps across two of them."""
     registered(
         workspace,
         document(
+            issuers=issuers,
             instruments=[instrument("1"), instrument("2")],
-            assertions=[assertion("1", value="X")],
+            assertions=[first],
         ),
     )
     # The registry refuses the ambiguous second row, so it arrives as another route would.
-    (row,) = parse_registry(document(assertions=[assertion("2", value="X", known=3)])).assertions
+    (row,) = parse_registry(document(assertions=[second])).assertions
     columns, marks = ",".join(row), ",".join("?" * len(row))
     with atomic(workspace.state):
         workspace.state.execute(

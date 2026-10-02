@@ -26,6 +26,8 @@ _MAX_CHARGE = 64 * 1024 * 1024
 _I64_MAX = 2**63 - 1
 _HASH_FORMAT = "aas-canonical-json-sha256-v1"
 IDENTITY_MANIFEST_SCHEMA = "aas-identity-manifest-v1"
+# Issuer-link assertions name one instrument's issuer, so they overlap per instrument.
+ISSUER_LINK_NAMESPACE = "issuer"
 UNIVERSE_MANIFEST_SCHEMA = "aas-universe-manifest-v1"
 # A chunked document's parts are ordinary v1 documents named ``<root>#<5 digits>``.
 # That suffix is reserved for parts, so a part can never be mistaken for a root.
@@ -179,7 +181,8 @@ def _identity_intervals(members: list[Record], assertions: list[Record]) -> None
     groups: dict[tuple[object, ...], list[Record]] = {}
     for row in members:
         assertion = by_id[row["assertion_id"]]
-        key = tuple(assertion[field] for field in ("provider", "namespace", "token"))
+        last = "instrument_id" if assertion["namespace"] == ISSUER_LINK_NAMESPACE else "token"
+        key = tuple(assertion[field] for field in ("provider", "namespace", last))
         prior = groups.setdefault(key, [])
         for other in prior:
             if all(
@@ -643,7 +646,8 @@ def _manifest_rules(
     if parts and isinstance(parts[0], IdentityPin) and len(parts) > 1:
         names = json.dumps([cast("IdentityPin", part).snapshot_id for part in parts])
         overlap = connection.execute(
-            "WITH m AS (SELECT s.snapshot_id AS part,a.provider,a.namespace,a.token,"
+            "WITH m AS (SELECT s.snapshot_id AS part,a.provider,a.namespace,"
+            "CASE WHEN a.namespace=? THEN a.instrument_id ELSE a.token END AS token,"
             "s.valid_from_us AS vf,s.valid_to_us AS vt,s.known_from_us AS kf,"
             "s.known_to_us AS kt FROM identity_snapshot_members s "
             "JOIN identity_assertions a ON a.assertion_id=s.assertion_id "
@@ -652,7 +656,7 @@ def _manifest_rules(
             "AND x.namespace=y.namespace AND x.token=y.token AND x.part<y.part "
             "WHERE (x.vt IS NULL OR y.vf<x.vt) AND (y.vt IS NULL OR x.vf<y.vt) "
             "AND (x.kt IS NULL OR y.kf<x.kt) AND (y.kt IS NULL OR x.kf<y.kt))",
-            (names,),
+            (ISSUER_LINK_NAMESPACE, names),
         ).fetchone()[0]
         if overlap:
             raise ValueError("identity snapshot interval overlap")

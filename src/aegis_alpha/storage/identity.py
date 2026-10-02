@@ -24,6 +24,7 @@ from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.engine.codec import decode_json
 from aegis_alpha.identity.records import IdentifierType, IdentifierValueError, normalize_identifier
 from aegis_alpha.storage.membership_pins import (
+    ISSUER_LINK_NAMESPACE,
     IdentityPin,
     MembershipPlan,
     membership_parts,
@@ -106,9 +107,9 @@ def mint_issuer(anchor_namespace: str, token: str) -> str:
     return _mint("iss-", ISSUER_FORMAT, ISSUER_ANCHORS, anchor_namespace, token)
 
 
-# An issuer link is an assertion in this namespace. Many instruments share one issuer, so
-# its token names the pair; one provider links one instrument to one issuer at a time.
-ISSUER_LINK_NAMESPACE = "issuer"
+# An issuer link is an assertion in ISSUER_LINK_NAMESPACE. Many instruments share one
+# issuer, so its token names the pair; one provider links one instrument to one issuer at
+# a time, which the snapshot validators in membership_pins hold too.
 _ISSUER_LINK_TOKEN = re.compile(r"(iss-[0-9a-f]{64})/(ins-[0-9a-f]{64})")
 
 
@@ -381,6 +382,7 @@ class _Assertions:
     def __init__(self, connection: sqlite3.Connection, incoming: Sequence[Record]) -> None:
         self.connection = connection
         self.rows: dict[str, Record | None] = {}
+        self.links: dict[str, dict[str, list[Record]]] = {}
         self.incoming = {cast("str", row["assertion_id"]): row for row in incoming}
         self.successor_known: dict[str, int] = {
             str(predecessor): int(known)
@@ -421,18 +423,32 @@ class _Assertions:
         return self.successor_known.get(identifier)
 
     def registered_with_key(self, key: tuple[object, ...]) -> list[Record]:
-        column = "instrument_id" if key[1] == ISSUER_LINK_NAMESPACE else "token"
+        if key[1] == ISSUER_LINK_NAMESPACE:
+            return self._issuer_links(cast("str", key[0])).get(cast("str", key[2]), [])
         rows = [
             dict(row)
             for row in self.connection.execute(
-                "SELECT * FROM identity_assertions "  # noqa: S608 -- fixed column choice
-                f"WHERE provider=? AND namespace=? AND {column}=?",
+                "SELECT * FROM identity_assertions WHERE provider=? AND namespace=? AND token=?",
                 key,
             )
         ]
         for row in rows:
             self.rows.setdefault(cast("str", row["assertion_id"]), row)
         return rows
+
+    def _issuer_links(self, provider: str) -> dict[str, list[Record]]:
+        """Load one provider's issuer links once, by instrument (the index keys on token)."""
+        if provider not in self.links:
+            grouped: dict[str, list[Record]] = {}
+            for found in self.connection.execute(
+                "SELECT * FROM identity_assertions WHERE provider=? AND namespace=?",
+                (provider, ISSUER_LINK_NAMESPACE),
+            ):
+                row = dict(found)
+                self.rows.setdefault(cast("str", row["assertion_id"]), row)
+                grouped.setdefault(cast("str", row["instrument_id"]), []).append(row)
+            self.links[provider] = grouped
+        return self.links[provider]
 
 
 def _overlap(start: int, end: int | None, other_start: int, other_end: int | None) -> bool:
