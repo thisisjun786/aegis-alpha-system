@@ -10,6 +10,7 @@ from aegis_alpha.application import (
     compute_cli,
     data_cli,
     etf_cli,
+    identity_cli,
     prepare_cli,
     provider_cli,
     proxy_cli,
@@ -49,6 +50,7 @@ def _parser() -> argparse.ArgumentParser:
     proxy_cli.add_commands(commands)
     research_cli.add_commands(commands)
     etf_cli.add_commands(commands)
+    identity_cli.add_commands(commands)
     return parser
 
 
@@ -138,6 +140,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912 -- explic
                 result = research_cli.execute(args)
             case "etfs":
                 result = etf_cli.execute(args)
+            case "identity":
+                result = identity_cli.execute(args)
             case "providers" | "collect":
                 result = provider_cli.execute(args)
             case "legacy-db" | "legacy-data":

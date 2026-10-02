@@ -22,7 +22,7 @@ from aegis_alpha.storage.market_inputs import verify_sealed_publication
 from aegis_alpha.storage.membership_pins import (
     IdentityPin,
     UniversePin,
-    read_membership_pins,
+    verify_membership_pin,
 )
 from aegis_alpha.storage.raw import verify_raw
 from aegis_alpha.storage.run_schema import inspect_run_schema
@@ -34,18 +34,22 @@ if TYPE_CHECKING:
 
 
 def _verify_membership(workspace: Workspace, allowance: int) -> None:
-    """Reconstruct every stored membership document under the caller's allowance."""
+    """Reconstruct every stored membership document under the caller's allowance.
+
+    A chunked manifest's parts are headers of their own, so each part is reconstructed
+    once here and the manifest is checked against its parts without materializing them.
+    """
     for header in workspace.state.execute(
         "SELECT snapshot_id,content_hash FROM identity_snapshots"
     ):
-        read_membership_pins(
-            workspace.state, IdentityPin(*header), None, max_materialization_bytes=allowance
+        verify_membership_pin(
+            workspace.state, IdentityPin(*header), max_materialization_bytes=allowance
         )
     for header in workspace.state.execute(
         "SELECT universe_id,version,content_hash FROM universe_versions"
     ):
-        read_membership_pins(
-            workspace.state, None, UniversePin(*header), max_materialization_bytes=allowance
+        verify_membership_pin(
+            workspace.state, UniversePin(*header), max_materialization_bytes=allowance
         )
 
 
