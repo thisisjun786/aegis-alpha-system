@@ -91,7 +91,15 @@ def ingest_arrow_retained(  # noqa: PLR0913 -- explicit provenance and reader in
     *,
     metadata: object = None,
 ) -> dict[str, object]:
-    """Ingest under an explicit, already-pinned source ID and request digest."""
+    """Ingest under an explicit, already-pinned source ID and request digest.
+
+    Only ``ingest_arrow`` writes the content namespace, so explicit metadata may not
+    claim a content identity of its own.
+    """
+    from aegis_alpha.storage.source_identity import is_content_record  # noqa: PLC0415
+
+    if is_content_record(metadata):
+        raise ValueError("an explicit source ID cannot claim a content identity")
     return _ingest(
         workspace, source_id, sha256, table_name, reader, request=metadata, metadata=metadata
     )

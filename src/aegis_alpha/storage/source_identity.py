@@ -10,6 +10,12 @@ state as one ``source_snapshots`` row (``provider='source-library'``,
 ``snapshot_id='sl:' + source_id``) plus one ``source_files`` row per original file.
 The link is derived only from the commit marker, its durable intent and ``raw/``, so
 linking the same commit again changes nothing.
+
+One ID names one file group, so the group is part of the identity: a loader commits
+one source per complete original unit whose members the bytes themselves fix (for
+example one collection job's ``complete.json`` and the files it lists), never per
+batch of units sized by loader code. Regrouping the same files under such a rule
+yields the same ID set; regrouping by batch size does not.
 """
 
 from __future__ import annotations
@@ -39,7 +45,15 @@ _SHAPE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _RECORD_KEYS = frozenset({"format", "provider", "shape", "schema_major", "files"})
 
-LinkStatus = Literal["linked", "unchanged", "pending", "unbacked", "incomplete"]
+LinkStatus = Literal["linked", "unchanged", "pending", "unbacked", "corrupt", "incomplete"]
+_STATUSES: tuple[LinkStatus, ...] = (
+    "linked",
+    "unchanged",
+    "pending",
+    "unbacked",
+    "corrupt",
+    "incomplete",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,8 +210,8 @@ def _derive(workspace: Workspace, source_id: str, *, check_raw: bool) -> _Link |
         return "incomplete"
     metadata = json.loads(str(manifest_json)).get("metadata")
     files = _files(workspace, source_id, str(source_sha256), metadata, check_raw=check_raw)
-    if files is None:
-        return "unbacked"
+    if isinstance(files, str):
+        return files
     snapshot = (
         LINK_PREFIX + source_id,
         LINK_PROVIDER,
@@ -209,27 +223,49 @@ def _derive(workspace: Workspace, source_id: str, *, check_raw: bool) -> _Link |
     return _Link(snapshot, files)
 
 
+def content_of(source_id: str, source_sha256: str, metadata: object) -> SourceContent | None:
+    """Return a commit's content identity, or None for a commit under an explicit ID."""
+    if not is_content_record(metadata):
+        return None
+    content = SourceContent.from_record(cast("dict[str, object]", metadata)["source"])
+    if (content.source_id, content.sha256) != (source_id, source_sha256):
+        raise ValueError("content source record does not match its source ID")
+    return content
+
+
+def _raw_status(workspace: Workspace, item: SourceFile) -> LinkStatus | None:
+    """Re-hash one retained object: None when intact, otherwise why it cannot back a link."""
+    try:
+        verify_raw(workspace.paths.raw, item.relative_path, item.sha256, item.size_bytes)
+    except (OSError, DescriptorTreeError):
+        return "unbacked"
+    except ValueError:
+        return "corrupt"
+    return None
+
+
 def _files(
     workspace: Workspace, source_id: str, source_sha256: str, metadata: object, *, check_raw: bool
-) -> tuple[SourceFile, ...] | None:
-    """Return the original files a commit links, or None when raw lacks any of them."""
-    if is_content_record(metadata):
-        content = SourceContent.from_record(cast("dict[str, object]", metadata)["source"])
-        if (content.source_id, content.sha256) != (source_id, source_sha256):
-            raise ValueError("content source record does not match its source ID")
+) -> tuple[SourceFile, ...] | LinkStatus:
+    """Return the original files a commit links, or why raw cannot back them.
+
+    A content commit also needs its ID document in raw, so ``source_sha256`` keeps a
+    preimage; that document is provenance of the ID, not an original file.
+    """
+    content = content_of(source_id, source_sha256, metadata)
+    if content is not None:
         files = content.files
+        retained = (*files, SourceFile(content.sha256, len(content.document())))
     else:
         # A commit made under an explicit ID links the raw object its intent pins.
         size = _raw_size(workspace, source_sha256)
         if size is None:
-            return None
-        files = (SourceFile(source_sha256, size),)
+            return "unbacked"
+        files = retained = (SourceFile(source_sha256, size),)
     if check_raw:
-        for item in files:
-            try:
-                verify_raw(workspace.paths.raw, item.relative_path, item.sha256, item.size_bytes)
-            except (OSError, DescriptorTreeError):
-                return None
+        statuses = {_raw_status(workspace, item) for item in retained} - {None}
+        if statuses:
+            return "corrupt" if "corrupt" in statuses else "unbacked"
     return files
 
 
@@ -299,21 +335,27 @@ def link_source(workspace: Workspace, source_id: str, *, apply: bool = True) -> 
 
 
 def source_link(workspace: Workspace, *, apply: bool) -> dict[str, object]:
-    """Plan or apply the ``sl:`` link of every committed source-library source."""
-    counts: dict[str, int] = dict.fromkeys(
-        ("linked", "unchanged", "pending", "unbacked", "incomplete"), 0
-    )
-    unbacked: list[str] = []
-    incomplete: list[str] = []
+    """Plan or apply the ``sl:`` link of every committed source-library source.
+
+    One commit that cannot be linked never stops the others: a commit whose raw
+    bytes differ from its pins is listed under ``corrupt_sources`` and one whose
+    records contradict each other (or an existing link) under ``invalid_sources``.
+    """
+    counts: dict[str, int] = dict.fromkeys((*_STATUSES, "invalid"), 0)
+    listed: dict[str, list[str]] = {"unbacked": [], "corrupt": [], "incomplete": []}
+    invalid: list[dict[str, str]] = []
     files = size = 0
     if schema.ensure(workspace):
         for source_id in _commits(workspace):
-            status = link_source(workspace, source_id, apply=apply)
+            try:
+                status = link_source(workspace, source_id, apply=apply)
+            except ValueError as error:
+                counts["invalid"] += 1
+                invalid.append({"source_id": source_id, "error": str(error)})
+                continue
             counts[status] += 1
-            if status == "unbacked":
-                unbacked.append(source_id)
-            elif status == "incomplete":
-                incomplete.append(source_id)
+            if status in listed:
+                listed[status].append(source_id)
             elif status in {"linked", "pending"}:
                 derived = _derive(workspace, source_id, check_raw=False)
                 if isinstance(derived, _Link):
@@ -325,20 +367,55 @@ def source_link(workspace: Workspace, *, apply: bool) -> dict[str, object]:
         **counts,
         "new_files": files,
         "new_bytes": size,
-        "unbacked_sources": unbacked,
-        "incomplete_sources": incomplete,
+        "unbacked_sources": listed["unbacked"],
+        "corrupt_sources": listed["corrupt"],
+        "incomplete_sources": listed["incomplete"],
+        "invalid_sources": invalid,
     }
+
+
+def link_content_sources(workspace: Workspace) -> list[str]:
+    """Record the missing link of every completed content commit; return their IDs.
+
+    A content commit is linked at commit time; this finishes one interrupted between
+    completing its intent and recording its link. Explicit-ID commits are linked by
+    ``source_link`` instead, because their pinned bytes may not be in raw yet.
+    """
+    linked: list[str] = []
+    if not schema.ensure(workspace):
+        return linked
+    for source_id in _commits(workspace):
+        if _recorded(workspace, LINK_PREFIX + source_id) is not None:
+            continue
+        marker = _marker(workspace, source_id)
+        if marker is None or not is_content_record(json.loads(str(marker[4])).get("metadata")):
+            continue
+        if link_source(workspace, source_id) == "linked":
+            linked.append(source_id)
+    return linked
 
 
 def verify_links(workspace: Workspace, source_ids: Iterable[str]) -> int:
     """Check every recorded ``sl:`` link of a live commit against its derivation.
 
-    File bytes are re-hashed by the workspace verifier, which reads every
+    A completed content commit must be linked and keep its ID document in raw. An
+    explicit-ID commit may stay unlinked until ``source_link`` backfills it. Original
+    file bytes are re-hashed by the workspace verifier, which reads every
     ``source_files`` row; this check covers the link rows themselves.
     """
     linked = 0
     for source_id in source_ids:
         recorded = _recorded(workspace, LINK_PREFIX + source_id)
+        marker = _marker(workspace, source_id)
+        if marker is None:
+            raise ValueError("source commit marker missing")
+        content = content_of(source_id, str(marker[2]), json.loads(str(marker[4])).get("metadata"))
+        if content is not None:
+            document = SourceFile(content.sha256, len(content.document()))
+            if _raw_status(workspace, document) is not None:
+                raise ValueError(f"content source {source_id} lacks its ID document in raw")
+            if recorded is None:
+                raise ValueError(f"content source {source_id} lacks its link; run aas db recover")
         if recorded is None:
             continue
         derived = _derive(workspace, source_id, check_raw=False)

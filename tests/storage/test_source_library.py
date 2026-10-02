@@ -185,7 +185,7 @@ def test_sqlite_preserves_mixed_values_and_regular_tables_only(tmp_path: Path, h
     ]
     assert schema[0] == 1
     assert len(schema[1]) == 64
-    assert report == {"sources": 1, "tables": 2, "rows": 4, "linked": 0}
+    assert report == {"sources": 1, "tables": 2, "rows": 4}
     assert workspace_report["source_library"] == report
     assert workspace_report["strategy_versions"] == 0
     assert (home / "strategies.sqlite3").stat().st_mode & 0o777 == _PRIVATE_FILE
@@ -207,7 +207,7 @@ def test_sqlite_replay_same_hash_is_idempotent(tmp_path: Path, home: Path) -> No
     assert [row["source_id"] for row in sources] == [_SQLITE_SOURCE]
     assert _table(tables, _MIXED_TABLE)["rows"] == 2
     assert len(rows) == 2
-    assert report == {"sources": 1, "tables": 2, "rows": 4, "linked": 0}
+    assert report == {"sources": 1, "tables": 2, "rows": 4}
 
 
 def test_sqlite_same_id_different_hash_is_rejected(tmp_path: Path, home: Path) -> None:
@@ -336,7 +336,7 @@ def test_arrow_native_roundtrip(home: Path) -> None:
     assert limited["rows"] == [first]
     assert schema[0] == 1
     assert len(schema[1]) == 64
-    assert report == {"sources": 1, "tables": 1, "rows": 2, "linked": 0}
+    assert report == {"sources": 1, "tables": 1, "rows": 2}
     assert workspace_report["source_library"] == report
     assert workspace_report["strategy_versions"] == 0
 
@@ -415,7 +415,6 @@ def test_arrow_batch_failure_rolls_back_and_allows_retry(
             "sources": 1,
             "tables": 1,
             "rows": table.num_rows,
-            "linked": 0,
         }
     with open_workspace(home) as workspace:
         assert len(source_library.list_sources(workspace)) == 1
@@ -509,7 +508,7 @@ def test_source_verification_admits_the_largest_batch_not_the_first(
         with pytest.raises(ComputeResourceError, match="source table batch"):
             source_library.verify_sources(workspace, budget=_budget(16 * 1024 * 1024))
         report = source_library.verify_sources(workspace, budget=_budget(256 * 1024 * 1024))
-    assert report == {"sources": 1, "tables": 1, "rows": 3, "linked": 0}
+    assert report == {"sources": 1, "tables": 1, "rows": 3}
 
 
 def test_source_verification_rejects_before_any_digest_read(
@@ -609,4 +608,4 @@ def test_sqlite_source_verifies_without_pyarrow(
     with open_workspace(home) as workspace:
         monkeypatch.setitem(sys.modules, "pyarrow", None)
         report = source_library.verify_sources(workspace)
-    assert report == {"sources": 1, "tables": 2, "rows": 4, "linked": 0}
+    assert report == {"sources": 1, "tables": 2, "rows": 4}

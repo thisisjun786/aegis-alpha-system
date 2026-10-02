@@ -287,7 +287,10 @@ def _workspace_command(workspace: object, args: argparse.Namespace) -> dict[str,
 
         if inspect_run_schema(workspace).state == "partial":
             require_run_schema(workspace)
-        return recover_operations(workspace)
+        from aegis_alpha.storage.source_identity import link_content_sources
+
+        recovered = recover_operations(workspace)
+        return {**recovered, "linked_sources": link_content_sources(workspace)}
     if args.command == "strategy":
         return _strategy_command(workspace, args)
     from aegis_alpha.application.data_cli import execute_native_data

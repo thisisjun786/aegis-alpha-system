@@ -97,18 +97,25 @@ aas db source-link --apply
 원본 설정, 연구용 설정, 원래 성과는 각각 원래 테이블과 열의 의미를 유지한다.
 `strategy list`는 검증된 실행 bundle 목록이며 `db sources`의 원본 자료 목록과 구분된다.
 `source-link`는 원본 자료실 commit마다 `sl:` 원천 snapshot과 원본 파일 행을 state에 남긴다.
-`--plan`은 연결할 commit 수, 이미 연결된 수, 원본 bytes가 `raw/`에 없어 연결하지 못하는 수와
-완료되지 않은 수를 보고하고 아무것도 쓰지 않는다. `--apply`는 빠진 연결만 기록하며 다시 실행하면
-바뀌는 것이 없다. 원본 bytes는 두 모드 모두 `raw/`에서 다시 해시한다.
+`--plan`은 연결할 commit 수, 이미 연결된 수, 원본 bytes가 `raw/`에 없어 연결하지 못하는
+`unbacked`, `raw/`의 bytes가 pin과 달라 연결하지 못하는 `corrupt`, 완료되지 않은 `incomplete`,
+기록끼리 맞지 않는 `invalid`를 commit ID와 함께 보고하고 아무것도 쓰지 않는다. 한 commit이
+연결되지 못해도 나머지는 계속 처리한다. `--apply`는 빠진 연결만 기록하며 다시 실행하면 바뀌는
+것이 없다. 원본 bytes는 두 모드 모두 `raw/`에서 다시 해시한다. `corrupt` commit은 원본을 백업에서
+되살린 뒤 다시 실행한다. 내용 ID commit이 적재 도중 멈춰 연결 없이 남으면 `aas db verify`가 실패하고
+`aas db recover`가 그 연결을 기록해 `linked_sources`로 보고한다.
 
 대량 분석 자료는 `storage.source_library.import_content_arrow`로 명시적인 Arrow reader에서
 DuckDB에 적재한다. 원천 ID는 `raw/`에 먼저 보존한 원본 파일의 내용에서 나오고 적재 코드의 해시는
-`lineage`로만 기록되므로, 코드만 바꿔 같은 원본을 다시 적재하면 기존 원천을 재사용한다.
+`lineage`로만 기록되므로, 코드만 바꿔 같은 원본을 다시 적재하면 기존 원천을 재사용한다. commit 하나는
+경계가 원본 bytes로 정해지는 완결 단위 하나(예: 수집 job 하나의 `complete.json`과 그것이 나열한
+파일)다. 여러 단위를 적재 코드의 batch 크기로 묶어 commit하면 batch가 바뀔 때마다 새 원천이 생긴다.
 `import_arrow`는 내용 ID 이전에 만든 명시 ID를 그대로 쓰는 경로다. 같은 스키마끼리 묶고 파일 경로와 원본 행 번호를 보존한다.
 원본 시각이나 숫자의 정밀도를 임의로 줄이지 않는다. 원본 자료실 등록은 PIT 사용 자격이나
 백테스트 실행 성공을 뜻하지 않으며, `data datasets`의 게시된 데이터 버전에 자동 추가되지 않는다.
-대량 이전은 원본 파일·행 번호를 유지한 여러 source로 나눠 적재할 수 있다. 행 수만으로
-메모리 사용량을 판단하지 않으며, 실제 사용량과 처리 속도에 맞춰 작업 단위를 조정한다.
+대량 이전은 원본 파일·행 번호를 유지한 여러 source로 나눠 적재할 수 있고, 나누는 경계는 위의
+완결 단위다. 행 수만으로 메모리 사용량을 판단하지 않으며, 실제 사용량과 처리 속도에 맞춘 작업
+크기 조정은 한 commit 안의 reader batch로 한다.
 DuckDB의 메모리 설정은 전체 Python 프로세스의 메모리 한도가 아니다.
 고정 행 묶음을 하나의 Arrow batch로 합칠 수 없으면 원본 적재를 취소한다.
 큰 문자열·바이너리 값은 원본 스키마에서 large-offset 형식을 명시해야 한다.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 import subprocess
@@ -13,7 +14,9 @@ from typing import cast
 import pyarrow as pa
 import pytest
 
+from aegis_alpha.data.descriptor_tree import DescriptorTreeError
 from aegis_alpha.storage import source_library
+from aegis_alpha.storage.publication import recover_operations
 from aegis_alpha.storage.raw import put_raw
 from aegis_alpha.storage.source_identity import (
     SourceContent,
@@ -62,7 +65,7 @@ def _commit_count(workspace: Workspace) -> int:
 
 def _linked(workspace: Workspace) -> object:
     report = cast("dict[str, dict[str, object]]", verify_workspace(workspace))
-    return report["source_library"]["linked"]
+    return report["source_library"].get("linked", 0)
 
 
 def _manifest(workspace: Workspace, source_id: str) -> dict[str, object]:
@@ -203,8 +206,12 @@ def test_content_change_mints_new_id(home: Path) -> None:
 
 
 def _cli(*args: str, home: Path) -> dict[str, object]:
+    return _db("source-link", *args, home=home)
+
+
+def _db(*args: str, home: Path) -> dict[str, object]:
     result = subprocess.run(  # noqa: S603 -- fixed interpreter, temporary synthetic home
-        [sys.executable, "-m", "aegis_alpha", "db", "source-link", *args],
+        [sys.executable, "-m", "aegis_alpha", "db", *args],
         env={**os.environ, "AAS_HOME": str(home), "PYTHONPATH": str(_ROOT / "src")},
         cwd=home.parent,
         text=True,
@@ -238,11 +245,15 @@ def test_source_link_is_idempotent(home: Path) -> None:
         "unchanged": 0,
         "pending": 1,
         "unbacked": 0,
+        "corrupt": 0,
         "incomplete": 0,
+        "invalid": 0,
         "new_files": 1,
         "new_bytes": len(payload),
         "unbacked_sources": [],
+        "corrupt_sources": [],
         "incomplete_sources": [],
+        "invalid_sources": [],
     }
     with open_workspace(home) as workspace:
         assert _links(workspace) == []
@@ -282,5 +293,219 @@ def test_conflicting_link_is_refused(home: Path) -> None:
         workspace.state.commit()
         with pytest.raises(ValueError, match="conflicts"):
             link_source(workspace, "synthetic-x")
-        with pytest.raises(ValueError, match="conflicts"):
-            source_link(workspace, apply=False)
+        report = source_link(workspace, apply=False)
+        assert report["invalid"] == 1
+        invalid = cast("list[dict[str, str]]", report["invalid_sources"])
+        assert invalid[0]["source_id"] == "synthetic-x"
+        assert "conflicts" in invalid[0]["error"]
+        # verify compares a recorded link with its commit and refuses the difference.
+        with pytest.raises(ValueError, match="conflicts with its commit"):
+            verify_workspace(workspace)
+
+
+def test_file_order_and_duplicates_never_move_the_id() -> None:
+    files = [SourceFile(hashlib.sha256(bytes([n])).hexdigest(), n + 1) for n in range(4)]
+    expected = SourceContent("synthetic", "daily-bars", 1, tuple(files)).source_id
+    for order in itertools.permutations(files):
+        for repeat in range(len(files)):
+            listed = (*order, *order[:repeat])
+            assert SourceContent("synthetic", "daily-bars", 1, listed).source_id == expected
+
+
+def test_regrouping_complete_units_reuses_the_same_ids(home: Path) -> None:
+    """One source per complete original unit, so loader batch sizes never move the IDs."""
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        jobs = [
+            (
+                SourceContent(
+                    "synthetic",
+                    "daily-bars",
+                    1,
+                    (
+                        _retain(workspace, f"complete-{n}".encode()),
+                        _retain(workspace, f"bars-{n}".encode()),
+                    ),
+                ),
+                (f"S{n}", float(n)),
+            )
+            for n in range(5)
+        ]
+
+        def load(batch: int, lineage: str) -> list[dict[str, object]]:
+            results = []
+            for start in range(0, len(jobs), batch):
+                for content, row in jobs[start : start + batch]:
+                    results.append(
+                        source_library.import_content_arrow(
+                            workspace, content, "bars", _bars(row), lineage={"loader": lineage}
+                        )
+                    )
+            return results
+
+        first = load(2, "v1")
+        second = load(3, "v2")
+        assert [r["source_id"] for r in first] == [r["source_id"] for r in second]
+        assert {r["source_id"] for r in first} == {content.source_id for content, _ in jobs}
+        assert all(r["reused"] for r in second)
+        assert _commit_count(workspace) == len(jobs)
+        # A batch of units is a different file group and therefore a different source.
+        merged = SourceContent("synthetic", "daily-bars", 1, jobs[0][0].files + jobs[1][0].files)
+        assert merged.source_id not in {r["source_id"] for r in first}
+
+
+def test_reuse_with_a_different_arrow_schema_is_refused(home: Path) -> None:
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        content = SourceContent("synthetic", "daily-bars", 1, (_retain(workspace, b"export"),))
+        source_library.import_content_arrow(workspace, content, "bars", _bars(("AAA", 1.5)))
+        widened = pa.table(
+            {"symbol": ["AAA"], "close": [1.5]},
+            schema=pa.schema([("symbol", pa.large_string()), ("close", pa.float64())]),
+        )
+        with pytest.raises(ValueError, match="different content"):
+            source_library.import_content_arrow(workspace, content, "bars", widened.to_reader())
+        assert _commit_count(workspace) == 1
+
+
+def test_explicit_id_cannot_claim_a_content_identity(home: Path) -> None:
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        with pytest.raises(ValueError, match="cannot claim a content identity"):
+            source_library.import_arrow(
+                workspace,
+                "zz-explicit",
+                "1" * 64,
+                "t",
+                _bars(("A", 1.0)),
+                metadata={"source": {"format": "aas-source-id-v1"}},
+            )
+        assert source_library.list_sources(workspace) == []
+
+
+def _crash(*_args: object) -> None:
+    raise RuntimeError("synthetic interruption")
+
+
+def test_incomplete_intent_is_reported_not_linked(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"pinned"
+    digest = hashlib.sha256(payload).hexdigest()
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        put_raw(workspace.paths.raw, payload)
+        with monkeypatch.context() as patch:
+            patch.setattr(source_library, "complete_operation", _crash)
+            with pytest.raises(RuntimeError, match="interruption"):
+                source_library.import_arrow(
+                    workspace, "synthetic-x", digest, "bars", _bars(("A", 1.0))
+                )
+        report = source_link(workspace, apply=True)
+        assert (report["incomplete"], report["incomplete_sources"]) == (1, ["synthetic-x"])
+        assert _links(workspace) == []
+
+
+def test_corrupt_and_invalid_commits_never_stop_the_backfill(home: Path) -> None:
+    payloads = [b"first", b"second", b"third"]
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        for n, payload in enumerate(payloads):
+            source_library.import_arrow(
+                workspace,
+                f"synthetic-{n}",
+                hashlib.sha256(payload).hexdigest(),
+                "bars",
+                _bars(("A", float(n))),
+            )
+            put_raw(workspace.paths.raw, payload)
+        corrupt = hashlib.sha256(payloads[0]).hexdigest()
+        stored = workspace.paths.raw / corrupt[:2] / corrupt
+        stored.chmod(0o600)
+        stored.write_bytes(b"FIRST")
+        workspace.state.execute(
+            "INSERT INTO source_snapshots VALUES "
+            "('sl:synthetic-1','source-library',0,0,NULL,'raw_verified')"
+        )
+        workspace.state.commit()
+        report = source_link(workspace, apply=True)
+        assert (report["corrupt"], report["corrupt_sources"]) == (1, ["synthetic-0"])
+        assert report["invalid"] == 1
+        assert report["linked"] == 1
+        assert {row[0] for row in _links(workspace)} == {"sl:synthetic-2"}
+
+
+def test_interrupted_content_link_fails_verify_until_recover(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        content = SourceContent("synthetic", "daily-bars", 1, (_retain(workspace, b"export"),))
+        # The process stops after completing the intent and before recording the link.
+        with monkeypatch.context() as patch:
+            patch.setattr(source_library, "link_source", _crash)
+            with pytest.raises(RuntimeError, match="interruption"):
+                source_library.import_content_arrow(workspace, content, "bars", _bars(("A", 1.0)))
+        assert _commit_count(workspace) == 1
+        with pytest.raises(ValueError, match="lacks its link"):
+            verify_workspace(workspace)
+    recovered = _db("recover", home=home)
+    assert recovered["linked_sources"] == [content.source_id]
+    with open_workspace(home) as workspace:
+        assert _linked(workspace) == 1
+    assert _db("recover", home=home)["linked_sources"] == []
+
+
+def test_content_source_requires_its_id_document_in_raw(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        linked = SourceContent("synthetic", "daily-bars", 1, (_retain(workspace, b"one"),))
+        source_library.import_content_arrow(workspace, linked, "bars", _bars(("A", 1.0)))
+        (workspace.paths.raw / linked.sha256[:2] / linked.sha256).unlink()
+        with pytest.raises(ValueError, match="ID document"):
+            verify_workspace(workspace)
+        unlinked = SourceContent("synthetic", "daily-bars", 1, (_retain(workspace, b"two"),))
+        with monkeypatch.context() as patch:
+            patch.setattr(source_library, "link_source", _crash)
+            with pytest.raises(RuntimeError, match="interruption"):
+                source_library.import_content_arrow(workspace, unlinked, "bars", _bars(("B", 2.0)))
+        (workspace.paths.raw / unlinked.sha256[:2] / unlinked.sha256).unlink()
+        assert link_source(workspace, unlinked.source_id) == "unbacked"
+
+
+def test_recover_source_records_the_link(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = b"pinned"
+    digest = hashlib.sha256(payload).hexdigest()
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        put_raw(workspace.paths.raw, payload)
+        with monkeypatch.context() as patch:
+            patch.setattr(source_library, "complete_operation", _crash)
+            with pytest.raises(RuntimeError, match="interruption"):
+                source_library.import_arrow(
+                    workspace, "synthetic-x", digest, "bars", _bars(("A", 1.0))
+                )
+        assert _links(workspace) == []
+        assert recover_operations(workspace)["pending"] == []
+        assert [row[0] for row in _links(workspace)] == ["sl:synthetic-x"]
+        assert _linked(workspace) == 1
+
+
+def test_link_that_is_no_longer_linkable_fails_verify(home: Path) -> None:
+    payload = b"pinned"
+    digest = hashlib.sha256(payload).hexdigest()
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        put_raw(workspace.paths.raw, payload)
+        source_library.import_arrow(workspace, "synthetic-x", digest, "bars", _bars(("A", 1.0)))
+        assert _linked(workspace) == 1
+        (workspace.paths.raw / digest[:2] / digest).unlink()
+        with pytest.raises(ValueError, match="no longer linkable"):
+            source_library.verify_sources(workspace)
+        # The workspace verifier also re-hashes the linked file and fails on it first.
+        with pytest.raises(DescriptorTreeError, match="cannot be opened"):
+            verify_workspace(workspace)
+
+
+def test_report_without_links_keeps_its_shape(home: Path) -> None:
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        imported = source_library.import_arrow(
+            workspace, "synthetic-x", "1" * 64, "bars", _bars(("A", 1.0))
+        )
+        assert imported["link"] == "unbacked"
+        report = verify_workspace(workspace)
+        # Backups record this report; one taken before links existed restores unchanged.
+        assert report["source_library"] == {"sources": 1, "tables": 1, "rows": 1}

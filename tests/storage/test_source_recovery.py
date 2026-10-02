@@ -46,12 +46,7 @@ def test_target_commit_recovers_after_state_failure(
         assert source_library.read_table(workspace, "source", "source")["rows"] == [
             {"value": "preserved"}
         ]
-        assert source_library.verify_sources(workspace) == {
-            "sources": 1,
-            "tables": 1,
-            "rows": 1,
-            "linked": 0,
-        }
+        assert source_library.verify_sources(workspace) == {"sources": 1, "tables": 1, "rows": 1}
         assert (
             workspace.state.execute(
                 "SELECT count(*) FROM storage_operations WHERE phase='PREPARED'"
@@ -90,7 +85,6 @@ def test_large_arrow_source_is_not_limited_by_arbitrary_row_count(tmp_path: Path
             "sources": 1,
             "tables": 1,
             "rows": 2_000_001,
-            "linked": 0,
         }
         assert recover_operations(workspace)["pending"] == []
 

@@ -92,7 +92,7 @@ def test_serializes_admitted_lists_when_cells_contain_special_scalars(tmp_path: 
     ]
     with open_workspace(home, require_strategies=True) as workspace:
         assert list_tables(workspace, "synthetic") == before
-        assert verify_sources(workspace) == {"sources": 1, "tables": 1, "rows": 1, "linked": 0}
+        assert verify_sources(workspace) == {"sources": 1, "tables": 1, "rows": 1}
 
 
 @pytest.mark.parametrize("kind", ["sqlite", "binary", "string", "list", "nested"])

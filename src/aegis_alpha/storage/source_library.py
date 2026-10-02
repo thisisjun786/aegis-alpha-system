@@ -577,8 +577,11 @@ def verify_sources(
     ):
         if _marker(workspace, row[0]) is None:
             raise ValueError("completed source intent lacks target marker")
-    linked = verify_links(workspace, committed)
-    return {"sources": sources, "tables": tables, "rows": total, "linked": linked}
+    report: dict[str, object] = {"sources": sources, "tables": tables, "rows": total}
+    # The count appears once a link exists, so a report without links keeps its shape.
+    if linked := verify_links(workspace, committed):
+        report["linked"] = linked
+    return report
 
 
 def recover_source(workspace: Workspace, operation_id: str) -> bool:
