@@ -160,6 +160,14 @@ universe·전략·시장 관례의 exact version/hash를 묶고, 각 의사결�
 기록을 대조하고 내용·행 수를 검증한다. 원본 자료는 실행 전략이나 PIT 데이터 게시물로
 자동 승격되지 않으며 `aas db sources/source-tables/source-read`로 조회한다.
 
+원천 자료실 자료를 PIT 조회 가능한 시장 generation으로 만드는 길은 하나로 정해져 있다.
+[데이터 수직 계약](design/data-vertical.md)과 [0017](decisions/0017-data-vertical-contract.md)에 따라
+해시로 고정한 `aas-promotion-v1` 명세가 원천 pin·매퍼·시간 규칙·숫자 규칙·품질 규칙·identity
+snapshot을 선언하고, 공통 revision 열은 원천과 그 규칙에서만 계산된다. dataset은 공급자마다 따로
+두고(`<domain>.<market>.<provider>[.ref]`), 공급자를 잇는 일과 규칙 시점의 strict 사용 허용(grant)은
+소비자 binding이 맡으며 run 영수증에 남는다. 이 경로의 구현 상태는 그 문서의 대응표가 계약별
+테스트로 판정한다. 아래의 `research_inputs` 변환 문서는 현재 쓰이는 별도 경로다.
+
 `storage/source_reader`는 명시한 원본·테이블 해시와 완료 기록을 확인하고, 선택한 테이블의
 내용 해시를 다시 계산한 뒤 제한된 크기로 읽는다. 다른 테이블 전체를 재검사하지 않는다.
 읽은 자료가 시점에 적합하거나 거래 가능한지는 별도 입력 계약이 판단한다.
