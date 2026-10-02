@@ -371,9 +371,16 @@ dataset의 백필은 연도 단위 generation, 이후 유지보수는 세션 단
 - 메모리는 [0016](../decisions/0016-maintenance-admission-budget.md)을 따른다. fetch 전에 SQL 집계로
   가장 넓은 행을 재고, 배치 과금이 호출자 할당의 비DuckDB 몫에 들어가도록 배치 행 수를 정한다. 과금은
   행 수와 무관하다. 한 행도 들어가지 않으면 `ComputeResourceError`다. 정렬·spill·색인 유지는 같은
-  할당에서 유도한 DuckDB 몫이 맡는다. 도메인 테이블의 PK·UNIQUE 색인은 삽입 중 메모리에 올라오므로
-  DuckDB 몫은 그 테이블의 전체 행 수에 비례해 커진다. 한도를 넘으면 트랜잭션 전체가 취소되고
-  `ComputeResourceError`가 된다.
+  할당에서 유도한 DuckDB 몫이 맡는다. 한도를 넘으면 트랜잭션 전체가 취소되고 `ComputeResourceError`가
+  된다.
+- 기본 512 MiB 할당은 Python 몫만 행 수와 무관하게 보장한다. 1e7행 계획의 Python peak는 74 MiB다.
+  도메인 테이블의 `PRIMARY KEY(generation_id, record_id, revision_id)`와 `UNIQUE(record_id, revision_id)`
+  색인은 삽입과 COMMIT 중 메모리에 올라오므로, DuckDB 몫은 그 테이블의 전체 행 수에 비례해 커진다.
+  합성 prices 측정에서 checkpoint된 테이블에 10k행 generation을 게시할 때, 기존 1M행이면 512 MiB로
+  통과했고 2M·4M행이면 1 GiB, 8M행이면 1.5 GiB가 필요했다. 빈 테이블에 1M행을 게시할 때는 1 GiB,
+  1e7행을 게시할 때는 16 GiB 할당이 필요했다(RSS 약 9.7 GiB). 따라서 수천만 행 테이블의 백필과
+  유지보수 게시는 기본 할당으로 끝나지 않는다. 색인 제거(다음 core 버전) 또는 기록된 더 큰 할당 grant
+  중 하나를 Linear AAS-54에서 결정하며, 대량 승격(대응표 DV-65)은 그 결정 뒤에 한다.
 - `read_heads(pins, domain, instruments?, date_range?, cutoffs, roles, granted_rules)`는
   `QUALIFY row_number()`로 head를 투영하며 기존 `project_heads`와 결과가 같다. ordered pin과
   cutover를 해석한다.
@@ -518,4 +525,6 @@ state v2:
 | DV-60 | 계획 뒤 dataset head가 바뀌면 대량 게시는 부모 CAS로 거부되고 새 head에서 다시 계획한다 | `tests/storage/test_bulk_generation.py::test_parent_cas_mismatch_requires_replan` | 구현 |
 | DV-61 | 같은 ID의 기존 generation은 내용이 같은 요청에만 재사용되고 다른 요청이 채택하지 않는다 | `tests/storage/test_bulk_generation.py::test_leftover_generation_is_not_adopted` | 구현 |
 | DV-62 | 증분 검증은 모든 chain link와 대상 generation의 행을, `deep`은 모든 delta를 다시 해시한다 | `tests/storage/test_bulk_generation.py::test_incremental_verify_checks_links_and_leaf_rows` | 구현 |
-| DV-63 | 대량 게시의 Python 배치 과금은 가장 넓은 행으로 정해지고 행 수와 무관하다 | `tests/storage/test_bulk_generation.py::test_batches_fit_the_default_budget_at_ten_million_rows` | 구현 |
+| DV-63 | 대량 게시의 Python 배치 과금은 가장 넓은 행으로 정해지고 행 수와 무관하다. DuckDB 몫은 포함하지 않는다 | `tests/storage/test_bulk_generation.py::test_python_batch_charge_is_independent_of_row_count` | 구현 |
+| DV-64 | DuckDB가 할당 안에서 끝내지 못한 대량 게시는 marker와 행을 남기지 않고 `ComputeResourceError`가 된다 | `tests/storage/test_bulk_generation.py::test_duckdb_exhaustion_rolls_back_as_a_budget_error` | 구현 |
+| DV-65 | 수천만 행 도메인 테이블에 유지보수 generation을 기본 할당 또는 기록된 할당 grant 안에서 게시한다 | `tests/storage/test_bulk_generation.py::test_maintenance_publication_fits_a_large_table` | 예정 |

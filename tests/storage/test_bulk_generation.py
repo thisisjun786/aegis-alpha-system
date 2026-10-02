@@ -37,9 +37,8 @@ from aegis_alpha.storage.rowset import RowsetStream, encode_row, rowset_hash
 
 BUDGET: Final = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
 _TEXT: Final = "aZ09-_.:/é한字😀\t \x7f\u0085\u00a0"
-# normalize_rows compares abs() under the default 28-digit context, so a magnitude that
-# rounds up to 10**26 there is refused; stay just under it so both routes admit the rows.
-_LARGEST: Final = 10**38 - 10**10
+# The largest DECIMAL(38,12) magnitude, unscaled; both routes admit the full column range.
+_LARGEST: Final = 10**38 - 1
 _FIRST_DAY: Final = date(1, 1, 1)
 _LAST_DAY: Final = date(9999, 12, 31)
 
@@ -396,40 +395,66 @@ def test_close_only_and_v1_prices_keep_parity(tmp_path: Path) -> None:
         connection.close()
 
 
+_NO_RANGE: Final = {"open": None, "high": None, "low": None, "volume": None}
+
+
 @pytest.mark.parametrize(
-    ("change", "message"),
+    ("domain", "change", "message"),
     [
-        ({"currency": " \t　"}, "market text must be nonempty"),
-        ({"currency": "U\x00SD"}, "market text must be nonempty"),
-        ({"instrument_id": None}, "required market field is null"),
-        ({"source_row_hash": "A" * 64}, "invalid source row hash"),
-        ({"ingested_at_us": 2**62}, "ingestion timestamp cannot be in the future"),
-        ({"available_at_us": 2_000_000}, "ingestion cannot precede source knowledge"),
-        ({"close": Decimal(-1), "value_state": "present"}, "cannot be negative"),
-        ({"close": None, "value_state": "present"}, "missing state disagree"),
-        ({"value_state": "estimated"}, "unknown market value state"),
-        ({"basis": "split_adjusted", "price_role": "canonical"}, "remain reference data"),
-        ({"price_role": "primary"}, "unknown market price role"),
-        ({"record_id": "0" * 64}, "record identity does not match"),
+        ("prices", {"currency": " \t　"}, "market text must be nonempty"),
+        ("prices", {"currency": "U\x00SD"}, "market text must be nonempty"),
+        ("prices", {"instrument_id": None}, "required market field is null"),
+        ("prices", {"source_row_hash": "A" * 64}, "invalid source row hash"),
+        ("prices", {"ingested_at_us": 2**62}, "ingestion timestamp cannot be in the future"),
+        ("prices", {"available_at_us": 2_000_000}, "ingestion cannot precede source knowledge"),
+        ("prices", {"available_at_us": -1}, "market timestamps cannot be negative"),
+        ("prices", {"close": Decimal(-1), "value_state": "present"}, "cannot be negative"),
+        ("prices", {"close": None, "value_state": "present"}, "missing state disagree"),
+        ("prices", {"value_state": "estimated"}, "unknown market value state"),
+        ("prices", {"basis": "split_adjusted", "price_role": "canonical"}, "remain reference data"),
+        ("prices", {"price_role": "primary"}, "unknown market price role"),
+        ("prices", {"record_id": "0" * 64}, "record identity does not match"),
+        ("prices", {"fields": "bogus"}, "price fields must be ohlcv or close"),
+        ("prices", {"fields": "close", "basis": "unadjusted", "price_role": "canonical",
+                    **_NO_RANGE}, "close-only price is reference data"),
+        ("prices", {"fields": "close", "basis": "unadjusted", "price_role": "reference",
+                    **_NO_RANGE, "open": Decimal(1)}, "close-only price is reference data"),
+        ("corporate_actions", {"ex_date": "infinity"}, "market date must be ISO YYYY-MM-DD"),
+        ("corporate_actions", {"ex_date": "10000-01-01"}, "market date must be ISO YYYY-MM-DD"),
+        ("corporate_actions", {"ex_date": "0001-01-01 (BC)"}, "market date must be ISO"),
+        ("feature_values", {"value": math.nan, "value_state": "present"}, "must be a finite"),
+        ("feature_values", {"value": -math.inf, "value_state": "present"}, "must be a finite"),
     ],
-)
+)  # fmt: skip
 def test_row_rules_match_normalize_rows(
-    tmp_path: Path, change: dict[str, object], message: str
+    tmp_path: Path, domain: str, change: dict[str, object], message: str
 ) -> None:
     rng = random.Random(3)
-    rows = _first(rng, "prices", 4)
+    rows = _first(rng, domain, 4)
     changed = {**rows[2], **change}
-    if "record_id" not in change and changed["instrument_id"] is not None:
-        changed = _identify("prices", changed)
+    if "record_id" not in change and all(changed[n] is not None for n in NATURAL_KEYS[domain]):
+        changed = _identify(domain, changed)
     rows[2] = changed
     with pytest.raises(ValueError, match=message):
-        market.normalize_rows("prices", "g1", [dict(row) for row in rows])
+        market.normalize_rows(domain, "g1", [dict(row) for row in rows])
     connection = _store(tmp_path / "market.duckdb")
-    _stage(connection, "prices", rows)
+    _stage(connection, domain, rows, fields="fields" in change)
     with pytest.raises(ValueError, match=message):
-        plan_generation_bulk(connection, _request("1", parent=None, domain="prices"), budget=BUDGET)
+        plan_generation_bulk(connection, _request("1", parent=None, domain=domain), budget=BUDGET)
     assert connection.execute("SELECT count(*) FROM market_generations").fetchone() == (0,)
     connection.close()
+
+
+def test_full_decimal_range_is_admitted_on_both_paths(tmp_path: Path) -> None:
+    rows = _first(random.Random(4), "prices", 2)
+    largest = Decimal((0, tuple(int(digit) for digit in str(_LARGEST)), -12))
+    rows[0].update(close=largest, volume=largest, value_state="present")
+    python = _store(tmp_path / "python.duckdb")
+    bulk = _store(tmp_path / "bulk.duckdb")
+    expected = _python(python, rows, "1", parent=None, domain="prices")
+    assert _bulk(bulk, rows, "1", parent=None, domain="prices") == expected
+    python.close()
+    bulk.close()
 
 
 def test_revision_rules_match_python(tmp_path: Path) -> None:
@@ -441,19 +466,28 @@ def test_revision_rules_match_python(tmp_path: Path) -> None:
     _python(python, first, "1", parent=None, domain="prices")
     _bulk(bulk, first, "1", parent=None, domain="prices")
     head = first[0]
+    parent = head["revision_id"]
     cases = [
         ([{**head, "revision_id": "again"}], "ambiguous repeated ASSERT"),
         ([{**head, "revision_id": "x", "op": "SUPERSEDE", "supersedes_revision_id": "nope"}],
          "current ancestor"),
-        ([{**head, "op": "SUPERSEDE", "supersedes_revision_id": head["revision_id"]}],
+        ([{**head, "revision_id": "x", "op": "TOMBSTONE", "supersedes_revision_id": "nope"}],
+         "current ancestor"),
+        ([{**head, "revision_id": "x", "op": "TOMBSTONE", "supersedes_revision_id": None}],
+         "current ancestor"),
+        ([{**head, "revision_id": "x", "op": "BOGUS", "supersedes_revision_id": parent}],
+         "unsupported market revision operation"),
+        ([{**head, "op": "SUPERSEDE", "supersedes_revision_id": parent}],
          "duplicate market revision"),
-        ([{**head, "revision_id": "x", "op": "SUPERSEDE",
-           "supersedes_revision_id": head["revision_id"], "available_at_us": 0,
+        ([{**head, "revision_id": "x", "op": "SUPERSEDE", "supersedes_revision_id": parent,
+           "available_at_us": 0, "revision_known_at_us": 0}], "knowledge cannot move backwards"),
+        ([{**head, "revision_id": "x", "op": "SUPERSEDE", "supersedes_revision_id": parent,
+           "available_at_us": 0}], "knowledge cannot move backwards"),
+        ([{**head, "revision_id": "x", "op": "TOMBSTONE", "supersedes_revision_id": parent,
            "revision_known_at_us": 0}], "knowledge cannot move backwards"),
-        ([{**head, "revision_id": "x", "op": "SUPERSEDE",
-           "supersedes_revision_id": head["revision_id"]},
-          {**head, "revision_id": "y", "op": "SUPERSEDE",
-           "supersedes_revision_id": head["revision_id"]}], "only one revision per natural record"),
+        ([{**head, "revision_id": "x", "op": "SUPERSEDE", "supersedes_revision_id": parent},
+          {**head, "revision_id": "y", "op": "SUPERSEDE", "supersedes_revision_id": parent}],
+         "only one revision per natural record"),
     ]  # fmt: skip
     for rows, message in cases:
         with pytest.raises(ValueError, match=message):
@@ -557,7 +591,9 @@ def test_incremental_verify_checks_links_and_leaf_rows(tmp_path: Path) -> None:
     connection.close()
 
 
-def test_batches_fit_the_default_budget_at_ten_million_rows() -> None:
+def test_python_batch_charge_is_independent_of_row_count() -> None:
+    # Python's share only: DuckDB's sort, spill and index maintenance are bounded by its
+    # own connection limit (see test_duckdb_exhaustion_rolls_back_as_a_budget_error).
     # The widest prices row this vertical stages: digests, ids and full decimals.
     columns = market.delta_columns("prices", fields=True)
     widths = {"generation_id": 69, "record_id": 69, "revision_id": 69, "source_row_hash": 69}
@@ -594,24 +630,7 @@ def test_batches_fit_the_default_budget_at_ten_million_rows() -> None:
 def test_streaming_memory_stays_within_the_admitted_allowance(tmp_path: Path) -> None:
     connection = _store(tmp_path / "market.duckdb")
     rows = 100_000
-    connection.execute(
-        f"""CREATE TABLE staged AS
-        SELECT sha256(json_array('aas-record-v1', 'prices', json_array(
-                 json_array('instrument_id', 'I' || i), json_array('session_date', '2026-01-02'),
-                 json_array('interval', '1d'), json_array('bar_end_us', 20),
-                 json_array('basis', 'unadjusted'), json_array('currency', 'USD'),
-                 json_array('price_role', 'canonical')))::VARCHAR) AS record_id,
-               sha256('rev' || i) AS revision_id, NULL::VARCHAR AS supersedes_revision_id,
-               'ASSERT' AS op, 10::BIGINT AS available_at_us, 10::BIGINT AS revision_known_at_us,
-               20::BIGINT AS ingested_at_us, 'synthetic' AS source_snapshot_id,
-               sha256('src' || i) AS source_row_hash, 'I' || i AS instrument_id,
-               DATE '2026-01-02' AS session_date, '1d' AS "interval", 20::BIGINT AS bar_end_us,
-               'unadjusted' AS basis, 'USD' AS currency,
-               (i / 7)::DECIMAL(38,12) AS "open", (i / 3)::DECIMAL(38,12) AS high,
-               (i / 9)::DECIMAL(38,12) AS low, (i / 5)::DECIMAL(38,12) AS "close",
-               i::DECIMAL(38,12) AS volume, 'canonical' AS price_role, 'present' AS value_state
-        FROM range({rows}) t(i)"""
-    )
+    _staged_prices(connection, rows)
     # Python keeps a quarter of the allocation, 32 MiB here, which is less than the
     # delta's encoded rows alone, so only a streamed digest can plan it. Planning does
     # every Python-side step of a publication: validation, identities and the digest.
@@ -637,6 +656,95 @@ def test_streaming_memory_stays_within_the_admitted_allowance(tmp_path: Path) ->
         connection, request, budget=ComputeBudget(Fraction(1), 1024 * 1024 * 1024), plan=plan
     )
     assert market.verify_generation(connection, "g1") == marker
+    connection.close()
+
+
+def _staged_prices(connection: duckdb.DuckDBPyConnection, rows: int) -> None:
+    """``rows`` valid canonical OHLCV prices staged as table ``staged``."""
+    connection.execute(
+        f"""CREATE TABLE staged AS
+        SELECT sha256(json_array('aas-record-v1', 'prices', json_array(
+                 json_array('instrument_id', 'I' || i), json_array('session_date', '2026-01-02'),
+                 json_array('interval', '1d'), json_array('bar_end_us', 20),
+                 json_array('basis', 'unadjusted'), json_array('currency', 'USD'),
+                 json_array('price_role', 'canonical')))::VARCHAR) AS record_id,
+               sha256('rev' || i) AS revision_id, NULL::VARCHAR AS supersedes_revision_id,
+               'ASSERT' AS op, 10::BIGINT AS available_at_us, 10::BIGINT AS revision_known_at_us,
+               20::BIGINT AS ingested_at_us, 'synthetic' AS source_snapshot_id,
+               sha256('src' || i) AS source_row_hash, 'I' || i AS instrument_id,
+               DATE '2026-01-02' AS session_date, '1d' AS "interval", 20::BIGINT AS bar_end_us,
+               'unadjusted' AS basis, 'USD' AS currency,
+               (i / 7)::DECIMAL(38,12) AS "open", (i / 3)::DECIMAL(38,12) AS high,
+               (i / 9)::DECIMAL(38,12) AS low, (i / 5)::DECIMAL(38,12) AS "close",
+               i::DECIMAL(38,12) AS volume, 'canonical' AS price_role, 'present' AS value_state
+        FROM range({rows}) t(i)"""
+    )
+
+
+def test_duckdb_exhaustion_rolls_back_as_a_budget_error(tmp_path: Path) -> None:
+    connection = _store(tmp_path / "market.duckdb")
+    _staged_prices(connection, 100_000)
+    request = _request("1", parent=None, domain="prices")
+    # Python's batches fit this allocation; DuckDB's 48 MiB share cannot hold the work.
+    small = ComputeBudget(Fraction(1), 64 * 1024 * 1024)
+    with pytest.raises(ComputeResourceError, match="within admitted memory") as caught:
+        publish_generation_bulk(connection, request, budget=small)
+    assert isinstance(caught.value.__cause__, duckdb.Error)
+    assert connection.execute("SELECT count(*) FROM market_generations").fetchone() == (0,)
+    assert connection.execute("SELECT count(*) FROM prices").fetchone() == (0,)
+    connection.close()
+    connection = duckdb.connect(str(tmp_path / "market.duckdb"))
+    marker = publish_generation_bulk(
+        connection, request, budget=ComputeBudget(Fraction(1), 1024 * 1024 * 1024)
+    )
+    assert market.verify_generation(connection, "g1") == marker
+    connection.close()
+
+
+def test_commit_allocation_failure_is_a_budget_error() -> None:
+    connection = duckdb.connect()
+    with (
+        pytest.raises(ComputeResourceError, match="within admitted memory"),
+        bulk_generation._budgeted(connection, BUDGET),
+    ):
+        raise duckdb.TransactionException("Failed to commit: could not allocate block")
+    with pytest.raises(duckdb.TransactionException), bulk_generation._budgeted(connection, BUDGET):
+        raise duckdb.TransactionException("Conflict on tuple deletion")
+    # A COMMIT that failed has already ended its transaction; rollback accepts that.
+    bulk_generation._rollback(connection)
+    connection.close()
+
+
+@pytest.mark.parametrize("damage", ["missing", "foreign", "nonfinite"])
+def test_verify_refuses_missing_foreign_and_nonfinite_rows(tmp_path: Path, damage: str) -> None:
+    rng = random.Random(29)
+    domain = "feature_values" if damage == "nonfinite" else "prices"
+    rows = _first(rng, domain, 4)
+    connection = _store(tmp_path / "market.duckdb")
+    _bulk(connection, rows, "1", parent=None, domain=domain)
+    if damage == "missing":
+        connection.execute("DELETE FROM prices WHERE record_id=?", [rows[0]["record_id"]])
+        message = "hash/count mismatch"
+    elif damage == "foreign":
+        foreign = {**_first(rng, "corporate_actions", 1)[0], "generation_id": "g1"}
+        names = [name for name, _ in COMMON + DOMAINS["corporate_actions"]]
+        connection.execute(
+            "INSERT INTO corporate_actions ("
+            + ", ".join(f'"{name}"' for name in names)
+            + ") VALUES ("
+            + ", ".join("?" for _ in names)
+            + ")",
+            [foreign[name] for name in names],
+        )
+        message = "foreign domain"
+    else:
+        connection.execute(
+            "UPDATE feature_values SET value='nan'::DOUBLE WHERE record_id=?",
+            [rows[0]["record_id"]],
+        )
+        message = "must be finite"
+    with pytest.raises(ValueError, match=message):
+        verify_generation_bulk(connection, "g1", budget=BUDGET)
     connection.close()
 
 

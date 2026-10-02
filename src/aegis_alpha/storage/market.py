@@ -171,7 +171,10 @@ def _cell(value: object, kind: str) -> object:  # noqa: C901, PLR0911, PLR0912 -
         return value
     if base == "DATE":
         if isinstance(value, str):
-            parsed = date.fromisoformat(value)
+            try:
+                parsed = date.fromisoformat(value)
+            except ValueError:
+                raise ValueError("market date must be ISO YYYY-MM-DD") from None
             if parsed.isoformat() != value:
                 raise ValueError("market date must be ISO YYYY-MM-DD")
             return parsed
@@ -190,10 +193,14 @@ def _cell(value: object, kind: str) -> object:  # noqa: C901, PLR0911, PLR0912 -
         raise TypeError("exact decimal fields reject floating point inputs")
     try:
         decimal = Decimal(value)
+        # Every step runs at 50 digits, so abs() and the bound never round a 38-digit value.
         with localcontext() as context:
             context.prec = 50
             quantized = decimal.quantize(Decimal("0.000000000001"))
-        if not decimal.is_finite() or decimal != quantized or abs(decimal) >= Decimal(10) ** 26:
+            refused = (
+                not decimal.is_finite() or decimal != quantized or abs(decimal) >= Decimal(10) ** 26
+            )
+        if refused:
             raise ValueError("decimal exceeds exact DECIMAL(38,12) representation")
     except InvalidOperation:
         raise ValueError("invalid exact decimal") from None
