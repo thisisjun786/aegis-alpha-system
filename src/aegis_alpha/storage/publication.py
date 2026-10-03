@@ -356,6 +356,10 @@ def _recover_one(  # noqa: PLR0911 -- one route per operation kind
         from aegis_alpha.storage.strategy_import import recover_strategy_import  # noqa: PLC0415
 
         return recover_strategy_import(workspace, operation)
+    if kind == "strategy_registry":
+        from aegis_alpha.storage.strategy_registry import recover_registration  # noqa: PLC0415
+
+        return recover_registration(workspace, dict(operation))
     if kind == "source_import":
         from aegis_alpha.storage.source_library import recover_source  # noqa: PLC0415
 
@@ -447,6 +451,9 @@ def quarantine(workspace: Workspace, operation_id: str, reason: str) -> dict[str
     from aegis_alpha.storage.run_schema import MIGRATION_KIND  # noqa: PLC0415
     from aegis_alpha.storage.runs import RUN_OPERATION_KIND  # noqa: PLC0415
     from aegis_alpha.storage.state import get_operation, quarantine_operation  # noqa: PLC0415
+    from aegis_alpha.storage.strategy_registry import (  # noqa: PLC0415
+        OPERATION_KIND as REGISTRY_KIND,
+    )
 
     intent = get_operation(workspace.state, operation_id)
     if intent is not None and intent["kind"] == RUN_OPERATION_KIND:
@@ -458,6 +465,11 @@ def quarantine(workspace: Workspace, operation_id: str, reason: str) -> dict[str
         # neither undo a rebuild that already landed nor leave any way to finish one
         # that did not. The add-on would stay unusable with nothing able to clear it.
         raise ValueError("a run add-on migration is finished by aas db run-migrate")
+    if intent is not None and intent["kind"] == REGISTRY_KIND:
+        # The operation ID is the request hash, so a quarantined intent would refuse every
+        # later apply of the same source. Repeating --apply finishes one with no marker and
+        # db recover one with a marker.
+        raise ValueError("a strategy registration is finished by aas strategy promote --apply")
     if intent is not None and intent["kind"] == CORE_MIGRATION_KIND:
         # The same dead end for the core stores: a half-migrated installation can only
         # be finished by the command that started it.
