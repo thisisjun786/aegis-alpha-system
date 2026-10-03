@@ -49,7 +49,9 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
     home_option(kr_build)
     kr_build.add_argument("--eodhd", action="append", required=True, help="Symbol-list source ID")
     kr_build.add_argument("--kind", action="append", default=[], help="KIND listing source ID")
-    kr_build.add_argument("--dart", help="Source ID holding the DART corp_codes receipt")
+    kr_build.add_argument(
+        "--dart", action="append", default=[], help="Source ID holding a DART corp_codes receipt"
+    )
     kr_build.add_argument("--output", type=Path, required=True, help="New registry file")
     kr_build.add_argument("--report", type=Path, help="New file for the full JSON report")
     show = sub.add_parser("show", help="Inspect one instrument, provider key or snapshot")
@@ -73,12 +75,34 @@ def _registry_bytes(path: Path) -> bytes:
         raise ValueError("cannot read bounded regular identity registry document") from error
 
 
-def _new_file(path: Path, raw: bytes) -> None:
+def _new_files(files: list[tuple[Path, bytes]]) -> None:
+    """Create every file or none: each is written whole beside its target, then linked."""
+    import os
+    import tempfile
+
+    for path, _ in files:
+        if path.exists() or path.is_symlink():
+            raise ValueError(f"cannot create new file {path.name}: it exists")
+    staged: list[tuple[str, Path]] = []
+    linked: list[Path] = []
     try:
-        with path.open("xb") as handle:
-            handle.write(raw)
+        for path, raw in files:
+            handle, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+            staged.append((temporary, path))
+            with os.fdopen(handle, "wb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+        for temporary, path in staged:
+            os.link(temporary, path)  # refuses an existing path; nothing is replaced
+            linked.append(path)
     except OSError as error:
-        raise ValueError(f"cannot create new file {path.name}") from error
+        for path in linked:
+            path.unlink(missing_ok=True)
+        raise ValueError(f"cannot create new files {[path.name for path, _ in files]}") from error
+    finally:
+        for temporary, _ in staged:
+            Path(temporary).unlink(missing_ok=True)
 
 
 def _kr(args: argparse.Namespace, home: Path) -> dict[str, object]:
@@ -93,10 +117,11 @@ def _kr(args: argparse.Namespace, home: Path) -> dict[str, object]:
             registry = kr_identity.build_from_workspace(
                 workspace, eodhd=args.eodhd, kind=args.kind, dart=args.dart
             )
-        _new_file(args.output, registry.raw())
+        files = [(args.output, registry.raw())]
         if args.report is not None:
             full = json.dumps(registry.report(sample=None), ensure_ascii=False, sort_keys=True)
-            _new_file(args.report, full.encode())
+            files.append((args.report, full.encode()))
+        _new_files(files)
         return {"file": str(args.output), **registry.report()}
     units = [
         *(kr_identity.read_kind_receipt(path) for path in args.kind_receipt),

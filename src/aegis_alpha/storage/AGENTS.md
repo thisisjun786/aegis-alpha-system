@@ -101,7 +101,8 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   ID document in raw; `db recover` links one interrupted before its link.
 - `identity` owns the native identity registry. Issuer and instrument IDs are minted
   only from a permanent anchor (`mint_issuer`, `mint_instrument`: `sec_cik`,
-  `dart_corp_code`, `norgate_assetid`, `krx_isin`); a ticker, symbol, path or date is
+  `dart_corp_code`, `norgate_assetid`, `krx_isin`, the ISIN of a KRX listing whatever its
+  country prefix); a ticker, symbol, path or date is
   an assertion, never an anchor, and a non-canonical token is refused rather than
   repaired. Registration (`aas-identity-registry-v1`) appends only: identical rows are
   reused, a correction is a new assertion naming the one it supersedes, known later
@@ -114,11 +115,15 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   A manifest root holds no members; a root with members is read as a v1 document.
 - `kr_identity` builds the KR registry document from three identity mappers
   (`eodhd.kr_symbol@1`, `kind.listings@1`, `dart.corp_codes@1`) over committed sources and
-  commits collected KIND and EODHD symbol-list receipts as content sources. Only a KR ISIN
+  commits collected KIND and EODHD symbol-list receipts as content sources. Only an ISIN
   with a valid check digit mints an instrument; KIND and DART reach it only through a short
-  code EODHD binds to exactly one ISIN, and every missing or ambiguous match stays
-  unresolved with its reason rather than being derived from a code or a name. Assertions
-  are known from their receipt's retrieval instant and cite the source row hash.
+  code EODHD binds to exactly one ISIN, and every missing or ambiguous match (including
+  lists that disagree on a symbol's ISIN, type or currency) stays unresolved with its reason
+  rather than being derived from a code or a name or chosen from one list. Stock asset types
+  stay `unclassified` because the provider types preferred shares as common. Assertions
+  are known from their receipt's retrieval instant and cite the source row hash. A build
+  must read every source registered KR assertions cite, and reports registered claims its
+  sources no longer give (`withdrawn`) instead of closing them.
 - Every contract in that document has a row in its contract/test table. A change
   that implements a `예정` row adds the named test and flips the row to `구현` in
   the same change; `tests/tools/test_data_vertical_contract.py` enforces both directions.

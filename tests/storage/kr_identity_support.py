@@ -40,10 +40,10 @@ DART_COLUMNS: Final = (
 )
 
 
-def isin(body: str) -> str:
-    """The KR ISIN ``KR<body><check digit>`` for a nine-character body."""
+def isin(body: str, country: str = "KR") -> str:
+    """The ISIN ``<country><body><check digit>`` for a nine-character body."""
     for digit in "0123456789":
-        candidate = f"KR{body}{digit}"
+        candidate = f"{country}{body}{digit}"
         try:
             return normalize_identifier(IdentifierType.ISIN, candidate)
         except IdentifierValueError:
@@ -56,26 +56,33 @@ def bad_check_digit(value: str) -> str:
 
 
 def symbol(
-    code: str, value: str | None, *, exchange: str = "KO", kind: str = "Common Stock"
+    code: str,
+    value: str | None,
+    *,
+    exchange: str = "KO",
+    kind: str = "Common Stock",
+    currency: str = "KRW",
 ) -> dict[str, object]:
     return {
         "Code": code,
         "Name": f"Synthetic {code}",
         "Country": "Korea",
         "Exchange": exchange,
-        "Currency": "KRW",
+        "Currency": currency,
         "Type": kind,
         "Isin": value,
     }
 
 
-def eodhd_job(
+def eodhd_job(  # noqa: PLR0913 -- one synthetic job spells every receipt field
     rows: list[dict[str, object]],
     *,
     exchange: str = "KO",
     delisted: str = "0",
     retrieved: str = RETRIEVED,
     status: str = "RAW_ACQUIRED",
+    tool_id: str = "eodhd.exchange_symbols.list.v1.synthetic",
+    page_status: int = 200,
 ) -> tuple[bytes, dict[str, bytes]]:
     """``complete.json`` and the files it lists for one exchange-symbol-list job."""
     parameters = {"EXCHANGE_CODE": exchange, "delisted": delisted, "fmt": "json"}
@@ -83,11 +90,11 @@ def eodhd_job(
         "dataset": "universe",
         "job_id": f"kr-{exchange}-universe-{delisted}",
         "parameters_json": json.dumps(parameters, separators=(",", ":")),
-        "tool_id": "eodhd.exchange_symbols.list.v1.synthetic",
+        "tool_id": tool_id,
         "upstream": "eodhd",
     }
     fingerprint = hashlib.sha256(json.dumps(job, sort_keys=True).encode()).hexdigest()
-    page = {"execution_id": "synthetic", "result": {"status_code": 200, "data": rows}}
+    page = {"execution_id": "synthetic", "result": {"status_code": page_status, "data": rows}}
     files = {
         f"jobs/{fingerprint}/0000.intent.json": json.dumps({"job": job}).encode(),
         f"jobs/{fingerprint}/0000.raw": json.dumps(page).encode(),
@@ -135,6 +142,7 @@ def kind_listing(
     list_id: str = "kind-kospi",
     retrieved: str = KIND_RETRIEVED,
     header: tuple[str, ...] = _HEADER,
+    status: int = 200,
 ) -> tuple[bytes, bytes]:
     """A KIND receipt and its EUC-KR HTML table; each row is (name, short code, listed on)."""
     cells = "".join(f"<th>{name}</th>" for name in header)
@@ -159,7 +167,7 @@ def kind_listing(
             "size_bytes": len(raw),
         },
         "retrieved_at_utc": retrieved,
-        "status": 200,
+        "status": status,
     }
     return json.dumps(receipt).encode(), raw
 

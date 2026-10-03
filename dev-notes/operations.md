@@ -258,7 +258,7 @@ bundle의 identity binding이 된다. `show`는 읽기 전용이다. 문서 형�
 ```bash
 aas identity kr-import --kind-receipt KIND_DIR/response.json --eodhd-job JOB_DIR [--plan]
 aas identity kr-build --eodhd SOURCE_ID [--eodhd SOURCE_ID] [--kind SOURCE_ID] \
-  [--dart SOURCE_ID] --output registry.json [--report report.json]
+  [--dart SOURCE_ID] ... --output registry.json [--report report.json]
 aas identity register --file registry.json --sha256 SHA256 --plan
 ```
 
@@ -270,16 +270,21 @@ commit한다. 두 옵션 모두 반복할 수 있고, 같은 수집물을 다시
 
 `kr-build`는 설치본을 읽기 전용으로 열어 지정한 원천을 pin과 대조해 읽고, `eodhd.kr_symbol@1`,
 `kind.listings@1`, `dart.corp_codes@1` 매퍼로 `aas-identity-registry-v1` 문서를 `--output`에 쓴다.
-`--dart`는 DART `corp_codes` receipt 한 행을 담은 원천 자료실 `receipts` 테이블의 원천 ID다. 출력과
-`--report`는 새 파일이어야 하며 기존 파일은 덮어쓰지 않는다. 응답은 문서 SHA-256, issuer·instrument·
-assertion 수, 매퍼별 행 보고, 미해결 key의 이유별 수와 표본이다. 등록은 그 파일과 SHA-256으로 위
+`--dart`는 DART `corp_codes` receipt 한 행을 담은 원천 자료실 `receipts` 테이블의 원천 ID다. 세
+옵션 모두 반복할 수 있다. 입력은 누적이다. 이미 등록된 KR assertion이 인용하는 원천을 모두 다시 넣어야
+하며, 빠진 원천이 있으면 그 ID를 보고하고 아무것도 쓰지 않는다. 새로 수집한 목록은 그 원천들에 더해
+넣는다. 출력과 `--report`는 둘 다 없는 경로여야 하고, 두 파일을 온전히 쓴 뒤 함께 만들며 실패하면
+아무것도 남기지 않는다. 응답은 문서 SHA-256, issuer·instrument·assertion 수, 매퍼별 행 보고, 미해결 key의
+이유별 수와 표본, 그리고 등록돼 있지만 이번 원천이 더는 내지 않는 assertion(`withdrawn`)이다.
+`withdrawn`은 대체 assertion으로 정정할 대상이며 빌더가 닫지 않는다. 등록은 그 파일과 SHA-256으로 위
 `register`를 실행한다. `sl:` 원천 연결이 없으면 `register --plan`이 누락 원천으로 보고하므로 먼저
 `aas db source-link --apply`로 연결한다. 해석 규칙과 미해결 이유는
 [KR 등록](design/data-vertical.md#kr-등록)이 소유한다.
 
-`scripts/kr_identity_report.py`는 market 파일을 읽기 전용으로 열고 수집물 파일에서 같은 문서를
-메모리에서 만들어, 일봉 원천(`--symbols-prefix`, `--table`)의 EODHD 심볼이 몇 개 해석되는지와
-미해결 심볼을 이유별로 보고한다. 설치본에 쓰지 않는 검토 근거다.
+`scripts/kr_identity_report.py`는 state 파일이 없는 store도 읽도록 market 파일만 읽기 전용으로 열고,
+수집물 파일에서 `kr-build`와 같은 bytes의 문서를 메모리에서 만들어, 일봉 원천(`--symbols-prefix`,
+`--table`)의 EODHD 심볼이 몇 개 해석되는지와 미해결 심볼을 이유별로 보고한다. 설치본에 쓰지 않는 검토
+근거다.
 
 ## 원천 자료의 승격과 은퇴
 

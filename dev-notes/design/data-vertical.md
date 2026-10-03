@@ -503,7 +503,8 @@ issuer_id     = "iss-" + sha256(정규 JSON ["aas-issuer-v1", anchor_namespace, 
 ```
 
 - 영구 anchor는 공급자가 재사용하거나 재배정하지 않는 식별자다. instrument는 `norgate_assetid`,
-  `krx_isin`(KR ISIN, 검사 숫자 확인), issuer는 `sec_cik`(10자리 0 채움), `dart_corp_code`(8자리)다.
+  `krx_isin`(KRX 상장 종목의 ISIN, 검사 숫자 확인. 국가 접두어는 발행인의 나라이므로 KRX에 상장한 외국
+  기업은 자기 ISIN(예: `KY`)을 쓴다), issuer는 `sec_cik`(10자리 0 채움), `dart_corp_code`(8자리)다.
   namespace가 하나 늘 때는 이 목록과 정규 표기 검사를 함께 추가한다.
 - 티커·EODHD 심볼·KRX 단축코드·경로·날짜는 anchor가 아니며 발급을 거부한다. 정규 표기가 아닌
   token(앞자리 0 누락 CIK, 검사 숫자가 틀린 ISIN 등)도 고쳐 쓰지 않고 거부한다.
@@ -575,19 +576,27 @@ KR identity는 세 원천을 identity 매퍼로 읽어 `aas-identity-registry-v1
 
 | 매퍼 | 원천 | 만드는 행 |
 | --- | --- | --- |
-| `eodhd.kr_symbol@1` | EODHD 거래소 종목 목록(`KO` 유가증권, `KQ` 코스닥, 상장·상폐 목록) | `Isin`이 검사 숫자가 맞는 KR ISIN인 행의 instrument `mint('krx_isin', Isin)`(venue는 두 시장의 운영자 `XKRX`, asset_type은 `common_stock`·`preferred_stock`·`etf`), assertion `eodhd`/`eodhd_symbol`(`<Code>.<Exchange>`, `eodhd.bars@1`이 해석하는 token)과 `eodhd`/`krx_short_code`(`Code`) |
+| `eodhd.kr_symbol@1` | EODHD 거래소 종목 목록(`KO` 유가증권, `KQ` 코스닥, 상장·상폐 목록) | `Isin`이 검사 숫자가 맞는 ISIN이고 원화인 행의 instrument `mint('krx_isin', Isin)`(venue는 두 시장의 운영자 `XKRX`), assertion `eodhd`/`eodhd_symbol`(`<Code>.<Exchange>`, `eodhd.bars@1`이 해석하는 token)과 `eodhd`/`krx_short_code`(`Code`가 6자리 단축코드일 때) |
 | `kind.listings@1` | KIND 상장법인목록(유가증권, 코스닥) | assertion `kind`/`krx_short_code`, 유효 구간은 상장일의 Asia/Seoul 0시부터 |
 | `dart.corp_codes@1` | DART `corpCode.xml` 응답(원천 자료실의 `corp_codes` receipt 한 행) | 종목코드가 있는 회사의 issuer `mint('dart_corp_code', corp_code)`(이름은 `corp_name`), 그 종목코드의 instrument에 대한 `dart`/`issuer` assertion과 instrument 행의 issuer |
 
+- asset_type은 `etf`(EODHD `ETF`)와 `unclassified`(EODHD `Common Stock`·`Preferred Stock`)다. EODHD는
+  KRX 우선주도 `Common Stock`으로 실으므로 주식의 종류를 단정하지 않는다. 등록된 asset_type은 바꿀 수
+  없으므로 보통주·우선주 구분은 분류 dataset이 기록한다.
 - KIND와 DART는 ISIN을 싣지 않으므로 EODHD가 정확히 하나의 ISIN에 묶은 단축코드로만 instrument에
   닿는다. 단축코드·종목코드·이름에서 ISIN이나 ID를 유도하지 않는다.
+- 한 심볼은 모든 목록을 함께 보고 판정한다. ISIN이 비어 있는 행만 ISIN을 실은 목록에 판정을 맡긴다.
+  ISIN을 실은 목록끼리 ISIN·asset_type·통화 중 하나라도 다르면, 한쪽이 틀린 ISIN이거나 알 수 없는
+  유형이어도, 어느 쪽도 고르지 않고 `symbol_ambiguous`로 둔다. ISIN과 단축코드의 모호성은 해석되지 않은
+  심볼의 행까지 포함해 발급 가능한 모든 행으로 판정한다.
 - 다음은 해석하지 않고 이유와 함께 보고한다: ISIN이 없거나(`isin_missing`), 검사 숫자가 틀리거나
-  (`isin_invalid`), KR ISIN이 아님(`isin_not_kr`), 알 수 없는 종목 유형(`type_unknown`), 원화가 아님
-  (`currency_not_krw`), 한 심볼이 두 ISIN을 가짐(`symbol_ambiguous`), 한 ISIN이 두 단축코드나 두 유형을
-  가짐(`isin_ambiguous`), 한 단축코드가 두 ISIN을 가짐(`short_code_ambiguous`), 한 종목코드를 두 회사가
-  가짐(`stock_code_ambiguous`), 한 회사가 두 종목코드를 가짐(`corp_code_ambiguous`), 종목코드가 ETF를 가리킴(`stock_code_is_etf`), 단축코드가 instrument에
-  닿지 않음(`short_code_unresolved`), 다듬어지지 않은 회사명(`corp_name_invalid`). 다른 목록에서 ISIN이
-  비어 있는 같은 심볼은 ISIN을 실은 목록의 주장을 무효로 만들지 않는다.
+  (`isin_invalid`), 알 수 없는 종목 유형(`type_unknown`), 원화가 아님(`currency_not_krw`), 목록끼리 다름
+  (`symbol_ambiguous`), 한 ISIN이 두 단축코드나 두 유형을 가짐(`isin_ambiguous`), 한 단축코드가 두 ISIN을
+  가짐(`short_code_ambiguous`), 한 종목코드를 두 회사가 가짐(`stock_code_ambiguous`), 한 회사가 두
+  종목코드를 가짐(`corp_code_ambiguous`), 종목코드가 ETF를 가리킴(`stock_code_is_etf`), 단축코드가
+  instrument에 닿지 않음(`short_code_unresolved`), KIND가 한 단축코드에 두 상장일을 줌
+  (`listing_ambiguous`), 다듬어지지 않은 회사명(`corp_name_invalid`).
+- DART `corp_codes` receipt 여러 개를 함께 읽는다. 회사의 이름과 근거는 가장 이른 receipt의 것이다.
 - EODHD 목록에는 날짜가 없으므로 그 assertion은 공급자 시계열 전체에서 유효하다(`valid_from_us`는
   int64 최소값, `valid_to_us`는 null). 모든 assertion의 `known_from_us`는 그 원천 receipt가 기록한
   수집 시각이다. AAS가 그 주장이 공개돼 있었다고 보일 수 있는 가장 이른 시각이며 보수적 상한이다.
@@ -597,6 +606,14 @@ KR identity는 세 원천을 identity 매퍼로 읽어 `aas-identity-registry-v1
   `aas-source-row-v1` 해시다. ETF와 DART 종목코드가 가리키지 않는 종목(우선주 등)은 issuer가 null이다.
 - 문서의 issuer는 corp code, instrument는 ISIN, assertion은 (provider, namespace, token) 순이므로 같은
   원천에서 늘 같은 bytes가 나온다.
+- 빌드 입력은 누적이다. 등록된 KR assertion(provider `kind`, `dart`의 `issuer`, `eodhd`의
+  `krx_short_code`와 `.KO`·`.KQ` 심볼)이 인용하는 원천은 모두 빌드 원천에 들어가야 하고, 빠지면
+  `kr-build`는 더할 원천을 이름으로 보고하며 거부한다. 그러면 이미 등록된 주장은 같은 가장 이른 근거로
+  같은 assertion ID가 되어 재사용되고, 새 수집물은 새 주장만 더한다. 새 원천만으로 빌드하면 같은 key가
+  다른 근거로 나와 등록이 `assertion_overlap`으로 전체를 거부하기 때문이다.
+- 정정되지 않은 등록 assertion을 이번 원천이 더는 내지 않으면(나중 목록이 그 key를 모호하게 만든 경우)
+  보고의 `withdrawn`에 남긴다. 그 주장이 언제부터 틀렸는지 말하는 원천이 없으므로 빌더는 그것을 닫지
+  않고, 정정은 그 assertion을 대체하는 별도 등록이다.
 
 KIND 목록과 EODHD 종목 목록 수집물은 `aas identity kr-import`가 내용 원천으로 commit한다. KIND는
 receipt(`response.json`)와 그것이 크기·SHA-256으로 가리키는 응답 하나가 한 단위이고
@@ -605,7 +622,8 @@ receipt(`response.json`)와 그것이 크기·SHA-256으로 가리키는 응답 
 그대로(KIND는 EUC-KR 응답의 공백만 접은 셀 텍스트) 담고 요청 목록, 거래소, 상폐 요청 여부, job 상태,
 수집 시각을 함께 싣는다. 공급자 경고(`RAW_ACQUIRED_WITH_WARNINGS`)는 행의 job 상태로 남는다.
 receipt가 기록한 크기·해시와 다른 파일, 완료 문서에 없는 파일은 거부한다. `aas identity kr-build`는
-commit된 원천을 pin과 대조해 읽고 문서와 보고를 새 파일에 쓰며 설치본에는 쓰지 않는다.
+commit된 원천을 pin과 대조해 읽고 문서와 보고를 새 파일에 쓰며 설치본에는 쓰지 않는다. 두 파일은
+모두 없을 때만 온전히 쓴 뒤 함께 만들어지고, 실패하면 둘 다 남지 않는다.
 
 ## 대량 게시와 reader
 
@@ -867,3 +885,7 @@ state v2:
 | DV-106 | KR 원천은 내용 원천으로 재사용되고 commit된 원천에서 만든 문서는 누락 참조 없이 한 번에 등록된다 | `tests/storage/test_kr_identity.py::test_kr_sources_import_as_content_and_register_as_one_document` | 구현 |
 | DV-107 | KR 등록의 snapshot은 `eodhd.bars@1` 승격에서 심볼을 instrument로 해석하고 ISIN이 없는 심볼은 미해결로 둔다 | `tests/storage/test_kr_identity.py::test_kr_registry_resolves_eodhd_bars_in_promotion` | 구현 |
 | DV-108 | `identity kr-import --plan`은 쓰지 않고 `kr-build`는 새 파일에만 쓰며 그 문서는 `identity register`로 등록된다 | `tests/storage/test_kr_identity.py::test_kr_cli_imports_builds_and_registers` | 구현 |
+| DV-109 | ISIN을 실은 목록끼리 한 심볼의 ISIN·유형·통화가 다르면 어느 쪽도 고르지 않고 미해결로 둔다 | `tests/storage/test_kr_identity.py::test_lists_that_disagree_on_a_symbol_leave_it_unresolved` | 구현 |
+| DV-110 | KR 빌드는 등록된 KR assertion의 원천을 모두 읽어야 하며, 더는 나오지 않는 등록 주장을 `withdrawn`으로 보고한다 | `tests/storage/test_kr_identity.py::test_a_build_reads_every_registered_kr_source_and_reports_withdrawn_claims` | 구현 |
+| DV-111 | KRX에 상장한 외국 기업은 자기 ISIN으로 해석되고 KR 주식의 asset_type은 `unclassified`다 | `tests/storage/test_kr_identity.py::test_a_foreign_issuer_listed_on_krx_resolves_by_its_own_isin` | 구현 |
+| DV-112 | KIND 상장일과 DART receipt 여러 개를 함께 읽어 충돌하는 단축코드·회사는 미해결로 둔다 | `tests/storage/test_kr_identity.py::test_dart_receipts_and_kind_lists_read_together_leave_conflicts_unresolved` | 구현 |

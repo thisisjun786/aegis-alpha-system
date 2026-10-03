@@ -4,29 +4,31 @@ Three identity mappers turn retained source rows into one ``aas-identity-registr
 document; ``aas identity register`` then appends it like any other registry document.
 
 - ``eodhd.kr_symbol@1`` reads the EODHD exchange symbol lists of ``KO`` (KOSPI) and
-  ``KQ`` (KOSDAQ). A row whose ``Isin`` is a KR ISIN with a valid check digit mints the
-  instrument ``mint_instrument('krx_isin', Isin)`` (venue ``XKRX``, the operator of both
-  markets) and asserts the provider symbol ``<Code>.<Exchange>`` (namespace
-  ``eodhd_symbol``, the token ``eodhd.bars@1`` resolves) and the KRX short code ``Code``
-  (namespace ``krx_short_code``). The list carries no dates, so both claims are valid over
-  the provider's whole series.
+  ``KQ`` (KOSDAQ). A KRW row whose ``Isin`` has a valid check digit mints the instrument
+  ``mint_instrument('krx_isin', Isin)`` (venue ``XKRX``, the operator of both markets;
+  a foreign company listed on KRX keeps its own country prefix) and asserts the provider
+  symbol ``<Code>.<Exchange>`` (namespace ``eodhd_symbol``, the token ``eodhd.bars@1``
+  resolves) and the KRX short code ``Code`` (namespace ``krx_short_code``). The list
+  carries no dates, so both claims are valid over the provider's whole series. EODHD types
+  preferred shares "Common Stock", so a stock's asset type is ``unclassified``.
 - ``kind.listings@1`` reads the KIND listed-company lists and asserts the short code
   (provider ``kind``) from its listing date, at local midnight in Asia/Seoul.
-- ``dart.corp_codes@1`` reads the DART ``corpCode.xml`` receipt. A corp with a stock code
+- ``dart.corp_codes@1`` reads DART ``corpCode.xml`` receipts. A corp with a stock code
   is an issuer ``mint_issuer('dart_corp_code', corp_code)`` and the instrument with that
   short code is linked to it by a ``dart`` issuer assertion.
 
 KIND and DART name no ISIN, so they reach an instrument only through the short code that
 EODHD binds to exactly one ISIN. Nothing is derived from a ticker, a short code or a
-name: an ISIN missing from the provider, a check digit that fails, an ISIN claimed by two
-short codes or two asset types, a short code claimed by two ISINs and a stock code claimed
-by two corps all stay unresolved with their reason, never guessed (data-vertical risk 7).
+name, and no list is chosen over another: lists that disagree on a symbol's ISIN, type or
+currency (only a blank ISIN defers), an ISIN claimed by two short codes or two asset
+types, a short code claimed by two ISINs and a stock code claimed by two corps all stay
+unresolved with their reason, never guessed (data-vertical risk 7).
 
 Every assertion is known from the retrieval instant its source receipt records, the
 earliest time AAS can show the claim was public, and cites its source as
-``sl:<source_id>`` with the ``aas-source-row-v1`` hash of the row it came from. The
-contract is in dev-notes/design/data-vertical.md.
-"""
+``sl:<source_id>`` with the ``aas-source-row-v1`` hash of the row it came from. The build
+input is cumulative (``check_registered``). The contract is in
+dev-notes/design/data-vertical.md."""
 
 from __future__ import annotations
 
@@ -57,6 +59,7 @@ from aegis_alpha.storage.promotion import formats
 from aegis_alpha.storage.source_identity import LINK_PREFIX, SourceContent, SourceFile
 
 if TYPE_CHECKING:
+    import sqlite3
     from pathlib import Path
 
     import pyarrow as pa
@@ -122,9 +125,11 @@ _HTTP_OK: Final = 200
 _EODHD_TOOL: Final = "eodhd.exchange_symbols.list."
 KR_EXCHANGES: Final = frozenset({"KO", "KQ"})
 VENUE: Final = "XKRX"
+# EODHD types KRX preferred shares "Common Stock", so a share's class is not asserted here:
+# it stays ``unclassified`` for the classifications dataset to state.
 ASSET_TYPES: Final[Mapping[str, str]] = {
-    "Common Stock": "common_stock",
-    "Preferred Stock": "preferred_stock",
+    "Common Stock": "unclassified",
+    "Preferred Stock": "unclassified",
     "ETF": "etf",
 }
 SEOUL: Final = ZoneInfo("Asia/Seoul")
@@ -536,6 +541,13 @@ class MapperReport:
     def skip(self, reason: str) -> None:
         self.skipped[reason] = self.skipped.get(reason, 0) + 1
 
+    def merge(self, other: MapperReport) -> None:
+        self.rows += other.rows
+        self.accepted += other.accepted
+        for mine, theirs in ((self.skipped, other.skipped), (self.refused, other.refused)):
+            for reason, count in theirs.items():
+                mine[reason] = mine.get(reason, 0) + count
+
     def json(self) -> dict[str, object]:
         return {
             "rows": self.rows,
@@ -560,6 +572,31 @@ class SymbolClaim:
     evidence: Evidence
 
 
+@dataclass(frozen=True, slots=True)
+class SymbolRow:
+    """One KR symbol-list row as the list states it, with the reason it cannot mint."""
+
+    symbol: str
+    code: str
+    isin: str | None
+    """The ``Isin`` cell, or None when the list leaves it blank."""
+    asset_type: str | None
+    currency: object
+    type_label: object
+    evidence: Evidence
+    reason: str | None
+
+    def statement(self) -> tuple[object, ...]:
+        """What the row says about its symbol; two lists that differ here disagree."""
+        return (self.isin, self.asset_type or f"unknown:{self.type_label}", self.currency)
+
+    def claim(self) -> SymbolClaim:
+        return SymbolClaim(
+            self.symbol, self.code, cast("str", self.isin), cast("str", self.asset_type),
+            self.evidence,
+        )  # fmt: skip
+
+
 def _isin(value: object) -> tuple[str | None, str | None]:
     if value is None or value == "":
         return None, "isin_missing"
@@ -569,22 +606,19 @@ def _isin(value: object) -> tuple[str | None, str | None]:
         return None, "isin_invalid"
     if canonical != value:
         return None, "isin_invalid"
-    if not canonical.startswith("KR"):
-        return None, "isin_not_kr"
     return canonical, None
 
 
-def map_eodhd_symbols(
-    sources: Sequence[SourceRows],
-) -> tuple[list[SymbolClaim], dict[str, set[str]], MapperReport]:
-    """``eodhd.kr_symbol@1``: KR symbol rows to symbol claims; other rows give a reason.
+def map_eodhd_symbols(sources: Sequence[SourceRows]) -> tuple[list[SymbolRow], MapperReport]:
+    """``eodhd.kr_symbol@1``: KR symbol-list rows, each with the reason it cannot mint.
 
-    Returns the claims, every KR symbol's refusal reasons, and the row report. Rows of an
-    exchange other than ``KO``/``KQ`` are skipped, not refused.
+    A row mints when its ``Isin`` is an ISIN with a valid check digit, its ``Type`` is
+    known and its currency is KRW. Whether its symbol resolves is decided over every list
+    together (``_resolve_symbols``). Rows of an exchange other than ``KO``/``KQ`` are
+    skipped, not refused.
     """
     report = MapperReport()
-    claims: list[SymbolClaim] = []
-    refusals: dict[str, set[str]] = defaultdict(set)
+    rows: list[SymbolRow] = []
     for source in sources:
         _require(source, ("code", "exchange", "currency", "type", "isin", "retrieved_at_utc"),
                  EODHD_MAPPER)  # fmt: skip
@@ -594,23 +628,30 @@ def map_eodhd_symbols(
             if not isinstance(code, str) or not code or exchange not in KR_EXCHANGES:
                 report.skip("exchange_not_kr")
                 continue
-            symbol = f"{code}.{exchange}"
-            isin, reason = _isin(row["isin"])
+            _, reason = _isin(row["isin"])
             asset_type = ASSET_TYPES.get(cast("str", row["type"]))
             if reason is None and asset_type is None:
                 reason = "type_unknown"
             if reason is None and row["currency"] != "KRW":
                 reason = "currency_not_krw"
-            if reason is not None:
+            if reason is None:
+                report.accepted += 1
+            else:
                 report.refuse(reason)
-                refusals[symbol].add(reason)
-                continue
-            report.accepted += 1
-            evidence = Evidence(source.snapshot_id, row_hash, instant_us(row["retrieved_at_utc"]))
-            claims.append(
-                SymbolClaim(symbol, code, cast("str", isin), cast("str", asset_type), evidence)
+            stated = row["isin"]
+            rows.append(
+                SymbolRow(
+                    f"{code}.{exchange}",
+                    code,
+                    None if stated is None or stated == "" else cast("str", stated),
+                    asset_type,
+                    row["currency"],
+                    row["type"],
+                    Evidence(source.snapshot_id, row_hash, instant_us(row["retrieved_at_utc"])),
+                    reason,
+                )
             )
-    return claims, refusals, report
+    return rows, report
 
 
 @dataclass(frozen=True, slots=True)
@@ -770,6 +811,10 @@ class KrRegistry:
     symbols: dict[str, str]
     """Each KR EODHD symbol seen: its minted instrument ID, or ``unresolved:<reason>``."""
     unresolved: dict[str, dict[str, list[str]]]
+    sources: frozenset[str] = frozenset()
+    """The ``sl:`` IDs of every source the build read."""
+    withdrawn: list[dict[str, object]] = field(default_factory=list)
+    """Registered KR assertions, not yet corrected, that these sources no longer give."""
 
     def raw(self) -> bytes:
         return formats.canonical(self.document)
@@ -821,6 +866,8 @@ class KrRegistry:
                 key: {reason: cut(values) for reason, values in sorted(groups.items())}
                 for key, groups in sorted(self.unresolved.items())
             },
+            "withdrawn_count": len(self.withdrawn),
+            "withdrawn": self.withdrawn if sample is None else self.withdrawn[:sample],
         }
 
 
@@ -848,55 +895,75 @@ def _accepted(
 
 
 def _codes(
-    accepted: Mapping[str, list[SymbolClaim]], unresolved: dict[str, list[str]]
+    stated: Mapping[str, list[SymbolClaim]],
+    accepted: Mapping[str, object],
+    unresolved: dict[str, list[str]],
 ) -> dict[str, str]:
-    """Short codes that exactly one accepted ISIN carries."""
+    """Short codes every mintable row ties to one ISIN, when that ISIN is accepted."""
     isins_of: dict[str, set[str]] = defaultdict(set)
-    for isin, group in accepted.items():
+    for isin, group in stated.items():
         for claim in group:
             if _SHORT_CODE.fullmatch(claim.code):
                 isins_of[claim.code].add(isin)
     by_code: dict[str, str] = {}
     for code, isins in sorted(isins_of.items()):
-        if len(isins) == 1:
-            (by_code[code],) = isins
-        else:
+        if len(isins) > 1:
             unresolved["short_code_ambiguous"].append(code)
+        elif (isin := next(iter(isins))) in accepted:
+            by_code[code] = isin
     return by_code
 
 
-def _symbol_reason(
-    isins: set[str], refused: set[str], accepted: Mapping[str, object]
-) -> str | None:
-    if len(isins) > 1:
-        return "symbol_ambiguous"
-    if isins:
-        return None if next(iter(isins)) in accepted else "isin_ambiguous"
-    return min(refused)
+def _symbol_claims(group: Sequence[SymbolRow]) -> tuple[list[SymbolClaim], str | None]:
+    """One symbol's rows across every list: its claims, or why it stays unresolved.
+
+    A blank ``Isin`` defers to the lists that name one. Lists that name an ISIN must
+    agree on it, on the asset type and on the currency; any disagreement leaves the
+    symbol ``symbol_ambiguous`` rather than choosing a side. An agreed statement that
+    cannot mint keeps its own reason.
+    """
+    named = [row for row in group if row.isin is not None]
+    if not named:
+        return [], "isin_missing"
+    if len({row.statement() for row in named}) > 1:
+        return [], "symbol_ambiguous"
+    if named[0].reason is not None:
+        return [], named[0].reason
+    return [row.claim() for row in named], None
 
 
 def _group_symbols(
-    claims: Sequence[SymbolClaim],
-    refusals: Mapping[str, set[str]],
-    unresolved: Mapping[str, dict[str, list[str]]],
+    rows: Sequence[SymbolRow], unresolved: Mapping[str, dict[str, list[str]]]
 ) -> _Symbols:
-    """A symbol with two ISINs, an ISIN with two short codes or asset types, and a short
-    code with two ISINs are each ambiguous; the claims that remain mint instruments."""
-    by_symbol: dict[str, set[str]] = defaultdict(set)
-    for claim in claims:
-        by_symbol[claim.symbol].add(claim.isin)
-    by_isin: dict[str, list[SymbolClaim]] = defaultdict(list)
-    for claim in claims:
-        if len(by_symbol[claim.symbol]) == 1:
-            by_isin[claim.isin].append(claim)
-    accepted = _accepted(by_isin, unresolved["isins"])
-    by_code = _codes(accepted, unresolved["short_codes"])
+    """A symbol the lists disagree on, an ISIN with two short codes or asset types, and a
+    short code with two ISINs are each ambiguous; the claims that remain mint instruments."""
+    per_symbol: dict[str, list[SymbolRow]] = defaultdict(list)
+    for row in rows:
+        per_symbol[row.symbol].append(row)
+    reasons: dict[str, str] = {}
+    resolved: dict[str, list[SymbolClaim]] = defaultdict(list)
+    for symbol, group in per_symbol.items():
+        claims, reason = _symbol_claims(group)
+        if reason is not None:
+            reasons[symbol] = reason
+        for claim in claims:
+            resolved[claim.isin].append(claim)
+    # Every mintable row speaks to its ISIN, even one whose symbol stays unresolved.
+    stated: dict[str, list[SymbolClaim]] = defaultdict(list)
+    for row in rows:
+        if row.reason is None:
+            stated[cast("str", row.isin)].append(row.claim())
+    agreed = _accepted(stated, unresolved["isins"])
+    accepted = {isin: resolved[isin] for isin in sorted(agreed) if resolved.get(isin)}
+    by_code = _codes(stated, accepted, unresolved["short_codes"])
     status: dict[str, str] = {}
-    for symbol in sorted(set(by_symbol) | set(refusals)):
-        isins = by_symbol.get(symbol, set())
-        reason = _symbol_reason(isins, refusals.get(symbol, set()), accepted)
+    for symbol, group in sorted(per_symbol.items()):
+        reason = reasons.get(symbol)
+        isin = next((row.isin for row in group if row.isin is not None), None)
+        if reason is None and isin not in accepted:
+            reason = "isin_ambiguous"
         if reason is None:
-            status[symbol] = mint_instrument("krx_isin", next(iter(isins)))
+            status[symbol] = mint_instrument("krx_isin", cast("str", isin))
         else:
             status[symbol] = "unresolved:" + reason
             unresolved["symbols"][reason].append(symbol)
@@ -906,20 +973,25 @@ def _group_symbols(
 def _dart(
     claims: Sequence[CorpClaim], symbols: _Symbols, unresolved: dict[str, list[str]]
 ) -> tuple[list[Record], dict[str, tuple[str, Evidence]]]:
-    """Issuers and the instrument each listed corp's stock code reaches, by ISIN."""
+    """Issuers and the instrument each listed corp's stock code reaches, by ISIN.
+
+    Receipts collected at different times are read together: a stock code two corps
+    claim, or a corp that names two stock codes, stays unresolved. A corp's name and
+    evidence are its earliest receipt's.
+    """
     per_stock: dict[str, list[CorpClaim]] = defaultdict(list)
-    per_corp: dict[str, int] = defaultdict(int)
+    stocks_of: dict[str, set[str]] = defaultdict(set)
     for claim in claims:
         per_stock[claim.stock_code].append(claim)
-        per_corp[claim.corp_code] += 1
+        stocks_of[claim.corp_code].add(claim.stock_code)
     issuers: list[Record] = []
     links: dict[str, tuple[str, Evidence]] = {}
     for stock, group in sorted(per_stock.items()):
-        if len(group) > 1:
+        if len({claim.corp_code for claim in group}) > 1:
             unresolved["stock_code_ambiguous"].append(stock)
             continue
-        (claim,) = group
-        if per_corp[claim.corp_code] > 1:
+        claim = min(group, key=lambda item: item.evidence.order())
+        if len(stocks_of[claim.corp_code]) > 1:
             unresolved["corp_code_ambiguous"].append(stock)
             continue
         isin = symbols.by_code.get(stock)
@@ -982,7 +1054,9 @@ def _eodhd_assertions(symbols: _Symbols, links: Mapping[str, tuple[str, Evidence
 
 
 def build_kr_registry(
-    eodhd: Sequence[SourceRows], kind: Sequence[SourceRows] = (), dart: SourceRows | None = None
+    eodhd: Sequence[SourceRows],
+    kind: Sequence[SourceRows] = (),
+    dart: Sequence[SourceRows] = (),
 ) -> KrRegistry:
     """Build the KR ``aas-identity-registry-v1`` document from pinned source rows.
 
@@ -992,13 +1066,19 @@ def build_kr_registry(
     unresolved: dict[str, dict[str, list[str]]] = {
         key: defaultdict(list) for key in ("symbols", "isins", "short_codes", "kind", "dart")
     }
-    claims, refusals, eodhd_report = map_eodhd_symbols(eodhd)
-    symbols = _group_symbols(claims, refusals, unresolved)
+    symbol_rows, eodhd_report = map_eodhd_symbols(eodhd)
+    symbols = _group_symbols(symbol_rows, unresolved)
     mappers = {EODHD_MAPPER: eodhd_report}
     issuers: list[Record] = []
     links: dict[str, tuple[str, Evidence]] = {}
-    if dart is not None:
-        corps, mappers[DART_MAPPER] = map_dart_corp_codes(dart)
+    if dart:
+        corps: list[CorpClaim] = []
+        dart_report = MapperReport()
+        for source in dart:
+            found, report = map_dart_corp_codes(source)
+            corps.extend(found)
+            dart_report.merge(report)
+        mappers[DART_MAPPER] = dart_report
         issuers, links = _dart(corps, symbols, unresolved["dart"])
     listings, mappers[KIND_MAPPER] = map_kind_listings(kind)
     instruments = [
@@ -1032,7 +1112,61 @@ def build_kr_registry(
             key: {reason: sorted(values) for reason, values in groups.items() if values}
             for key, groups in unresolved.items()
         },
+        frozenset(source.snapshot_id for source in (*eodhd, *kind, *dart)),
     )
+
+
+# Registered assertions the KR registry owns: KIND short codes, DART issuer links, EODHD
+# short codes and EODHD symbols of the two KRX markets.
+_KR_ASSERTIONS: Final = (
+    "SELECT a.assertion_id,a.provider,a.namespace,a.token,a.source_snapshot_id,"
+    "EXISTS(SELECT 1 FROM identity_assertions c WHERE c.supersedes_assertion_id=a.assertion_id)"
+    " FROM identity_assertions a WHERE a.provider='kind'"
+    " OR (a.provider='dart' AND a.namespace='issuer')"
+    " OR (a.provider='eodhd' AND (a.namespace='krx_short_code'"
+    " OR (a.namespace='eodhd_symbol' AND (a.token LIKE '%.KO' OR a.token LIKE '%.KQ'))))"
+    " ORDER BY a.provider,a.namespace,a.token,a.assertion_id"
+)
+
+
+def check_registered(registry: KrRegistry, state: sqlite3.Connection) -> KrRegistry:
+    """Hold a build to the KR assertions already registered.
+
+    The build input is cumulative: every source a registered KR assertion cites must be
+    among the build's sources, so a claim registered before is rebuilt from the same
+    earliest evidence with the same assertion ID instead of conflicting with itself. A
+    build missing one is refused, naming the sources to add. A registered claim that is
+    not corrected and that the sources no longer give (a later list made its key
+    ambiguous) is reported in ``withdrawn``; the builder never closes it, because no
+    source says when it stopped holding, so a correction is registered separately.
+    """
+    sources = registry.sources
+    built = {
+        cast("str", row["assertion_id"]) for row in parse_registry(registry.document).assertions
+    }
+    missing: set[str] = set()
+    withdrawn: list[dict[str, object]] = []
+    for assertion_id, provider, namespace, token, source, corrected in state.execute(
+        _KR_ASSERTIONS
+    ):
+        if source not in sources:
+            missing.add(str(source))
+        elif not corrected and assertion_id not in built:
+            withdrawn.append(
+                {
+                    "assertion_id": assertion_id,
+                    "provider": provider,
+                    "namespace": namespace,
+                    "token": token,
+                }
+            )
+    if missing:
+        raise ValueError(
+            "the KR registry build must include every source its registered assertions "
+            f"cite; add {sorted(missing)}"
+        )
+    registry.withdrawn = withdrawn
+    return registry
 
 
 def build_from_workspace(
@@ -1040,15 +1174,21 @@ def build_from_workspace(
     *,
     eodhd: Sequence[str],
     kind: Sequence[str] = (),
-    dart: str | None = None,
+    dart: Sequence[str] = (),
 ) -> KrRegistry:
-    """Build the registry from committed sources named by their source IDs."""
+    """Build the registry from committed sources named by their source IDs.
+
+    The sources must include every source the workspace's registered KR assertions cite
+    (``check_registered``).
+    """
     if not eodhd:
         raise ValueError("the KR registry needs at least one EODHD symbol source")
-    return build_kr_registry(
+    registry = build_kr_registry(
         [pinned_rows(workspace, source, EODHD_TABLE) for source in eodhd],
         [pinned_rows(workspace, source, KIND_TABLE) for source in kind],
-        None
-        if dart is None
-        else pinned_rows(workspace, dart, DART_TABLE, lambda row: row["endpoint"] == "corp_codes"),
+        [
+            pinned_rows(workspace, source, DART_TABLE, lambda row: row["endpoint"] == "corp_codes")
+            for source in dart
+        ],
     )
+    return check_registered(registry, workspace.state)

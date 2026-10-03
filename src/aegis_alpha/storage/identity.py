@@ -56,10 +56,9 @@ def _identifier(kind: IdentifierType, token: str) -> str:
 
 
 def _krx_isin(token: str) -> str:
-    canonical = _identifier(IdentifierType.ISIN, token)
-    if not canonical.startswith("KR"):
-        raise IdentityAnchorError("krx_isin must be a KR ISIN")
-    return canonical
+    # The ISIN of a KRX-listed instrument. Its prefix is the issuer's country, so a
+    # foreign company listed on KRX keeps its own (for example KY) ISIN.
+    return _identifier(IdentifierType.ISIN, token)
 
 
 def _dart_corp_code(token: str) -> str:

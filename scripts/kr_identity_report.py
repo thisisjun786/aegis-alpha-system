@@ -1,7 +1,8 @@
 """Report how the KR identity registry resolves a daily-bar source's EODHD symbols.
 
 Review evidence for ``aas identity kr-build``, never an input to it. It opens the market
-DuckDB file read-only, reads the DART ``corp_codes`` receipt from ``--dart-source`` and
+DuckDB file read-only (a store without the state file ``kr-build`` needs), reads the DART
+``corp_codes`` receipt from each ``--dart-source`` and
 the provider symbols of every committed table named ``--table`` under
 ``--symbols-prefix``, reads KIND receipts and EODHD symbol-list jobs from their collected
 files (the same bytes ``aas identity kr-import`` would commit, cited by the same content
@@ -16,7 +17,9 @@ source IDs), builds the registry document in memory and reports::
 - the resolution of the bar source's symbols: how many resolve to exactly one
   instrument, and every unresolved symbol by reason.
 
-Nothing is written unless ``--output`` names a new file for the full JSON report.
+Nothing is written unless ``--output`` names a new file for the full JSON report. The
+document it builds is byte-identical to ``kr-build``'s from the same committed sources
+(``tests/storage/test_kr_identity.py`` holds the two together).
 """
 
 from __future__ import annotations
@@ -68,7 +71,7 @@ def _dart(connection: duckdb.DuckDBPyConnection, source_id: str) -> SourceRows:
     rows = connection.execute(
         "SELECT "  # noqa: S608 -- quoted names from the commit manifest
         + ",".join(_quote(column) for column in columns)
-        + f" FROM {_quote(target)} ORDER BY _aas_ordinal"
+        + f" FROM {_quote(target)} WHERE endpoint = 'corp_codes' ORDER BY _aas_ordinal"
     ).fetchall()
     return SourceRows(LINK_PREFIX + source_id, tuple(columns), tuple(rows))
 
@@ -88,7 +91,12 @@ def _symbols(connection: duckdb.DuckDBPyConnection, prefix: str, table: str) -> 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--market", type=Path, required=True)
-    parser.add_argument("--dart-source", help="Source ID holding the DART corp_codes receipt")
+    parser.add_argument(
+        "--dart-source",
+        action="append",
+        default=[],
+        help="Source ID holding a DART corp_codes receipt",
+    )
     parser.add_argument("--kind-receipt", type=Path, action="append", default=[])
     parser.add_argument("--eodhd-job", type=Path, action="append", default=[], required=True)
     parser.add_argument("--symbols-prefix", required=True)
@@ -98,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
     eodhd = [read_eodhd_job(path) for path in args.eodhd_job]
     kind = [read_kind_receipt(path) for path in args.kind_receipt]
     with duckdb.connect(str(args.market), read_only=True) as connection:
-        dart = None if args.dart_source is None else _dart(connection, args.dart_source)
+        dart = [_dart(connection, source) for source in args.dart_source]
         symbols = _symbols(connection, args.symbols_prefix, args.table)
     registry = build_kr_registry(
         [unit.source_rows() for unit in eodhd], [unit.source_rows() for unit in kind], dart
