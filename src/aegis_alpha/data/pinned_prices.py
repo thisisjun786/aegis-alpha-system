@@ -180,6 +180,11 @@ def _verify_files(
             raise
 
 
+def _interrupt(connection: DuckDBPyConnection) -> None:
+    """Interrupt the connection's running statement; tests observe deliveries here."""
+    connection.interrupt()
+
+
 @contextmanager
 def _connection(
     budget: ComputeBudget | None, cancel_event: Event | None
@@ -193,10 +198,12 @@ def _connection(
         done = Event()
 
         def interrupt_on_cancel() -> None:
+            # DuckDB clears a pending interrupt when a statement starts, so a single
+            # interrupt delivered before the statement begins is lost. Keep
+            # interrupting until the connection body has finished.
             while not done.wait(0.05):
                 if cancel_event is not None and cancel_event.is_set():
-                    connection.interrupt()
-                    return
+                    _interrupt(connection)
 
         watcher = Thread(target=interrupt_on_cancel, name="aas-price-cancel", daemon=True)
         if cancel_event is not None:
