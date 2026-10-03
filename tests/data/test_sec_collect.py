@@ -18,6 +18,7 @@ from tests.data.us_collect_support import (
     SecFiling,
     companyfacts_bytes,
     index_bytes,
+    submissions_bytes,
 )
 
 CIK = "0000000101"
@@ -57,6 +58,15 @@ def test_requests_name_the_document_and_never_the_contact() -> None:
     # An answer echoing the contact is not retained.
     with pytest.raises(TransportError, match="echoed"):
         client.request(sec.submissions(CIK))
+    # The contact address alone, without the rest of the User-Agent, is refused too.
+    address = USER_AGENT.rsplit(" ", 1)[-1]
+
+    def echo(method: str, url: str, body: bytes | None, headers: dict[str, str]) -> HttpAnswer:
+        del method, url, body, headers
+        return HttpAnswer(200, (("x-contact", address),), b"{}")
+
+    with pytest.raises(TransportError, match="echoed"):
+        sec.SecClient(USER_AGENT, echo, FakeClock()).request(sec.submissions(CIK))  # ty: ignore[invalid-argument-type]
     assert seen == [{"Accept": "*/*", "User-Agent": USER_AGENT}]
     assert USER_AGENT not in json.dumps(sec.submissions(CIK).document)
     with pytest.raises(ValueError, match="contact"):
@@ -68,14 +78,17 @@ def test_a_daily_index_keeps_every_line_and_reads_the_filings() -> None:
         SecFiling(CIK, A1, "10-Q", MONDAY, "2026-09-14T20:01:02.000Z"),
         SecFiling(OTHER, B1, "8-K", MONDAY, "2026-09-14T21:01:02.000Z"),
     ]
-    body = index_bytes(MONDAY, filings, extra=("not|an|index|line",))
+    # A line whose file lies under another filer's CIK names no filing.
+    crossed = f"101|SYNTHETIC CO 101|8-K|20260914|edgar/data/202/{B1}.txt"
+    body = index_bytes(MONDAY, filings, extra=("not|an|index|line", crossed))
     lines = sec.parse_index(body)
     assert [(line.cik, line.form, line.filed, line.accession) for line in lines] == [
         (CIK, "10-Q", MONDAY, A1),
         (OTHER, "8-K", MONDAY, B1),
         (None, None, None, None),
+        (None, None, None, None),
     ]
-    assert lines[-1].line == "not|an|index|line"
+    assert [line.line for line in lines[-2:]] == ["not|an|index|line", crossed]
     # The header is matched by its column names: whitespace, case and the full-index
     # spelling "Filename" read the same lines; an index without the header is refused.
     header = b"CIK|Company Name|Form Type|Date Filed|File Name"
@@ -112,6 +125,13 @@ def test_company_facts_keep_each_number_as_written() -> None:
     text = companyfacts_bytes(CIK, facts[:1]).replace(b'"accn"', b'"accession"')
     with pytest.raises(ValueError, match="unknown or missing"):
         list(sec.companyfacts_facts(text, CIK))
+    # A repeated key is ambiguous: the answer is unreadable, not its last value.
+    repeated = companyfacts_bytes(CIK, facts[:1]).replace(b'{"cik"', b'{"cik": 202, "cik"', 1)
+    assert repeated != companyfacts_bytes(CIK, facts[:1])
+    with pytest.raises(ValueError, match="repeats a key"):
+        list(sec.companyfacts_facts(repeated, CIK))
+    twice = submissions_bytes(CIK, []).replace(b'{"cik"', b'{"cik": "202", "cik"', 1)
+    assert sec.classify(sec.submissions(CIK), _response(200, twice))[0] == FAILED
     quoted = companyfacts_bytes(CIK, facts[:1]).replace(b"123456789012345678901234567890", b'"123"')
     with pytest.raises(ValueError, match="no decimal value"):
         list(sec.companyfacts_facts(quoted, CIK))

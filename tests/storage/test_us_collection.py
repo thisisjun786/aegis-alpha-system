@@ -799,6 +799,43 @@ def test_a_refused_rate_stops_the_run_and_the_contact_is_never_retained(ws: Work
             assert contact not in path.read_bytes()
 
 
+def test_a_csv_download_whose_rows_do_not_read_is_failed_and_asked_again(
+    ws: Workspace,
+) -> None:
+    fake = FakeFred(date(2026, 9, 9))
+    _history(fake)
+    fake.answers["fredgraph.csv"] = HttpAnswer(
+        200, (), b"observation_date,DEXKOUS\n2026-09-01,1300.5,extra\n"
+    )
+    clock = FakeClock(FRED_NOW)
+    first = _fred_run(ws, fake, clock)
+    assert cast("dict[str, int]", first["outcomes"])["FAILED"] == 1
+    assert _sources(first, "fred-series-csv-") == []
+    assert fred_collection.load_known(ws).knowledge.csv_days == {}
+    del fake.answers["fredgraph.csv"]
+    clock.advance(hours=1)
+    second = _fred_run(ws, fake, clock)
+    assert cast("dict[str, int]", second["asked"])["series_csv:daily"] == 1
+    assert len(_sources(second, "fred-series-csv-")) == 1
+
+
+def test_a_run_without_pyarrow_stops_before_any_call(
+    ws: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = provider_collection.importlib.util.find_spec
+    monkeypatch.setattr(
+        provider_collection.importlib.util, "find_spec",
+        lambda name, *args: None if name == "pyarrow" else original(name, *args),
+    )  # fmt: skip
+    fake, sec_fake = FakeFred(date(2026, 9, 9)), _sec_fake()
+    with pytest.raises(ValueError, match="needs pyarrow"):
+        _fred_run(ws, fake, FakeClock(FRED_NOW))
+    with pytest.raises(ValueError, match="needs pyarrow"):
+        _sec_run(ws, sec_fake, FakeClock(SEC_NOW))
+    assert (fake.calls, sec_fake.calls) == ([], [])
+    assert ws.state.execute("SELECT count(*) FROM collection_attempts").fetchone()[0] == 0
+
+
 def test_a_submissions_answer_whose_rows_do_not_read_is_failed() -> None:
     request = sec.submissions(CIK)
     moment = datetime(2026, 9, 17, tzinfo=UTC)

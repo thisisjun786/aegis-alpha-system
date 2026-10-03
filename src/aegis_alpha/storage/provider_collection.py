@@ -21,6 +21,7 @@ reused because the same bytes give the same source ID.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import time
 from collections import Counter
@@ -66,6 +67,12 @@ DEFAULT_BATCH: Final = 500
 DEFAULT_BATCH_BYTES: Final = 256 * 1024 * 1024
 _MAX_RAW_BYTES: Final = 512 * 1024 * 1024
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def require_pyarrow(command: str) -> None:
+    """Commits need the legacy extra; check before recovery or the first provider call."""
+    if importlib.util.find_spec("pyarrow") is None:
+        raise ValueError(f"{command} needs pyarrow (the legacy extra)")
 
 
 def epoch_us(moment: datetime) -> int:

@@ -1224,8 +1224,9 @@ fingerprint = sha256(정규 JSON ["aas-<provider>-request-v1", endpoint, paramet
 | `fred` | `series_csv` | `fredgraph.csv` | `id` |
 
 FRED 키는 `vintage_dates`·`observations`의 공급자 URL에만 실리고, SEC의 공정 접근 `User-Agent`(연락처
-포함)는 header에만 실린다. 둘 다 요청·receipt·원천에 들어가지 않으며, 답이 그 값을 되돌려 주면 그 답을
-보존하지 않는다. SEC는 HTTP 403·429, FRED는 401·403·429와 키를 거부하는 400이 실행을 멈춘다. 전송 실패가
+포함)는 header에만 실린다. 둘 다 요청·receipt·원천에 들어가지 않으며, 답이 그 값(SEC는 `User-Agent` 전체나
+그 안의 연락처 주소)을 되돌려 주면 그 답을 보존하지 않는다. 두 명령은 commit에 쓰는 pyarrow(legacy extra)가
+없으면 정산이나 호출 전에 멈춘다. SEC는 HTTP 403·429, FRED는 401·403·429와 키를 거부하는 400이 실행을 멈춘다. 전송 실패가
 세 번 이어져도 멈춘다. 호출 상한은 `--max-calls`(SEC 기본 2,000, FRED 기본 500)이고, 호출 간격은 SEC
 0.125초(초당 10회 한도), FRED 0.5초(분당 120회 한도)다.
 
@@ -1272,7 +1273,8 @@ batch의 것만 읽는다.
 | `sec-submissions-filings-` | `filings` | `sec.submissions_filings@1`의 열과 같은 열로, 문서의 `filings.recent` 중 원한 공시의 위치. `sec.submissions@1`이 읽는다 |
 | `sec-companyfacts-facts-` | `facts` | 원한 공시의 사실. `cik`, `taxonomy`, `tag`, `unit`, `period_start`, `period_end`, `accession_number`, `form`, `filed`, 숫자의 JSON 원문 텍스트 `value`, `fy`, `fp`, `frame`, `retrieved_at`, `receipt_sha256`. `sec.companyfacts@1`이 읽는다 |
 
-알 수 없는 필드, 빠진 필수 필드, 십진수가 아닌 값, 다른 CIK의 문서는 그 답을 `FAILED`로 만든다. 행을
+되풀이된 key, 알 수 없는 필드, 빠진 필수 필드, 십진수가 아닌 값, 다른 CIK의 문서는 그 답을 `FAILED`로 만든다.
+색인 줄의 CIK와 `File Name` 경로의 CIK가 다르면 그 줄은 공시가 아니다. 행을
 다듬지 않고, 공급자가 쓴 미래 기간 끝도 그대로 남긴다.
 
 **FRED/ALFRED.** ALFRED는 실시간 구간을 질의 창으로 자른다. 창 시작보다 먼저 시작한 vintage는 창 시작에
@@ -1299,7 +1301,8 @@ batch의 것만 읽는다.
 | `fred-alfred-observations-` | `observations` | 완결된 창의 vintage 행. `series_id`, `observation_date`, `realtime_start`, `realtime_end`(창 끝으로 잘린 값), `value` 원문, `query_realtime_start`, `query_realtime_end`, `retrieved_at_utc`, `receipt_sha256`. `fred.alfred@1`이 읽는다 |
 | `fred-series-csv-` | `observations` | `series_csv` 답 하나의 bytes만을 원본으로 한 원천. 행은 `fred.series_csv@1`과 같아 같은 bytes는 같은 원천이고, `fred.fx_series@1`이 읽는다 |
 
-`series_csv`(기본 DEXKOUS, dataset `fx.usdkrw.fred`)는 FRED 날마다 한 번 받는다. 기본 ALFRED 시계열은
+`series_csv`(기본 DEXKOUS, dataset `fx.usdkrw.fred`)는 FRED 날마다 한 번 받는다. 행이
+`fred.series_csv@1`로 읽히지 않는 답은 `FAILED`라 그 날을 덮지 않는다. 기본 ALFRED 시계열은
 legacy 거시 목록 35개와 DEXKOUS다. 수집기 자신의 watermark는 시계열마다의 `known`이고, 수집으로만
 앞으로 간다. 승격된 dataset의 `watermarks`는 [승격 실행과 보고](#승격-실행과-보고)의 규칙대로 그 수집
 원천을 승격할 때 앞으로 간다. 유지보수 승격은 수집된 원천마다 `vintage_partitions`의 구간을 순서대로
@@ -2096,9 +2099,9 @@ state v2:
 | DV-300 | FRED 키 거부는 실행을 멈추고 그 답을 commit한다 | `tests/storage/test_us_collection.py::test_a_refused_key_stops_the_run_and_keeps_the_answer` | 구현 |
 | DV-301 | `fred.alfred@1`이 읽는 legacy 테이블도 알려진 vintage 날을 정하고, 받은 FRED 날에 시작한 vintage는 세지 않는다 | `tests/storage/test_us_collection.py::test_a_legacy_alfred_table_sets_the_known_vintage_day` | 구현 |
 | DV-302 | CSV 내려받기는 `fred.series_csv@1` 편입과 같은 원천이고 `fred.fx_series@1`로 승격된다 | `tests/storage/test_us_collection.py::test_the_csv_download_is_the_source_the_legacy_import_makes` | 구현 |
-| DV-303 | SEC 요청은 문서를 이름 짓고 연락처 `User-Agent`는 header에만 실리며 되돌리는 답은 보존되지 않는다 | `tests/data/test_sec_collect.py::test_requests_name_the_document_and_never_the_contact` | 구현 |
-| DV-304 | 일일 색인은 모든 줄을 남기고 다섯 칸으로 읽힌 줄만 공시가 되며 header는 열 이름(대소문자·공백 무시, `File Name`·`Filename`)으로 찾고 404는 `NO_DATA`, 403은 실행을 멈춘다 | `tests/data/test_sec_collect.py::test_a_daily_index_keeps_every_line_and_reads_the_filings` | 구현 |
-| DV-305 | companyfacts 사실은 숫자의 JSON 원문을 그대로 남기고 다른 CIK·알 수 없는 필드·십진수가 아닌 값은 답을 거부한다 | `tests/data/test_sec_collect.py::test_company_facts_keep_each_number_as_written` | 구현 |
+| DV-303 | SEC 요청은 문서를 이름 짓고 연락처 `User-Agent`는 header에만 실리며 그것이나 연락처 주소를 되돌리는 답은 보존되지 않는다 | `tests/data/test_sec_collect.py::test_requests_name_the_document_and_never_the_contact` | 구현 |
+| DV-304 | 일일 색인은 모든 줄을 남기고 다섯 칸으로 읽힌 줄만 공시가 되며 header는 열 이름(대소문자·공백 무시, `File Name`·`Filename`)으로 찾고 경로의 CIK가 다른 줄은 공시가 아니며 404는 `NO_DATA`, 403은 실행을 멈춘다 | `tests/data/test_sec_collect.py::test_a_daily_index_keeps_every_line_and_reads_the_filings` | 구현 |
+| DV-305 | companyfacts 사실은 숫자의 JSON 원문을 그대로 남기고 다른 CIK·되풀이된 key·알 수 없는 필드·십진수가 아닌 값은 답을 거부한다 | `tests/data/test_sec_collect.py::test_company_facts_keep_each_number_as_written` | 구현 |
 | DV-306 | 색인 날은 답이나 다음 날이 끝난 뒤 받은 404로만 덮이고 빈 날은 알려진 가장 이른 날부터 채운다 | `tests/data/test_sec_collect.py::test_index_days_are_covered_by_an_answer_or_a_404_after_the_next_day` | 구현 |
 | DV-307 | 문서는 제출자마다 원한 공시로 한 번 묻고 나열되지 않은 공시는 창 안에서 하루 뒤 다시 묻으며 발행인 범위 밖은 세어진다 | `tests/data/test_sec_collect.py::test_documents_are_asked_per_filer_for_the_wanted_filings_and_retried_in_window` | 구현 |
 | DV-308 | SEC 실행은 색인 뒤 문서를 묻고 원한 공시의 행만 commit하며 `sec.submissions@1`·`sec.companyfacts@1`이 그 원천을 승격한다 | `tests/storage/test_us_collection.py::test_a_run_reads_indexes_then_documents_and_the_sec_mappers_promote_them` | 구현 |
@@ -2115,3 +2118,5 @@ state v2:
 | DV-319 | 시계열은 처음 완결되지 않은 창에서 멈추고 앞 창까지만 commit하며 다음 실행은 그 창의 마지막 vintage에서 다시 묻는다 | `tests/storage/test_us_collection.py::test_a_series_stops_at_its_first_incomplete_window_and_resumes_there` | 구현 |
 | DV-320 | receipt·batch 문서와 receipts 원천 ID는 문서화된 정규 bytes로 고정된다 | `tests/storage/test_us_collection.py::test_receipts_and_batches_have_fixed_canonical_bytes` | 구현 |
 | DV-321 | 답을 보존하지 못한 SEC 문서 요청은 물은 것으로 보아 같은 날 다시 묻지 않고 하루 뒤 다시 묻는다 | `tests/storage/test_us_collection.py::test_an_uncertain_document_ask_is_asked_again_the_next_day` | 구현 |
+| DV-322 | 행이 읽히지 않는 CSV 답은 `FAILED`이고 그 FRED 날을 덮지 않아 다음 실행이 다시 받는다 | `tests/storage/test_us_collection.py::test_a_csv_download_whose_rows_do_not_read_is_failed_and_asked_again` | 구현 |
+| DV-323 | pyarrow가 없으면 US 수집은 원장이나 공급자 호출 전에 멈춘다 | `tests/storage/test_us_collection.py::test_a_run_without_pyarrow_stops_before_any_call` | 구현 |

@@ -21,7 +21,8 @@
    brings it to ``batch_size`` receipts or ``BATCH_BYTES`` of responses, so one batch may
    pass either bound by the pages of that query.
 
-A query is complete when every page from offset 0 answered ``COMPLETED`` with the same
+A CSV download whose rows ``fred.series_csv@1`` cannot read is ``FAILED``, so it covers no
+FRED day. A query is complete when every page from offset 0 answered ``COMPLETED`` with the same
 count and the pages hold that many rows. Rows of an incomplete query are not committed;
 the next run asks the query again from the same known day.
 """
@@ -38,7 +39,7 @@ from datetime import date
 from typing import TYPE_CHECKING, Final, cast
 
 from aegis_alpha.data import fred_collect as fred
-from aegis_alpha.data.provider_request import COMPLETED, Request
+from aegis_alpha.data.provider_request import COMPLETED, FAILED, Request, Response
 from aegis_alpha.storage import collection_ledger as ledger
 from aegis_alpha.storage import provider_collection as collection
 from aegis_alpha.storage import source_library_schema as schema
@@ -97,6 +98,17 @@ def _dataset(policy: fred.FredPolicy) -> Callable[[Request], str]:
         return fred.ALFRED_DATASET
 
     return dataset
+
+
+def classify(request: Request, response: Response) -> tuple[str, str | None]:
+    """``fred.classify``, and a CSV download is readable only if its rows are."""
+    outcome, status = fred.classify(request, response)
+    if outcome == COMPLETED and request.endpoint == fred.SERIES_CSV:
+        try:
+            csv_source(response.body, request.parameters["id"])
+        except ValueError as error:
+            return FAILED, f"unreadable answer: {error}"
+    return outcome, status
 
 
 # --- batch tables -----------------------------------------------------------------------------
@@ -344,6 +356,7 @@ def collect_fred(  # noqa: PLR0913 -- every bound of one run is explicit
     min_interval: float = MIN_INTERVAL_SECONDS,
 ) -> dict[str, object]:
     """One bounded FRED collection; see the module documentation for the phases."""
+    collection.require_pyarrow(LOADER + " run")
     policy = policy or fred.FredPolicy()
     for name, value in (("max_calls", max_calls), ("batch_size", batch_size)):
         if type(value) is not int or value < (0 if name == "max_calls" else 1):
@@ -358,7 +371,7 @@ def collect_fred(  # noqa: PLR0913 -- every bound of one run is explicit
         committed.extend(commit_fred_batch(workspace, collection.Batch.of(PROVIDER, chunk)))
     known = load_known(workspace) if recovered else before
     caller = collection.Caller(
-        workspace, PROVIDER, policy.sha256, client.request, fred.classify, fred.stops_run,
+        workspace, PROVIDER, policy.sha256, client.request, classify, fred.stops_run,
         _dataset(policy), clock, sleep, max_calls, min_interval,
     )  # fmt: skip
     run = Run(workspace, caller, known.knowledge, batch_size, committed=committed)

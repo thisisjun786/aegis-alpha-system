@@ -353,6 +353,7 @@ def collect_sec(  # noqa: PLR0913 -- every bound of one run is explicit
     min_interval: float = MIN_INTERVAL_SECONDS,
 ) -> dict[str, object]:
     """One bounded SEC collection; see the module documentation for the phases."""
+    collection.require_pyarrow(LOADER + " run")
     policy = policy or sec.SecPolicy()
     for name, value in (("max_calls", max_calls), ("batch_size", batch_size),
                         ("batch_bytes", batch_bytes)):  # fmt: skip

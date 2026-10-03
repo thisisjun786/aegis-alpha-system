@@ -30,7 +30,11 @@ from zoneinfo import ZoneInfo
 
 from aegis_alpha.data.opendart import Clock, Transport, TransportError, canonical, utc_now
 from aegis_alpha.data.provider_request import COMPLETED, FAILED, NO_DATA, Request, Response
-from aegis_alpha.data.sec_transport import UserAgentError, validate_user_agent
+from aegis_alpha.data.sec_transport import (
+    UserAgentError,
+    configured_user_agent_needles,
+    validate_user_agent,
+)
 
 PROVIDER: Final = "sec"
 DAILY_INDEX: Final = "daily_index"
@@ -170,6 +174,8 @@ def _index_line(line: str) -> IndexLine:
     named = _FILE_NAME.fullmatch(name)
     if not cik.isdigit() or len(cik) > 10 or stamp is None or named is None or not form:  # noqa: PLR2004 -- ten digits
         return IndexLine(line)
+    if int(named.group(1)) != int(cik):  # the file lies under another filer
+        return IndexLine(line)
     try:
         day = date(int(stamp.group(1)), int(stamp.group(2)), int(stamp.group(3)))
     except ValueError:
@@ -184,7 +190,8 @@ def parse_index(body: bytes) -> list[IndexLine]:
     its dashed rule; an index without them is refused. The header is matched by its column
     names, ignoring case and surrounding whitespace, and the last may be ``Filename`` as in
     EDGAR's full-index files. A line that does not read as five fields naming a CIK, a form,
-    a filing date and an ``edgar/data`` accession file stays as its text with no fields.
+    a filing date and an ``edgar/data`` accession file under that CIK stays as its text
+    with no fields.
     """
     lines = _text(body).splitlines()
     header = next((index for index, line in enumerate(lines) if _is_index_header(line)), None)
@@ -215,8 +222,19 @@ def _json(body: bytes, *, exact_numbers: bool = False) -> dict[str, object]:
     def refuse(name: str) -> object:
         raise ValueError(f"SEC JSON holds {name}")
 
+    def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        document = dict(pairs)
+        if len(document) != len(pairs):
+            raise ValueError("SEC JSON repeats a key")
+        return document
+
     try:
-        value = json.loads(body.decode("utf-8"), parse_constant=refuse, **hooks)  # ty: ignore[invalid-argument-type]
+        value = json.loads(
+            body.decode("utf-8"),
+            parse_constant=refuse,
+            object_pairs_hook=unique,
+            **hooks,  # ty: ignore[invalid-argument-type]
+        )
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise ValueError("SEC answer is not UTF-8 JSON") from None
     if not isinstance(value, dict):
@@ -374,9 +392,10 @@ class SecClient:
             "GET", url(request), None, {"Accept": "*/*", "User-Agent": self._user_agent}
         )
         finished = self._clock()
-        contact = self._user_agent.encode()
-        if contact in answer.body or any(contact in v.encode() for _, v in answer.headers):
-            raise TransportError("provider answer echoed the contact; it is not retained")
+        # The whole User-Agent and the contact address in it.
+        for contact in configured_user_agent_needles(self._user_agent):
+            if contact in answer.body or any(contact in v.encode() for _, v in answer.headers):
+                raise TransportError("provider answer echoed the contact; it is not retained")
         if len(answer.body) > MAX_RESPONSE_BYTES:
             raise TransportError("provider answer exceeds its bound")
         return Response(answer.status, answer.headers, answer.body, started, finished)
