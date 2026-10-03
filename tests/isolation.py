@@ -11,6 +11,11 @@ for every process, so a caller value there says nothing about intent. ``AAS_HOME
 and ``AAS_DATA_ROOT`` keep a caller value, the way mounted real-input acceptance
 names its roots; :func:`live_state_refusal` then refuses the run when such a value,
 or anything the defaults resolve to, lies inside live state.
+
+An xdist worker starts with its controller's environment, so it inherits the
+controller's ``AAS_HOME`` and ``AAS_DATA_ROOT``. :data:`OWNER` names the tree of the
+process that set them; a value inside that tree is the parent's default, not a caller
+root, and the worker replaces it with its own.
 """
 
 from __future__ import annotations
@@ -33,6 +38,8 @@ AAS_PATHS = (
     "AAS_COLLECTION_STATE",
     "AAS_COLLECTION_CONFIG",
 )
+# The isolation tree of the test process that exported the current environment.
+OWNER = "AAS_PYTEST_ISOLATION_ROOT"
 # The container installation's state mount.
 CONTAINER_STATE = Path("/state/aas")
 # State a native installation keeps under a user's home.
@@ -53,8 +60,12 @@ def isolate(root: Path, environ: MutableMapping[str, str]) -> None:
         path.mkdir()
     for name, path in homes.items():
         environ[name] = os.fspath(path)
+    parent = environ.get(OWNER)
     for name, path in defaults.items():
-        environ.setdefault(name, os.fspath(path))
+        value = environ.get(name)
+        if value is None or (parent and _within(Path(value), Path(parent))):
+            environ[name] = os.fspath(path)
+    environ[OWNER] = os.fspath(root)
 
 
 def live_roots(*operator_homes: str | None) -> frozenset[Path]:
@@ -81,6 +92,10 @@ def live_state_refusal(environ: Mapping[str, str], roots: Iterable[Path]) -> str
                     f"tests refuse to run against live state: {name}={path} resolves inside {root}"
                 )
     return None
+
+
+def _within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
 
 
 def _resolved(path: Path) -> Path:

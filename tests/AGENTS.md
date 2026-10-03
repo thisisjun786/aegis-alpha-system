@@ -24,9 +24,11 @@ The root `conftest.py` owns network, home, data-root and disposable DB isolation
 - **Every test process runs in its own isolated home.** Before `aegis_alpha` imports (that
   ordering is why `tests/conftest.py` carries `# noqa: E402`), `tests/isolation.py` creates one
   `aas-pytest-*` tree under `TMPDIR` per process (per xdist worker) and points `HOME` and
-  `XDG_{CONFIG,DATA,STATE,CACHE}_HOME` into it. `AAS_HOME` and `AAS_DATA_ROOT` are `setdefault`
-  into the same tree: a caller-supplied root (mounted real-input acceptance) wins, and it
-  must still contain only synthetic disposable test inputs, never recovered or production data.
+  `XDG_{CONFIG,DATA,STATE,CACHE}_HOME` into it. `AAS_HOME` and `AAS_DATA_ROOT` default into
+  the same tree: a caller-supplied root (mounted real-input acceptance) wins, and it must
+  still contain only synthetic disposable test inputs, never recovered or production data.
+  The process exports its tree as `AAS_PYTEST_ISOLATION_ROOT`; an xdist worker, which starts
+  with its controller's environment, replaces any root inside that tree with its own.
 - **A run aimed at live state stops before any test.** At session start the guard refuses the
   run (exit 4) when `HOME`'s `.aas` or `.local/share/aegis-alpha`, an `XDG_*_HOME`, or a set
   `AAS_HOME`, `AAS_DATA_ROOT`, `AAS_DATA_CONFIG`, `AAS_INSTALL_CONFIG`, `AAS_COLLECTION_STATE`
@@ -49,9 +51,12 @@ The root `conftest.py` owns network, home, data-root and disposable DB isolation
   `pytestmark = pytest.mark.xdist_group("<resource>")` under a `# Serial: <reason>` comment;
   every file of one group runs in one worker. Today the only group is
   `qveris-account-lease`: the Qveris store binds an abstract socket named by the account, and
-  the synthetic accounts are fixed. A group serializes one run only: two pytest runs on one
-  host still contend for the same socket. Under xdist a grouped test's reported node ID ends in
-  `@<group>`. `AAS_TEST_WORKERS=0` runs serially.
+  the synthetic accounts are fixed. `conftest.py` fails a test that enters `QverisStore`
+  outside that group. A group serializes one run only: two pytest runs on one host still
+  contend for the same socket, so a test that starts a nested pytest run points it at
+  generated files under `tmp_path`, never at test files that take a host-wide resource.
+  Under xdist a grouped test's reported node ID ends in `@<group>`. `AAS_TEST_WORKERS=0` runs
+  serially.
   xdist puts `tmp_path` one directory deeper (`popen-gwN/`), so bind an `AF_UNIX` socket by
   a name relative to its directory rather than by its 107-byte-limited absolute path.
 - **Fast local loop.** `uv run --no-sync pytest -n auto --dist loadgroup -m 'not database'
