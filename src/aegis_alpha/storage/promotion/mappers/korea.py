@@ -2,15 +2,17 @@
 
 Input is the observation table the legacy ``korea.public_response@1`` import keeps for one
 provider (BOK ``bok-observations``, OECD ``oecd-observations``): ``series_id``, ``period``,
-``value``, ``units``, ``unit_multiplier`` and ``base_period`` as text, beside columns that
-stay only in the source row (``value_raw``, ``regime``, ``status``).
+``value``, ``units``, ``unit_multiplier``, ``base_period`` and ``regime`` as text, beside
+columns that stay only in the source row (``value_raw``, ``status``).
 
 - ``observation_period`` is the first day of ``period``: ``YYYY-MM-DD`` itself, ``YYYY-MM``
   its month, ``YYYY-Qn`` its quarter, ``YYYY`` its year. Any other spelling leaves the
   required column empty and the promotion refuses it.
-- ``unit`` is ``units``, followed by ``;base=<base_period>`` and ``;multiplier=<unit_multiplier>``
-  when the source states them, so a rebased or rescaled series is a different unit rather
-  than a revision of the same number. A row without ``units`` is refused.
+- ``unit`` is ``units``, followed by ``;base=<base_period>``, ``;multiplier=<unit_multiplier>``
+  and ``;regime=<regime>`` when the source states them, so a rebased or rescaled series, or a
+  rate set under another definition (BOK's call-rate target before its base rate), is a
+  different unit rather than a revision of the same number. A row without ``units`` is
+  refused.
 - The responses carry no vintage and no publication time, so these mappers declare no time
   input: a spec gives both time columns ``unknown_null@1`` and strict readers never select
   these rows. ``source_vintage_start`` and ``source_vintage_end`` are NULL; ingestion is the
@@ -25,7 +27,15 @@ from typing import Final
 from aegis_alpha.storage.promotion.mappers.common import decimal_state
 from aegis_alpha.storage.promotion.time_rules import InputKind
 
-_TEXT: Final = ("series_id", "period", "value", "units", "unit_multiplier", "base_period")
+_TEXT: Final = (
+    "series_id",
+    "period",
+    "value",
+    "units",
+    "unit_multiplier",
+    "base_period",
+    "regime",
+)
 _PERIOD: Final = (
     "CASE "
     "WHEN regexp_full_match(period, '[0-9]{4}-[0-9]{2}-[0-9]{2}') "
@@ -43,7 +53,9 @@ _UNIT: Final = (
     "|| CASE WHEN base_period IS NULL OR base_period = '' THEN '' "
     "ELSE ';base=' || base_period END "
     "|| CASE WHEN unit_multiplier IS NULL OR unit_multiplier = '' THEN '' "
-    "ELSE ';multiplier=' || unit_multiplier END END"
+    "ELSE ';multiplier=' || unit_multiplier END "
+    "|| CASE WHEN regime IS NULL OR regime = '' THEN '' "
+    "ELSE ';regime=' || regime END END"
 )
 
 

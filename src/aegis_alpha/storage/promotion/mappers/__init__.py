@@ -60,8 +60,8 @@ class Mapper(Protocol):
         ...
 
     @property
-    def date_column(self) -> str | None:
-        """The domain DATE column a tombstone scope's dates test; None takes no tombstones."""
+    def date_column(self) -> str:
+        """The domain column a tombstone scope's dates test: a DATE, or an instant's UTC day."""
         ...
 
     @property

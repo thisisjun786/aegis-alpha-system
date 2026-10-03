@@ -78,7 +78,10 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   A generation holds one revision per record, so ALFRED vintages promote one vintage partition per
   generation in order (`mappers.fred.vintage_partitions`), each later vintage a SUPERSEDE; the closed
   `realtime_end` of a later pull stays in the source row, never on the earlier revision. A partition
-  needs a DATE partition column, and a mapper without a domain date column takes no tombstones.
+  needs a DATE partition column; a tombstone scope tests the mapper's domain date column, or the
+  UTC day of an instant column such as FX `fixing_at_us`. An FX spec's `timezone` must end the day
+  after the provider's fixing, and `local_day_end@1` on the fixing date needs the provider to publish
+  by then (FRED H.10 does not, so `fred.fx_series@1` takes `unknown_null@1`).
   A mapper whose source shape several providers share declares `source_prefixes`, and the spec
   refuses a pin from another provider's source.
 - `legacy_import` owns `aas import legacy` (`aas-legacy-import-v1`, see the legacy section of

@@ -86,6 +86,7 @@ FLAG_SCHEMA: Final = (
 _DEFAULT_BUDGET: Final = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
 _MAX_RAW: Final = 64 * 1024 * 1024
 _SAMPLE: Final = 20
+_DAY_US: Final = 86_400_000_000
 _BATCH: Final = 4096
 _LINK: Final = "sl:"
 _TEMP: Final = (
@@ -684,13 +685,22 @@ def _diff(
     )
 
 
+def _scope_day(domain: str, column: str, alias: str) -> str:
+    """The DATE a tombstone scope tests: a DATE column, or the UTC day of a microsecond instant."""
+    kind = dict(DOMAINS[domain])[column].removesuffix("?")
+    qualified = f"{alias}.{_q(column)}"
+    if kind == "DATE":
+        return qualified
+    if kind != "BIGINT":
+        raise ValueError(f"domain column {column} is neither a DATE nor an instant")
+    return f"(DATE '1970-01-01' + CAST(floor({qualified} / {_DAY_US}.0) AS INTEGER))"
+
+
 def _scope_sql(workspace: Workspace, spec: PromotionSpec, alias: str) -> str:
     policy = spec.tombstone
     if policy.start is None or policy.end is None:
         raise ValueError("a tombstone scope needs its date interval")
-    if spec.mapper.date_column is None:
-        raise ValueError(f"mapper {spec.mapper_name} has no date column to scope absence")
-    date_column = f"{alias}.{_q(spec.mapper.date_column)}"
+    date_column = _scope_day(spec.domain, spec.mapper.date_column, alias)
     condition = (
         f"{date_column} >= DATE '{policy.start.isoformat()}' "
         f"AND {date_column} < DATE '{policy.end.isoformat()}'"

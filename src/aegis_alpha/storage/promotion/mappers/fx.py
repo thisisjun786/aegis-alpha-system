@@ -11,10 +11,19 @@ Both read a table the legacy import keeps as text and promote the rows of the sp
 ``rate`` is the source text of the quote currency per one unit of the base, converted by
 ``decimal_text@1``: ``present`` only for a positive plain decimal, ``missing`` for no text,
 empty text or FRED's ``.``, ``invalid`` otherwise. ``fixing_at_us`` is the last
-microsecond of the row's date in the spec's ``timezone``, an upper bound on the fixing time
-that needs no fixing schedule; the time input ``fixing_date`` is that date. A date that is
-not ``YYYY-MM-DD`` leaves the required fixing time empty, so the promotion refuses it. The
-sources carry no collection time, so ingestion is the source's ``sl:`` retrieval.
+microsecond of the row's date in the spec's ``timezone``; the time input ``fixing_date`` is
+that date. A date that is not ``YYYY-MM-DD`` leaves the required fixing time empty, so the
+promotion refuses it. The sources carry no collection time, so ingestion is the source's
+``sl:`` retrieval.
+
+The day end bounds the fixing only in a zone whose day ends after the provider's fixing or
+close of that date: the fixing's own zone (New York for FRED's noon buying rates), or for a
+close the provider does not place, ``Etc/GMT+12``, whose day end is the latest of any zone. A
+quote currency's market zone is no bound by itself: onshore USDKRW trades until 02:00 the
+next Seoul day. The fixing day says nothing about publication, so a spec gives
+``local_day_end@1`` on ``fixing_date`` only when the provider publishes a fixing by that day
+end; FRED's H.10 release publishes a week's fixings days later, so ``fred.fx_series@1`` takes
+``unknown_null@1``.
 """
 
 from __future__ import annotations
@@ -36,7 +45,7 @@ from aegis_alpha.storage.promotion.time_rules import InputKind
 class TextFxSeries:
     major: Final = 1
     domain: Final = "fx_rates"
-    date_column: Final = None
+    date_column: Final = "fixing_at_us"
     time_inputs: Final[Mapping[str, InputKind]] = {"fixing_date": "date"}
 
     def __init__(  # noqa: PLR0913 -- one source shape: provider, prefix and three columns

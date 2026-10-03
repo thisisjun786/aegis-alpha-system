@@ -10,9 +10,10 @@ pair and the others are not selected.
   it. A row whose ``Date`` is not the row's ``date`` is ``invalid``. Otherwise a row is
   ``present`` only when the text is a positive decimal whose double equals ``close``, and
   ``missing`` when it has neither close; any other row is ``invalid`` and keeps no rate.
-- ``fixing_at_us`` is the last microsecond of ``date`` in the spec's ``timezone``, an upper
-  bound on the close that needs no fixing schedule; the time input ``fixing_date`` is
-  ``date``.
+- ``fixing_at_us`` is the last microsecond of ``date`` in the spec's ``timezone``; the time
+  input ``fixing_date`` is ``date``. It bounds the close only in a zone whose day ends after
+  the provider's close of that date, never by default the quote currency's market zone (see
+  ``mappers.fx``).
 - The table has no collection time, so ingestion is the source's ``sl:`` retrieval.
 
 The legacy import of a Norgate export keeps its rows as text; ``norgate.fx_history@1`` in
@@ -44,7 +45,7 @@ class NorgateFxCloses:
     source_prefixes: Final = ()
     domain: Final = "fx_rates"
     partition_column: Final = "date"
-    date_column: Final = None
+    date_column: Final = "fixing_at_us"
     time_inputs: Final[Mapping[str, InputKind]] = {"fixing_date": "date"}
 
     def check_args(self, args: Mapping[str, object]) -> None:

@@ -39,7 +39,8 @@ from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
 
 CHICAGO: Final = "America/Chicago"
-SEOUL: Final = "Asia/Seoul"
+# The latest day end of any zone: a close dated that day, wherever dated, is before it.
+LATEST: Final = "Etc/GMT+12"
 BUDGET: Final = ComputeBudget(Fraction(1), 256 * 1024 * 1024)
 RETRIEVED: Final = datetime(2026, 9, 1, tzinfo=UTC)
 GRANT: Final = ("local_day_end@1",)
@@ -259,7 +260,7 @@ def test_fred_alfred_maps_synthetic_fixture() -> None:
 
 def test_fx_mappers_map_synthetic_fixtures() -> None:
     closes = mapper("norgate.fx_closes@1")
-    args = {"series": "USDKRW", "base": "USD", "quote": "KRW", "timezone": SEOUL}
+    args = {"series": "USDKRW", "base": "USD", "quote": "KRW", "timezone": LATEST}
     closes.check_args(args)
     for bad, message in (
         ({**args, "base": "usd"}, "currency codes"),
@@ -269,7 +270,7 @@ def test_fx_mappers_map_synthetic_fixtures() -> None:
     ):
         with pytest.raises(ValueError, match=message):
             closes.check_args(bad)
-    assert closes.date_column is None
+    assert closes.date_column == "fixing_at_us"
     day = date(2020, 1, 2)
 
     def raw(text: str | None, on: date = day) -> str:
@@ -294,18 +295,18 @@ def test_fx_mappers_map_synthetic_fixtures() -> None:
     ).fetchall()
     assert rows == [
         # The export's own text is the rate, not the double read from it.
-        (0, "USD", "KRW", _day_end(day, SEOUL), "1158.1", "present", None, day),
+        (0, "USD", "KRW", _day_end(day, LATEST), "1158.1", "present", None, day),
         # Text and double disagree, or the row's own date is another day: invalid.
-        (1, "USD", "KRW", _day_end(day + timedelta(1), SEOUL), None, "invalid", None,
+        (1, "USD", "KRW", _day_end(day + timedelta(1), LATEST), None, "invalid", None,
          day + timedelta(1)),
-        (2, "USD", "KRW", _day_end(day + timedelta(2), SEOUL), None, "invalid", None,
+        (2, "USD", "KRW", _day_end(day + timedelta(2), LATEST), None, "invalid", None,
          day + timedelta(2)),
-        (3, "USD", "KRW", _day_end(day + timedelta(3), SEOUL), None, "missing", None,
+        (3, "USD", "KRW", _day_end(day + timedelta(3), LATEST), None, "missing", None,
          day + timedelta(3)),
-        (4, "USD", "KRW", _day_end(day + timedelta(4), SEOUL), None, "invalid", None,
+        (4, "USD", "KRW", _day_end(day + timedelta(4), LATEST), None, "invalid", None,
          day + timedelta(4)),
         # A row without a close whose own date is another day is invalid, not missing.
-        (5, "USD", "KRW", _day_end(day + timedelta(5), SEOUL), None, "invalid", None,
+        (5, "USD", "KRW", _day_end(day + timedelta(5), LATEST), None, "invalid", None,
          day + timedelta(5)),
     ]  # fmt: skip
     series = mapper("fred.fx_series@1")
@@ -338,7 +339,7 @@ def test_fx_mappers_map_synthetic_fixtures() -> None:
         (5, None, "1", "present", None),
     ]
     history = mapper("norgate.fx_history@1")
-    args = {"series": "USDKRW", "base": "USD", "quote": "KRW", "timezone": SEOUL}
+    args = {"series": "USDKRW", "base": "USD", "quote": "KRW", "timezone": LATEST}
     history.check_args(args)
     assert history.source_prefixes == ("norgate-history-csv-",)
     connection = _memory(
@@ -355,9 +356,9 @@ def test_fx_mappers_map_synthetic_fixtures() -> None:
         f"FROM ({history.select('src', args)}) ORDER BY _aas_ordinal"
     ).fetchall()
     assert rows == [
-        (0, _day_end(date(1991, 1, 2), SEOUL), "714.5", "present", date(1991, 1, 2)),
-        (1, _day_end(date(1991, 1, 3), SEOUL), None, "missing", date(1991, 1, 3)),
-        (2, _day_end(date(1991, 1, 4), SEOUL), None, "invalid", date(1991, 1, 4)),
+        (0, _day_end(date(1991, 1, 2), LATEST), "714.5", "present", date(1991, 1, 2)),
+        (1, _day_end(date(1991, 1, 3), LATEST), None, "missing", date(1991, 1, 3)),
+        (2, _day_end(date(1991, 1, 4), LATEST), None, "invalid", date(1991, 1, 4)),
     ]
 
 
@@ -375,6 +376,8 @@ def test_korea_observations_map_synthetic_fixture() -> None:
         [
             ("KOR_POLICY_BOK", "2008-03-07", "5.00", "5.00", "percent", None, None, "base_rate",
              None),
+            ("KOR_POLICY_BOK", "2007-08-09", "5.00", "5.00", "percent", None, None, "call_target",
+             None),
             ("KOR_CPI_OECD", "1965-02", "2.685533", "2.685533", "index", None, "2015", None, "A"),
             ("KOR_GDP", "2020-Q3", "1.5", "1.5", "KRW", "9", None, None, None),
             ("KOR_GDP", "2020", "", "", "KRW", "9", "", None, None),
@@ -387,7 +390,25 @@ def test_korea_observations_map_synthetic_fixture() -> None:
         f"_aas_ingested_at_us FROM ({oecd.select('src', {})}) ORDER BY _aas_ordinal"
     ).fetchall()
     assert rows == [
-        ("KOR_POLICY_BOK", date(2008, 3, 7), "percent", None, "5.00", "present", None),
+        # The two policy-rate definitions stay apart as two units.
+        (
+            "KOR_POLICY_BOK",
+            date(2008, 3, 7),
+            "percent;regime=base_rate",
+            None,
+            "5.00",
+            "present",
+            None,
+        ),
+        (
+            "KOR_POLICY_BOK",
+            date(2007, 8, 9),
+            "percent;regime=call_target",
+            None,
+            "5.00",
+            "present",
+            None,
+        ),
         ("KOR_CPI_OECD", date(1965, 2, 1), "index;base=2015", None, "2.685533", "present", None),
         ("KOR_GDP", date(2020, 7, 1), "KRW;multiplier=9", None, "1.5", "present", None),
         ("KOR_GDP", date(2020, 1, 1), "KRW;multiplier=9", None, None, "missing", None),
@@ -571,8 +592,8 @@ def test_fx_series_promote_one_pair_each(ws: Workspace) -> None:
         _closes_row("XAUUSD", date(1991, 1, 2), "386.2"),
     ]
     pin = _source(ws, CLOSES, rows, tag="closes")
-    args = {"series": "USDKRW", "base": "USD", "quote": "KRW", "timezone": SEOUL}
-    times = _rule("local_day_end@1", "record", "fixing_date", SEOUL)
+    args = {"series": "USDKRW", "base": "USD", "quote": "KRW", "timezone": LATEST}
+    times = _rule("local_day_end@1", "record", "fixing_date", LATEST)
     document = _spec(
         "fx_rates",
         "fx.usdkrw.norgate",
@@ -592,29 +613,41 @@ def test_fx_series_promote_one_pair_each(ws: Workspace) -> None:
         "FROM fx_rates ORDER BY fixing_at_us"
     ).fetchall()
     assert stored == [
-        ("USD", "KRW", _day_end(date(1991, 1, 2), SEOUL), Decimal("714.5"), "present",
-         _day_end(date(1991, 1, 2), SEOUL)),
-        ("USD", "KRW", _day_end(date(1991, 1, 3), SEOUL), Decimal("714.55"), "present",
-         _day_end(date(1991, 1, 3), SEOUL)),
+        ("USD", "KRW", _day_end(date(1991, 1, 2), LATEST), Decimal("714.5"), "present",
+         _day_end(date(1991, 1, 2), LATEST)),
+        ("USD", "KRW", _day_end(date(1991, 1, 3), LATEST), Decimal("714.55"), "present",
+         _day_end(date(1991, 1, 3), LATEST)),
     ]  # fmt: skip
-    # FX has no domain date column, so absence cannot be scoped and a tombstone is refused.
-    tombstone = {
-        "mode": "absent_in_full_snapshot",
-        "source": {"source_id": pin["source_id"], "table": pin["table"]},
-        "scope": {"instruments": None, "from": "1991-01-01", "to": "1992-01-01"},
-    }
-    raw, sha = _spec(
-        "fx_rates",
-        "fx.usdkrw.norgate",
-        [pin],
-        "norgate.fx_closes@1",
-        args,
-        times,
-        decimal={"rate": "decimal_text@1"},
-        tombstone=tombstone,
+    # A full snapshot without a fixing tombstones it. The scope tests the fixing's UTC day,
+    # which for a zone west of UTC is the day after the fixing date.
+    full = _source(
+        ws,
+        CLOSES,
+        [_closes_row("USDKRW", date(1991, 1, 2), "714.5"), rows[2]],
+        tag="closes-full",
     )
-    with pytest.raises(ValueError, match="no date column"):
-        parse_spec(raw, sha)
+
+    def absent(to: str) -> tuple[bytes, str]:
+        return _spec(
+            "fx_rates",
+            "fx.usdkrw.norgate",
+            [full],
+            "norgate.fx_closes@1",
+            args,
+            times,
+            decimal={"rate": "decimal_text@1"},
+            parent=str(result["generation_id"]),
+            tombstone={
+                "mode": "absent_in_full_snapshot",
+                "source": {"source_id": full["source_id"], "table": full["table"]},
+                "scope": {"instruments": None, "from": "1991-01-01", "to": to},
+            },
+        )
+
+    narrow = promote(ws, *absent("1991-01-04"), apply=False)
+    assert (narrow["operations"], narrow["unchanged"]) == ({}, 1)
+    wide = _apply(ws, absent("1991-01-05"))
+    assert (wide["operations"], wide["unchanged"]) == ({"TOMBSTONE": 1}, 1)
 
 
 def _private(path: Path, payload: bytes) -> Path:
@@ -645,11 +678,13 @@ def _korea_request(root: Path, name: str, source: str, rows: list[dict[str, obje
     _private(root / name / "normalized.v1.json", json.dumps(normalized).encode())
 
 
-def _observation(series: str, period: str, value: str, units: str, base: str | None) -> dict:
+def _observation(  # noqa: PLR0913, PLR0917 -- one public response row
+    series: str, period: str, value: str, units: str, base: str | None, regime: str | None = None
+) -> dict:
     return {
         "base_period": base,
         "period": period,
-        "regime": None,
+        "regime": regime,
         "series_id": series,
         "status": None,
         "unit_multiplier": None,
@@ -670,7 +705,10 @@ def test_legacy_fred_and_kr_public_sources_promote(tmp_path: Path, ws: Workspace
         korea,
         "bok",
         "bok-policy",
-        [_observation("KOR_POLICY_BOK", "2008-03-07", "5.00", "percent", None)],
+        [
+            _observation("KOR_POLICY_BOK", "2007-08-09", "5.00", "percent", None, "call_target"),
+            _observation("KOR_POLICY_BOK", "2008-08-07", "5.25", "percent", None, "base_rate"),
+        ],
     )
     _korea_request(
         korea,
@@ -708,18 +746,20 @@ def test_legacy_fred_and_kr_public_sources_promote(tmp_path: Path, ws: Workspace
         [pins["fred-series-csv"]],
         "fred.fx_series@1",
         {"series": "DEXKOUS", "base": "USD", "quote": "KRW", "timezone": ny},
-        _rule("local_day_end@1", "record", "fixing_date", ny),
+        # H.10 publishes a fixing days after its day, so no day-end rule bounds it.
+        _rule("unknown_null@1", "record", None, None),
         decimal={"rate": "decimal_text@1"},
     )
     result = _apply(ws, fx)
     assert result["operations"] == {"ASSERT": 3}
     rates = ws.market.execute(
-        "SELECT fixing_at_us, rate, value_state FROM fx_rates ORDER BY fixing_at_us"
+        "SELECT fixing_at_us, rate, value_state, available_at_us, revision_known_at_us "
+        "FROM fx_rates ORDER BY fixing_at_us"
     ).fetchall()
     assert rates == [
-        (_day_end(date(2011, 10, 3), ny), Decimal("1180.00"), "present"),
-        (_day_end(date(2011, 10, 4), ny), None, "missing"),
-        (_day_end(date(2011, 10, 5), ny), Decimal("1197.50"), "present"),
+        (_day_end(date(2011, 10, 3), ny), Decimal("1180.00"), "present", None, None),
+        (_day_end(date(2011, 10, 4), ny), None, "missing", None, None),
+        (_day_end(date(2011, 10, 5), ny), Decimal("1197.50"), "present", None, None),
     ]
     # The CSV's dates are text, so a partition is refused instead of cast.
     raw_fx, sha_fx = _spec(
@@ -728,7 +768,7 @@ def test_legacy_fred_and_kr_public_sources_promote(tmp_path: Path, ws: Workspace
         [pins["fred-series-csv"]],
         "fred.fx_series@1",
         {"series": "DEXKOUS", "base": "USD", "quote": "KRW", "timezone": ny},
-        _rule("local_day_end@1", "record", "fixing_date", ny),
+        _rule("unknown_null@1", "record", None, None),
         decimal={"rate": "decimal_text@1"},
         parent=str(result["generation_id"]),
         partition=(date(2011, 1, 1), date(2012, 1, 1)),
@@ -736,7 +776,7 @@ def test_legacy_fred_and_kr_public_sources_promote(tmp_path: Path, ws: Workspace
     with pytest.raises(ValueError, match="without a partition"):
         promote(ws, raw_fx, sha_fx, apply=False)
     unknown = _rule("unknown_null@1", "record", None, None)
-    for provider, dataset, count in (("bok", "macro.kr.bok", 1), ("oecd", "macro.kr.oecd", 2)):
+    for provider, dataset, count in (("bok", "macro.kr.bok", 2), ("oecd", "macro.kr.oecd", 2)):
         document = _spec(
             "macro_observations",
             dataset,
@@ -770,8 +810,11 @@ def test_legacy_fred_and_kr_public_sources_promote(tmp_path: Path, ws: Workspace
     assert stored == [
         ("KOR_CPI_OECD", date(2026, 6, 1), "index;base=2015", Decimal("125.9"), None, None),
         ("KOR_CPI_OECD", date(2026, 7, 1), "index;base=2015", Decimal("126.2585"), None, None),
-        ("KOR_POLICY_BOK", date(2008, 3, 7), "percent", Decimal("5.00"), None, None),
-    ]
+        ("KOR_POLICY_BOK", date(2007, 8, 9), "percent;regime=call_target", Decimal("5.00"), None,
+         None),
+        ("KOR_POLICY_BOK", date(2008, 8, 7), "percent;regime=base_rate", Decimal("5.25"), None,
+         None),
+    ]  # fmt: skip
     assert verify_workspace(ws)["verified"] is True
 
 
@@ -854,8 +897,8 @@ def test_norgate_history_export_promotes_one_pair(tmp_path: Path, ws: Workspace)
         "fx.usdkrw.norgate",
         [pin],
         "norgate.fx_history@1",
-        {"series": "USDKRW", "base": "USD", "quote": "KRW", "timezone": SEOUL},
-        _rule("local_day_end@1", "record", "fixing_date", SEOUL),
+        {"series": "USDKRW", "base": "USD", "quote": "KRW", "timezone": LATEST},
+        _rule("local_day_end@1", "record", "fixing_date", LATEST),
         decimal={"rate": "decimal_text@1"},
     )
     result = _apply(ws, document)
@@ -863,8 +906,8 @@ def test_norgate_history_export_promotes_one_pair(tmp_path: Path, ws: Workspace)
     assert ws.market.execute(
         "SELECT fixing_at_us, rate, value_state FROM fx_rates ORDER BY fixing_at_us"
     ).fetchall() == [
-        (_day_end(date(1991, 1, 2), SEOUL), Decimal("714.5"), "present"),
-        (_day_end(date(1991, 1, 3), SEOUL), Decimal("714.55"), "present"),
+        (_day_end(date(1991, 1, 2), LATEST), Decimal("714.5"), "present"),
+        (_day_end(date(1991, 1, 3), LATEST), Decimal("714.55"), "present"),
     ]
     # The same shape pinned under the FRED series mapper is another provider's source.
     raw_fred, sha_fred = _spec(
@@ -872,8 +915,8 @@ def test_norgate_history_export_promotes_one_pair(tmp_path: Path, ws: Workspace)
         "fx.usdkrw.fred",
         [pin],
         "fred.fx_series@1",
-        {"series": "USDKRW", "base": "USD", "quote": "KRW", "timezone": SEOUL},
-        _rule("local_day_end@1", "record", "fixing_date", SEOUL),
+        {"series": "USDKRW", "base": "USD", "quote": "KRW", "timezone": LATEST},
+        _rule("local_day_end@1", "record", "fixing_date", LATEST),
         decimal={"rate": "decimal_text@1"},
     )
     with pytest.raises(ValueError, match="reads only sources"):
