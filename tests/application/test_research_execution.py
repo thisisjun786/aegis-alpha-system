@@ -38,6 +38,7 @@ from aegis_alpha.storage.market_inputs import (
     load_pinned_observations,
 )
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
+from tests.application.installation_template import copy_template
 from tests.application.test_backtest_prepare import (
     BUDGET,
     DAYS,
@@ -267,23 +268,81 @@ def compute_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("AAS_COMPUTE_LOCK_FILE", str(tmp_path / "compute.lock"))
 
 
-@pytest.fixture
-def installation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> tuple[Path, Document, Document]:
+CLOCK_NS = micros(date(2026, 6, 1)) * 1000
+
+
+def _build_installation(root: Path) -> tuple[Path, Document, Document]:
     """One installation carrying both the executable fixture and the observation panels."""
-    monkeypatch.setattr(time, "time_ns", lambda: micros(date(2026, 6, 1)) * 1000)
-    home = tmp_path / "home"
+    home = root / "home"
     _ = initialize(home)
     with open_workspace(home, writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
-        close = _panel(workspace, tmp_path, "obs-close", "close")
-        opening = _panel(workspace, tmp_path, "obs-open", "open")
+        body = stored_request(workspace, root)
+        close = _panel(workspace, root, "obs-close", "close")
+        opening = _panel(workspace, root, "obs-open", "open")
         workspace.state.commit()
         assert workspace.strategies is not None
         workspace.strategies.commit()
         _ = workspace.market.execute("CHECKPOINT")
     return home, body, _declaration(body, close, opening)
+
+
+def copy_installation(
+    factory: pytest.TempPathFactory, root: Path
+) -> tuple[Path, Document, Document]:
+    """A private copy of the installation, built once per process under the pinned clock."""
+    body, declaration = copy_template(
+        "research-installation",
+        factory,
+        root,
+        CLOCK_NS,
+        lambda source: list(_build_installation(source)[1:]),
+    )
+    return root / "home", body, declaration
+
+
+@pytest.fixture
+def installation(
+    tmp_path_factory: pytest.TempPathFactory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Document, Document]:
+    """A private copy of the shared installation; writes to it reach no other test."""
+    # The test body keeps the clock a fresh build pinned for it.
+    monkeypatch.setattr(time, "time_ns", lambda: CLOCK_NS)
+    return copy_installation(tmp_path_factory, tmp_path)
+
+
+@pytest.fixture
+def fresh_installation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Document, Document]:
+    """The same installation built in this test, for tests that need their own identity."""
+    monkeypatch.setattr(time, "time_ns", lambda: CLOCK_NS)
+    return _build_installation(tmp_path)
+
+
+def test_a_write_to_one_copy_never_reaches_a_fresh_copy(
+    installation: tuple[Path, Document, Document],
+    tmp_path_factory: pytest.TempPathFactory,
+    tmp_path: Path,
+) -> None:
+    """The shared template stays what it was built as, whatever a test does to its copy."""
+    home, _body, _declaration = installation
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        extra = {"changes": {"series_id": "SYNTHETIC-EXTRA"}}
+        _ = _panel(workspace, tmp_path, "obs-extra", "close", extra)
+        workspace.state.commit()
+        _ = workspace.market.execute("CHECKPOINT")
+        assert publication.read_dataset(workspace, "obs-extra", "1")["status"] == "committed"
+    second, _body, _declaration = copy_installation(tmp_path_factory, tmp_path / "second")
+    assert second != home
+    with (
+        open_workspace(second) as workspace,
+        pytest.raises(ValueError, match="dataset/version is not published"),
+    ):
+        _ = publication.read_dataset(workspace, "obs-extra", "1")
+    for path in (path for path in second.rglob("*") if path.is_file()):
+        copied = home / path.relative_to(second)
+        assert path.stat().st_nlink == 1
+        assert not copied.exists() or not path.samefile(copied)
 
 
 def _prepared(home: Path, declaration: Document) -> PreparedResearchRun:
@@ -449,7 +508,7 @@ def test_the_run_identity_is_the_declaration_and_what_it_produced(
 
 
 def test_a_restored_installation_reproduces_the_same_run(
-    installation: tuple[Path, Document, Document], tmp_path: Path
+    fresh_installation: tuple[Path, Document, Document], tmp_path: Path
 ) -> None:
     """Backup and restore carry everything the run is: it comes back byte for byte.
 
@@ -457,8 +516,9 @@ def test_a_restored_installation_reproduces_the_same_run(
     executable runs (see 010-run-store-blocker in the evidence root). What a restored
     installation does carry is every pinned input the declaration names, so the same
     declaration reproduces the same identity, the same envelope and the same accounting.
+    Backup and restore carry the installation identity, so this builds its own.
     """
-    home, _body, declaration = installation
+    home, _body, declaration = fresh_installation
     original = _prepared(home, declaration)
     archive = tmp_path / "backup"
     _ = backup(home, archive, budget=BUDGET)

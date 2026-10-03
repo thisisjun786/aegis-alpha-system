@@ -59,6 +59,7 @@ from tests.application.test_backtest_prepare import BUDGET
 from tests.application.test_research_execution import (  # noqa: F401 -- shared fixtures
     SERIES,
     compute_environment,
+    fresh_installation,
     installation,
 )
 from tests.storage.test_run_migration import install_v1
@@ -77,6 +78,12 @@ def research(request: pytest.FixtureRequest) -> tuple[Path, Document, Document]:
     so no test parameter shadows the name this module imported it under.
     """
     return cast("tuple[Path, Document, Document]", request.getfixturevalue("installation"))
+
+
+@pytest.fixture
+def fresh_research(request: pytest.FixtureRequest) -> tuple[Path, Document, Document]:
+    """The same installation built in the test, for a backup that carries its identity."""
+    return cast("tuple[Path, Document, Document]", request.getfixturevalue("fresh_installation"))
 
 
 def migrated(home: Path) -> None:
@@ -256,9 +263,9 @@ def test_the_stored_run_reruns_deterministically_from_its_own_sealed_envelope(
 
 
 def test_backup_and_restore_carry_the_declared_run_into_a_new_root(
-    research: tuple[Path, Document, Document], tmp_path: Path
+    fresh_research: tuple[Path, Document, Document], tmp_path: Path
 ) -> None:
-    home, _body, declaration = research
+    home, _body, declaration = fresh_research
     migrated(home)
     prepared = prepare(home, declaration)
     record(home, prepared, declaration)
@@ -417,7 +424,7 @@ DECLARED_STATUS = _DECLARED_RESULT_STATUS
 
 
 def test_the_declared_status_survives_recording_requery_and_restore(
-    research: tuple[Path, Document, Document], tmp_path: Path
+    fresh_research: tuple[Path, Document, Document], tmp_path: Path
 ) -> None:
     """The runner says this run is uncertified; storage has to keep saying it.
 
@@ -425,7 +432,7 @@ def test_the_declared_status_survives_recording_requery_and_restore(
     record, and on the same artifact after a restore into a new root. The caller's own
     copy is never the evidence: each read comes from what storage actually holds.
     """
-    home, _body, declaration = research
+    home, _body, declaration = fresh_research
     migrated(home)
     prepared = prepare(home, declaration)
     produced = run_document(prepared.envelope.canonical_bytes, prepared.envelope.envelope_sha256)
