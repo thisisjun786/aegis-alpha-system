@@ -54,6 +54,34 @@ def test_database_free_tests_run_as_complete_isolated_shards() -> None:
     assert "strategy:" not in workflow_jobs()["gate"]
 
 
+def test_shards_publish_their_measured_durations() -> None:
+    body = workflow_jobs()["tests"]
+    durations = "${{ runner.temp }}/durations-${{ matrix.shard }}.json"
+    assert f"PYTEST_ADDOPTS: --test-durations-out={durations}" in body
+    upload = body.split("- name: Publish measured test durations\n", 1)[1]
+    assert re.findall(r"(?m)^        if: (.*)$", upload) == ["always()"]
+    assert re.search(r"(?m)^        uses: actions/upload-artifact@[0-9a-f]{40} # v", upload)
+    assert "name: test-durations-${{ matrix.shard }}" in upload
+    assert f"path: {durations}" in upload
+    assert re.search(r"(?m)^          retention-days: [0-9]+$", upload)
+
+
+def test_body_edits_run_in_their_own_group_without_cancelling_the_push_run() -> None:
+    text = (ROOT / ".github/workflows/ci.yml").read_text()
+    concurrency = text.split("\nconcurrency:\n", 1)[1].split("\n\n", 1)[0]
+    assert re.findall(r"(?m)^  group: (.*)$", concurrency) == [
+        (
+            "aas-ci-${{ github.base_ref }}-${{ github.event.pull_request.number }}"
+            "${{ github.event.action == 'edited' && !github.event.changes.base && '-edit' || '' }}"
+        )
+    ]
+    assert "  cancel-in-progress: true" in concurrency
+    # An edit run still runs every job: a skipped gate would satisfy the required check.
+    for job, body in workflow_jobs().items():
+        assert "github.event.action" not in body, job
+        assert "github.event.changes" not in body, job
+
+
 def test_events_and_permissions_do_not_bypass_required_checks() -> None:
     text = (ROOT / ".github/workflows/ci.yml").read_text()
     assert "branches:" not in text
