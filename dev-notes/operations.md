@@ -385,10 +385,11 @@ aas data kr-prices --identity-snapshot ID --lag-us MICROSECONDS \
   --history-lineage SOURCE_ID_PREFIX [--bulk-lineage SOURCE_ID_PREFIX] [--reference] [--plan]
 ```
 
-`kr-prices`는 EODHD KR 일봉 이력(`--history-lineage`의 `bars` 테이블, 연도마다)과 공급자가 부분 응답이라고
+`kr-prices`는 EODHD KR 일봉 이력(`--history-lineage`의 `bars` 테이블, 연도마다), 그 이력에서 수집기가
+보류한 행(같은 접두어의 `quarantine` 테이블, 값 없는 `invalid` bar로 한 번), 공급자가 부분 응답이라고
 경고한 일간 내려받기(`--bulk-lineage`의 KR `quarantine` 테이블, 세션 날짜마다)를 `prices.kr.eodhd`의
-generation으로 차례로 승격한다. `--reference`는 같은 단계를 adjusted close로 `prices.kr.eodhd.ref`에
-만든다. 전제는 core schema v2, 원천의 `sl:` 연결, 등록된 KR identity snapshot(`--identity-snapshot`),
+generation으로 차례로 승격한다. `--reference`는 이력과 부분 응답 단계를 adjusted close로
+`prices.kr.eodhd.ref`에 만든다. 전제는 core schema v2, 원천의 `sl:` 연결, 등록된 KR identity snapshot(`--identity-snapshot`),
 `sessions.xkrx`의 committed generation이다. `--lag-us`는 `session_close_plus_lag@1`이 XKRX 마감에 더하는
 상한이며 명세와 transform hash에 들어간다. 부분 응답 행은 flag `provider_reported_partial`과 함께
 승격되고 generation마다 `partition_row_count@1` 행 수 대조가 `quality_checks`에 남는다.

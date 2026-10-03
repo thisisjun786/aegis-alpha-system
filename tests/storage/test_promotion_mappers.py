@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import duckdb
 import pytest
 
-from aegis_alpha.storage.promotion.mappers import REGISTRY, IdentityKey, mapper
+from aegis_alpha.storage.promotion.mappers import MANIFEST_ITEMS, REGISTRY, IdentityKey, mapper
 
 
 def _us(moment: datetime) -> int:
@@ -23,6 +23,7 @@ def test_eodhd_bars_maps_synthetic_fixture() -> None:
         "calendar.declared@1",
         "eodhd.bars@1",
         "eodhd.bars_adjusted@1",
+        "eodhd.bars_quarantine@1",
         "eodhd.bulk_quarantine@1",
         "eodhd.bulk_quarantine_adjusted@1",
     }
@@ -266,3 +267,99 @@ def test_eodhd_adjusted_close_maps_close_only_reference() -> None:
     ).fetchall() == [
         ("close", "total_return", "reference", "invalid", None, None, None, None, None, True)
     ]
+
+
+def test_eodhd_bars_quarantine_maps_held_history_rows() -> None:
+    held = mapper("eodhd.bars_quarantine@1")
+    args = {"timezone": "Asia/Seoul", "currencies": {"KO": "KRW", "KQ": "KRW"}}
+    held.check_args(args)
+    with pytest.raises(ValueError, match="takes exactly"):
+        held.check_args({"timezone": "Asia/Seoul"})
+    assert held.manifest_items == "jobs"
+    assert held.identity(args) == IdentityKey("eodhd", "eodhd_symbol")
+    connection = duckdb.connect()
+    connection.execute("SET TimeZone='UTC'")
+    connection.execute(
+        "CREATE TABLE src (_aas_pin INTEGER, _aas_ordinal BIGINT, _aas_row_hash VARCHAR, "
+        "source_fingerprint VARCHAR, reason VARCHAR, source_row_json VARCHAR)"
+    )
+    zero = json.dumps(
+        {
+            "date": "2025-01-02",
+            "open": 0,
+            "high": 0,
+            "low": 0,
+            "close": 0,
+            "adjusted_close": 0,
+            "volume": 25607,
+        }
+    )
+    crossed = json.dumps(
+        {
+            "date": "2025-01-03",
+            "open": 1680,
+            "high": 1740,
+            "low": 1685,
+            "close": 1685,
+            "adjusted_close": 1000.0038,
+            "volume": 104011,
+        }
+    )
+    rows = [
+        (0, "fa", "invalid_price_or_volume", zero),
+        (0, "fb", "inconsistent_ohlc", crossed),
+        (0, "fc", "invalid_price_or_volume", zero),  # listed twice: no symbol
+        (0, "fd", "invalid_price_or_volume", zero),  # instant without offset
+        (0, "fz", "invalid_price_or_volume", zero),  # not in the manifest
+        (0, "fa", "duplicate_row", zero),  # an unmapped reason has no session date
+        (1, "fa", "invalid_price_or_volume", zero),  # another pin's jobs
+    ]  # fmt: skip
+    connection.executemany(
+        "INSERT INTO src VALUES (?, ?, 'h', ?, ?, ?)",
+        [(pin, index, *row) for index, (pin, *row) in enumerate(rows)],
+    )
+    connection.execute(f"CREATE TABLE {MANIFEST_ITEMS} (_aas_pin INTEGER, item VARCHAR)")
+    done = "2025-01-10T00:00:00.5+09:00"
+    jobs = [
+        (0, {"fingerprint": "fa", "symbol": "005930.KO", "completed_at_utc": done}),
+        (0, {"fingerprint": "fb", "symbol": "035720.KQ", "completed_at_utc": done}),
+        (0, {"fingerprint": "fc", "symbol": "000001.KO", "completed_at_utc": done}),
+        (0, {"fingerprint": "fc", "symbol": "000002.KO", "completed_at_utc": done}),
+        (0, {"fingerprint": "fd", "symbol": "000003.KO", "completed_at_utc": "2025-01-10"}),
+        (1, {"fingerprint": "fa", "symbol": "000004.US", "completed_at_utc": done}),
+    ]
+    connection.executemany(
+        f"INSERT INTO {MANIFEST_ITEMS} VALUES (?, ?)",
+        [(pin, json.dumps(job)) for pin, job in jobs],
+    )
+    mapped = connection.execute(
+        f"SELECT _aas_ordinal, _aas_id_token, _aas_id_at_us, session_date, bar_end_us, "
+        f"currency, basis, price_role, value_state, open, high, low, close, volume, "
+        f"_aas_ingested_at_us, _aas_t_session_date "
+        f"FROM ({held.select('src', args)}) ORDER BY _aas_ordinal"
+    ).fetchall()
+    start = _us(datetime(2025, 1, 1, 15, tzinfo=UTC))
+    day = 86_400 * 10**6
+    completed = _us(datetime(2025, 1, 9, 15, 0, 0, 500_000, tzinfo=UTC))
+    session = date(2025, 1, 2)
+    # The collector's held rows are invalid bars that keep no values, even all-zero ones.
+    assert mapped[0] == (
+        0, "005930.KO", start, session, start + day - 1, "KRW", "unadjusted", "canonical",
+        "invalid", None, None, None, None, None, completed, session,
+    )  # fmt: skip
+    assert mapped[1][1:4] == ("035720.KQ", start + day, date(2025, 1, 3))
+    assert mapped[1][8:14] == ("invalid", None, None, None, None, None)
+    assert [(row[1], row[5], row[14]) for row in mapped[2:5]] == [
+        (None, None, None),
+        ("000003.KO", "KRW", None),
+        (None, None, None),
+    ]
+    assert mapped[5][3] is None
+    # The other pin's jobs name the fingerprint for that pin only; its exchange has no currency.
+    assert (mapped[6][1], mapped[6][5]) == ("000004.US", None)
+    partitions = connection.execute(
+        f"SELECT ({held.partition_sql}) FROM src ORDER BY _aas_ordinal"
+    ).fetchall()
+    assert [row[0] for row in partitions] == [
+        session, date(2025, 1, 3), session, session, session, None, session,
+    ]  # fmt: skip

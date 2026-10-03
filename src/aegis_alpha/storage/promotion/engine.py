@@ -51,6 +51,7 @@ from aegis_alpha.storage.membership_pins import (
     verify_membership_pin,
 )
 from aegis_alpha.storage.promotion import decimal_rules, formats
+from aegis_alpha.storage.promotion.mappers import MANIFEST_ITEMS
 from aegis_alpha.storage.promotion.spec import PromotionSpec, parse_spec
 from aegis_alpha.storage.promotion.time_rules import (
     CLAMP_FLAG,
@@ -59,6 +60,7 @@ from aegis_alpha.storage.promotion.time_rules import (
     rule_sql,
 )
 from aegis_alpha.storage.raw import put_raw
+from aegis_alpha.storage.source_library import source_metadata
 from aegis_alpha.storage.source_reader import resolve_source
 from aegis_alpha.storage.state import atomic, complete_operation, get_operation, prepare_operation
 
@@ -91,6 +93,7 @@ _BATCH: Final = 4096
 _LINK: Final = "sl:"
 _TEMP: Final = (
     "src",
+    "items",
     "map",
     "identity",
     "res",
@@ -456,6 +459,33 @@ def _stage_sources(
         _t("src"),
         "_aas_row_hash",
     )
+
+
+def _stage_items(
+    workspace: Workspace, spec: PromotionSpec, sources: list[_Source], plan: PromotionPlan
+) -> None:
+    """Stage the manifest list the mapper reads as ``MANIFEST_ITEMS``, one row per element."""
+    market = workspace.market
+    market.execute(
+        f"CREATE OR REPLACE TEMP TABLE {MANIFEST_ITEMS} (_aas_pin INTEGER, item VARCHAR)"
+    )
+    name = spec.mapper.manifest_items
+    if name is None:
+        return
+    lacking = []
+    for index, source in enumerate(sources):
+        metadata = source_metadata(workspace, source.pin.source_id)
+        items = metadata.get(name) if isinstance(metadata, dict) else None
+        if not isinstance(items, list):
+            lacking.append(source.pin.source_id)
+            continue
+        rows = [(index, formats.canonical(item).decode()) for item in items]
+        for start in range(0, len(rows), _BATCH):
+            market.executemany(
+                f"INSERT INTO {MANIFEST_ITEMS} VALUES (?, ?)", rows[start : start + _BATCH]
+            )
+    if lacking:
+        plan.refusals.append(f"{len(lacking)} pinned sources have no manifest metadata list {name}")
 
 
 def _map(workspace: Workspace, spec: PromotionSpec) -> bool:
@@ -1246,6 +1276,7 @@ def plan_promotion(
     calendars = _calendars(workspace, spec, budget)
     decimal_rules.install(market)
     _stage_sources(workspace, spec, sources, plan)
+    _stage_items(workspace, spec, sources, plan)
     fields = _map(workspace, spec)
     flags = _rows(workspace, spec, sources, calendars, fields=fields)
     _report(workspace, spec, plan, flags)

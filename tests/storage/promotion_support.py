@@ -47,6 +47,14 @@ SCHEMA: Final = pa.schema(
 BULK_SCHEMA: Final = pa.schema(
     [("ordinal", pa.int64()), ("reason", pa.string()), ("source_row_json", pa.string())]
 )
+HELD_SCHEMA: Final = pa.schema(
+    [
+        ("source_fingerprint", pa.string()),
+        ("ordinal", pa.int64()),
+        ("reason", pa.string()),
+        ("source_row_json", pa.string()),
+    ]
+)
 PARTIAL: Final = "provider_reported_partial"
 SYMBOLS: Final = {"AAA.KO": "100001", "BBB.KQ": "100002", "CCC.KO": "100003"}
 DAY_RULE: Final = {
@@ -179,6 +187,52 @@ def add_bulk_source(
     return {
         "source_id": content.source_id,
         "source_sha256": content.sha256,
+        "table": "quarantine",
+        "digest": str(tables[0]["digest"]),
+    }
+
+
+def held_row(fingerprint: str, day: date, *, reason: str = "invalid_price_or_volume") -> tuple:
+    """A held history row (job fingerprint, reason, provider JSON) with all-zero prices."""
+    document = dict.fromkeys(("open", "high", "low", "close", "adjusted_close"), 0)
+    return fingerprint, reason, json.dumps({**document, "date": day.isoformat(), "volume": 0})
+
+
+def add_held_source(  # noqa: PLR0913 -- the explicit ID, its rows and manifest jobs
+    workspace: Workspace,
+    rows: list[tuple[str, str, str]],
+    jobs: list[dict[str, str]],
+    *,
+    lineage: str,
+    tag: str,
+    linked: datetime,
+) -> dict[str, str]:
+    """Commit held history rows under an explicit ID with ``jobs`` metadata; return its pin.
+
+    This is the shape of the collector's history downloads: one ``quarantine`` table per
+    download, the job list (fingerprint, symbol, completion instant) in the manifest.
+    """
+    stamp = us(linked) * 1000
+    with patch.object(time, "time_ns", lambda: stamp):
+        _, digest, _ = put_raw(workspace.paths.raw, f"synthetic-held-{tag}".encode())
+        source_id = f"{lineage}-{digest[:16]}-quarantine"
+        table = pa.table(
+            {
+                "source_fingerprint": [row[0] for row in rows],
+                "ordinal": list(range(len(rows))),
+                "reason": [row[1] for row in rows],
+                "source_row_json": [row[2] for row in rows],
+            },
+            schema=HELD_SCHEMA,
+        )
+        result = source_library.import_arrow(
+            workspace, source_id, digest, "quarantine", table.to_reader(), metadata={"jobs": jobs}
+        )
+    tables = result["tables"]
+    assert isinstance(tables, list)
+    return {
+        "source_id": source_id,
+        "source_sha256": digest,
         "table": "quarantine",
         "digest": str(tables[0]["digest"]),
     }

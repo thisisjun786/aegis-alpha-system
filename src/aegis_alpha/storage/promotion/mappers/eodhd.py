@@ -1,4 +1,4 @@
-"""EODHD daily bars as prices: two source shapes, each as unadjusted or adjusted close.
+"""EODHD daily bars as prices: three source shapes.
 
 ``eodhd.bars@1`` reads the source library's EODHD daily bar table: ``provider_symbol``,
 ``date``, unadjusted ``open``/``high``/``low``/``close``, ``volume`` (binary64),
@@ -22,7 +22,10 @@ is invalid.
 and emit the provider's ``adjusted_close`` as a close-only (``fields='close'``) reference
 price with basis ``total_return``.
 
-For all four:
+``eodhd.bars_quarantine@1`` reads the rows a daily-bar history download held back as
+invalid (``EodhdBarsQuarantine``); they become ``invalid`` bars that keep no values.
+
+For all five:
 
 - The instrument is the pinned identity snapshot's resolution of the assertion key
   (``eodhd``, ``eodhd_symbol``, ``<code>.<exchange>``) at the local start of the session
@@ -30,8 +33,8 @@ For all four:
 - ``bar_end_us`` is the last microsecond of the session date in the ``timezone``
   argument, an upper bound on when a daily bar can end that needs no calendar.
 - A bar whose values are all finite and nonnegative is ``present``; one with none is
-  ``missing``; any other bar is ``invalid`` and keeps no values. Values are never filled
-  from neighbours.
+  ``missing``; any other bar, and every held history row, is ``invalid`` and keeps no
+  values. Values are never filled from neighbours.
 - ``session_date`` is the one time input, for record-basis rules.
 """
 
@@ -43,10 +46,11 @@ from typing import Final
 from zoneinfo import ZoneInfo
 
 from aegis_alpha.storage.promotion.formats import quote_identifier, sql_literal
-from aegis_alpha.storage.promotion.mappers import IdentityKey
+from aegis_alpha.storage.promotion.mappers import MANIFEST_ITEMS, IdentityKey
 from aegis_alpha.storage.promotion.time_rules import InputKind
 
 PARTIAL_FLAG: Final = "provider_reported_partial"
+HELD_INVALID: Final = ("invalid_price_or_volume", "inconsistent_ohlc")
 _VALUES: Final = ("open", "high", "low", "close", "volume")
 _ZONE: Final = re.compile(r"[A-Za-z][A-Za-z0-9_+-]*(?:/[A-Za-z0-9_+-]+)*")
 _EXCHANGE: Final = re.compile(r"[A-Z0-9]{1,10}")
@@ -135,6 +139,7 @@ class _Bars:
     date_column: Final = "session_date"
     time_inputs: Final[Mapping[str, InputKind]] = {"session_date": "date"}
     row_flags: Final[Mapping[str, str]] = {}
+    manifest_items: Final = None
     name: str
     _adjusted: bool
 
@@ -238,6 +243,7 @@ class _BulkQuarantine:
     date_column: Final = "session_date"
     time_inputs: Final[Mapping[str, InputKind]] = {"session_date": "date"}
     row_flags: Final[Mapping[str, str]] = {PARTIAL_FLAG: "_aas_f_" + PARTIAL_FLAG}
+    manifest_items: Final = None
     name: str
     _adjusted: bool
 
@@ -302,3 +308,109 @@ class EodhdBulkQuarantine(_BulkQuarantine):
 class EodhdBulkQuarantineAdjusted(_BulkQuarantine):
     name: Final = "eodhd.bulk_quarantine_adjusted"
     _adjusted = True
+
+
+def _held_day(json: str) -> str:
+    """The session date of a held history row whose reason says its values are invalid."""
+    text = f"json_extract_string({json}, '$.date')"
+    reasons = ", ".join(sql_literal(reason) for reason in HELD_INVALID)
+    return (
+        f"CASE WHEN reason IN ({reasons}) AND json_valid(source_row_json) AND "
+        f"json_type({json}, '$.date') = 'VARCHAR' AND regexp_full_match({text}, '{_DAY}') "
+        f"THEN TRY_CAST({text} AS DATE) END"
+    )
+
+
+_OFFSET_INSTANT: Final = (
+    "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})"
+)
+
+
+class EodhdBarsQuarantine:
+    """The rows of an EODHD daily-bar history download the collector held back as invalid.
+
+    One table per download with ``source_fingerprint`` (the collection job), ``reason``
+    and the provider row as JSON text (``date``, OHLCV, ``adjusted_close``; no symbol).
+    The symbol and the job's completion instant come from the ``jobs`` list of the
+    pinned source's commit manifest (``fingerprint``, ``symbol``, ``completed_at_utc``):
+    a fingerprint that list names once with one symbol resolves, any other does not.
+    Only the reasons ``invalid_price_or_volume`` and ``inconsistent_ohlc`` are mapped,
+    as bars whose ``value_state`` is ``invalid`` and that keep no values; any other
+    reason has no session date and is refused as missing a required column. Ingestion
+    is the job's completion instant when it is an ISO instant with an offset, else the
+    source's ``sl:`` link time. The currency is the ``currencies`` entry of the symbol's
+    exchange suffix.
+    """
+
+    major: Final = 1
+    provider: Final = "eodhd"
+    domain: Final = "prices"
+    name: Final = "eodhd.bars_quarantine"
+    partition_sql: Final = _held_day(
+        "CASE WHEN json_valid(source_row_json) THEN source_row_json END"
+    )
+    date_column: Final = "session_date"
+    time_inputs: Final[Mapping[str, InputKind]] = {"session_date": "date"}
+    row_flags: Final[Mapping[str, str]] = {}
+    manifest_items: Final = "jobs"
+
+    def check_args(self, args: Mapping[str, object]) -> None:
+        if set(args) != {"timezone", "currencies"}:
+            raise ValueError(f"{self.name}@1 takes exactly timezone and currencies arguments")
+        _check_zone(f"{self.name}@1", args)
+        _check_currencies(f"{self.name}@1", args)
+
+    def source_columns(self) -> Mapping[str, frozenset[str]]:
+        return {
+            "source_fingerprint": frozenset({"VARCHAR"}),
+            "reason": frozenset({"VARCHAR"}),
+            "source_row_json": frozenset({"VARCHAR"}),
+        }
+
+    def numeric_columns(self, args: Mapping[str, object]) -> Mapping[str, str]:
+        del args
+        return dict.fromkeys(_VALUES, "DOUBLE")
+
+    def identity(self, args: Mapping[str, object]) -> IdentityKey:
+        del args
+        return IdentityKey("eodhd", "eodhd_symbol")
+
+    def select(self, source: str, args: Mapping[str, object]) -> str:
+        currencies = args["currencies"]
+        assert isinstance(currencies, dict)  # noqa: S101 -- check_args admitted the shape
+        currency = " ".join(
+            f"WHEN {sql_literal(code)} THEN {sql_literal(str(name))}"
+            for code, name in sorted(currencies.items())
+        )
+        start, end = _bounds(args["timezone"])
+        completed = "json_extract_string(item, '$.completed_at_utc')"
+        jobs = (
+            "SELECT _aas_pin, json_extract_string(item, '$.fingerprint') AS fingerprint, "  # noqa: S608 -- engine-named relation
+            "CASE WHEN count(*) = 1 THEN min(json_extract_string(item, '$.symbol')) END "
+            "AS symbol, CASE WHEN count(*) = 1 THEN min(CASE WHEN "
+            f"regexp_full_match({completed}, '{_OFFSET_INSTANT}') "
+            f"THEN epoch_us(TRY_CAST({completed} AS TIMESTAMPTZ)) END) END AS completed_us "
+            f"FROM {MANIFEST_ITEMS} WHERE json_valid(item) "
+            "AND json_type(item, '$.fingerprint') = 'VARCHAR' "
+            "AND json_type(item, '$.symbol') = 'VARCHAR' GROUP BY ALL"
+        )
+        nulls = ", ".join(f"CAST(NULL AS DOUBLE) AS {name}" for name in _VALUES)
+        parsed = (
+            "SELECT s._aas_pin, s._aas_ordinal, s._aas_row_hash, "  # noqa: S608 -- engine-named relations
+            "j.completed_us AS _aas_ingested_at_us, j.symbol AS _aas_token, "
+            f"{_held_day(_JSON)} AS session_date, "
+            f"CASE regexp_extract(j.symbol, '\\.([A-Z0-9]{{1,10}})$', 1) {currency} END "
+            "AS currency "
+            f"FROM (SELECT *, CASE WHEN json_valid(source_row_json) THEN source_row_json END "
+            f"AS {_JSON} FROM {source}) s "
+            f"LEFT JOIN ({jobs}) j ON j._aas_pin = s._aas_pin "
+            "AND j.fingerprint = s.source_fingerprint"
+        )
+        return (
+            "SELECT _aas_pin, _aas_ordinal, _aas_row_hash, _aas_ingested_at_us, "  # noqa: S608 -- engine-named relation
+            f"_aas_token AS _aas_id_token, {start} AS _aas_id_at_us, "
+            f"session_date, '1d' AS interval, {end} AS bar_end_us, currency, "
+            f"'invalid' AS value_state, {nulls}, "
+            "'unadjusted' AS basis, 'canonical' AS price_role, "
+            f"session_date AS _aas_t_session_date FROM ({parsed})"
+        )

@@ -419,6 +419,11 @@ def list_tables(workspace: Workspace, source_id: str) -> list[dict[str, object]]
     return cast("list[dict[str, object]]", _visible(workspace, source_id)["tables"])
 
 
+def source_metadata(workspace: Workspace, source_id: str) -> object:
+    """The ``metadata`` a completed source's commit manifest records (None when absent)."""
+    return _visible(workspace, source_id).get("metadata")
+
+
 def _admit_source_metadata(workspace: Workspace, max_materialization_bytes: int) -> int:
     # list_sources fetches all markers before visibility filtering; _marker also
     # fetches store_kind. Charge every field, including NULs and UTF-8 bytes;

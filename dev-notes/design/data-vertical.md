@@ -255,6 +255,10 @@ revision 정체성, head 비교, flag는 매퍼가 아니라 승격 엔진(`stor
 날짜를 내는 SQL 식), tombstone 범위가 쓰는 도메인 날짜 열, 행 flag를 선언한다. 행 flag는 그 행이 만든
 revision에 매퍼의 `name@major`를 규칙으로 해서 달리고 `detail`은 null이다. 필수 도메인 열이 빈 행은
 identity 해석과 무관하게 `refused_required`이므로, 모양이 잘못된 행이 미해결 행으로 조용히 빠지지 않는다.
+매퍼는 pin한 원천의 commit manifest `metadata`에서 읽을 목록 이름 하나(`manifest_items`)를 선언할 수
+있다. 엔진은 원천마다 그 목록의 원소를 정규 JSON 텍스트 한 행으로 펼쳐 넘기고, 목록이 없는 원천은
+계획 거부로 보고한다. manifest는 pin의 원천 SHA-256이 가리키는 commit의 것이므로 매퍼가 거기서 읽는
+값도 행과 같이 pin된다.
 
 `source_row_hash`는 원천 행 내용의 해시다.
 
@@ -271,7 +275,7 @@ source_row_hash = sha256(정규 JSON ["aas-source-row-v1", [[열 이름, 값], .
 행만 같은 형식으로 Python에서 계산한다. 원본 값은 숫자 규칙이 바꾼 뒤에도 이 해시와 원천 자료실에
 그대로 남는다.
 
-등록된 매퍼는 `eodhd.bars@1`이다. EODHD 일봉(`provider_symbol`, `date`, binary64 OHLCV,
+등록된 매퍼는 다음과 같다. `eodhd.bars@1`은 EODHD 일봉(`provider_symbol`, `date`, binary64 OHLCV,
 `currency`, `retrieved_at`)을 canonical unadjusted `prices`로 옮긴다. instrument는 assertion key
 (`eodhd`, `eodhd_symbol`, `provider_symbol`)를 세션 날짜의 현지 0시에 해석하고, `interval`은 `1d`,
 `bar_end_us`는 인자 `timezone`에서 그 세션 날짜의 마지막 microsecond, 수집 시각은 `retrieved_at`이다.
@@ -287,6 +291,15 @@ source_row_hash = sha256(정규 JSON ["aas-source-row-v1", [[열 이름, 값], .
 선언하며 선언하지 않은 거래소의 행은 통화가 없어 거부된다. 행에 수집 시각이 없으므로 수집 시각은 그
 원천의 `sl:` 연결 시각이다. JSON 숫자는 binary64로 읽고, 2^53을 넘는 정수나 숫자가 아닌 JSON 값은
 `invalid`다. 나머지(해석, `bar_end_us`, 값 상태, 시간 입력)는 `eodhd.bars@1`과 같다.
+
+`eodhd.bars_quarantine@1`은 EODHD 일봉 이력 내려받기에서 수집기가 보류한 행(내려받기 하나의
+테이블, 수집 작업 `source_fingerprint`, `reason`, 심볼 없는 공급자 행 JSON `source_row_json`)을 같은
+canonical unadjusted `prices`로 옮긴다. 심볼과 작업 완료 시각은 그 원천 manifest의 `jobs` 목록
+(`fingerprint`, `symbol`, `completed_at_utc`)에서 온다. 목록에 한 번만 나오는 fingerprint만 심볼을 갖고,
+심볼이 없는 행은 통화도 없어 거부된다. 보류 이유가 `invalid_price_or_volume`이나 `inconsistent_ohlc`인
+행만 세션 날짜를 갖고, 모두 값 없는 `invalid` bar가 된다(가격이 모두 0인 행, 시가가 저가보다 낮은 행).
+다른 보류 이유의 행은 세션 날짜가 없어 거부된다. 수집 시각은 시간대가 붙은 ISO 완료 시각이고, 그렇지
+않으면 원천의 `sl:` 연결 시각이다. 통화는 심볼의 거래소 접미어에 대한 인자 `currencies` 값이다.
 
 `eodhd.bars_adjusted@1`과 `eodhd.bulk_quarantine_adjusted@1`은 같은 두 원천 모양에서 공급자
 `adjusted_close`를 close 전용(`fields='close'`) reference 가격(basis `total_return`)으로 옮긴다. 숫자 열은
@@ -616,16 +629,19 @@ dataset의 백필은 연도 단위 generation, 이후 유지보수는 세션 단
 
 1. 이력: 원천 ID 접두어 하나(`--history-lineage`)의 모든 `bars` 테이블을 pin하고 달력 연도마다
    `eodhd.bars@1`로 승격한다.
-2. 부분 응답 일간 내려받기: 원천 ID 접두어 하나(`--bulk-lineage`)의 `quarantine` 테이블 중 행이 KR
+2. 보류된 이력 행: 같은 접두어의 행이 있는 `quarantine` 테이블을 pin하고, 그 행들의 연도 전체를
+   generation 하나로 `eodhd.bars_quarantine@1`로 승격한다. 행은 값 없는 `invalid` bar가 된다.
+3. 부분 응답 일간 내려받기: 원천 ID 접두어 하나(`--bulk-lineage`)의 `quarantine` 테이블 중 행이 KR
    거래소(`KO`, `KQ` → `KRW`)를 가리키는 것을 세션 날짜마다 `eodhd.bulk_quarantine@1`로 승격한다. KR과
-   다른 거래소를 섞은 테이블은 거부한다. 테이블 digest가 같은 반복 내려받기는 가장 작은 원천 ID 하나만
-   pin한다. 내용이 다른 두 테이블이 같은 거래소·날짜를 실으면 둘 다 pin해 계획이 반복 자연키로 거부한다.
+   다른 거래소를 섞은 테이블은 거부한다. 보류 행과 부분 응답 모두 테이블 digest가 같은 반복 내려받기는
+   가장 작은 원천 ID 하나만 pin한다. 내용이 다른 두 테이블이 같은 거래소·날짜를 실으면 둘 다 pin해 계획이 반복 자연키로 거부한다.
 
 두 시점 열은 `session_close_plus_lag@1`(근거 `record`, 입력 `session_date`, `--lag-us`)이고 OHLC는
 `krw_tick@1`, 거래량은 `float_shortest@1`이다. 공급자는 거래량도 분할 계수로 나눠 다시 계산하므로
 (545540.77978275주처럼) 소수 12자리로 정확히 표현되지 않는 거래량이 있고, 그 행에는
-`provider_float_storage`가 남는다. `--reference`는 같은 단계를 adjusted close 매퍼로
-`prices.kr.eodhd.ref`에 만들며 close는 `float_shortest@1`이다. 이력과 겹치는 부분 응답 날짜는 이력
+`provider_float_storage`가 남는다. `--reference`는 이력과 부분 응답 단계를 adjusted close 매퍼로
+`prices.kr.eodhd.ref`에 만들며 close는 `float_shortest@1`이다. 보류된 이력 행은 남길 adjusted close가
+없으므로 reference에 단계가 없다. 이력과 겹치는 부분 응답 날짜는 이력
 generation의 자식이므로 같은 값은 바뀌지 않고, 다른 값은 SUPERSEDE로 그 원천을 받은 시각부터 알려진다.
 
 `--plan`은 아무것도 쓰지 않고 모든 단계를 현재 head의 자식으로 계획해 단계별 보고와 합계(원천 행,
@@ -1140,3 +1156,6 @@ state v2:
 | DV-150 | `kr-prices --plan`은 설치본에 아무것도 쓰지 않는다 | `tests/storage/test_promotion_cli.py::test_kr_prices_plan_writes_nothing_and_apply_publishes` | 구현 |
 | DV-151 | `eodhd.bulk_quarantine@1`은 합성 원천 fixture를 독립 기대값과 같은 도메인 열과 행 flag로 옮기고 다른 보류 이유·잘못된 날짜·JSON의 세션 날짜를 비운다 | `tests/storage/test_promotion_mappers.py::test_eodhd_bulk_quarantine_maps_synthetic_fixture` | 구현 |
 | DV-152 | adjusted close 매퍼는 close 전용 `total_return` reference 가격을 낸다 | `tests/storage/test_promotion_mappers.py::test_eodhd_adjusted_close_maps_close_only_reference` | 구현 |
+| DV-153 | `eodhd.bars_quarantine@1`은 manifest `jobs`로 보류 행의 심볼·완료 시각을 찾아 값 없는 `invalid` bar로 옮기고, 두 번 나오거나 없는 fingerprint·다른 보류 이유는 해석하지 않는다 | `tests/storage/test_promotion_mappers.py::test_eodhd_bars_quarantine_maps_held_history_rows` | 구현 |
+| DV-154 | `kr-prices`는 보류된 이력 행을 이력 연도 뒤 한 단계로 `invalid` bar로 승격하고 반복 내려받기는 한 번만 pin하며 reference에는 그 단계가 없다 | `tests/storage/test_kr_prices.py::test_held_history_rows_become_invalid_bars` | 구현 |
+| DV-155 | `manifest_items` 목록이 없는 원천을 pin한 계획은 거부되고 심볼 없는 보류 행은 필수 열 누락으로 거부된다 | `tests/storage/test_kr_prices.py::test_held_rows_without_manifest_jobs_are_refused` | 구현 |

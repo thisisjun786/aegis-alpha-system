@@ -4,15 +4,19 @@ The backfill is a sequence of promotions, each the next generation of one datase
 
 1. the EODHD KR daily-bar history (every ``bars`` table of one source lineage), one
    generation per calendar year, with ``eodhd.bars@1``;
-2. the exchange-wide daily downloads the provider answered with a partial-response
+2. the rows the same history downloads held back as invalid (every nonempty
+   ``quarantine`` table of that lineage), one generation over their years, with
+   ``eodhd.bars_quarantine@1``: each becomes an ``invalid`` bar that keeps no values;
+3. the exchange-wide daily downloads the provider answered with a partial-response
    warning (every ``quarantine`` table of one bulk lineage whose rows name an exchange
    of ``CURRENCIES``), one generation per session date, with
    ``eodhd.bulk_quarantine@1``. Each row is promoted with the flag
    ``provider_reported_partial`` and each generation records ``partition_row_count@1``
    against the history it extends.
 
-``--reference`` builds ``prices.kr.eodhd.ref`` from the same tables with the provider's
-adjusted close (``eodhd.bars_adjusted@1``, ``eodhd.bulk_quarantine_adjusted@1``).
+``--reference`` builds ``prices.kr.eodhd.ref`` from the history and partial tables with
+the provider's adjusted close (``eodhd.bars_adjusted@1``,
+``eodhd.bulk_quarantine_adjusted@1``); held invalid rows have no adjusted close to keep.
 
 Every step's spec is the canonical document this module writes for the step's partition,
 its pinned tables, the pinned identity snapshot, the committed head of ``sessions.xkrx``
@@ -136,6 +140,47 @@ def _history_steps(workspace: Workspace, lineage: str, *, reference: bool) -> li
     ]
 
 
+def _distinct(
+    tables: list[tuple[dict[str, str], str, int]], report: dict[str, object], kind: str
+) -> list[tuple[dict[str, str], str, int]]:
+    """Nonempty tables, a repeated download (the same digest) kept once by smallest ID."""
+    kept: dict[str, tuple[dict[str, str], str, int]] = {}
+    for item in tables:
+        if item[2]:
+            kept.setdefault(item[0]["digest"], item)
+    report[f"{kind}_tables"] = len(kept)
+    report[f"{kind}_repeated_tables"] = sum(1 for item in tables if item[2]) - len(kept)
+    return list(kept.values())
+
+
+def _held_steps(workspace: Workspace, lineage: str, report: dict[str, object]) -> list[Step]:
+    """One step over the years of the history rows held back as invalid, if there are any."""
+    tables = _distinct(_tables(workspace, lineage, _BULK_TABLE), report, "held")
+    if not tables:
+        return []
+    day = mapper("eodhd.bars_quarantine@1").partition_sql
+    union = " UNION ALL ".join(
+        f"SELECT min({day}), max({day}) FROM {formats.quote_identifier(target)}"  # noqa: S608
+        for _, target, _ in tables
+    )
+    first, last = cast(
+        "tuple[date | None, date | None]",
+        workspace.market.execute(f"SELECT min(a), max(b) FROM ({union}) t(a, b)").fetchone(),  # noqa: S608
+    )
+    if first is None or last is None:
+        raise ValueError(f"no held row of lineage {lineage} has a mapped reason and date")
+    pins = tuple(sorted((pin for pin, _, _ in tables), key=lambda pin: pin["source_id"]))
+    return [
+        Step(
+            "held",
+            date(first.year, 1, 1),
+            date(last.year + 1, 1, 1),
+            "eodhd.bars_quarantine@1",
+            pins,
+        )
+    ]
+
+
 def _bulk_steps(
     workspace: Workspace, lineage: str, report: dict[str, object], *, reference: bool
 ) -> list[Step]:
@@ -241,7 +286,7 @@ def step_spec(  # noqa: PLR0913 -- every input the canonical spec spells
         }
     )
     args: dict[str, object] = {"timezone": TIMEZONE}
-    if step.kind == "bulk":
+    if step.kind in {"held", "bulk"}:
         args["currencies"] = dict(CURRENCIES)
     return formats.canonical(
         {
@@ -267,8 +312,10 @@ def kr_price_steps(
     reference: bool,
     report: dict[str, object],
 ) -> list[Step]:
-    """The backfill's steps in order: history years, then partial bulk session dates."""
+    """The backfill's steps in order: history years, held history rows, partial bulk dates."""
     steps = _history_steps(workspace, history_lineage, reference=reference)
+    if not reference:
+        steps += _held_steps(workspace, history_lineage, report)
     if bulk_lineage is not None:
         steps += _bulk_steps(workspace, bulk_lineage, report, reference=reference)
     return steps

@@ -24,10 +24,12 @@ from tests.storage.promotion_support import (
     SYMBOLS,
     ZONE,
     add_bulk_source,
+    add_held_source,
     add_source,
     at,
     bar,
     bulk_row,
+    held_row,
     prices,
     publish_calendar,
     register_symbols,
@@ -335,3 +337,91 @@ def test_kr_prices_backfills_years_then_partial_days(ws: Workspace) -> None:
         "USING (generation_id) WHERE g.dataset_id = 'prices.kr.eodhd.ref'"
     ).fetchall()
     assert stored == [("close", "total_return", "reference")]
+
+
+def test_held_history_rows_become_invalid_bars(ws: Workspace) -> None:
+    history = add_source(
+        ws,
+        [bar("AAA.KO", D1, 100.0, retrieved=LATE), bar("BBB.KQ", D1, 50.0, retrieved=LATE)],
+        tag="history",
+    )
+    register_symbols(ws, history["source_id"])
+    _calendar(ws)
+    done = "2025-01-09T09:00:00+09:00"
+    jobs = [
+        {"fingerprint": "fa", "symbol": "AAA.KO", "completed_at_utc": done},
+        {"fingerprint": "fb", "symbol": "BBB.KQ", "completed_at_utc": done},
+        {"fingerprint": "fz", "symbol": "ZZZ.KO", "completed_at_utc": done},
+    ]
+    rows = [held_row("fa", D0), held_row("fb", D2, reason="inconsistent_ohlc"), held_row("fz", D0)]
+    lineage = "synthetic-kr-bars"
+    add_held_source(ws, rows, jobs, lineage=lineage, tag="held", linked=LATER)
+    add_held_source(ws, rows, jobs, lineage=lineage, tag="held-again", linked=LATER)
+    add_held_source(ws, [], [], lineage=lineage, tag="empty", linked=LATER)
+    planned = _backfill(ws, apply=False)
+    steps = cast("list[dict[str, object]]", planned["steps"])
+    # The held rows span 2024..2025 and form one step after the history years; the
+    # repeated download is pinned once and the empty one not at all.
+    assert [(step["kind"], step["from"], step["to"], step["sources"]) for step in steps] == [
+        ("history", "2025-01-01", "2026-01-01", 1),
+        ("held", "2024-01-01", "2026-01-01", 1),
+    ]
+    assert (planned["held_tables"], planned["held_repeated_tables"]) == (1, 1)
+    assert steps[1]["rows"] == {"ok": 2, "unresolved": 1}
+    assert steps[1]["unresolved_tokens"] == ["ZZZ.KO"]
+    applied = _backfill(ws, apply=True)
+    head = str(applied["head"])
+    stored = ws.market.execute(
+        "SELECT instrument_id, session_date, value_state, open, high, low, close, volume, "
+        "ingested_at_us, available_at_us FROM prices WHERE generation_id = ? ORDER BY 2",
+        [head],
+    ).fetchall()
+    # Held rows are invalid bars that keep none of the provider's values; the job's
+    # completion instant is their ingestion and the XKRX close plus the lag their time.
+    ingested = us(at("2025-01-09T00:00:00"))
+    assert stored == [
+        (AAA, D0, "invalid", None, None, None, None, None, ingested,
+         us(at("2024-12-30T07:30:00"))),
+        (BBB, D2, "invalid", None, None, None, None, None, ingested,
+         us(at("2025-01-03T07:30:00"))),
+    ]  # fmt: skip
+    verify_promotion(ws, head)
+    again = _backfill(ws, apply=True)
+    assert [step["published"] for step in cast("list[dict[str, object]]", again["steps"])] == [
+        False,
+        False,
+    ]
+    reference = _backfill(ws, apply=False, reference=True)
+    assert [step["kind"] for step in cast("list[dict[str, object]]", reference["steps"])] == [
+        "history"
+    ]
+
+
+def test_held_rows_without_manifest_jobs_are_refused(ws: Workspace) -> None:
+    history = add_source(ws, [bar("AAA.KO", D1, 100.0, retrieved=LATE)], tag="history")
+    identity = register_symbols(ws, history["source_id"])
+    held = add_held_source(
+        ws, [held_row("fa", D1)], [], lineage="synthetic-kr-bars", tag="held", linked=LATER
+    )
+    # A manifest whose jobs list is missing: the commit names no symbols at all.
+    ws.market.execute(
+        "UPDATE source_library_commits SET manifest_json = json_object('source_id', "
+        "source_id, 'store', 'market', 'tables', manifest_json->'tables', 'metadata', "
+        "json_object()) WHERE source_id = ?",
+        [held["source_id"]],
+    )
+    document = spec(
+        [held],
+        identity,
+        mapper={
+            "name": "eodhd.bars_quarantine@1",
+            "args": {"timezone": ZONE, "currencies": {"KO": "KRW", "KQ": "KRW"}},
+        },
+    )
+    planned = promote(ws, document[0], document[1], apply=False)
+    # Without its job the row has no symbol and so no currency: it is refused, not dropped.
+    assert planned["refusals"] == [
+        "1 pinned sources have no manifest metadata list jobs",
+        "1 rows required refused",
+    ]
+    assert planned["rows"] == {"refused_required": 1}
