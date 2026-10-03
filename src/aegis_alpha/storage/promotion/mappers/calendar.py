@@ -39,6 +39,7 @@ class CalendarDeclared:
     name: Final = "calendar.declared"
     major: Final = 1
     provider: Final = "calendar"
+    source_prefixes: Final = ()
     domain: Final = "calendar_sessions"
     partition_column: Final = "session_date"
     date_column: Final = "session_date"

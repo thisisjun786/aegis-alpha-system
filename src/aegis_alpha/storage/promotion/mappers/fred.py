@@ -1,6 +1,6 @@
-"""FRED mappers: ALFRED vintages as ``macro_observations`` and a FRED series as ``fx_rates``.
+"""``fred.alfred@1``: ALFRED vintages as ``macro_observations``.
 
-``fred.alfred@1`` reads an ALFRED observation table: ``series_id``, ``observation_date``,
+Input is an ALFRED observation table: ``series_id``, ``observation_date``,
 the vintage's ``realtime_start``, the provider's ``value`` text and the collection instant
 ``retrieved_at_utc``. Other source columns (the vintage's ``realtime_end`` among them) are
 not read; they stay in the source row and its hash.
@@ -22,13 +22,7 @@ not read; they stay in the source row and its hash.
   gives it to ``local_day_end@1`` with basis ``revision``, so both a first vintage and a
   revision are known from the end of their own vintage day.
 
-``fred.fx_series@1`` reads the ``observation_date,<SERIES>`` download as the legacy import
-keeps it (``series_id``, ``observation_date`` and ``value``, all text) and promotes the rows
-of the spec's ``series`` as one currency pair: ``rate`` is the quote currency per one unit
-of the base. ``fixing_at_us`` is the last microsecond of the observation date in the spec's
-``timezone``, an upper bound on the fixing time that needs no fixing schedule; the time
-input ``fixing_date`` is that date. A date that is not ``YYYY-MM-DD`` leaves the required
-fixing time empty, so the promotion refuses it. Rows of other series are not selected.
+``fred.fx_series@1`` is a text FX series in ``mappers.fx``.
 """
 
 from __future__ import annotations
@@ -39,13 +33,7 @@ from itertools import pairwise
 from typing import TYPE_CHECKING, Final
 
 from aegis_alpha.storage.promotion.formats import sql_literal
-from aegis_alpha.storage.promotion.mappers.common import (
-    day_end_us,
-    decimal_state,
-    epoch_floor,
-    iso_day,
-    pair_args,
-)
+from aegis_alpha.storage.promotion.mappers.common import decimal_state, epoch_floor
 from aegis_alpha.storage.promotion.time_rules import InputKind
 
 if TYPE_CHECKING:
@@ -59,6 +47,7 @@ class FredAlfred:
     name: Final = "fred.alfred"
     major: Final = 1
     provider: Final = "fred"
+    source_prefixes: Final = ()
     domain: Final = "macro_observations"
     partition_column: Final = "realtime_start"
     date_column: Final = "observation_period"
@@ -97,52 +86,6 @@ class FredAlfred:
             f"CASE WHEN {state} = 'present' THEN value END AS value, "
             f"{state} AS value_state, "
             f"{epoch_floor('realtime_start')} AS _aas_t_vintage_start FROM {source}"
-        )
-
-
-class FredFxSeries:
-    name: Final = "fred.fx_series"
-    major: Final = 1
-    provider: Final = "fred"
-    domain: Final = "fx_rates"
-    partition_column: Final = "observation_date"
-    date_column: Final = None
-    time_inputs: Final[Mapping[str, InputKind]] = {"fixing_date": "date"}
-
-    def check_args(self, args: Mapping[str, object]) -> None:
-        pair_args("fred.fx_series@1", args)
-
-    def source_columns(self) -> Mapping[str, frozenset[str]]:
-        return {
-            "series_id": frozenset({"VARCHAR"}),
-            "observation_date": frozenset({"VARCHAR"}),
-            "value": frozenset({"VARCHAR"}),
-        }
-
-    def numeric_columns(self, args: Mapping[str, object]) -> Mapping[str, str]:
-        del args
-        return {"rate": "VARCHAR"}
-
-    def identity(self, args: Mapping[str, object]) -> None:
-        del args
-
-    def select(self, source: str, args: Mapping[str, object]) -> str:
-        day = iso_day("observation_date")
-        state = (
-            f"CASE WHEN {decimal_state('value')} = 'present' AND "
-            "TRY_CAST(value AS DOUBLE) <= 0 THEN 'invalid' "
-            f"ELSE {decimal_state('value')} END"
-        )
-        return (
-            "SELECT _aas_pin, _aas_ordinal, _aas_row_hash, "  # noqa: S608 -- engine-named relation
-            "CAST(NULL AS BIGINT) AS _aas_ingested_at_us, "
-            f"{sql_literal(str(args['base']))} AS base_currency, "
-            f"{sql_literal(str(args['quote']))} AS quote_currency, "
-            f"{day_end_us(str(args['timezone']), day)} AS fixing_at_us, "
-            f"CASE WHEN {state} = 'present' THEN value END AS rate, "
-            f"{state} AS value_state, "
-            f"{epoch_floor(day)} AS _aas_t_fixing_date "
-            f"FROM {source} WHERE series_id = {sql_literal(str(args['series']))}"
         )
 
 

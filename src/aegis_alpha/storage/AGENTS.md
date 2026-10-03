@@ -74,11 +74,13 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   another one at the same instant, or a plan with stale rows is refused, so an old declaration
   never undoes a newer correction and a correction is never dropped silently.
 - The macro and FX mappers (`fred.alfred@1`, `bok`/`oecd.observations@1`, `norgate.fx_closes@1`,
-  `fred.fx_series@1`) emit numbers as the source's text for `decimal_text@1` and never repair it.
+  `norgate.fx_history@1`, `fred.fx_series@1`) emit numbers as the source's text for `decimal_text@1` and never repair it.
   A generation holds one revision per record, so ALFRED vintages promote one vintage partition per
   generation in order (`mappers.fred.vintage_partitions`), each later vintage a SUPERSEDE; the closed
   `realtime_end` of a later pull stays in the source row, never on the earlier revision. A partition
   needs a DATE partition column, and a mapper without a domain date column takes no tombstones.
+  A mapper whose source shape several providers share declares `source_prefixes`, and the spec
+  refuses a pin from another provider's source.
 - `legacy_import` owns `aas import legacy` (`aas-legacy-import-v1`, see the legacy section of
   `dev-notes/design/data-vertical.md`). A registered loader (`<provider>.<shape>@<major>`) fixes
   one format's complete unit, output columns and reconciliation metrics; one unit commits one

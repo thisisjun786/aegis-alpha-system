@@ -57,6 +57,7 @@ class KoreaObservations:
     def __init__(self, provider: str) -> None:
         self.provider = provider
         self.name = f"{provider}.observations"
+        self.source_prefixes = (f"{provider}-observations-",)
 
     def check_args(self, args: Mapping[str, object]) -> None:
         if args:

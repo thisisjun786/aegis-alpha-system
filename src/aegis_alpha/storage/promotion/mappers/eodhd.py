@@ -35,6 +35,7 @@ class EodhdBars:
     name: Final = "eodhd.bars"
     major: Final = 1
     provider: Final = "eodhd"
+    source_prefixes: Final = ()
     domain: Final = "prices"
     partition_column: Final = "date"
     date_column: Final = "session_date"

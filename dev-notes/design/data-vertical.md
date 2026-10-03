@@ -254,6 +254,9 @@ assertion key(provider, namespace), 파티션 날짜 열, tombstone 범위가 �
 명세의 `partition`은 원천의 파티션 열이 DATE일 때만 쓸 수 있다. 날짜를 텍스트로 싣는 원천(FRED CSV,
 KR 공개 응답)은 텍스트를 날짜로 바꿔 비교하지 않고 파티션 없이 승격한다. 도메인 날짜 열이 없는
 매퍼(FX)는 부재를 범위로 한정할 수 없으므로 `absent_in_full_snapshot`을 명세 단계에서 거부한다.
+여러 공급자의 원천이 같은 형태를 공유하는 매퍼는 읽는 원천 ID 접두사를 선언하고, 명세 단계에서 접두사가
+다른 원천 pin을 거부한다. 그래서 한 공급자의 행이 다른 공급자의 dataset에 들어가지 않는다. 접두사를
+선언하지 않은 매퍼는 열이 맞는 원천을 모두 읽는다.
 
 `source_row_hash`는 원천 행 내용의 해시다.
 
@@ -340,12 +343,15 @@ FX 매퍼는 인자 `series`(원천의 시계열 이름), `base`·`quote`(대문
 시간대의 날짜는 다음 UTC 날짜로 읽힌다.
 
 - `norgate.fx_closes@1`은 Norgate 기준 시리즈 테이블(`symbol`, `date`, binary64 `close`, 내보내기 행
-  원문 `raw_row_json`)을 읽는다. `rate`는 binary64 값이 아니라 내보내기가 쓴 `Close` 텍스트다. 그
-  텍스트가 양의 십진수이고 그 double이 `close`와 같으며 원문의 `Date`가 행의 `date`일 때만 `present`이고,
-  close가 없으면 `missing`, 그 밖은 `invalid`다. 원천에 수집 시각이 없으므로 수집 시각은 `sl:` 수집 시각이다.
-- `fred.fx_series@1`은 legacy `fred.series_csv@1`이 편입한 텍스트 행(`series_id`, `observation_date`,
-  `value`)을 읽는다. 0 이하의 값은 `invalid`이고, `YYYY-MM-DD`가 아니거나 없는 날짜는 필수 열인
-  `fixing_at_us`를 비워 승격을 거부한다.
+  원문 `raw_row_json`)을 읽는다. `rate`는 binary64 값이 아니라 내보내기가 쓴 `Close` 텍스트다. 원문의
+  `Date`가 행의 `date`가 아니면 `invalid`다. 그 밖에는 텍스트가 양의 십진수이고 그 double이 `close`와 같을
+  때만 `present`이고, 둘 다 없으면 `missing`, 나머지는 `invalid`다. 원천에 수집 시각이 없으므로 수집 시각은
+  `sl:` 수집 시각이다.
+- `fred.fx_series@1`(`fred-series-csv-*` 원천)은 legacy `fred.series_csv@1`이 편입한 텍스트 행
+  (`series_id`, `observation_date`, `value`)을, `norgate.fx_history@1`(`norgate-history-csv-*` 원천)은
+  legacy `norgate.history_export@1`이 편입한 `bars`의 텍스트 행(`symbol`, `date`, `close`)을 읽는다. 0
+  이하의 값은 `invalid`이고, `YYYY-MM-DD`가 아니거나 없는 날짜는 필수 열인 `fixing_at_us`를 비워 승격을
+  거부한다.
 
 ## 결정적 공통 열
 
@@ -627,7 +633,7 @@ KRX 토요일 session은 확인되지 않은 반일 마감 대신 평일 마감�
 | `fundamentals.kr.dart` | `fundamentals` | 재무제표 응답. 연결·별도는 dimensions. 자료 없음 응답은 행 대신 coverage 기록 |
 | `macro.us.alfred` | `macro_observations` | ALFRED vintage(`fred.alfred@1`). vintage 구간마다 generation 하나, 정정은 SUPERSEDE. 두 시점은 `local_day_end@1(realtime_start)` |
 | `macro.kr.bok`, `macro.kr.oecd` | `macro_observations` | `bok.observations@1`, `oecd.observations@1`. vintage가 없어 두 시점은 `unknown_null@1` |
-| `fx.usdkrw.norgate`, `fx.usdkrw.fred` | `fx_rates` | `norgate.fx_closes@1`(동결, 2026-09-08까지), `fred.fx_series@1`(DEXKOUS). 우선순위는 소비자 pin |
+| `fx.usdkrw.norgate`, `fx.usdkrw.fred` | `fx_rates` | `norgate.fx_closes@1`(source library 기준 시리즈, 동결, 2026-09-08까지) 또는 `norgate.fx_history@1`(legacy 내보내기 편입본), `fred.fx_series@1`(DEXKOUS). 우선순위는 소비자 pin |
 | `classifications.*` | `classifications`(v2) | Norgate 분류, SEC SIC, KIND 업종. known은 snapshot 시각이며 과거로 소급하지 않음 |
 
 identity 원천(Norgate master, SEC submissions, FMP profile, DART 고유번호, KIND 목록)은 typed generation이
@@ -1141,3 +1147,5 @@ state v2:
 | DV-149 | KR 공개 관측 매퍼는 기간 형식과 단위를 정해진 규칙으로만 옮기고 나머지는 필수 열을 비운다 | `tests/storage/test_macro_fx.py::test_korea_observations_map_synthetic_fixture` | 구현 |
 | DV-150 | FX 승격은 한 통화쌍만 고르고 나머지를 `unselected_rows`로 보고하며 도메인 날짜 열이 없어 tombstone 명세를 거부한다 | `tests/storage/test_macro_fx.py::test_fx_series_promote_one_pair_each` | 구현 |
 | DV-151 | legacy FRED CSV와 KR 공개 응답은 편입 뒤 승격되고, 텍스트 날짜 원천의 파티션은 거부되며 시점이 없는 거시 행의 두 시점은 null이다 | `tests/storage/test_macro_fx.py::test_legacy_fred_and_kr_public_sources_promote` | 구현 |
+| DV-152 | legacy Norgate 내보내기는 편입 뒤 `norgate.fx_history@1`로 한 통화쌍이 승격된다 | `tests/storage/test_macro_fx.py::test_norgate_history_export_promotes_one_pair` | 구현 |
+| DV-153 | 원천 ID 접두사를 선언한 매퍼는 다른 공급자의 원천 pin을 명세 단계에서 거부한다 | `tests/storage/test_macro_fx.py::test_legacy_fred_and_kr_public_sources_promote` | 구현 |

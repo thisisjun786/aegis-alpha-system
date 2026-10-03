@@ -283,6 +283,7 @@ def test_fx_mappers_map_synthetic_fixtures() -> None:
             ("USDKRW", 1, day + timedelta(2), 1158.1, raw("1158.1", day)),
             ("USDKRW", 1, day + timedelta(3), None, raw(None, day + timedelta(3))),
             ("USDKRW", 1, day + timedelta(4), 0.0, raw("0", day + timedelta(4))),
+            ("USDKRW", 1, day + timedelta(5), None, raw(None, day)),
             ("XAUUSD", 2, day, 1500.0, raw("1500")),
         ],
     )
@@ -303,6 +304,9 @@ def test_fx_mappers_map_synthetic_fixtures() -> None:
          day + timedelta(3)),
         (4, "USD", "KRW", _day_end(day + timedelta(4), SEOUL), None, "invalid", None,
          day + timedelta(4)),
+        # A row without a close whose own date is another day is invalid, not missing.
+        (5, "USD", "KRW", _day_end(day + timedelta(5), SEOUL), None, "invalid", None,
+         day + timedelta(5)),
     ]  # fmt: skip
     series = mapper("fred.fx_series@1")
     args = {"series": "DEXKOUS", "base": "USD", "quote": "KRW", "timezone": "America/New_York"}
@@ -332,6 +336,28 @@ def test_fx_mappers_map_synthetic_fixtures() -> None:
         # An impossible or misspelled date leaves the required fixing time empty.
         (4, None, "1", "present", None),
         (5, None, "1", "present", None),
+    ]
+    history = mapper("norgate.fx_history@1")
+    args = {"series": "USDKRW", "base": "USD", "quote": "KRW", "timezone": SEOUL}
+    history.check_args(args)
+    assert history.source_prefixes == ("norgate-history-csv-",)
+    connection = _memory(
+        "symbol VARCHAR, date VARCHAR, close VARCHAR",
+        [
+            ("USDKRW", "1991-01-02", "714.5"),
+            ("USDKRW", "1991-01-03", None),
+            ("USDKRW", "1991-01-04", "0"),
+            ("XAUUSD", "1991-01-02", "386.2"),
+        ],
+    )
+    rows = connection.execute(
+        "SELECT _aas_ordinal, fixing_at_us, rate, value_state, _aas_t_fixing_date "
+        f"FROM ({history.select('src', args)}) ORDER BY _aas_ordinal"
+    ).fetchall()
+    assert rows == [
+        (0, _day_end(date(1991, 1, 2), SEOUL), "714.5", "present", date(1991, 1, 2)),
+        (1, _day_end(date(1991, 1, 3), SEOUL), None, "missing", date(1991, 1, 3)),
+        (2, _day_end(date(1991, 1, 4), SEOUL), None, "invalid", date(1991, 1, 4)),
     ]
 
 
@@ -721,6 +747,22 @@ def test_legacy_fred_and_kr_public_sources_promote(tmp_path: Path, ws: Workspace
             decimal={"value": "decimal_text@1"},
         )
         assert _apply(ws, document)["operations"] == {"ASSERT": count}
+    # BOK and OECD tables share one shape, so each mapper reads only its provider's sources.
+    for pinned in (
+        [pins["oecd-observations"]],
+        [pins["bok-observations"], pins["oecd-observations"]],
+    ):
+        raw_kr, sha_kr = _spec(
+            "macro_observations",
+            "macro.kr.bok",
+            pinned,
+            "bok.observations@1",
+            {},
+            unknown,
+            decimal={"value": "decimal_text@1"},
+        )
+        with pytest.raises(ValueError, match="reads only sources"):
+            parse_spec(raw_kr, sha_kr)
     stored = ws.market.execute(
         "SELECT series_id, observation_period, unit, value, available_at_us, "
         "revision_known_at_us FROM macro_observations ORDER BY series_id, observation_period"
@@ -731,3 +773,108 @@ def test_legacy_fred_and_kr_public_sources_promote(tmp_path: Path, ws: Workspace
         ("KOR_POLICY_BOK", date(2008, 3, 7), "percent", Decimal("5.00"), None, None),
     ]
     assert verify_workspace(ws)["verified"] is True
+
+
+def _norgate_export(root: Path, series: str, assetid: int, csv: bytes) -> Path:
+    """One batch of a Norgate history export holding ``series``, its plan and acquisition."""
+    digest = hashlib.sha256(csv).hexdigest()
+    _private(root / "batch-000" / "history" / f"{digest}.csv", csv)
+    lines = csv.decode().splitlines()
+    record = {
+        "assetid": assetid,
+        "columns": lines[0].split(",")[1:],
+        "first_index": lines[1].split(",")[0] + " 00:00:00",
+        "identity": {
+            "assetid": assetid,
+            "database": "Forex Spot",
+            "securityname": "US Dollar / Korean Won",
+            "symbol": series,
+        },
+        "index_name": "Date",
+        "last_index": lines[-1].split(",")[0] + " 00:00:00",
+        "path": f"{digest}.csv",
+        "rows": len(lines) - 1,
+        "sha256": digest,
+        "status": "exported",
+        "symbol": series,
+    }
+    result = {
+        "batch": 0,
+        "checked_at": "2026-09-09T00:00:00+00:00",
+        "checkpoints": [],
+        "expected": 1,
+        "recorded": 1,
+        "records": {series: record},
+        "unattempted": [],
+        "validation_layer": "synthetic",
+    }
+    _private(root / "batch-000-result.json", json.dumps(result).encode())
+    plan = json.dumps({"pending_symbols": [series], "reused": {}}).encode()
+    plan_sha = hashlib.sha256(plan).hexdigest()
+    _private(root / f"plan-{plan_sha}.json", plan)
+    acquisition = json.dumps(
+        {"batches": 1, "plan_sha256": plan_sha, "reused_series": 0, "unattempted": 0}
+    ).encode()
+    _private(root / f"acquisition-{hashlib.sha256(acquisition).hexdigest()}.json", acquisition)
+    return root
+
+
+def test_norgate_history_export_promotes_one_pair(tmp_path: Path, ws: Workspace) -> None:
+    csv = (
+        b"Date,Open,High,Low,Close\n"
+        b"1991-01-02,714.1,715.0,713.9,714.5\n"
+        b"1991-01-03,714.5,715.2,714.0,714.55\n"
+    )
+    export = _norgate_export(tmp_path / "legacy" / "forex", "USDKRW", 7, csv)
+    entry = {
+        "name": "forex",
+        "loader": "norgate.history_export@1",
+        "path": str(export),
+        "args": {},
+        "expect": {},
+    }
+    raw = json.dumps({"schema_version": "aas-legacy-import-v1", "entries": [entry]}).encode()
+    report = apply_import(ws, parse_manifest(raw, hashlib.sha256(raw).hexdigest()))
+    assert report["reconciled"] is True
+    (source,) = [
+        source
+        for item in cast("list[dict[str, object]]", report["entries"])
+        for source in cast("list[dict[str, object]]", item["sources"])
+    ]
+    source_id = str(source["source_id"])
+    assert source_id.startswith("norgate-history-csv-")
+    pin = {
+        "source_id": source_id,
+        "source_sha256": source_id.rsplit("-", 1)[1],
+        "table": str(source["table"]),
+        "digest": str(source["digest"]),
+    }
+    document = _spec(
+        "fx_rates",
+        "fx.usdkrw.norgate",
+        [pin],
+        "norgate.fx_history@1",
+        {"series": "USDKRW", "base": "USD", "quote": "KRW", "timezone": SEOUL},
+        _rule("local_day_end@1", "record", "fixing_date", SEOUL),
+        decimal={"rate": "decimal_text@1"},
+    )
+    result = _apply(ws, document)
+    assert result["operations"] == {"ASSERT": 2}
+    assert ws.market.execute(
+        "SELECT fixing_at_us, rate, value_state FROM fx_rates ORDER BY fixing_at_us"
+    ).fetchall() == [
+        (_day_end(date(1991, 1, 2), SEOUL), Decimal("714.5"), "present"),
+        (_day_end(date(1991, 1, 3), SEOUL), Decimal("714.55"), "present"),
+    ]
+    # The same shape pinned under the FRED series mapper is another provider's source.
+    raw_fred, sha_fred = _spec(
+        "fx_rates",
+        "fx.usdkrw.fred",
+        [pin],
+        "fred.fx_series@1",
+        {"series": "USDKRW", "base": "USD", "quote": "KRW", "timezone": SEOUL},
+        _rule("local_day_end@1", "record", "fixing_date", SEOUL),
+        decimal={"rate": "decimal_text@1"},
+    )
+    with pytest.raises(ValueError, match="reads only sources"):
+        parse_spec(raw_fred, sha_fred)

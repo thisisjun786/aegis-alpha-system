@@ -23,6 +23,7 @@ def test_eodhd_bars_maps_synthetic_fixture() -> None:
         "fred.alfred@1",
         "fred.fx_series@1",
         "norgate.fx_closes@1",
+        "norgate.fx_history@1",
         "bok.observations@1",
         "oecd.observations@1",
     }

@@ -7,13 +7,16 @@ pair and the others are not selected.
 
 - ``rate`` is the export's ``Close`` text, the quote currency per one unit of the base,
   converted by ``decimal_text@1``: the value Norgate wrote, not the binary double read from
-  it. A row is ``present`` only when that text is a positive decimal, its double equals
-  ``close`` and its ``Date`` is the row's ``date``; a row with no close is ``missing``; any
-  other row is ``invalid`` and keeps no rate.
+  it. A row whose ``Date`` is not the row's ``date`` is ``invalid``. Otherwise a row is
+  ``present`` only when the text is a positive decimal whose double equals ``close``, and
+  ``missing`` when it has neither close; any other row is ``invalid`` and keeps no rate.
 - ``fixing_at_us`` is the last microsecond of ``date`` in the spec's ``timezone``, an upper
   bound on the close that needs no fixing schedule; the time input ``fixing_date`` is
   ``date``.
 - The table has no collection time, so ingestion is the source's ``sl:`` retrieval.
+
+The legacy import of a Norgate export keeps its rows as text; ``norgate.fx_history@1`` in
+``mappers.fx`` reads that shape.
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ class NorgateFxCloses:
     name: Final = "norgate.fx_closes"
     major: Final = 1
     provider: Final = "norgate"
+    source_prefixes: Final = ()
     domain: Final = "fx_rates"
     partition_column: Final = "date"
     date_column: Final = None
@@ -63,13 +67,12 @@ class NorgateFxCloses:
 
     def select(self, source: str, args: Mapping[str, object]) -> str:
         text = decimal_state(_CLOSE)
-        agrees = (
-            f"TRY_CAST({_CLOSE} AS DOUBLE) = close AND close > 0 "
-            f"AND {_DATE} = strftime(date, '%Y-%m-%d')"
-        )
+        dated = f"coalesce({_DATE} = strftime(date, '%Y-%m-%d'), false)"
+        agrees = f"coalesce(TRY_CAST({_CLOSE} AS DOUBLE) = close AND close > 0, false)"
         state = (
-            f"CASE WHEN close IS NULL AND {text} = 'missing' THEN 'missing' "
-            f"WHEN {text} = 'present' AND coalesce({agrees}, false) THEN 'present' "
+            f"CASE WHEN NOT {dated} THEN 'invalid' "
+            f"WHEN close IS NULL AND {text} = 'missing' THEN 'missing' "
+            f"WHEN {text} = 'present' AND {agrees} THEN 'present' "
             "ELSE 'invalid' END"
         )
         return (

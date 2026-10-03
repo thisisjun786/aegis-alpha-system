@@ -5,6 +5,8 @@ for the same input takes a new major. It reads only the source relation it is gi
 its spec arguments: never the network, a clock, randomness or the environment. The
 promotion engine owns everything common to all mappers (source row hashes, identity
 resolution, decimal and time rules, record and revision identity, head diff, flags).
+A mapper whose source shape more than one provider's sources share names the source ID
+prefixes it reads, so a spec cannot promote one provider's rows into another's dataset.
 
 ``select`` returns one SELECT over the source relation with these columns:
 
@@ -48,6 +50,11 @@ class Mapper(Protocol):
     def domain(self) -> str: ...
 
     @property
+    def source_prefixes(self) -> tuple[str, ...]:
+        """Source ID prefixes a pinned source must start with; empty accepts any source."""
+        ...
+
+    @property
     def partition_column(self) -> str:
         """The source DATE column a spec partition and the record date come from."""
         ...
@@ -80,7 +87,11 @@ class Mapper(Protocol):
 def _registry() -> dict[str, Mapper]:
     from aegis_alpha.storage.promotion.mappers.calendar import CalendarDeclared  # noqa: PLC0415
     from aegis_alpha.storage.promotion.mappers.eodhd import EodhdBars  # noqa: PLC0415 -- registry
-    from aegis_alpha.storage.promotion.mappers.fred import FredAlfred, FredFxSeries  # noqa: PLC0415
+    from aegis_alpha.storage.promotion.mappers.fred import FredAlfred  # noqa: PLC0415
+    from aegis_alpha.storage.promotion.mappers.fx import (  # noqa: PLC0415
+        fred_fx_series,
+        norgate_fx_history,
+    )
     from aegis_alpha.storage.promotion.mappers.korea import KoreaObservations  # noqa: PLC0415
     from aegis_alpha.storage.promotion.mappers.norgate import NorgateFxCloses  # noqa: PLC0415
 
@@ -88,8 +99,9 @@ def _registry() -> dict[str, Mapper]:
         CalendarDeclared(),
         EodhdBars(),
         FredAlfred(),
-        FredFxSeries(),
+        fred_fx_series(),
         NorgateFxCloses(),
+        norgate_fx_history(),
         KoreaObservations("bok"),
         KoreaObservations("oecd"),
     )
