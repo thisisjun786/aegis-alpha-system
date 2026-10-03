@@ -1584,6 +1584,34 @@ system의 `network-online.target`에 순서를 걸 수 없으므로 service는 �
 최대 5분 기다린다. 그래도 네트워크가 없으면 공급자 단계가 실패로 기록되고(종료 코드 1), 수집기는 빈 날짜에서
 계획하므로 다음 실행이 놓친 날을 묻는다.
 
+## 운영 전환 확인
+
+운영 전환은 legacy 예약 unit이 쓰던 설치본을 `aas maintain`으로 옮기는 일회성 절차이고, 그 명령 순서는
+[운영 문서](../operations.md#운영-전환)가 소유한다. 전환의 마지막 단계는 `aas maintain cutover-check`이며
+`application/cutover.py`가 이 확인과 은퇴 기록을 소유한다. 확인은 설치본을 읽기 전용으로 열고, 백업은 전체를
+다시 읽으므로 설치본 잠금을 잡기 전에 대조한다.
+
+| 항목 | 통과 조건 |
+| --- | --- |
+| `schema` | core schema가 현재 버전(`inspect_core_schema`가 `current`) |
+| `operations` | `PREPARED` storage operation이 없음 |
+| `backup` | `validated_backup`이 모든 파일을 다시 해시해 받아들이고, manifest `deep`이 참이고, `installation_id`가 같고, 설치본의 `PREPARED`가 아닌 storage operation이 모두 백업 state 사본에 있고(사본은 `immutable`로 읽어 백업에 아무것도 만들지 않는다), 백업 루트의 장치가 설치본 루트·state·market·`raw/`의 장치와 모두 다름 |
+| `units` | `systemctl --user list-unit-files`와 `list-units --all`의 `aas-*` unit이 `aas-maintain.service`와 `aas-maintain.timer`뿐이고, timer 파일이 `enabled`이고 timer가 `active`. `systemctl`을 실행할 수 없으면 실패 |
+| `collectors` | `runtime.json`이 유지보수 설정으로 읽히고 `jobs.enabled`이며 `--expect-provider`로 이름 붙인 공급자 절이 모두 켜짐 |
+| `install_receipt` | `aas-install-receipt-v1`이 있음. 실행 환경과의 차이는 `differences`로 보고만 한다 |
+| `maintain_run` | `<runtime>/maintain-report.json`이 이 설치본의 `run` 보고이고 `status`가 `succeeded` |
+| `legacy` | `--legacy-manifest` 파일마다 정확한 bytes가 `raw/`에 온전히 있고(`aas import legacy`가 실행됨) 모든 항목 경로가 없으며, `--removed` 경로가 모두 없음 |
+
+백업의 장치 조건은 `aas db source-retire`가 백업을 받아들이는 조건과 같다. 그래서 확인을 통과한 백업은 은퇴에도
+쓸 수 있고, 백업 위치와 같은 장치에 설치본 루트나 state가 있는 설치본은 다른 장치로 옮겨야 통과한다. 같은
+장치를 쓰는 경로 이름은 `shared_device_with`에 남는다.
+
+보고 `aas-cutover-record-v1`은 확인 시각, `installation_id`, `passed`, 실패한 항목 이름(`failed`), 항목별 결과,
+`source_retirements`를 백업 ID·operation·이유별로 묶은 원천·행 수(`retirements`), `raw/`의 파일 수와 bytes(`raw`)를
+담는다. 은퇴와 compact는 `raw/`를 지우지 않으므로 은퇴한 원천의 원본 archive는 그 수에 남는다. `--record`는
+모든 항목이 통과한 보고만 정규 JSON bytes로 `raw/`와 `<runtime>/cutover-record.json`에 남기고 그 SHA-256을
+`record_sha256`으로 돌려준다. 실패한 보고는 출력만 하고 기록하지 않으며 종료 코드는 1이다.
+
 ## identity 등록과 chunked 문서
 
 identity는 `storage/identity.py`가 state에 등록하고 `aas identity register|snapshot|show`가 CLI다.
@@ -2808,3 +2836,14 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-447 | `identity` 단계가 실패한 실행은 snapshot을 pin하는 chain을 `identity_unavailable`로 두고, 회복한 실행이 새 상장의 행을 해석해 승격한다 | `tests/application/test_maintain.py::test_a_failed_identity_stage_holds_identity_chains_until_it_recovers` | 구현 |
 | DV-448 | 늦은 identity가 남긴 `unresolved` 원천은 같은 identity로는 다시 계획되지 않고, 그 key의 해석 행이 바뀐 snapshot에서 다시 승격된다 | `tests/application/test_maintain.py::test_rows_an_older_snapshot_left_unresolved_are_promoted_once_identity_catches_up` | 구현 |
 | DV-449 | 연속한 정산된 실패는 1, 2, 4일 간격으로 늦춰 다시 묻고 재시도는 첫 묻기 뒤에 온다 | `tests/application/test_maintain_qveris.py::test_settled_failures_back_off_and_retry_after_the_first_asks` | 구현 |
+| DV-450 | 전환을 마친 설치본은 모든 확인을 통과하고 통과한 보고만 정확한 bytes로 `raw/`와 `runtime/`에 기록된다 | `tests/application/test_cutover.py::test_a_cut_over_installation_passes_and_records_it` | 구현 |
+| DV-451 | legacy `aas-*` unit이 하나라도 파일이나 적재된 unit(실패 상태 포함)으로 남으면 unit 확인이 실패한다 | `tests/application/test_cutover.py::test_legacy_units_left_behind_fail_the_unit_check` | 구현 |
+| DV-452 | 유지보수 service가 없거나 timer가 enabled·active가 아니면 unit 확인이 실패한다 | `tests/application/test_cutover.py::test_the_maintenance_timer_must_be_installed_enabled_and_active` | 구현 |
+| DV-453 | `systemctl`을 실행할 수 없으면 unit 확인은 실패로 닫힌다 | `tests/application/test_cutover.py::test_an_unavailable_systemctl_fails_closed` | 구현 |
+| DV-454 | deep이 아니거나, 뒤에 끝난 operation을 담지 않거나, 설치본과 같은 장치의 백업은 확인을 통과하지 않는다 | `tests/application/test_cutover.py::test_a_backup_must_be_deep_current_and_on_another_device` | 구현 |
+| DV-455 | 파일이 기록과 다르거나 없는 백업과 다른 설치본의 백업은 확인을 통과하지 않는다 | `tests/application/test_cutover.py::test_a_broken_or_foreign_backup_fails` | 구현 |
+| DV-456 | 꺼진 예상 공급자, `jobs.enabled` 거짓, 없는 설치 receipt, 성공하지 않은 유지보수 실행은 각자의 항목으로 실패한다 | `tests/application/test_cutover.py::test_collectors_receipt_and_maintenance_run_are_required` | 구현 |
+| DV-457 | 편입되지 않은 manifest, 남은 항목 경로, 남은 `--removed` 경로는 legacy 확인을 실패시킨다 | `tests/application/test_cutover.py::test_legacy_paths_must_be_imported_and_gone` | 구현 |
+| DV-458 | 은퇴 기록은 백업 ID·operation·이유별 원천과 행 수로 보고된다 | `tests/application/test_cutover.py::test_retirements_are_reported_by_backup_operation_and_reason` | 구현 |
+| DV-459 | `cutover-check --record`는 실패한 확인을 기록하지 않고 종료 코드 1, 통과한 확인을 기록하고 종료 코드 0이다 | `tests/application/test_cutover.py::test_the_command_records_only_a_passing_check` | 구현 |
+| DV-460 | 운영 runbook의 `aas` 명령과 `cutover-check` 옵션은 CLI에 있고, runbook은 legacy unit 넷을 은퇴하고 다섯 수집기를 기대한다 | `tests/application/test_cutover.py::test_the_runbook_names_only_commands_and_options_the_cli_has` | 구현 |

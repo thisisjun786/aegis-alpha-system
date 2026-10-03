@@ -382,6 +382,16 @@ aas db source-retire --spec /path/to/retirement.json --sha256 SHA256 --backup /p
 aas db compact --to /path/to/new-root
 ```
 
+`db migrate --plan`은 state·market을 읽기 전용으로 열어 각 저장소의 버전, 인식한 `schema_migrations` checksum,
+남은 단계(`backup`, `intent`, `market`, `state`, `receipt`, `complete`)를 보고하고 아무것도 쓰지 않는다.
+실행은 실행 중인 run이나 PREPARED 작업이 없을 때만 시작하고, 검증된 백업을 만든 뒤 intent를 기록하고
+market과 state를 각각 한 트랜잭션으로 올린 다음 설치 영수증을 바꾸고 intent를 완료한다. 응답은 두
+저장소의 버전과 영수증 행, 백업 경로와 manifest SHA-256을 담는다. 이미 v2인 설치본에는 아무것도 하지
+않는다. 중간에 멈춘 설치본은 다른 명령으로 열리지 않으며, 같은 명령을 다시 실행하면 백업 없이 남은
+단계부터 끝낸다. `aas db recover`와 `aas db quarantine`은 이 작업을 다루지 않는다.
+
+실제 설치본에서 이 명령들을 실행하는 순서와 정확한 명령은 [운영 전환](#운영-전환)이 정한다.
+
 `promote --plan`은 설치본을 읽기 전용으로 열어 명세가 요청하는 승격을 끝까지 계산하고 아무것도
 쓰지 않는다. 응답은 원천 행 수, 매핑 행 수, 매퍼가 고르지 않은 행 수, 응답을 담는 원천(DART 재무제표 응답 등)의 결과 분포
 (`source_outcomes`: 완료·자료 없음·실패·읽을 수 없음·요청 불일치·결산월 미선언), 행 상태(승격 가능·보류·미해결·거부), 미해결 token 표본, 숫자 규칙
@@ -575,34 +585,6 @@ head가 있으면 `--plan`도 head의 원천 테이블을 `pyarrow`로 검증한
 `declared_at`을 공표 시각 이후로 올린 문서를 `--declaration`으로 갱신한다. 다음 해 선언과 정정된
 과거 일정은 `scripts/calendar_declarations.py`로 패키지 선언을 다시 만들어 리뷰한다. 선언 형식, 시점
 규칙, 순서 규칙은 [데이터 수직 계약](design/data-vertical.md#선언-달력)이 소유한다.
-
-`--plan`은 state·market을 읽기 전용으로 열어 각 저장소의 버전, 인식한 `schema_migrations` checksum,
-남은 단계(`backup`, `intent`, `market`, `state`, `receipt`, `complete`)를 보고하고 아무것도 쓰지 않는다.
-실행은 실행 중인 run이나 PREPARED 작업이 없을 때만 시작하고, 검증된 백업을 만든 뒤 intent를 기록하고
-market과 state를 각각 한 트랜잭션으로 올린 다음 설치 영수증을 바꾸고 intent를 완료한다. 응답은 두
-저장소의 버전과 영수증 행, 백업 경로와 manifest SHA-256을 담는다. 이미 v2인 설치본에는 아무것도 하지
-않는다. 중간에 멈춘 설치본은 다른 명령으로 열리지 않으며, 같은 명령을 다시 실행하면 백업 없이 남은
-단계부터 끝낸다. `aas db recover`와 `aas db quarantine`은 이 작업을 다루지 않는다.
-
-실제 설치본에서 이 명령들을 실행하는 순서는 다음과 같다. 모든 단계는 같은 요청 해시로 다시
-실행하면 재사용된다.
-
-1. `[owner]` 예약 수집을 멈추고 새 루트 복원본에서 전 과정을 먼저 실행해 시간·메모리·verify를 기록한다.
-2. `[owner]` 다른 장치에 `aas db backup`을 만들고 백업 ID를 기록한다.
-3. `aas db migrate --to 2 --backup-output DIR`, 이어서 `aas db source-link --apply`. legacy 원본은
-   `aas import legacy --plan`의 `reconciled`를 확인하고, `[owner]` 항목마다 `uncovered` 파일을 manifest의
-   `retain`·`exclude`로 기록한 뒤 실행하고 `--verify`로 `complete`를 확인한다.
-4. `aas calendar refresh --plan`을 확인하고 실행해 달력 generation을 먼저 만든다. 이어서 KR identity를
-   등록하고 `aas data kr-prices --plan`을 확인한 뒤 실행한다. 다른 dataset은 명세마다
-   `aas data promote --plan`을 확인한 뒤 실행하고 generation마다 verify한다. 실패하면
-   `aas db recover`로 게시만 재개한다. 공급자를 다시 호출하지 않는다.
-5. `[owner]` 승인된 수집기를 설정의 호출 상한과 함께 예약 실행으로 켠다.
-6. 승격을 마친 뒤 `aas db source-retire --plan`으로 은퇴 후보, 참조, 거부 이유와 `partial_columns` group을
-   확인하고 2단계의 다른 장치 백업으로 `--apply`해 증명을 통과한 원천을 일괄 은퇴한다. `[owner]`
-   `uncompared` 열이 있는 group은 문서에 그 열을 이름으로 적은 소유자 허가로만 은퇴한다. `aas db compact --to NEW_ROOT`가 새 루트에서 검증을
-   통과하면 `AAS_HOME`을 새 루트로 바꾼다.
-   설치본 밖 legacy 원본은 그 manifest의 `aas import legacy --verify`가 `complete`(미대조 파일 0 포함)이고
-   종료 코드가 0일 때 그 항목 경로만 지운다.
 
 ## 검사·복구·백업
 
@@ -1335,7 +1317,7 @@ commit에는 `pyarrow`(legacy extra)가 필요하다.
 `kind_filter: true`와 회사 수를 확인한 뒤 `dart run`을 켠다.
 
 승인된 수집기(OpenDART corp code·공시 목록·재무, KIND 목록)지만 패키지 설치나 이 명령은 예약 실행을
-만들지 않는다. 예약 실행은 [하루 유지보수 실행](#하루-유지보수-실행)이고, `[owner]` 운영 전환에서 키 파일과 호출
+만들지 않는다. 예약 실행은 [하루 유지보수 실행](#하루-유지보수-실행)이고, `[owner]` [운영 전환](#운영-전환)에서 키 파일과 호출
 상한을 정해 켠다. 같은 키를 쓰는 legacy DART backfill unit은 그 전에 멈춘다(두 수집기는 quota를 서로 세지 않는다). 요청·cohort·원장·보존 규칙은
 [KR 공시·상장 수집](design/data-vertical.md#kr-공시상장-수집)이 소유한다.
 
@@ -1371,7 +1353,7 @@ FRED는 시계열별 알려진 vintage 날과 완결되지 않은 창을 함께 
 `fred-alfred-observations-*`는 `fred.alfred@1`(원천마다 `vintage_partitions`의 구간 순서로),
 `fred-series-csv-*`는 `fred.fx_series@1`이다. 승인된 수집기(SEC 색인·submissions·companyfacts, FRED/ALFRED와
 DEXKOUS CSV)지만, 패키지 설치나 이 명령이 예약 실행을 만들지는 않는다. 예약 실행은
-[하루 유지보수 실행](#하루-유지보수-실행)이고, `[owner]` 운영 전환에서 연락처·키 파일과 호출 상한을 정해 켠다. 요청·창·선택·보존 규칙은
+[하루 유지보수 실행](#하루-유지보수-실행)이고, `[owner]` [운영 전환](#운영-전환)에서 연락처·키 파일과 호출 상한을 정해 켠다. 요청·창·선택·보존 규칙은
 [US 공시·거시 수집](design/data-vertical.md#us-공시거시-수집)이 소유한다.
 
 ## Qveris 원문 수집
@@ -1472,11 +1454,11 @@ identity 증분 계획, dataset마다 새 원천과 단계를 낸다. `--promoti
 }
 ```
 
-유지보수는 chain을 이어 붙일 뿐 시작하지 않는다. 각 dataset의 첫 generation은 운영 전환에서 운영자가
+유지보수는 chain을 이어 붙일 뿐 시작하지 않는다. 각 dataset의 첫 generation은 [운영 전환](#운영-전환)에서 운영자가
 `aas data promote`(또는 `data kr-prices`, `calendar refresh`)로 만들고, 그 뒤 실행이 새로 수집된 원천을 그
 명세의 규칙으로 이어 붙인다. head가 없는 dataset은 `no_head`로 보고된다.
 
-설치와 예약은 운영 전환의 일이다. 태그된 dev 커밋을 정확한 CPython 경로로 설치하고 receipt를 남긴다.
+설치와 예약은 [운영 전환](#운영-전환)의 일이다. 태그된 dev 커밋을 정확한 CPython 경로로 설치하고 receipt를 남긴다.
 
 ```bash
 uv tool install --python /path/to/cpython-3.13.N/bin/python3.13 \
@@ -1495,6 +1477,269 @@ lock 해시를 `<runtime>/install-receipt.json`과 `raw/`에 남긴다. 실행�
 놓친 날을 묻는다. 종료 코드 2는 Qveris에 정산되지 않은 유료 page가 남았다는 뜻이므로 보고의 `held`를 보고
 정산이나 격리를 한다.
 패키지 설치나 이 명령은 unit을 설치하거나 켜지 않는다.
+
+## 운영 전환
+
+운영 전환은 legacy 예약 unit이 쓰던 설치본을 한 번에 `aas maintain`으로 옮기는 일회성 절차다. 순서대로
+실행하고, 각 단계는 같은 요청으로 다시 실행하면 재사용되거나 이미 끝난 일을 보고한다. `[owner]`는 운영자가
+값을 정하거나 결과를 보고 넘어가는 단계다. 삭제는 증명과 다른 장치 백업을 통과한 항목만 일괄로 하고
+결과를 은퇴 기록으로 남긴다. 수집기는 승인된 다섯 공급자(KIND, OpenDART, SEC, FRED/ALFRED, Qveris)를 모두
+설정의 실행 상한과 함께 켠다.
+
+**다른 장치.** `aas db source-retire`는 설치본 루트, state, market, `raw/` 중 하나와 같은 장치의 백업을
+`backup_on_installation_device`로 거부한다. 그래서 백업 위치(`~/aas-backups`)와 다른 장치에 설치본 전체를
+모은다. 1단계 백업을 3단계에서 저장소 장치의 새 루트로 복원해 그 루트를 설치본으로 쓰고, 원래 설치본은
+비교와 되돌리기용으로 그대로 둔다.
+
+```bash
+TS=20261004T000000Z                   # 전환을 시작한 UTC 시각; 전환 내내 같은 값
+OLD_HOME=~/.aas                       # 지금의 설치본(runtime.json이 market·raw를 다른 장치에 둘 수 있음)
+BACKUPS=~/aas-backups                 # 새 설치본의 모든 경로와 다른 장치
+REHEARSAL=/path/to/store-device/rehearsal-$TS
+HOME_V2=/path/to/store-device/aas-v2  # 복원한 새 설치본
+HOME_V3=/path/to/store-device/aas-v3  # 은퇴 뒤 compact한 최종 설치본
+LEGACY=~/.local/share/aegis-alpha     # legacy 런타임 루트
+QVERIS=/path/to/store-device/qveris   # 유지보수의 Qveris raw root와 identity 문서
+SPECS=/path/to/private/specs          # 승격 명세, 은퇴 문서, legacy manifest(비공개)
+LEGACY_UNITS="aas-native-data-maintenance aas-qveris-korea-backfill aas-korea-historical-backfill"
+export AAS_HOST_CPU_LIMIT=8 AAS_HOST_MEMORY_LIMIT_BYTES=25769803776 \
+  AAS_CPU_LIMIT=8 AAS_MEMORY_LIMIT_BYTES=25769803776 \
+  AAS_COMPUTE_LOCK_FILE=/path/to/store-device/compute.lock
+sha() { sha256sum "$1" | cut -d' ' -f1; }
+mkdir -p -m 0700 "$BACKUPS"
+```
+
+`/path/to/<tag>`는 설치한 태그의 저장소 checkout이다. 계산 예산은 수억 행 원천 자료실의 `--deep` 검증이 쓰는 메모리(최대 약 18 GB)를 담는 값이다. 백업 하나는
+설치본의 state, strategies, market, `raw/`, `runs/` 크기만큼 공간을 쓴다.
+
+**0. 동결.** 설치본에 쓰는 legacy timer와 service를 멈추고 남은 작업을 정리한다. ETF 탐색 unit은
+설치본에 쓰지 않으므로 5단계에서 은퇴한다.
+
+```bash
+for unit in $LEGACY_UNITS; do systemctl --user stop "$unit.timer" "$unit.service"; done
+systemctl --user list-units --all 'aas-*'   # 위 service가 모두 active가 아님
+AAS_HOME="$OLD_HOME" aas db recover
+AAS_HOME="$OLD_HOME" aas db status
+```
+
+**1. 백업.** `--deep` 백업은 먼저 모든 원천 테이블과 승격 delta를 다시 해시해 검증하므로 전환 전 설치본의
+deep 검증을 겸한다. 백업 ID는 `backup.json`의 SHA-256이다.
+
+```bash
+AAS_HOME="$OLD_HOME" aas db backup --output "$BACKUPS/$TS-v1" --deep > "$BACKUPS/$TS-v1.json"
+sha "$BACKUPS/$TS-v1/backup.json"
+```
+
+**2. 리허설.** 같은 백업을 새 루트로 복원해 3·4·6단계(설치본 이동 제외)를 끝까지 먼저 실행하고, 단계마다
+시간과 최대 메모리(`/usr/bin/time -v`)와 `aas db verify` 결과를 기록한다. 복원한 `runtime.json`은 공급자가
+없고 `jobs.enabled`가 `false`라 리허설은 공급자를 부르지 않는다. 리허설의 은퇴 백업은 리허설 루트와 다른 장치인
+`$BACKUPS` 아래에 두고 리허설이 끝나면 지운다.
+
+```bash
+aas --home "$REHEARSAL" db restore --backup "$BACKUPS/$TS-v1"
+export AAS_HOME="$REHEARSAL"   # 3·4·6단계 명령을 그대로 실행한다
+# 끝나면
+unset AAS_HOME; rm -rf -- "$REHEARSAL" "$BACKUPS/rehearsal-"*
+```
+
+**3. 설치본 이동, 마이그레이션, 연결.** 1단계 백업을 새 설치본으로 복원하고 그 설치본에서 core schema를 v2로
+올린 뒤 원천 자료실 commit을 모두 `sl:` 연결한다. 이후 모든 명령은 `AAS_HOME="$HOME_V2"`로 실행한다.
+
+```bash
+aas --home "$HOME_V2" db restore --backup "$BACKUPS/$TS-v1"
+export AAS_HOME="$HOME_V2"
+aas db migrate --to 2 --plan
+aas db migrate --to 2 --backup-output "$BACKUPS/$TS-migrate"
+aas db source-link --plan
+aas db source-link --apply
+```
+
+`migrate`는 백업을 만든 뒤에만 intent를 기록하고, 멈추면 같은 명령이 백업 없이 남은 단계를 끝낸다.
+`source-link --plan`의 `unbacked`·`corrupt`·`incomplete`·`invalid`가 비어 있어야 다음 단계로 간다.
+
+**4. 승격.** 아래 순서로 dataset의 첫 generation을 만든다. 명세와 문서는 모두 `$SPECS`의 비공개 파일이고,
+`[owner]`는 각 `--plan` 보고(원천·매핑 행 수, `blocking`, `refusals`, 미해결 표본)를 보고 실행한다. 실행은
+`blocking`이나 `refusals`가 있으면 아무것도 쓰지 않고 거부하며, 실패한 게시는 `aas db recover`가 재개한다.
+공급자는 부르지 않는다.
+
+1. 달력: `aas calendar refresh --plan`, `aas calendar refresh`.
+2. KR identity: `aas identity kr-import ... [--plan]`, `aas identity kr-build ... --output "$SPECS/kr-registry.json"`,
+   `aas identity register --file "$SPECS/kr-registry.json" --sha256 "$(sha "$SPECS/kr-registry.json")" [--plan]`,
+   `aas identity snapshot --id ID --provider P --namespace N [--plan]`([KR identity](#kr-identity)).
+3. KR 가격: `aas data kr-prices --identity-snapshot ID --lag-us LAG --history-lineage PREFIX --bulk-lineage PREFIX
+   [--reference] --plan`, 같은 명령에서 `--plan`을 뺀 실행([KR 가격 승격](#kr-가격-승격)).
+4. legacy 원본: manifest마다 `--plan`이 `reconciled`이고 `[owner]` 항목마다 `uncovered` 파일을 `retain`·`exclude`로
+   기록한 뒤 실행하고 `--verify`가 `complete`인지 확인한다([legacy 원천 편입](#legacy-원천-편입)).
+
+   ```bash
+   for manifest in "$SPECS"/legacy-*.json; do
+     aas import legacy --manifest "$manifest" --sha256 "$(sha "$manifest")" --plan > "$manifest.plan.json" &&
+     aas import legacy --manifest "$manifest" --sha256 "$(sha "$manifest")" &&
+     aas import legacy --manifest "$manifest" --sha256 "$(sha "$manifest")" --verify > "$manifest.verify.json" ||
+     break
+   done
+   aas import sec-companies --source SEC_SUBMISSIONS_SOURCE_ID
+   aas db source-link --apply
+   ```
+
+5. US identity와 universe: `aas identity us-build --master ID ... --norgate-exports --bindings ID --output
+   "$SPECS/us-registry.json"`, `register`, `snapshot`([US identity](#us-identity)), 이어서 `aas universe index`와
+   `aas universe listings`([universe](#universe)).
+6. 명세 승격: US 가격(연도별), 기업행동·상장 상태, 거시·FX(ALFRED는 vintage 구간 순서), 공시, 재무(SEC는 연도
+   partition, DART), 분류 순서로 파일 이름을 붙인 명세를 하나씩 승격하고 generation마다 검증한다.
+
+   ```bash
+   for spec in "$SPECS"/promote/*.json; do
+     aas data promote --spec "$spec" --sha256 "$(sha "$spec")" --plan > "$spec.plan.json" &&
+     aas data promote --spec "$spec" --sha256 "$(sha "$spec")" > "$spec.apply.json" &&
+     aas db verify > "$spec.verify.json" ||
+     break
+   done
+   aas data promotions
+   ```
+
+7. 전략 레지스트리: `aas strategy promote --source SOURCE_ID --sha256 SHA256 --plan`, 같은 명령의 `--apply`.
+
+**5. 유지보수 전환.** 태그된 dev 커밋을 설치하고, 자격 증명과 Qveris 수집 기록을 새 설치본으로 옮기고,
+다섯 수집기를 켠 `runtime.json`으로 계획을 확인한 뒤 timer를 켜고 legacy unit을 은퇴한다.
+
+```bash
+uv tool install --python /path/to/cpython-3.13.N/bin/python3.13 \
+  'aegis-alpha-system[legacy] @ git+https://github.com/thisisjun786/aegis-alpha-system@<tag>'
+aas maintain receipt --lock /path/to/<tag>/uv.lock
+install -m 0600 "$LEGACY/secrets/opendart-api-key" "$LEGACY/secrets/qveris-api-key" "$AAS_HOME/secrets/"
+# [owner] FRED API 키 한 줄과 SEC 연락처 User-Agent 한 줄
+(umask 077 && cat > "$AAS_HOME/secrets/fred-api-key")
+(umask 077 && cat > "$AAS_HOME/secrets/sec-user-agent")
+mkdir -p -m 0700 "$QVERIS"
+cp -a "$LEGACY/data/raw/qveris" "$QVERIS/raw" && diff -r "$LEGACY/data/raw/qveris" "$QVERIS/raw"
+install -m 0600 "$LEGACY/research/native-etf/qveris-bulk-identity.json" "$QVERIS/identity.json"
+aas collect qveris import --raw-root "$QVERIS/raw" --identity "$QVERIS/identity.json" --plan > "$QVERIS/parity.json"
+```
+
+`parity.json`은 replay 대조다. 옮긴 raw root의 완료 job은 이미 적재된 원천 ID로 다시 계산되어 `reused`이고
+`failed`와 `missing`이 0이어야 한다. `built`는 아직 적재되지 않은 job 수이며 첫 실행이 적재한다. 이어서
+`runtime.json`에 `jobs.enabled: true`와 [하루 유지보수 실행](#하루-유지보수-실행)의 다섯 공급자 절을 쓴다.
+Qveris 절의 `raw_root`는 `$QVERIS/raw`, `identity`는 `$QVERIS/identity.json`이고, `[owner]` `max_calls`와
+`max_credits`는 남은 크레딧 안에서 한 실행의 상한으로 정한다. SEC `since`는 legacy bulk archive 뒤의 첫 색인
+날이다.
+
+```bash
+aas maintain plan --promotions > "$AAS_HOME/runtime/cutover-plan.json"
+install -m 0644 /path/to/<tag>/config/systemd/aas-maintain.service \
+  /path/to/<tag>/config/systemd/aas-maintain.timer ~/.config/systemd/user/
+mkdir -p ~/.config/systemd/user/aas-maintain.service.d
+cat > ~/.config/systemd/user/aas-maintain.service.d/home.conf <<CONF
+[Service]
+Environment=AAS_HOME=$AAS_HOME
+Environment=AAS_HOST_CPU_LIMIT=$AAS_HOST_CPU_LIMIT AAS_HOST_MEMORY_LIMIT_BYTES=$AAS_HOST_MEMORY_LIMIT_BYTES
+Environment=AAS_CPU_LIMIT=$AAS_CPU_LIMIT AAS_MEMORY_LIMIT_BYTES=$AAS_MEMORY_LIMIT_BYTES
+Environment=AAS_COMPUTE_LOCK_FILE=$AAS_COMPUTE_LOCK_FILE
+CONF
+for unit in $LEGACY_UNITS aas-etf-discovery; do
+  systemctl --user disable --now "$unit.timer"
+  systemctl --user stop "$unit.service"
+  rm -f ~/.config/systemd/user/"$unit".service ~/.config/systemd/user/"$unit".timer
+done
+systemctl --user daemon-reload
+systemctl --user reset-failed
+systemctl --user enable --now aas-maintain.timer
+systemctl --user list-units --all 'aas-*'   # aas-maintain.service와 active인 aas-maintain.timer만
+```
+
+`maintain plan`은 시작한 dataset chain마다 `no_head`나 `no_template` 없이 새 원천의 단계를 내야 한다. 실패한
+legacy service는 unit 파일을 지워도 `reset-failed` 전까지 목록에 남는다. 종료 코드 2로 끝난 실행은
+[Qveris 원문 수집](#명시한-job의-수집과-적재)의 `quarantine`으로 정산한다.
+
+**6. 정리.** 은퇴 문서를 계획하고, 승격까지 담은 다른 장치 deep 백업으로 증명을 통과한 원천을 일괄 은퇴한 뒤
+compact로 공간을 회수하고 설치본을 새 루트로 바꾼다. 은퇴와 compact 동안 timer를 멈춘다.
+
+```bash
+systemctl --user stop aas-maintain.timer
+aas db backup --output "$BACKUPS/$TS-retire" --deep > "$BACKUPS/$TS-retire.json"
+retire="$SPECS/retirement.json"
+aas db source-retire --spec "$retire" --sha256 "$(sha "$retire")" --backup "$BACKUPS/$TS-retire" --plan > "$retire.plan.json"
+aas db source-retire --spec "$retire" --sha256 "$(sha "$retire")" --backup "$BACKUPS/$TS-retire" --apply > "$retire.apply.json"
+aas db compact --to "$HOME_V3" > "$BACKUPS/$TS-compact.json"
+sed -i "s|^Environment=AAS_HOME=.*|Environment=AAS_HOME=$HOME_V3|" ~/.config/systemd/user/aas-maintain.service.d/home.conf
+export AAS_HOME="$HOME_V3"
+aas maintain receipt --lock /path/to/<tag>/uv.lock
+systemctl --user daemon-reload && systemctl --user start aas-maintain.timer
+```
+
+은퇴 대상은 Norgate normalized·canonical-v1 사본, KR 이전 lineage와 그 보류분, 중복 DART lineage, Qveris
+부분 중복분, FMP 반복 retrieval분, master 사본이다. `--plan`은 group마다 상태와 이유, 참조 위치, `uncompared`
+열을 보고하고 `--apply`는 증명을 통과한 group을 모두 은퇴하고 나머지를 이유와 함께 보고한다. `[owner]`
+`uncompared` 열이 있는 group은 은퇴 문서에 그 열을 이름으로 적어 허가한다. 은퇴는 `raw/`의 bytes를 지우지
+않으므로 은퇴한 원천의 원본 archive tar는 `raw/`에 남는다. compact는 `runtime/`을 옮기지 않으므로 새 루트에서
+설치 receipt를 다시 남긴다. 은퇴 백업(`$TS-retire`)은 `source_retirements`의 `backup_id`가 가리키므로 지우지
+않는다.
+
+설치본 밖 legacy 원본은 증명된 것만 지운다. manifest의 `--verify`가 `complete`이고 종료 코드가 0이면 그 항목
+경로만 지운다. manifest 항목이 아닌 legacy 경로(코드 snapshot, 릴리스, DB dump, 준비 snapshot)는 `$BACKUPS`에
+tar로 보관해 원본과 대조한 뒤 지운다. legacy worktree는 커밋되지 않은 변경과 push되지 않은 커밋이 없을 때만
+지운다.
+
+```bash
+for manifest in "$SPECS"/legacy-*.json; do
+  aas import legacy --manifest "$manifest" --sha256 "$(sha "$manifest")" --verify > "$manifest.verify.json" &&
+  jq -r '.entries[].path' "$manifest" | while read -r path; do rm -rf -- "$path"; done
+done
+diff -r "$LEGACY/data/raw/qveris" "$QVERIS/raw" && rm -rf -- "$LEGACY/data/raw/qveris"
+ARCHIVE="$BACKUPS/$TS-legacy"; mkdir -m 0700 "$ARCHIVE"
+for path in "$LEGACY/preparation" "$LEGACY/releases" /path/to/legacy-postgres-dump; do
+  name=$(basename "$path"); parent=$(dirname "$path")
+  tar --create --file "$ARCHIVE/$name.tar" -C "$parent" "$name" &&
+  tar --compare --file "$ARCHIVE/$name.tar" -C "$parent" &&
+  (cd "$ARCHIVE" && sha256sum "$name.tar" >> SHA256SUMS) &&
+  rm -rf -- "$path"
+done
+worktree=/path/to/legacy-worktree
+test -z "$(git -C "$worktree" status --porcelain)" &&
+  test -z "$(git -C "$worktree" log --branches --not --remotes --oneline)" && rm -rf -- "$worktree"
+```
+
+원래 설치본(`$OLD_HOME`과 그 `runtime.json`이 가리키는 market·`raw/`)과 `$HOME_V2`는 7일 동안 두고, 그동안
+유지보수 실행이 성공하고 7단계가 통과하면 지운다. 기본 설치 위치를 쓰지 않으므로 대화형 셸도
+`AAS_HOME="$HOME_V3"`를 설정한다.
+
+**7. 사후 확인과 은퇴 기록.** 새 설치본에서 유지보수를 한 번 실행하고, deep 백업을 다른 장치에 만든 뒤
+전환 확인을 기록한다.
+
+```bash
+systemctl --user start aas-maintain.service   # 끝날 때까지 기다린다
+aas db backup --output "$BACKUPS/$TS-post" --deep > "$BACKUPS/$TS-post.json"
+systemctl --user list-units --all 'aas-*'
+aas maintain cutover-check --backup "$BACKUPS/$TS-post" \
+  --expect-provider kind --expect-provider dart --expect-provider sec \
+  --expect-provider fred --expect-provider qveris \
+  $(for manifest in "$SPECS"/legacy-*.json; do printf -- '--legacy-manifest %s ' "$manifest"; done) \
+  --removed "$LEGACY/data/raw/qveris" --removed "$LEGACY/preparation" --removed "$LEGACY/releases" \
+  --removed /path/to/legacy-postgres-dump --removed /path/to/legacy-worktree \
+  --record > "$BACKUPS/$TS-cutover-record.json"
+```
+
+`--deep` 백업은 설치본 전체의 deep 검증을 먼저 통과해야 만들어지므로 `aas db verify --deep`과 `aas db backup`의
+성공을 함께 증명한다. `cutover-check`는 설치본을 읽기 전용으로 열고 항목마다 결과를 낸다.
+
+| 항목 | 통과 조건 |
+| --- | --- |
+| `schema` | core schema가 현재 버전 |
+| `operations` | `PREPARED`로 남은 storage operation이 없음 |
+| `backup` | 백업의 모든 파일이 다시 해시해 맞고, `deep`, 같은 설치본, 끝난 storage operation을 모두 담고, 설치본 루트·state·market·`raw/`와 다른 장치 |
+| `units` | `aas-*` user unit이 `aas-maintain.service`와 enabled·active인 `aas-maintain.timer`뿐(`systemctl --user list-unit-files`와 `list-units --all`) |
+| `collectors` | `jobs.enabled`이고 `--expect-provider`로 이름 붙인 공급자 절이 모두 켜짐 |
+| `install_receipt` | 설치 receipt가 있음. 실행 환경과의 차이는 보고만 한다 |
+| `maintain_run` | 이 설치본의 마지막 `aas maintain run` 보고가 `succeeded` |
+| `legacy` | `--legacy-manifest`의 정확한 bytes가 `raw/`에 있고(편입됨) 그 항목 경로가 모두 없으며, `--removed` 경로가 모두 없음 |
+
+보고는 이 밖에 `source_retirements`를 백업·operation·이유별로 묶은 원천·행 수와 `raw/`의 파일 수·bytes를
+싣는다. 모든 항목이 통과하면 종료 코드 0이고, `--record`는 그 보고를 `aas-cutover-record-v1` 은퇴 기록으로
+정확한 bytes를 `raw/`와 `<runtime>/cutover-record.json`에 남기고 그 SHA-256을 `record_sha256`으로 돌려준다.
+하나라도 실패하면 `failed`에 항목 이름을 담아 종료 코드 1로 끝나고 아무것도 기록하지 않는다. 백업 대조는
+백업 전체를 다시 읽으므로 설치본 잠금을 잡기 전에 한다. 확인이 통과하면 `$TS-retire`와 `$TS-post`를 남기고
+이전 백업(`$TS-v1`, `$TS-migrate`)을 지운다. 규칙은 [운영 전환 확인](design/data-vertical.md#운영-전환-확인)이
+소유한다.
 
 ## 전환 중인 공급자 도구
 
