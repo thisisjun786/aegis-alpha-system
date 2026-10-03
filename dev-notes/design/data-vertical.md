@@ -16,7 +16,7 @@
 | 층 | 내용 | 소유 코드 |
 | --- | --- | --- |
 | L0 raw | 공급자 응답·내보내기 원본 bytes. 해시 경로, no-clobber | `storage/raw.py` |
-| L1 원천 자료실 | `sl_*` 테이블. 원래 열·값·행 순서를 그대로 보존하는 `source_only` 자료와 legacy 원본 편입 | `storage/source_library*.py`, `storage/legacy_import/` |
+| L1 원천 자료실 | `sl_*` 테이블. 원래 열·값·행 순서를 그대로 보존하는 `source_only` 자료, legacy 원본 편입, 수집 job 적재 | `storage/source_library*.py`, `storage/legacy_import/`, `storage/qveris_import.py` |
 | L2 승격 | 승격 명세 → 매퍼 → head 비교 → 품질 flag → generation 게시 | `storage/promotion/` |
 | L3 저장 | `market.duckdb`의 typed generation과 `state.sqlite3`의 카탈로그·identity·품질·수집 기록 | `storage/market.py`, `storage/state.py`, `storage/identity.py` |
 | L4 소비 | exact pin, cutoff, grant로 head를 투영하는 reader와 실행 준비 | `storage/read_heads.py`, `storage/market_inputs.py`, `application/backtest_prepare.py` |
@@ -182,6 +182,65 @@ loader, 보존 파일마다 `[상대 경로, SHA-256, 크기, 이유]`(이유는
 legacy 원본은 `complete`인 manifest의 항목 경로만 지울 수 있다. 항목 경로가 아닌 디렉터리(형제 수집 디렉터리,
 내보내기 상위 디렉터리)는 그 자체를 항목으로 대조하기 전에는 지우지 않는다. CLI는 `--verify`가 `complete`가
 아니거나 `--plan`·실행이 `reconciled`가 아니면 보고를 출력한 뒤 종료 코드 1을 돌려준다.
+
+## Qveris 수집과 원천 적재
+
+`aas collect qveris`는 Qveris 게이트웨이(하위 공급자 EODHD)의 수집 job을 계획·실행하고, 완료된
+job을 원천 자료실의 내용 원천으로 적재한다. 수집 증거(`jobs/<fingerprint>/` 아래 page의 intent·raw·
+response·billing과 `complete.json`)를 쓰는 규칙은 [qveris_acquisition.py](../../src/aegis_alpha/data/qveris_acquisition.py)와
+[qveris_store.py](../../src/aegis_alpha/data/qveris_store.py)가, 명령은 [operations](../operations.md#qveris-원문-수집)가 소유한다.
+
+**수집.** job 문서 하나가 cohort 하나다. 작업자 하나면 cohort를 순서대로 job 하나씩
+수집하고(`data/qveris_batch.py`), 여럿이면 cohort들을 번갈아 섞어 단일 page 도구(EOD 일간 내려받기,
+JSON 이력, SEC facts)를 작업자 수만큼 한 group으로 묶는다(`data/qveris_parallel_batch.py`). group은
+모든 새 job의 견적을 받고, 서버 잔액에서 다른 예약을 뺀 값과 실행 예산(유료 호출 수·크레딧) 모두가
+group 전체를 받아들일 때만 batch manifest와 job별 intent를 남긴 뒤 실행한다(`data/qveris_parallel.py`).
+예산은 group 전체를 예약하거나 하나도 예약하지 않는다. 실행 중인 유료 future는 모두 기다려 기록하고,
+group 정산은 usage와 계정 ledger로 한 번 한다. 정산되지 않은 group은 정산되거나 운영자가 예약을 남긴 채
+격리할 때까지 그 계정의 새 실행을 막는다. 모든 요청은 실행 하나에 공유된 HTTP 시도 수·시간 한도를
+통과한 뒤 같은 간격으로 시작한다(`data/qveris_pacing.py`).
+
+- 정산된 실패는 기록하고 다음 job으로 간다. 공급자 경고(`RAW_ACQUIRED_WITH_WARNINGS`)는 완료이며
+  `warned`로 세고 수집을 멈추지 않는다.
+- 결과가 불확실한 유료 호출은 수집을 멈추고(`stopped`, 종료 코드 2) 자동으로 다시 호출하지 않는다.
+- 예산 거부는 intent를 만들기 전에 일어나므로 시도한 것이 없다. 남은 job은 `pending`이고 상태는
+  `budget_exhausted`(종료 코드 0)다. 다음 실행은 완료된 job을 HTTP 없이 재사용한다.
+
+**일간 요청.** `daily-jobs`는 거래소(`US`는 XNYS, `KO`·`KQ`는 XKRX)의 [선언 달력](#선언-달력)에서
+관측일 이전의 열린 세션마다 `prices`·`splits`·`dividends` 일간 내려받기 요청을 만든다. 요청의 정체는
+도구·하위 공급자·시장·dataset·요청 변수이고 관측일과 job ID는 아니다. raw 수집 root의 완료된 job이
+같은 요청을 가지면 상태와 관측일이 무엇이든 그 요청은 `covered`다. 완료 없이 시도만 있는 요청은
+`held`로 보고하고 계획하지 않으므로 불확실한 시도가 자동 재호출되지 않는다. 창은 366일 이하이고 선언
+기간 안이어야 한다.
+
+**적재.** 완료된 job 하나가 원본 단위 하나다. 단위의 bytes는 `complete.json`, 그것이 pin한 page 파일
+넷, 그리고 행이 instrument를 이름 붙일 때 그 행을 해석한 identity 문서(`{"identities": {"<CODE>.<EXCHANGE>":
+{instrument_id, venue, instrument_type, currency, ...}}}`)다. 원천 ID는 이 bytes의
+`aas-source-id-v1`이므로 실행 순서·묶음·적재 코드 버전이 달라도 같은 job은 같은 ID가 되고, identity 문서가
+바뀌면 새 원천이 된다. 적재 코드와 변환 해시는 commit `lineage`에만 남는다.
+
+| job | 행 원천(shape, 테이블) | 보류 행 원천(shape) |
+| --- | --- | --- |
+| KR·US 단일 종목 `price_history` | `<m>-history-bars`, `bars` | `<m>-history-quarantine` |
+| 거래소 일간 `prices` | `bulk-bars`, `bars` | `bulk-quarantine` |
+| 거래소 일간 `splits` | `splits`, `splits` | `splits-quarantine` |
+| 거래소 일간 `dividends` | `dividends`, `dividends` | `dividends-quarantine` |
+| FX 통화쌍 `fx_history`(`<BASE><QUOTE>.FOREX`) | `fx-history-bars`, `bars` | `fx-history-quarantine` |
+
+- 원천 ID는 `qveris-<shape>-<hex>`이고 한 job의 두 원천은 `hex`를 공유한다. 보류 테이블 이름은 모두
+  `quarantine`이며 열은 `ordinal`, `reason`, `source_row_json`이고 이력은 앞에 `source_fingerprint`를
+  둔다. 가격 `bars` 열은 `eodhd.*` 매퍼가 읽는 열 그대로다.
+- 행 테이블은 비어 있어도 commit한다(분할이 없는 거래일도 사실이다). 보류 테이블은 행이 있을 때만,
+  행 테이블보다 먼저 commit하므로 행 원천이 있으면 단위가 완결이다. 다시 적재하면 행 원천이 있는 단위는
+  다시 만들지 않고 `reused`로 센다.
+- 공급자 경고는 기록만 한다. 경고가 붙은 내려받기의 모든 행은 `provider_reported_partial` 사유로 보류되고
+  적재는 계속된다. 승격은 그 행에 같은 flag를 단다([KR 가격](#kr-가격)).
+- 분할 비율, 배당 금액·통화·날짜·주기는 공급자 텍스트 그대로(숫자는 가장 짧은 십진 표기) 남긴다.
+  identity가 없는 종목, 양수 십진수가 아닌 비율·금액은 그 사유로 보류하고 고치지 않는다. 통화쌍
+  이력은 instrument가 아니므로 identity 문서 없이 쌍·기준 통화·호가 통화를 남긴다.
+- 읽거나 검증할 수 없는 job은 `failures`에 남고 다음 job을 적재한다. 완료 문서가 없는 요청 job은
+  `missing`, 적재기가 없는 종류(FRED, SEC, 종목 목록, 연구 이력)는 `unsupported`로 센다. 적재는
+  공급자를 호출하지 않는다.
 
 ## 승격 명세 `aas-promotion-v1`
 
@@ -1744,3 +1803,17 @@ state v2:
 | DV-249 | 매퍼 참조는 참조 도메인의 dataset generation만 pin할 수 있다 | `tests/storage/test_sec_promotion.py::test_a_filings_reference_must_pin_a_filings_generation` | 구현 |
 | DV-250 | SEC가 두 번 나열한 같은 공시는 한 번 읽히고, 값이 다른 같은 accession의 행은 둘 다 매핑되어 승격을 거부한다 | `tests/storage/test_sec_promotion.py::test_a_repeated_listing_is_read_once` | 구현 |
 | DV-251 | 제출자 문서가 자기 CIK의 `CIK##########-submissions-###.json`이 아닌 쪽을 나열하면 submissions 단위를 거부한다 | `tests/storage/test_legacy_import.py::test_sec_submissions_filings_refuse_a_page_of_another_filer` | 구현 |
+| DV-252 | 완료된 Qveris job 하나는 행 원천과 보류 원천으로 commit되고 둘은 원본 bytes의 `hex`를 공유하며 매퍼가 lineage 접두어와 테이블 이름으로 찾는다 | `tests/storage/test_qveris_import.py::test_one_job_commits_its_rows_and_held_rows_under_one_content_hex` | 구현 |
+| DV-253 | 같은 job을 다시 적재하면 재사용하고 적재 코드만 바뀌어도 같은 원천 ID다 | `tests/storage/test_qveris_import.py::test_reimport_reuses_and_a_code_change_keeps_the_id` | 구현 |
+| DV-254 | 다른 identity 문서로 해석한 job은 다른 원천이다 | `tests/storage/test_qveris_import.py::test_another_identity_document_is_another_source` | 구현 |
+| DV-255 | 경고가 붙은 내려받기는 빈 행 테이블과 `provider_reported_partial` 보류 행으로 적재되고 적재를 막지 않는다 | `tests/storage/test_qveris_import.py::test_a_warned_download_commits_an_empty_rows_table_and_its_held_rows` | 구현 |
+| DV-256 | 읽을 수 없는 job은 기록되고 나머지 job은 적재된다 | `tests/storage/test_qveris_import.py::test_unreadable_jobs_are_recorded_and_the_run_continues` | 구현 |
+| DV-257 | 일간 요청은 선언 달력의 열린 세션에서 나오고 관측일과 무관하게 완료된 요청은 빠진다 | `tests/application/test_qveris_cli.py::test_daily_jobs_follow_declared_sessions_and_skip_completed_requests` | 구현 |
+| DV-258 | 완료 없이 시도만 있는 요청은 `held`로 보고되고 계획되지 않는다 | `tests/application/test_qveris_cli.py::test_an_attempt_without_a_completion_is_held_not_planned` | 구현 |
+| DV-259 | 유료 호출 한도에 닿은 실행은 시도 없이 `budget_exhausted`로 끝나고 다음 실행은 완료된 job을 다시 호출하지 않는다 | `tests/application/test_qveris_cli.py::test_run_stops_at_the_paid_call_limit_and_resumes_without_repeating` | 구현 |
+| DV-260 | 결과가 불확실한 유료 호출은 수집을 멈추고 종료 코드 2를 낸다 | `tests/application/test_qveris_cli.py::test_run_stops_with_exit_two_when_a_paid_call_is_uncertain` | 구현 |
+| DV-261 | 병렬 group은 예산에 전부 예약되거나 하나도 예약되지 않고, 거부된 group은 실행되지 않는다 | `tests/data/test_qveris_parallel.py::test_group_is_reserved_whole_or_not_at_all` | 구현 |
+| DV-262 | 공급자 경고는 완료로 세어지고 cohort를 멈추지 않는다 | `tests/data/test_qveris_batch.py::test_a_provider_warning_completes_and_the_cohort_continues` | 구현 |
+| DV-263 | 분할 비율은 공급자 텍스트로 남고 identity가 없거나 양수가 아닌 비율은 보류된다 | `tests/data/test_qveris_actions_fx.py::test_splits_keep_the_ratio_text_and_hold_unknown_identities` | 구현 |
+| DV-264 | 통화쌍 이력은 identity 없이 쌍과 두 통화를 남기고 맞지 않는 OHLC는 보류된다 | `tests/data/test_qveris_actions_fx.py::test_forex_history_keeps_the_pair_and_holds_bad_rows` | 구현 |
+| DV-265 | 요청 시작 간격과 HTTP 시도·시간 한도는 coordinator와 작업자에 공유된다 | `tests/data/test_qveris_pacing.py::test_admission_bounds_requests_and_time_across_shared_clients` | 구현 |

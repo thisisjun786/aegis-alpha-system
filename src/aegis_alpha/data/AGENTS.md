@@ -7,6 +7,7 @@ This directory uses flat provider prefixes. Follow root policy and decision 0012
 | Data-root configuration and safe file access | `data_root.py`, `descriptor_tree.py` |
 | Catalog validation and version-pinned prices | `catalog_access.py`, `pinned_prices.py`, `price_schema.py` |
 | FMP one-shot/backfill and daily acquisition | `fmp_collector_cli.py`, `fmp_daily_cli.py` and `fmp_*` contracts |
+| Qveris jobs, settlement, serial/parallel cohorts and pacing | `qveris_*`; import in `storage/qveris_import.py` |
 | Macro observations/vintages and raw archives | `fred_alfred_*`, `fred_raw_archive*` |
 | SEC collection, bulk archives and period identity | `sec_*`; trusted policy pin in `sec_policy.py` |
 | FinImpulse estimates | `finimpulse_*` |

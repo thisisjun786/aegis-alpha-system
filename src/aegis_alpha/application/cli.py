@@ -16,6 +16,7 @@ from aegis_alpha.application import (
     prepare_cli,
     provider_cli,
     proxy_cli,
+    qveris_cli,
     research_cli,
     run_cli,
     storage_cli,
@@ -154,6 +155,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915 
                 result = universe_cli.execute(args)
             case "import":
                 result = import_cli.execute(args)
+            case "collect" if args.collect_command == "qveris":
+                result = qveris_cli.execute(args)
             case "providers" | "collect":
                 result = provider_cli.execute(args)
             case "legacy-db" | "legacy-data":
