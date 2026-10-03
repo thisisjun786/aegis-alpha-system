@@ -1654,7 +1654,10 @@ pin(`observations`) 대신 canonical 가격 binding(`prices`: `aas-head-binding-
 - `heads`로 묶은 달력은 이력 시작부터 기간 끝까지 그 달력의 revision을 한 번 읽고(`aas-head-revisions-v1`),
   판단마다 그 cutoff로 투영한다. 행의 달력·venue·timezone version이 calendar 관례와 다르면 거부한다.
   native 가격 generation과 파생 가격 입력은 native 세션 generation과 함께 읽히므로 `heads` 달력과 함께
-  묶을 수 없다.
+  묶을 수 없다. 일정은 판단 cutoff에 알려진 달력으로 정하므로, 그 cutoff에 다음 개장 session과 그 달의 남은
+  날짜가 알려져 있어야 판단이 생긴다. [선언 달력](#선언-달력)의 `declared_session_end@1`은 선언 시각 이전
+  날짜를 그 날짜가 끝난 시각부터 알리므로, 선언 시각보다 앞선 기간의 판단은 다음 session을 알지 못해
+  일정이 만들어지지 않고 준비는 미해결 월을 보고하며 거부한다.
 - 거시 선택의 subject는 `series_id`이고 행의 단위는 선택의 `unit`과 같아야 한다. FX 선택의 `series_id`는
   `BASE/QUOTE`이고, 경제 날짜는 고시 시각의 UTC 날짜, 값은 `rate`, 선택의 `unit`은 호가 통화다. 준비는
   지식 cutoff로 한 번 읽어 binding이 그 series의 head를 가지는지 확인하고(`admission`), 판단마다 다시 읽는다.
