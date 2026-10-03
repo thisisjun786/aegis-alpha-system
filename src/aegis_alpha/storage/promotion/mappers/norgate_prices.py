@@ -25,16 +25,18 @@ retrieval. Nothing is filled from a neighbour; a bar with some values and not ot
   ``date``, the binary64 ``close`` and the export row ``raw_row_json``) as close-only
   (``fields='close'``) ``reference`` prices. The close is the export's ``Close`` text for
   ``decimal_text@1``, the value Norgate wrote, and it is ``present`` only when that text is
-  a decimal whose double is ``close`` and the row's ``Date`` text is its date.
+  an unsigned decimal whose double is ``close`` and the row's ``Date`` text is its date.
 - ``norgate.reference_history@1`` reads a history CSV export of any other Norgate database
   (indices, economic series, spot FX and commodities) as close-only ``reference`` prices
   from its ``Close`` text. An equity row has no session date and is refused, so an equity
   export never becomes a reference series by mistake.
 
-A reference series level is not an amount of money, so both close-only mappers name the
-currency ``XXX`` (ISO 4217 "no currency") and the basis ``unadjusted``: the series as
-Norgate publishes it. Their one time input, ``session_date``, is never before 1970-01-01
-(some indices start in the 1890s); the canonical and adjusted equity bars start in 1990.
+A negative level (a spread or a rate below zero) is ``invalid``: the price domain holds no
+negative value. A reference series level is not an amount of money, so both close-only
+mappers name the currency ``XXX`` (ISO 4217 "no currency") and the basis ``unadjusted``:
+the series as Norgate publishes it. Their one time input, ``session_date``, is never before
+1970-01-01 (some indices start in the 1890s); the canonical and adjusted equity bars start
+in 1990.
 """
 
 from __future__ import annotations
@@ -126,7 +128,7 @@ class NorgatePricesNone(_Norgate):
     def select(self, source: str, args: Mapping[str, object]) -> str:
         zone = str(args["timezone"])
         day = f"CASE WHEN {_equity('database')} THEN {iso_day('date')} END"
-        state = bar_state([text_state(f'"{name}"', signed=False) for name in _VALUES])
+        state = bar_state([text_state(f'"{name}"') for name in _VALUES])
         values = ", ".join(
             f'CASE WHEN {state} = \'present\' THEN "{name}" END AS "{name}"' for name in _VALUES
         )
@@ -213,7 +215,7 @@ class NorgateReferenceCloses(_Norgate):
         text = "json_extract_string(raw_row_json, '$.Close')"
         stated = "json_extract_string(raw_row_json, '$.Date')"
         agrees = f"TRY_CAST({text} AS DOUBLE) = close AND {stated} = strftime(date, '%Y-%m-%d')"
-        found = text_state(text, signed=True)
+        found = text_state(text)
         state = (
             f"CASE WHEN close IS NULL AND {found} = 'missing' THEN 'missing' "
             f"WHEN {found} = 'present' AND coalesce({agrees}, false) THEN 'present' "
@@ -243,5 +245,5 @@ class NorgateReferenceHistory(_Norgate):
         zone = str(args["timezone"])
         reference = f"database IS NOT NULL AND NOT {_equity('database')}"
         day = f"CASE WHEN {reference} THEN {iso_day('date')} END"
-        state = text_state("close", signed=True)
+        state = text_state("close")
         return _head(zone, day) + _close_only(zone, day, "close", state) + f"FROM {source}"

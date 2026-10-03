@@ -2,9 +2,9 @@
 
 - A session date spelled as text is a DATE only when it is exactly ``YYYY-MM-DD`` and a real
   day; any other text is NULL, which a partition refuses and a required column refuses.
-- A text value is ``present`` when it is a plain decimal (``decimal_text@1`` converts it),
-  ``missing`` when it is empty or absent, and ``invalid`` otherwise. Nothing is trimmed or
-  repaired.
+- A text value is ``present`` when it is an unsigned decimal (``decimal_text@1`` converts
+  it; no price or volume is negative), ``missing`` when it is empty or absent, and
+  ``invalid`` otherwise. Nothing is trimmed or repaired.
 - A bar ends at the last microsecond of its session date in an IANA zone: an upper bound on
   when a daily bar can end that needs no calendar.
 - A time input never precedes the Unix epoch. Market times are nonnegative, so a session
@@ -21,7 +21,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aegis_alpha.storage.promotion.formats import sql_literal
 
-DECIMAL_TEXT: Final = r"[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?"
 UNSIGNED_TEXT: Final = r"\+?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?"
 _ZONE: Final = re.compile(r"[A-Za-z][A-Za-z0-9_+-]*(?:/[A-Za-z0-9_+-]+)*")
 EPOCH_DAY: Final = "DATE '1970-01-01'"
@@ -35,12 +34,11 @@ def iso_day(text: str) -> str:
     )
 
 
-def text_state(text: str, *, signed: bool) -> str:
+def text_state(text: str) -> str:
     """``present``, ``missing`` or ``invalid`` for one source text value."""
-    pattern = DECIMAL_TEXT if signed else UNSIGNED_TEXT
     return (
         f"CASE WHEN {text} IS NULL OR {text} = '' THEN 'missing' "
-        f"WHEN regexp_full_match({text}, {sql_literal(pattern)}) THEN 'present' "
+        f"WHEN regexp_full_match({text}, {sql_literal(UNSIGNED_TEXT)}) THEN 'present' "
         "ELSE 'invalid' END"
     )
 

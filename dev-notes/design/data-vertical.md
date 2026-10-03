@@ -336,7 +336,8 @@ microsecond, 시간 입력은 `session_date` 하나다. 값 일부만 있는 bar
   경제 지표, 외환 현물, 상품)의 history 내보내기를 close 전용(`fields='close'`) reference `prices`로 옮긴다.
   close는 내보내기의 `Close` 원문을 `decimal_text@1`에 넘긴다. 기준 시리즈 표의 close는 그 원문이 저장된
   double과 같고 원문 `Date`가 행 날짜와 같을 때만 `present`이다. history 내보내기의 주식 행은 세션 날짜가
-  없어 거부되므로 주식 내보내기가 기준 시리즈로 승격되지 않는다. 시리즈 수준은 금액이 아니므로 통화는
+  없어 거부되므로 주식 내보내기가 기준 시리즈로 승격되지 않는다. 가격 도메인은 음수를 담지 않으므로 0보다 작은 수준(스프레드, 음의 금리·선물 가격)은 값 없이
+  `invalid`다. 시리즈 수준은 금액이 아니므로 통화는
   `XXX`(ISO 4217 "통화 없음"), basis는 Norgate가 낸 그대로인 `unadjusted`다. 1970년 이전 날짜(1890년대
   지수)의 시간 입력은 1970-01-01로 올린다. 더 늦은 날짜도 그 행이 공개된 시점의 상한이다.
 - `fmp.eod_non_split@1`은 FMP 동결 snapshot의 non-split-adjusted 일봉(`symbol`, `date`, binary64

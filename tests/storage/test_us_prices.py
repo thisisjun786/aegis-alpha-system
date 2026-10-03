@@ -269,6 +269,8 @@ def test_norgate_reference_series_are_close_only() -> None:
             (41, "US Indices", "1885-02-16", "30.5"),
             (41, "US Indices", "2026-09-08", "6502.08"),
             (42, "US Equities", "2026-09-08", "10"),
+            # A spread below zero is no price.
+            (43, "Continuous Futures", "2020-04-20", "-37.63"),
         ],
     )
     mapped = _mapped(
@@ -282,6 +284,7 @@ def test_norgate_reference_series_are_close_only() -> None:
         (date(1885, 2, 16), "present", "30.5", "close", date(1970, 1, 1)),
         (date(2026, 9, 8), "present", "6502.08", "close", date(2026, 9, 8)),
         (None, "present", "10", "close", None),
+        (date(2020, 4, 20), "invalid", None, "close", date(2020, 4, 20)),
     ]
 
 
