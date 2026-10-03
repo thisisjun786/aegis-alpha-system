@@ -310,15 +310,6 @@ def installation(
     return copy_installation(tmp_path_factory, tmp_path)
 
 
-@pytest.fixture
-def fresh_installation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> tuple[Path, Document, Document]:
-    """The same installation built in this test, for tests that need their own identity."""
-    monkeypatch.setattr(time, "time_ns", lambda: CLOCK_NS)
-    return _build_installation(tmp_path)
-
-
 def test_a_write_to_one_copy_never_reaches_a_fresh_copy(
     installation: tuple[Path, Document, Document],
     tmp_path_factory: pytest.TempPathFactory,
@@ -508,7 +499,7 @@ def test_the_run_identity_is_the_declaration_and_what_it_produced(
 
 
 def test_a_restored_installation_reproduces_the_same_run(
-    fresh_installation: tuple[Path, Document, Document], tmp_path: Path
+    installation: tuple[Path, Document, Document], tmp_path: Path
 ) -> None:
     """Backup and restore carry everything the run is: it comes back byte for byte.
 
@@ -516,9 +507,8 @@ def test_a_restored_installation_reproduces_the_same_run(
     executable runs (see 010-run-store-blocker in the evidence root). What a restored
     installation does carry is every pinned input the declaration names, so the same
     declaration reproduces the same identity, the same envelope and the same accounting.
-    Backup and restore carry the installation identity, so this builds its own.
     """
-    home, _body, declaration = fresh_installation
+    home, _body, declaration = installation
     original = _prepared(home, declaration)
     archive = tmp_path / "backup"
     _ = backup(home, archive, budget=BUDGET)
