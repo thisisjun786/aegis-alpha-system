@@ -290,9 +290,11 @@ def _run_on_workers(tmp_path: Path, *arguments: str) -> subprocess.CompletedProc
 @pytest.mark.parametrize(
     ("arguments", "status", "summary"),
     [
-        (("--test-shard", "1/2"), 0, "test shard 1/2: 1 files, "),
-        (("--test-shard", "2/2"), 0, "test shard 2/2: 0 files, 0 tests"),
-        (("-k", "nothing_matches_this"), 5, None),
+        pytest.param(("--test-shard", "1/2"), 0, "test shard 1/2: 1 files, ", id="shard"),
+        pytest.param(
+            ("--test-shard", "2/2"), 0, "test shard 2/2: 0 files, 0 tests", id="empty-shard"
+        ),
+        pytest.param(("-k", "nothing_matches_this"), 5, None, id="empty-selection"),
     ],
 )
 def test_shards_on_xdist_workers_keep_the_serial_exit_status_and_summary(
