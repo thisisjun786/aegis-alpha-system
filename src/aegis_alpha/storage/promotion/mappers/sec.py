@@ -16,8 +16,9 @@ lists, its fields as SEC wrote them. It writes one ``filings`` row per row:
   NULL and the promotion refuses the row; nothing is repaired.
 - ``accepted_at_us`` is ``acceptanceDateTime`` (``YYYY-MM-DDTHH:MM:SS[.fff]Z``, UTC) in
   microseconds. EDGAR states no acceptance instant for filings it holds only by date: it
-  writes their local midnight in New York. Such an instant, and any other spelling, is
-  NULL, so the row's time is unknown rather than earlier than the filing.
+  writes midnight of ``filingDate``, mostly in UTC and otherwise in New York. Either
+  midnight, and any other spelling, is NULL, so the row's time is unknown rather than
+  earlier than the filing.
 - SEC lists some filings twice (in a filer's recent filings and an older page, or in two
   pages). Rows that state the same CIK, accession, dates, acceptance and form are one
   listing, read once from its first row in source order; rows of one accession that
@@ -129,9 +130,14 @@ class SecSubmissions:
             f"CASE WHEN regexp_full_match({text}, '{_INSTANT}') "
             f"THEN epoch_us(TRY_CAST({text} AS TIMESTAMPTZ)) END"
         )
-        # EDGAR writes local midnight in New York for a filing it holds only by date.
-        midnight = "epoch_us(timezone('America/New_York', CAST(_s_filed AS TIMESTAMP)))"
-        accepted = f"CASE WHEN _s_instant IS DISTINCT FROM {midnight} THEN _s_instant END"
+        # EDGAR writes midnight of the filing date, in UTC or in New York, for a filing it
+        # holds only by date.
+        new_york = "epoch_us(timezone('America/New_York', CAST(_s_filed AS TIMESTAMP)))"
+        utc = "epoch_us(CAST(_s_filed AS TIMESTAMP))"
+        accepted = (
+            f"CASE WHEN _s_instant IS DISTINCT FROM {new_york} "
+            f"AND _s_instant IS DISTINCT FROM {utc} THEN _s_instant END"
+        )
         number = '"accessionNumber"'
         report = _day('"reportDate"')
         filed = _day('"filingDate"')

@@ -201,11 +201,13 @@ def test_filings_take_the_recorded_acceptance_instant(ws: Workspace) -> None:
             _filing("0000000002", A1, "2025-02-10", "2025-02-10T21:30:00.000Z"),
             # A date-only filing (local midnight in New York) has no instant.
             _filing("0000000001", "0000000001-99-000001", "1999-01-04", "1999-01-04T05:00:00.000Z"),
+            # EDGAR mostly writes a date-only filing as midnight in UTC: no instant either.
+            _filing("0000000001", "0000000001-99-000002", "1999-01-05", "1999-01-05T00:00:00.000Z"),
         ],
         "f1",
     )
-    assert result["operations"] == {"ASSERT": 3}
-    assert result["rows"] == {"ok": 3}
+    assert result["operations"] == {"ASSERT": 4}
+    assert result["rows"] == {"ok": 4}
     rows = ws.market.execute(
         "SELECT issuer_id, filing_id, filed_date, accepted_at_us, available_at_us, "
         "revision_known_at_us FROM filings ORDER BY filed_date, issuer_id"
@@ -213,6 +215,7 @@ def test_filings_take_the_recorded_acceptance_instant(ws: Workspace) -> None:
     accepted = us(datetime(2025, 2, 10, 21, 30, tzinfo=UTC))
     assert rows == [
         (ISSUER, "0000000001-99-000001", date(1999, 1, 4), None, None, None),
+        (ISSUER, "0000000001-99-000002", date(1999, 1, 5), None, None, None),
         *sorted(
             [
                 (ISSUER, A1, date(2025, 2, 10), accepted, accepted, accepted),
@@ -366,6 +369,19 @@ def test_a_later_filings_generation_completes_unmatched_facts(ws: Workspace) -> 
         accepted,
         accepted,
     )
+    # Back to the ancestor filings generation of the same chain is refused too.
+    with pytest.raises(ValueError, match="descendant"):
+        promote(
+            ws,
+            *_spec(
+                [facts],
+                domain="fundamentals",
+                dataset="fundamentals.us.sec",
+                filings=filings,
+                parent=str(result["generation_id"]),
+            ),
+            apply=False,
+        )
 
 
 def _filings_other(workspace: Workspace) -> tuple[dict[str, object], dict[str, str]]:

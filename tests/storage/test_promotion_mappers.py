@@ -434,6 +434,16 @@ def test_sec_submissions_maps_synthetic_fixture() -> None:
                 "1999-07-06T04:00:00.000Z",
                 "8-K",
             ),
+            # Midnight in UTC is EDGAR's usual date-only placeholder: no instant.
+            (
+                5,
+                "0000000001",
+                "0000000001-01-000001",
+                "2001-06-08",
+                "",
+                "2001-06-08T00:00:00.000Z",
+                "10-K",
+            ),
             # Another spelling leaves the field NULL; nothing is repaired.
             (4, "1", "1-26-2", "2026/08/03", "2026-06", "2026-08-03 20:05:01", "4"),
         ],
@@ -483,6 +493,18 @@ def test_sec_submissions_maps_synthetic_fixture() -> None:
             date(1999, 7, 6),
         ),
         (4, None, None, "4", None, None, None, None, None, None),
+        (
+            5,
+            issuer,
+            "0000000001-01-000001",
+            "10-K",
+            date(2001, 6, 8),
+            None,
+            None,
+            None,
+            None,
+            date(2001, 6, 8),
+        ),
     ]
     partitions = connection.execute(
         f"SELECT _aas_ordinal, {filings.partition_sql} FROM src ORDER BY 1"
@@ -492,6 +514,7 @@ def test_sec_submissions_maps_synthetic_fixture() -> None:
         date(1999, 1, 4),
         date(1999, 7, 6),
         None,
+        date(2001, 6, 8),
     ]
 
 

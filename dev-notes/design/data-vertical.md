@@ -770,9 +770,9 @@ member마다 한 행을 내용 원천 `sec-submissions-companies-*`(테이블 `c
 | `period_end` | `reportDate`. 비었거나 다른 표기면 null |
 | `accepted_at_us` | `acceptanceDateTime`(`YYYY-MM-DDTHH:MM:SS[.fff]Z`, UTC)의 microsecond. 다른 표기는 null |
 
-EDGAR는 날짜로만 받은 공시(전자 접수 이전 공시 등)의 접수 시각을 그 날짜의 New York 현지 0시로 싣는다.
-그 시각은 실제 접수보다 이를 수 있으므로 매퍼는 `filingDate`의 New York 현지 0시와 같은 접수 시각을 null로
-둔다. 그런 공시의 시점은 알 수 없음이고 공시일로 채우지 않는다. 시간 입력은 접수 시각 `accepted_at`
+EDGAR는 날짜로만 받은 공시(전자 접수 이전 공시 등)의 접수 시각을 그 날짜의 0시로 싣는다. 대부분은 UTC 0시
+(`YYYY-MM-DDT00:00:00.000Z`)이고 나머지는 New York 현지 0시다. 두 시각 모두 실제 접수보다 이를 수 있으므로
+매퍼는 `filingDate`의 UTC 0시나 New York 현지 0시와 같은 접수 시각을 null로 둔다. 그런 공시의 시점은 알 수 없음이고 공시일로 채우지 않는다. 시간 입력은 접수 시각 `accepted_at`
 (`source_column@1`)과 `filed_date`이고 명세 파티션은 `filingDate`로 원천 행을 고른다. `filingDate`가
 날짜 표기가 아닌 행은 어느 파티션에도 들지 않으므로 파티션 명세가 거부한다.
 
@@ -1497,7 +1497,7 @@ state v2:
 | DV-195 | `sec.submissions_filings@1`은 제출자 문서와 나열된 쪽의 공시를 member·배열 순서대로 원문 값의 행으로 편입한다 | `tests/storage/test_legacy_import.py::test_sec_submissions_filings_reads_every_listed_filing` | 구현 |
 | DV-196 | 없는 쪽, 나열되지 않은 쪽, 공시 수가 다른 쪽은 불일치 지표이고 `expect`에 적기 전까지 대조를 실패시킨다 | `tests/storage/test_legacy_import.py::test_sec_submissions_filings_count_page_discrepancies` | 구현 |
 | DV-197 | 알 수 없는 배열, 길이가 다른 배열, 다른 JSON 타입의 값은 submissions 단위를 거부한다 | `tests/storage/test_legacy_import.py::test_sec_submissions_filings_refuse_unknown_shapes` | 구현 |
-| DV-198 | `sec.submissions@1`은 합성 원천을 독립 기대값과 같은 발행인 공시 행으로 옮기고, New York 현지 0시의 접수 시각과 다른 표기는 null로 둔다 | `tests/storage/test_promotion_mappers.py::test_sec_submissions_maps_synthetic_fixture` | 구현 |
+| DV-198 | `sec.submissions@1`은 합성 원천을 독립 기대값과 같은 발행인 공시 행으로 옮기고, `filingDate`의 UTC 0시·New York 현지 0시인 접수 시각과 다른 표기는 null로 둔다 | `tests/storage/test_promotion_mappers.py::test_sec_submissions_maps_synthetic_fixture` | 구현 |
 | DV-199 | `sec.companyfacts@1`은 사실마다 accession을 dimensions로 한 발행인 재무 행을 내고, 접수 시각을 pin한 공시 참조에서 accession으로 조인하며 없거나 서로 다른 접수 시각은 null이다 | `tests/storage/test_promotion_mappers.py::test_sec_companyfacts_maps_synthetic_fixture` | 구현 |
 | DV-200 | SEC 공시는 기록된 접수 시각을 시점으로 승격되고 공동 제출자는 따로 record이며, 발행인 매퍼의 명세는 identity snapshot을 pin하지 않는다 | `tests/storage/test_sec_promotion.py::test_filings_take_the_recorded_acceptance_instant` | 구현 |
 | DV-201 | SEC 재무는 pin한 공시 generation의 접수 시각부터 알려지고, 조인되지 않은 사실은 시점이 null이며, 같은 원천의 재승격은 빈 delta다 | `tests/storage/test_sec_promotion.py::test_facts_are_known_from_their_filing_acceptance` | 구현 |
