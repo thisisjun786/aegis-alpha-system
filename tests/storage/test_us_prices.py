@@ -31,6 +31,8 @@ from aegis_alpha.storage.legacy_import.norgate import HISTORY
 from aegis_alpha.storage.promotion import formats
 from aegis_alpha.storage.promotion.engine import promote
 from aegis_alpha.storage.promotion.mappers import REGISTRY, IdentityKey, mapper
+from aegis_alpha.storage.promotion.mappers.norgate_prices import signed_series
+from aegis_alpha.storage.promotion.spec import parse_spec
 from aegis_alpha.storage.us_identity import build_from_workspace, export_sources
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
 from tests.storage.promotion_support import add_source, at, bar
@@ -273,12 +275,9 @@ def test_norgate_reference_series_are_close_only() -> None:
             (43, "Continuous Futures", "2020-04-20", "-37.63"),
         ],
     )
-    mapped = _mapped(
-        history,
-        "norgate.reference_history@1",
-        {"timezone": NEW_YORK},
-        'session_date, value_state, close, "fields", _aas_t_session_date',
-    )
+    columns = 'session_date, value_state, close, "fields", _aas_t_session_date'
+    args: dict[str, object] = {"timezone": NEW_YORK, "signed": []}
+    mapped = _mapped(history, "norgate.reference_history@1", args, columns)
     # A series before 1970 keeps its date; its time input is floored at the epoch.
     assert mapped == [
         (date(1885, 2, 16), "present", "30.5", "close", date(1970, 1, 1)),
@@ -286,6 +285,63 @@ def test_norgate_reference_series_are_close_only() -> None:
         (None, "present", "10", "close", None),
         (date(2020, 4, 20), "invalid", None, "close", date(2020, 4, 20)),
     ]
+    # A signed series is found in the export and, once the spec names it, not selected at all.
+    assert signed_series(history, "src") == [43]
+    args["signed"] = [43]
+    assert _mapped(history, "norgate.reference_history@1", args, columns) == mapped[:3]
+    for signed in ([43, 41], [41, 41], ["41"], [True], 41):
+        with pytest.raises(ValueError, match="signed"):
+            mapper("norgate.reference_history@1").check_args(
+                {"timezone": NEW_YORK, "signed": signed}
+            )
+
+
+def test_history_mappers_share_one_value_predicate() -> None:
+    """One Norgate history row is a value in both history mappers, except a zero rate."""
+    texts = ["1.5", "1.5e3", "+2", "0", "-1", ".", "", None, "abc", "1,5"]
+    connection = duckdb.connect()
+    _source(
+        connection,
+        "symbol VARCHAR, assetid BIGINT, database VARCHAR, date VARCHAR, close VARCHAR",
+        [("USDKRW", 7, "Forex Spot", "2026-09-08", text) for text in texts],
+    )
+    fx = _mapped(
+        connection,
+        "norgate.fx_history@1",
+        {"series": "USDKRW", "base": "USD", "quote": "KRW", "timezone": "Etc/GMT+12"},
+        "value_state, rate",
+    )
+    reference = _mapped(
+        connection,
+        "norgate.reference_history@1",
+        {"timezone": NEW_YORK, "signed": []},
+        "value_state, close",
+    )
+    expected = ["present"] * 4 + ["invalid", "missing", "missing", "missing", "invalid", "invalid"]
+    assert [row[0] for row in reference] == expected
+    assert [row[0] for row in fx] == [*expected[:3], "invalid", *expected[4:]]
+    assert [row[1] for row in fx] == [row[1] for row in reference][:3] + [None] * 7
+
+
+def test_history_mappers_refuse_another_providers_source() -> None:
+    sources = [{"source_id": "synthetic-history-csv-1", "source_sha256": "a" * 64}]
+    sources[0] |= {"table": "bars", "digest": "b" * 64}
+    identity = {"snapshot_id": "s", "content_hash": "c" * 64}
+    cases: list[tuple[str, dict[str, object]]] = [
+        ("norgate.prices_none@1", {"timezone": NEW_YORK}),
+        ("norgate.reference_history@1", {"timezone": NEW_YORK, "signed": []}),
+    ]
+    for name, args in cases:
+        raw, sha = _spec(
+            sources,
+            identity,
+            mapper_name=name,
+            dataset="prices.ref.norgate",
+            decimals=dict.fromkeys(FIVE if "none" in name else ("close",), "decimal_text@1"),
+            args=args,
+        )
+        with pytest.raises(ValueError, match=r"reads only sources \['norgate-history-csv-'\]"):
+            parse_spec(raw, sha)
 
 
 def test_fmp_revisions_select_the_first_response_of_each_run() -> None:
@@ -588,6 +644,7 @@ def test_us_prices_promote_through_the_export_registry(ws: Workspace) -> None:
             mapper_name="norgate.reference_history@1",
             dataset="prices.ref.norgate",
             decimals={"close": "decimal_text@1"},
+            args={"timezone": NEW_YORK, "signed": []},
         ),
         apply=True,
     )
@@ -755,6 +812,69 @@ def test_fmp_corrections_promote_as_later_generations(ws: Workspace) -> None:
         (_instrument(1), "ASSERT", "reference", 10, end, _us(first)),
         (_instrument(1), "SUPERSEDE", "reference", 10.25, _us(corrected), _us(corrected)),
     ]
+
+
+def test_fmp_tied_responses_are_refused_and_never_revised(ws: Workspace) -> None:
+    master_id = commit(
+        ws,
+        "norgate-master",
+        "observations",
+        table([master(1, "AAA", last_date="2026-07-28")], MASTER_SCHEMA),
+    )
+    _export(ws, [history(1, "AAA", "2026-07-28", "10"), history(1, "AAA", "2026-09-08", "10")])
+    profiles = commit(
+        ws,
+        "fmp-profiles",
+        "observations",
+        table([profile("AAA", "0000000101", cusip("03783310"))], FMP_SCHEMA),
+    )
+    registry = build_from_workspace(
+        ws, master=master_id, fmp=[profiles], exports=export_sources(ws)
+    )
+    register_identities(
+        ws.state,
+        decode_registry(registry.raw(), expected_file_sha256=registry.sha256()),
+        apply=True,
+    )
+    identity = _snapshot(ws, "us")
+    tied, later = at("2026-08-29T09:00:00"), at("2026-08-30T09:00:00")
+    rows = [
+        {
+            "symbol": "AAA",
+            "date": date(2026, 8, 28),
+            **dict.fromkeys(("adjOpen", "adjHigh", "adjLow", "adjClose"), close),
+            "volume": 100,
+            "retrieved_at_utc": retrieved,
+        }
+        for close, retrieved in ((10.0, tied), (11.0, tied), (12.0, later))
+    ]
+    schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("date", pa.date32()),
+            *((name, pa.float64()) for name in ("adjOpen", "adjHigh", "adjLow", "adjClose")),
+            ("volume", pa.int64()),
+            ("retrieved_at_utc", pa.timestamp("us", tz="UTC")),
+        ]
+    )
+    pin = _pin(ws, commit(ws, "fmp-non-split", "bars", pa.Table.from_pylist(rows, schema)), "bars")
+    decimals = {**dict.fromkeys(FIVE[:4], "float_shortest@1"), "volume": "exact@1"}
+
+    def spec(revision: int) -> tuple[bytes, str]:
+        return _spec(
+            [pin],
+            identity,
+            mapper_name="fmp.eod_non_split@1",
+            dataset="prices.us.fmp.ref",
+            decimals=decimals,
+            args={"timezone": NEW_YORK, "revision": revision},
+        )
+
+    # Two answers collected at one instant are refused, never chosen between.
+    with pytest.raises(ValueError, match="natural keys repeat across 2 source rows"):
+        promote(ws, *spec(1), apply=True)
+    # The later correction of the tied bar is not a revision of either answer.
+    assert promote(ws, *spec(2), apply=False)["rows"] == {}
 
 
 def test_exports_extend_ticker_claims_past_the_master(ws: Workspace) -> None:

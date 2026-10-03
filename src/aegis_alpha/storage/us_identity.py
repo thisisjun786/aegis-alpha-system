@@ -1047,7 +1047,6 @@ def _link(
     inside: Sequence[Filer],
     profile: Profile | None,
     claim: _Claim,
-    links: Mapping[str, tuple[str, Evidence, int]],
 ) -> tuple[Filer, int, int] | str:
     """One claim's SEC filer and the link's valid and known instants, or why it has none."""
     if len({filer.cik for filer in inside}) > 1:
@@ -1059,8 +1058,6 @@ def _link(
         return "fmp_cik_missing"
     if profile.cik != filer.cik:
         return "fmp_cik_differs"
-    if claim.assetid in links and links[claim.assetid][0] != filer.cik:
-        return "sec_cik_differs_across_claims"
     valid = max(filer.evidence.known_from_us, profile.evidence.known_from_us)
     return filer, valid, max(valid, claim.evidence.known_from_us)
 
@@ -1076,15 +1073,14 @@ def _issuers(
     Only SEC filers retrieved while a claim holds count for it. Both sources state the
     current ticker-to-CIK mapping, not since when, so a link is valid from the later of
     the SEC and FMP instants and known from the latest of those and the series' own
-    evidence. A series links once, by its earliest-valid link; a later claim naming
-    another CIK for it stays unresolved.
+    evidence. A series links once, by its earliest-valid link over all its claims; a claim
+    naming another CIK for it stays unresolved.
     """
     by_ticker: dict[str, list[Filer]] = defaultdict(list)
     for filer in filers:
         for ticker in set(filer.tickers):
             by_ticker[ticker].append(filer)
-    names: dict[str, Filer] = {}
-    links: dict[str, tuple[str, Evidence, int]] = {}
+    candidates: list[tuple[str, str, Filer, int, int]] = []
     for ticker, held in sorted(claims.items()):
         found = _by_claim(
             by_ticker.get(ticker, []), lambda filer: filer.evidence.known_from_us, held, "sec"
@@ -1094,23 +1090,38 @@ def _issuers(
             continue
         reasons: set[str] = set()
         for claim, inside in found.items():
-            judged = _link(inside, agreed.get((ticker, claim)), claim, links)
+            judged = _link(inside, agreed.get((ticker, claim)), claim)
             if isinstance(judged, str):
                 reasons.add(judged)
                 continue
             filer, valid, known = judged
-            earlier = links.get(claim.assetid)
-            if earlier is None or valid < earlier[2]:
-                links[claim.assetid] = (
-                    filer.cik,
-                    replace(filer.evidence, known_from_us=known),
-                    valid,
-                )
-            named = names.get(filer.cik)
-            if named is None or filer.evidence.order() < named.evidence.order():
-                names[filer.cik] = filer
+            candidates.append((claim.assetid, ticker, filer, valid, known))
         for reason in sorted(reasons):
             unresolved[reason].append(ticker)
+    return _chosen(candidates, unresolved)
+
+
+def _chosen(
+    candidates: Sequence[tuple[str, str, Filer, int, int]], unresolved: dict[str, list[str]]
+) -> tuple[list[Record], dict[str, tuple[str, Evidence, int]]]:
+    """Each series' earliest-valid link among its (assetid, ticker, filer, valid, known)."""
+    links: dict[str, tuple[str, Evidence, int]] = {}
+    for assetid, _, filer, valid, known in sorted(
+        candidates, key=lambda item: (item[3], item[2].evidence.order(), item[1])
+    ):
+        if assetid not in links:
+            links[assetid] = (filer.cik, replace(filer.evidence, known_from_us=known), valid)
+    names: dict[str, Filer] = {}
+    differing: set[str] = set()
+    for assetid, ticker, filer, _, _ in candidates:
+        if links[assetid][0] != filer.cik:
+            differing.add(ticker)
+            continue
+        named = names.get(filer.cik)
+        if named is None or filer.evidence.order() < named.evidence.order():
+            names[filer.cik] = filer
+    if differing:
+        unresolved["sec_cik_differs_across_claims"].extend(sorted(differing))
     issuers = [
         {**_anchor("sec_cik", cik), "name": filer.name} for cik, filer in sorted(names.items())
     ]

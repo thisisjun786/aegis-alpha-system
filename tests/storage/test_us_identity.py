@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
@@ -873,3 +874,44 @@ def test_the_report_reads_the_master_as_us_build_does(tmp_path: Path) -> None:
         built.through,
     )
     assert reported.unresolved == built.unresolved
+
+
+def test_a_series_links_to_the_earliest_valid_cik_of_all_its_claims() -> None:
+    """Asset 1 held BBB (CIK X, valid t1) and later AAA (CIK Y, valid t2 > t1)."""
+    from aegis_alpha.storage import us_identity  # noqa: PLC0415 -- private helpers under test
+
+    def evidence(source: str, known: int) -> us_identity.Evidence:
+        return us_identity.Evidence(source, hashlib.sha256(source.encode()).hexdigest(), known)
+
+    early, late = (
+        us_identity._Claim(  # noqa: SLF001
+            "1", 0, 100, etf=False, evidence=evidence("master", 0), after="claim"
+        ),
+        us_identity._Claim(  # noqa: SLF001
+            "1", 100, 200, etf=False, evidence=evidence("export", 100), after="claim"
+        ),
+    )
+    filers = [
+        us_identity.Filer("0000000001", "X Corp", ("BBB",), evidence("sec-x", 10)),
+        us_identity.Filer("0000000002", "Y Corp", ("AAA",), evidence("sec-y", 150)),
+    ]
+
+    def agreed(symbol: str, cik: str, known: int) -> us_identity.Profile:
+        return us_identity.Profile(
+            symbol, cik, None, None, etf=False, currency="USD", evidence=evidence("fmp", known)
+        )
+
+    unresolved: defaultdict[str, list[str]] = defaultdict(list)
+    issuers, links = us_identity._issuers(  # noqa: SLF001
+        filers,
+        {
+            ("BBB", early): agreed("BBB", "0000000001", 20),
+            ("AAA", late): agreed("AAA", "0000000002", 160),
+        },
+        {"AAA": [late], "BBB": [early]},
+        unresolved,
+    )
+    # AAA sorts first, yet the series keeps BBB's earlier-valid link and AAA stays unresolved.
+    assert (links["1"][0], links["1"][2]) == ("0000000001", 20)
+    assert [issuer["name"] for issuer in issuers] == ["X Corp"]
+    assert dict(unresolved) == {"sec_cik_differs_across_claims": ["AAA"]}

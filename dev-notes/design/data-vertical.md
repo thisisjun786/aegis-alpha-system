@@ -333,8 +333,9 @@ microsecond, 시간 입력은 `session_date` 하나다. 값 일부만 있는 bar
   `bars`)를 canonical unadjusted USD `prices`로 옮긴다. `database`가 `US Equities`·`US Equities Delisted`인
   행만 세션 날짜를 가지며, 날짜는 실제 날짜인 `YYYY-MM-DD` 원문일 때만 읽는다. 그 밖의 행은 필수 열 누락으로
   거부된다. 다섯 값은 CSV 원문 그대로 `decimal_text@1`에 넘기므로 `1.6357e+06` 같은 잘린 거래량은 그 값과
-  `volume_precision_limited` flag로 남는다. 다섯 원문이 모두 부호 없는 십진수이면 `present`, 모두 비었으면
-  `missing`이다. 행에 수집 시각이 없으므로 수집 시각은 원천의 `sl:` 연결 시각이다.
+  `volume_precision_limited` flag로 남는다. 이 flag는 열 이름과 함께 기록되며, `2.914e+06`처럼 지수로 쓴
+  가격 열에도 붙는다(flag의 열이 그 값을 가리킨다). 다섯 원문이 모두 음수가 아닌 십진수이면 `present`, 모두
+  비었으면 `missing`이다. 행에 수집 시각이 없으므로 수집 시각은 원천의 `sl:` 연결 시각이다.
 - `norgate.prices_adjusted@1`은 Norgate 조정 가격 part(`assetid`, 0시의 nanosecond `date`, binary32 OHLCV,
   `adjustment_type`)를 reference USD `prices`로 옮긴다. `CAPITAL`은 `split_adjusted`, `TOTALRETURN`은
   `total_return`이고, 다른 조정 유형은 basis가, 시각이 0시가 아닌 날짜는 세션 날짜가 없어 거부된다. binary32
@@ -344,8 +345,12 @@ microsecond, 시간 입력은 `session_date` 하나다. 값 일부만 있는 bar
   경제 지표, 외환 현물, 상품)의 history 내보내기를 close 전용(`fields='close'`) reference `prices`로 옮긴다.
   close는 내보내기의 `Close` 원문을 `decimal_text@1`에 넘긴다. 기준 시리즈 표의 close는 그 원문이 저장된
   double과 같고 원문 `Date`가 행 날짜와 같을 때만 `present`이다. history 내보내기의 주식 행은 세션 날짜가
-  없어 거부되므로 주식 내보내기가 기준 시리즈로 승격되지 않는다. 가격 도메인은 음수를 담지 않으므로 0보다 작은 수준(스프레드, 음의 금리·선물 가격)은 값 없이
-  `invalid`다. 시리즈 수준은 금액이 아니므로 통화는
+  없어 거부되므로 주식 내보내기가 기준 시리즈로 승격되지 않는다. 가격 도메인은 음수를 담지 않는다. 음수
+  수준이 있는 시리즈(등락 종목 수, 스프레드, 금리, 변화율)의 음수가 아닌 날만 남기면 값이 있는 곳에서는
+  완전해 보이는 검열된 시리즈가 되므로, `norgate.reference_history@1`은 인자 `signed`(증가 순서의 asset ID
+  목록, `signed_series`가 내보내기에서 계산)에 든 시리즈의 행을 하나도 고르지 않고 계획은 그 행을
+  `unselected_rows`로 센다. 그 시리즈는 부호 있는 값 도메인의 몫이다(Linear AAS-67). 그 밖의 음수 close는
+  값 없이 `invalid`다. 시리즈 수준은 금액이 아니므로 통화는
   `XXX`(ISO 4217 "통화 없음"), basis는 Norgate가 낸 그대로인 `unadjusted`다. 1970년 이전 날짜(1890년대
   지수)의 시간 입력은 1970-01-01로 올린다. 더 늦은 날짜도 그 행이 공개된 시점의 상한이다.
 - `fmp.eod_non_split@1`은 FMP 동결 snapshot의 non-split-adjusted 일봉(`symbol`, `date`, binary64
@@ -356,6 +361,14 @@ microsecond, 시간 입력은 `session_date` 하나다. 값 일부만 있는 bar
   generation으로 승격하면 정정은 그것을 수집한 시각부터 알려진 SUPERSEDE가 되고 바뀌지 않은 bar는 다시 쓰지
   않는다. 같은 시각에 수집한 서로 다른 응답은 revision 1에 모두 들어가 자연키 반복으로 거부되고, 그 bar는
   이후 revision에 들어가지 않는다.
+
+텍스트 값 원문을 읽는 매퍼(FRED·KR 거시, 텍스트 FX, Norgate history 내보내기 가격)는 값 판정 하나를
+함께 쓴다. 원문이 `decimal_text@1`이 바꾸는 십진수(부호, 소수점, 지수 허용)이고 매퍼의 부호 범위(거시 값은
+제한 없음, 가격과 거래량은 0 이상, FX 환율은 0 초과) 안이면 `present`, 비었거나 없거나 FRED의 `.`이면
+`missing`, 그 밖은 `invalid`다. 같은 Norgate history 행은 `norgate.fx_history@1`과
+`norgate.reference_history@1`에서 0인 값만 달리 판정된다. 같은 내보내기 모양을 읽는 세 매퍼
+(`norgate.prices_none@1`, `norgate.reference_history@1`, `norgate.fx_history@1`)는 `norgate-history-csv-`
+원천만 받는다.
 
 예정된 매퍼 목록: `norgate.dividends`,
 `fmp.actions`, `sec.submissions`, `sec.companyfacts`,
@@ -699,8 +712,8 @@ generation에 승격하며, 두 시점 열은 `declared_session_end@1`(근거 `r
 KRX 토요일 session은 확인되지 않은 반일 마감 대신 평일 마감을 선언하며, 이 값은 실제 마감보다 늦은
 상한이다. 원천 자료실의 관측 거래일은 선언의 대조 근거이고 선언에 섞이지 않는다.
 `scripts/calendar_compare.py`는 market 파일을 읽기 전용으로 열어 패키지 선언과 일봉 원천의 거래일을
-비교한다. 날짜와 거래량은 타입 값이든 내보내기 원문이든 읽으며, 날짜나 수로 읽히지 않는 값은 없는 것으로
-센다. 거래일은 거래량이 있는 행 수가 앞뒤 30일 최대값의 5% 이상인 날짜이고, 보고는 선언 session 중
+비교한다. 날짜와 거래량은 타입 값이든 내보내기 원문이든 읽으며, 수로 읽히지 않는 거래량은 없는 것으로,
+날짜로 읽히지 않는 행은 session이 아닌 `undated_rows`로 센다. 거래일은 거래량이 있는 행 수가 앞뒤 30일 최대값의 5% 이상인 날짜이고, 보고는 선언 session 중
 거래가 없는 날짜(행 없음과 얇은 거래), 선언이 닫은 거래일, 거래 흔적 없이 행만 있는 휴장일 수다.
 
 ## 대상 dataset
@@ -711,9 +724,9 @@ KRX 토요일 session은 확인되지 않은 반일 마감 대신 평일 마감�
 | `prices.kr.eodhd.ref` | `prices`, reference `total_return`, `fields='close'` | 같은 원천의 adjusted close(`eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1`), `float_shortest@1` |
 | `prices.us.norgate` | `prices`, canonical unadjusted | Norgate 비조정 일봉 내보내기(CSV), `norgate.prices_none@1`. 다섯 값 모두 `decimal_text@1` |
 | `prices.us.norgate.ref` | `prices`, reference `split_adjusted`·`total_return` | Norgate 조정 OHLC, `norgate.prices_adjusted@1`. float32 저장값은 `float_shortest@1` |
-| `prices.us.eodhd` | `prices`, canonical unadjusted | EODHD US 일간 수집, `eodhd.bars@1`. 다운로드 하나가 generation 하나이고 같은 날짜의 다른 다운로드는 SUPERSEDE. Norgate와 겹치는 구간에 `cross_provider_mismatch@1`(기준 `prices.us.norgate`) |
-| `prices.us.fmp.ref` | `prices`, reference unadjusted | FMP 동결 snapshot, `fmp.eod_non_split@1`. 정정은 revision 번호순 generation |
-| `prices.ref.norgate` | `prices`, reference, `fields='close'` | Norgate 기준 시리즈(`norgate.reference_closes@1`)와 지수·기타 데이터베이스 내보내기(`norgate.reference_history@1`) |
+| `prices.us.eodhd` | `prices`, canonical unadjusted | EODHD US 일간 수집, `eodhd.bars@1`. 다운로드 하나가 generation 하나이고 같은 날짜의 다른 다운로드는 SUPERSEDE. Norgate와 겹치는 구간에 `cross_provider_mismatch@1`(기준 `prices.us.norgate`). identity가 해석한 US 보류 행의 재처리 단계는 Linear AAS-69 |
+| `prices.us.fmp.ref` | `prices`, reference unadjusted | FMP 동결 legacy non-split 응답, `fmp.eod_non_split@1`. 정정은 revision 번호순 generation. 원천 자료실 FMP normalized lineage(eod_full, dividend_adjusted)의 매퍼는 Linear AAS-68 |
+| `prices.ref.norgate` | `prices`, reference, `fields='close'` | Norgate 기준 시리즈(`norgate.reference_closes@1`)와 지수·기타 데이터베이스 내보내기(`norgate.reference_history@1`). 음수 수준이 있는 시리즈는 `signed`로 고르지 않는다 |
 | `sessions.xnys`, `sessions.xkrx` | `calendar_sessions` | [선언 달력](#선언-달력) 문서. 관측 거래일은 대조 보고의 근거. 임시 휴장은 SUPERSEDE |
 | `actions.us.norgate`, `actions.us.fmp.ref`, `actions.{us,kr}.eodhd` | `corporate_actions` | `exdate_open@1` |
 | `status.us.norgate`, `status.kr.kind` | `instrument_status` | 상장·상폐 이력 |
@@ -1385,3 +1398,9 @@ state v2:
 | DV-190 | Norgate 조정 part는 `float_shortest@1`로 승격되고 binary32 저장값에 `provider_float_storage` flag를 단다 | `tests/storage/test_us_prices.py::test_norgate_adjusted_parts_promote_with_float_storage_flags` | 구현 |
 | DV-191 | FMP 정정은 다음 revision generation의 SUPERSEDE이며 정정을 수집한 시각부터 알려진다 | `tests/storage/test_us_prices.py::test_fmp_corrections_promote_as_later_generations` | 구현 |
 | DV-192 | history 내보내기는 master에 없는 시리즈를 asset ID로 발급하고 `through` 뒤 창의 티커 주장을 만들며, 그 창에서 수집한 FMP profile은 창의 시리즈로 판단되고 모호하거나 옮겨 간 티커는 미해결이다 | `tests/storage/test_us_prices.py::test_exports_extend_ticker_claims_past_the_master` | 구현 |
+| DV-193 | 부호 있는 Norgate 기준 시리즈는 `signed_series`로 찾고, 명세의 `signed`에 들면 행이 하나도 선택되지 않으며 `signed`는 증가하는 asset ID 목록이어야 한다 | `tests/storage/test_us_prices.py::test_norgate_reference_series_are_close_only` | 구현 |
+| DV-194 | 같은 Norgate history 행은 `norgate.fx_history@1`과 `norgate.reference_history@1`에서 같은 값 판정을 받고 0만 다르다 | `tests/storage/test_us_prices.py::test_history_mappers_share_one_value_predicate` | 구현 |
+| DV-195 | history 내보내기 가격 매퍼는 `norgate-history-csv-`가 아닌 원천 pin을 명세 단계에서 거부한다 | `tests/storage/test_us_prices.py::test_history_mappers_refuse_another_providers_source` | 구현 |
+| DV-196 | 같은 시각에 수집한 서로 다른 FMP 응답은 승격에서 자연키 반복으로 거부되고, 그 bar의 뒤 정정은 revision 2에 들지 않는다 | `tests/storage/test_us_prices.py::test_fmp_tied_responses_are_refused_and_never_revised` | 구현 |
+| DV-197 | 한 시리즈의 issuer 연결은 모든 티커 주장 중 가장 이른 유효 시작의 CIK이고, 다른 CIK를 대는 주장은 처리 순서와 무관하게 미해결이다 | `tests/storage/test_us_identity.py::test_a_series_links_to_the_earliest_valid_cik_of_all_its_claims` | 구현 |
+| DV-198 | `calendar_compare`는 텍스트 날짜·거래량을 읽고 읽히지 않는 날짜의 행을 session이 아닌 `undated_rows`로 센다 | `tests/tools/test_calendar_compare.py::test_text_dates_and_volumes_are_read_and_undated_rows_counted` | 구현 |

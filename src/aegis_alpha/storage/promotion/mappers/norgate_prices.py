@@ -9,12 +9,15 @@ retrieval. Nothing is filled from a neighbour; a bar with some values and not ot
 ``invalid`` and keeps none.
 
 - ``norgate.prices_none@1`` reads a history CSV export (``norgate.history_export@1``: the
-  ``bars`` table of ``norgate-history-csv`` sources, every value the CSV text) of the US
+  ``bars`` table of ``norgate-history-csv-*`` sources, every value the CSV text) of the US
   equity databases (``US Equities``, ``US Equities Delisted``) as canonical ``unadjusted``
   USD bars. Open, high, low, close and volume are the CSV texts for ``decimal_text@1``, so a
-  volume Norgate wrote as ``1.6357e+06`` keeps exactly that value and its precision flag. A
-  bar is ``present`` when all five texts are unsigned decimals. A row of another database
-  or with a date that is not ``YYYY-MM-DD`` has no session date and is refused.
+  volume Norgate wrote as ``1.6357e+06`` keeps exactly that value and its precision flag
+  (``volume_precision_limited``, on whichever column it is written: a price written as
+  ``2.914e+06`` carries it too). A bar is ``present`` when all five texts are nonnegative
+  decimals (``decimal_state`` with sign ``nonnegative``, the predicate the FX and macro
+  mappers use). A row of another database or with a date that is not ``YYYY-MM-DD`` has no
+  session date and is refused.
 - ``norgate.prices_adjusted@1`` reads Norgate's adjusted price parts (``assetid``, a
   nanosecond ``date`` at midnight, binary32 OHLCV, ``adjustment_type``) as ``reference``
   USD bars: ``CAPITAL`` rows are ``split_adjusted`` and ``TOTALRETURN`` rows
@@ -29,34 +32,45 @@ retrieval. Nothing is filled from a neighbour; a bar with some values and not ot
 - ``norgate.reference_history@1`` reads a history CSV export of any other Norgate database
   (indices, economic series, spot FX and commodities) as close-only ``reference`` prices
   from its ``Close`` text. An equity row has no session date and is refused, so an equity
-  export never becomes a reference series by mistake.
+  export never becomes a reference series by mistake. Its argument ``signed`` lists, in
+  increasing order, the asset IDs of the series whose rows it does not select:
+  ``signed_series`` gives every series of an export with a negative close.
 
-A negative level (a spread or a rate below zero) is ``invalid``: the price domain holds no
-negative value. A reference series level is not an amount of money, so both close-only
-mappers name the currency ``XXX`` (ISO 4217 "no currency") and the basis ``unadjusted``:
-the series as Norgate publishes it. Their one time input, ``session_date``, is never before
-1970-01-01 (some indices start in the 1890s); the canonical and adjusted equity bars start
-in 1990.
+The price domain holds no negative value. A signed series (a net-advance count, a spread, a
+rate or a percentage change) is a level of another kind, and keeping only its nonnegative
+days would leave a series that looks complete wherever it has a value; so the spec names
+it in ``signed`` and the plan counts its rows as unselected, never promoting part of it. A
+negative close in any other row (``reference_closes`` or a series ``signed`` does not name)
+is ``invalid``. Both history-export mappers read only ``norgate-history-csv-*`` sources,
+the shape ``norgate.fx_history@1`` reads too.
+
+A reference series level is not an amount of money, so both close-only mappers name the
+currency ``XXX`` (ISO 4217 "no currency") and the basis ``unadjusted``: the series as
+Norgate publishes it. Their one time input, ``session_date``, is never before 1970-01-01
+(some indices start in the 1890s); the canonical and adjusted equity bars start in 1990.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Final
+from typing import TYPE_CHECKING, Final, cast
 
 from aegis_alpha.storage.promotion.formats import sql_literal
 from aegis_alpha.storage.promotion.mappers import IdentityKey
-from aegis_alpha.storage.promotion.mappers.daily import (
+from aegis_alpha.storage.promotion.mappers.common import (
     bar_state,
     day_end_us,
+    decimal_state,
     epoch_floor,
     exact_args,
     iso_day,
-    text_state,
     zone_arg,
     zone_start_us,
 )
 from aegis_alpha.storage.promotion.time_rules import InputKind
+
+if TYPE_CHECKING:
+    import duckdb
 
 EQUITY_DATABASES: Final = ("US Equities", "US Equities Delisted")
 NO_CURRENCY: Final = "XXX"
@@ -64,6 +78,7 @@ _VALUES: Final = ("open", "high", "low", "close", "volume")
 _IDENTITY: Final = IdentityKey("norgate", "norgate_assetid")
 _ADJUSTMENTS: Final = {"CAPITAL": "split_adjusted", "TOTALRETURN": "total_return"}
 _CLOSE_ONLY: Final = ("open", "high", "low", "volume")
+_HISTORY: Final = ("norgate-history-csv-",)
 
 
 def _equity(column: str) -> str:
@@ -96,6 +111,7 @@ class _Norgate:
     time_inputs: Final[Mapping[str, InputKind]] = {"session_date": "date"}
     row_flags: Final[Mapping[str, str]] = {}
     manifest_items: Final = None
+    source_prefixes: tuple[str, ...] = ()
     name: str
     major: int
 
@@ -111,6 +127,7 @@ class _Norgate:
 class NorgatePricesNone(_Norgate):
     name: Final = "norgate.prices_none"
     major: Final = 1
+    source_prefixes: Final = _HISTORY
     partition_sql: Final = iso_day('"date"')
 
     def source_columns(self) -> Mapping[str, frozenset[str]]:
@@ -128,7 +145,7 @@ class NorgatePricesNone(_Norgate):
     def select(self, source: str, args: Mapping[str, object]) -> str:
         zone = str(args["timezone"])
         day = f"CASE WHEN {_equity('database')} THEN {iso_day('date')} END"
-        state = bar_state([text_state(f'"{name}"') for name in _VALUES])
+        state = bar_state([decimal_state(f'"{name}"', "nonnegative") for name in _VALUES])
         values = ", ".join(
             f'CASE WHEN {state} = \'present\' THEN "{name}" END AS "{name}"' for name in _VALUES
         )
@@ -215,7 +232,7 @@ class NorgateReferenceCloses(_Norgate):
         text = "json_extract_string(raw_row_json, '$.Close')"
         stated = "json_extract_string(raw_row_json, '$.Date')"
         agrees = f"TRY_CAST({text} AS DOUBLE) = close AND {stated} = strftime(date, '%Y-%m-%d')"
-        found = text_state(text)
+        found = decimal_state(text, "nonnegative")
         state = (
             f"CASE WHEN close IS NULL AND {found} = 'missing' THEN 'missing' "
             f"WHEN {found} = 'present' AND coalesce({agrees}, false) THEN 'present' "
@@ -227,7 +244,20 @@ class NorgateReferenceCloses(_Norgate):
 class NorgateReferenceHistory(_Norgate):
     name: Final = "norgate.reference_history"
     major: Final = 1
+    source_prefixes: Final = _HISTORY
     partition_sql: Final = iso_day('"date"')
+
+    def check_args(self, args: Mapping[str, object]) -> None:
+        label = f"{self.name}@{self.major}"
+        exact_args(label, args, {"timezone", "signed"})
+        zone_arg(label, args)
+        signed = args["signed"]
+        if (
+            not isinstance(signed, list)
+            or any(type(item) is not int for item in signed)
+            or signed != sorted(set(cast("list[int]", signed)))
+        ):
+            raise ValueError(f"{label} signed is an increasing list of asset IDs")
 
     def source_columns(self) -> Mapping[str, frozenset[str]]:
         return {
@@ -245,5 +275,22 @@ class NorgateReferenceHistory(_Norgate):
         zone = str(args["timezone"])
         reference = f"database IS NOT NULL AND NOT {_equity('database')}"
         day = f"CASE WHEN {reference} THEN {iso_day('date')} END"
-        state = text_state("close")
-        return _head(zone, day) + _close_only(zone, day, "close", state) + f"FROM {source}"
+        state = decimal_state("close", "nonnegative")
+        signed = cast("list[int]", args["signed"])
+        where = f" WHERE assetid NOT IN ({', '.join(map(str, signed))})" if signed else ""
+        return _head(zone, day) + _close_only(zone, day, "close", state) + f"FROM {source}{where}"
+
+
+def signed_series(connection: duckdb.DuckDBPyConnection, relation: str) -> list[int]:
+    """The asset IDs of the reference series in a history export with a negative close.
+
+    ``relation`` is an engine-quoted table or view of ``norgate.history_export@1`` bars; the
+    list is the ``signed`` argument a ``norgate.reference_history@1`` spec over it names.
+    """
+    reference = f"database IS NOT NULL AND NOT {_equity('database')}"
+    rows = connection.execute(
+        f"SELECT DISTINCT assetid FROM {relation} WHERE {reference} "  # noqa: S608
+        f"AND {decimal_state('close')} = 'present' AND TRY_CAST(close AS DOUBLE) < 0 "
+        "ORDER BY assetid"
+    ).fetchall()
+    return [int(assetid) for (assetid,) in rows]

@@ -387,7 +387,30 @@ generation을 pin한다.
 - `prices.us.fmp.ref`: `fmp-price-eod-non-split-*` 원천 전부를 pin하고 `fmp.eod_non_split@1`의 `revision`을
   1부터 delta가 빌 때까지 올리며 이어 승격한다.
 - `prices.ref.norgate`: 기준 시리즈 표는 `norgate.reference_closes@1`, 지수·기타 내보내기는
-  `norgate.reference_history@1`, close `decimal_text@1`.
+  `norgate.reference_history@1`, close `decimal_text@1`. 내보내기 명세의 인자 `signed`는 그 내보내기
+  `bars`에 대한 `norgate_prices.signed_series` 결과(음수 close가 있는 시리즈의 asset ID)이고, 그 행은
+  `unselected_rows`로 센다.
+
+XNYS 세션 공백 보고는 `scripts/calendar_compare.py --calendar XNYS --source-prefix norgate-history-csv-
+--table bars`이고, 날짜로 읽히지 않는 행은 `undated_rows`로 따로 센다. 08-31..09-08 Norgate↔EODHD close
+불일치율은 두 dataset을 게시한 market 파일을 읽기 전용으로 열어 다시 계산한다.
+
+```sql
+WITH g AS (SELECT generation_id, dataset_id FROM market_generations
+           WHERE dataset_id IN ('prices.us.norgate', 'prices.us.eodhd')),
+p AS (SELECT g.dataset_id, instrument_id, session_date, close FROM prices JOIN g USING (generation_id)
+      WHERE value_state = 'present' AND session_date BETWEEN DATE '2026-08-31' AND DATE '2026-09-08'
+      QUALIFY row_number() OVER (PARTITION BY g.dataset_id, instrument_id, session_date
+                                 ORDER BY revision_known_at_us DESC) = 1),
+pair AS (SELECT n.session_date, n.close AS n, e.close AS e
+         FROM p n JOIN p e USING (instrument_id, session_date)
+         WHERE n.dataset_id = 'prices.us.norgate' AND e.dataset_id = 'prices.us.eodhd')
+SELECT session_date, count(*) AS pairs,
+       avg(CASE WHEN n <> e THEN 1 ELSE 0 END) AS any_difference,
+       avg(CASE WHEN abs(e - n) > 0.0001 * n THEN 1 ELSE 0 END) AS over_1bp,
+       avg(CASE WHEN abs(e - n) > 0.01 * n THEN 1 ELSE 0 END) AS over_1pct
+FROM pair GROUP BY ROLLUP (session_date) ORDER BY session_date NULLS LAST;
+```
 
 ### legacy 원천 편입
 

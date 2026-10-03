@@ -28,7 +28,7 @@ from collections.abc import Mapping
 from typing import Final
 
 from aegis_alpha.storage.promotion.mappers import IdentityKey
-from aegis_alpha.storage.promotion.mappers.daily import (
+from aegis_alpha.storage.promotion.mappers.common import (
     day_end_us,
     exact_args,
     zone_arg,
@@ -46,6 +46,7 @@ class FmpEodNonSplit:
     name: Final = "fmp.eod_non_split"
     major: Final = 1
     provider: Final = "fmp"
+    source_prefixes: Final = ()
     domain: Final = "prices"
     partition_sql: Final = '"date"'
     date_column: Final = "session_date"

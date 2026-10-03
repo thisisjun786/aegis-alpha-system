@@ -10,7 +10,8 @@ apart, never as closed)::
         --calendar XKRX --source-prefix qveris-kr-history-62d23e53 --table bars
 
 - dates and volumes may be typed or the export's text (a Norgate history export keeps both
-  as CSV text); a value that does not read as a date or a number counts as absent;
+  as CSV text); a volume that does not read as a number counts as absent, and a row whose
+  date does not read as a date is counted in ``undated_rows``, never as a session;
 - an observed date has at least one row; a traded date has rows with positive volume for
   at least 5% of the largest such count within 30 calendar days either side, so a date
   with a few stale fills in a thin market is not mistaken for a session;
@@ -84,6 +85,18 @@ def observed(
     return {row[0]: (int(row[1]), int(row[2]), int(row[3])) for row in rows}
 
 
+def undated(connection: duckdb.DuckDBPyConnection, targets: list[str], date_column: str) -> int:
+    """The rows whose date does not read as a date."""
+    day = _quote(date_column)
+    total = 0
+    for target in targets:
+        found = connection.execute(
+            f"SELECT count(*) FROM {_quote(target)} WHERE TRY_CAST({day} AS DATE) IS NULL"  # noqa: S608
+        ).fetchone()
+        total += int(found[0]) if found else 0
+    return total
+
+
 def compare(calendar_id: str, days: dict[date, tuple[int, int, int]]) -> dict[str, object]:
     raw = packaged_declaration(calendar_id)
     declaration = parse_declaration(raw, hashlib.sha256(raw).hexdigest())
@@ -151,10 +164,16 @@ def main() -> None:
     try:
         targets = _targets(connection, args.source_prefix, args.table)
         days = observed(connection, targets, args.date_column, args.volume_column)
+        missing = undated(connection, targets, args.date_column)
     finally:
         connection.close()
     report = compare(args.calendar.upper(), days)
-    document = {"source_prefix": args.source_prefix, "tables": len(targets), **report}
+    document = {
+        "source_prefix": args.source_prefix,
+        "tables": len(targets),
+        "undated_rows": missing,
+        **report,
+    }
     sys.stdout.write(json.dumps(document) + "\n")
 
 
