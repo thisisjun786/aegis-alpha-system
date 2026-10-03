@@ -46,6 +46,8 @@ The root `conftest.py` owns network, home, data-root and disposable DB isolation
   needs a resource shared across processes (a fixed path outside `tmp_path`, a port, a
   system-wide lock) carries `@pytest.mark.xdist_group("<reason>")` and a
   `# Serial: <reason>` comment; there is none today. `AAS_TEST_WORKERS=0` runs serially.
+  xdist puts `tmp_path` one directory deeper (`popen-gwN/`), so bind an `AF_UNIX` socket by
+  a name relative to its directory rather than by its 107-byte-limited absolute path.
 - **Fast local loop.** `uv run --no-sync pytest -n auto --dist loadfile -m 'not database'
   <paths>` for the area you change; `./scripts/verify-lane-test` for the whole lane. For
   fsync-heavy storage tests use `TMPDIR=/dev/shm/aas-$USER`, never `/tmp` (a stray `/tmp/.git`
