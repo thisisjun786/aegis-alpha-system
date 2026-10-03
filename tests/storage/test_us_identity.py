@@ -527,6 +527,9 @@ def test_us_sources_register_as_one_document(ws: Workspace, tmp_path: Path) -> N
     )
     with pytest.raises(ValueError, match="no sl: link"):
         link_instant(ws.state, "market-raw-norgate-unlinked")
+    # An FMP source without a link is refused before any document is written.
+    with pytest.raises(ValueError, match="fmp-unlinked has no sl: link"):
+        build_from_workspace(ws, master=master_id, fmp=["fmp-unlinked"])
 
 
 def _new_york(document: tuple[bytes, str]) -> tuple[bytes, str]:

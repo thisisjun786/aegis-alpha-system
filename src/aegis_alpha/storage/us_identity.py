@@ -1109,6 +1109,10 @@ def build_from_workspace(
     the minted asset IDs with; it adds no claim.
     """
     state = workspace.state
+    # Every claim cites its source's sl: link, so an unlinked FMP source is refused here
+    # rather than by registration.
+    for source in fmp:
+        link_instant(state, source)
     master_rows = LinkedRows(
         read_rows(workspace, master, MASTER_TABLE), link_instant(state, master)
     )
