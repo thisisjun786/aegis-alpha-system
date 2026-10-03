@@ -92,8 +92,9 @@ class QualityRule:
     """``cross_provider_mismatch@1``: flag a value that differs beyond ``tolerance``.
 
     ``reference`` pins another provider's published prices; ``column`` is compared on the
-    same instrument, session date and interval, and a relative difference
-    ``|value - reference| > tolerance * |reference|`` flags the promoted revision.
+    same instrument, session date, interval, bar end, basis and currency (every price key
+    but the role), and a relative difference ``|value - reference| > tolerance * |reference|``
+    flags the promoted revision once.
     """
 
     rule: str
@@ -128,8 +129,8 @@ class PromotionSpec:
     tombstone: TombstonePolicy
     identity_snapshot: IdentityPin | None
 
-    def time_rule_documents(self) -> dict[str, object]:
-        return {column: self.time_rules[column].document() for column in TIME_COLUMNS}
+    def time_rule_identities(self) -> dict[str, object]:
+        return {column: self.time_rules[column].identity() for column in TIME_COLUMNS}
 
 
 def _object(value: object, keys: frozenset[str] | set[str], name: str) -> dict[str, object]:

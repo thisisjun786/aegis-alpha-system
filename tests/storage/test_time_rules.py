@@ -185,3 +185,46 @@ def test_rule_after_ingestion_is_clamped_above_physical_base(ws: Workspace) -> N
     ) in _flags(ws, applied["generation_id"])
     timing = cast("dict[str, dict[str, int]]", applied["time_rules"])
     assert timing["available_at_us"]["clamped"] == 1
+
+
+def test_exdate_open_uses_pinned_session_open(ws: Workspace) -> None:
+    opened = us(at("2025-01-02T00:00:00"))
+    calendar = publish_calendar(ws, {D1: (opened, us(at("2025-01-02T06:30:00"))), D2: (None, None)})
+    pin = add_source(
+        ws,
+        [bar("AAA.KO", D1, 100.0, retrieved=LATE), bar("AAA.KO", D2, 101.0, retrieved=LATE)],
+        tag="a",
+    )
+    identity = register_symbols(ws, pin["source_id"])
+    rule = {
+        "rule": "exdate_open@1",
+        "basis": "record",
+        "input": "session_date",
+        "args": {"calendar": calendar, "calendar_id": "XKRX", "venue": "XKRX"},
+    }
+    document = spec([pin], identity, rules=_rules(rule))
+    applied = promote(ws, document[0], document[1], apply=True)
+    rows = {row["session_date"]: row for row in prices(ws, str(applied["generation_id"]))}
+    assert rows[D1]["available_at_us"] == rows[D1]["revision_known_at_us"] == opened
+    # No session open, no value: NULL, never the ingestion.
+    assert rows[D2]["available_at_us"] is None
+    assert rows[D2]["revision_known_at_us"] is None
+
+
+def test_source_column_is_its_own_value_and_base() -> None:
+    rule = parse_rule(
+        "revision_known_at_us",
+        {"rule": "source_column@1", "basis": "revision", "input": "t", "args": {}},
+        {"t": "utc_us"},
+    )
+    computed = rule_sql(rule, "t", None)
+    published = us(at("2025-01-02T09:00:00"))
+    connection = duckdb.connect()
+    assert connection.execute(
+        f"SELECT {computed.value}, {computed.base} FROM (SELECT ?::BIGINT AS t)", [published]
+    ).fetchone() == (published, published)
+    # Ingested after the source's own time: kept. Before it: held, never clamped.
+    assert bound(published, published, published + 1) == time_rules.Bounded(
+        published, clamped=False, held=False
+    )
+    assert bound(published, published, published - 1).held is True

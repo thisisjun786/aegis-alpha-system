@@ -24,13 +24,18 @@ from aegis_alpha.storage.promotion.decimal_rules import (
 )
 
 
-def _sql(rule: DecimalRule, kind: str, values: Sequence[object]) -> list[Converted | None]:
-    """Run ``rule`` in DuckDB; None marks a refused value."""
+def _sql(
+    rule: DecimalRule, kind: str, values: Sequence[object], currency: str | None = "KRW"
+) -> list[Converted | None]:
+    """Run ``rule`` in DuckDB over rows of ``currency``; None marks a refused value."""
     connection = duckdb.connect()
     decimal_rules.install(connection)
-    connection.execute(f"CREATE TABLE t (n BIGINT, v {kind})")
-    connection.executemany("INSERT INTO t VALUES (?, ?)", list(enumerate(values)))
-    layers, conversion = decimal_rules.conversion(rule, "v", kind, "_c_")
+    connection.execute(f"CREATE TABLE t (n BIGINT, v {kind}, c VARCHAR)")
+    connection.executemany(
+        "INSERT INTO t VALUES (?, ?, ?)",
+        [(index, value, currency) for index, value in enumerate(values)],
+    )
+    layers, conversion = decimal_rules.conversion(rule, "v", kind, "_c_", currency="c")
     sql = "SELECT * FROM t"
     for layer in layers:
         sql = f"SELECT *, {', '.join(f'{expr} AS {alias}' for alias, expr in layer)} FROM ({sql})"
@@ -50,9 +55,11 @@ def _sql(rule: DecimalRule, kind: str, values: Sequence[object]) -> list[Convert
     return results
 
 
-def _reference(rule: DecimalRule, kind: str, value: object) -> Converted | None:
+def _reference(
+    rule: DecimalRule, kind: str, value: object, currency: str = "KRW"
+) -> Converted | None:
     try:
-        return convert(rule, value, kind)
+        return convert(rule, value, kind, currency=currency)
     except (ValueError, TypeError):
         return None
 
@@ -75,13 +82,21 @@ def test_krw_tick_rounds_half_even_and_flags() -> None:
         Converted(None, ()),
     ]
     for value, want, sql in zip(values, expected, _sql(KRW_TICK, "DOUBLE", values), strict=True):
-        assert _same(convert(KRW_TICK, value, "DOUBLE"), want), value
+        assert _same(convert(KRW_TICK, value, "DOUBLE", currency="KRW"), want), value
         assert _same(sql, want), value
     for refused in (math.inf, math.nan, 1e26):
         assert _reference(KRW_TICK, "DOUBLE", refused) is None
     assert _sql(KRW_TICK, "DOUBLE", [math.inf, math.nan, 1e26]) == [None, None, None]
     with pytest.raises(ValueError, match="KRW price columns"):
         decimal_rules.check_column("krw_tick@1", "volume", "DOUBLE", domain="prices")
+
+
+def test_krw_tick_refuses_rows_in_another_currency() -> None:
+    values = [12.34, 51900.0, None]
+    expected = [None, None, Converted(None, ())]
+    assert _sql(KRW_TICK, "DOUBLE", values, currency="USD") == expected
+    assert [_reference(KRW_TICK, "DOUBLE", value, "USD") for value in values] == expected
+    assert _sql(KRW_TICK, "DOUBLE", [12.34], currency=None) == [None]
 
 
 def _doubles(rng: random.Random, count: int) -> list[float]:

@@ -11,7 +11,8 @@ row's ``source_row_hash``. Every rule refuses NaN, infinities and values outside
   fits 12 decimals. No flag.
 - ``krw_tick@1`` (binary64 KRW price): the exact binary expansion rounded to whole won,
   half to even. ``provider_float_reconstructed`` when the value was not whole and
-  ``decimal_rounding_tie`` when it was exactly half.
+  ``decimal_rounding_tie`` when it was exactly half. A row whose currency is not ``KRW``
+  is refused, never rounded.
 - ``float_shortest@1`` (binary32 or binary64): the fewest correctly rounded significant
   digits that convert back to the stored value at its width, then 12 decimals half to
   even. ``provider_float_storage`` when the result differs from the stored binary value
@@ -236,12 +237,13 @@ def _shortest_text(value: str, kind: str) -> str:
 
 
 def conversion(
-    found: DecimalRule, column: str, kind: str, prefix: str
+    found: DecimalRule, column: str, kind: str, prefix: str, *, currency: str | None = None
 ) -> tuple[list[Layer], Conversion]:
     """The SQL of ``found`` over the source value ``column`` of type ``kind``.
 
-    Returns projection layers (each may read the columns of the layers before it; every
-    name starts with ``prefix``) and the final expressions over those columns.
+    ``currency`` is the SQL of the row's currency, which ``krw_tick@1`` needs. Returns
+    projection layers (each may read the columns of the layers before it; every name
+    starts with ``prefix``) and the final expressions over those columns.
     """
     present = f"{column} IS NOT NULL"
     if found is DECIMAL_TEXT:
@@ -265,6 +267,8 @@ def conversion(
     double = f"CAST({column} AS DOUBLE)"
     finite = f"(isfinite({double}) AND abs({double}) < 1e26)"
     if found is KRW_TICK:
+        if currency is None:
+            raise ValueError("krw_tick@1 needs the row currency")
         whole = f"floor({column})"
         rest = f"({column} - {whole})"
         rounded = (
@@ -273,7 +277,7 @@ def conversion(
         )
         return [], Conversion(
             value=f"CAST(CAST({rounded} AS HUGEINT) AS DECIMAL(38,12))",
-            refused=f"{present} AND NOT {finite}",
+            refused=f"{present} AND (NOT {finite} OR {currency} IS DISTINCT FROM 'KRW')",
             flags=(
                 ("provider_float_reconstructed", f"{present} AND {rest} <> 0"),
                 ("decimal_rounding_tie", f"{present} AND {rest} = 0.5"),
@@ -383,7 +387,11 @@ def _text_reference(value: object) -> Converted:
     return Converted(result, ("volume_precision_limited",) if limited else ())
 
 
-def _float_reference(found: DecimalRule, value: float, kind: str) -> Converted:
+def _float_reference(
+    found: DecimalRule, value: float, kind: str, currency: str | None
+) -> Converted:
+    if found is KRW_TICK and currency != "KRW":
+        raise ValueError("krw_tick@1 converts KRW rows only")
     exact = _bounded(Decimal(value))
     if found is EXACT:
         result, _ = _quantize(exact)
@@ -410,8 +418,13 @@ def _float_reference(found: DecimalRule, value: float, kind: str) -> Converted:
     return Converted(result, tuple(flags))
 
 
-def convert(found: DecimalRule, value: object, kind: str) -> Converted:
-    """The Python reference of ``found`` for one source value of DuckDB type ``kind``."""
+def convert(
+    found: DecimalRule, value: object, kind: str, *, currency: str | None = None
+) -> Converted:
+    """The Python reference of ``found`` for one source value of DuckDB type ``kind``.
+
+    ``currency`` is the row's currency, which ``krw_tick@1`` needs.
+    """
     if value is None:
         return Converted(None, ())
     if found is DECIMAL_TEXT:
@@ -425,4 +438,4 @@ def convert(found: DecimalRule, value: object, kind: str) -> Converted:
         return Converted(result, ())
     if not isinstance(value, float):
         raise TypeError("expected a floating point source value")
-    return _float_reference(found, value, kind)
+    return _float_reference(found, value, kind, currency)

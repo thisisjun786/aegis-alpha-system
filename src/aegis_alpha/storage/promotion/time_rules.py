@@ -32,7 +32,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Final, Literal, cast
 from zoneinfo import ZoneInfo
 
 from aegis_alpha.storage.market_inputs import GenerationPin
@@ -112,8 +112,19 @@ class TimeRule:
         pin = self.args.get("calendar")
         return pin if isinstance(pin, GenerationPin) else None
 
+    def identity(self) -> dict[str, object]:
+        """The rule a chain keeps: its document without the calendar data pin.
+
+        The calendar pin is evidence the rule reads, not the rule; a chain may move it to a
+        descendant generation of the same calendar dataset.
+        """
+        document = self.document()
+        args = cast("dict[str, object]", document["args"])
+        document["args"] = {key: value for key, value in args.items() if key != "calendar"}
+        return document
+
     def document(self) -> dict[str, object]:
-        """The canonical spec form, used to compare a chain's rules."""
+        """The canonical spec form of the rule and its arguments."""
         args = {
             key: (
                 {name: getattr(value, name) for name in sorted(_PIN_KEYS)}

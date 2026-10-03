@@ -107,6 +107,7 @@ _TEMP: Final = (
     "cal1",
 )
 _FLAG_ROW_BYTES: Final = 4096
+_COMPARED_KEYS: Final = tuple(name for name in NATURAL_KEYS["prices"] if name != "price_role")
 
 
 def _t(name: str) -> str:
@@ -521,7 +522,13 @@ def _rows(
     flags: list[_Flag] = []
     for position, (column, found) in enumerate(sorted(spec.decimal_rules.items())):
         prefix = f"_aas_d{position}_"
-        added, conversion = decimal_rules.conversion(found, _q(column), numeric[column], prefix)
+        added, conversion = decimal_rules.conversion(
+            found,
+            _q(column),
+            numeric[column],
+            prefix,
+            currency=_q("currency") if spec.domain == "prices" else None,
+        )
         for index, layer in enumerate(added):
             while len(layers) <= index:
                 layers.append([])
@@ -710,9 +717,27 @@ def _tombstones(
         )
     if evidence is None:
         plan.blocking.append("tombstone evidence needs every pinned source's sl: link")
+    (full,) = [
+        index
+        for index, source in enumerate(sources)
+        if (source.pin.source_id, source.pin.table)
+        == (policy.source.source_id, policy.source.table)
+    ]
+    # Only the full snapshot proves absence; another pinned table's row inside its scope
+    # contradicts the declared completeness, so the plan says so instead of picking one.
+    contradicting = _count(
+        market,
+        f"SELECT count(*) FROM {_t('rows')} r WHERE r._aas_pin <> {full} "
+        f"AND r._aas_status IN ('ok', 'held') AND ({_scope_sql(workspace, spec, 'r')})",
+    )
+    if contradicting:
+        plan.refusals.append(
+            f"{contradicting} rows of other pinned sources fall in the full snapshot's scope; "
+            "promote them in a separate generation"
+        )
     absent = (
         f"h.op <> 'TOMBSTONE' AND ({_scope_sql(workspace, spec, 'h')}) AND NOT EXISTS "
-        f"(SELECT 1 FROM {_t('rows')} r WHERE r.record_id = h.record_id)"
+        f"(SELECT 1 FROM {_t('rows')} r WHERE r.record_id = h.record_id AND r._aas_pin = {full})"
     )
     stamp = "NULL" if evidence is None else str(evidence)
     stale = (
@@ -840,8 +865,16 @@ def _flags(
     spec: PromotionSpec,
     flags: list[_Flag],
     budget: ComputeBudget,
+    refusals: list[str],
 ) -> dict[str, int]:
-    """Write ``_aas_p_flags``, one row per (revision, rule, flag) with the columns it names."""
+    """Write ``_aas_p_flags``, one row per (revision, rule, flag) with the columns it names.
+
+    A cross-provider rule compares a delta row with the reference head of the same
+    instrument, session, interval, bar end, basis and currency (the price key without the
+    role, which differs between a canonical and a reference dataset), so an adjusted
+    reference never judges an unadjusted value and a row matches at most one reference.
+    A flag key repeated within the delta is refused before anything is prepared.
+    """
     market = workspace.market
     groups: dict[tuple[str, str, str], list[_Flag]] = {}
     for flag in flags:
@@ -866,21 +899,23 @@ def _flags(
     for rule in spec.quality_rules:
         chain = _verify_pin(workspace, rule.reference, budget)
         column = _q(rule.column)
+        keys = ", ".join(_q(name) for name in _COMPARED_KEYS)
         market.execute(
-            f"CREATE OR REPLACE TEMP TABLE {_t('ref')} AS SELECT instrument_id, session_date, "
-            f"interval, {column} AS v FROM ({_heads_sql('prices')}) "
-            "WHERE op <> 'TOMBSTONE' AND value_state = 'present'",
+            f"CREATE OR REPLACE TEMP TABLE {_t('ref')} AS SELECT {keys}, {column} AS v "
+            f"FROM ({_heads_sql('prices')}) WHERE op <> 'TOMBSTONE' AND value_state = 'present'",
             [chain],
         )
         tolerance = f"CAST('{rule.tolerance}' AS DECIMAL(38,12))"
+        same = " AND ".join(
+            f"r.{_q(name)} IS NOT DISTINCT FROM d.{_q(name)}" for name in _COMPARED_KEYS
+        )
         selects.append(
             f"SELECT d.record_id, d.revision_id, {formats.sql_literal(rule.rule_id)} AS rule_id, "
             f"{formats.sql_literal(rule.version)} AS rule_version, "
             "'cross_provider_mismatch' AS flag, "
-            f"{formats.sql_literal(rule.column)} AS detail FROM {_t('delta')} d JOIN {_t('ref')} r "
-            "ON r.instrument_id = d.instrument_id AND r.session_date = d.session_date "
-            f"AND r.interval = d.interval WHERE d.op <> 'TOMBSTONE' AND d.{column} IS NOT NULL "
-            f"AND abs(d.{column} - r.v) > {tolerance} * abs(r.v)"
+            f"{formats.sql_literal(rule.column)} AS detail FROM {_t('delta')} d "
+            f"WHERE d.op <> 'TOMBSTONE' AND d.{column} IS NOT NULL AND EXISTS (SELECT 1 FROM "
+            f"{_t('ref')} r WHERE {same} AND abs(d.{column} - r.v) > {tolerance} * abs(r.v))"
         )
     if selects:
         market.execute(
@@ -891,6 +926,14 @@ def _flags(
             f"CREATE OR REPLACE TEMP TABLE {_t('flags')} (record_id VARCHAR, revision_id VARCHAR, "
             "rule_id VARCHAR, rule_version VARCHAR, flag VARCHAR, detail VARCHAR)"
         )
+    duplicated = _count(
+        market,
+        "SELECT count(*) FROM (SELECT 1 FROM "
+        f"{_t('flags')} GROUP BY record_id, revision_id, rule_id, rule_version, flag "
+        "HAVING count(*) > 1)",
+    )
+    if duplicated:
+        refusals.append(f"{duplicated} quality flag keys repeat within the delta")
     return {
         str(name): int(count)
         for name, count in market.execute(
@@ -965,11 +1008,25 @@ def _check_parent(workspace: Workspace, spec: PromotionSpec) -> int:
     parent = parse_spec(_read_raw(workspace, str(catalog[0])), str(catalog[0]))
     if parent.domain != spec.domain or parent.dataset_id != spec.dataset_id:
         raise ValueError("the parent generation belongs to another dataset")
-    if parent.time_rule_documents() != spec.time_rule_documents():
+    if parent.time_rule_identities() != spec.time_rule_identities():
         raise ValueError(
             "time rules differ from the parent chain's; a new rule generation is a new dataset "
             "(append .r<N> to the dataset ID) promoted from its first generation"
         )
+    for column in TIME_COLUMNS:
+        before = parent.time_rules[column].calendar
+        after = spec.time_rules[column].calendar
+        if before is None or after is None or before == after:
+            continue
+        chain = [
+            str(item["generation_id"])
+            for item in generation_chain(workspace.market, after.generation_id)
+        ]
+        if after.dataset_id != before.dataset_id or before.generation_id not in chain:
+            raise ValueError(
+                f"the {column} calendar pin must be the parent's calendar generation "
+                "or a descendant of it"
+            )
     return int(cast("int", marker["sequence"])) + 1
 
 
@@ -1098,7 +1155,7 @@ def plan_promotion(
     time_flags = _delta(
         workspace, spec, sources, flags, stage_fields=stage_fields, mapped_fields=fields
     )
-    flag_counts = _flags(workspace, spec, flags + time_flags, budget)
+    flag_counts = _flags(workspace, spec, flags + time_flags, budget, plan.refusals)
     operations = {
         str(op): int(count)
         for op, count in market.execute(
@@ -1108,6 +1165,11 @@ def plan_promotion(
     plan.report["operations"] = operations
     plan.report["unchanged"] = _count(
         market, f"SELECT count(*) FROM {_t('diff')} WHERE _aas_op = 'SKIP'"
+    )
+    plan.report["time_drift"] = _count(
+        market,
+        f"SELECT count(*) FROM {_t('diff')} WHERE _aas_op = 'SKIP' AND "
+        "(_aas_t0 IS DISTINCT FROM _aas_h_av OR _aas_t1 IS DISTINCT FROM _aas_h_kn)",
     )
     plan.report["stale"] = _count(
         market, f"SELECT count(*) FROM {_t('diff')} WHERE _aas_stale"
@@ -1204,6 +1266,8 @@ def promote(
     generation_id, operation_id = generation_identity(request_hash)
     operation = get_operation(workspace.state, operation_id)
     if operation is not None:
+        if operation["phase"] == "PREPARED" and not apply:
+            return _pending_plan(workspace, spec, operation, generation_id, budget)
         return _existing(workspace, operation, generation_id, apply=apply, budget=budget)
     if apply:
         pending = workspace.state.execute(
@@ -1228,6 +1292,49 @@ def promote(
         _drop(workspace.market)
 
 
+def _pending_plan(
+    workspace: Workspace,
+    spec: PromotionSpec,
+    operation: Mapping[str, object],
+    generation_id: str,
+    budget: ComputeBudget,
+) -> dict[str, object]:
+    """Plan a request whose intent is pending, writing nothing and recovering nothing.
+
+    Before the market commit the report is recomputed and says whether it still yields
+    the intent's manifest; after it, recovery only has the catalog left to write.
+    """
+    pending: dict[str, object] = {
+        "mode": "plan",
+        "reused": False,
+        "pending": True,
+        "operation_id": operation["operation_id"],
+        "generation_id": generation_id,
+        "request_hash": operation["request_hash"],
+        "published": False,
+    }
+    committed = workspace.market.execute(
+        "SELECT 1 FROM market_generations WHERE generation_id=?", [generation_id]
+    ).fetchone()
+    if committed is not None:
+        return {**pending, "market_committed": True}
+    try:
+        plan = plan_promotion(workspace, spec, budget=budget)
+        manifest = plan.manifest
+        recomputes = (
+            manifest is not None
+            and hashlib.sha256(manifest).hexdigest() == operation["payload_hash"]
+        )
+        return {
+            **plan.summary(),
+            **pending,
+            "market_committed": False,
+            "recomputes_intent": recomputes,
+        }
+    finally:
+        _drop(workspace.market)
+
+
 def _existing(
     workspace: Workspace,
     operation: Mapping[str, object],
@@ -1239,19 +1346,10 @@ def _existing(
     """The answer for a request that already has an intent: reuse, resume or refuse."""
     if operation["phase"] == "QUARANTINED":
         raise ValueError("this promotion request is quarantined")
-    if operation["phase"] == "PREPARED":
-        if not apply:
-            return {
-                "mode": "plan",
-                "reused": False,
-                "pending": True,
-                "operation_id": operation["operation_id"],
-                "generation_id": generation_id,
-                "request_hash": operation["request_hash"],
-                "published": False,
-            }
-        if not recover_promotion(workspace, operation, budget=budget):
-            raise ValueError("the pending promotion no longer recomputes its intent; quarantine it")
+    if operation["phase"] == "PREPARED" and not recover_promotion(
+        workspace, operation, budget=budget
+    ):
+        raise ValueError("the pending promotion no longer recomputes its intent; quarantine it")
     result = verify_promotion(workspace, generation_id, budget=budget)
     return {"mode": "apply" if apply else "plan", "reused": True, **result}
 
@@ -1427,7 +1525,8 @@ def _complete(
                     "INSERT INTO watermarks(provider, dataset_id, partition_id, committed_version, "
                     "through_us) VALUES (?,?,?,?,?) "
                     "ON CONFLICT(provider, dataset_id, partition_id) "
-                    "DO UPDATE SET committed_version=excluded.committed_version, "
+                    "DO UPDATE SET committed_version=CASE WHEN excluded.through_us > through_us "
+                    "THEN excluded.committed_version ELSE committed_version END, "
                     "through_us=max(through_us, excluded.through_us)",
                     (
                         spec.mapper.provider,

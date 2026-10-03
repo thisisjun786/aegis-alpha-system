@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from aegis_alpha.storage.promotion.spec import parse_spec
+from aegis_alpha.storage.promotion.spec import MAX_SPEC_BYTES, parse_spec
 from tests.storage.promotion_support import DAY_RULE, DECIMALS, ZONE
 
 _PIN = {
@@ -101,3 +101,11 @@ def test_spec_rejects_unknown_fields_and_moving_refs() -> None:
     for payload in (duplicate, b"\xef\xbb\xbf" + raw, raw.replace(b"2025", b"NaN", 1)):
         with pytest.raises(ValueError, match=r"JSON|BOM|exactly|ISO"):
             parse_spec(payload, hashlib.sha256(payload).hexdigest())
+    assert b'"quality_rules": []' in raw
+    for literal in (b"NaN", b"Infinity", b"-Infinity"):
+        payload = raw.replace(b'"quality_rules": []', b'"quality_rules": [' + literal + b"]")
+        with pytest.raises(ValueError, match="non-finite"):
+            parse_spec(payload, hashlib.sha256(payload).hexdigest())
+    oversized = raw + b" " * (MAX_SPEC_BYTES + 1 - len(raw))
+    with pytest.raises(ValueError, match="64 MiB"):
+        parse_spec(oversized, hashlib.sha256(oversized).hexdigest())

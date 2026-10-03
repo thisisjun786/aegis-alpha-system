@@ -30,6 +30,7 @@ from tests.storage.promotion_support import (
     bar,
     full_snapshot,
     prices,
+    publish_calendar,
     register_symbols,
     spec,
     us,
@@ -272,6 +273,12 @@ def test_interrupted_promotion_resumes_publication_only(
     assert ws.market.execute("SELECT count(*) FROM market_generations").fetchone() == (0,)
     (pending,) = engine.list_promotions(ws)
     assert pending["phase"] == "PREPARED"
+    # A plan of the pending request recomputes its report and recovers nothing.
+    planned = _plan(ws, document)
+    assert (planned["pending"], planned["market_committed"]) == (True, False)
+    assert planned["recomputes_intent"] is True
+    assert planned["operations"] == {"ASSERT": 1}
+    assert engine.list_promotions(ws)[0]["phase"] == "PREPARED"
     recovered = recover_operations(ws)
     assert recovered["recovered"] == [pending["operation_id"]]
     assert recovered["provider_calls"] == 0
@@ -284,6 +291,7 @@ def test_interrupted_promotion_resumes_publication_only(
         with pytest.raises(RuntimeError):
             _apply(ws, following)
     assert ws.market.execute("SELECT count(*) FROM market_generations").fetchone() == (2,)
+    assert _plan(ws, following)["market_committed"] is True
     # Repeating the same request finishes the catalog without publishing anything new.
     resumed = _apply(ws, following)
     assert resumed["reused"] is True
@@ -428,3 +436,159 @@ def test_time_rule_change_requires_new_chain(ws: Workspace) -> None:
     (row,) = prices(ws, str(fresh["generation_id"]))
     assert row["available_at_us"] is None
     assert row["revision_known_at_us"] is None
+
+
+def _generation_pin(dataset: str, applied: dict[str, object]) -> dict[str, str]:
+    marker = cast("dict[str, object]", applied["marker"])
+    return {
+        "dataset_id": dataset,
+        "version": str(marker["version"]),
+        "generation_id": str(marker["generation_id"]),
+        "chain_hash": str(marker["chain_hash"]),
+        "manifest_hash": str(marker["request_hash"]),
+    }
+
+
+def test_cross_provider_matches_one_reference_per_key(ws: Workspace) -> None:
+    # The reference holds two rows per instrument, session and interval: KRW and USD.
+    reference_pin, identity = _setup(
+        ws,
+        [
+            bar("AAA.KO", D1, 1000.0, retrieved=LATE),
+            bar("AAA.KO", D1, 0.75, retrieved=LATE, currency="USD"),
+            bar("BBB.KQ", D1, 1000.0, retrieved=LATE),
+            bar("BBB.KQ", D1, 0.75, retrieved=LATE, currency="USD"),
+        ],
+    )
+    shortest = dict.fromkeys(("open", "high", "low", "close"), "float_shortest@1")
+    reference = _apply(
+        ws,
+        spec(
+            [reference_pin],
+            identity,
+            dataset="prices.kr.other",
+            decimals={**shortest, "volume": "exact@1"},
+        ),
+    )
+    assert reference["rows"] == {"ok": 4}
+    candidate = add_source(
+        ws,
+        [bar("AAA.KO", D1, 1050.0, retrieved=LATE), bar("BBB.KQ", D1, 1005.0, retrieved=LATE)],
+        tag="b",
+    )
+    rule = {
+        "rule": "cross_provider_mismatch@1",
+        "args": {
+            "reference": _generation_pin("prices.kr.other", reference),
+            "column": "close",
+            "tolerance": "0.01",
+        },
+    }
+    document = spec([candidate], identity, quality=[rule])
+    planned = _plan(ws, document)
+    assert planned["refusals"] == []
+    assert cast("dict[str, int]", planned["flags"])["cross_provider_mismatch"] == 1
+    applied = _apply(ws, document)
+    flagged = ws.market.execute(
+        "SELECT p.instrument_id, f.detail FROM quality_flags f "
+        "JOIN prices p USING (generation_id, record_id, revision_id) "
+        "WHERE f.flag='cross_provider_mismatch' AND f.generation_id=?",
+        [applied["generation_id"]],
+    ).fetchall()
+    # Only the KRW reference judges a KRW value: AAA is 5% off, BBB 0.5%.
+    assert flagged == [(AAA, "close")]
+    assert engine.list_promotions(ws)[-1]["phase"] == "COMPLETED"
+
+
+def test_krw_tick_refuses_non_krw_rows(ws: Workspace) -> None:
+    pin, identity = _setup(
+        ws,
+        [
+            bar("AAA.KO", D1, 1000.4, retrieved=LATE),
+            bar("BBB.KQ", D1, 12.34, retrieved=LATE, currency="USD"),
+        ],
+    )
+    document = spec([pin], identity)
+    planned = _plan(ws, document)
+    assert planned["rows"] == {"ok": 1, "refused_number": 1}
+    assert planned["refusals"] == ["1 rows number refused"]
+    # The USD bar is never rounded to a whole unit; the promotion is refused instead.
+    with pytest.raises(ValueError, match="number refused"):
+        _apply(ws, document)
+    assert ws.market.execute("SELECT count(*) FROM market_generations").fetchone() == (0,)
+
+
+def test_calendar_descendant_extends_chain(ws: Workspace) -> None:
+    close1, close2 = us(at("2025-01-02T06:30:00")), us(at("2025-01-03T06:30:00"))
+    first_calendar = publish_calendar(ws, {D1: (None, close1)})
+    # The next calendar generation extends the sessions by one day.
+    extended = publish_calendar(ws, {D2: (None, close2)}, sequence=2, parent="cal-1")
+    other = publish_calendar(ws, {D1: (None, close1), D2: (None, close2)}, dataset="sessions.alt")
+
+    def rules(calendar: dict[str, str]) -> dict[str, object]:
+        rule = {
+            "rule": "session_close_plus_lag@1",
+            "basis": "record",
+            "input": "session_date",
+            "args": {"calendar": calendar, "calendar_id": "XKRX", "venue": "XKRX", "lag_us": 0},
+        }
+        return {"available_at_us": rule, "revision_known_at_us": rule}
+
+    pin, identity = _setup(ws, [bar("AAA.KO", D1, 100.0, retrieved=LATE)])
+    first = _apply(ws, spec([pin], identity, rules=rules(first_calendar)))
+    parent = str(first["generation_id"])
+    second_pin = add_source(
+        ws,
+        [bar("AAA.KO", D1, 100.0, retrieved=LATE), bar("AAA.KO", D2, 101.0, retrieved=LATE)],
+        tag="b",
+    )
+    with pytest.raises(ValueError, match="descendant"):
+        _plan(ws, spec([second_pin], identity, parent=parent, rules=rules(other)))
+    second = _apply(ws, spec([second_pin], identity, parent=parent, rules=rules(extended)))
+    assert second["operations"] == {"ASSERT": 1}
+    assert second["unchanged"] == 1
+    assert second["time_drift"] == 0
+    (row,) = prices(ws, str(second["generation_id"]))
+    assert (row["session_date"], row["available_at_us"]) == (D2, close2)
+
+
+def test_absence_is_proven_by_the_full_snapshot_only(ws: Workspace) -> None:
+    first_pin, identity = _setup(
+        ws, [bar("AAA.KO", D1, 100.0, retrieved=LATE), bar("BBB.KQ", D1, 50.0, retrieved=LATE)]
+    )
+    first = _apply(ws, spec([first_pin], identity))
+    parent = str(first["generation_id"])
+    snapshot = add_source(ws, [bar("AAA.KO", D1, 100.0, retrieved=LATER)], tag="b")
+    history = add_source(ws, [bar("BBB.KQ", D1, 50.0, retrieved=LATE)], tag="c")
+    # The full snapshot holds only AAA; a second pinned table still carries BBB in scope.
+    policy = full_snapshot(snapshot, "2025-01-01", "2025-02-01")
+    planned = _plan(ws, spec([snapshot, history], identity, parent=parent, tombstone=policy))
+    (refusal,) = cast("list[str]", planned["refusals"])
+    assert refusal.startswith("1 rows of other pinned sources fall in the full snapshot's scope")
+    # Outside the scope the other table is no contradiction, and BBB is still absent.
+    scoped = full_snapshot(snapshot, "2025-01-01", "2025-02-01", [AAA, BBB])
+    outside = add_source(ws, [bar("CCC.KO", D1, 7.0, retrieved=LATE)], tag="d")
+    applied = _apply(ws, spec([snapshot, outside], identity, parent=parent, tombstone=scoped))
+    assert applied["operations"] == {"ASSERT": 1, "TOMBSTONE": 1}
+    rows = _by_key(prices(ws, str(applied["generation_id"])))
+    assert rows[(BBB, D1)]["op"] == "TOMBSTONE"
+    assert rows[(CCC, D1)]["op"] == "ASSERT"
+
+
+def test_watermark_version_follows_its_time(ws: Workspace) -> None:
+    pin, identity = _setup(ws, [bar("AAA.KO", D1, 100.0, retrieved=LATER)])
+    first = _apply(ws, spec([pin], identity))
+    # A later generation whose rows were collected earlier does not take the watermark.
+    older = add_source(ws, [bar("BBB.KQ", D1, 50.0, retrieved=LATE)], tag="b")
+    _apply(ws, spec([older], identity, parent=str(first["generation_id"])))
+    watermark = ws.state.execute(
+        "SELECT committed_version, through_us FROM watermarks WHERE dataset_id='prices.kr.eodhd'"
+    ).fetchone()
+    assert tuple(watermark) == ("1", us(LATER))
+    newer = add_source(ws, [bar("CCC.KO", D1, 7.0, retrieved=at("2025-01-30T00:00:00"))], tag="c")
+    head = engine.list_promotions(ws)[-1]["generation_id"]
+    _apply(ws, spec([newer], identity, parent=str(head)))
+    watermark = ws.state.execute(
+        "SELECT committed_version, through_us FROM watermarks WHERE dataset_id='prices.kr.eodhd'"
+    ).fetchone()
+    assert tuple(watermark) == ("3", us(at("2025-01-30T00:00:00")))

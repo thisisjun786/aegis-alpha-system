@@ -94,7 +94,7 @@ DuckDB 안에서 흐르고 Python으로 통째로 올라오지 않는다. 엄격
 | `time_rules` | `available_at_us`, `revision_known_at_us` 각각의 `rule`(`id@version`), 입력 근거 `basis`(`revision`·`record`), 규칙이 읽는 매퍼의 시간 입력 `input`(없으면 null), 그 규칙의 인자 `args` |
 | `decimal_rule` | 매퍼가 내는 숫자 열마다 `id@version` 하나 |
 | `quality_rules` | `rule`(`id@version`)과 `args`의 목록. 같은 규칙은 한 번만 쓴다 |
-| `tombstone_policy` | `{"mode": "never"}`, 또는 `absent_in_full_snapshot`과 전체 snapshot인 pin 하나(`source`: `source_id`, `table`), 그것이 빠짐없이 담는 범위(`scope`: instrument ID 목록 또는 모든 instrument인 null, `from`·`to` 날짜 구간). 범위는 `partition` 안에 있다 |
+| `tombstone_policy` | `{"mode": "never"}`, 또는 `absent_in_full_snapshot`과 전체 snapshot인 pin 하나(`source`: `source_id`, `table`), 그것이 빠짐없이 담는 범위(`scope`: instrument ID 목록 또는 모든 instrument인 null, `from`·`to` 날짜 구간). 범위는 `partition` 안에 있다. 부재는 그 snapshot의 행으로만 판단하고, 다른 pin의 행이 범위 안에 있으면 계획이 거부하므로 그 행은 별도 generation으로 승격한다 |
 | `identity_snapshot` | instrument를 해석한 identity snapshot pin(`snapshot_id`, `content_hash`). instrument가 없는 도메인(거시·FX·달력)은 null |
 
 `request_hash = sha256(정규 JSON ["aas-promotion-request-v1", 명세 SHA-256, 원천 digest 목록, parent])`다.
@@ -117,8 +117,8 @@ flag → 대량 게시 계획이다. 원천 확인은 pin한 테이블마다 완
 계산해 대조한다. `--plan`은 같은 계산을 하고 아무것도 쓰지 않는다. 읽기 전용으로 연 설치본에서
 돌며, 계산에 쓰는 것은 그 연결의 임시 테이블뿐이다. 보고는 원천 행 수, 행 상태(`ok`, `held`,
 `unresolved`, `ambiguous`, `refused_*`), 미해결 token 표본, 해석 전 매핑 행 전체의 숫자 flag 분포,
-시간 규칙별 null·상한 적용 수, 반복된 자연키, op 분포, 변하지 않은 행과 stale 행 수, delta의 flag
-분포, 계획한 marker를 담는다.
+시간 규칙별 null·상한 적용 수, 반복된 자연키, op 분포, 변하지 않은 행과 stale 행 수,
+head와 시점이 다르게 계산되는 변하지 않은 행 수(`time_drift`), delta의 flag 분포, 계획한 marker를 담는다.
 
 보고는 두 종류의 거부 이유를 따로 싣는다. `blocking`은 설치본이 아직 갖추지 않은 전제다(core
 schema v2, 원천의 `sl:` 연결, 등록되지 않은 identity snapshot). `refusals`는 자료 자체의 문제다(규칙이
@@ -133,13 +133,16 @@ state 카탈로그를 한 트랜잭션으로 쓰고 intent를 완료한다. 카�
 `normalizer_version`은 매퍼 `name@major`, `identity_snapshot_hash`, `coverage`는 partition), 원천마다
 `dataset_sources`의 `sl:` 행, `quality_checks`의 `promotion_report@1` 행(op·행 상태·flag 수), 그리고
 (매퍼 공급자, dataset, partition)마다 delta의 가장 늦은 `ingested_at_us`까지 앞으로만 가는 `watermarks`다.
+`committed_version`은 그 시각까지 처음 나아간 version이며, 시각을 넘지 못한 정정 generation은 바꾸지 않는다.
 
 승격 manifest(`aas-promotion-manifest-v1`, 정규 JSON)는 요청·명세 해시, marker의 dataset·version·
 generation·parent·sequence·delta hash·chain hash·행 수, op 분포, 행 상태 수, flag 행의 rowset digest와
 수, 원천 pin과 identity pin을 담는다. 중단된 승격은 같은 명령을 다시 실행하거나 `aas db recover`로
 끝낸다. market에 commit된 generation이 있으면 manifest와 대조해 카탈로그만 쓰고, 없으면 보존한
 명세로 다시 계산해 manifest가 intent의 payload hash와 정확히 같을 때만 게시한다. 다시 계산한 결과가
-다르면 intent는 PREPARED로 남고 `aas db quarantine`의 대상이 된다. `aas db verify`는 승격 chain의
+다르면 intent는 PREPARED로 남고 `aas db quarantine`의 대상이 된다. 중단된 요청의 `--plan`은 아무것도
+복구하지 않는다. market commit 전이면 보고를 다시 계산해 intent의 manifest와 같은지(`recomputes_intent`)를
+싣고, commit 뒤면 카탈로그만 남았다고(`market_committed`) 보고한다. `aas db verify`는 승격 chain의
 generation마다 카탈로그, 완료된 intent, 명세·요청·manifest의 raw 증거, flag digest를 확인하고 chain
 link와 마지막 generation의 행을 다시 해시한다.
 
@@ -221,7 +224,7 @@ accession·`accepted_at`, 거시의 vintage 구간, `value_state`)도 도메인 
 | ASSERT·SUPERSEDE, 비교 값 같음 | 있음 | 행 없음(멱등) |
 | ASSERT·SUPERSEDE, 비교 값 다름 | 있음 | SUPERSEDE |
 | TOMBSTONE | 있음 | SUPERSEDE(재등장) |
-| ASSERT·SUPERSEDE | 없음, `absent_in_full_snapshot`이고 record가 명세의 `scope` 안 | TOMBSTONE |
+| ASSERT·SUPERSEDE | 전체 snapshot에 없음, `absent_in_full_snapshot`이고 record가 명세의 `scope` 안 | TOMBSTONE |
 | ASSERT·SUPERSEDE | 없음, 그 밖의 경우 | 행 없음 |
 
 TOMBSTONE의 `source_row_hash`는 `sha256(정규 JSON ["aas-tombstone-v1", source_id, table, digest])`,
@@ -258,9 +261,12 @@ TOMBSTONE의 `source_row_hash`는 `sha256(정규 JSON ["aas-tombstone-v1", sourc
 `exdate_open@1`은 항상 `record`다.
 
 규칙 ID와 버전은 명세에 있으므로 transform hash에 포함된다. 규칙의 계산을 바꾸면 새 버전이 된다.
-한 chain의 모든 generation은 열마다 같은 시간 규칙(ID·버전·근거·인자)을 쓴다. op는 시점을 비교하지
-않으므로 규칙이 바뀐 명세로 이어 승격하면 이전 규칙의 시점이 새 규칙의 것처럼 남는다. 그래서 parent
-명세와 시간 규칙이 다른 승격은 거부한다. 규칙을 바꾸려면 [dataset 이름](#공급자별-dataset과-ordered-pin-cutover)에
+한 chain의 모든 generation은 열마다 같은 시간 규칙(ID·버전·근거·입력과 달력 pin을 뺀 인자)을 쓴다.
+op는 시점을 비교하지 않으므로 규칙이 바뀐 명세로 이어 승격하면 이전 규칙의 시점이 새 규칙의 것처럼
+남는다. 그래서 parent 명세와 시간 규칙이 다른 승격은 거부한다. 달력 pin은 규칙이 읽는 근거 자료라서
+규칙에 속하지 않는다. 명세는 parent가 pin한 달력 generation이나 같은 달력 dataset chain의 후손
+generation을 pin할 수 있다(연말 세션 연장, 임시 휴장 SUPERSEDE). 새 달력으로 시점이 달라지는 기존
+행은 다시 쓰지 않고 `time_drift`로 보고하며, 새 행만 새 달력의 시점을 받는다. 규칙을 바꾸려면 [dataset 이름](#공급자별-dataset과-ordered-pin-cutover)에
 규칙 세대 `.r<N>`을 붙인 새 dataset을 첫 generation부터 승격한다. reader는 행이 속한 chain의 명세에서
 그 행의 시점이 어느 규칙에서 왔는지 안다.
 
@@ -302,7 +308,7 @@ AAS가 정정 bytes를 받은 시각부터 알려진 것으로 본다. 실제 �
 | 규칙 | 계산 | flag |
 | --- | --- | --- |
 | `exact@1` | 원천 값(binary64·binary32·정수)이 정확히 표현될 때만 승인. 아니면 승격 거부 | 없음 |
-| `krw_tick@1` | binary64 원천 값의 정확한 십진 전개를 원 단위 정수로 반올림(ROUND_HALF_EVEN). KRW 가격 열(open·high·low·close)에만 적용 | 정수가 아니던 행 `provider_float_reconstructed`, 나머지가 정확히 0.5이던 행 `decimal_rounding_tie` |
+| `krw_tick@1` | binary64 원천 값의 정확한 십진 전개를 원 단위 정수로 반올림(ROUND_HALF_EVEN). KRW 가격 열(open·high·low·close)에만 적용. 통화가 KRW가 아닌 행은 반올림하지 않고 `refused_number`로 거부 | 정수가 아니던 행 `provider_float_reconstructed`, 나머지가 정확히 0.5이던 행 `decimal_rounding_tie` |
 | `float_shortest@1` | 매퍼가 낸 저장 폭(binary32 `FLOAT` 또는 binary64 `DOUBLE`)에서, 저장 값을 유효숫자 p자리로 올바르게 반올림한 십진 값이 같은 폭으로 되돌아오는 가장 작은 p(binary32는 9, binary64는 17까지)의 표현. 소수 12자리를 넘으면 소수 12자리로 ROUND_HALF_EVEN | 결과가 저장된 binary 값과 다르면 `provider_float_storage`, 버린 나머지가 정확히 절반이면 `decimal_rounding_tie` |
 | `decimal_text@1` | 원천 텍스트의 십진 값을 그대로 사용. 소수 12자리를 넘으면 승격 거부 | 지수 표기이고 가수의 유효숫자가 7자리 이하면 `volume_precision_limited` |
 
@@ -340,7 +346,7 @@ quality_flags(generation_id, record_id, revision_id, rule_id, rule_version, flag
 | `provider_reported_partial` | 공급자가 경고와 함께 보낸 부분 응답 파티션의 행 |
 | `volume_precision_limited` | 원천 거래량의 유효숫자가 잘려 있음 |
 | `time_precision_day` | 시점이 `local_day_end@1`의 날짜 단위 상한임 |
-| `cross_provider_mismatch` | 같은 instrument·세션·interval의 다른 공급자 값과 명세 품질 규칙의 허용오차를 넘게 다름(`cross_provider_mismatch@1`: 인자 `reference` generation pin, 비교할 숫자 열 `column`, 상대 허용오차 `tolerance` 십진 문자열로 `abs(값 - 기준) > tolerance × abs(기준)`). 허용오차 안이면 flag가 없다 |
+| `cross_provider_mismatch` | 같은 instrument·세션·interval·bar_end·basis·currency(가격 키에서 role만 뺀 키)의 다른 공급자 값과 명세 품질 규칙의 허용오차를 넘게 다름(`cross_provider_mismatch@1`: 인자 `reference` generation pin, 비교할 숫자 열 `column`, 상대 허용오차 `tolerance` 십진 문자열로 `abs(값 - 기준) > tolerance × abs(기준)`). 허용오차 안이면 flag가 없다. 한 revision에 규칙마다 flag는 많아야 하나이고, delta 안에서 flag 키가 겹치면 계획이 거부한다 |
 
 dataset version 단위의 판정(행 수 대조, coverage 종료, 교차 대조율)은 기존 state
 `quality_checks`가 맡는다. 부분 응답 파티션은 행마다 flag를 달고, 같은 파티션의 다른 원천과
@@ -651,7 +657,7 @@ state v2:
 | DV-53 | 같은 parent에 다른 요청이 먼저 게시되면 부모 CAS가 실패한다 | `tests/storage/test_promotion_engine.py::test_competing_request_fails_parent_cas` | 구현 |
 | DV-54 | migration-incomplete 설치본은 정상으로 열리지 않는다 | `tests/storage/test_migration.py::test_incomplete_migration_refuses_normal_open` | 구현 |
 | DV-55 | 수집 시각보다 늦은 규칙 시점은 물리 기준 이후에 받은 행에서만 수집 시각으로 내려가 flag를 달고, 물리 기준 전에 받은 행은 보류로 보고된다 | `tests/storage/test_time_rules.py::test_rule_after_ingestion_is_clamped_above_physical_base` | 구현 |
-| DV-56 | parent 명세와 시간 규칙이 다른 승격은 거부되고 규칙 변경은 `.r<N>` 새 dataset으로만 한다 | `tests/storage/test_promotion_engine.py::test_time_rule_change_requires_new_chain` | 구현 |
+| DV-56 | parent 명세와 시간 규칙(달력 pin 제외)이 다른 승격은 거부되고 규칙 변경은 `.r<N>` 새 dataset으로만 한다 | `tests/storage/test_promotion_engine.py::test_time_rule_change_requires_new_chain` | 구현 |
 | DV-57 | identity 정정은 새 assertion이며 기존 행을 UPDATE하지 않는다 | `tests/storage/test_identity_registration.py::test_correction_is_a_new_assertion_without_update` | 구현 |
 | DV-58 | 같은 provider key의 두 assertion이 정정 관계 없이 유효·지식 구간에서 겹치면 등록을 거부한다 | `tests/storage/test_identity_registration.py::test_overlapping_unrelated_assertions_conflict` | 구현 |
 | DV-59 | instrument·issuer·assertion ID 형식은 고정 입력과 기대 값으로 고정돼 있다 | `tests/storage/test_identity_mint.py::test_identity_id_formats_are_frozen` | 구현 |
@@ -673,3 +679,8 @@ state v2:
 | DV-75 | 수천만 행 도메인 테이블에 유지보수 generation을 기본 할당 또는 기록된 할당 grant 안에서 게시한다 | `tests/storage/test_bulk_generation.py::test_maintenance_publication_fits_a_large_table` | 예정 |
 | DV-76 | 승격 `--plan`은 같은 계산을 보고하고 저장소에 아무것도 쓰지 않는다 | `tests/storage/test_promotion_cli.py::test_promote_plan_writes_nothing_and_apply_publishes` | 구현 |
 | DV-77 | `eodhd.bars@1`은 합성 원천 fixture를 독립 기대값과 같은 도메인 열로 옮긴다 | `tests/storage/test_promotion_mappers.py::test_eodhd_bars_maps_synthetic_fixture` | 구현 |
+| DV-78 | 같은 chain의 승격은 달력 pin을 parent 달력 generation의 후손으로 옮길 수 있고 다른 달력 dataset의 pin은 거부된다 | `tests/storage/test_promotion_engine.py::test_calendar_descendant_extends_chain` | 구현 |
+| DV-79 | `cross_provider_mismatch`는 role을 뺀 가격 키가 같은 기준 행과만 비교하고 revision마다 flag를 하나만 단다 | `tests/storage/test_promotion_engine.py::test_cross_provider_matches_one_reference_per_key` | 구현 |
+| DV-80 | `krw_tick@1`은 KRW가 아닌 행의 값을 반올림하지 않고 숫자 거부로 보고한다 | `tests/storage/test_promotion_engine.py::test_krw_tick_refuses_non_krw_rows` | 구현 |
+| DV-81 | 부재는 전체 snapshot pin의 행으로만 판단하고 범위 안의 다른 pin 행은 계획 거부로 보고된다 | `tests/storage/test_promotion_engine.py::test_absence_is_proven_by_the_full_snapshot_only` | 구현 |
+| DV-82 | watermark의 version은 시각을 앞으로 옮긴 generation만 바꾼다 | `tests/storage/test_promotion_engine.py::test_watermark_version_follows_its_time` | 구현 |

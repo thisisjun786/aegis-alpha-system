@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -30,6 +31,21 @@ def _data(*args: str, home: Path) -> dict[str, object]:
     return json.loads(result.stdout)
 
 
+def _tree(home: Path) -> dict[str, str]:
+    """Every file under the installation with its content hash.
+
+    A read-only SQLite reader may leave its shared-memory index and an empty WAL behind;
+    neither holds data, so the index is skipped and an empty WAL counts as absent.
+    """
+    return {
+        str(path.relative_to(home)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(home.rglob("*"))
+        if path.is_file()
+        and not path.name.endswith("-shm")
+        and not (path.name.endswith("-wal") and path.stat().st_size == 0)
+    }
+
+
 def test_promote_plan_writes_nothing_and_apply_publishes(tmp_path: Path) -> None:
     home = tmp_path / "aas"
     initialize(home)
@@ -43,12 +59,13 @@ def test_promote_plan_writes_nothing_and_apply_publishes(tmp_path: Path) -> None
     raw, sha256 = spec([pin], identity)
     path = tmp_path / "spec.json"
     path.write_bytes(raw)
-    state = (home / "state.sqlite3").read_bytes()
+    before = _tree(home)
     planned = _data("promote", "--spec", str(path), "--sha256", sha256, "--plan", home=home)
     assert planned["mode"] == "plan"
     assert planned["published"] is False
     assert planned["operations"] == {"ASSERT": 1}
-    assert (home / "state.sqlite3").read_bytes() == state
+    # No file appears, disappears or changes: state, market, its WAL and raw/ alike.
+    assert _tree(home) == before
     assert _data("promotions", home=home) == {"promotions": []}
     applied = _data("promote", "--spec", str(path), "--sha256", sha256, home=home)
     assert applied["published"] is True

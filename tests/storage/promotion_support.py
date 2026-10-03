@@ -195,14 +195,24 @@ def full_snapshot(
 
 
 def publish_calendar(
-    workspace: Workspace, sessions: Mapping[date, tuple[int | None, int | None]]
+    workspace: Workspace,
+    sessions: Mapping[date, tuple[int | None, int | None]],
+    *,
+    dataset: str = "sessions.xkrx",
+    sequence: int = 1,
+    parent: str | None = None,
 ) -> dict[str, str]:
-    """Publish and catalog a declared XKRX session generation; return its generation pin."""
+    """Publish and catalog a declared XKRX session generation; return its generation pin.
+
+    ``sequence`` and ``parent`` extend an earlier generation of ``dataset`` with new sessions.
+    """
+    base = "cal" if dataset == "sessions.xkrx" else f"{dataset}-cal"
+    generation_id = f"{base}-{sequence}"
     rows: list[dict[str, object]] = []
     for index, (day, (opened, closed)) in enumerate(sorted(sessions.items())):
         rows.append(
             {
-                "revision_id": f"cal-{index}",
+                "revision_id": f"{generation_id}-{index}",
                 "supersedes_revision_id": None,
                 "op": "ASSERT",
                 "available_at_us": 0,
@@ -219,27 +229,35 @@ def publish_calendar(
                 "timezone_version": "synthetic",
             }
         )
-    request = hashlib.sha256(b"declared-calendar").hexdigest()
+    seed = b"declared-calendar" if generation_id == "cal-1" else generation_id.encode()
+    request = hashlib.sha256(seed).hexdigest()
+    version = str(sequence)
     marker = publish_generation(
         workspace.market,
-        dataset_id="sessions.xkrx",
-        version="1",
-        generation_id="cal-1",
-        operation_id="cal-op-1",
+        dataset_id=dataset,
+        version=version,
+        generation_id=generation_id,
+        operation_id=f"op-{generation_id}" if generation_id != "cal-1" else "cal-op-1",
         request_hash=request,
-        parent_id=None,
+        parent_id=parent,
         domain="calendar_sessions",
         rows=rows,
     )
     with atomic(workspace.state):
+        if parent is None:
+            workspace.state.execute(
+                "INSERT INTO datasets VALUES (?,'calendar_sessions',?,'test')",
+                (dataset, "aas-market-rowset-v1"),
+            )
         workspace.state.execute(
-            "INSERT INTO datasets VALUES ('sessions.xkrx','calendar_sessions',?,'test')",
-            ("aas-market-rowset-v1",),
-        )
-        workspace.state.execute(
-            "INSERT INTO dataset_versions VALUES ('sessions.xkrx','1','cal-1',NULL,1,?,?,?,"
+            "INSERT INTO dataset_versions VALUES (?,?,?,?,?,?,?,?,"
             "'synthetic',?,NULL,NULL,?,'all','committed')",
             (
+                dataset,
+                version,
+                generation_id,
+                parent,
+                sequence,
                 marker["chain_hash"],
                 request,
                 "aas-market-rowset-v1",
@@ -248,9 +266,9 @@ def publish_calendar(
             ),
         )
     return {
-        "dataset_id": "sessions.xkrx",
-        "version": "1",
-        "generation_id": "cal-1",
+        "dataset_id": dataset,
+        "version": version,
+        "generation_id": generation_id,
         "chain_hash": str(marker["chain_hash"]),
         "manifest_hash": request,
     }
