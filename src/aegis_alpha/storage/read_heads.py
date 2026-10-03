@@ -227,6 +227,9 @@ class HeadQuery:
 
     cutoff_us: int | None = None
     ingestion_cutoff_us: int | None = None
+    # Research reads only: a revision recorded as known after this instant is not read,
+    # while one with no recorded knowledge time still is (``_Visibility.candidates``).
+    known_ceiling_us: int | None = None
     subjects: tuple[str, ...] | None = None
     from_date: date | None = None
     to_date: date | None = None
@@ -234,9 +237,12 @@ class HeadQuery:
     grid: tuple[date, ...] | None = None
 
     def __post_init__(self) -> None:
-        for cutoff in (self.cutoff_us, self.ingestion_cutoff_us):
+        for cutoff in (self.cutoff_us, self.ingestion_cutoff_us, self.known_ceiling_us):
             if cutoff is not None and (type(cutoff) is not int or not 0 <= cutoff < 2**63):
                 raise ValueError("cutoff must be UTC microseconds")
+        if self.known_ceiling_us is not None and self.cutoff_us is not None:
+            # A strict cutoff already decides knowledge; a second ceiling would be ignored.
+            raise ValueError("a known ceiling belongs to a research read only")
         for values in (self.subjects, self.price_roles, self.grid):
             if values is not None and (
                 type(values) is not tuple or not values or len(set(values)) != len(values)
@@ -271,7 +277,7 @@ class HeadQuery:
         return "observed_snapshot_research" if self.cutoff_us is None else "strict_pit"
 
     def document(self) -> dict[str, object]:
-        return {
+        document: dict[str, object] = {
             "cutoff_us": self.cutoff_us,
             "ingestion_cutoff_us": self.ingestion_cutoff_us,
             "subjects": None if self.subjects is None else sorted(self.subjects),
@@ -280,6 +286,10 @@ class HeadQuery:
             "price_roles": None if self.price_roles is None else sorted(self.price_roles),
             "grid": None if self.grid is None else list(self.grid),
         }
+        if self.known_ceiling_us is not None:
+            # Present only when set, so every read without one keeps its receipt bytes.
+            document["known_ceiling_us"] = self.known_ceiling_us
+        return document
 
 
 @dataclass(frozen=True, slots=True)
@@ -443,6 +453,9 @@ def _filters(
     if query.ingestion_cutoff_us is not None:
         params["ingested"] = query.ingestion_cutoff_us
         pre.append("ingested_at_us <= $ingested")
+    if query.known_ceiling_us is not None:
+        params["ceiling"] = query.known_ceiling_us
+        pre.append("(revision_known_at_us IS NULL OR revision_known_at_us <= $ceiling)")
     return pre, post
 
 

@@ -75,6 +75,7 @@ from aegis_alpha.storage.market_inputs import (
     PriceInputRequest,
     ReaderMode,
     admit_native_input,
+    load_pinned_heads,
     load_pinned_observations,
     load_pinned_prices,
     load_pinned_proxy,
@@ -82,6 +83,7 @@ from aegis_alpha.storage.market_inputs import (
     verify_sealed_publication,
 )
 from aegis_alpha.storage.membership_pins import IdentityPin, UniversePin, read_membership_pins
+from aegis_alpha.storage.read_heads import HeadBinding, HeadQuery, HeadRead
 from aegis_alpha.storage.source_library import admit_source_table
 from aegis_alpha.storage.source_reader import SourcePin, resolve_source
 from aegis_alpha.storage.strategies import load_strategy
@@ -1590,6 +1592,95 @@ def _mapped_panel(
     return _Observed(role, values, observed, known, frozenset(read), calendar_ref)
 
 
+def _price_panels(
+    loader: _Loader, declaration: ResearchRunRequest, visibility: _Visibility
+) -> tuple[dict[str, _Observed], HeadRead]:
+    """Derive the open and close panels from canonical price pins through read_heads.
+
+    One read serves both panels, so they cannot disagree on basis, adjustment, calendar
+    or sessions: each canonical unadjusted bar supplies its own open and its own close.
+    The read is a research read (no strict cutoff, so time-rule grants decide nothing)
+    bounded by the declared knowledge time exactly as the observation route bounds its
+    panel: a revision recorded as known after the ceiling is not read, one with no
+    recorded knowledge time is. A head the store itself says became available after the
+    ceiling is skipped rather than replaced by the value it superseded.
+
+    The query is pushed down to the declared instruments and to the dates the run can
+    use, from the earlier of the history and period starts, so the panel starts where
+    the pinned data starts for each instrument and not where a retained snapshot did.
+    """
+    binding = cast("HeadBinding", declaration.prices)
+    start = min(declaration.history.start, declaration.period.start)
+    end = max(declaration.history.end, declaration.period.end)
+    read = load_pinned_heads(
+        loader.workspace,
+        binding,
+        HeadQuery(
+            known_ceiling_us=visibility.ceiling,
+            subjects=tuple(sorted(declaration.instrument_map)),
+            from_date=start,
+            to_date=end + timedelta(days=1),
+            price_roles=("canonical",),
+        ),
+        budget=loader.budget,
+    )
+    reference = canonical_json_bytes(
+        {"schema": "aas-head-binding-v1", "binding_hash": binding.binding_hash}
+    ).decode()
+    values: dict[str, dict[str, dict[date, float]]] = {"open": {}, "close": {}}
+    observed: dict[str, dict[date, date]] = {}
+    known: dict[str, dict[date, int]] = {}
+    seen: set[str] = set()
+    for head in read.rows:
+        row = head.values
+        name = _text(row["instrument_id"])
+        instrument = declaration.instrument_map[name]
+        seen.add(name)
+        if (row["basis"], row["price_role"]) != ("unadjusted", "canonical"):
+            raise ValueError("a price-pinned research run reads only canonical unadjusted bars")
+        if _text(row["currency"]) != declaration.conventions.currency:
+            raise ValueError("price currency is not the declared account currency")
+        if row["value_state"] != "present":
+            continue
+        if row["available_at_us"] is not None and cast("int", row["available_at_us"]) > (
+            visibility.ceiling
+        ):
+            continue
+        session = _day(row["session_date"])
+        if session in values["close"].setdefault(instrument, {}):
+            raise ValueError("price panel repeats one session for " + instrument)
+        for role in ("open", "close"):
+            values[role].setdefault(instrument, {})[session] = _number(row[role])
+        observed.setdefault(instrument, {})[session] = visibility.observed(row, session)
+        # The bar's own end instant orders sessions for the date-only schedule. It is the
+        # economic axis of the bar, not a knowledge time, exactly as the observation
+        # panel's feature instant is.
+        known.setdefault(instrument, {})[session] = cast("int", row["bar_end_us"])
+    absent = sorted(set(declaration.instrument_map) - seen)
+    if absent:
+        raise ValueError(
+            "instrument_map names instruments no pinned price carries: " + ", ".join(absent)
+        )
+    loader.retain(
+        "prices:" + binding.binding_hash,
+        {
+            "head_read": dict(read.receipt),
+            "panels": {
+                role: {
+                    instrument: {day.isoformat(): value for day, value in sorted(series.items())}
+                    for instrument, series in sorted(panel.items())
+                }
+                for role, panel in values.items()
+            },
+        },
+    )
+    panels = {
+        role: _Observed(role, values[role], observed, known, frozenset(seen), reference)
+        for role in ("open", "close")
+    }
+    return panels, read
+
+
 def _observation_panels(
     loader: _Loader, declaration: ResearchRunRequest, visibility: _Visibility
 ) -> dict[str, _Observed]:
@@ -2038,7 +2129,11 @@ def prepare_research_run(
     )
     loader = _Loader(workspace, budget, {})
     sleeves = _research_sleeves(workspace, loader, declaration)
-    panels = _observation_panels(loader, declaration, visibility)
+    head_read = None
+    if declaration.prices is None:
+        panels = _observation_panels(loader, declaration, visibility)
+    else:
+        panels, head_read = _price_panels(loader, declaration, visibility)
     read = {series for panel in panels.values() for series in panel.series}
     plan = _research_plan(declaration, panels)
     decisions = _research_decisions(sleeves, plan.slots, visibility, panels)
@@ -2051,7 +2146,12 @@ def prepare_research_run(
             decision.receipt.as_of: _research_targets(decision.receipt, decision.sleeve.definition)
             for decision in decisions
         },
-        _observation_types(workspace, declaration.instrument_map, read),
+        _observation_types(workspace, declaration.instrument_map, read)
+        if head_read is None
+        else {
+            declaration.instrument_map[name]: kind
+            for name, kind in _instrument_types(workspace, sorted(read)).items()
+        },
         (),
     )
     _require_fillable(inputs)
@@ -2081,6 +2181,7 @@ def prepare_research_run(
                 "last_session": plan.dates[-1].isoformat(),
                 "decisions": len(plan.slots),
             },
+            head_read=None if head_read is None else head_read.receipt,
         ),
     )
     return PreparedResearchRun(

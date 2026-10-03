@@ -216,7 +216,7 @@ def _binding_report(declared: _Declared) -> dict[str, object]:
         "membership_bound": not composed,
         "covered_by_declaration_hash_only": [
             "calendar",
-            "observations",
+            declared.request.panel_source,
             *(
                 ["composition.sleeves.defense.membership", "composition.sleeves.offense.membership"]
                 if composed

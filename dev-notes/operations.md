@@ -809,6 +809,24 @@ run 이력에 남는다. 어느 쪽이든 성공 영수증은 없다. 그 run을
 `aas-research-run-v2` 슬리브 선언과 `aas-research-composition-v1` 표본 조합 선언을 모두 받는다.
 어느 쪽인지는 문서의 `schema_version`이 말하므로 호출자가 고르지 않는다.
 
+패널 원천은 선언 최상위의 열쇠 하나로 정한다. `observations`는 보존 관측 generation pin 목록이고,
+`prices`는 canonical 가격 binding이다. 둘 다 있거나 둘 다 없으면 거부한다.
+
+```json
+"prices": {
+  "pins": [{"dataset_id": "prices.kr.eodhd", "version": "<v>", "generation_id": "<g>",
+            "chain_hash": "<sha256>", "manifest_hash": "<sha256>", "from": null, "to": null}],
+  "excluded_flags": ["provider_reported_partial"]
+},
+"instrument_map": {"<instrument_id>": "<전략의 자산 ID>"}
+```
+
+`pins`는 `aas-head-binding-v1`의 순서 있는 pin과 `[from, to)` cutover 구간이고, `excluded_flags`는
+읽지 않을 quality flag다. 연구 읽기는 엄격 PIT가 아니므로 시간 규칙 grant는 선언하지 않는다.
+`instrument_map`의 열쇠는 identity가 발급한 instrument ID이고 값 자산은 상태 저장소에서 `etf`로
+분류돼 있어야 한다. 가격 통화는 `conventions.currency`와 같아야 한다. 선언한 `knowledge_time`보다
+늦게 알려진 revision은 읽지 않는다. 봉인 준비 문서의 `prices.head_read`가 그 읽기 영수증이다.
+
 run 저장 표는 기본 설치에 없고, 선언된 계약을 담으려면 add-on이 v1보다 높아야 한다. 둘 다
 0단계에서 확인하므로 설치가 부족하면 계산 전에 실행할 명령을 알려주고 끝난다.
 
