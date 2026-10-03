@@ -1157,6 +1157,105 @@ ASCII escape와 바이트까지 같다.
 `accepted_at_us`와 `period_end`는 응답이 말하지 않으므로 null이다. 다시 수집한 같은 공시를 따로
 승격하면 변하지 않은 행이다.
 
+## KR 공시·상장 수집
+
+OpenDART와 KIND 수집은 설치본에 직접 기록한다. 고정된 작업 목록은 없다. 매 실행이 이미 아는 것과
+Seoul 날짜에서 물을 것을 계산하므로, 한 번 답을 받은 요청도 기간·공시·재시도 규칙이 다시 묻게 한다.
+코드는 `data/opendart.py`(요청·결과·HTTP 클라이언트), `data/opendart_cohort.py`(rolling cohort),
+`data/kind.py`, `storage/collection_ledger.py`(state 수집 원장), `storage/kr_collection.py`(실행과
+commit)이고, 명령은 `aas collect dart plan|run`과 `aas collect kind run`이다.
+
+**요청.** OpenDART 요청은 endpoint와 정규 parameter JSON뿐이다.
+
+```text
+fingerprint = sha256(정규 JSON ["aas-opendart-request-v1", endpoint, parameters_json])
+```
+
+| endpoint | 공급자 경로 | parameter |
+| --- | --- | --- |
+| `corp_codes` | `corpCode.xml` | 없음 |
+| `financials` | `fnlttSinglAcntAll.json` | `corp_code`(8자리), `bsns_year`(2015 이상), `reprt_code`(`11011`·`11012`·`11013`·`11014`), `fs_div`(`CFS`·`OFS`) |
+| `list` | `list.json` | `bgn_de`·`end_de`(92일 이내), `pblntf_ty=A`, `last_reprt_at=N`, `page_count=100`, `page_no` |
+
+관측일은 요청에 들어가지 않는다. 같은 질문을 다른 날 다시 묻는 것은 같은 요청의 다음 attempt이고,
+관측일을 담은 legacy 요청 문서도 같은 요청으로 읽힌다. 응답 결과는 `COMPLETED`(내용 있는 답),
+`NO_DATA`(공급자 상태 `013`), `FAILED`(그 밖의 답)이며 수집 경로만 정한다. corp code 답은
+`CORPCODE.xml`이 읽히고 종목코드가 있는 회사를 나열할 때만, 목록 답은 요청한 `page_no`이고 공시 접수일이
+요청한 날 안이며 1,000 page 이하를 셀 때만 `COMPLETED`다. key를 되풀이하는 JSON은 상태가 없는 답이다. 응답 bytes는 결과와 상관없이
+보존하고 판정은 승격 매퍼가 한다. 키·IP·만료 거부와 일일 한도(`010`·`011`·`012`·`020`·`021`·`901`,
+HTTP 401·403·429)는 실행을 멈춘다. 키는 공급자 URL에만 실리며 응답이 키를 되돌려 주면 그 응답을
+보존하지 않는다.
+
+**rolling cohort.** 계획의 입력은 가장 새로운 완료 corp code 목록에서 종목코드가 있는 회사(KIND의
+유가증권·코스닥 목록이 둘 다 commit돼 있고 모든 코드가 KRX 단축코드면 그 단축코드로 좁힘)와 유가증권·코스닥(`corp_cls`
+`Y`·`K`) 정기공시를 낸 회사, 원천 자료실의 모든 `opendart-*` receipts 테이블(legacy 편입분 포함), 공시
+목록 page가 말하는 정기보고서 공시, 그리고 답을 보존하지 못한 원장 attempt다. 12월 결산 기준으로
+기간이 끝난 사업연도(2015년부터)·보고서마다:
+
+| 이유 | 연결(`CFS`) 요청을 묻는 조건 |
+| --- | --- |
+| `new_filing` | 그 보고서의 공시 접수일이 마지막 수집의 Seoul 날짜 이후(같은 날 포함)이고 그 수집이 오늘 전. 늦은 제출과 정정 공시다 |
+| `never_asked` | 물은 적이 없음 |
+| `season_retry` | 마지막 답이 `NO_DATA`이고 제출 기한(분기·반기 45일, 사업 90일)+30일 안에서 7일이 지남 |
+| `failed_retry` | 마지막 답이 `FAILED`이거나 답을 보존하지 못한 attempt이고 하루가 지남 |
+| `no_data_retry` | 마지막 답이 `NO_DATA`이고 그 시즌 뒤 90일이 지남. 직전 사업연도 이후의 보고서만이며 더 오래된 보고서는 공시가 먼저 알린다 |
+
+별도(`OFS`) 요청은 연결 요청의 마지막 답이 `NO_DATA`인 동안 같은 규칙을 따른다. `COMPLETED`는 새 공시가
+없으면 다시 묻지 않는다. 요청 순서는 위 표의 순서(`opendart_cohort.REASONS`)이고, 같은 이유 안에서는
+최신 기간부터다. 간격은 `CohortPolicy`의
+값이며 그 해시가 원장 job의 `policy_hash`(그 job을 처음 만든 실행의 정책)다.
+
+공시 목록은 하루 단위로 읽는다. 오늘 전의 Seoul 날짜는 그 날이 끝난 뒤 받은 첫 page와 첫 page가 센
+모든 page의 답이 있을 때 덮인 것이다(첫 page가 `NO_DATA`면 공시 없는 날). 처음에는 90일 전부터 읽고,
+알려진 가장 이른 날부터 빈 날을 채운다. 실행 중 첫 page가 오면 그 page가 센 page를 바로 묻는다. 마지막
+답이 `FAILED`이거나 답을 보존하지 못한 page는 하루 뒤 다시 묻는다. 응답이 없는 완료 목록 행은 읽히지 않은
+행으로 세고 그 날을 덮지 않는다.
+보고서 이름 `분기보고서 (YYYY.03|09)`, `반기보고서 (YYYY.06)`, `사업보고서 (YYYY.12)`(앞의 `[기재정정]` 같은
+괄호 표시 포함)만 요청에 대응하고, 다른 결산월의 보고서는 대응하지 않은 수로 센다. corp code 목록은
+7일마다 다시 받는다.
+
+**원장.** state의 수집 표가 호출을 기록한다. job은 요청 하나(`job_id`·`idempotency_key` =
+`opendart:<fingerprint>`, dataset `identity.kr.dart`·`filings.kr.dart`·`fundamentals.kr.dart`, 재무는 보고서
+누적 기간, 목록은 그 날을 window로 가짐)이고 묻는 때마다 번호가 오르는 attempt다.
+
+| 시점 | attempt | usage event |
+| --- | --- | --- |
+| 호출 전 | `reserved` | `reserved` |
+| 호출 직전 | `started` | |
+| 답과 receipt를 `raw/`에 보존한 뒤 | `succeeded`(공급자 오류 답 포함) | `charged`, receipt SHA-256 |
+| 답을 보존하지 못함(전송 실패) | `uncertain` | `uncertain` |
+| 중단 뒤 다음 실행: `reserved`로 남음 | `failed` | `released` |
+| 중단 뒤 다음 실행: `started`로 남음 | `uncertain` | `uncertain` |
+
+불확실한 attempt는 성공이나 미호출로 바뀌지 않는다. 일일 quota는 24시간 안에 `reserved`가 기록되고
+`released`되지 않은 attempt 수이며 기본 19,000이다. 실행의 호출 상한은 `--max-calls`(기본 2,000)와 quota의
+남은 수 중 작은 값이다. 전송 실패가 세 번 이어지면 실행을 멈춘다.
+
+**보존과 commit.** 호출마다 응답 bytes와 정규 receipt(`aas-opendart-receipt-v1`: 요청, fingerprint, job과
+attempt, HTTP 상태, 보존 header(`content-type`·`date`·`retry-after`), 요청·수집 시각, 결과, 공급자 상태,
+응답의 크기·SHA-256)를 `raw/`에 둔다. 500개까지(응답 합계 256 MiB까지)의 receipt를 수집 순서로 나열한 batch 문서
+(`aas-opendart-batch-v1`)와 그 receipt·응답이 완결 단위 하나이고, `opendart-receipts-<hex>` 원천의
+`receipts` 테이블 하나로 commit된다. 행은 `fingerprint`, `endpoint`, `outcome`, `provider_status`,
+`request_json`(`endpoint`·`parameters_json`), `receipt_json`, `receipt_sha256`, `raw_base64`, `raw_sha256`,
+`retrieved_at_utc`(`YYYY-MM-DDTHH:MM:SS.ffffffZ`)의 텍스트이며 `dart.fnltt@1`, `dart.fnltt_filings@1`,
+`dart.corp_codes@1`이 이 테이블을 읽는다. 공시 목록 행은 재무 매퍼에서 `other_endpoint`다. commit 전에
+중단된 실행의 `charged` receipt 중 어느 commit에도 없는 것은 다음 실행이 먼저 commit하고, 계획 전에 그 답을
+아는 것에 더하므로 그 요청을 다시 묻지 않는다. 한 batch에는 완료된 corp code 답이 많아야 하나다.
+
+**KIND.** `aas collect kind run`은 KIND 상장법인목록 내려받기(`corpList.do`, 시장 `stockMkt`·`kosdaqMkt`)를
+요청 `kind-kospi`·`kind-kosdaq`로 묻고, 응답과 receipt(`aas-kind-receipt-v1`: 요청 `source_id`, HTTP 상태,
+응답 크기·SHA-256, 요청·수집 시각)를 `raw/`에 둔 뒤 그 둘을 [KR 등록](#kr-등록)의 `kind-listings` 원천
+하나로 commit한다. 원장 provider는 `kind`, dataset은 `identity.kr.kind`다. 상장법인목록 표가 아닌 답은
+`FAILED`로 정산하고 거부를 보고하며 bytes만 남긴다. KIND는 quota가 없으므로 commit 전에 멈춘 실행의 목록은
+다음 실행이 다시 받는다.
+
+**legacy 원장 재생.** `aas collect dart plan --legacy-root DIR`은 설치본을 열지 않고 legacy 수집 디렉터리의
+`attempts.jsonl`이 나열한 요청마다 `receipts/<fingerprint>.json`의 결과와 수집 시각(검증 문서
+`.validation-v1.json`이 `FAILED`를 다시 판정했으면 그 결과, receipt가 없으면 원장 시각의 `FAILED`)을, 가장
+새로운 완료 corp code 응답에서 회사 목록을 읽어 같은 계획을 보고한다. `--kind-receipt`는 KIND 목록으로
+회사를 좁힌다. 그 legacy 수집기는 요청 지문에 고정 cohort의 관측일을 넣고 모든 답(`NO_DATA` 포함)을
+종결로 다뤘으므로, 목록을 다 물은 뒤에는 새 요청을 만들지 못한다.
+
 ## identity 등록과 chunked 문서
 
 identity는 `storage/identity.py`가 state에 등록하고 `aas identity register|snapshot|show`가 CLI다.
@@ -1285,7 +1384,8 @@ KR identity는 세 원천을 identity 매퍼로 읽어 `aas-identity-registry-v1
   보고의 `withdrawn`에 남긴다. 그 주장이 언제부터 틀렸는지 말하는 원천이 없으므로 빌더는 그것을 닫지
   않고, 정정은 그 assertion을 대체하는 별도 등록이다.
 
-KIND 목록과 EODHD 종목 목록 수집물은 `aas identity kr-import`가 내용 원천으로 commit한다. KIND는
+KIND 목록과 EODHD 종목 목록 수집물은 `aas identity kr-import`가 내용 원천으로 commit한다(KIND는
+`aas collect kind run`이 수집하면서 같은 원천으로 commit한다, [KR 공시·상장 수집](#kr-공시상장-수집)). KIND는
 receipt(`response.json`)와 그것이 크기·SHA-256으로 가리키는 응답 하나가 한 단위이고
 (`kind-listings-<hex>`, 테이블 `listings`), EODHD는 수집 job 하나의 `complete.json`과 그것이 나열한
 파일이 한 단위다(`qveris-eodhd-exchange-symbols-<hex>`, 테이블 `symbols`). 행은 응답의 셀 값을 텍스트
@@ -1907,17 +2007,45 @@ state v2:
 | DV-260 | 격자가 말하는 ex-date 직전 세션에 bar가 없으면 배당을 쓸 수 없다 | `tests/storage/test_read_heads.py::test_adjustment_needs_a_close_on_the_session_before_the_exdate` | 구현 |
 | DV-261 | `aas-adjusted-read-v1` 영수증은 같은 읽기에 같은 hash이고, 행동 집합이 바뀌면 `rows_hash`가 바뀌며, 하위 읽기의 hash를 싣는다 | `tests/storage/test_read_heads.py::test_adjusted_receipt_pins_the_reads_and_the_rows` | 구현 |
 | DV-262 | `norgate.status@1`과 `fmp.dividends@1`은 승격을 거쳐 `local_day_end@1`과 XNYS `exdate_open@1` 시각으로 저장된다 | `tests/storage/test_us_actions.py::test_norgate_status_and_fmp_actions_promote` | 구현 |
-| DV-263 | 완료된 Qveris job 하나는 행 원천과 보류 원천으로 commit되고 둘은 원본 bytes의 `hex`를 공유하며 매퍼가 lineage 접두어와 테이블 이름으로 찾는다 | `tests/storage/test_qveris_import.py::test_one_job_commits_its_rows_and_held_rows_under_one_content_hex` | 구현 |
-| DV-264 | 같은 job을 다시 적재하면 재사용하고 적재 코드만 바뀌어도 같은 원천 ID다 | `tests/storage/test_qveris_import.py::test_reimport_reuses_and_a_code_change_keeps_the_id` | 구현 |
-| DV-265 | 다른 identity 문서로 해석한 job은 다른 원천이다 | `tests/storage/test_qveris_import.py::test_another_identity_document_is_another_source` | 구현 |
-| DV-266 | 경고가 붙은 내려받기는 빈 행 테이블과 `provider_reported_partial` 보류 행으로 적재되고 적재를 막지 않는다 | `tests/storage/test_qveris_import.py::test_a_warned_download_commits_an_empty_rows_table_and_its_held_rows` | 구현 |
-| DV-267 | 읽을 수 없는 job은 기록되고 나머지 job은 적재된다 | `tests/storage/test_qveris_import.py::test_unreadable_jobs_are_recorded_and_the_run_continues` | 구현 |
-| DV-268 | 일간 요청은 선언 달력의 열린 세션에서 나오고 관측일과 무관하게 완료된 요청은 빠진다 | `tests/application/test_qveris_cli.py::test_daily_jobs_follow_declared_sessions_and_skip_completed_requests` | 구현 |
-| DV-269 | 완료 없이 시도만 있는 요청은 `held`로 보고되고 계획되지 않는다 | `tests/application/test_qveris_cli.py::test_an_attempt_without_a_completion_is_held_not_planned` | 구현 |
-| DV-270 | 유료 호출 한도에 닿은 실행은 시도 없이 `budget_exhausted`로 끝나고 다음 실행은 완료된 job을 다시 호출하지 않는다 | `tests/application/test_qveris_cli.py::test_run_stops_at_the_paid_call_limit_and_resumes_without_repeating` | 구현 |
-| DV-271 | 결과가 불확실한 유료 호출은 수집을 멈추고 종료 코드 2를 낸다 | `tests/application/test_qveris_cli.py::test_run_stops_with_exit_two_when_a_paid_call_is_uncertain` | 구현 |
-| DV-272 | 병렬 group은 예산에 전부 예약되거나 하나도 예약되지 않고, 거부된 group은 실행되지 않는다 | `tests/data/test_qveris_parallel.py::test_group_is_reserved_whole_or_not_at_all` | 구현 |
-| DV-273 | 공급자 경고는 완료로 세어지고 cohort를 멈추지 않는다 | `tests/data/test_qveris_batch.py::test_a_provider_warning_completes_and_the_cohort_continues` | 구현 |
-| DV-274 | 분할 비율은 공급자 텍스트로 남고 identity가 없거나 양수가 아닌 비율은 보류된다 | `tests/data/test_qveris_actions_fx.py::test_splits_keep_the_ratio_text_and_hold_unknown_identities` | 구현 |
-| DV-275 | 통화쌍 이력은 identity 없이 쌍과 두 통화를 남기고 맞지 않는 OHLC는 보류된다 | `tests/data/test_qveris_actions_fx.py::test_forex_history_keeps_the_pair_and_holds_bad_rows` | 구현 |
-| DV-276 | 요청 시작 간격과 HTTP 시도·시간 한도는 coordinator와 작업자에 공유된다 | `tests/data/test_qveris_pacing.py::test_admission_bounds_requests_and_time_across_shared_clients` | 구현 |
+| DV-263 | OpenDART 요청 지문은 endpoint와 parameter만 해시하고 legacy 요청의 관측일을 무시한다 | `tests/data/test_opendart.py::test_request_fingerprint_names_the_question_without_its_observation_date` | 구현 |
+| DV-264 | 응답 결과는 수집 경로만 정하고 공급자 상태를 남기며, 키·한도 거부는 실행을 멈춘다. 상장회사로 읽히지 않는 corp code 답, 요청한 page·날이 아닌 목록 page, 1,000 page를 넘게 세는 목록, key를 되풀이하는 JSON은 `FAILED`다 | `tests/data/test_opendart.py::test_outcomes_route_the_collector_and_keep_the_provider_status` | 구현 |
+| DV-265 | 보고서는 12월 결산 기간이 끝나면 cohort에 들어오고 최신 기간부터 묻는다 | `tests/data/test_opendart_cohort.py::test_a_quarter_enters_the_cohort_when_its_period_ends` | 구현 |
+| DV-266 | `NO_DATA`는 종결이 아니며 시즌 안에서는 7일, 그 뒤에는 직전 사업연도까지 90일마다 다시 묻는다 | `tests/data/test_opendart_cohort.py::test_no_data_is_asked_again_in_season_weekly_and_after_it_quarterly` | 구현 |
+| DV-267 | 마지막 수집일 이후의 공시(늦은 제출·정정)는 그 요청을 다시 묻게 한다 | `tests/data/test_opendart_cohort.py::test_a_filing_on_or_after_the_last_ask_asks_again` | 구현 |
+| DV-268 | 별도 재무제표 요청은 연결 요청의 마지막 답이 `NO_DATA`인 동안만 묻는다 | `tests/data/test_opendart_cohort.py::test_the_separate_statement_follows_a_consolidated_no_data` | 구현 |
+| DV-269 | 실패했거나 답을 보존하지 못한 요청은 하루 뒤 다시 묻는다 | `tests/data/test_opendart_cohort.py::test_failed_and_unanswered_asks_wait_a_day` | 구현 |
+| DV-270 | 회사 목록은 KIND 목록으로 좁혀지고 유가증권·코스닥 정기공시 회사로 넓혀진다 | `tests/data/test_opendart_cohort.py::test_the_universe_is_narrowed_by_kind_and_widened_by_listed_filers` | 구현 |
+| DV-271 | 공시 목록의 날은 그 날이 끝난 뒤 받은 첫 page와 그 page가 센 모든 page로만 덮이고, 실패한 page는 하루 뒤 다시 묻는다 | `tests/data/test_opendart_cohort.py::test_list_days_are_covered_only_by_answers_after_the_day_ended` | 구현 |
+| DV-272 | legacy 원장 재생은 고정 cohort가 묻지 않은 분기와 `NO_DATA` 뒤의 별도 재무제표를 계획한다 | `tests/data/test_opendart_cohort.py::test_the_legacy_ledger_replay_plans_the_quarter_its_fixed_cohort_never_asks` | 구현 |
+| DV-273 | 호출은 `reserved` attempt와 usage event로 먼저 기록되고 답을 보존한 뒤 receipt 해시로 정산된다 | `tests/storage/test_collection_ledger.py::test_a_call_is_reserved_before_it_starts_and_settled_after` | 구현 |
+| DV-274 | 중단된 attempt는 호출 전이면 `released`, 호출 뒤면 `uncertain`이 되고 성공이나 미호출로 바뀌지 않는다 | `tests/storage/test_collection_ledger.py::test_recovery_never_turns_an_interrupted_call_into_a_success_or_a_non_call` | 구현 |
+| DV-275 | quota는 창 안에서 해제되지 않은 모든 예약을 센다 | `tests/storage/test_collection_ledger.py::test_the_quota_counts_every_unreleased_reservation_in_the_window` | 구현 |
+| DV-276 | 수집 실행은 corp code·공시 목록·재무 순으로 묻고, batch 단위 `opendart-receipts` 원천을 DART 매퍼가 읽으며, 키는 보존되지 않는다 | `tests/storage/test_kr_collection.py::test_a_run_asks_by_phase_and_commits_receipts_the_dart_mappers_read` | 구현 |
+| DV-277 | 다음 실행은 commit된 답으로 할 일을 정하고 끝난 요청을 다시 묻지 않는다 | `tests/storage/test_kr_collection.py::test_the_next_day_asks_what_the_answers_made_due_and_nothing_else` | 구현 |
+| DV-278 | 일일 quota는 실행을 넘어 원장으로 세어진다 | `tests/storage/test_kr_collection.py::test_the_daily_quota_counts_the_ledger_across_runs` | 구현 |
+| DV-279 | 중단된 실행의 attempt는 정산되고, 보존된 receipt는 다음 실행이 계획 전에 알고 먼저 commit하며 그 요청을 다시 묻지 않는다 | `tests/storage/test_kr_collection.py::test_an_interrupted_run_is_settled_and_its_receipts_committed_next` | 구현 |
+| DV-280 | 키·한도 거부는 실행을 멈추고 그 답을 commit한다 | `tests/storage/test_kr_collection.py::test_a_refused_key_stops_the_run_and_keeps_the_answer` | 구현 |
+| DV-281 | 전송 실패는 `uncertain`이며 세 번 이어지면 실행을 멈추고 quota에 세어진다 | `tests/storage/test_kr_collection.py::test_transport_failures_are_uncertain_and_stop_after_three` | 구현 |
+| DV-282 | KIND 목록 수집은 `kind-listings` 원천으로 commit되고 cohort의 회사를 좁힌다 | `tests/storage/test_kr_collection.py::test_kind_lists_commit_as_listing_sources_and_narrow_the_cohort` | 구현 |
+| DV-283 | 상장법인목록 표가 아닌 KIND 답은 거부를 보고하고 원천이 되지 않는다 | `tests/storage/test_kr_collection.py::test_a_kind_answer_that_is_not_the_listing_table_is_refused` | 구현 |
+| DV-284 | 한 `opendart-receipts` 원천에는 완료된 corp code 답이 많아야 하나다 | `tests/storage/test_kr_collection.py::test_a_batch_holds_at_most_one_completed_corp_code_list` | 구현 |
+| DV-285 | marker는 commit됐지만 완료되지 않은 batch는 다음 실행이 완료하고 그 receipt를 다시 commit하지 않는다 | `tests/storage/test_kr_collection.py::test_a_commit_left_without_its_completion_is_finished_not_committed_again` | 구현 |
+| DV-286 | legacy `opendart-native` receipts 테이블의 세 형태(`raw_json`, `raw_base64`, 검증 결과)는 모두 계획에 읽힌다 | `tests/storage/test_kr_collection.py::test_legacy_receipts_tables_of_every_shape_are_read` | 구현 |
+| DV-287 | `aas-opendart-receipt-v1`, `aas-opendart-batch-v1`, `aas-kind-receipt-v1` 형식은 고정 입력과 기대 digest로 고정돼 있다 | `tests/storage/test_kr_collection.py::test_receipt_batch_and_kind_receipt_formats_are_frozen` | 구현 |
+| DV-288 | KIND 목록의 코드 하나라도 KRX 단축코드가 아니면 cohort를 좁히지 않는다 | `tests/storage/test_kr_collection.py::test_a_kind_list_with_a_malformed_code_never_narrows_the_cohort` | 구현 |
+| DV-289 | 응답 없는 완료 공시 목록 행은 읽히지 않은 행이고 그 날을 덮지 않는다 | `tests/storage/test_kr_collection.py::test_a_completed_list_row_without_its_page_is_unreadable` | 구현 |
+| DV-290 | batch는 응답 bytes 상한에서도 끝난다 | `tests/storage/test_kr_collection.py::test_a_batch_ends_at_its_byte_budget` | 구현 |
+| DV-291 | 완료된 Qveris job 하나는 행 원천과 보류 원천으로 commit되고 둘은 원본 bytes의 `hex`를 공유하며 매퍼가 lineage 접두어와 테이블 이름으로 찾는다 | `tests/storage/test_qveris_import.py::test_one_job_commits_its_rows_and_held_rows_under_one_content_hex` | 구현 |
+| DV-292 | 같은 job을 다시 적재하면 재사용하고 적재 코드만 바뀌어도 같은 원천 ID다 | `tests/storage/test_qveris_import.py::test_reimport_reuses_and_a_code_change_keeps_the_id` | 구현 |
+| DV-293 | 다른 identity 문서로 해석한 job은 다른 원천이다 | `tests/storage/test_qveris_import.py::test_another_identity_document_is_another_source` | 구현 |
+| DV-294 | 경고가 붙은 내려받기는 빈 행 테이블과 `provider_reported_partial` 보류 행으로 적재되고 적재를 막지 않는다 | `tests/storage/test_qveris_import.py::test_a_warned_download_commits_an_empty_rows_table_and_its_held_rows` | 구현 |
+| DV-295 | 읽을 수 없는 job은 기록되고 나머지 job은 적재된다 | `tests/storage/test_qveris_import.py::test_unreadable_jobs_are_recorded_and_the_run_continues` | 구현 |
+| DV-296 | 일간 요청은 선언 달력의 열린 세션에서 나오고 관측일과 무관하게 완료된 요청은 빠진다 | `tests/application/test_qveris_cli.py::test_daily_jobs_follow_declared_sessions_and_skip_completed_requests` | 구현 |
+| DV-297 | 완료 없이 시도만 있는 요청은 `held`로 보고되고 계획되지 않는다 | `tests/application/test_qveris_cli.py::test_an_attempt_without_a_completion_is_held_not_planned` | 구현 |
+| DV-298 | 유료 호출 한도에 닿은 실행은 시도 없이 `budget_exhausted`로 끝나고 다음 실행은 완료된 job을 다시 호출하지 않는다 | `tests/application/test_qveris_cli.py::test_run_stops_at_the_paid_call_limit_and_resumes_without_repeating` | 구현 |
+| DV-299 | 결과가 불확실한 유료 호출은 수집을 멈추고 종료 코드 2를 낸다 | `tests/application/test_qveris_cli.py::test_run_stops_with_exit_two_when_a_paid_call_is_uncertain` | 구현 |
+| DV-300 | 병렬 group은 예산에 전부 예약되거나 하나도 예약되지 않고, 거부된 group은 실행되지 않는다 | `tests/data/test_qveris_parallel.py::test_group_is_reserved_whole_or_not_at_all` | 구현 |
+| DV-301 | 공급자 경고는 완료로 세어지고 cohort를 멈추지 않는다 | `tests/data/test_qveris_batch.py::test_a_provider_warning_completes_and_the_cohort_continues` | 구현 |
+| DV-302 | 분할 비율은 공급자 텍스트로 남고 identity가 없거나 양수가 아닌 비율은 보류된다 | `tests/data/test_qveris_actions_fx.py::test_splits_keep_the_ratio_text_and_hold_unknown_identities` | 구현 |
+| DV-303 | 통화쌍 이력은 identity 없이 쌍과 두 통화를 남기고 맞지 않는 OHLC는 보류된다 | `tests/data/test_qveris_actions_fx.py::test_forex_history_keeps_the_pair_and_holds_bad_rows` | 구현 |
+| DV-304 | 요청 시작 간격과 HTTP 시도·시간 한도는 coordinator와 작업자에 공유된다 | `tests/data/test_qveris_pacing.py::test_admission_bounds_requests_and_time_across_shared_clients` | 구현 |

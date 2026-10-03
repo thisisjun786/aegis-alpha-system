@@ -119,6 +119,19 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   records (the held rows' job symbols) declares `manifest_items`; the engine stages that list
   from the pinned commit as `MANIFEST_ITEMS` after recomputing the source's request hash from
   that manifest, never from outside the pin.
+- `collection_ledger` writes the state collection tables: a job per provider request
+  (named by its fingerprint, whatever day it is asked), a numbered attempt per ask that is
+  `reserved` with a `reserved` usage event before the call, `started` just before it, then
+  `succeeded` with a `charged` event naming the retained receipt or `uncertain`. Recovery
+  turns a left `reserved` into `failed`/`released` and a left `started` into `uncertain`,
+  never into a success or a non-call; a quota counts unreleased reservations in its window.
+- `kr_collection` runs `aas collect dart` and `aas collect kind` on a writable workspace:
+  the rolling OpenDART cohort planned from every committed `opendart-*` receipts table,
+  the newest KIND lists and unanswered attempts; each answer and its canonical receipt go
+  to `raw/` before the attempt succeeds, and batches commit as `opendart-receipts` (and
+  KIND answers as `kind-listings`) content sources. Receipts a crashed run retained but did
+  not commit are committed first by the next run. See the KR collection section of
+  `dev-notes/design/data-vertical.md`.
 - `bulk_generation` publishes a staged DuckDB table as one generation: plan without
   writing, then one transaction with the marker and `INSERT … SELECT`. DuckDB encodes and
   sorts `aas-rowset-v1` rows and `rowset.RowsetStream` digests them in admitted batches and

@@ -11,6 +11,7 @@ This directory uses flat provider prefixes. Follow root policy and decision 0012
 | Macro observations/vintages and raw archives | `fred_alfred_*`, `fred_raw_archive*` |
 | SEC collection, bulk archives and period identity | `sec_*`; trusted policy pin in `sec_policy.py` |
 | FinImpulse estimates | `finimpulse_*` |
+| OpenDART requests, the rolling cohort and KIND downloads | `opendart.py`, `opendart_cohort.py`, `opendart_legacy.py`, `kind.py`; the installation side is `storage/kr_collection.py` |
 | Supported historical record/schema formats | `canonical_records.py`, `canonical_json.py`, `canonical_generation_schema.py` |
 
 - Filesystem access uses admitted data roots and descriptor-relative operations:
@@ -27,6 +28,9 @@ This directory uses flat provider prefixes. Follow root policy and decision 0012
   series do not advance watermarks; unsupported derived spreads are not inferred.
 - Usage ledgers and receipts remain durable across interruption. Uncertain runs
   cannot trigger unaccounted paid retries.
+- A request is its endpoint and parameters, never the day it is asked; a collector
+  plans from retained answers and the calendar, not from a fixed job list, so an
+  empty answer is asked again by rule instead of ending the request.
 - `duckdb_engine.py` owns its version pin; `pinned_prices.py` owns catalog-bound
   queries and resource budgets. No obsolete glob/query runtime is installed.
 - Generation SQL models remain for installation/adoption. Their presence does

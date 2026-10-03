@@ -13,6 +13,7 @@ from aegis_alpha.application import (
     etf_cli,
     identity_cli,
     import_cli,
+    kr_collection_cli,
     prepare_cli,
     provider_cli,
     proxy_cli,
@@ -157,6 +158,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915 
                 result = import_cli.execute(args)
             case "collect" if args.collect_command == "qveris":
                 result = qveris_cli.execute(args)
+            case "collect" if args.collect_command in {"dart", "kind"}:
+                result = kr_collection_cli.execute(args)
             case "providers" | "collect":
                 result = provider_cli.execute(args)
             case "legacy-db" | "legacy-data":
