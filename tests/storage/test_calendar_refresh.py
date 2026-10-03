@@ -172,6 +172,9 @@ def test_older_declaration_cannot_undo_a_newer_one(ws: Workspace) -> None:
         _refresh(ws, _declaration(SECOND))
     with pytest.raises(ValueError, match="later than now"):
         _refresh(ws, _declaration("2025-07-01T00:00:00Z"))
+    # A newer declaration still states every date the head holds.
+    with pytest.raises(ValueError, match="does not cover every date"):
+        _refresh(ws, _declaration(THIRD, end="2025-01-27"))
 
 
 THIRD: Final = "2025-01-25T00:00:00Z"

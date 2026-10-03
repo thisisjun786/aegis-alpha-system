@@ -3,9 +3,9 @@
 For one ``aas-calendar-declaration-v1`` document the refresh
 
 1. checks it against the dataset head (``sessions.<mic>``): the same calendar, venue and
-   time zone, declared no earlier than the declaration the head was promoted from, and
-   not at the same instant with other content, so an older declaration can never undo a
-   newer one;
+   time zone, a range covering every date the head's declaration states, declared no
+   earlier than that declaration, and not at the same instant with other content, so an
+   older declaration can never undo a newer one and no stated date is left behind;
 2. (apply) retains the document in ``raw/`` and commits its source table
    (``calendar-declared-sessions-<hex>``, one row per date) to the source library, which
    reuses the source when the same bytes were committed before;
@@ -126,7 +126,13 @@ class _Head:
         self.generation_id = generation_id
         self.pin = spec.sources[0]
         self.timezone_version = str(spec.mapper_args["timezone_version"])
-        target = str(resolve_source(workspace, self.pin)["target"])
+        try:
+            target = str(resolve_source(workspace, self.pin)["target"])
+        except ImportError:
+            raise ValueError(
+                "aas calendar refresh verifies the head's source table through pyarrow; "
+                "install the legacy extra"
+            ) from None
         rows = workspace.market.execute(
             "SELECT DISTINCT calendar_id, venue, timezone, epoch_us(declared_at) FROM "  # noqa: S608
             f"{formats.quote_identifier(target)}"
@@ -183,6 +189,11 @@ def _check_head(declaration: Declaration, head: _Head, content: SourceContent) -
             f"the declaration is older than the one {declaration.dataset_id} was promoted "
             "from; declare the change again with a later declared_at"
         )
+    if head.days and (declaration.start > min(head.days) or declaration.end <= max(head.days)):
+        raise ValueError(
+            f"the declaration does not cover every date {declaration.dataset_id} holds "
+            f"({min(head.days)}..{max(head.days)}); a declaration states its whole range"
+        )
     if (
         declaration.declared_at_us == head.declared_at_us
         and content.source_id != head.pin.source_id
@@ -212,12 +223,10 @@ def _changes(declaration: Declaration, head: _Head | None) -> dict[str, object]:
                         "after": _day_json(after),
                     }
                 )
-    declared = {item.session_date for item in declaration.days()}
     return {
         "added": added,
         "changed": changed,
         "unchanged": unchanged,
-        "undeclared": sum(1 for day in before if day not in declared),
         "changed_sample": sample,
         "timezone_version_changed": head is not None
         and head.timezone_version != timezone_version(),

@@ -300,7 +300,9 @@ aas calendar refresh --declaration /path/to/declaration.json --sha256 SHA256 [--
 계획을, 아니면 head 선언과 날짜 단위로 비교한 추가·변경·불변 수와 변경 표본을 보고한다. 응답은
 선언 요약(연도별 개장·휴장 수), 다음 해 말까지 덮는지(`coverage.covers_next_year`), head generation,
 원천 ID를 함께 담는다. head를 만든 선언보다 이른 `declared_at`의 선언, 같은 `declared_at`의 다른
-내용, 다른 달력·시간대, 현재보다 늦은 `declared_at`은 거부한다.
+내용, 다른 달력·시간대, 현재보다 늦은 `declared_at`, head 선언의 날짜를 모두 덮지 않는 범위는 거부한다.
+head가 있으면 `--plan`도 head의 원천 테이블을 `pyarrow`로 검증한다. 계획에 stale 행이 남는 선언은
+게시하지 않고 거부한다. strict 소비자는 달력 시점(`declared_session_end@1`)을 binding grant로 허용한다.
 
 임시 휴장처럼 공표된 변경은 패키지 선언을 복사해 그 날짜를 `closed`나 `sessions`에 반영하고
 `declared_at`을 공표 시각 이후로 올린 문서를 `--declaration`으로 갱신한다. 다음 해 선언과 정정된
