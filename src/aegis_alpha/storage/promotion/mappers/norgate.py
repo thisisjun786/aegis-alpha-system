@@ -44,7 +44,9 @@ class NorgateFxCloses:
     provider: Final = "norgate"
     source_prefixes: Final = ()
     domain: Final = "fx_rates"
-    partition_column: Final = "date"
+    partition_sql: Final = '"date"'
+    row_flags: Final[Mapping[str, str]] = {}
+    manifest_items: Final = None
     date_column: Final = "fixing_at_us"
     time_inputs: Final[Mapping[str, InputKind]] = {"fixing_date": "date"}
 

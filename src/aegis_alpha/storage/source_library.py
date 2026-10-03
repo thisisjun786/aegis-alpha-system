@@ -419,6 +419,39 @@ def list_tables(workspace: Workspace, source_id: str) -> list[dict[str, object]]
     return cast("list[dict[str, object]]", _visible(workspace, source_id)["tables"])
 
 
+def source_metadata(workspace: Workspace, source_id: str) -> object:
+    """The ``metadata`` a completed source's commit manifest records (None when absent).
+
+    The metadata is returned only when the commit's request hash, which the completed
+    operation also records, recomputes from the manifest's table and metadata. A
+    content source's metadata holds its content record, which the hash covers, and
+    its lineage, which it does not; any other metadata is the request itself.
+    """
+    from aegis_alpha.storage.source_identity import is_content_record  # noqa: PLC0415
+
+    manifest = _visible(workspace, source_id)
+    marker = _marker(workspace, source_id)
+    metadata = manifest.get("metadata")
+    tables = cast("list[dict[str, object]]", manifest["tables"])
+    if marker is None or manifest.get("store") != "market" or len(tables) != 1:
+        raise ValueError("source metadata is read from a one-table market source")
+    table = tables[0]
+    requests: list[object] = [metadata]
+    if is_content_record(metadata) and set(cast("dict[str, object]", metadata)) == {
+        "source",
+        "lineage",
+    }:
+        requests = [{"source": cast("dict[str, object]", metadata)["source"]}]
+    for request in requests:
+        detail = [table["name"], table.get("arrow_schema"), request]
+        expected = hashlib.sha256(
+            schema.encoded([source_id, marker[2], "market", detail]).encode()
+        ).hexdigest()
+        if expected == marker[1]:
+            return metadata
+    raise ValueError(f"source {source_id} manifest does not match its request hash")
+
+
 def _admit_source_metadata(workspace: Workspace, max_materialization_bytes: int) -> int:
     # list_sources fetches all markers before visibility filtering; _marker also
     # fetches store_kind. Charge every field, including NULs and UTF-8 bytes;

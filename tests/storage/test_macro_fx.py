@@ -761,7 +761,7 @@ def test_legacy_fred_and_kr_public_sources_promote(tmp_path: Path, ws: Workspace
         (_day_end(date(2011, 10, 4), ny), None, "missing", None, None),
         (_day_end(date(2011, 10, 5), ny), Decimal("1197.50"), "present", None, None),
     ]
-    # The CSV's dates are text, so a partition is refused instead of cast.
+    # The CSV's dates are text; a partition reads only YYYY-MM-DD days.
     raw_fx, sha_fx = _spec(
         "fx_rates",
         "fx.usdkrw.fred",
@@ -771,10 +771,10 @@ def test_legacy_fred_and_kr_public_sources_promote(tmp_path: Path, ws: Workspace
         _rule("unknown_null@1", "record", None, None),
         decimal={"rate": "decimal_text@1"},
         parent=str(result["generation_id"]),
-        partition=(date(2011, 1, 1), date(2012, 1, 1)),
+        partition=(date(2011, 10, 4), date(2011, 10, 6)),
     )
-    with pytest.raises(ValueError, match="without a partition"):
-        promote(ws, raw_fx, sha_fx, apply=False)
+    replan = promote(ws, raw_fx, sha_fx, apply=False)
+    assert (replan["operations"], replan["unchanged"]) == ({}, 2)
     unknown = _rule("unknown_null@1", "record", None, None)
     for provider, dataset, count in (("bok", "macro.kr.bok", 2), ("oecd", "macro.kr.oecd", 2)):
         document = _spec(

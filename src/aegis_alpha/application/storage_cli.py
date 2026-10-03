@@ -90,6 +90,34 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
         "--plan", action="store_true", help="Report rows, operations and flags; write nothing"
     )
     _home(sub.add_parser("promotions", help="List promotion intents and their generations"))
+    kr_prices = sub.add_parser(
+        "kr-prices",
+        help="Promote EODHD KR history (by year) and partial bulk days (by date) in order",
+    )
+    _home(kr_prices)
+    kr_prices.add_argument("--identity-snapshot", required=True)
+    kr_prices.add_argument(
+        "--lag-us",
+        type=int,
+        required=True,
+        help="session_close_plus_lag@1 lag after the XKRX close, in microseconds",
+    )
+    kr_prices.add_argument(
+        "--history-lineage", required=True, help="Source ID prefix of the KR daily-bar history"
+    )
+    kr_prices.add_argument(
+        "--bulk-lineage", help="Source ID prefix of the exchange-wide daily downloads"
+    )
+    kr_prices.add_argument(
+        "--reference",
+        action="store_true",
+        help="Build prices.kr.eodhd.ref from the provider's adjusted close",
+    )
+    kr_prices.add_argument(
+        "--plan",
+        action="store_true",
+        help="Plan every step against the current head; write nothing",
+    )
     for name in ("inspect", "read"):
         reader = sub.add_parser(name)
         _home(reader)
@@ -176,8 +204,9 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             return initialize(home)
         if args.command == "data" and args.data_command in {"convention-import", "binding-import"}:
             return _pin_import(home, args)
-        if args.command == "data" and args.data_command == "promote":
-            return _promote(home, args)
+        if args.command == "data" and args.data_command in {"promote", "kr-prices"}:
+            run = _promote if args.data_command == "promote" else _kr_prices
+            return run(home, args)
         if args.command == "db" and args.db_command in {
             "verify",
             "backup",
@@ -286,6 +315,32 @@ def _promote(home: Path, args: argparse.Namespace) -> dict[str, object]:
         open_workspace(home, writable=not args.plan) as workspace,
     ):
         return promote(workspace, raw, args.sha256, apply=not args.plan, budget=budget)
+
+
+def _kr_prices(home: Path, args: argparse.Namespace) -> dict[str, object]:
+    """Plan (read-only) or apply the KR price backfill under the shared compute budget."""
+    from aegis_alpha.application.compute_cli import price_compute
+    from aegis_alpha.storage.kr_prices import kr_prices
+    from aegis_alpha.storage.locks import private_directory, storage_lock_targets
+    from aegis_alpha.storage.paths import load_paths
+    from aegis_alpha.storage.workspace import open_workspace
+
+    private_directory(home)
+    targets = storage_lock_targets(home, load_paths(home).stores())
+    with (
+        price_compute(excluded_locks=targets) as budget,
+        open_workspace(home, writable=not args.plan) as workspace,
+    ):
+        return kr_prices(
+            workspace,
+            identity_snapshot=args.identity_snapshot,
+            lag_us=args.lag_us,
+            history_lineage=args.history_lineage,
+            bulk_lineage=args.bulk_lineage,
+            reference=args.reference,
+            apply=not args.plan,
+            budget=budget,
+        )
 
 
 def _pin_import(home: Path, args: argparse.Namespace) -> dict[str, object]:

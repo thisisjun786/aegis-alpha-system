@@ -49,7 +49,9 @@ class FredAlfred:
     provider: Final = "fred"
     source_prefixes: Final = ()
     domain: Final = "macro_observations"
-    partition_column: Final = "realtime_start"
+    partition_sql: Final = '"realtime_start"'
+    row_flags: Final[Mapping[str, str]] = {}
+    manifest_items: Final = None
     date_column: Final = "observation_period"
     time_inputs: Final[Mapping[str, InputKind]] = {"vintage_start": "date"}
 

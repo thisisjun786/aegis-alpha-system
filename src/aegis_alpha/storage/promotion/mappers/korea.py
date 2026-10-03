@@ -62,7 +62,9 @@ _UNIT: Final = (
 class KoreaObservations:
     major: Final = 1
     domain: Final = "macro_observations"
-    partition_column: Final = "period"
+    partition_sql: Final = _PERIOD
+    row_flags: Final[Mapping[str, str]] = {}
+    manifest_items: Final = None
     date_column: Final = "observation_period"
     time_inputs: Final[Mapping[str, InputKind]] = {}
 

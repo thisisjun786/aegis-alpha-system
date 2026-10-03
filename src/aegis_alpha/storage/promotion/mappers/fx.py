@@ -47,6 +47,8 @@ class TextFxSeries:
     domain: Final = "fx_rates"
     date_column: Final = "fixing_at_us"
     time_inputs: Final[Mapping[str, InputKind]] = {"fixing_date": "date"}
+    row_flags: Final[Mapping[str, str]] = {}
+    manifest_items: Final = None
 
     def __init__(  # noqa: PLR0913 -- one source shape: provider, prefix and three columns
         self, name: str, provider: str, prefix: str, *, series: str, day: str, value: str
@@ -54,7 +56,7 @@ class TextFxSeries:
         self.name = name
         self.provider = provider
         self.source_prefixes = (prefix,)
-        self.partition_column = day
+        self.partition_sql = iso_day(day)
         self._series, self._day, self._value = series, day, value
 
     def check_args(self, args: Mapping[str, object]) -> None:
