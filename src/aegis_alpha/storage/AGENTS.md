@@ -73,6 +73,17 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   SUPERSEDE takes the correcting source's evidence time. A declaration older than the head's,
   another one at the same instant, or a plan with stale rows is refused, so an old declaration
   never undoes a newer correction and a correction is never dropped silently.
+- The macro and FX mappers (`fred.alfred@1`, `bok`/`oecd.observations@1`, `norgate.fx_closes@1`,
+  `norgate.fx_history@1`, `fred.fx_series@1`) emit numbers as the source's text for `decimal_text@1` and never repair it.
+  A generation holds one revision per record, so ALFRED vintages promote one vintage partition per
+  generation in order (`mappers.fred.vintage_partitions`), each later vintage a SUPERSEDE; the closed
+  `realtime_end` of a later pull stays in the source row, never on the earlier revision. A text-dated
+  source partitions on its `YYYY-MM-DD` text read as a date; a tombstone scope tests the mapper's domain date column, or the
+  UTC day of an instant column such as FX `fixing_at_us`. An FX spec's `timezone` must end the day
+  after the provider's fixing, and `local_day_end@1` on the fixing date needs the provider to publish
+  by then (FRED H.10 does not, so `fred.fx_series@1` takes `unknown_null@1`).
+  A mapper whose source shape several providers share declares `source_prefixes`, and the spec
+  refuses a pin from another provider's source.
 - `legacy_import` owns `aas import legacy` (`aas-legacy-import-v1`, see the legacy section of
   `dev-notes/design/data-vertical.md`). A registered loader (`<provider>.<shape>@<major>`) fixes
   one format's complete unit, output columns and reconciliation metrics; one unit commits one
