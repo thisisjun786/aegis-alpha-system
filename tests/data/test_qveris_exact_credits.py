@@ -19,6 +19,10 @@ from aegis_alpha.data.qveris_store import QverisStore
 from tests.data.test_qveris_acquisition import NOW, FakeQveris, eod_job
 from tests.data.test_qveris_client import FakeOpener, FakeResponse
 
+# Serial: these tests take the host-wide Qveris account lease (an abstract Unix socket named by
+# the synthetic account), so every file that takes it runs in one xdist worker.
+pytestmark = pytest.mark.xdist_group("qveris-account-lease")
+
 
 class WireCredits(FakeQveris):
     """Keep the stateful fake's accounting, but emit numeric monetary JSON tokens."""

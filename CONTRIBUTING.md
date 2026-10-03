@@ -10,6 +10,22 @@ the focused tests for your change and the relevant style/type checks. CI selects
 independent jobs and aggregates one required result; a duplicate full local suite
 is not required before opening a PR. See [scripts/AGENTS.md](scripts/AGENTS.md).
 
+### Fast local loop
+
+Tests run whole files in parallel worker processes (pytest-xdist). Each process
+gets its own isolated home under `TMPDIR` (see [tests/AGENTS.md](tests/AGENTS.md)),
+so a run never reads or writes your `~/.aas`.
+
+- The area you are changing: `uv run --no-sync pytest -n auto --dist loadgroup -m 'not database' <paths>`
+  (whole files per worker; see tests/AGENTS.md for serial groups).
+- The full database-free lane: `./scripts/verify-lane-test` (the same command each CI
+  `tests` shard runs).
+- For fsync-heavy storage runs on Linux, set `TMPDIR=/dev/shm/aas-$USER` (create it
+  first) to keep the scratch stores in memory. Do not use `/tmp`: a stray `/tmp/.git`
+  makes storage refuse paths beneath it.
+- `AAS_TEST_WORKERS=0 ./scripts/verify-lane-test` (or `pytest` without `-n`) runs
+  serially in one process, for debuggers and `breakpoint()`.
+
 Public tests must work without private strategy data, credentials, live providers
 or installed production services. Use synthetic assets, parameters and expected
 results. The repository owns generic calculation, schema, parsing and execution

@@ -6,6 +6,7 @@ import tempfile
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -13,20 +14,28 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import Engine, create_engine, inspect, make_url, text
 
+from tests.isolation import isolate, live_roots, live_state_refusal
+from tests.serial import QVERIS_LEASE_GROUP
+
 if TYPE_CHECKING:
     from sqlalchemy.engine import URL
 
-# Production has no data-root default.  The test process installs one explicit,
-# already-existing synthetic root before test modules import path-bound
-# constants.  A caller-provided root (for mounted real-input acceptance) wins.
-_PYTEST_DATA_ROOT = tempfile.TemporaryDirectory(prefix="aas-pytest-data-root-")
-os.environ.setdefault("AAS_DATA_ROOT", os.path.realpath(_PYTEST_DATA_ROOT.name))
+# One isolation tree per test process (per xdist worker) under TMPDIR, installed before
+# test modules import path-bound constants: HOME, XDG_*_HOME, AAS_HOME and the synthetic
+# AAS_DATA_ROOT (production has no data-root default) all live in it.  A caller-provided
+# AAS_HOME or AAS_DATA_ROOT (mounted real-input acceptance) wins; the session-start guard
+# refuses any of them that resolves inside live state.  See tests/isolation.py.
+_OPERATOR_HOME = os.environ.get("HOME")
+_PYTEST_ROOT = tempfile.TemporaryDirectory(prefix="aas-pytest-")
+isolate(Path(os.path.realpath(_PYTEST_ROOT.name)), os.environ)
 
 from aegis_alpha.data import canonical_generation_schema  # noqa: E402, F401
+from aegis_alpha.data.qveris_store import QverisStore  # noqa: E402
 from aegis_alpha.metadata.schema import metadata  # noqa: E402
 
-# CI splits the database-free lane into deterministic file shards (tests/sharding.py).
-pytest_plugins = ["tests.sharding"]
+# CI splits the database-free lane into deterministic file shards (tests/sharding.py), and
+# xdist runs whole files or declared serial groups per worker (tests/scheduling.py).
+pytest_plugins = ["tests.sharding", "tests.scheduling"]
 
 _DATABASE_PREFIX = "aas_owned_"
 _DATABASE_SUFFIX = "_test"
@@ -38,6 +47,13 @@ _DATABASE_SUFFIX = "_test"
 # a test that opens PostgreSQL without the fixture must carry
 # ``@pytest.mark.database`` itself.
 _DATABASE_FIXTURE = "test_database"
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    del session
+    refusal = live_state_refusal(os.environ, live_roots(_OPERATOR_HOME))
+    if refusal is not None:
+        pytest.exit(refusal, returncode=pytest.ExitCode.USAGE_ERROR)
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
@@ -56,6 +72,27 @@ def block_network(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket, "create_connection", denied)
     monkeypatch.setattr(socket, "getaddrinfo", denied)
     monkeypatch.setattr(socket.socket, "connect", denied)
+
+
+@pytest.fixture(autouse=True)
+def qveris_lease_needs_its_serial_group(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail a test that takes the Qveris account lease outside its serial group."""
+    if any(
+        marker.args == (QVERIS_LEASE_GROUP,) for marker in request.node.iter_markers("xdist_group")
+    ):
+        return
+    enter = QverisStore.__enter__
+
+    def refused(store: QverisStore) -> QverisStore:
+        pytest.fail(
+            f"{request.node.nodeid} takes the Qveris account lease; mark its file "
+            f'pytestmark = pytest.mark.xdist_group("{QVERIS_LEASE_GROUP}") (tests/AGENTS.md)'
+        )
+        return enter(store)
+
+    monkeypatch.setattr(QverisStore, "__enter__", refused)
 
 
 @dataclass(frozen=True, slots=True)
