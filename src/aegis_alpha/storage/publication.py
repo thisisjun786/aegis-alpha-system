@@ -341,7 +341,7 @@ def source_snapshots(
     return headers
 
 
-def _recover_one(
+def _recover_one(  # noqa: PLR0911 -- one route per operation kind
     workspace: Workspace, operation: sqlite3.Row, budget: ComputeBudget | None
 ) -> bool:
     """Route one prepared operation to the module that owns finishing it."""
@@ -362,6 +362,10 @@ def _recover_one(
         return recover_source(workspace, str(operation["operation_id"]))
     if kind == "market_publish":
         return _recover_publication(workspace, operation)
+    if kind == "promotion":
+        from aegis_alpha.storage.promotion.engine import recover_promotion  # noqa: PLC0415
+
+        return recover_promotion(workspace, dict(operation), budget=budget)
     if kind == RUN_OPERATION_KIND:
         from aegis_alpha.storage.runs import recover_run  # noqa: PLC0415
 

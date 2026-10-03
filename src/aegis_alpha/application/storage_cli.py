@@ -80,6 +80,16 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
             "--request" if name == "read-prices" else "--spec", type=Path, required=True
         )
         command.add_argument("--sha256", required=True)
+    promote = sub.add_parser(
+        "promote", help="Promote pinned source tables by an exact aas-promotion-v1 spec"
+    )
+    _home(promote)
+    promote.add_argument("--spec", type=Path, required=True)
+    promote.add_argument("--sha256", required=True)
+    promote.add_argument(
+        "--plan", action="store_true", help="Report rows, operations and flags; write nothing"
+    )
+    _home(sub.add_parser("promotions", help="List promotion intents and their generations"))
     for name in ("inspect", "read"):
         reader = sub.add_parser(name)
         _home(reader)
@@ -166,6 +176,8 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             return initialize(home)
         if args.command == "data" and args.data_command in {"convention-import", "binding-import"}:
             return _pin_import(home, args)
+        if args.command == "data" and args.data_command == "promote":
+            return _promote(home, args)
         if args.command == "db" and args.db_command in {
             "verify",
             "backup",
@@ -258,6 +270,24 @@ def _maintenance(home: Path, args: argparse.Namespace) -> dict[str, object]:  # 
             return verify_workspace(workspace, budget=budget)
 
 
+def _promote(home: Path, args: argparse.Namespace) -> dict[str, object]:
+    """Plan (read-only) or apply one promotion under the shared compute budget, if set."""
+    from aegis_alpha.application.compute_cli import price_compute
+    from aegis_alpha.storage.locks import private_directory, storage_lock_targets
+    from aegis_alpha.storage.paths import load_paths
+    from aegis_alpha.storage.promotion.engine import promote, read_spec_file
+    from aegis_alpha.storage.workspace import open_workspace
+
+    raw = read_spec_file(args.spec, args.sha256)
+    private_directory(home)
+    targets = storage_lock_targets(home, load_paths(home).stores())
+    with (
+        price_compute(excluded_locks=targets) as budget,
+        open_workspace(home, writable=not args.plan) as workspace,
+    ):
+        return promote(workspace, raw, args.sha256, apply=not args.plan, budget=budget)
+
+
 def _pin_import(home: Path, args: argparse.Namespace) -> dict[str, object]:
     from dataclasses import asdict
 
@@ -282,7 +312,7 @@ def _pin_import(home: Path, args: argparse.Namespace) -> dict[str, object]:
             return import_binding(workspace, raw, args.sha256, budget=budget)
 
 
-def _workspace_command(workspace: object, args: argparse.Namespace) -> dict[str, object]:  # noqa: PLR0911 -- CLI routing
+def _workspace_command(workspace: object, args: argparse.Namespace) -> dict[str, object]:  # noqa: C901, PLR0911 -- CLI routing
     from aegis_alpha.storage.workspace import Workspace
 
     if not isinstance(workspace, Workspace):
@@ -315,6 +345,10 @@ def _workspace_command(workspace: object, args: argparse.Namespace) -> dict[str,
         return {**recovered, **link_content_sources(workspace)}
     if args.command == "strategy":
         return _strategy_command(workspace, args)
+    if args.data_command == "promotions":
+        from aegis_alpha.storage.promotion.engine import list_promotions
+
+        return {"promotions": list_promotions(workspace)}
     from aegis_alpha.application.data_cli import execute_native_data
 
     return execute_native_data(workspace, args)

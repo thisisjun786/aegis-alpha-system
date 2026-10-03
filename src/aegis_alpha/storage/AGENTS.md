@@ -51,6 +51,18 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   `request_hash`, `source_id`) has a frozen expected digest. Source retirement
   requires no references (the source's own `sl:` link is lineage, not a reference),
   an equivalence digest and an other-device backup, and never removes `raw/` bytes.
+- `promotion/` implements that path. `spec` parses the document, `mappers` is the registry
+  (one module per provider shape; a mapper is SQL over the staged source and declares its
+  columns, identity key, partition and time inputs), `time_rules` and `decimal_rules` hold the
+  versioned rules with a Python reference beside each SQL form, `formats` the frozen hash
+  formats, and `engine` plans, applies, recovers and verifies. All per-row work stays in DuckDB
+  temp tables on the workspace connection; only rows SQL cannot hash exactly (escaped text, odd
+  natural keys) are computed in Python in bounded key-ordered batches. A plan writes nothing; an
+  apply retains spec, request and manifest in `raw/`, records a `promotion` intent whose payload
+  is the manifest, commits marker, rows and `quality_flags` in one DuckDB transaction through
+  `publish_generation_bulk(companion=...)`, then writes the catalog. `aas db verify` sends a
+  promoted chain to `engine.verify_promotion` instead of the import-document verifier, and
+  `db recover` finishes a `promotion` intent only when the retained spec recomputes its manifest.
 - `bulk_generation` publishes a staged DuckDB table as one generation: plan without
   writing, then one transaction with the marker and `INSERT … SELECT`. DuckDB encodes and
   sorts `aas-rowset-v1` rows and `rowset.RowsetStream` digests them in admitted batches and

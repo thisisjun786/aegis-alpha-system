@@ -150,7 +150,7 @@ def _verify_runs(workspace: Workspace, budget: ComputeBudget) -> list[str]:
     ]
 
 
-def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification boundary
+def verify_workspace(  # noqa: C901, PLR0912, PLR0915 -- full cross-store verification boundary
     workspace: Workspace, *, budget: ComputeBudget | None = None
 ) -> dict[str, object]:
     """Verify under a caller-owned allocation, retaining the serial default when omitted."""
@@ -195,8 +195,17 @@ def verify_workspace(  # noqa: C901, PLR0912 -- full cross-store verification bo
     committed = {version["generation_id"] for version in versions}
     parents = {version["parent_generation_id"] for version in versions}
     covered: set[str] = set()
+    from aegis_alpha.storage.promotion.engine import (  # noqa: PLC0415 -- promotion owner
+        is_promoted,
+        verify_promotion,
+    )
+
     for generation in sorted(committed - parents):
-        verify_sealed_publication(workspace, generation, budget=held)
+        # A promoted chain is evidenced by its spec, manifest and flags, not an import document.
+        if is_promoted(workspace, generation):
+            verify_promotion(workspace, generation, budget=held)
+        else:
+            verify_sealed_publication(workspace, generation, budget=held)
         covered.update(
             str(marker["generation_id"])
             for marker in generation_chain(workspace.market, generation)

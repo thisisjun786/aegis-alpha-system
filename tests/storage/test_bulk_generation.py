@@ -344,7 +344,7 @@ def test_sql_cell_encoding_matches_python_codec() -> None:
         connection.execute(f"CREATE OR REPLACE TABLE cells (v {sql_type})")
         values = [None, *(draw() for _ in range(2_000))]
         connection.executemany("INSERT INTO cells VALUES (?)", [[value] for value in values])
-        encoded = bulk_generation._encoded("v", rowset_type)
+        encoded = bulk_generation.encoded_cell_sql("v", rowset_type)
         for stored, blob in connection.execute(f"SELECT v, {encoded} FROM cells").fetchall():
             assert blob == encode_row((("v", rowset_type),), {"v": stored}), (rowset_type, stored)
 
@@ -815,7 +815,7 @@ def test_sql_record_identity_matches_python() -> None:
             "INSERT INTO keys VALUES (" + ",".join("?" for _ in columns) + ")",
             [[row[name] for name, _ in columns] for row in rows],
         )
-        expected, plain = bulk_generation._identity_sql(domain)
+        expected, plain = bulk_generation.record_identity_sql(domain)
         names = ", ".join(f'"{name}"' for name in NATURAL_KEYS[domain])
         checked = connection.execute(
             f"SELECT {expected}, {names} FROM keys WHERE {plain}"
