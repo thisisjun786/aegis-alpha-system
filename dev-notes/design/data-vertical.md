@@ -118,7 +118,8 @@ loader는 원본 형식 하나를 읽는 등록된 코드다. loader가 원본�
 `acceptanceDateTime`, `act`, `form`, `fileNumber`, `filmNumber`, `items`, `core_type`, `primaryDocument`,
 `primaryDocDescription`(텍스트), `size`, `isXBRL`, `isInlineXBRL`, `isXBRLNumeric`(정수)이다. 문서에 없는
 배열은 그 행에서 null이다. 이 밖의 키, 길이가 다른 배열, 다른 JSON 타입의 값, member 이름과 다른 `cik`를
-싣는 제출자 문서는 단위를 거부한다. 제출자가 나열했지만 archive에 없는 쪽(`missing_pages`), 어느 제출자도
+싣는 제출자 문서, 자기 CIK의 `CIK##########-submissions-###.json`이 아닌 쪽을 나열하는 제출자 문서는 단위를
+거부한다. 제출자가 나열했지만 archive에 없는 쪽(`missing_pages`), 어느 제출자도
 나열하지 않은 쪽(`unlisted_pages`), 공시 수가 나열과 다른 쪽(`miscounted_pages`), 그 밖의 이름을 가진 JSON
 member(`unknown_members`)는 불일치 지표다. 쪽의 행은 수가 달라도 모두 읽는다. 같은 archive를
 `sec.submissions_zip@1` 항목과 함께 편입할 수 있으며 bytes는 `raw/`에 한 번 보존된다.
@@ -1742,3 +1743,4 @@ state v2:
 | DV-248 | 같은 accession의 바뀐 값은 SUPERSEDE이고 그 시점은 공시 접수 시각이며, 명세 파티션은 공시일로 사실을 고른다 | `tests/storage/test_sec_promotion.py::test_a_changed_value_of_one_accession_supersedes_and_partitions_select_by_filing` | 구현 |
 | DV-249 | 매퍼 참조는 참조 도메인의 dataset generation만 pin할 수 있다 | `tests/storage/test_sec_promotion.py::test_a_filings_reference_must_pin_a_filings_generation` | 구현 |
 | DV-250 | SEC가 두 번 나열한 같은 공시는 한 번 읽히고, 값이 다른 같은 accession의 행은 둘 다 매핑되어 승격을 거부한다 | `tests/storage/test_sec_promotion.py::test_a_repeated_listing_is_read_once` | 구현 |
+| DV-251 | 제출자 문서가 자기 CIK의 `CIK##########-submissions-###.json`이 아닌 쪽을 나열하면 submissions 단위를 거부한다 | `tests/storage/test_legacy_import.py::test_sec_submissions_filings_refuse_a_page_of_another_filer` | 구현 |

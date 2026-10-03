@@ -630,7 +630,11 @@ def _filings(*rows: tuple[str, str, str, str, int]) -> dict[str, list[object]]:
 
 
 def _submissions(
-    tmp_path: Path, *, pages: dict[str, object] | None = None, listed: int = 1
+    tmp_path: Path,
+    *,
+    pages: dict[str, object] | None = None,
+    listed: int = 1,
+    listed_name: str = "CIK0000000001-submissions-001.json",
 ) -> tuple[Path, Path]:
     """A submissions archive: one filer document, its one older page and a text member."""
     stamp = (2026, 9, 5, 4, 25, 4)
@@ -644,7 +648,7 @@ def _submissions(
             ),
             "files": [
                 {
-                    "name": "CIK0000000001-submissions-001.json",
+                    "name": listed_name,
                     "filingCount": listed,
                     "filingFrom": "1999-01-04",
                     "filingTo": "1999-01-04",
@@ -786,6 +790,20 @@ def test_sec_submissions_filings_refuse_unknown_shapes(
     )
     report = plan_import(_manifest([_filings_entry(archive_path, receipt_path)]))
     assert reason in _refusal(report)
+
+
+@pytest.mark.parametrize(
+    "listed_name", ["CIK0000000002-submissions-001.json", "CIK0000000001-page-001.json"]
+)
+def test_sec_submissions_filings_refuse_a_page_of_another_filer(
+    tmp_path: Path, listed_name: str
+) -> None:
+    page = _filings(("0000000002-99-000001", "1999-01-04", "", "1999-01-04T05:00:00.000Z", 7))
+    archive_path, receipt_path = _submissions(
+        tmp_path, pages={listed_name: page}, listed_name=listed_name
+    )
+    report = plan_import(_manifest([_filings_entry(archive_path, receipt_path)]))
+    assert "lists a page of another filer" in _refusal(report)
 
 
 def _small_originals(

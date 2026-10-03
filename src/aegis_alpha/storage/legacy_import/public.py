@@ -17,7 +17,8 @@ top level. Each array position is one row, members in central-directory order an
 in array order: the member name, the member's ten-digit CIK and each array's value as SEC
 wrote it (text stays text; ``size`` and the XBRL markers stay integers). An array a document
 lacks is null in its rows. A key outside the known arrays, arrays of unequal length, a value
-of another JSON type or a filer document whose ``cik`` is not its member's refuses the unit.
+of another JSON type, a filer document whose ``cik`` is not its member's or a listed page
+whose name is not a ``CIK##########-submissions-###.json`` of that CIK refuses the unit.
 Pages a filer lists but the archive lacks (``missing_pages``), pages no filer lists
 (``unlisted_pages``), pages whose filing count differs from the listing (``miscounted_pages``)
 and JSON members of any other name (``unknown_members``) are discrepancy metrics.
@@ -442,7 +443,12 @@ def _filer_arrays(
     filings = json_object(document.get("filings"), f"{name} filings")
     if set(filings) != {"recent", "files"}:
         raise ValueError(f"SEC submissions {name} filings keys are unknown")
-    listed.update(_page_list(filings["files"], name))
+    pages = _page_list(filings["files"], name)
+    for page, _ in pages:
+        named = _PAGE.fullmatch(page)
+        if named is None or named.group(1) != cik:
+            raise ValueError(f"SEC submissions {name} lists a page of another filer: {page}")
+    listed.update(pages)
     return json_object(filings["recent"], f"{name} filings.recent")
 
 
