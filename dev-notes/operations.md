@@ -32,6 +32,9 @@ aas strategy list
 aas strategy show --id ID --version VERSION --sha256 SHA256
 aas strategy show --id ID --version VERSION --sha256 SHA256 \
   --requirements /path/to/requirements.json --requirements-sha256 SHA256
+aas strategy promote --source SOURCE_ID --sha256 SHA256 --plan
+aas strategy promote --source SOURCE_ID --sha256 SHA256 --apply
+aas strategy definitions [--id ID]
 aas data datasets
 aas data import /path/to/typed-data.json --sha256 SHA256
 aas data inspect --dataset ID --version VERSION
@@ -51,6 +54,19 @@ aas data read --dataset ID --version VERSION --cutoff-us UTC_MICROSECONDS
 계보 없는 v1은 그대로 지원한다. 상태를 봉인하지 않은 중간 개발 버전의 caller-only 계보 v1은
 원본을 보존하지만 조회·재봉인·검증·복구 완료·백업·ready 복원은 거부한다. 자동 변환은 없다.
 정확한 바이트 규약과 호환 한계는 [계보 프로토콜](design/strategy-lineage.md)에 있다.
+
+`strategy promote`는 `db source-import`로 보존한 전략 원본 레코드(`strategy`·`asset_dependency`·
+`macro_dependency` 테이블)를 [정의 문서](design/data-vertical.md#전략-레지스트리)로 등록한다.
+`--sha256`은 그 원천을 적재할 때의 SHA-256이다. `--plan`은 아무것도 쓰지 않고 전략 수, 새 전략·새
+버전·재사용 버전 수, 요구 행의 도메인·사상 상태별 수, dataset ID마다 요구 수·전략 수와 state
+카탈로그의 등록 여부(`in_catalog`)·committed 버전 수, 사상되지 않은 토큰과 이유, 원천 의존 테이블과
+요청이 어긋난 전략(`dependency_mismatches`)을 보고한다. `--apply`는 어긋난 전략이 하나라도 있으면
+거부하고, 같은 원천으로 다시 실행하면 `reused=true`로 끝나며 바뀌는 것이 없다. 내용이 바뀐 레코드는
+새 버전이 되고 이전 버전은 그대로 남는다. 정의는 실행 bundle이 아니므로 `strategy list`에 나오지 않고
+`strategy definitions`로 조회하며 모든 행이 `execution_eligible=false`다. 원천 테이블은 계산 예산
+(설정한 AAS compute 환경, 없으면 512 MiB 직렬 기본값)에서 세 테이블을 누적해 승인한다. 등록 작업이 PREPARED로 남으면
+`aas db recover`가 저장된 정의를 다시 도출해 완료하고 원천을 다시 읽지 않는다. 비공개 marker 없이
+남은 작업은 같은 `--apply`를 다시 실행해 끝내며, `aas db quarantine`은 등록 작업을 격리하지 않는다.
 
 `strategy show`는 고정한 전략의 실행 정의를 JSON으로 출력하며 계산·기록을 하지 않는다.
 출력에는 자산·현금 ID, 역할별 입력 요구, 달력 규약, `required_convention_roles`,
@@ -683,7 +699,8 @@ run 등록, 결과 저장은 하지 않는다. 봉투 회계는 별도 `aas back
 (`aas-canonical-json-sha256-v1`), `strategy`, `bindings`, `refs`, `price_inputs`,
 `macro_inputs`, `derived_inputs`, `proxy_rules`, `period`, `history`, `cutoff`,
 `decision_latency_us`, `explicit_decision_dates`, `account`, `comparison`, `envelope`,
-`metadata`다. 모든 키가 필수이고 알 수 없는 키·중복 키·bool을 숫자로 쓴 값은 거부한다.
+`metadata`다. 계좌 통화가 아닌 가격 선택이 있으면 `fx_conversions`를 더한다. 그 밖의 키는 모두 필수이고
+알 수 없는 키·중복 키·bool을 숫자로 쓴 값은 거부한다.
 기계용 JSON Schema는 [backtest_request.py](../src/aegis_alpha/engine/backtest_request.py)의
 `PREPARE_REQUEST_SCHEMA`가 정본이다. 인라인 가격·전략·기본 관례는 받지 않는다.
 
@@ -703,6 +720,8 @@ run 등록, 결과 저장은 하지 않는다. 봉투 회계는 별도 `aas back
   시장마다 다른 기업행동 원천을 묶을 수 있다. 여러 개를 허용하는 역할은 `signal_prices`·`execution_prices`·
   `macro`·`derived`·`proxy`·`actions`뿐이며 ordinal은 역할 안에서 0부터 연속이다. `signal_prices`·
   `execution_prices`·`sessions`·`macro`는 `generation` 또는 `heads` 참조를, `actions`는 `heads` 참조만 받는다.
+  `fx_conversion`은 `fx_rates` 도메인의 `heads` 참조만 받고 `fx_conversions` 항목마다 하나이며 여러 개를
+  허용한다.
 - `refs`: bindings가 가리키는 참조 서술자. `ref_kind`, `ref_id`, `ref_version`, `hash`,
   `schema`, `hash_format`, `pin`을 담고 같은 서술자를 두 번 넣으면 거부한다.
   `generation`의 pin은 `data inspect`가 돌려주는 `dataset_id`·`version`·`generation_id`·
@@ -717,6 +736,11 @@ run 등록, 결과 저장은 하지 않는다. 봉투 회계는 별도 `aas back
   `ordinal`), 정렬된 `instrument_ids`, `currency`, `basis`(`unadjusted`·`split_adjusted`·
   `total_return`), `price_role`(`canonical`·`reference`), `interval=1d`. 신호 가격은 basis
   관례와 맞아야 하고 체결 가격은 `unadjusted`·`canonical`이어야 한다.
+- `fx_conversions`: 계좌 통화가 아닌 가격 통화마다 하나. `binding`(`fx_conversion` 역할·ordinal),
+  `currency`(세 글자 대문자), `series_id`(`<currency>/<계좌 통화>` 또는 `<계좌 통화>/<currency>`),
+  `max_fixing_age_days`(0 이상 정수), `signal_basis`(`account_currency` 또는 `price_currency`). 환산이
+  없으면 열쇠를 두지 않으며 빈 배열은 거부한다. 규칙과 기록은
+  [FX 변환 계약](design/data-vertical.md#fx-변환-계약)이 소유한다.
 - `macro_inputs`(`binding`·`series_id`·`unit`), `derived_inputs`(`binding`·`series_id`),
   `proxy_rules`(`binding`·`logical_exposure_id`): 전략 정의의 요구를 빠짐없이 채워야 하며
   요구하지 않은 입력을 조용히 무시하지 않는다.
@@ -956,8 +980,30 @@ run 이력에 남는다. 어느 쪽이든 성공 영수증은 없다. 그 run을
 `pins`는 `aas-head-binding-v1`의 순서 있는 pin과 `[from, to)` cutover 구간이고, `excluded_flags`는
 읽지 않을 quality flag다. 연구 읽기는 엄격 PIT가 아니므로 시간 규칙 grant는 선언하지 않는다.
 `instrument_map`의 열쇠는 identity가 발급한 instrument ID이고 값 자산은 상태 저장소에서 `etf`로
-분류돼 있어야 한다. 가격 통화는 `conventions.currency`와 같아야 한다. 선언한 `knowledge_time`보다
-늦게 알려진 revision은 읽지 않는다. 봉인 준비 문서의 `prices.head_read`가 그 읽기 영수증이다.
+분류돼 있어야 한다. 가격 통화는 `conventions.currency`이거나 `fx_conversions` grant가 허용한 통화다.
+선언한 `knowledge_time`보다 늦게 알려진 revision은 읽지 않는다. 봉인 준비 문서의 `prices.head_read`가
+그 읽기 영수증이다.
+
+슬리브가 거시 신호를 읽으면 선언은 그 series를 `macro`로 grant하고, 다른 통화의 가격을 쓰면
+`fx_conversions`로 grant한다. 둘 다 쓰지 않으면 열쇠를 두지 않는다.
+
+```json
+"macro": [
+  {"series_id": "T10Y3M", "unit": "percent",
+   "binding": {"domain": "macro_observations", "pins": [<pin>], "excluded_flags": []}}
+],
+"fx_conversions": [
+  {"currency": "USD", "series_id": "USD/KRW", "max_fixing_age_days": 5,
+   "signal_basis": "account_currency",
+   "binding": {"pins": [<fx_rates pin>], "excluded_flags": []},
+   "prices": {"pins": [<USD 가격 pin>], "excluded_flags": []}}
+]
+```
+
+`macro`는 슬리브들이 읽는 series와 정확히 같아야 하고 판단마다 그 cutoff로 다시 읽힌다.
+`fx_conversions`의 `prices`는 선택이며, 있으면 그 통화의 chain을 선언의 `prices`와 함께 읽는다.
+봉인 준비 문서의 `macro`와 `fx_conversions`가 grant와 그 아래의 모든 읽기를 기록한다. 계약은
+[연구 실행의 canonical 가격 패널](design/data-vertical.md#연구-실행의-canonical-가격-패널)이 소유한다.
 
 run 저장 표는 기본 설치에 없고, 선언된 계약을 담으려면 add-on이 v1보다 높아야 한다. 둘 다
 0단계에서 확인하므로 설치가 부족하면 계산 전에 실행할 명령을 알려주고 끝난다.

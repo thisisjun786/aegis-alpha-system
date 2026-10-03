@@ -199,6 +199,7 @@ _ROLES: dict[str, tuple[tuple[str, ...], bool]] = {
     "derived": (("derived",), False),
     "proxy": (("generation",), False),
     "actions": (("heads",), False),
+    "fx_conversion": (("heads",), False),
     **{kind: (("convention:" + kind,), True) for kind in _KINDS},
 }
 

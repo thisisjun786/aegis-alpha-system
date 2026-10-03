@@ -25,6 +25,7 @@ from typing import Literal, cast
 from aegis_alpha.application.backtest_cli import DECLARED_RESEARCH_MODE
 from aegis_alpha.application.research_run import (
     FILL_CONVENTION,
+    MacroGrant,
     MembershipRef,
     PreparationRecord,
     ResearchRunRequest,
@@ -54,6 +55,7 @@ from aegis_alpha.engine.features import (
     PricePoint,
     build_feature_matrix,
 )
+from aegis_alpha.engine.fx_conversion import FxConversion, FxFixing, FxRates
 from aegis_alpha.engine.membership import MembershipRow
 from aegis_alpha.engine.models import ENGINE_CONTRACT_VERSION_V1
 from aegis_alpha.engine.replay import ReplayReceipt, ReplayRequest, replay
@@ -135,6 +137,7 @@ CALCULATION_MODULES = (
     "aegis_alpha.engine.etf_candidates",
     "aegis_alpha.engine.execution",
     "aegis_alpha.engine.features",
+    "aegis_alpha.engine.fx_conversion",
     "aegis_alpha.engine.membership",
     "aegis_alpha.engine.models",
     "aegis_alpha.engine.numbers",
@@ -780,6 +783,139 @@ class _Prices:
             return self.heads.instruments
         return cast("PinnedPriceSeries", self.series).request.instrument_ids
 
+    @property
+    def currency(self) -> str:
+        if self.heads is not None:
+            return self.heads.currency
+        return cast("PinnedPriceSeries", self.series).request.currency
+
+
+@dataclass(frozen=True, slots=True)
+class _Fx:
+    """One granted FX conversion and the ``fx_conversion`` head binding of its fixings."""
+
+    conversion: FxConversion
+    binding: HeadBinding
+    key: tuple[str, int]
+    # A declared research run's own price binding for this currency's bars, if it names one.
+    prices: HeadBinding | None = None
+
+
+@dataclass(slots=True)
+class _Conversions:
+    """The request's FX conversions by price currency, and what each actually converted.
+
+    Signal reads are converted per decision and recorded beside each read's receipt. The
+    execution prices are converted once over the period; the fixing applied to each
+    session and the cells no fixing could convert are kept for the sealed record.
+    """
+
+    account: str
+    by_currency: Mapping[str, _Fx]
+    applied: dict[str, dict[date, FxFixing]] = field(default_factory=dict)
+    unconverted: dict[str, set[tuple[str, date]]] = field(default_factory=dict)
+
+    def record(self) -> list[dict[str, object]]:
+        return [
+            {
+                "binding": {"role": fx.key[0], "ordinal": fx.key[1]},
+                "binding_hash": fx.binding.binding_hash,
+                "conversion": fx.conversion.document(),
+                "fixings": [
+                    [day.isoformat(), fixing.day.isoformat(), fixing.rate]
+                    for day, fixing in sorted(self.applied.get(currency, {}).items())
+                ],
+                "unconverted": [
+                    [instrument, day.isoformat()]
+                    for instrument, day in sorted(self.unconverted.get(currency, set()))
+                ],
+            }
+            for currency, fx in sorted(self.by_currency.items())
+        ]
+
+
+def _conversions(loader: _Loader, body: Row) -> _Conversions:
+    """The FX conversions the request grants, each with its admitted head binding."""
+    account = _text(_row(body["account"])["currency"])
+    result = {}
+    for row in _rows(body.get("fx_conversions", ())):
+        key = _row(row["binding"])
+        position = (_text(key["role"]), cast("int", key["ordinal"]))
+        conversion = FxConversion(
+            _text(row["currency"]),
+            account,
+            _text(row["series_id"]),
+            cast("int", row["max_fixing_age_days"]),
+            _text(row["signal_basis"]),
+        )
+        result[conversion.currency] = _Fx(conversion, loader.binding(position), position)
+    return _Conversions(account, MappingProxyType(result))
+
+
+def _fx_rates(
+    loader: _Loader, fx: _Fx, visibility: _Visibility, cutoff: int, window: tuple[date, date]
+) -> tuple[FxRates, HeadRead]:
+    """The fixings a conversion may apply, as known at ``cutoff``.
+
+    The read reaches back the conversion's maximum fixing age before the window, so the
+    window's first value can use the fixing before it. A fixing is used only when it is
+    present, available by the cutoff and fixed by it: a rate fixed after a decision is
+    not one that decision could have applied.
+    """
+    conversion = fx.conversion
+    start, end = window
+    read = load_pinned_heads(
+        loader.workspace,
+        fx.binding,
+        visibility.query(
+            cutoff,
+            (conversion.series_id,),
+            start - timedelta(days=conversion.max_fixing_age_days),
+            end,
+        ),
+        budget=loader.budget,
+    )
+    fixings = []
+    for head in read.rows:
+        row = head.values
+        if _text(row["base_currency"]) + "/" + _text(row["quote_currency"]) != (
+            conversion.series_id
+        ):
+            raise ValueError("an FX read returned a fixing of another series")
+        if (
+            row["value_state"] != "present"
+            or cast("int", row["fixing_at_us"]) > cutoff
+            or (row["available_at_us"] is not None and cast("int", row["available_at_us"]) > cutoff)
+        ):
+            continue
+        fixings.append(FxFixing(_utc_day(row["fixing_at_us"]), _number(row["rate"])))
+    return FxRates(conversion, fixings), read
+
+
+def _record_fx(  # noqa: PLR0913 -- one fixing read and what it converted
+    loader: _Loader,
+    fx: _Fx,
+    purpose: tuple[str, date | None],
+    read: HeadRead,
+    *,
+    converted: int,
+    unconverted: Iterable[tuple[str, date]],
+) -> None:
+    loader.head_read(
+        fx.key,
+        purpose[0],
+        purpose[1],
+        read.receipt,
+        read.receipt_hash,
+        notes={
+            "fx_conversion": fx.conversion.document(),
+            "converted": converted,
+            "unconverted": [
+                [instrument, day.isoformat()] for instrument, day in sorted(set(unconverted))
+            ],
+        },
+    )
+
 
 def _memberships(loader: _Loader) -> tuple[IdentityPin, UniversePin, History, History]:
     ip = _row(loader.bindings["identity", 0]["pin"])
@@ -1076,12 +1212,14 @@ def _eligible_prices(
     )
 
 
-def _price_points(
+def _price_points(  # noqa: PLR0913 -- one decision's signal reads and their conversions
     loader: _Loader,
     prices: tuple[_Prices, ...],
     calendar: _Calendar,
     visibility: _Visibility,
     slot: DecisionSlot,
+    *,
+    conversions: _Conversions,
 ) -> dict[str, tuple[PricePoint, ...]]:
     result: dict[str, tuple[PricePoint, ...]] = {}
     for selected in prices:
@@ -1097,16 +1235,56 @@ def _price_points(
             if selected.heads is None
             else _head_signal(loader, selected, visibility, slot, calendar)
         )
+        closes = _signal_closes(loader, selected, rows, visibility, slot, conversions=conversions)
         for instrument in selected.instruments:
             result[instrument] = tuple(
-                PricePoint(
-                    _day(row["session_date"]),
-                    _number(row["close"]),
-                    visibility.observed(row, _day(row["session_date"])),
-                )
+                PricePoint(day, value, visibility.observed(row, day))
                 for row in rows
                 if row["instrument_id"] == instrument
+                and (value := closes.get((instrument, day := _day(row["session_date"]))))
+                is not None
             )
+    return result
+
+
+def _signal_closes(  # noqa: PLR0913 -- one selection's signal bars and their conversion
+    loader: _Loader,
+    selected: _Prices,
+    rows: History,
+    visibility: _Visibility,
+    slot: DecisionSlot,
+    *,
+    conversions: _Conversions,
+) -> dict[tuple[str, date], float]:
+    """Each signal bar's close in the currency the strategy's signals read it in.
+
+    A selection in the account currency, or one whose conversion keeps signals in the
+    price currency, reads its closes as stored. Otherwise the fixings known at the
+    decision's cutoff convert each close; a bar no fixing converts is not a signal point,
+    and the decision's read record names it.
+    """
+    closes = {
+        (_text(row["instrument_id"]), _day(row["session_date"])): _number(row["close"])
+        for row in rows
+    }
+    fx = conversions.by_currency.get(selected.currency)
+    if fx is None or fx.conversion.signal_basis == "price_currency" or not closes:
+        return closes
+    window = (min(day for _, day in closes), max(day for _, day in closes))
+    rates, read = _fx_rates(loader, fx, visibility, slot.cutoff_us, window)
+    result = {}
+    for cell, value in closes.items():
+        converted = rates.convert(value, cell[1])
+        if converted is not None:
+            result[cell] = converted[0]
+    _record_fx(
+        loader,
+        fx,
+        ("decision", slot.decision_date),
+        read,
+        converted=len(result),
+        unconverted=closes.keys() - result.keys(),
+    )
     return result
 
 
@@ -1174,6 +1352,13 @@ def _head_auxiliary(loader: _Loader, selection: Row, visibility: _Visibility) ->
         key=position,
         unit=_text(selection["unit"]),
     )
+    _admit_head_macro(loader, item, visibility)
+    return item
+
+
+def _admit_head_macro(loader: _Loader, item: _Auxiliary, visibility: _Visibility) -> None:
+    """Hold a head-bound series to carrying the series, in its unit, by the ceiling."""
+    series = item.series
     # The pin must carry the series, as a native macro generation must; a series it does
     # not hold by the knowledge cutoff would otherwise reach replay as silence.
     rows = _head_macro(
@@ -1188,7 +1373,6 @@ def _head_auxiliary(loader: _Loader, selection: Row, visibility: _Visibility) ->
         raise ValueError("macro binding holds no head of " + series + " by the knowledge cutoff")
     for row in rows:
         _macro_value(item, row)
-    return item
 
 
 def _auxiliary(
@@ -1430,6 +1614,12 @@ def _proxies(loader: _Loader, body: Row, prices: tuple[_Prices, ...]) -> tuple[_
         if item.role == "execution_prices"
         for instrument in item.instruments
     }
+    currencies = {
+        instrument: item.currency
+        for item in prices
+        if item.role == "execution_prices"
+        for instrument in item.instruments
+    }
     for selection in _rows(body["proxy_rules"]):
         pin = _generation(_selection_ref(selection, loader.bindings))
         stored = load_pinned_proxy(loader.workspace, pin, budget=loader.budget)
@@ -1448,6 +1638,7 @@ def _proxies(loader: _Loader, body: Row, prices: tuple[_Prices, ...]) -> tuple[_
             }:
                 raise ValueError("proxy convention reference mismatch")
         _proxy_sources(loader, transition, selected_sources)
+        _proxy_currency(transition, currencies, _text(_row(body["account"])["currency"]))
         loader.retain("proxy:" + logical, {"definition": doc, "history": stored.history})
         result.append(_Proxy(logical, stored.history, transition))
     return tuple(result)
@@ -1467,6 +1658,29 @@ def _proxy_sources(
         if required and (instrument not in selected or pin not in selected[instrument]):
             raise ValueError(
                 "proxy donor/target must match explicitly selected native execution sources"
+            )
+
+
+def _proxy_currency(transition: Row, currencies: Mapping[str, str], account: str) -> None:
+    """Hold a proxy's selected donor and target to the account currency.
+
+    A proxy's feature values carry no currency, so no conversion can state them in the
+    account currency; a donor or target selected in another currency is refused by name.
+    """
+    for side in ("donor", "target"):
+        instrument = _text(transition[side + "_id"])
+        currency = currencies.get(instrument, account)
+        if currency != account:
+            raise ValueError(
+                "proxy "
+                + side
+                + " "
+                + instrument
+                + " is selected in "
+                + currency
+                + ", not the account currency "
+                + account
+                + "; a proxy carries no currency"
             )
 
 
@@ -1550,10 +1764,24 @@ def _execution_rows(
 
 
 def _outcomes(
-    loader: _Loader, prices: tuple[_Prices, ...], dates: tuple[date, ...], visibility: _Visibility
+    loader: _Loader,
+    prices: tuple[_Prices, ...],
+    dates: tuple[date, ...],
+    visibility: _Visibility,
+    conversions: _Conversions,
 ) -> tuple[tuple[Mapping[str, float], ...], tuple[Mapping[str, float], ...]]:
+    """The period's execution prices in the account currency.
+
+    A selection in another currency is converted with the fixings known at the request's
+    ceiling, read once per currency over the period. A session no fixing converts has no
+    price for that instrument, exactly as a missing bar has none; the sealed record lists
+    those cells and the fixing applied to every other session.
+    """
     opening: dict[date, dict[str, float]] = {day: {} for day in dates}
     closing: dict[date, dict[str, float]] = {day: {} for day in dates}
+    outcome = _OutcomeFx(
+        loader, conversions, visibility, (dates[0], dates[-1]) if dates else None, "outcomes"
+    )
     for selected in prices:
         if selected.role != "execution_prices":
             continue
@@ -1570,9 +1798,62 @@ def _outcomes(
             ):
                 continue
             for name, destination in (("open", opening), ("close", closing)):
-                if row[name] is not None:
-                    destination[day][symbol] = _number(row[name])
+                if row[name] is None:
+                    continue
+                value = outcome.value(selected.currency, symbol, day, _number(row[name]))
+                if value is not None:
+                    destination[day][symbol] = value
+    outcome.record()
     return tuple(opening[day] for day in dates), tuple(closing[day] for day in dates)
+
+
+@dataclass(slots=True)
+class _OutcomeFx:
+    """Conversions over one window at the request's ceiling: a fixing read per currency.
+
+    The strict path converts its execution prices over the period this way; a declared
+    research run converts its price panels over its whole read window.
+    """
+
+    loader: _Loader
+    conversions: _Conversions
+    visibility: _Visibility
+    window: tuple[date, date] | None
+    purpose: str
+    rates: dict[str, tuple[FxRates, HeadRead]] = field(default_factory=dict)
+    counts: dict[str, int] = field(default_factory=dict)
+
+    def value(self, currency: str, symbol: str, day: date, value: float) -> float | None:
+        """``value`` in the account currency, or None when no fixing converts it."""
+        fx = self.conversions.by_currency.get(currency)
+        if fx is None:
+            return value
+        if currency not in self.rates:
+            self.rates[currency] = _fx_rates(
+                self.loader,
+                fx,
+                self.visibility,
+                self.visibility.ceiling,
+                cast("tuple[date, date]", self.window),
+            )
+        converted = self.rates[currency][0].convert(value, day)
+        if converted is None:
+            self.conversions.unconverted.setdefault(currency, set()).add((symbol, day))
+            return None
+        self.conversions.applied.setdefault(currency, {})[day] = converted[1]
+        self.counts[currency] = self.counts.get(currency, 0) + 1
+        return converted[0]
+
+    def record(self) -> None:
+        for currency, (_, read) in sorted(self.rates.items()):
+            _record_fx(
+                self.loader,
+                self.conversions.by_currency[currency],
+                (self.purpose, None),
+                read,
+                converted=self.counts.get(currency, 0),
+                unconverted=self.conversions.unconverted.get(currency, ()),
+            )
 
 
 def _types(workspace: Workspace, prices: tuple[_Prices, ...]) -> dict[str, str]:
@@ -1891,14 +2172,15 @@ def prepare_backtest(
     auxiliary = _auxiliary(loader, body, definition, template, visibility)
     proxies = _proxies(loader, body, prices)
     _execution_selection(prices, proxies, definition)
+    conversions = _conversions(loader, body)
     decisions, features = _decisions(
         bundle,
         definition,
         slots,
         visibility,
-        (loader, sessions, membership, prices, auxiliary, proxies),
+        (loader, sessions, membership, prices, auxiliary, proxies, conversions),
     )
-    opening, closing = _outcomes(loader, prices, dates, visibility)
+    opening, closing = _outcomes(loader, prices, dates, visibility, conversions)
     sources = tuple(
         asdict(pin)
         for pin in sorted(
@@ -1931,6 +2213,9 @@ def prepare_backtest(
             # Every head read the preparation made, with the receipt its reader returned.
             "head_reads": loader.reads,
             "source_pins": sources,
+            # Present only when the request grants a conversion, so a single-currency
+            # preparation keeps the sealed bytes it had before conversions existed.
+            **({"fx_conversions": conversions.record()} if conversions.by_currency else {}),
             "slots": slots,
             "decisions": decisions,
             "features": {
@@ -2096,6 +2381,9 @@ class _Observed:
     known_us: Mapping[str, Mapping[date, int]]
     series: frozenset[str]
     calendar_ref: str
+    # A signal panel's instruments whose closes each decision converts, by the series name
+    # the store carries them under and the conversion that applies.
+    converts: Mapping[str, tuple[str, _Fx]] = field(default_factory=dict)
 
 
 def _declared_pin(reference: object) -> GenerationPin:
@@ -2151,7 +2439,10 @@ def _mapped_panel(
 
 
 def _price_panels(
-    loader: _Loader, declaration: ResearchRunRequest, visibility: _Visibility
+    loader: _Loader,
+    declaration: ResearchRunRequest,
+    visibility: _Visibility,
+    conversions: _Conversions,
 ) -> tuple[dict[str, _Observed], HeadRead]:
     """Derive the open and close panels from canonical price pins through read_heads.
 
@@ -2166,53 +2457,62 @@ def _price_panels(
     The query is pushed down to the declared instruments and to the dates the run can
     use, from the earlier of the history and period starts, so the panel starts where
     the pinned data starts for each instrument and not where a retained snapshot did.
+
+    A bar in a currency the declaration grants a conversion for is stated in the account
+    currency with the fixings known at the ceiling, read once over the same window; a bar
+    no fixing converts is left out of both marking panels like a bar that is not present.
+    The signal panel holds each close in its own currency. Where the conversion states
+    signals in the account currency, each decision converts the closes it reads with the
+    fixings known at its own cutoff, so a fixing fixed or known after a decision never
+    reaches that decision's signals.
     """
     binding = cast("HeadBinding", declaration.prices)
     start = min(declaration.history.start, declaration.period.start)
     end = max(declaration.history.end, declaration.period.end)
-    read = load_pinned_heads(
-        loader.workspace,
-        binding,
-        HeadQuery(
-            known_ceiling_us=visibility.ceiling,
-            subjects=tuple(sorted(declaration.instrument_map)),
-            from_date=start,
-            to_date=end + timedelta(days=1),
-            price_roles=("canonical",),
-        ),
-        budget=loader.budget,
+    query = HeadQuery(
+        known_ceiling_us=visibility.ceiling,
+        subjects=tuple(sorted(declaration.instrument_map)),
+        from_date=start,
+        to_date=end + timedelta(days=1),
+        price_roles=("canonical",),
     )
+    read = load_pinned_heads(loader.workspace, binding, query, budget=loader.budget)
+    sources = _panel_sources(loader, read, query, conversions)
     reference = canonical_json_bytes(
         {"schema": "aas-head-binding-v1", "binding_hash": binding.binding_hash}
     ).decode()
-    values: dict[str, dict[str, dict[date, float]]] = {"open": {}, "close": {}}
+    values: dict[str, dict[str, dict[date, float]]] = {"open": {}, "close": {}, "signal": {}}
     observed: dict[str, dict[date, date]] = {}
     known: dict[str, dict[date, int]] = {}
     seen: set[str] = set()
-    for head in read.rows:
+    sessions: set[tuple[str, date]] = set()
+    converts: dict[str, tuple[str, _Fx]] = {}
+    converting = _OutcomeFx(loader, conversions, visibility, (start, end), "panels")
+    for head, required in (
+        (head, required) for source, required in sources for head in source.rows
+    ):
         row = head.values
         name = _text(row["instrument_id"])
         instrument = declaration.instrument_map[name]
         seen.add(name)
-        if (row["basis"], row["price_role"]) != ("unadjusted", "canonical"):
-            raise ValueError("a price-pinned research run reads only canonical unadjusted bars")
-        if row["interval"] != "1d":
-            # The panels are session panels: any other bar would stand in for a session's
-            # open and close, or meet the daily bar of its session as a repeat.
-            raise ValueError("a price-pinned research run reads only daily bars")
-        if _text(row["currency"]) != declaration.conventions.currency:
-            raise ValueError("price currency is not the declared account currency")
-        if row["value_state"] != "present":
-            continue
-        if row["available_at_us"] is not None and cast("int", row["available_at_us"]) > (
-            visibility.ceiling
-        ):
+        currency = _text(row["currency"])
+        fx = _panel_fx(row, required, declaration, conversions)
+        if not _panel_bar(row, visibility):
             continue
         session = _day(row["session_date"])
-        if session in values["close"].setdefault(instrument, {}):
+        if (instrument, session) in sessions:
             raise ValueError("price panel repeats one session for " + instrument)
-        for role in ("open", "close"):
-            values[role].setdefault(instrument, {})[session] = _number(row[role])
+        sessions.add((instrument, session))
+        stated = {
+            role: converting.value(currency, name, session, _number(row[role]))
+            for role in ("open", "close")
+        }
+        if stated["open"] is not None and stated["close"] is not None:
+            for role in ("open", "close"):
+                values[role].setdefault(instrument, {})[session] = cast("float", stated[role])
+        values["signal"].setdefault(instrument, {})[session] = _number(row["close"])
+        if fx is not None and fx.conversion.signal_basis == "account_currency":
+            converts[instrument] = (name, fx)
         observed.setdefault(instrument, {})[session] = visibility.observed(row, session)
         # The bar's own end instant orders sessions for the date-only schedule. It is the
         # economic axis of the bar, not a knowledge time, exactly as the observation
@@ -2223,6 +2523,7 @@ def _price_panels(
         raise ValueError(
             "instrument_map names instruments no pinned price carries: " + ", ".join(absent)
         )
+    converting.record()
     loader.retain(
         "prices:" + binding.binding_hash,
         {
@@ -2233,14 +2534,69 @@ def _price_panels(
                     for instrument, series in sorted(panel.items())
                 }
                 for role, panel in values.items()
+                if role != "signal" or conversions.by_currency
             },
         },
     )
     panels = {
-        role: _Observed(role, values[role], observed, known, frozenset(seen), reference)
-        for role in ("open", "close")
+        role: _Observed(
+            role,
+            values[role],
+            observed,
+            known,
+            frozenset(seen),
+            reference,
+            MappingProxyType(converts) if role == "signal" else MappingProxyType({}),
+        )
+        for role in ("open", "close", "signal")
     }
     return panels, read
+
+
+def _panel_sources(
+    loader: _Loader, read: HeadRead, query: HeadQuery, conversions: _Conversions
+) -> list[tuple[HeadRead, str | None]]:
+    """The declaration's price read, then each FX grant's own price binding read.
+
+    A grant's binding contributes that chain's bars, which must all be in the grant's
+    currency; a bar both bindings carry repeats its session and is refused.
+    """
+    sources: list[tuple[HeadRead, str | None]] = [(read, None)]
+    for fx in conversions.by_currency.values():
+        if fx.prices is not None:
+            extra = load_pinned_heads(loader.workspace, fx.prices, query, budget=loader.budget)
+            loader.head_read(fx.key, "prices", None, extra.receipt, extra.receipt_hash)
+            sources.append((extra, fx.conversion.currency))
+    return sources
+
+
+def _panel_fx(
+    row: Row, required: str | None, declaration: ResearchRunRequest, conversions: _Conversions
+) -> _Fx | None:
+    """Admit one panel bar's shape; the conversion it takes, or None in the account currency."""
+    if (row["basis"], row["price_role"]) != ("unadjusted", "canonical"):
+        raise ValueError("a price-pinned research run reads only canonical unadjusted bars")
+    if row["interval"] != "1d":
+        # The panels are session panels: any other bar would stand in for a session's
+        # open and close, or meet the daily bar of its session as a repeat.
+        raise ValueError("a price-pinned research run reads only daily bars")
+    currency = _text(row["currency"])
+    if required is not None and currency != required:
+        raise ValueError("an FX grant's price binding carries a bar not in " + required)
+    fx = conversions.by_currency.get(currency)
+    if currency != declaration.conventions.currency and fx is None:
+        raise ValueError(
+            "price currency is not the declared account currency and no FX conversion "
+            "grants it: " + currency
+        )
+    return fx
+
+
+def _panel_bar(row: Row, visibility: _Visibility) -> bool:
+    """A present bar the store says was available by the declared ceiling."""
+    return row["value_state"] == "present" and (
+        row["available_at_us"] is None or cast("int", row["available_at_us"]) <= visibility.ceiling
+    )
 
 
 def _observation_panels(
@@ -2336,9 +2692,10 @@ class ResearchDecision:
 def _load_sleeve(workspace: Workspace, loader: _Loader, role: str, sleeve: SleeveRef) -> _Sleeve:
     """Load one registered sleeve and refuse one this path cannot feed.
 
-    The declaration pins observations and nothing else, so a sleeve reading a macro
-    series or a derived one would reach the engine short of an input it was told to
-    expect. Refused here rather than failing inside replay.
+    A sleeve's macro series are fed from the declaration's macro grants, which
+    ``_research_macro`` holds to exactly the series the sleeves require. A derived series
+    has no declared source on this path, so a sleeve reading one would reach the engine
+    short of an input it was told to expect. Refused here rather than failing in replay.
     """
     bundle, definition = _stored_strategy(
         workspace,
@@ -2350,11 +2707,11 @@ def _load_sleeve(workspace: Workspace, loader: _Loader, role: str, sleeve: Sleev
             sleeve.contract_sha256,
         ),
     )
-    if definition.derived_series or bundle.contract.macro_signals:
+    if definition.derived_series:
         raise ValueError(
-            "a declared research run supplies only observed prices; the "
+            "a declared research run supplies prices and granted macro series; the "
             + role
-            + " sleeve also requires macro or derived inputs"
+            + " sleeve also requires derived inputs"
         )
     return _Sleeve(
         role, bundle, definition, _research_membership(loader, sleeve.membership, bundle)
@@ -2384,6 +2741,13 @@ def _require_composable(offense: _Sleeve, defense: _Sleeve) -> None:
                 "the offensive sleeve declares regular signals, enabled or not; "
                 "this composition switches on the canary alone"
             )
+    if offense.bundle.contract.macro_signals:
+        # A macro signal folds into the same master switch, so the switch that routed a
+        # decision to the defensive sleeve would not be the canary the record names.
+        raise ValueError(
+            "the offensive sleeve declares macro signals; this composition switches on "
+            "the canary alone"
+        )
     # Every pack member, not the first: replay evaluates all of them, so a canary on a
     # later strategy would fire inside the defensive sleeve just the same.
     for strategy in defense.bundle.contract.pack:
@@ -2398,11 +2762,14 @@ def _require_composable(offense: _Sleeve, defense: _Sleeve) -> None:
         raise ValueError("the two sleeves declare different calendar conventions")
 
 
-def _research_decisions(
+def _research_decisions(  # noqa: PLR0913 -- the sleeves, their schedule and every input
+    loader: _Loader,
     sleeves: tuple[_Sleeve, ...],
     slots: tuple[DecisionSlot, ...],
     visibility: _Visibility,
     panels: Mapping[str, _Observed],
+    *,
+    macro: tuple[_Auxiliary, ...],
 ) -> tuple[ResearchDecision, ...]:
     """Evaluate the registered strategy at each decision through the ordinary engine.
 
@@ -2414,32 +2781,96 @@ def _research_decisions(
     and the engine's own master switch, computed from that sleeve's declared canary
     configuration, decides whether the defense sleeve supplies the decision instead.
     Nothing here interprets a condition a declaration wrote.
+
+    Each granted macro series is read at the decision's own cutoff (never past the
+    declared knowledge time), so a decision sees the vintage known when it was made where
+    the store records one, and each sleeve receives the series its contract reads. A
+    signal converted into the account currency is converted the same way: with the
+    fixings known at the decision's cutoff.
     """
-    close = panels["close"]
+    close = panels.get("signal", panels["close"])
     offense = sleeves[0]
     receipts = []
     for slot in slots:
-        points = {
-            instrument: tuple(
-                PricePoint(session, value, close.observed[instrument][session])
-                for session, value in sorted(series.items())
+        known = replace(slot, cutoff_us=min(slot.cutoff_us, visibility.ceiling))
+        series = {
+            item.name: tuple(
+                MacroPoint(*point) for point in _head_aux_points(loader, item, visibility, known)
+            )
+            for item in macro
+        }
+        readable = {
+            instrument: {
+                session: value
+                for session, value in series.items()
                 # The declared history window bounds what a signal may look back on, as
                 # it does on the executable path. It does not bound the marking panels:
                 # a period legitimately extends past the lookback window it warmed up on.
                 if visibility.history_start <= session <= visibility.history_end
                 and close.known_us[instrument][session] <= slot.cutoff_us
-            )
+            }
             for instrument, series in close.values.items()
         }
-        chosen, receipt = offense, _replay_sleeve(offense, points, slot, visibility)
+        _convert_signals(loader, close.converts, readable, visibility, known)
+        points = {
+            instrument: tuple(
+                PricePoint(session, value, close.observed[instrument][session])
+                for session, value in sorted(values.items())
+            )
+            for instrument, values in readable.items()
+        }
+        chosen, receipt = offense, _replay_sleeve(offense, points, slot, visibility, series)
         if len(sleeves) > 1 and any(receipt.master_switch.values()):
             # The switch fired, so the defensive sleeve supplies this decision. The
             # offense receipt is discarded rather than blended: a sample takes one
             # sleeve's weights at a time, which is what the private runner does.
             chosen = sleeves[1]
-            receipt = _replay_sleeve(chosen, points, slot, visibility)
+            receipt = _replay_sleeve(chosen, points, slot, visibility, series)
         receipts.append(ResearchDecision(receipt, chosen))
     return tuple(receipts)
+
+
+def _convert_signals(
+    loader: _Loader,
+    converts: Mapping[str, tuple[str, _Fx]],
+    readable: dict[str, dict[date, float]],
+    visibility: _Visibility,
+    slot: DecisionSlot,
+) -> None:
+    """Convert one decision's signal closes, in place, with the fixings its cutoff knows.
+
+    One fixing read per currency serves every instrument in it, over the sessions the
+    decision reads. A close no fixing known at the cutoff converts is not a signal point,
+    and the decision's read record names it.
+    """
+    by_currency: dict[str, list[tuple[str, str]]] = {}
+    for instrument, (name, fx) in sorted(converts.items()):
+        if readable.get(instrument):
+            by_currency.setdefault(fx.conversion.currency, []).append((instrument, name))
+    for _, members in sorted(by_currency.items()):
+        fx = converts[members[0][0]][1]
+        days = [day for instrument, _ in members for day in readable[instrument]]
+        rates, read = _fx_rates(loader, fx, visibility, slot.cutoff_us, (min(days), max(days)))
+        converted = 0
+        unconverted = []
+        for instrument, name in members:
+            values = readable[instrument]
+            for day, value in list(values.items()):
+                stated = rates.convert(value, day)
+                if stated is None:
+                    del values[day]
+                    unconverted.append((name, day))
+                else:
+                    values[day] = stated[0]
+                    converted += 1
+        _record_fx(
+            loader,
+            fx,
+            ("decision", slot.decision_date),
+            read,
+            converted=converted,
+            unconverted=unconverted,
+        )
 
 
 def _replay_sleeve(
@@ -2447,13 +2878,95 @@ def _replay_sleeve(
     points: Mapping[str, tuple[PricePoint, ...]],
     slot: DecisionSlot,
     visibility: _Visibility,
+    macro: Mapping[str, tuple[MacroPoint, ...]],
 ) -> ReplayReceipt:
     _warmup(sleeve.definition, points, slot, visibility)
+    required = _macro_series(sleeve)
     return replay(
         sleeve.bundle,
-        ReplayRequest(slot.decision_date, slot.decision_date, points, {}, {}, sleeve.membership),
+        ReplayRequest(
+            slot.decision_date,
+            slot.decision_date,
+            points,
+            {name: macro[name] for name in required},
+            {},
+            sleeve.membership,
+        ),
         knowledge_as_of=_utc_day(slot.cutoff_us),
     )
+
+
+def _macro_series(sleeve: _Sleeve) -> tuple[str, ...]:
+    """The macro series a sleeve's contract reads, as its execution definition lists them."""
+    return tuple(
+        sorted(
+            identity
+            for requirement in sleeve.definition.input_requirements
+            if requirement.role == "macro"
+            for identity in requirement.identifiers
+        )
+    )
+
+
+def _research_macro(
+    loader: _Loader,
+    declaration: ResearchRunRequest,
+    sleeves: tuple[_Sleeve, ...],
+    visibility: _Visibility,
+) -> tuple[_Auxiliary, ...]:
+    """Admit the declaration's macro grants against the series its sleeves read.
+
+    The grant is exact: every series a sleeve reads is granted, and nothing else is, so a
+    sleeve never reaches replay short of a series and a declaration never records a series
+    no decision used. Each binding is verified against the store and must hold the series,
+    in its declared unit, by the declared knowledge time.
+    """
+    required = sorted({name for sleeve in sleeves for name in _macro_series(sleeve)})
+    granted = [grant.series_id for grant in declaration.macro]
+    if required != granted:
+        raise ValueError(
+            "the sleeves read macro series ["
+            + ", ".join(required)
+            + "]; the declaration grants ["
+            + ", ".join(granted)
+            + "]"
+        )
+    items = []
+    for ordinal, grant in enumerate(declaration.macro):
+        items.append(_granted_macro(loader, grant, ordinal, visibility))
+    return tuple(items)
+
+
+def _granted_macro(
+    loader: _Loader, grant: MacroGrant, ordinal: int, visibility: _Visibility
+) -> _Auxiliary:
+    verify_head_binding(loader.workspace, grant.binding, budget=loader.budget)
+    item = _Auxiliary(
+        grant.series_id,
+        grant.binding.domain,
+        (),
+        grant.series_id,
+        "value",
+        ("heads", grant.binding.binding_hash),
+        binding=grant.binding,
+        key=("macro", ordinal),
+        unit=grant.unit,
+    )
+    _admit_head_macro(loader, item, visibility)
+    return item
+
+
+def _research_conversions(loader: _Loader, declaration: ResearchRunRequest) -> _Conversions:
+    """The declaration's FX conversions, each binding verified against the store."""
+    result = {}
+    for ordinal, grant in enumerate(declaration.fx_conversions):
+        for binding in (grant.binding, grant.prices):
+            if binding is not None:
+                verify_head_binding(loader.workspace, binding, budget=loader.budget)
+        result[grant.conversion.currency] = _Fx(
+            grant.conversion, grant.binding, ("fx_conversion", ordinal), grant.prices
+        )
+    return _Conversions(declaration.conventions.currency, MappingProxyType(result))
 
 
 def _research_outcomes(
@@ -2691,14 +3204,16 @@ def prepare_research_run(
     )
     loader = _Loader(workspace, budget, {})
     sleeves = _research_sleeves(workspace, loader, declaration)
+    macro = _research_macro(loader, declaration, sleeves, visibility)
+    conversions = _research_conversions(loader, declaration)
     head_read = None
     if declaration.prices is None:
         panels = _observation_panels(loader, declaration, visibility)
     else:
-        panels, head_read = _price_panels(loader, declaration, visibility)
+        panels, head_read = _price_panels(loader, declaration, visibility, conversions)
     read = {series for panel in panels.values() for series in panel.series}
     plan = _research_plan(declaration, panels)
-    decisions = _research_decisions(sleeves, plan.slots, visibility, panels)
+    decisions = _research_decisions(loader, sleeves, plan.slots, visibility, panels, macro=macro)
     opening, closing = _research_outcomes(panels, plan.dates)
     inputs = EnvelopeInputs(
         plan.dates,
@@ -2744,6 +3259,9 @@ def prepare_research_run(
                 "decisions": len(plan.slots),
             },
             head_read=None if head_read is None else head_read.receipt,
+            macro_reads=tuple(item for item in loader.reads if item["role"] == "macro"),
+            fx_conversions=tuple(conversions.record()),
+            fx_reads=tuple(item for item in loader.reads if item["role"] == "fx_conversion"),
         ),
     )
     return PreparedResearchRun(
@@ -2770,13 +3288,14 @@ def _decisions(
         tuple[_Prices, ...],
         tuple[_Auxiliary, ...],
         tuple[_Proxy, ...],
+        _Conversions,
     ],
 ) -> tuple[tuple[ReplayReceipt, ...], Mapping[date, Mapping[str, AssetFeatures]]]:
-    loader, calendar, membership, prices, auxiliary, proxies = loaded
+    loader, calendar, membership, prices, auxiliary, proxies, conversions = loaded
     receipts = []
     features = {}
     for slot in slots:
-        points = _price_points(loader, prices, calendar, visibility, slot)
+        points = _price_points(loader, prices, calendar, visibility, slot, conversions=conversions)
         points.update(
             {proxy.logical: _proxy_points(proxy, visibility, slot.cutoff_us) for proxy in proxies}
         )

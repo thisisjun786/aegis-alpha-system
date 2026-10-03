@@ -100,6 +100,11 @@ _PRICE_ROOTS = (
     (_RESEARCH_ROOT - {"observations"}) | {"prices"},
     (_COMPOSITION_ROOT - {"observations"}) | {"prices"},
 )
+# Keys a document carries only when it uses them: an executable request's FX conversion
+# grants, and a declaration's macro grants and FX conversion grants. Mirrored from the
+# engine request contract and the declared research contract like the roots above.
+_OPTIONAL = frozenset({"fx_conversions"})
+_RESEARCH_OPTIONAL = frozenset({"macro", "fx_conversions"})
 
 
 def request_schema(body: dict[str, object]) -> str:
@@ -109,17 +114,18 @@ def request_schema(body: dict[str, object]) -> str:
     Nothing here guesses: a root that is not exactly one of them is refused, never
     defaulted, and a declared root must also say in its own bytes that it is uncertified.
     """
-    if body.keys() == _ROOT:
+    keys = body.keys() - _RESEARCH_OPTIONAL
+    if body.keys() - _OPTIONAL == _ROOT:
         if body["schema"] != BACKTEST_REQUEST_SCHEMA or body["hash_format"] != HASH_FORMAT:
             raise ValueError("invalid backtest request root/schema")
         return BACKTEST_REQUEST_SCHEMA
-    if body.keys() in (_RESEARCH_ROOT, _PRICE_ROOTS[0]):
+    if keys in (_RESEARCH_ROOT, _PRICE_ROOTS[0]):
         if body["schema_version"] != RESEARCH_REQUEST_SCHEMA:
             raise ValueError("invalid research run root/schema")
         if body["execution_mode"] != RESEARCH_EXECUTION_MODE:
             raise ValueError("a stored research run must declare " + RESEARCH_EXECUTION_MODE)
         return RESEARCH_REQUEST_SCHEMA
-    if body.keys() in (_COMPOSITION_ROOT, _PRICE_ROOTS[1]):
+    if keys in (_COMPOSITION_ROOT, _PRICE_ROOTS[1]):
         if body["schema_version"] != COMPOSITION_REQUEST_SCHEMA:
             raise ValueError("invalid research composition root/schema")
         if body["execution_mode"] != RESEARCH_EXECUTION_MODE:
