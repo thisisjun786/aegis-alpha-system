@@ -52,7 +52,7 @@ from aegis_alpha.storage.membership_pins import (
     verify_membership_pin,
 )
 from aegis_alpha.storage.promotion import decimal_rules, formats
-from aegis_alpha.storage.promotion.mappers import MANIFEST_ITEMS
+from aegis_alpha.storage.promotion.mappers import MANIFEST_ITEMS, resolved_column
 from aegis_alpha.storage.promotion.spec import PromotionSpec, parse_spec
 from aegis_alpha.storage.promotion.time_rules import (
     CLAMP_FLAG,
@@ -547,10 +547,11 @@ def _map(workspace: Workspace, spec: PromotionSpec) -> bool:
         "_aas_row_hash": "VARCHAR",
         "_aas_ingested_at_us": "BIGINT",
     }
-    if spec.mapper.identity(spec.mapper_args) is not None:
+    resolved = _resolved_column(spec)
+    if resolved is not None:
         expected |= {"_aas_id_token": "VARCHAR", "_aas_id_at_us": "BIGINT"}
     for name, kind in DOMAINS[spec.domain]:
-        if name != "instrument_id":
+        if name != resolved:
             expected[name] = numeric.get(name, kind.rstrip("?"))
     for name, kind in spec.mapper.time_inputs.items():
         expected["_aas_t_" + name] = "DATE" if kind == "date" else "BIGINT"
@@ -571,17 +572,19 @@ def _map(workspace: Workspace, spec: PromotionSpec) -> bool:
     return fields
 
 
+def _resolved_column(spec: PromotionSpec) -> str | None:
+    """The domain column the mapper's identity key resolves, or None without a key."""
+    if spec.mapper.identity(spec.mapper_args) is None:
+        return None
+    return resolved_column(spec.domain)
+
+
 def _resolved(workspace: Workspace, spec: PromotionSpec) -> str:
     """The mapped rows with the resolved instrument and how many instruments matched."""
     market = workspace.market
-    if spec.mapper.identity(spec.mapper_args) is None:
-        # A domain whose instrument is optional, mapped without an identity key, names none.
-        unnamed = (
-            ", CAST(NULL AS VARCHAR) AS instrument_id"
-            if "instrument_id" in dict(DOMAINS[spec.domain])
-            else ""
-        )
-        return f"SELECT m.*{unnamed}, 1 AS _aas_matches FROM {_t('map')} m"
+    column = _resolved_column(spec)
+    if column is None:
+        return f"SELECT m.*, 1 AS _aas_matches FROM {_t('map')} m"
     market.execute(
         f"CREATE OR REPLACE TEMP TABLE {_t('res')} AS SELECT m._aas_pin, m._aas_ordinal, "
         "m._aas_item, count(DISTINCT i.instrument_id) AS matches, "
@@ -592,7 +595,8 @@ def _resolved(workspace: Workspace, spec: PromotionSpec) -> str:
     )
     same = " AND ".join(f"r.{name} = m.{name}" for name in _ROW_KEY)
     return (
-        f"SELECT m.*, r.instrument_id, coalesce(r.matches, 0) AS _aas_matches FROM {_t('map')} m "
+        f"SELECT m.*, r.instrument_id AS {_q(column)}, coalesce(r.matches, 0) AS _aas_matches "
+        f"FROM {_t('map')} m "
         f"LEFT JOIN {_t('res')} r ON {same}"
     )
 
@@ -677,7 +681,7 @@ def _rows(
     required = [
         name
         for name, kind in DOMAINS[spec.domain]
-        if not kind.endswith("?") and name not in numeric and name != "instrument_id"
+        if not kind.endswith("?") and name not in numeric and name != _resolved_column(spec)
     ]
     missing = " OR ".join(f"{_q(name)} IS NULL" for name in required) or "false"
     held = " OR ".join(
@@ -810,11 +814,12 @@ def _scope_sql(workspace: Workspace, spec: PromotionSpec, alias: str) -> str:
     )
     if policy.instruments is not None:
         market = workspace.market
+        subject = _q(resolved_column(spec.domain))
         market.execute(f"CREATE OR REPLACE TEMP TABLE {_t('scope')} (instrument_id VARCHAR)")
         market.executemany(
             f"INSERT INTO {_t('scope')} VALUES (?)", [[item] for item in policy.instruments]
         )
-        condition += f" AND {alias}.instrument_id IN (SELECT instrument_id FROM {_t('scope')})"
+        condition += f" AND {alias}.{subject} IN (SELECT instrument_id FROM {_t('scope')})"
     return condition
 
 

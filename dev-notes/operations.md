@@ -345,7 +345,7 @@ member instrument는 US identity 등록이 먼저 있어야 한다. `index`는 �
 원천 자료실 자료를 공급자별 시장 dataset으로 승격하는 명령(`aas data promote`), 원천 ID 연결
 (`aas db source-link`), core schema 업그레이드(`aas db migrate`), 원천 은퇴(`aas db source-retire`)와
 compact(`aas db compact`)의 계약은 [데이터 수직 계약](design/data-vertical.md)이 소유한다. 현재 CLI에는
-`aas db migrate`, `aas data promote`·`promotions`·`kr-prices`, `aas calendar refresh`, `aas import legacy`와 위
+`aas db migrate`, `aas data promote`·`promotions`·`kr-prices`, `aas calendar refresh`, `aas import legacy`·`sec-companies`와 위
 [원본 자료 이전과 조회](#원본-자료-이전과-조회)의 `source-link`가 있다. 은퇴와 compact는 그 계약의 대응표 행이 `구현`이 될 때 이 절에 추가된다.
 승격된 dataset을 읽는 소비자 경로(`read_heads`)가 연결되기 전까지 원천 자료의 연구 입력은 아래
 `register-*` 경로가 맡는다.
@@ -430,6 +430,21 @@ SUPERSEDE한다.
 멈추며, 같은 명령을 다시 실행하면 이미 게시된 단계는 빈 delta라 아무것도 쓰지 않는다. 연도 단위 대량
 게시의 DuckDB 메모리는 [대량 게시](design/data-vertical.md#대량-게시와-reader)의 할당 결정(AAS-54)을
 따른다. 단계 순서와 규칙은 [데이터 수직 계약](design/data-vertical.md#kr-가격)이 소유한다.
+
+### SEC 회사 header 편입
+
+```bash
+aas import sec-companies --source SEC_SUBMISSIONS_SOURCE_ID --plan
+aas import sec-companies --source SEC_SUBMISSIONS_SOURCE_ID
+```
+
+`import sec-companies`는 `aas import legacy`의 `sec.submissions_zip@1`로 편입한 SEC submissions 내용 원천의
+member 색인으로 `raw/`의 archive를 읽어, CIK 문서마다 회사 header(CIK, 이름, 유형, SIC와 설명, 가장 새
+공시일) 한 행을 `sec-submissions-companies-*` 내용 원천으로 commit한다. 이 원천은 `sec.sic@1` 분류
+승격(`classifications.us.sec`)의 입력이다. `--plan`은 모든 member를 읽어 수를 보고하고 쓰지 않는다. 실행은
+다시 실행하면 같은 원천을 재사용하며, 공급자를 호출하지 않는다. 테이블 commit에는 `pyarrow`(legacy
+extra)가 필요하다. 원천 연결은 `aas db source-link --apply`로 한다. 행 규칙과 분류 승격은
+[분류](design/data-vertical.md#분류)가 소유한다.
 
 ### 선언 달력 갱신
 
@@ -833,6 +848,24 @@ run 이력에 남는다. 어느 쪽이든 성공 영수증은 없다. 그 run을
 
 `aas-research-run-v2` 슬리브 선언과 `aas-research-composition-v1` 표본 조합 선언을 모두 받는다.
 어느 쪽인지는 문서의 `schema_version`이 말하므로 호출자가 고르지 않는다.
+
+패널 원천은 선언 최상위의 열쇠 하나로 정한다. `observations`는 보존 관측 generation pin 목록이고,
+`prices`는 canonical 가격 binding이다. 둘 다 있거나 둘 다 없으면 거부한다.
+
+```json
+"prices": {
+  "pins": [{"dataset_id": "prices.kr.eodhd", "version": "<v>", "generation_id": "<g>",
+            "chain_hash": "<sha256>", "manifest_hash": "<sha256>", "from": null, "to": null}],
+  "excluded_flags": ["provider_reported_partial"]
+},
+"instrument_map": {"<instrument_id>": "<전략의 자산 ID>"}
+```
+
+`pins`는 `aas-head-binding-v1`의 순서 있는 pin과 `[from, to)` cutover 구간이고, `excluded_flags`는
+읽지 않을 quality flag다. 연구 읽기는 엄격 PIT가 아니므로 시간 규칙 grant는 선언하지 않는다.
+`instrument_map`의 열쇠는 identity가 발급한 instrument ID이고 값 자산은 상태 저장소에서 `etf`로
+분류돼 있어야 한다. 가격 통화는 `conventions.currency`와 같아야 한다. 선언한 `knowledge_time`보다
+늦게 알려진 revision은 읽지 않는다. 봉인 준비 문서의 `prices.head_read`가 그 읽기 영수증이다.
 
 run 저장 표는 기본 설치에 없고, 선언된 계약을 담으려면 add-on이 v1보다 높아야 한다. 둘 다
 0단계에서 확인하므로 설치가 부족하면 계산 전에 실행할 명령을 알려주고 끝난다.

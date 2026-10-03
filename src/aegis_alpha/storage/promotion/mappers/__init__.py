@@ -15,12 +15,17 @@ prefixes it reads, so a spec cannot promote one provider's rows into another's d
   document) holds several domain rows, numbered distinctly within that source row, and a
   source row may yield none;
 - ``_aas_ingested_at_us`` (BIGINT, NULL when the source row has no collection time);
-- ``_aas_id_token`` (VARCHAR) and ``_aas_id_at_us`` (BIGINT) when the domain names an
-  instrument: the identity key token and the instant at which it is resolved;
-- every domain column except ``instrument_id`` (and ``fields`` when the mapper emits it),
-  with each numeric column left as its raw source value for the spec's decimal rule;
+- ``_aas_id_token`` (VARCHAR) and ``_aas_id_at_us`` (BIGINT) when the mapper has an
+  identity key: the key's token and the instant at which it is resolved;
+- every domain column except the one the identity key resolves (``instrument_id``, or a
+  classification's ``subject_id``) and ``fields`` when the mapper emits it, with each
+  numeric column left as its raw source value for the spec's decimal rule;
 - one ``_aas_t_<name>`` column per time input the mapper declares;
 - one BOOLEAN column per row flag the mapper declares (``row_flags``).
+
+A domain whose rows always name an instrument needs a mapper with an identity key. A
+classification's subject may instead come from a source that carries the subject's
+permanent anchor; that mapper mints the ID itself and has no identity key.
 
 A mapper that declares ``manifest_items`` may also read ``MANIFEST_ITEMS``: one row
 ``(_aas_pin INTEGER, item VARCHAR)`` per element of that list in each pinned source's
@@ -29,13 +34,13 @@ each source's request hash from the manifest's table and metadata and refuses th
 when it differs from the marker and completed operation, so what the mapper reads from
 the manifest is pinned like the rows.
 
-A domain whose ``instrument_id`` is optional (fundamentals, filings) may be mapped
-without an identity key; its rows then name no instrument. A mapper whose source rows
-are responses rather than facts declares an ``outcome`` over a staged source row
-(completed, no data, failed, ...), which the promotion records as coverage in place of
-rows that a response without data cannot give. A partition stages such a mapper's
-source rows whose partition date is NULL in every partition, so each is counted, and
-refuses them for every other mapper.
+A domain whose ``instrument_id`` is optional (fundamentals) may be mapped without an
+identity key; such a mapper emits a NULL ``instrument_id``. Filings name no instrument.
+A mapper whose source rows are responses rather than facts declares an ``outcome`` over
+a staged source row (completed, no data, failed, ...), which the promotion records as
+coverage in place of rows that a response without data cannot give. A partition stages
+such a mapper's source rows whose partition date is NULL in every partition, so each is
+counted, and refuses them for every other mapper.
 """
 
 from __future__ import annotations
@@ -136,8 +141,22 @@ class Mapper(Protocol):
     def select(self, source: str, args: Mapping[str, object]) -> str: ...
 
 
+# The domain column an identity key resolves into when it is not ``instrument_id``.
+_RESOLVED: Final = {"classifications": "subject_id"}
+
+
+def resolved_column(domain: str) -> str:
+    """The column of ``domain`` that a mapper's identity key resolves through the snapshot."""
+    return _RESOLVED.get(domain, "instrument_id")
+
+
 def _registry() -> dict[str, Mapper]:
     from aegis_alpha.storage.promotion.mappers.calendar import CalendarDeclared  # noqa: PLC0415
+    from aegis_alpha.storage.promotion.mappers.classifications import (  # noqa: PLC0415
+        KindIndustry,
+        NorgateClassification,
+        SecSic,
+    )
     from aegis_alpha.storage.promotion.mappers.dart import (  # noqa: PLC0415 -- registry
         DartFnltt,
         DartFnlttFilings,
@@ -172,6 +191,9 @@ def _registry() -> dict[str, Mapper]:
         norgate_fx_history(),
         KoreaObservations("bok"),
         KoreaObservations("oecd"),
+        KindIndustry(),
+        NorgateClassification(),
+        SecSic(),
     )
     return {f"{mapper.name}@{mapper.major}": mapper for mapper in mappers}
 

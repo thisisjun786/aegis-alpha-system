@@ -187,6 +187,14 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   read exactly is refused whole, members are only instruments the identity registry
   holds, and members are known from their source's `sl:` link. Universe parts fill
   source by source.
+- `promotion/mappers/classifications.py` promotes snapshot classifications
+  (`norgate.classification@1`, `sec.sic@1`, `kind.industry@1`). A row starts at its
+  snapshot's date and is never extended into the past; a later snapshot adds rows of its
+  own date. A subject whose source carries its permanent anchor (Norgate asset ID, SEC CIK)
+  is minted in SQL exactly as `identity.mint_*` does and pins no identity snapshot; a KRX
+  short code resolves `subject_id` through the pinned snapshot. `sec_companies` owns
+  `aas import sec-companies`, which commits each CIK document's header from a retained
+  `sec-submissions-zip-*` archive as a content source for `sec.sic@1`.
 - Every contract in that document has a row in its contract/test table. A change
   that implements a `예정` row adds the named test and flips the row to `구현` in
   the same change; `tests/tools/test_data_vertical_contract.py` enforces both directions.
@@ -315,7 +323,11 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   it does name. Observation panels cannot be bound, because there is no role for reference
   observations and adding one would put adjusted reference data in the namespace the
   executable price roles use; a calendar cannot be bound either, because it is a declared
-  name over the panel's own dates rather than a published generation. An
+  name over the panel's own dates rather than a published generation. A declaration that
+  reads canonical price pins (its root carries `prices` in place of `observations`; each
+  research root has exactly those two variants) binds no price either: the binding vocabulary
+  has no research price role, and the declaration hash plus the sealed `aas-head-read-v1`
+  receipt cover those pins. An
   `aas-research-run-v2` bundle is therefore required to be exactly the membership it pins.
   An `aas-research-composition-v1` pins one membership per sleeve while the vocabulary
   holds a single membership, so binding one of the two would leave `bundle_id` describing

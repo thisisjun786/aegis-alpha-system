@@ -472,7 +472,8 @@ class DartFnltt(_Receipts):
             "SELECT _aas_pin, _aas_ordinal, _aas_row_hash, "  # noqa: S608 -- engine-named relation
             "2 * _d_line + _d_field AS _aas_item, "
             "_d_ingested AS _aas_ingested_at_us, "
-            f"{_issuer()} AS issuer_id, {_item('account_id')} AS concept, "
+            f"{_issuer()} AS issuer_id, CAST(NULL AS VARCHAR) AS instrument_id, "
+            f"{_item('account_id')} AS concept, "
             f"{start} AS period_start, {end} AS period_end, {label} AS fiscal_period, "
             f"{_item('currency')} AS unit, "
             f"{dimensions} AS dimensions_hash, {_form()} AS form, {number} AS accession, "

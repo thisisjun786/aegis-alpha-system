@@ -122,9 +122,9 @@ def test_an_optional_instrument_needs_no_identity_snapshot() -> None:
     )
     pinned = json.loads(raw)
     pinned["identity_snapshot"] = dict(_IDENTITY)
-    with pytest.raises(ValueError, match="others pin none"):
+    with pytest.raises(ValueError, match="resolves no subject pins none"):
         _parse(pinned)
     # A domain whose instrument is required keeps needing a mapper that resolves it.
     unresolved = _change(lambda d: d.update(identity_snapshot=None))
-    with pytest.raises(ValueError, match="requires an instrument"):
+    with pytest.raises(ValueError, match="an instrument domain pins"):
         _parse(unresolved)

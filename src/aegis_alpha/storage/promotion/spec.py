@@ -42,7 +42,7 @@ from aegis_alpha.storage.market_inputs import GenerationPin
 from aegis_alpha.storage.market_schema import COMMON, DOMAINS
 from aegis_alpha.storage.membership_pins import IdentityPin
 from aegis_alpha.storage.promotion import decimal_rules
-from aegis_alpha.storage.promotion.mappers import Mapper, mapper
+from aegis_alpha.storage.promotion.mappers import Mapper, mapper, resolved_column
 from aegis_alpha.storage.promotion.time_rules import TIME_COLUMNS, TimeRule, parse_rule
 from aegis_alpha.storage.source_reader import SourcePin
 
@@ -291,21 +291,22 @@ def _mapper(value: object, domain: str) -> tuple[str, Mapper, dict[str, object]]
 
 
 def _identity(
-    value: object, found: Mapper, args: Mapping[str, object], *, instrument: str | None
+    value: object, found: Mapper, args: Mapping[str, object], *, required: bool, resolvable: bool
 ) -> IdentityPin | None:
-    """The snapshot pin a mapper with an identity key needs; others pin none.
+    """The snapshot pin of a mapper with an identity key; a mapper without one pins none.
 
-    ``instrument`` is the domain's ``instrument_id`` type, if it has one. A required
-    instrument needs an identity key; an optional one (fundamentals) may go without.
+    ``required``: every row of the domain names an instrument, so its mapper resolves one.
+    An optional instrument (fundamentals, filings) may go without.
+    ``resolvable``: the domain has a column an identity key can resolve into.
     """
     resolves = found.identity(args) is not None
-    if resolves != (value is not None) or (instrument == "VARCHAR" and not resolves):
+    if resolves != (value is not None) or (required and not resolves):
         raise ValueError(
-            "a mapper that resolves instruments pins an identity snapshot; others pin none, "
-            "and a domain that requires an instrument needs a mapper that resolves one"
+            "an instrument domain pins an identity snapshot; a mapper that resolves no "
+            "subject pins none"
         )
-    if resolves and instrument is None:
-        raise ValueError("a domain without instruments cannot resolve them")
+    if resolves and not resolvable:
+        raise ValueError(f"domain {found.domain} has no column an identity key resolves")
     if value is None:
         return None
     item = _object(value, {"snapshot_id", "content_hash"}, "identity_snapshot")
@@ -357,7 +358,13 @@ def parse_spec(raw: bytes, sha256: str) -> PromotionSpec:
         conversions[column] = decimal_rules.check_column(
             _text(name, "decimal rule"), column, numeric[column], domain=domain
         )
-    pin = _identity(body["identity_snapshot"], found, args, instrument=kinds.get("instrument_id"))
+    pin = _identity(
+        body["identity_snapshot"],
+        found,
+        args,
+        required=kinds.get("instrument_id") == "VARCHAR",
+        resolvable=resolved_column(domain) in kinds,
+    )
     return PromotionSpec(
         raw=raw,
         sha256=sha256,
