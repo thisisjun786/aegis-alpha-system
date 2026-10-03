@@ -203,7 +203,17 @@ def test_ticker_claims_are_bounded_by_the_master() -> None:
     ]
     registry = build_us_registry(
         linked(rows),
-        fmp=[fmp_rows([profile("XYZ", CIK_A), profile("NODATE", CIK_A)])],
+        fmp=[
+            fmp_rows(
+                [
+                    profile("XYZ", CIK_A),
+                    profile("NODATE", CIK_A),
+                    # An earlier holder's profile does not make the current one ambiguous.
+                    profile("CLS-A", CIK_B, retrieved=datetime(2017, 6, 1, tzinfo=UTC)),
+                    profile("CLS-A", CIK_A, retrieved=datetime(2020, 6, 1, tzinfo=UTC)),
+                ]
+            )
+        ],
         sec=[in_memory(submissions([(CIK_A, "Synthetic A Inc", ["XYZ"])]))],
     )
     assert registry.through == date(2026, 7, 28)
@@ -236,7 +246,8 @@ def test_ticker_claims_are_bounded_by_the_master() -> None:
         "sec_after_master_through": ["XYZ"],
         "sec_ticker_missing": ["CLS-A", "PLAIN"],
     }
-    assert not {key for key in claims if key[0] in {"fmp", "sec"}}
+    fmp = {key: valid for key, valid in claims.items() if key[0] in {"fmp", "sec"}}
+    assert fmp == {("fmp", "fmp_symbol", "CLS-A"): registry.intervals["CLS-A.US"]}
     assert claims[("norgate", "norgate_symbol", "XYZ")] == registry.intervals["XYZ.US"]
     assert claims[("norgate", "norgate_symbol", "XYZ-202001")] == (UNBOUNDED, None)
     assert not {key for key in claims if key[2] in {"NODATE", "LOST", "LAST", "NODATE.US"}}

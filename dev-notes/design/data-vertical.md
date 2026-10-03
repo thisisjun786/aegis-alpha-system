@@ -769,7 +769,8 @@ Norgate security master 하나에서 모두 나온다.
     버전으로 읽어 `through` 다음 날부터의 구간으로 등록한다. 겹치지 않는 구간이므로 기존 주장과 충돌하지
     않는다.
   - 티커로 대조하는 FMP profile과 SEC member는 그 수집 시각이 상장의 티커 구간 안일 때만 그 상장을
-    가리킨다. 구간 밖에서 수집한 행은 다른 보유자를 말할 수 있으므로 해석하지 않는다
+    가리킨다. FMP 행들의 합의도 구간 안에서 수집한 행만으로 판단한다. 구간 밖에서 수집한 행은 다른
+    보유자를 말할 수 있으므로 해석하지 않고, 구간 안의 행이 하나도 없을 때 이유를 남긴다
     (`fmp_before_ticker_claim`, `fmp_after_master_through`, `sec_before_ticker_claim`,
     `sec_after_master_through`). SEC member의 수집 시각은 그 원천 `sl:` 연결의 `retrieved_at_us`다.
   - asset ID와 상폐 행의 접미사 심볼(그 상장만의 영구 이름)은 공급자 시계열 전체(`valid_from_us`는
@@ -1092,5 +1093,5 @@ state v2:
 | DV-142 | `scripts/us_identity_report.py`는 market 파일만 읽기 전용으로 열어 bulk·격리 행의 US 해석을 이유별로 보고한다 | `tests/storage/test_us_identity.py::test_the_report_script_resolves_bulk_and_quarantined_us_rows` | 구현 |
 | DV-143 | legacy 항목의 보존 파일은 경로·SHA-256·크기·이유를 담은 보존 목록 원천으로 commit되고, 목록 원천이 없거나 연결된 보존 bytes가 없으면 `--verify`가 `unmatched`로 센다 | `tests/storage/test_legacy_import.py::test_uncovered_files_keep_verify_incomplete` | 구현 |
 | DV-144 | 압축 해제가 깨진 SEC member나 지수 구성 gzip은 그 단위를 이유와 함께 거부하고 나머지 계획은 이어진다 | `tests/storage/test_legacy_import.py::test_sec_archive_refuses_a_corrupt_deflate_stream` | 구현 |
-| DV-145 | 상장의 티커 구간 밖에서 수집한 FMP profile과 SEC member는 그 상장에 FMP·issuer 주장을 만들지 않고 이유와 함께 미해결로 남는다 | `tests/storage/test_us_identity.py::test_ticker_claims_are_bounded_by_the_master` | 구현 |
+| DV-145 | 상장의 티커 구간 밖에서 수집한 FMP profile과 SEC member는 그 상장에 FMP·issuer 주장을 만들지 않고 구간 안의 행 합의를 흐리지 않으며, 구간 안의 행이 없으면 이유와 함께 미해결로 남는다 | `tests/storage/test_us_identity.py::test_ticker_claims_are_bounded_by_the_master` | 구현 |
 | DV-146 | `us_identity_report`가 읽은 master는 `us-build`와 같은 심볼·구간·`through`·미해결 이유를 낸다 | `tests/storage/test_us_identity.py::test_the_report_reads_the_master_as_us_build_does` | 구현 |

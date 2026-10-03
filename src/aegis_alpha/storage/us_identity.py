@@ -716,8 +716,8 @@ def _profiles(
 ) -> dict[str, Profile]:
     """The one agreed profile of each listed ticker, judged against its Norgate listing.
 
-    The profile names the listing only when it was retrieved while the listing's ticker
-    claim holds; a profile retrieved outside it may describe another holder of the ticker.
+    Only profiles retrieved while the listing's ticker claim holds are judged; a profile
+    retrieved outside it may describe another holder of the ticker.
     """
     agreed: dict[str, Profile] = {}
     for symbol in sorted({*profiles, *refused}):
@@ -726,21 +726,22 @@ def _profiles(
             unresolved["not_a_listed_norgate_ticker"].append(symbol)
             continue
         group = profiles.get(symbol, [])
+        interval = bounds.intervals[listing.assetid]
+        inside = [row for row in group if _outside(row.evidence.known_from_us, interval) is None]
         if symbol in refused:
             reason = refused[symbol]
-        elif len({profile.statement() for profile in group}) > 1:
+        elif not inside:
+            earliest = min(group, key=lambda profile: profile.evidence.order())
+            reason = f"fmp_{_outside(earliest.evidence.known_from_us, interval)}"
+        elif len({profile.statement() for profile in inside}) > 1:
             reason = "fmp_profile_ambiguous"
-        elif group[0].currency != "USD":
+        elif inside[0].currency != "USD":
             reason = "fmp_currency_not_usd"
-        elif group[0].etf != (listing.asset_type == "etf"):
+        elif inside[0].etf != (listing.asset_type == "etf"):
             reason = "fmp_type_differs"
         else:
-            first = min(group, key=lambda profile: profile.evidence.order())
-            outside = _outside(first.evidence.known_from_us, bounds.intervals[listing.assetid])
-            if outside is None:
-                agreed[symbol] = first
-                continue
-            reason = f"fmp_{outside}"
+            agreed[symbol] = min(inside, key=lambda profile: profile.evidence.order())
+            continue
         unresolved[reason].append(symbol)
     return agreed
 
