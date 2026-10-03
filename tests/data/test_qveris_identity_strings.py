@@ -10,6 +10,10 @@ from tests.data.test_qveris_native import IDENTITY, complete
 if TYPE_CHECKING:
     from pathlib import Path
 
+# Serial: these tests take the host-wide Qveris account lease (an abstract Unix socket named by
+# the synthetic account), so every file that takes it runs in one xdist worker.
+pytestmark = pytest.mark.xdist_group("qveris-account-lease")
+
 
 @pytest.mark.parametrize("value", [1, True, None, "", " ", " padded", "padded ", "a\nb", "a\x00b"])
 def test_invalid_stable_identity_is_rejected(tmp_path: Path, value: object) -> None:

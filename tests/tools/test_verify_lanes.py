@@ -580,7 +580,7 @@ def test_container_runs_get_unique_image_names(harness: Harness) -> None:
     [
         pytest.param(
             "test",
-            ["-m", "not database", "-n", "auto", "--dist", "loadfile"],
+            ["-m", "not database", "-n", "auto", "--dist", "loadgroup"],
             id="test-not database",
         ),
         pytest.param("database", ["-m", "database"], id="database-database"),
@@ -618,7 +618,7 @@ def test_test_lane_forwards_one_shard_selector(harness: Harness) -> None:
             "-n",
             "auto",
             "--dist",
-            "loadfile",
+            "loadgroup",
             "--test-shard",
             "2/4",
         ]
@@ -637,7 +637,7 @@ def test_test_lane_runs_whole_files_on_the_requested_workers(
     assert result.returncode == 0, result.stderr
     runs = [call["args"] for call in harness.calls() if call["args"][0] == "run"]
     assert runs == [
-        ["run", "--no-sync", "pytest", "-m", "not database", "-n", expected, "--dist", "loadfile"]
+        ["run", "--no-sync", "pytest", "-m", "not database", "-n", expected, "--dist", "loadgroup"]
     ]
 
 

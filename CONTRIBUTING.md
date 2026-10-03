@@ -16,12 +16,13 @@ Tests run whole files in parallel worker processes (pytest-xdist). Each process
 gets its own isolated home under `TMPDIR` (see [tests/AGENTS.md](tests/AGENTS.md)),
 so a run never reads or writes your `~/.aas`.
 
-- The area you are changing: `uv run --no-sync pytest -n auto --dist loadfile -m 'not database' <paths>`.
+- The area you are changing: `uv run --no-sync pytest -n auto --dist loadgroup -m 'not database' <paths>`
+  (whole files per worker; see tests/AGENTS.md for serial groups).
 - The full database-free lane: `./scripts/verify-lane-test` (the same command each CI
   `tests` shard runs).
-- Native stores fsync on every commit. On Linux, run with `TMPDIR=/dev/shm/aas-$USER`
-  (create it first) to keep the scratch stores in memory; do not use `/tmp`, where a
-  stray `/tmp/.git` makes storage refuse paths beneath it.
+- For fsync-heavy storage runs on Linux, set `TMPDIR=/dev/shm/aas-$USER` (create it
+  first) to keep the scratch stores in memory. Do not use `/tmp`: a stray `/tmp/.git`
+  makes storage refuse paths beneath it.
 - `AAS_TEST_WORKERS=0 ./scripts/verify-lane-test` (or `pytest` without `-n`) runs
   serially in one process, for debuggers and `breakpoint()`.
 

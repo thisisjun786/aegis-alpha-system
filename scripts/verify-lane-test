@@ -6,8 +6,9 @@
 # so an untagged PostgreSQL test fails loudly instead of passing by accident.
 # AAS_TEST_SHARD=INDEX/COUNT runs one deterministic file shard (tests/sharding.py);
 # unset, the lane runs every database-free test.
-# Whole files run in parallel worker processes (pytest-xdist, --dist loadfile), so a
-# file's module fixtures are built once and the file shards stay file-granular.
+# Whole files run in parallel worker processes (pytest-xdist). With --dist loadgroup,
+# tests/scheduling.py keeps each file on one worker, so its module fixtures are built once,
+# and keeps each xdist_group (files sharing a host-wide resource) on one worker.
 # AAS_TEST_WORKERS sets the worker count (default auto = one per CPU); 0 runs serially
 # in this process.
 set -euo pipefail
@@ -16,7 +17,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 ensure_verify_toolchain
 
 unset AAS_TEST_DATABASE_URL
-args=(-m "not database" -n "${AAS_TEST_WORKERS:-auto}" --dist loadfile)
+args=(-m "not database" -n "${AAS_TEST_WORKERS:-auto}" --dist loadgroup)
 if [[ -n "${AAS_TEST_SHARD+set}" ]]; then
   args+=(--test-shard "$AAS_TEST_SHARD")
 fi

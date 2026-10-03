@@ -274,7 +274,7 @@ def _run_on_workers(tmp_path: Path, *arguments: str) -> subprocess.CompletedProc
             "-n",
             "2",
             "--dist",
-            "loadfile",
+            "loadgroup",
             f"--basetemp={tmp_path / 'inner'}",
             *arguments,
         ],

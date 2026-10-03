@@ -16,6 +16,10 @@ from aegis_alpha.data.qveris_native import normalize_korean_price_history, read_
 from aegis_alpha.data.serialization import canonical_json_bytes
 from tests.data.test_qveris_acquisition import FakeQveris
 
+# Serial: these tests take the host-wide Qveris account lease (an abstract Unix socket named by
+# the synthetic account), so every file that takes it runs in one xdist worker.
+pytestmark = pytest.mark.xdist_group("qveris-account-lease")
+
 IDENTITY = {
     "123456.KO": {
         "instrument_id": "synthetic-etf",

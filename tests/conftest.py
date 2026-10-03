@@ -31,8 +31,9 @@ isolate(Path(os.path.realpath(_PYTEST_ROOT.name)), os.environ)
 from aegis_alpha.data import canonical_generation_schema  # noqa: E402, F401
 from aegis_alpha.metadata.schema import metadata  # noqa: E402
 
-# CI splits the database-free lane into deterministic file shards (tests/sharding.py).
-pytest_plugins = ["tests.sharding"]
+# CI splits the database-free lane into deterministic file shards (tests/sharding.py), and
+# xdist runs whole files or declared serial groups per worker (tests/scheduling.py).
+pytest_plugins = ["tests.sharding", "tests.scheduling"]
 
 _DATABASE_PREFIX = "aas_owned_"
 _DATABASE_SUFFIX = "_test"

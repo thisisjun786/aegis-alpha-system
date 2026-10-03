@@ -16,6 +16,10 @@ from tests.data.test_qveris_acquisition import FakeQveris, eod_job
 if TYPE_CHECKING:
     from pathlib import Path
 
+# Serial: these tests take the host-wide Qveris account lease (an abstract Unix socket named by
+# the synthetic account), so every file that takes it runs in one xdist worker.
+pytestmark = pytest.mark.xdist_group("qveris-account-lease")
+
 
 @pytest.mark.parametrize(
     ("peer_root", "peer_account", "expected"),

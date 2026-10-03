@@ -40,15 +40,20 @@ The root `conftest.py` owns network, home, data-root and disposable DB isolation
 - `tmp_path_retention_policy = "failed"`: a passing test's `tmp_path` is removed at teardown,
   so scratch (memory-backed in CI) holds one test's stores at a time. Failed tests keep theirs.
 - **The database-free lane runs whole files in parallel processes.** `verify-lane-test` passes
-  `-n "${AAS_TEST_WORKERS:-auto}" --dist loadfile`: one file runs start to finish in one
+  `-n "${AAS_TEST_WORKERS:-auto}" --dist loadgroup`, and `scheduling.py` (registered from
+  `conftest.py`) schedules an unmarked test by its file: one file runs start to finish in one
   worker, so module fixtures are built once per file, and process-global state (`os.environ`,
-  `chdir`, signal handlers, `/proc/self/fd`) is never shared between workers. A test that
-  needs a resource shared across processes (a fixed path outside `tmp_path`, a port, a
-  system-wide lock) carries `@pytest.mark.xdist_group("<reason>")` and a
-  `# Serial: <reason>` comment; there is none today. `AAS_TEST_WORKERS=0` runs serially.
+  `chdir`, signal handlers, `/proc/self/fd`) is never shared between workers. A file whose
+  tests hold a resource shared across processes (a fixed path outside `tmp_path`, a port, an
+  abstract Unix socket, a system-wide lock) carries
+  `pytestmark = pytest.mark.xdist_group("<resource>")` under a `# Serial: <reason>` comment;
+  every file of one group runs in one worker. Today the only group is
+  `qveris-account-lease`: the Qveris store binds an abstract socket named by the account, and
+  the synthetic accounts are fixed. Under xdist a grouped test's reported node ID ends in
+  `@<group>`. `AAS_TEST_WORKERS=0` runs serially.
   xdist puts `tmp_path` one directory deeper (`popen-gwN/`), so bind an `AF_UNIX` socket by
   a name relative to its directory rather than by its 107-byte-limited absolute path.
-- **Fast local loop.** `uv run --no-sync pytest -n auto --dist loadfile -m 'not database'
+- **Fast local loop.** `uv run --no-sync pytest -n auto --dist loadgroup -m 'not database'
   <paths>` for the area you change; `./scripts/verify-lane-test` for the whole lane. For
   fsync-heavy storage tests use `TMPDIR=/dev/shm/aas-$USER`, never `/tmp` (a stray `/tmp/.git`
   makes storage refuse paths). Use `AAS_TEST_WORKERS=0`, or omit `-n`, to debug in one process.
