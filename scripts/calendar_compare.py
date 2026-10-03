@@ -9,6 +9,8 @@ apart, never as closed)::
     uv run --no-sync python -m scripts.calendar_compare --market MARKET.duckdb \\
         --calendar XKRX --source-prefix qveris-kr-history-62d23e53 --table bars
 
+- dates and volumes may be typed or the export's text (a Norgate history export keeps both
+  as CSV text); a value that does not read as a date or a number counts as absent;
 - an observed date has at least one row; a traded date has rows with positive volume for
   at least 5% of the largest such count within 30 calendar days either side, so a date
   with a few stale fills in a thin market is not mistaken for a session;
@@ -68,13 +70,15 @@ def observed(
     """Each observed date's (rows, traded rows, largest traded count in its window)."""
     day, volume = _quote(date_column), _quote(volume_column)
     union = " UNION ALL ".join(
-        f"SELECT CAST({day} AS DATE) AS d, {volume} AS v FROM {_quote(target)}"  # noqa: S608
+        f"SELECT TRY_CAST({day} AS DATE) AS d, TRY_CAST({volume} AS DOUBLE) AS v "  # noqa: S608
+        f"FROM {_quote(target)}"
         for target in targets
     )
     rows = connection.execute(
         "SELECT d, n, t, max(t) OVER (ORDER BY d RANGE BETWEEN "  # noqa: S608 -- quoted names
         f"INTERVAL {_WINDOW_DAYS} DAYS PRECEDING AND INTERVAL {_WINDOW_DAYS} DAYS FOLLOWING) "
         f"FROM (SELECT d, count(*) AS n, count(*) FILTER (WHERE v > 0) AS t FROM ({union}) "
+        "WHERE d IS NOT NULL "
         "GROUP BY d) ORDER BY d"
     ).fetchall()
     return {row[0]: (int(row[1]), int(row[2]), int(row[3])) for row in rows}

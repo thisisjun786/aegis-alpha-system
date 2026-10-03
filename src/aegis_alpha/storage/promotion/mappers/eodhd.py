@@ -36,7 +36,7 @@ class EodhdBars:
     major: Final = 1
     provider: Final = "eodhd"
     domain: Final = "prices"
-    partition_column: Final = "date"
+    partition_sql: Final = '"date"'
     date_column: Final = "session_date"
     time_inputs: Final[Mapping[str, InputKind]] = {"session_date": "date"}
 

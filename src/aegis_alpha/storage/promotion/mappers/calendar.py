@@ -40,7 +40,7 @@ class CalendarDeclared:
     major: Final = 1
     provider: Final = "calendar"
     domain: Final = "calendar_sessions"
-    partition_column: Final = "session_date"
+    partition_sql: Final = '"session_date"'
     date_column: Final = "session_date"
     time_inputs: Final[Mapping[str, InputKind]] = {"public_by": "utc_us"}
 

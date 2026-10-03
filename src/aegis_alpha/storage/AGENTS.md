@@ -52,7 +52,8 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   requires no references (the source's own `sl:` link is lineage, not a reference),
   an equivalence digest and an other-device backup, and never removes `raw/` bytes.
 - `promotion/` implements that path. `spec` parses the document, `mappers` is the registry
-  (one module per provider shape; a mapper is SQL over the staged source and declares its
+  (one module per provider shape, `daily` holding the SQL the daily price mappers share; a
+  mapper is SQL over the staged source and declares its
   columns, identity key, partition and time inputs), `time_rules` and `decimal_rules` hold the
   versioned rules with a Python reference beside each SQL form, `formats` the frozen hash
   formats, and `engine` plans, applies, recovers and verifies. All per-row work stays in DuckDB
@@ -137,14 +138,18 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   are known from their receipt's retrieval instant and cite the source row hash. A build
   must read every source registered KR assertions cite, and reports registered claims its
   sources no longer give (`withdrawn`) instead of closing them.
-- `us_identity` builds the US registry document from four identity mappers over committed,
-  linked sources (`norgate.master@1`, `eodhd.us_symbol@1`, `fmp.profile@1`, `sec.tickers@1`).
-  Every instrument is a Norgate asset ID (venue `XNYS`); a listed row's ticker (class `.`
+- `us_identity` builds the US registry document from five identity mappers over committed,
+  linked sources (`norgate.master@1`, `eodhd.us_symbol@1`, `fmp.profile@1`, `sec.tickers@1`,
+  `norgate.export_listing@1`). Every instrument is a Norgate asset ID (venue `XNYS`, or `XXXX`
+  for an index or other reference series an export adds); a listed row's ticker (class `.`
   spelled `-`) reaches EODHD and FMP symbols only when one listed row has it, and an issuer
   CIK links only when SEC lists the ticker under one CIK and FMP names the same CIK. Every
   disagreement stays unresolved with its reason. A ticker's claims hold only from the
   listing's first date (or the day after a delisted earlier holder's last date) until the
-  day after the master's last observed session; later intervals need newer evidence.
+  day after the master's last observed session; a later Norgate history export adds a
+  non-overlapping window up to its own last session, and FMP or SEC rows are judged against
+  the claim (master or window) holding when they were retrieved. Later intervals need newer
+  evidence.
   Claims from sources without a row instant
   are known from the source's `sl:` link; an issuer link from the latest of its evidence.
   Builds are cumulative like `kr_identity`'s, and source rows are read through Arrow so

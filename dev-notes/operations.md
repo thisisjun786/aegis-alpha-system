@@ -290,7 +290,7 @@ commit한다. 두 옵션 모두 반복할 수 있고, 같은 수집물을 다시
 
 ```bash
 aas identity us-build --master SOURCE_ID [--fmp SOURCE_ID] ... [--sec SOURCE_ID] ... \
-  [--bindings SOURCE_ID] --output registry.json [--report report.json]
+  [--norgate-exports] [--bindings SOURCE_ID] --output registry.json [--report report.json]
 aas identity register --file registry.json --sha256 SHA256 --plan
 ```
 
@@ -298,11 +298,14 @@ aas identity register --file registry.json --sha256 SHA256 --plan
 `eodhd.us_symbol@1`, `fmp.profile@1`, `sec.tickers@1` 매퍼로 `aas-identity-registry-v1` 문서를 `--output`에
 쓴다. `--master`는 Norgate security master 원천 하나, `--fmp`는 FMP company profile 원천, `--sec`는
 `aas import legacy`의 `sec.submissions_zip@1`로 편입한 SEC submissions 내용 원천이다(`raw/`의 archive를
-읽는다). `--fmp`와 `--sec`는 반복할 수 있다. 원천마다 `sl:` 연결이 있어야 하므로 명시 ID 원천은 먼저
+읽는다). `--fmp`와 `--sec`는 반복할 수 있다. `--norgate-exports`는 `aas import legacy`의
+`norgate.history_export@1`로 편입한 `norgate-history-csv-*` 원천을 모두 `norgate.export_listing@1`로 읽어,
+master에 없는 시리즈를 발급하고 master의 마지막 세션 뒤 내보내기 창의 티커 주장을 더한다. 원천마다 `sl:` 연결이 있어야 하므로 명시 ID 원천은 먼저
 `aas db source-link --apply`로 연결한다. `--bindings`는 legacy identity bindings 원천과 발급한 asset ID
 집합을 비교해 보고에 싣는다. 입력의 누적 규칙, 출력·`--report` 파일 규칙, 응답 형태(`withdrawn` 포함)는
 `kr-build`와 같다. 응답에는 asset ID 집합의 `aas-norgate-assetids-v1` 해시(`assetids_sha256`)와 issuer가
-연결된 instrument 수, 티커 주장이 끝나는 master의 마지막 관측 세션(`through`)이 더 실린다. 공급자를
+연결된 instrument 수, 티커 주장이 끝나는 master의 마지막 관측 세션(`through`), 내보내기의 마지막 주식
+세션(`export_through`)과 창의 EODHD 심볼 수(`export_symbols`)가 더 실린다. 공급자를
 호출하지 않는다. 해석 규칙과 미해결 이유는 [US 등록](design/data-vertical.md#us-등록)이 소유한다.
 
 ```bash
@@ -345,6 +348,21 @@ flag 분포, 시간 규칙별 null·상한 적용 수, op 분포, stale 행, 계
 기존 generation을 검증해 돌려주고, 중단된 승격은 같은 명령이나 `aas db recover`가 끝낸다. 승격은
 공급자를 호출하지 않으며, 설정된 공유 계산 예산이 있으면 그 예산 안에서 돈다. `promotions`는
 승격 intent마다 단계, generation, dataset version, 행 수, 명세 해시와 매퍼를 나열한다.
+
+US 가격 dataset은 이 명령에 명세를 하나씩 넘겨 만든다. 매퍼와 dataset의 대응과 규칙은
+[대상 dataset](design/data-vertical.md#대상-dataset)이 소유한다. 명세는 US identity snapshot(`us-build
+--norgate-exports`로 만든 문서를 등록한 뒤 provider·namespace별로 만든 snapshot)과 `sessions.xnys` 달력
+generation을 pin한다.
+
+- `prices.us.norgate`: `norgate-history-csv-*` 중 미국 주식 내보내기의 `bars` 원천 전부, `norgate.prices_none@1`,
+  다섯 값 `decimal_text@1`, 연도 partition마다 generation 하나.
+- `prices.us.norgate.ref`: Norgate 조정 part, `norgate.prices_adjusted@1`, 다섯 값 `float_shortest@1`.
+- `prices.us.eodhd`: EODHD US 일간 다운로드 하나마다 generation 하나를 수집 순서대로, `eodhd.bars@1`과
+  `cross_provider_mismatch@1`(기준은 `prices.us.norgate`의 generation pin).
+- `prices.us.fmp.ref`: `fmp-price-eod-non-split-*` 원천 전부를 pin하고 `fmp.eod_non_split@1`의 `revision`을
+  1부터 delta가 빌 때까지 올리며 이어 승격한다.
+- `prices.ref.norgate`: 기준 시리즈 표는 `norgate.reference_closes@1`, 지수·기타 내보내기는
+  `norgate.reference_history@1`, close `decimal_text@1`.
 
 ### legacy 원천 편입
 

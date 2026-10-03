@@ -48,8 +48,12 @@ class Mapper(Protocol):
     def domain(self) -> str: ...
 
     @property
-    def partition_column(self) -> str:
-        """The source DATE column a spec partition and the record date come from."""
+    def partition_sql(self) -> str:
+        """SQL over the source columns giving the DATE a spec partition tests.
+
+        A row with no partition date never falls in a partition, and a partitioned plan
+        refuses such rows rather than dropping them.
+        """
         ...
 
     @property
@@ -80,8 +84,23 @@ class Mapper(Protocol):
 def _registry() -> dict[str, Mapper]:
     from aegis_alpha.storage.promotion.mappers.calendar import CalendarDeclared  # noqa: PLC0415
     from aegis_alpha.storage.promotion.mappers.eodhd import EodhdBars  # noqa: PLC0415 -- registry
+    from aegis_alpha.storage.promotion.mappers.fmp import FmpEodNonSplit  # noqa: PLC0415
+    from aegis_alpha.storage.promotion.mappers.norgate_prices import (  # noqa: PLC0415
+        NorgatePricesAdjusted,
+        NorgatePricesNone,
+        NorgateReferenceCloses,
+        NorgateReferenceHistory,
+    )
 
-    mappers: tuple[Mapper, ...] = (CalendarDeclared(), EodhdBars())
+    mappers: tuple[Mapper, ...] = (
+        CalendarDeclared(),
+        EodhdBars(),
+        FmpEodNonSplit(),
+        NorgatePricesAdjusted(),
+        NorgatePricesNone(),
+        NorgateReferenceCloses(),
+        NorgateReferenceHistory(),
+    )
     return {f"{mapper.name}@{mapper.major}": mapper for mapper in mappers}
 
 

@@ -416,11 +416,19 @@ def _stage_sources(
     names = ", ".join(_q(name) for name, _ in columns)
     where = ""
     if spec.partition is not None:
-        column = _q(spec.mapper.partition_column)
+        day = spec.mapper.partition_sql
         where = (
-            f" WHERE {column} >= DATE '{spec.partition.start.isoformat()}' "
-            f"AND {column} < DATE '{spec.partition.end.isoformat()}'"
+            f" WHERE ({day}) >= DATE '{spec.partition.start.isoformat()}' "
+            f"AND ({day}) < DATE '{spec.partition.end.isoformat()}'"
         )
+        undated = sum(
+            _count(market, f"SELECT count(*) FROM {_q(source.target)} WHERE ({day}) IS NULL")
+            for source in sources
+        )
+        if undated:
+            plan.refusals.append(
+                f"{undated} source rows have no partition date, so no partition holds them"
+            )
     union = " UNION ALL ".join(
         f"SELECT {index}::INTEGER AS _aas_pin, _aas_ordinal, {names} "
         f"FROM {_q(source.target)}{where}"
@@ -574,9 +582,10 @@ def _rows(
         for index in range(len(TIME_COLUMNS))
     )
     selected.append(
-        "CASE WHEN _aas_matches = 0 THEN 'unresolved' WHEN _aas_matches > 1 THEN 'ambiguous' "
+        # A row missing a required column is malformed whether or not it resolves.
+        f"CASE WHEN {missing} THEN 'refused_required' "
+        "WHEN _aas_matches = 0 THEN 'unresolved' WHEN _aas_matches > 1 THEN 'ambiguous' "
         f"WHEN {' OR '.join(refused) or 'false'} THEN 'refused_number' "
-        f"WHEN {missing} THEN 'refused_required' "
         "WHEN _aas_ingest IS NULL THEN 'refused_ingestion' "
         f"WHEN {held} THEN 'held' ELSE 'ok' END AS _aas_status"
     )
