@@ -84,6 +84,7 @@ def _history_export(
     batches: list[list[tuple[str, int, bytes]]],
     *,
     reused: dict[str, dict[str, object]] | None = None,
+    unexported: Sequence[str] = (),
 ) -> Path:
     """Write ``batch-NNN-result.json`` files, the CSV files each lists, the plan and acquisition."""
     columns = _HISTORY_COLUMNS.split(",")
@@ -106,7 +107,10 @@ def _history_export(
         _private(root / f"batch-{number:03d}-result.json", _json(result))
     reused = reused or {}
     plan = {
-        "pending_symbols": [symbol for batch in batches for symbol, _, _ in batch],
+        "pending_symbols": [
+            *(symbol for batch in batches for symbol, _, _ in batch),
+            *unexported,
+        ],
         "reused": reused,
     }
     plan_raw = _json(plan)
@@ -222,6 +226,7 @@ def test_plan_reads_originals_and_writes_nothing(tmp_path: Path, home: Path) -> 
         "missing_series": 0,
         "planned_series": 3,
         "records": 3,
+        "repeated_series": 0,
         "rows": 4,
         "unplanned_series": 0,
         "units": 2,
@@ -389,6 +394,24 @@ def test_verify_requires_committed_identical_linked_sources(tmp_path: Path, home
     assert after["complete"] is True
     assert after["unmatched"] == 0
     assert {s["status"] for s in _sources(after)} == {"committed"}
+    # A stored row that no longer matches its commit marker fails the source.
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        (manifest_json,) = cast(
+            "tuple[str]",
+            workspace.market.execute(
+                "SELECT manifest_json FROM source_library_commits WHERE source_id=?",
+                [_sources(after)[0]["source_id"]],
+            ).fetchone(),
+        )
+        target = json.loads(manifest_json)["tables"][0]["target"]
+        update = f"UPDATE \"{target}\" SET close = ? WHERE date = '2020-08-28'"  # noqa: S608 -- synthetic table name from the marker
+        workspace.market.execute(update, ["1"])
+    with open_workspace(home) as workspace:
+        altered = verify_import(workspace, manifest)
+    assert altered["complete"] is False
+    assert [s["status"] for s in _sources(altered)] == ["table_mismatch", "committed"]
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        workspace.market.execute(update, ["499.23"])
     # A retained original that no longer matches its address fails its link.
     digest = _sha(_BBB)
     retained = home / "raw" / digest[:2] / digest
@@ -803,6 +826,26 @@ def test_reused_series_are_units_until_imported(tmp_path: Path, home: Path) -> N
     other = _history_export(legacy / "other", [[("AAA", 131684, _AAA)]], reused=reused)
     report = plan_import(_manifest([_entry("other", "norgate.history_export@1", other)]))
     assert "does not hold the planned $SPX" in _refusal(report)
+    # An export that only reuses series is one checkpoint unit.
+    only = _history_export(legacy / "only", [], reused=reused)
+    report = plan_import(_manifest([_entry("only", "norgate.history_export@1", only)]))
+    assert "does not hold the planned $SPX" in _refusal(report)
+    reused = _checkpoint(legacy / "history-selected-2", [("$SPX", 392, _SPX)])
+    only = _history_export(legacy / "only-2", [], reused=reused)
+    report = plan_import(_manifest([_entry("only", "norgate.history_export@1", only)]))
+    assert report["reconciled"] is True
+    assert cast("dict", _only(report)["metrics"])["records"] == 1
+    # A planned series that no batch exported fails reconciliation unless the manifest pins it.
+    gap = _history_export(legacy / "gap", [[("AAA", 131684, _AAA)]], unexported=["ZZZ"])
+    report = plan_import(_manifest([_entry("gap", "norgate.history_export@1", gap)]))
+    assert cast("dict", _only(report)["expect"])["missing_series"] == {
+        "expected": 0,
+        "observed": 1,
+        "matched": False,
+    }
+    assert report["reconciled"] is False
+    pinned = _manifest([_entry("gap", "norgate.history_export@1", gap, missing_series=1)])
+    assert plan_import(pinned)["reconciled"] is True
     # An acquisition record that disagrees with its plan refuses the whole entry.
     acquisition = next(root.glob("acquisition-*.json"))
     document = json.loads(acquisition.read_bytes())
@@ -869,7 +912,9 @@ def test_uncovered_files_keep_verify_incomplete(tmp_path: Path, home: Path) -> N
 
 def _all_loaders(tmp_path: Path) -> dict[str, dict[str, object]]:
     entries, _, _ = _small_originals(tmp_path / "small")
-    membership = _entry("membership", "norgate.index_membership@1", _membership(tmp_path), pairs=3)
+    membership = _entry(
+        "membership", "norgate.index_membership@1", _membership(tmp_path), missing_pairs=1
+    )
     membership["args"] = {"include": ["pilot-capture"]}
     archive_path, receipt_path, _ = _archive(tmp_path)
     for loader in ("sec.submissions_zip@1", "sec.companyfacts_zip@1"):

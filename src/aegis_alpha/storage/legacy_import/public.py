@@ -6,7 +6,8 @@ are one unit; the table is the archive's member index in central-directory order
 sizes, CRC-32, modification time, compression method and the SHA-256 of each member's bytes.
 The member bytes themselves stay in the retained archive in ``raw/``, which the mappers read
 through this index. Every receipt that states the archive's hash, size, member counts or
-expanded size must agree with the archive.
+expanded size must agree with the archive. Receipts are optional; the ``receipts`` metric
+counts them so a manifest can pin how many the archive must carry.
 
 ``fred.series_csv@1`` reads one FRED download (``observation_date,<SERIES>``) as text rows.
 
@@ -19,7 +20,10 @@ observations are separate shapes.
 ``fmp.price_eod_non_split@1`` reads an FMP run root whose ``run_id=*`` directories each hold
 one ``fmp_price_eod_non_split_adjusted`` dataset (``history-index.json`` and
 ``part-*.parquet``). Each run's dataset is one unit; rows are the Parquet rows in part order.
-FMP is a frozen source, so this preserves its last snapshot only.
+FMP is a frozen source: every run's dataset is preserved as it was collected, and choosing
+among overlapping runs belongs to promotion, not to the import. The run's
+``history-index.json`` is the collector's cumulative recent-date cache across runs, not an
+inventory of that run's parts, so it is retained as evidence and checked only for its dataset.
 """
 
 from __future__ import annotations
@@ -128,7 +132,8 @@ class SecArchive:
     """``sec.submissions_zip@1`` and ``sec.companyfacts_zip@1``."""
 
     arg_names = frozenset({"evidence"})
-    metric_names = frozenset({"members", "json_members", "expanded_bytes"})
+    metric_names = frozenset({"members", "json_members", "expanded_bytes", "receipts"})
+    zero_metrics: frozenset[str] = frozenset()
 
     def __init__(self, name: str, table: Table) -> None:
         self.name = name
@@ -206,6 +211,7 @@ class SecArchive:
                 if key in receipt and receipt[key] != value:
                     raise ValueError(f"SEC archive receipt {path.name} disagrees on {key}")
         run.metrics["members"] += members
+        run.metrics["receipts"] += len(unit.files) - 1
         run.metrics["json_members"] += json_members
         run.metrics["expanded_bytes"] += expanded
 
@@ -219,6 +225,7 @@ class FredSeriesCsv:
     name = "fred.series_csv@1"
     arg_names: frozenset[str] = frozenset()
     metric_names = frozenset({"rows"})
+    zero_metrics: frozenset[str] = frozenset()
 
     def units(self, entry: Entry, source: OriginalBytes, run: Run) -> list[Unit]:
         del source, run
@@ -250,6 +257,7 @@ class KoreaPublicResponse:
     name = "korea.public_response@1"
     arg_names: frozenset[str] = frozenset()
     metric_names = frozenset({"units", "listings", "observations"})
+    zero_metrics: frozenset[str] = frozenset()
 
     def units(self, entry: Entry, source: OriginalBytes, run: Run) -> list[Unit]:
         del run
@@ -317,6 +325,7 @@ class FmpNonSplit:
     name = "fmp.price_eod_non_split@1"
     arg_names: frozenset[str] = frozenset()
     metric_names = frozenset({"units", "rows"})
+    zero_metrics: frozenset[str] = frozenset()
 
     def units(self, entry: Entry, source: OriginalBytes, run: Run) -> list[Unit]:
         del source, run

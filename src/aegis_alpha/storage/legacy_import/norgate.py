@@ -21,7 +21,8 @@ and every ``index_constituent_timeseries`` file it names (plus the batch result 
 is one); other methods' files in the same capture are not part of this source. ``include``
 names further capture directories below the root that no batch result names. The root's one
 ``membership-plan-*.json`` lists the planned (asset, index) pairs; the report states how many
-were captured, missing and repeated.
+were captured, missing, unplanned and repeated, and each discrepancy must be 0 unless the
+manifest pins its count.
 
 ``norgate.identity_authority@1`` reads one identity-authority JSON document and emits its
 ``mappings`` and ``issuer_bindings`` lists as two tables of the same source content.
@@ -174,19 +175,28 @@ class HistoryExport:
     name = "norgate.history_export@1"
     arg_names: frozenset[str] = frozenset()
     metric_names = frozenset(
-        {"units", "records", "rows", "planned_series", "missing_series", "unplanned_series"}
+        {
+            "units",
+            "records",
+            "rows",
+            "planned_series",
+            "missing_series",
+            "unplanned_series",
+            "repeated_series",
+        }
     )
+    zero_metrics = frozenset({"missing_series", "unplanned_series", "repeated_series"})
 
     def units(self, entry: Entry, source: OriginalBytes, run: Run) -> list[Unit]:
         children = _children(entry.path)
         results = [name for name in children if _BATCH_RESULT.fullmatch(name)]
-        if not results:
-            raise ValueError("Norgate export has no batch result files")
         batches = {name for name in children if re.fullmatch(r"batch-[0-9]{3,}", name)}
         orphans = sorted(batches - {name.removesuffix("-result.json") for name in results})
         if orphans:
             raise ValueError(f"Norgate export batch {orphans[0]} has no result file")
         reused = self._plan(entry, children, source, run, len(results))
+        if not results and not reused:
+            raise ValueError("Norgate export has no batch result files and reuses no series")
         units = []
         for name in results:
             path = entry.path / name
@@ -324,6 +334,7 @@ class HistoryExport:
         seen = cast("Counter[str]", run.state["seen"])
         run.metrics["missing_series"] = len(planned - set(seen))
         run.metrics["unplanned_series"] = len(set(seen) - planned)
+        run.metrics["repeated_series"] = sum(count - 1 for count in seen.values())
 
 
 def _exported(record: dict[str, object], symbol: str, name: str) -> None:
@@ -392,6 +403,7 @@ class IndexMembership:
 
     name = "norgate.index_membership@1"
     arg_names = frozenset({"include"})
+    zero_metrics = frozenset({"missing_pairs", "unplanned_pairs", "repeated_pairs"})
     metric_names = frozenset(
         {
             "units",
@@ -587,6 +599,7 @@ class IdentityAuthority:
     name = "norgate.identity_authority@1"
     arg_names: frozenset[str] = frozenset()
     metric_names = frozenset({"mappings", "issuer_bindings"})
+    zero_metrics: frozenset[str] = frozenset()
 
     def units(self, entry: Entry, source: OriginalBytes, run: Run) -> list[Unit]:
         del source, run

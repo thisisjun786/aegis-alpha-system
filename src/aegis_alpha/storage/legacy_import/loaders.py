@@ -14,7 +14,10 @@ A loader is registered as ``<provider>.<shape>@<major>``. It fixes three things:
   their own index (a hash, a row count, a header, a date range) is refused, never repaired.
 
 ``metrics`` are the reconciliation counts a loader reports for its entry; a manifest's
-``expect`` names some of them.
+``expect`` names some of them. A loader's ``zero_metrics`` count discrepancies (a planned item
+not read, an item read twice or outside the plan): each one is expected to be 0 unless the
+manifest's ``expect`` records another count for it, so an unpinned discrepancy fails the
+reconciliation.
 """
 
 from __future__ import annotations
@@ -87,6 +90,7 @@ class Loader(Protocol):
     name: str
     arg_names: frozenset[str]
     metric_names: frozenset[str]
+    zero_metrics: frozenset[str]
 
     def units(self, entry: Entry, source: OriginalBytes, run: Run) -> list[Unit]:
         """Discover the entry's units, reading only the index files discovery needs."""

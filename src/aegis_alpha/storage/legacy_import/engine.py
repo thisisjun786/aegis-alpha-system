@@ -12,9 +12,9 @@
   The first failing unit stops the apply.
 - ``verify_import`` re-derives the plan from the originals and checks that every planned
   source is committed and complete in the installation with the same rows and digest, that
-  its ``sl:`` link matches and every linked original is intact in ``raw/``, and that every
-  retained index file is intact in ``raw/``. A source or retained file that fails is
-  ``unmatched``.
+  its stored table still rehashes to them, that its ``sl:`` link matches and every linked
+  original is intact in ``raw/``, and that every retained index file is intact in ``raw/``.
+  A source or retained file that fails is ``unmatched``.
 
 Every regular file below an entry's root is accounted for. A unit file is covered by its
 source. An index file the loader read to discover its units (a membership plan, a batch
@@ -302,7 +302,8 @@ def _entry(  # noqa: PLR0913 -- one report row
     loader = LOADERS[entry.loader]
     metrics = {name: run.metrics.get(name, 0) for name in sorted(loader.metric_names)}
     expect = {}
-    for metric, expected in sorted(entry.expect.items()):
+    expected_counts = dict.fromkeys(loader.zero_metrics, 0) | entry.expect
+    for metric, expected in sorted(expected_counts.items()):
         expect[metric] = {
             "expected": expected,
             "observed": metrics[metric],
@@ -398,7 +399,7 @@ def apply_import(workspace: Workspace, manifest: Manifest) -> dict[str, object]:
 
 def _status(workspace: Workspace, item: dict[str, object]) -> str:
     from aegis_alpha.storage.source_identity import link_source  # noqa: PLC0415
-    from aegis_alpha.storage.source_library import _marker  # noqa: PLC0415
+    from aegis_alpha.storage.source_library import _marker, _verify_manifest  # noqa: PLC0415
     from aegis_alpha.storage.state import get_operation  # noqa: PLC0415
 
     source_id = str(item["source_id"])
@@ -408,11 +409,17 @@ def _status(workspace: Workspace, item: dict[str, object]) -> str:
     operation = get_operation(workspace.state, str(marker[0]))
     if operation is None or operation["phase"] != "COMPLETED":
         return "incomplete"
-    tables = json.loads(str(marker[4]))["tables"]
+    stored = json.loads(str(marker[4]))
+    tables = stored["tables"]
     if [(t["name"], t["rows"], t["digest"]) for t in tables] != [
         (item["table"], item["rows"], item["digest"])
     ]:
         return "mismatch"
+    try:
+        # The marker records what was committed; the stored rows are rehashed against it.
+        _verify_manifest(workspace, stored)
+    except ValueError:
+        return "table_mismatch"
     link = link_source(workspace, source_id, apply=False)
     return "committed" if link == "unchanged" else f"link_{link}"
 
