@@ -10,7 +10,18 @@ from zoneinfo import ZoneInfo
 import duckdb
 import pytest
 
-from aegis_alpha.storage.promotion.mappers import MANIFEST_ITEMS, REGISTRY, IdentityKey, mapper
+from aegis_alpha.storage.identity import mint_issuer
+from aegis_alpha.storage.market_inputs import GenerationPin
+from aegis_alpha.storage.promotion import formats
+from aegis_alpha.storage.promotion.mappers import (
+    MANIFEST_ITEMS,
+    REGISTRY,
+    IdentityKey,
+    Reference,
+    mapper,
+    reference_table,
+    references,
+)
 
 
 def _us(moment: datetime) -> int:
@@ -35,6 +46,8 @@ def test_eodhd_bars_maps_synthetic_fixture() -> None:
         "kind.industry@1",
         "norgate.classification@1",
         "sec.sic@1",
+        "sec.companyfacts@1",
+        "sec.submissions@1",
     }
     args = {"timezone": "Asia/Seoul"}
     bars.check_args(args)
@@ -374,3 +387,312 @@ def test_eodhd_bars_quarantine_maps_held_history_rows() -> None:
     assert [row[0] for row in partitions] == [
         session, date(2025, 1, 3), session, session, session, None, session,
     ]  # fmt: skip
+
+
+def test_sec_submissions_maps_synthetic_fixture() -> None:
+    filings = mapper("sec.submissions@1")
+    filings.check_args({})
+    with pytest.raises(ValueError, match="no arguments"):
+        filings.check_args({"timezone": "UTC"})
+    assert filings.identity({}) is None
+    assert references(filings, {}) == {}
+    connection = duckdb.connect()
+    connection.execute("SET TimeZone='UTC'")
+    connection.execute(
+        "CREATE TABLE src (_aas_pin INTEGER, _aas_ordinal BIGINT, _aas_row_hash VARCHAR, "
+        'cik VARCHAR, "accessionNumber" VARCHAR, "filingDate" VARCHAR, "reportDate" VARCHAR, '
+        '"acceptanceDateTime" VARCHAR, form VARCHAR)'
+    )
+    connection.executemany(
+        "INSERT INTO src VALUES (0, ?, 'h', ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                1,
+                "0000000001",
+                "0000000001-26-000002",
+                "2026-08-03",
+                "2026-06-30",
+                "2026-08-03T20:05:01.000Z",
+                "10-Q",
+            ),
+            # Local midnight in New York (EST, then EDT) is a date-only filing: no instant.
+            (
+                2,
+                "0000000001",
+                "0000000001-99-000001",
+                "1999-01-04",
+                "",
+                "1999-01-04T05:00:00.000Z",
+                "10-K",
+            ),
+            (
+                3,
+                "0000000001",
+                "0000000001-99-000002",
+                "1999-07-06",
+                "",
+                "1999-07-06T04:00:00.000Z",
+                "8-K",
+            ),
+            # Another spelling leaves the field NULL; nothing is repaired.
+            (4, "1", "1-26-2", "2026/08/03", "2026-06", "2026-08-03 20:05:01", "4"),
+        ],
+    )
+    rows = connection.execute(
+        f"SELECT _aas_ordinal, issuer_id, filing_id, form, filed_date, accepted_at_us, "
+        f"period_end, _aas_ingested_at_us, _aas_t_accepted_at, _aas_t_filed_date "
+        f"FROM ({filings.select('src', {})}) ORDER BY _aas_ordinal"
+    ).fetchall()
+    issuer = mint_issuer("sec_cik", "0000000001")
+    accepted = _us(datetime(2026, 8, 3, 20, 5, 1, tzinfo=UTC))
+    assert rows == [
+        (
+            1,
+            issuer,
+            "0000000001-26-000002",
+            "10-Q",
+            date(2026, 8, 3),
+            accepted,
+            date(2026, 6, 30),
+            None,
+            accepted,
+            date(2026, 8, 3),
+        ),
+        (
+            2,
+            issuer,
+            "0000000001-99-000001",
+            "10-K",
+            date(1999, 1, 4),
+            None,
+            None,
+            None,
+            None,
+            date(1999, 1, 4),
+        ),
+        (
+            3,
+            issuer,
+            "0000000001-99-000002",
+            "8-K",
+            date(1999, 7, 6),
+            None,
+            None,
+            None,
+            None,
+            date(1999, 7, 6),
+        ),
+        (4, None, None, "4", None, None, None, None, None, None),
+    ]
+    partitions = connection.execute(
+        f"SELECT _aas_ordinal, {filings.partition_sql} FROM src ORDER BY 1"
+    ).fetchall()
+    assert [day for _, day in partitions] == [
+        date(2026, 8, 3),
+        date(1999, 1, 4),
+        date(1999, 7, 6),
+        None,
+    ]
+
+
+_FILINGS_PIN = {
+    "dataset_id": "filings.us.sec",
+    "version": "1",
+    "generation_id": "prm-filings",
+    "chain_hash": "c" * 64,
+    "manifest_hash": "d" * 64,
+}
+
+
+def test_sec_companyfacts_maps_synthetic_fixture() -> None:
+    facts = mapper("sec.companyfacts@1")
+    args = {"filings": dict(_FILINGS_PIN)}
+    facts.check_args(args)
+    for wrong in (
+        {},
+        {"filings": {**_FILINGS_PIN, "dataset_id": "prices.us.sec"}},
+        {"filings": {**_FILINGS_PIN, "version": ""}},
+        {**args, "extra": 1},
+    ):
+        with pytest.raises(ValueError, match="filings"):
+            facts.check_args(wrong)
+    assert facts.identity(args) is None
+    assert facts.numeric_columns(args) == {"value": "VARCHAR"}
+    assert references(facts, args) == {
+        "filings": Reference("filings", GenerationPin(**_FILINGS_PIN))
+    }
+    connection = duckdb.connect()
+    connection.execute("SET TimeZone='UTC'")
+    accepted = _us(datetime(2025, 2, 10, 21, 30, tzinfo=UTC))
+    connection.execute(
+        f"CREATE TABLE {reference_table('filings')} (issuer_id VARCHAR, filing_id VARCHAR, "
+        "form VARCHAR, filed_date DATE, accepted_at_us BIGINT, period_end DATE)"
+    )
+    connection.executemany(
+        f"INSERT INTO {reference_table('filings')} "
+        "VALUES (?, ?, '10-K', DATE '2025-02-10', ?, NULL)",
+        [
+            ("iss-a", "0000000001-25-000001", accepted),
+            # A co-registrant row of the same filing agrees on the instant.
+            ("iss-b", "0000000001-25-000001", accepted),
+            # Co-registrant rows that disagree give no instant.
+            ("iss-a", "0000000001-25-000002", accepted),
+            ("iss-b", "0000000001-25-000002", accepted + 1),
+            # A filing without an acceptance instant gives none.
+            ("iss-a", "0000000001-25-000003", None),
+        ],
+    )
+    connection.execute(
+        "CREATE TABLE src (_aas_pin INTEGER, _aas_ordinal BIGINT, _aas_row_hash VARCHAR, "
+        "cik VARCHAR, taxonomy VARCHAR, tag VARCHAR, unit VARCHAR, form VARCHAR, "
+        "accession_number VARCHAR, value VARCHAR, fp VARCHAR, period_start DATE, "
+        "period_end DATE, filed DATE, retrieved_at TIMESTAMPTZ)"
+    )
+    collected = datetime(2026, 9, 6, 2, 24, 26, tzinfo=UTC)
+    rows = [
+        ("us-gaap", "Assets", "USD", "0000000001-25-000001", "1000", None, date(2024, 12, 31)),
+        (
+            "us-gaap",
+            "Revenues",
+            "USD",
+            "0000000001-25-000001",
+            "-2.50",
+            date(2024, 1, 1),
+            date(2024, 12, 31),
+        ),
+        ("dei", "Shares", "shares", "0000000001-25-000002", "1E+22", None, date(2025, 1, 31)),
+        ("us-gaap", "Assets", "USD", "0000000001-25-000003", "", None, date(2024, 12, 31)),
+        ("us-gaap", "Assets", "USD", "0000000001-25-000009", "n/a", None, date(2024, 12, 31)),
+        ("us-gaap", "Assets", "USD", "bad", "5", date(2024, 10, 1), date(2024, 12, 31)),
+    ]
+    connection.executemany(
+        "INSERT INTO src VALUES (0, ?, 'h', '0000000001', ?, ?, ?, '10-K', ?, ?, 'FY', ?, ?, "
+        "DATE '2025-02-10', ?)",
+        [(index, *row, collected) for index, row in enumerate(rows)],
+    )
+    mapped = connection.execute(
+        "SELECT _aas_ordinal, issuer_id, concept, period_start, period_end, fiscal_period, unit, "
+        "dimensions_hash, form, accession, accepted_at_us, value, value_state, "
+        "_aas_ingested_at_us, _aas_t_accepted_at, _aas_t_filed "
+        f"FROM ({facts.select('src', args)}) ORDER BY _aas_ordinal"
+    ).fetchall()
+    issuer = mint_issuer("sec_cik", "0000000001")
+
+    def dims(accession: str) -> str:
+        return formats.dimensions_hash({"accession": accession})
+
+    ingested, filed = _us(collected), date(2025, 2, 10)
+    year_end, january = date(2024, 12, 31), date(2025, 1, 31)
+    acc = [f"0000000001-25-00000{n}" for n in (1, 2, 3, 9)]
+    assert mapped == [
+        (
+            0,
+            issuer,
+            "us-gaap:Assets",
+            None,
+            year_end,
+            "instant",
+            "USD",
+            dims(acc[0]),
+            "10-K",
+            acc[0],
+            accepted,
+            "1000",
+            "present",
+            ingested,
+            accepted,
+            filed,
+        ),
+        (
+            1,
+            issuer,
+            "us-gaap:Revenues",
+            date(2024, 1, 1),
+            year_end,
+            "P366D",
+            "USD",
+            dims(acc[0]),
+            "10-K",
+            acc[0],
+            accepted,
+            "-2.50",
+            "present",
+            ingested,
+            accepted,
+            filed,
+        ),
+        (
+            2,
+            issuer,
+            "dei:Shares",
+            None,
+            january,
+            "instant",
+            "shares",
+            dims(acc[1]),
+            "10-K",
+            acc[1],
+            None,
+            "1E+22",
+            "present",
+            ingested,
+            None,
+            filed,
+        ),
+        (
+            3,
+            issuer,
+            "us-gaap:Assets",
+            None,
+            year_end,
+            "instant",
+            "USD",
+            dims(acc[2]),
+            "10-K",
+            acc[2],
+            None,
+            None,
+            "missing",
+            ingested,
+            None,
+            filed,
+        ),
+        (
+            4,
+            issuer,
+            "us-gaap:Assets",
+            None,
+            year_end,
+            "instant",
+            "USD",
+            dims(acc[3]),
+            "10-K",
+            acc[3],
+            None,
+            None,
+            "invalid",
+            ingested,
+            None,
+            filed,
+        ),
+        # An accession of another spelling has no dimensions, so the row is refused.
+        (
+            5,
+            issuer,
+            "us-gaap:Assets",
+            date(2024, 10, 1),
+            year_end,
+            "P92D",
+            "USD",
+            None,
+            "10-K",
+            None,
+            None,
+            "5",
+            "present",
+            ingested,
+            None,
+            filed,
+        ),
+    ]
+    assert facts.partition_sql == "filed"

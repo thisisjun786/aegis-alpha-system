@@ -101,6 +101,7 @@ loader는 원본 형식 하나를 읽는 등록된 코드다. loader가 원본�
 | `norgate.index_membership@1` | `batch-results/*.json` 중 family `membership`이 가리키는 `batch-attempts/` 수집 디렉터리 하나(또는 `args.include`의 수집 디렉터리): `request.json`, `manifest-*.json`, `receipts.jsonl`, 그 journal이 나열한 `index_constituent_timeseries` gzip CSV | `norgate-index-membership`, `constituents`: job ID·asset ID·심볼·지수 이름·gzip과 CSV 해시, `date`, `index_constituent` 원문 | `units`, `pairs`, `rows`, `planned_pairs`, `missing_pairs`*, `unplanned_pairs`*, `repeated_pairs`* |
 | `norgate.identity_authority@1` | identity authority JSON 한 파일 | `norgate-identity-mappings`(`mappings`), `norgate-identity-issuer-bindings`(`issuer_bindings`). 같은 파일이라 hex를 공유한다 | `mappings`, `issuer_bindings` |
 | `sec.submissions_zip@1`, `sec.companyfacts_zip@1` | archive 하나와 `args.evidence`의 수집 영수증 | `sec-submissions-zip`, `sec-companyfacts-zip`, `members`: central directory 순서의 member 이름·압축·원래 크기·CRC-32·수정 시각·압축 방식·member bytes의 SHA-256 | `members`, `json_members`, `expanded_bytes`, `receipts` |
+| `sec.submissions_filings@1` | submissions archive 하나와 `args.evidence`의 수집 영수증 | `sec-submissions-filings`, `filings`: 제출자 문서와 쪽 문서가 싣는 공시마다 한 행. member 이름, member의 10자리 CIK, SEC의 병렬 배열 값 원문(아래) | `members`, `json_members`, `expanded_bytes`, `receipts`, `filers`, `pages`, `filings`, `other_members`, `missing_pages`*, `unlisted_pages`*, `miscounted_pages`*, `unknown_members`* |
 | `fred.series_csv@1` | `observation_date,<SERIES>` CSV 한 파일 | `fred-series-csv`, `observations`: series ID, 날짜와 값 원문 | `rows` |
 | `korea.public_response@1` | 요청 디렉터리 하나(`request.json`, `response.json`, `response.raw`, `normalized.v1.json`) | KIND `kind-listings`(`listings`), BOK `bok-observations`, OECD `oecd-observations`(`observations`). 정규화 문서의 행이며 중첩 값은 정규 JSON 문자열 | `units`, `listings`, `observations` |
 | `fmp.price_eod_non_split@1` | `run_id=*/fmp_price_eod_non_split_adjusted`의 `history-index.json`과 `part-*.parquet` | `fmp-price-eod-non-split`, `bars`: Parquet 행을 part 순서 그대로 | `units`, `rows` |
@@ -108,6 +109,19 @@ loader는 원본 형식 하나를 읽는 등록된 코드다. loader가 원본�
 `*`를 붙인 지표는 불일치 수(계획했지만 읽지 못한 항목, 계획 밖 항목, 두 번 읽은 항목)다. manifest `expect`가
 다른 수를 기록하지 않으면 기대 수는 0이므로, 기록되지 않은 불일치는 `reconciled`를 거짓으로 만든다. 알려진
 누락은 그 수를 `expect`에 적어 받아들인다. SEC archive의 영수증은 선택이며 `receipts`로 그 수를 고정할 수 있다.
+
+`sec.submissions_filings@1`은 SEC submissions archive를 공시 행으로 읽는다. 제출자 문서
+`CIK##########.json`은 최근 공시를 `filings.recent`의 병렬 배열로 싣고 이전 공시를 담은 쪽 문서를
+`filings.files`(쪽 이름과 `filingCount`)로 나열한다. 쪽 문서 `CIK##########-submissions-###.json`은 같은
+배열을 최상위에 싣는다. 배열 위치 하나가 행 하나이며 member는 central directory 순서, 위치는 배열 순서다.
+열은 `member`, `cik`(member 이름의 10자리 CIK)와 SEC의 배열 `accessionNumber`, `filingDate`, `reportDate`,
+`acceptanceDateTime`, `act`, `form`, `fileNumber`, `filmNumber`, `items`, `core_type`, `primaryDocument`,
+`primaryDocDescription`(텍스트), `size`, `isXBRL`, `isInlineXBRL`, `isXBRLNumeric`(정수)이다. 문서에 없는
+배열은 그 행에서 null이다. 이 밖의 키, 길이가 다른 배열, 다른 JSON 타입의 값, member 이름과 다른 `cik`를
+싣는 제출자 문서는 단위를 거부한다. 제출자가 나열했지만 archive에 없는 쪽(`missing_pages`), 어느 제출자도
+나열하지 않은 쪽(`unlisted_pages`), 공시 수가 나열과 다른 쪽(`miscounted_pages`), 그 밖의 이름을 가진 JSON
+member(`unknown_members`)는 불일치 지표다. 쪽의 행은 수가 달라도 모두 읽는다. 같은 archive를
+`sec.submissions_zip@1` 항목과 함께 편입할 수 있으며 bytes는 `raw/`에 한 번 보존된다.
 FMP loader는 run마다의 데이터셋을 모두 보존하고 run 사이의 선택은 승격이 정한다. `history-index.json`은 수집기의
 run 누적 최근 날짜 캐시이므로 part 목록과 대조하지 않고 데이터셋 이름만 확인한다. 배치 없이 재사용 시리즈만
 있는 Norgate 내보내기도 checkpoint 단위로 편입한다.
@@ -180,13 +194,13 @@ DuckDB 안에서 흐르고 Python으로 통째로 올라오지 않는다. 엄격
 | `schema_version` | `aas-promotion-v1` |
 | `target` | `domain`, `dataset_id`, `parent`(직전 generation ID, 첫 generation은 null) |
 | `sources` | 순서 있는 원천 pin 목록. 각 항목은 `source_id`, `source_sha256`, `table`, `digest`(commit manifest의 테이블 digest). 같은 원천 테이블은 한 번만 pin한다 |
-| `mapper` | `name`(`name@major`)과 그 매퍼가 정의한 인자 `args` |
+| `mapper` | `name`(`name@major`)과 그 매퍼가 정의한 인자 `args`. 매퍼가 조인하는 다른 dataset의 generation pin(`dataset_id`, `version`, `generation_id`, `chain_hash`, `manifest_hash`)도 인자다 |
 | `partition` | null 또는 `from`·`to` 날짜. 매퍼의 파티션 날짜가 `[from, to)`인 원천 행만 승격한다. 백필은 구간 하나가 generation 하나다. |
 | `time_rules` | `available_at_us`, `revision_known_at_us` 각각의 `rule`(`id@version`), 입력 근거 `basis`(`revision`·`record`), 규칙이 읽는 매퍼의 시간 입력 `input`(없으면 null), 그 규칙의 인자 `args` |
 | `decimal_rule` | 매퍼가 내는 숫자 열마다 `id@version` 하나 |
 | `quality_rules` | `rule`(`id@version`)과 `args`의 목록. 같은 규칙은 한 번만 쓴다 |
 | `tombstone_policy` | `{"mode": "never"}`, 또는 `absent_in_full_snapshot`과 전체 snapshot인 pin 하나(`source`: `source_id`, `table`), 그것이 빠짐없이 담는 범위(`scope`: instrument ID 목록 또는 모든 instrument인 null, `from`·`to` 날짜 구간). 범위는 `partition` 안에 있다. 부재는 그 snapshot의 행으로만 판단하고, 다른 pin의 행이 범위 안에 있으면 계획이 거부하므로 그 행은 별도 generation으로 승격한다 |
-| `identity_snapshot` | 매퍼의 identity key를 해석할 identity snapshot pin(`snapshot_id`, `content_hash`). instrument 도메인은 늘 pin한다. identity key가 없는 매퍼(거시·FX·달력, 영구 anchor에서 주체 ID를 발급하는 분류 매퍼)는 null |
+| `identity_snapshot` | 매퍼의 identity key를 해석할 identity snapshot pin(`snapshot_id`, `content_hash`). instrument 도메인은 늘 pin한다. identity key가 없는 매퍼(거시·FX·달력, 영구 anchor에서 주체 ID를 발급하는 분류 매퍼, 발행인 단위의 재무·공시 매퍼)는 null |
 
 `request_hash = sha256(정규 JSON ["aas-promotion-request-v1", 명세 SHA-256, 원천 digest 목록, parent])`다.
 그 정규 JSON 요청 문서도 `raw/`에 보존한다. generation ID는 `prm-<request_hash>`, intent의 operation
@@ -203,8 +217,8 @@ ID는 `promotion:<request_hash>`, dataset version은 그 generation의 chain seq
 `aas data promote --spec FILE --sha256 SHA256 [--plan]`이 실행 진입점이고 `aas data promotions`가
 승격 intent와 그 generation·카탈로그 행을 나열한다. 승격은 공급자를 호출하지 않는다.
 
-순서는 원천 확인 → 원천 stage → 매퍼 → identity 해석 → 숫자·시간 규칙 → head 비교 → quality
-flag → 대량 게시 계획이다. 원천 확인은 pin한 테이블마다 완료된 commit과 테이블 digest를 다시
+순서는 원천 확인 → 매퍼가 참조하는 generation 확인·적재 → 원천 stage → 매퍼 → identity 해석 →
+숫자·시간 규칙 → head 비교 → quality flag → 대량 게시 계획이다. 원천 확인은 pin한 테이블마다 완료된 commit과 테이블 digest를 다시
 계산해 대조한다. `--plan`은 같은 계산을 하고 아무것도 쓰지 않는다. 읽기 전용으로 연 설치본에서
 돌며, 계산에 쓰는 것은 그 연결의 임시 테이블뿐이다. 보고는 원천 행 수, 행 상태(`ok`, `held`,
 `unresolved`, `ambiguous`, `refused_*`), 매퍼가 고르지 않은 원천 행 수(`unselected_rows`, 여러 시계열을
@@ -272,6 +286,16 @@ microsecond 시각(FX의 `fixing_at_us`)이면 그 UTC 날짜다. reader가 같�
 단계에서 접두사가 다른 원천 pin을 거부한다. 그래서 한 공급자의 행이 다른 공급자의 dataset에 들어가지
 않는다. 접두사를 선언하지 않은 매퍼는 열이 맞는 원천을 모두 읽는다.
 
+- `instrument_id`가 선택인 도메인(재무, 공시)은 identity key가 없는 매퍼로 승격할 수 있고 그 행의
+  instrument는 null이다. `instrument_id`가 필수인 도메인은 instrument를 해석하는 매퍼만 쓴다. 명세는
+  해석하는 매퍼에만 identity snapshot을 pin한다.
+- 매퍼는 다른 dataset의 generation을 참조(`references`)로 조인할 수 있다. 참조마다 도메인과 매퍼 인자의
+  generation pin이 있고, 엔진은 pin을 달력 pin처럼 marker·카탈로그·chain으로 확인한 뒤 그 dataset의 도메인이
+  참조의 도메인인지 보고, chain의 TOMBSTONE이 아닌 head 행의 도메인 열을 참조 테이블에 적재한다. 매퍼는
+  원천 relation처럼 그 테이블을 읽는다. 참조 pin은 규칙이 아니라 매퍼가 읽는 근거 자료라서, 자식
+  generation의 명세는 parent가 pin한 generation이나 같은 dataset chain의 후손만 pin할 수 있다. 참조가
+  달라져 도메인 열이 바뀐 행은 새 revision이다.
+
 `source_row_hash`는 원천 행 내용의 해시다.
 
 ```text
@@ -326,9 +350,12 @@ ICU 시간대 자료로 푼 값이고, `timezone_version`은 그 자료를 가�
 
 분류 매퍼 `norgate.classification@1`, `sec.sic@1`, `kind.industry@1`은 [분류](#분류)가 소유한다.
 
+`sec.submissions@1`과 `sec.companyfacts@1`은 [SEC 공시와 재무](#sec-공시와-재무)를 발행인 단위
+`filings`와 `fundamentals`로 옮기며, 재무 매퍼는 pin한 공시 generation을 참조로 조인한다.
+
 예정된 매퍼 목록: `norgate.prices_none`, `norgate.prices_adjusted`,
 `norgate.dividends`, `norgate.reference_series`,
-`fmp.actions`, `sec.submissions`, `sec.companyfacts`,
+`fmp.actions`,
 `dart.fnltt`, `dart.list`. identity 원천을 읽는 매퍼는 typed generation이
 아니라 등록 문서를 만든다. `eodhd.kr_symbol`, `kind.listings`, `dart.corp_codes`는
 [KR 등록](#kr-등록)이, `norgate.master`, `eodhd.us_symbol`, `fmp.profile`, `sec.tickers`는
@@ -442,7 +469,7 @@ TOMBSTONE의 `source_row_hash`는 `sha256(정규 JSON ["aas-tombstone-v1", sourc
 곧 그 행이 없다는 사실을 담은 원천 테이블의 증거다. TOMBSTONE의 시점은 아래
 [revision 시점](#revision-시점)이 정한다. 같은 명세를 두 번 승격하면 두 번째 delta는 비어 있다.
 
-`revision_id`, `source_row_hash`, TOMBSTONE 해시, `request_hash`, `source_id`의 형식은 고정 입력과
+`revision_id`, `source_row_hash`, TOMBSTONE 해시, `request_hash`, `source_id`, `dimensions_hash`의 형식은 고정 입력과
 기대 16진수 값으로 각각 고정한다. 형식을 바꾸려면 새 이름(`-v2`)을 쓴다. 매퍼가 DuckDB SQL로 내는
 `source_row_hash`는 같은 행의 Python 계산과 같아야 한다.
 
@@ -727,6 +754,68 @@ member마다 한 행을 내용 원천 `sec-submissions-companies-*`(테이블 `c
 - `--plan`은 모든 member를 읽어 member 수, CIK 문서 수, SIC가 있는 문서 수, 원천 ID와 commit 여부를
   보고하고 아무것도 쓰지 않는다.
 
+## SEC 공시와 재무
+
+두 매퍼는 발행인 단위다. issuer는 10자리 CIK로 발급한 `mint_issuer('sec_cik', cik)`이고 instrument는
+해석하지 않는다. 다른 표기의 CIK는 issuer가 비어 필수 열 누락으로 승격을 거부한다. 어떤 값도 고쳐
+읽지 않는다.
+
+`sec.submissions@1`은 `sec.submissions_filings@1`의 `filings` 테이블을 공시마다 `filings` 행 하나로 옮긴다.
+
+| 열 | 값 |
+| --- | --- |
+| `filing_id` | `##########-##-######` 표기의 `accessionNumber`. 다른 표기는 null(거부) |
+| `form` | `form` 원문 |
+| `filed_date` | `YYYY-MM-DD` 표기의 `filingDate`. 다른 표기는 null(거부) |
+| `period_end` | `reportDate`. 비었거나 다른 표기면 null |
+| `accepted_at_us` | `acceptanceDateTime`(`YYYY-MM-DDTHH:MM:SS[.fff]Z`, UTC)의 microsecond. 다른 표기는 null |
+
+EDGAR는 날짜로만 받은 공시(전자 접수 이전 공시 등)의 접수 시각을 그 날짜의 New York 현지 0시로 싣는다.
+그 시각은 실제 접수보다 이를 수 있으므로 매퍼는 `filingDate`의 New York 현지 0시와 같은 접수 시각을 null로
+둔다. 그런 공시의 시점은 알 수 없음이고 공시일로 채우지 않는다. 시간 입력은 접수 시각 `accepted_at`
+(`source_column@1`)과 `filed_date`이고 명세 파티션은 `filingDate`로 원천 행을 고른다. `filingDate`가
+날짜 표기가 아닌 행은 어느 파티션에도 들지 않으므로 파티션 명세가 거부한다. 행에 수집 시각이
+없으므로 수집 시각은 원천의 `sl:` 연결 시각이다.
+
+`sec.companyfacts@1`은 SEC companyfacts의 사실 테이블(사실마다 `cik`, `taxonomy`, `tag`, `unit`,
+`period_start`, `period_end`, `accession_number`, `form`, `filed`, 십진 텍스트 `value`, 수집 시각
+`retrieved_at`)을 사실마다 `fundamentals` 행 하나로 옮긴다. SEC의 `fy`, `fp`, `frame` 등 다른 열은 원천
+행과 그 해시에 남는다.
+
+| 열 | 값 |
+| --- | --- |
+| `concept` | `taxonomy:tag` |
+| `unit` | SEC의 단위 |
+| `period_start`, `period_end` | 사실의 기간. 시점 사실은 `period_start`가 null |
+| `fiscal_period` | 그 날짜만으로 정한 기간 이름표. 시점 사실은 `instant`, 기간 사실은 양 끝을 포함한 일수 `n`의 `P<n>D` |
+| `dimensions_hash` | `aas-dimensions-v1`(`accession`) |
+| `form`, `accession` | 사실을 보고한 공시의 양식과 accession |
+| `accepted_at_us` | pin한 `filings` generation에서 그 accession의 접수 시각. generation이 그 accession을 갖지 않거나 그 행들의 접수 시각이 다르면(공동 제출자) null |
+| `value`, `value_state` | 십진수(지수 표기 포함)는 `present`이고 `decimal_text@1`로 옮긴다. 빈 텍스트는 `missing`, 그 밖의 텍스트는 값 없이 `invalid` |
+
+SEC의 `fp`는 사실이 아니라 그 사실을 보고한 공시의 회계 기간이다(10-K의 전년 비교 값도 그 10-K의 `FY`를
+싣는다). 공시가 `fp`를 싣지 않는 경우도 있으므로 `fiscal_period`는 사실의 날짜에서만 나온다.
+
+공시마다 그 사실들이 따로 record다. 뒤의 공시가 같은 개념과 기간을 다시 보고하면(비교 값, 재작성,
+정정 공시) 어느 이전 값을 고친 것인지 추정하지 않고 자기 accession 아래 record를 더하며, 이전 공시의 값은
+그 공시의 사실로 남는다. 시점에 알려진 최신 값은 소비자가 그 시점까지 접수된 공시 중에서 고른다. 같은
+accession의 값이 이후 수집에서 바뀌면 그 record의 SUPERSEDE다.
+
+명세는 매퍼 인자 `filings`로 `filings.*` dataset의 generation 하나를 pin하고, 엔진은 그 chain의 head 행을
+참조 테이블로 적재한다. 두 시점 열은 조인한 접수 시각 `accepted_at`의 `source_column@1`(근거
+`revision`)이다. 조인되지 않은 사실은 시점이 null이라 strict reader가 고르지 않으며, 계획 보고의 시간 규칙
+null 수가 그 수다. 그 accession을 담은 후손 filings generation을 pin한 다음 승격에서 그 사실은 접수 시각을
+얻은 SUPERSEDE가 된다. 시간 입력 `filed`도 있으므로 공시일 상한(`local_day_end@1`, grant 필요)을 쓰는 명세는
+새 dataset(`.r<N>`)으로 승격한다. 명세 파티션은 `filed`로 사실을 고른다.
+
+```text
+dimensions_hash = sha256(정규 JSON ["aas-dimensions-v1", {이름: 텍스트, ...}])
+```
+
+차원 이름은 정렬된 키이고 값은 텍스트다. 값 하나라도 알 수 없으면 해시가 null이 되어 행이 필수 열
+누락으로 거부된다. 엔진처럼 매퍼도 이 해시를 SQL로 계산하며, SQL의 JSON 문자열 표기는 `json.dumps`의
+ASCII escape와 바이트까지 같다.
+
 ## 대상 dataset
 
 | dataset | 도메인·역할 | 원천과 규칙 |
@@ -741,8 +830,8 @@ member마다 한 행을 내용 원천 `sec-submissions-companies-*`(테이블 `c
 | `sessions.xnys`, `sessions.xkrx` | `calendar_sessions` | [선언 달력](#선언-달력) 문서. 관측 거래일은 대조 보고의 근거. 임시 휴장은 SUPERSEDE |
 | `actions.us.norgate`, `actions.us.fmp.ref`, `actions.{us,kr}.eodhd` | `corporate_actions` | `exdate_open@1` |
 | `status.us.norgate`, `status.kr.kind` | `instrument_status` | 상장·상폐 이력 |
-| `filings.us.sec`, `filings.kr.dart` | `filings`(v2) | SEC submissions(`source_column@1`), DART 공시 목록(`local_day_end@1`) |
-| `fundamentals.us.sec` | `fundamentals` | companyfacts. 시점은 accession으로 조인한 `filings.accepted_at_us`, 조인 실패 시 `local_day_end(filed)` 또는 null. 재공시는 SUPERSEDE |
+| `filings.us.sec`, `filings.kr.dart` | `filings`(v2) | SEC submissions(`sec.submissions@1`, `source_column@1`), DART 공시 목록(`local_day_end@1`) |
+| `fundamentals.us.sec` | `fundamentals` | companyfacts(`sec.companyfacts@1`). 공시마다 자기 record(accession은 dimensions). 시점은 pin한 `filings.us.sec` generation에서 accession으로 조인한 `accepted_at_us`(`source_column@1`)이고, 조인되지 않은 사실은 null이다. 같은 accession의 값이 다시 수집되어 바뀌면 SUPERSEDE |
 | `fundamentals.kr.dart` | `fundamentals` | 재무제표 응답. 연결·별도는 dimensions. 자료 없음 응답은 행 대신 coverage 기록 |
 | `macro.us.alfred` | `macro_observations` | ALFRED vintage(`fred.alfred@1`). vintage 구간마다 generation 하나, 정정은 SUPERSEDE. 두 시점은 `local_day_end@1(realtime_start)` |
 | `macro.kr.bok`, `macro.kr.oecd` | `macro_observations` | `bok.observations@1`, `oecd.observations@1`. vintage가 없어 두 시점은 `unknown_null@1` |
@@ -1401,3 +1490,15 @@ state v2:
 | DV-192 | `import sec-companies --plan`은 쓰지 않고 실행은 같은 원천 ID를 commit한다 | `tests/storage/test_classifications.py::test_sec_companies_cli_plans_and_imports` | 구현 |
 | DV-193 | `partition`이 있는 분류 명세는 파티션 날짜가 없는 Norgate 행을 거부한다 | `tests/storage/test_classifications.py::test_a_partitioned_plan_refuses_undated_norgate_rows` | 구현 |
 | DV-194 | UTF-8 JSON 객체가 아닌 CIK member는 `import sec-companies` 전체를 거부하고 아무것도 commit하지 않는다 | `tests/storage/test_classifications.py::test_sec_companies_refuse_a_member_that_is_not_a_json_object` | 구현 |
+| DV-195 | `sec.submissions_filings@1`은 제출자 문서와 나열된 쪽의 공시를 member·배열 순서대로 원문 값의 행으로 편입한다 | `tests/storage/test_legacy_import.py::test_sec_submissions_filings_reads_every_listed_filing` | 구현 |
+| DV-196 | 없는 쪽, 나열되지 않은 쪽, 공시 수가 다른 쪽은 불일치 지표이고 `expect`에 적기 전까지 대조를 실패시킨다 | `tests/storage/test_legacy_import.py::test_sec_submissions_filings_count_page_discrepancies` | 구현 |
+| DV-197 | 알 수 없는 배열, 길이가 다른 배열, 다른 JSON 타입의 값은 submissions 단위를 거부한다 | `tests/storage/test_legacy_import.py::test_sec_submissions_filings_refuse_unknown_shapes` | 구현 |
+| DV-198 | `sec.submissions@1`은 합성 원천을 독립 기대값과 같은 발행인 공시 행으로 옮기고, New York 현지 0시의 접수 시각과 다른 표기는 null로 둔다 | `tests/storage/test_promotion_mappers.py::test_sec_submissions_maps_synthetic_fixture` | 구현 |
+| DV-199 | `sec.companyfacts@1`은 사실마다 accession을 dimensions로 한 발행인 재무 행을 내고, 접수 시각을 pin한 공시 참조에서 accession으로 조인하며 없거나 서로 다른 접수 시각은 null이다 | `tests/storage/test_promotion_mappers.py::test_sec_companyfacts_maps_synthetic_fixture` | 구현 |
+| DV-200 | SEC 공시는 기록된 접수 시각을 시점으로 승격되고 공동 제출자는 따로 record이며, 발행인 매퍼의 명세는 identity snapshot을 pin하지 않는다 | `tests/storage/test_sec_promotion.py::test_filings_take_the_recorded_acceptance_instant` | 구현 |
+| DV-201 | SEC 재무는 pin한 공시 generation의 접수 시각부터 알려지고, 조인되지 않은 사실은 시점이 null이며, 같은 원천의 재승격은 빈 delta다 | `tests/storage/test_sec_promotion.py::test_facts_are_known_from_their_filing_acceptance` | 구현 |
+| DV-202 | 매퍼 참조 pin은 parent의 generation이나 그 후손으로만 옮겨지고, 후손 공시 generation이 접수 시각을 준 사실은 SUPERSEDE다 | `tests/storage/test_sec_promotion.py::test_a_later_filings_generation_completes_unmatched_facts` | 구현 |
+| DV-203 | 같은 accession의 바뀐 값은 SUPERSEDE이고 그 시점은 공시 접수 시각이며, 명세 파티션은 공시일로 사실을 고른다 | `tests/storage/test_sec_promotion.py::test_a_changed_value_of_one_accession_supersedes_and_partitions_select_by_filing` | 구현 |
+| DV-204 | 매퍼 참조는 참조 도메인의 dataset generation만 pin할 수 있다 | `tests/storage/test_sec_promotion.py::test_a_filings_reference_must_pin_a_filings_generation` | 구현 |
+| DV-205 | `aas-dimensions-v1` 형식은 고정 입력과 기대 값으로 고정돼 있고 SQL 계산이 Python과 같다 | `tests/storage/test_promotion_formats.py::test_dimensions_hash_format_is_frozen` | 구현 |
+| DV-206 | SQL의 JSON 문자열 표기는 모든 code point에서 `json.dumps`와 같다 | `tests/storage/test_promotion_formats.py::test_json_string_sql_matches_json_dumps` | 구현 |
