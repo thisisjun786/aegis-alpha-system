@@ -10,8 +10,12 @@ three transport failures in a row.
 A batch document (``aas-<provider>-batch-v1``) lists the receipts of one commit in
 collection order, so the batch, its receipts and their responses are one complete unit
 whose boundary the bytes fix; every table a collector derives from it is a content source
-of those files and shares their ``hex``. Receipts a run retained but did not commit (it
-stopped before its commit) are committed by the next run first.
+of those files and shares their ``hex``. The derived sources are committed first and the
+``<provider>-collect-receipts`` source last, so a committed receipts source marks a batch
+whose every derived source is committed too. Receipts a run retained but whose receipts
+source it did not commit (it stopped first) are orphans: the next run commits them first,
+in batches of the same bounds, and a derived source an interrupted commit already holds is
+reused because the same bytes give the same source ID.
 """
 
 from __future__ import annotations
@@ -32,7 +36,7 @@ from aegis_alpha.storage import collection_ledger as ledger
 from aegis_alpha.storage import source_library_schema as schema
 from aegis_alpha.storage.raw import put_raw
 from aegis_alpha.storage.source_identity import SourceContent, SourceFile
-from aegis_alpha.storage.source_library import list_sources
+from aegis_alpha.storage.source_library import list_sources, recover_source
 
 if TYPE_CHECKING:
     import duckdb
@@ -242,25 +246,70 @@ def commit_batch(
     tables: Sequence[tuple[str, str, pa.Table]],
     *,
     loader: str,
+    sources: Sequence[tuple[SourceContent, str, pa.Table]] = (),
 ) -> list[dict[str, object]]:
-    """Retain the batch and commit its receipts and every nonempty derived table.
+    """Retain the batch, commit every nonempty derived table and source, then its receipts.
 
     ``tables`` are ``(shape, table name, rows)``; each is a source of the batch's files.
+    ``sources`` are ``(content, table name, rows)`` of sources with their own files, all in
+    ``raw/``. The receipts source is committed last: it marks the batch complete.
     """
     put_raw(workspace.paths.raw, batch.manifest)
     for item in batch.retained:
         put_raw(workspace.paths.raw, item.receipt)
         put_raw(workspace.paths.raw, item.response)
     committed = [
-        commit(workspace, batch.content(RECEIPTS_SHAPE), RECEIPTS_TABLE, receipts_table(batch),
-               loader=loader)
-    ]  # fmt: skip
-    committed.extend(
         commit(workspace, batch.content(shape), name, table, loader=loader)
         for shape, name, table in tables
         if table.num_rows
+    ]
+    committed.extend(
+        commit(workspace, content, name, table, loader=loader) for content, name, table in sources
     )
+    committed.append(
+        commit(workspace, batch.content(RECEIPTS_SHAPE), RECEIPTS_TABLE, receipts_table(batch),
+               loader=loader)
+    )  # fmt: skip
     return committed
+
+
+def chunks(
+    retained: Sequence[Retained],
+    batch_size: int,
+    batch_bytes: int,
+    joins: Callable[[Retained], bool] = lambda _: False,
+) -> Iterator[list[Retained]]:
+    """``retained`` in order, as batches of the bounds a run flushes at.
+
+    A batch closes once it holds ``batch_size`` receipts or ``batch_bytes`` of responses,
+    but never before a receipt that ``joins`` the one before it.
+    """
+    chunk: list[Retained] = []
+    size = 0
+    for item in retained:
+        if chunk and (len(chunk) >= batch_size or size >= batch_bytes) and not joins(item):
+            yield chunk
+            chunk, size = [], 0
+        chunk.append(item)
+        size += len(item.response)
+    if chunk:
+        yield chunk
+
+
+def finish_sources(workspace: Workspace, provider: str) -> int:
+    """Complete the sources of ``provider`` an interrupted commit left prepared.
+
+    A source whose market commit landed before the process died is completed in state, so
+    its receipts are not taken for orphans; one whose market commit did not land stays
+    prepared and is committed again by the batch that holds its files.
+    """
+    prefix = f"{provider}-"
+    rows = workspace.state.execute(
+        "SELECT operation_id FROM storage_operations WHERE phase='PREPARED' "
+        "AND kind='source_import' AND substr(target_id,1,?)=?",
+        [len(prefix), prefix],
+    ).fetchall()
+    return sum(recover_source(workspace, str(row[0])) for row in rows)
 
 
 def read_raw(workspace: Workspace, digest: str) -> bytes:

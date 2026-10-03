@@ -76,6 +76,16 @@ def test_a_daily_index_keeps_every_line_and_reads_the_filings() -> None:
         (None, None, None, None),
     ]
     assert lines[-1].line == "not|an|index|line"
+    # The header is matched by its column names: whitespace, case and the full-index
+    # spelling "Filename" read the same lines; an index without the header is refused.
+    header = b"CIK|Company Name|Form Type|Date Filed|File Name"
+    for variant in (b"CIK | Company Name | Form Type | Date Filed | Filename  ",
+                    b"cik|company name|form type|date filed|file name"):  # fmt: skip
+        assert sec.parse_index(body.replace(header, variant)) == lines
+    with pytest.raises(ValueError, match="no CIK"):
+        sec.parse_index(body.replace(header, b"CIK|Company Name|Form Type|Date Filed"))
+    with pytest.raises(ValueError, match="dashed rule"):
+        sec.parse_index(body.replace(b"-" * 80, b"=" * 80))
     request = sec.daily_index(MONDAY)
     assert sec.classify(request, _response(200, body)) == (COMPLETED, None)
     assert sec.classify(request, _response(404, b"Not Found")) == (NO_DATA, None)

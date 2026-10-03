@@ -2,20 +2,24 @@
 
 ``collect_fred`` runs one bounded collection on an admitted writable workspace:
 
-1. settle attempts an interrupted run left (``collection_ledger.recover``) and commit the
-   receipts it retained but did not commit;
+1. settle attempts an interrupted run left (``collection_ledger.recover``), complete the
+   sources its commit left prepared, and commit the receipts it retained but did not
+   commit, in batches of the run's bounds that keep each query's pages together;
 2. read what is known (``load_known``): each series' latest collected vintage day from
-   every committed table ``fred.alfred@1`` reads, counting only vintages that started
-   before the FRED day they were retrieved on, and each CSV series' latest download day;
+   every committed table ``fred.alfred@1`` reads (this collector's own only when their
+   batch's receipts are committed), counting only vintages that started before the FRED
+   day they were retrieved on, and each CSV series' latest download day;
 3. download each CSV series once a FRED day (``series_csv``), then for each ALFRED series
    ask from the origin when nothing is known, or ask ``vintage_dates`` after the known day
    and, when a vintage exists, every page of the observations query from the known day
    to the last ended FRED day (``data.fred_collect``);
-4. commit the batch: a ``fred-collect-receipts`` table of every receipt and a
-   ``fred-alfred-observations`` table of the rows of every complete query that are
-   vintages as FRED dated them; and each completed CSV download as a ``fred-series-csv``
-   source of its bytes alone, the shape ``fred.series_csv@1`` imports and
-   ``fred.fx_series@1`` reads, so the same bytes are the same source.
+4. commit each batch: a ``fred-alfred-observations`` table of the rows of every complete
+   query that are vintages as FRED dated them; each completed CSV download as a
+   ``fred-series-csv`` source of its bytes alone, the shape ``fred.series_csv@1`` imports
+   and ``fred.fx_series@1`` reads, so the same bytes are the same source; and last a
+   ``fred-collect-receipts`` table of every receipt. A batch closes after the query that
+   brings it to ``batch_size`` receipts or ``BATCH_BYTES`` of responses, so one batch may
+   pass either bound by the pages of that query.
 
 A query is complete when every page from offset 0 answered ``COMPLETED`` with the same
 count and the pages hold that many rows. Rows of an incomplete query are not committed;
@@ -40,7 +44,6 @@ from aegis_alpha.storage import provider_collection as collection
 from aegis_alpha.storage import source_library_schema as schema
 from aegis_alpha.storage.legacy_import.loaders import csv_table
 from aegis_alpha.storage.legacy_import.public import FRED as SERIES_CSV_TABLE
-from aegis_alpha.storage.raw import put_raw
 from aegis_alpha.storage.source_identity import SourceContent, SourceFile
 
 if TYPE_CHECKING:
@@ -54,7 +57,7 @@ OBSERVATIONS_SHAPE: Final = "alfred-observations"
 OBSERVATIONS_TABLE: Final = "observations"
 LOADER: Final = "aas collect fred"
 DEFAULT_MAX_CALLS: Final = 500
-# A batch's rows are built in memory, so a batch closes at the end of the window that
+# A batch's rows are built in memory, so a batch closes at the end of the query that
 # brings its answers past this many bytes.
 BATCH_BYTES: Final = 64 * 1024 * 1024
 # FRED allows 120 requests a minute per key.
@@ -175,12 +178,8 @@ def csv_source(payload: bytes, series: str) -> tuple[SourceContent, pa.Table]:
 
 def commit_fred_batch(workspace: Workspace, batch: collection.Batch) -> list[dict[str, object]]:
     observations, restated = observations_table(batch)
-    committed = collection.commit_batch(
-        workspace, batch, [(OBSERVATIONS_SHAPE, OBSERVATIONS_TABLE, observations)], loader=LOADER
-    )
-    for entry in committed:
-        if entry["table"] == OBSERVATIONS_TABLE:
-            entry["restated_rows"] = restated
+    sources: list[tuple[SourceContent, str, pa.Table]] = []
+    refused: list[dict[str, object]] = []
     for item in batch.retained:
         request = item.request
         if request.endpoint != fred.SERIES_CSV or item.outcome != COMPLETED:
@@ -188,13 +187,26 @@ def commit_fred_batch(workspace: Workspace, batch: collection.Batch) -> list[dic
         try:
             content, table = csv_source(item.response, request.parameters["id"])
         except ValueError as error:
-            committed.append({"series": request.parameters["id"], "refused": str(error)})
+            refused.append({"series": request.parameters["id"], "refused": str(error)})
             continue
-        put_raw(workspace.paths.raw, item.response)
-        committed.append(
-            collection.commit(workspace, content, SERIES_CSV_TABLE.name, table, loader=LOADER)
-        )
-    return committed
+        sources.append((content, SERIES_CSV_TABLE.name, table))
+    committed = collection.commit_batch(
+        workspace,
+        batch,
+        [(OBSERVATIONS_SHAPE, OBSERVATIONS_TABLE, observations)],
+        loader=LOADER,
+        sources=sources,
+    )
+    for entry in committed:
+        if entry["table"] == OBSERVATIONS_TABLE:
+            entry["restated_rows"] = restated
+    return committed + refused
+
+
+def _continues(item: collection.Retained) -> bool:
+    """Whether a receipt is a later page of the observations query before it."""
+    request = item.request
+    return request.endpoint == fred.OBSERVATIONS and fred.window(request).offset > 0
 
 
 # --- what is known ------------------------------------------------------------------------------
@@ -208,10 +220,14 @@ class Known:
     receipt_rows: int = 0
 
 
-def _alfred_tables(workspace: Workspace) -> list[collection.Committed]:
+def _alfred_tables(workspace: Workspace, batches: set[str]) -> list[collection.Committed]:
+    """Every committed table ``fred.alfred@1`` reads; this collector's of committed batches."""
+    own = f"{PROVIDER}-{OBSERVATIONS_SHAPE}-"
     tables = []
     for table in collection.committed_tables(workspace):
         if not set(ALFRED_COLUMNS) <= set(table.columns):
+            continue
+        if table.source_id.startswith(own) and table.hex not in batches:
             continue
         types = collection.column_types(workspace, table)
         if all(types.get(name) == kind for name, kind in ALFRED_COLUMNS.items()):
@@ -222,7 +238,8 @@ def _alfred_tables(workspace: Workspace) -> list[collection.Committed]:
 def load_known(workspace: Workspace) -> Known:
     """Each series' latest collected vintage day and CSV day, from committed sources."""
     known = Known()
-    for table in _alfred_tables(workspace):
+    receipts = list(collection.receipt_rows(workspace, PROVIDER))
+    for table in _alfred_tables(workspace, {table.hex for table, _ in receipts}):
         known.alfred_tables += 1
         # A vintage that started on the FRED day it was retrieved may still have been
         # publishing; only earlier vintage days count as collected.
@@ -238,7 +255,7 @@ def load_known(workspace: Workspace) -> Known:
         for series, start in rows:
             if isinstance(series, str) and isinstance(start, date):
                 known.knowledge.vintage(series, start)
-    for _, row in collection.receipt_rows(workspace, PROVIDER):
+    for _, row in receipts:
         known.receipt_rows += 1
         known.committed_receipts.add(cast("str", row[8]))
         endpoint, request_json, outcome, retrieved = row[1], row[2], row[3], row[11]
@@ -333,11 +350,12 @@ def collect_fred(  # noqa: PLR0913 -- every bound of one run is explicit
             raise ValueError(f"{name} must be a positive integer")
     now = clock()
     settled = ledger.recover(workspace.state, PROVIDER, at_us=collection.epoch_us(now))
+    collection.finish_sources(workspace, PROVIDER)
     before = load_known(workspace)
     recovered = collection.orphans(workspace, PROVIDER, before.committed_receipts)
     committed: list[dict[str, object]] = []
-    if recovered:
-        committed.extend(commit_fred_batch(workspace, collection.Batch.of(PROVIDER, recovered)))
+    for chunk in collection.chunks(recovered, batch_size, BATCH_BYTES, _continues):
+        committed.extend(commit_fred_batch(workspace, collection.Batch.of(PROVIDER, chunk)))
     known = load_known(workspace) if recovered else before
     caller = collection.Caller(
         workspace, PROVIDER, policy.sha256, client.request, fred.classify, fred.stops_run,

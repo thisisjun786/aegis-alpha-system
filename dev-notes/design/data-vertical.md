@@ -1233,11 +1233,18 @@ FRED 키는 `vintage_dates`·`observations`의 공급자 URL에만 실리고, SE
 attempt, HTTP 상태, 보존 header, 요청·수집 시각, 결과, 공급자 상태, 선택, 응답의 크기·SHA-256)를 `raw/`에
 둔 뒤 attempt가 `succeeded`가 된다. 결과는 `COMPLETED`(읽을 수 있는 답), `NO_DATA`(SEC 404, FRED가 없다고
 답한 시계열), `FAILED`(그 밖의 답)이며 수집 경로만 정한다. 한 실행의 receipt를 수집 순서로 나열한 batch
-문서(`aas-<provider>-batch-v1`, 500개 또는 응답 256 MiB까지)와 그 receipt·응답이 완결 단위 하나다. 그 단위의
-모든 테이블은 같은 파일의 내용 원천이라 `hex`를 공유한다. `<provider>-collect-receipts` 원천의 `receipts`
+문서(`aas-<provider>-batch-v1`)와 그 receipt·응답이 완결 단위 하나다. SEC batch는 receipt 500개
+또는 응답 256 MiB에 이르면 닫힌다. FRED batch는 receipt 500개 또는 응답
+64 MiB에 이른 질의(observations 창의 모든 page)가 끝날 때 닫혀, 그 질의의 page만큼 두 한도를 넘을 수 있다.
+그 단위의 모든 테이블은 같은 파일의 내용 원천이라 `hex`를 공유한다. 파생 원천을 먼저, `<provider>-collect-receipts`
+원천을 마지막에 commit하므로 commit된 receipts 원천은 그 batch의 모든 파생 원천도 commit됐다는 표지다. `<provider>-collect-receipts` 원천의 `receipts`
 테이블은 receipt마다 `fingerprint`, `endpoint`, `request_json`, `outcome`, `provider_status`, `http_status`,
 `selection_json`, `receipt_json`, `receipt_sha256`, `raw_sha256`, `raw_size`, `retrieved_at_utc`의 텍스트 행이다.
-commit 전에 중단된 실행의 `charged` receipt 중 어느 commit에도 없는 것은 다음 실행이 먼저 commit한다.
+receipts 원천을 commit하기 전에 중단된 실행의 `charged` receipt 중 어느 receipts 원천에도 없는 것은 다음
+실행이 먼저 같은 한도의 batch로 commit한다(FRED는 한 질의의 page를 한 batch에 둔다). 중단된 commit이 이미 둔
+파생 원천은 같은 bytes가 같은 원천 ID라 재사용되고, market에 commit됐지만 state에서 끝나지 않은 원천은 다음
+실행이 먼저 완료한다. SEC의 `load_known`과 FRED의 수집기 자신의 observations 원천은 receipts 원천이 commit된
+batch의 것만 읽는다.
 
 **SEC.** 실행은 이 수집기의 commit된 batch만 읽는다. 읽은 색인 날, 색인이 말하는 공시, submissions 답이
 나열한 공시, companyfacts 답이 사실을 준 공시다. 그 다음 세 단계로 묻는다.
@@ -1269,12 +1276,13 @@ commit 전에 중단된 실행의 `charged` receipt 중 어느 commit에도 없�
 다듬지 않고, 공급자가 쓴 미래 기간 끝도 그대로 남긴다.
 
 **FRED/ALFRED.** ALFRED는 실시간 구간을 질의 창으로 자른다. 창 시작보다 먼저 시작한 vintage는 창 시작에
-시작한 것으로, 창 끝보다 늦게 끝나는 구간은 창 끝에 끝나는 것으로 답한다. observations 창 하나는 vintage
-날짜를 2000개까지만 담을 수 있다. 그래서 시계열마다 다음처럼 묻는다.
+시작한 것으로, 창 끝보다 늦게 끝나는 구간은 창 끝에 끝나는 것으로 답한다. FRED는 vintage 날짜가 2000개를
+넘는 observations 창을 거부한다. 수집기는 창마다 1990개까지만 담아, FRED가 창 시작일을 세든 세지 않든 한도
+안에 둔다. 그래서 시계열마다 다음처럼 묻는다.
 
 1. `vintage_dates`가 알려진 vintage 날(`known`) 다음 날부터, 알려진 날이 없으면 ALFRED 원점(1776-07-04)부터,
    끝난 FRED 날(어제)까지의 vintage 날짜를 page마다 묻는다. 날짜가 없으면 그 시계열은 최신이다.
-2. observations 창은 `known`(또는 원점)에서 그 날까지다. 창마다 vintage 날짜를 2000개까지(원점이 아닌
+2. observations 창은 `known`(또는 원점)에서 그 날까지다. 창마다 vintage 날짜를 1990개까지(원점이 아닌
    시작일도 하나로 셈) 담고, 다음 창은 앞 창의 마지막 vintage 날짜에서 시작한다
    (`observation_windows`). 창마다 page를 끝까지 묻는다.
 3. 원점이 아닌 창에서 창 시작일에 시작하는 행은 앞 창이나 앞선 수집이 이미 가진 구간을 다시 말한다(잘렸거나
@@ -2078,10 +2086,10 @@ state v2:
 | DV-290 | batch는 응답 bytes 상한에서도 끝난다 | `tests/storage/test_kr_collection.py::test_a_batch_ends_at_its_byte_budget` | 구현 |
 | DV-291 | 요청 지문은 공급자·endpoint·parameter만 해시하고 FRED 키는 공급자 URL에만 실리며 키를 되돌리는 답은 보존되지 않는다 | `tests/data/test_fred_collect.py::test_a_request_names_its_window_and_never_its_key` | 구현 |
 | DV-292 | FRED 답은 읽히면 `COMPLETED`, 없는 시계열은 `NO_DATA`, 창 밖 행이나 다른 모양은 `FAILED`이고 키 거부와 한도는 실행을 멈춘다 | `tests/data/test_fred_collect.py::test_answers_are_classified_and_a_refused_key_stops_the_run` | 구현 |
-| DV-293 | observations 창은 vintage 날짜를 2000개까지 담고 다음 창은 앞 창의 마지막 vintage 날짜에서 시작한다 | `tests/data/test_fred_collect.py::test_windows_span_at_most_2000_vintages_and_chain_on_their_last_vintage` | 구현 |
+| DV-293 | observations 창은 vintage 날짜를 1990개까지 담고 다음 창은 앞 창의 마지막 vintage 날짜에서 시작한다 | `tests/data/test_fred_collect.py::test_windows_span_at_most_1990_vintages_and_chain_on_their_last_vintage` | 구현 |
 | DV-294 | 원점이 아닌 창의 시작일에 시작하는 행은 이미 가진 구간의 재진술로 세어지고 옮겨지지 않는다 | `tests/data/test_fred_collect.py::test_rows_starting_on_a_window_start_restate_what_is_held` | 구현 |
 | DV-295 | 계획은 알려진 vintage 날 다음 날부터 끝난 FRED 날까지 vintage를 확인하고 알려진 날이 없으면 원점부터 묻으며 CSV는 FRED 날마다 한 번이다 | `tests/data/test_fred_collect.py::test_the_plan_checks_vintages_after_the_known_day_and_csv_once_a_day` | 구현 |
-| DV-296 | 원점 수집은 잘린 재진술 없이 FRED가 매긴 구간을 한 번씩만 2000개 이하의 창으로 옮긴다 | `tests/storage/test_us_collection.py::test_an_origin_run_collects_every_vintage_once_in_windows_of_at_most_2000` | 구현 |
+| DV-296 | 원점 수집은 잘린 재진술 없이 FRED가 매긴 구간을 한 번씩만 1990개 이하의 창으로 옮긴다 | `tests/storage/test_us_collection.py::test_an_origin_run_collects_every_vintage_once_in_windows_of_at_most_1990` | 구현 |
 | DV-297 | 날마다의 수집과 승격에서 승격 watermark와 수집기의 시계열별 vintage 날은 앞으로만 가고, 새 vintage가 없으면 그대로다 | `tests/storage/test_us_collection.py::test_the_watermark_advances_monotonically_across_daily_collections` | 구현 |
 | DV-298 | 완결되지 않은 창은 옮겨지지 않고 다음 실행이 같은 알려진 날에서 다시 묻는다 | `tests/storage/test_us_collection.py::test_an_incomplete_window_is_asked_again_from_the_same_known_day` | 구현 |
 | DV-299 | 중단된 FRED 실행의 attempt는 정산되고 보존된 receipt는 다음 실행이 먼저 commit하며 완결된 창은 알려진 것이 된다 | `tests/storage/test_us_collection.py::test_a_crashed_run_is_settled_and_its_receipts_committed_by_the_next` | 구현 |
@@ -2089,7 +2097,7 @@ state v2:
 | DV-301 | `fred.alfred@1`이 읽는 legacy 테이블도 알려진 vintage 날을 정하고, 받은 FRED 날에 시작한 vintage는 세지 않는다 | `tests/storage/test_us_collection.py::test_a_legacy_alfred_table_sets_the_known_vintage_day` | 구현 |
 | DV-302 | CSV 내려받기는 `fred.series_csv@1` 편입과 같은 원천이고 `fred.fx_series@1`로 승격된다 | `tests/storage/test_us_collection.py::test_the_csv_download_is_the_source_the_legacy_import_makes` | 구현 |
 | DV-303 | SEC 요청은 문서를 이름 짓고 연락처 `User-Agent`는 header에만 실리며 되돌리는 답은 보존되지 않는다 | `tests/data/test_sec_collect.py::test_requests_name_the_document_and_never_the_contact` | 구현 |
-| DV-304 | 일일 색인은 모든 줄을 남기고 다섯 칸으로 읽힌 줄만 공시가 되며 404는 `NO_DATA`, 403은 실행을 멈춘다 | `tests/data/test_sec_collect.py::test_a_daily_index_keeps_every_line_and_reads_the_filings` | 구현 |
+| DV-304 | 일일 색인은 모든 줄을 남기고 다섯 칸으로 읽힌 줄만 공시가 되며 header는 열 이름(대소문자·공백 무시, `File Name`·`Filename`)으로 찾고 404는 `NO_DATA`, 403은 실행을 멈춘다 | `tests/data/test_sec_collect.py::test_a_daily_index_keeps_every_line_and_reads_the_filings` | 구현 |
 | DV-305 | companyfacts 사실은 숫자의 JSON 원문을 그대로 남기고 다른 CIK·알 수 없는 필드·십진수가 아닌 값은 답을 거부한다 | `tests/data/test_sec_collect.py::test_company_facts_keep_each_number_as_written` | 구현 |
 | DV-306 | 색인 날은 답이나 다음 날이 끝난 뒤 받은 404로만 덮이고 빈 날은 알려진 가장 이른 날부터 채운다 | `tests/data/test_sec_collect.py::test_index_days_are_covered_by_an_answer_or_a_404_after_the_next_day` | 구현 |
 | DV-307 | 문서는 제출자마다 원한 공시로 한 번 묻고 나열되지 않은 공시는 창 안에서 하루 뒤 다시 묻으며 발행인 범위 밖은 세어진다 | `tests/data/test_sec_collect.py::test_documents_are_asked_per_filer_for_the_wanted_filings_and_retried_in_window` | 구현 |
@@ -2099,3 +2107,11 @@ state v2:
 | DV-311 | SEC의 한도 거부는 실행을 멈추고 연락처는 `raw/`의 어떤 bytes에도 남지 않는다 | `tests/storage/test_us_collection.py::test_a_refused_rate_stops_the_run_and_the_contact_is_never_retained` | 구현 |
 | DV-312 | `aas collect fred plan`과 `aas collect sec plan`은 공급자를 호출하지 않고 `run`은 호출 상한에서 정상 종료한다 | `tests/storage/test_us_collection.py::test_the_commands_plan_without_calls_and_run_through_the_cli` | 구현 |
 | DV-313 | 행으로 읽히지 않는 submissions 답은 `FAILED`이고 실행이나 commit을 막지 않는다 | `tests/storage/test_us_collection.py::test_a_submissions_answer_whose_rows_do_not_read_is_failed` | 구현 |
+| DV-314 | receipts 원천을 commit하기 전에 중단된 FRED batch는 다음 실행이 통째로 다시 commit하고 이미 commit된 파생 원천을 재사용해 CSV 날과 vintage를 잃지 않는다 | `tests/storage/test_us_collection.py::test_a_batch_whose_receipts_did_not_commit_is_derived_again_whole` | 구현 |
+| DV-315 | receipts 원천을 commit하기 전에 중단된 SEC batch의 색인은 다음 실행에서 알려지고 그 색인이 말하는 모든 문서를 묻는다 | `tests/storage/test_us_collection.py::test_an_sec_batch_whose_receipts_did_not_commit_loses_no_filing` | 구현 |
+| DV-316 | 고아 receipt는 실행의 batch 한도로 나뉘어 commit된다 | `tests/storage/test_us_collection.py::test_orphans_are_committed_in_batches_of_the_run_bounds` | 구현 |
+| DV-317 | 복구 batch는 질의 사이에서만 닫혀 한 observations 질의의 page를 한 batch에 둔다 | `tests/storage/test_us_collection.py::test_a_recovered_batch_closes_only_between_queries` | 구현 |
+| DV-318 | 전송 실패가 세 번 이어지면 `transport_failures`로 멈추고 명령은 종료 코드 1이다 | `tests/storage/test_us_collection.py::test_three_transport_failures_in_a_row_stop_the_run` | 구현 |
+| DV-319 | 시계열은 처음 완결되지 않은 창에서 멈추고 앞 창까지만 commit하며 다음 실행은 그 창의 마지막 vintage에서 다시 묻는다 | `tests/storage/test_us_collection.py::test_a_series_stops_at_its_first_incomplete_window_and_resumes_there` | 구현 |
+| DV-320 | receipt·batch 문서와 receipts 원천 ID는 문서화된 정규 bytes로 고정된다 | `tests/storage/test_us_collection.py::test_receipts_and_batches_have_fixed_canonical_bytes` | 구현 |
+| DV-321 | 답을 보존하지 못한 SEC 문서 요청은 물은 것으로 보아 같은 날 다시 묻지 않고 하루 뒤 다시 묻는다 | `tests/storage/test_us_collection.py::test_an_uncertain_document_ask_is_asked_again_the_next_day` | 구현 |

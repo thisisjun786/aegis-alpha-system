@@ -64,7 +64,8 @@ DEFAULT_FACT_FORMS: Final = frozenset(
 _CIK: Final = re.compile(r"[0-9]{10}")
 _DAY: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _ACCESSION: Final = re.compile(r"[0-9]{10}-[0-9]{2}-[0-9]{6}")
-_INDEX_HEADER: Final = "CIK|Company Name|Form Type|Date Filed|File Name"
+_INDEX_HEADER: Final = ("cik", "company name", "form type", "date filed")
+_INDEX_FILE_COLUMNS: Final = frozenset({"file name", "filename"})
 _FILE_NAME: Final = re.compile(r"edgar/data/([0-9]{1,10})/([0-9]{10}-[0-9]{2}-[0-9]{6})\.txt")
 _INDEX_DAY: Final = re.compile(r"([0-9]{4})-?([0-9]{2})-?([0-9]{2})")
 _FACT_KEYS: Final = frozenset({"start", "end", "val", "accn", "fy", "fp", "form", "filed", "frame"})
@@ -180,19 +181,24 @@ def parse_index(body: bytes) -> list[IndexLine]:
     """Every entry line of a daily ``master`` index, in the index's order.
 
     The entries follow the ``CIK|Company Name|Form Type|Date Filed|File Name`` header and
-    its dashed rule; an index without them is refused. A line that does not read as five
-    fields naming a CIK, a form, a filing date and an ``edgar/data`` accession file stays
-    as its text with no fields.
+    its dashed rule; an index without them is refused. The header is matched by its column
+    names, ignoring case and surrounding whitespace, and the last may be ``Filename`` as in
+    EDGAR's full-index files. A line that does not read as five fields naming a CIK, a form,
+    a filing date and an ``edgar/data`` accession file stays as its text with no fields.
     """
     lines = _text(body).splitlines()
-    try:
-        header = lines.index(_INDEX_HEADER)
-    except ValueError:
-        raise ValueError("SEC daily index has no CIK|Company Name|... header") from None
-    rule = lines[header + 1] if header + 1 < len(lines) else ""
+    header = next((index for index, line in enumerate(lines) if _is_index_header(line)), None)
+    if header is None:
+        raise ValueError("SEC daily index has no CIK|Company Name|... header")
+    rule = lines[header + 1].strip() if header + 1 < len(lines) else ""
     if len(rule) < 10 or set(rule) != {"-"}:  # noqa: PLR2004 -- the dashed rule under the header
         raise ValueError("SEC daily index header is not followed by its dashed rule")
     return [_index_line(line) for line in lines[header + 2 :] if line]
+
+
+def _is_index_header(line: str) -> bool:
+    names = [name.strip().casefold() for name in line.split("|")]
+    return tuple(names[:-1]) == _INDEX_HEADER and names[-1] in _INDEX_FILE_COLUMNS
 
 
 class _Number(str):

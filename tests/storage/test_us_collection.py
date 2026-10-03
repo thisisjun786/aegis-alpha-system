@@ -2,7 +2,8 @@
 
 The providers are ``tests.data.us_collect_support.FakeFred`` and ``FakeSec``, which answer
 in the providers' shapes (ALFRED clips real-time periods to the asked window and refuses a
-window over 2000 vintage dates). Every series, value, CIK and accession is synthetic.
+window over the collector's margin of 1990 vintage dates). Every series, value, CIK and
+accession is synthetic.
 Expected rows come from the fakes' unclipped histories, not from the collector's code.
 """
 
@@ -26,7 +27,9 @@ from aegis_alpha.application.cli import main
 from aegis_alpha.data import fred_collect as fred
 from aegis_alpha.data import sec_collect as sec
 from aegis_alpha.data.opendart import HttpAnswer
-from aegis_alpha.storage import fred_collection, sec_collection, source_library
+from aegis_alpha.data.provider_request import Response
+from aegis_alpha.storage import fred_collection, provider_collection, sec_collection, source_library
+from aegis_alpha.storage.collection_ledger import Attempt
 from aegis_alpha.storage.identity import mint_issuer
 from aegis_alpha.storage.legacy_import.engine import apply_import
 from aegis_alpha.storage.legacy_import.manifest import parse_manifest
@@ -145,7 +148,7 @@ def _watermarks(ws: Workspace, dataset: str) -> dict[str, int]:
 # --- FRED -------------------------------------------------------------------------------------
 
 
-def test_an_origin_run_collects_every_vintage_once_in_windows_of_at_most_2000(
+def test_an_origin_run_collects_every_vintage_once_in_windows_of_at_most_1990(
     ws: Workspace,
 ) -> None:
     fake = FakeFred(date(2026, 9, 9))
@@ -380,6 +383,205 @@ def test_the_csv_download_is_the_source_the_legacy_import_makes(
     assert again["asked"] == {"vintage_dates:vintage_check": 2}
 
 
+def _interrupt_receipts(monkeypatch: pytest.MonkeyPatch, provider: str) -> list[str]:
+    """Make the first commit of a receipts source die after its batch's derived commits."""
+    original = provider_collection.commit
+    committed: list[str] = []
+
+    def commit(*args: object, **kwargs: object) -> dict[str, object]:
+        content = cast("SourceContent", args[1])
+        if content.source_id.startswith(f"{provider}-collect-receipts-") and committed:
+            monkeypatch.setattr(provider_collection, "commit", original)
+            raise KeyboardInterrupt  # the process dies before the completion marker
+        result = original(*args, **kwargs)  # ty: ignore[invalid-argument-type]
+        committed.append(content.source_id)
+        return result
+
+    monkeypatch.setattr(provider_collection, "commit", commit)
+    return committed
+
+
+def test_a_batch_whose_receipts_did_not_commit_is_derived_again_whole(
+    ws: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeFred(date(2026, 9, 9))
+    _history(fake)
+    clock = FakeClock(FRED_NOW)
+    derived = _interrupt_receipts(monkeypatch, "fred")
+    with pytest.raises(KeyboardInterrupt):
+        _fred_run(ws, fake, clock)
+    # The run's one batch (the CSV and both series' vintage dates and windows) committed
+    # its observations and CSV sources, then died before its receipts.
+    assert len(fake.calls) == 5
+    assert sorted(item.rsplit("-", 1)[0] for item in derived) == [
+        "fred-alfred-observations", "fred-series-csv",
+    ]  # fmt: skip
+    assert fred_collection.load_known(ws).knowledge.vintages == {}
+    result = _fred_run(ws, fake, clock)
+    assert result["recovered_receipts"] == 5
+    recovered = cast("list[dict[str, object]]", result["sources"])[:3]
+    assert {str(item["source_id"]) for item in recovered[:2]} == set(derived)
+    assert all(item["reused"] for item in recovered[:2])
+    assert str(recovered[2]["source_id"]).startswith("fred-collect-receipts-")
+    # Nothing is lost: the CSV day and both series' vintages are known, so the run asks
+    # only the vintage checks.
+    assert [name for name, _ in fake.calls[5:]] == ["vintagedates", "vintagedates"]
+    known = fred_collection.load_known(ws).knowledge
+    assert known.vintages == {"DGS10": date(2026, 9, 1), "GDP": date(2026, 8, 28)}
+    assert known.csv_days == {"DEXKOUS": date(2026, 9, 9)}
+    assert verify_workspace(ws)["verified"] is True
+
+
+def test_orphans_are_committed_in_batches_of_the_run_bounds(ws: Workspace) -> None:
+    fake = FakeFred(date(2026, 9, 9))
+    _history(fake)
+    fake.crash_after = 4  # csv, DGS10's vintage dates and window, GDP's vintage dates
+    clock = FakeClock(FRED_NOW)
+    with pytest.raises(KeyboardInterrupt):
+        _fred_run(ws, fake, clock)
+    fake.crash_after = None
+    result = _fred_run(ws, fake, clock, batch_size=3)
+    assert result["recovered_receipts"] == 4
+    receipts = _sources(result, "fred-collect-receipts-")
+    assert [item["rows"] for item in receipts][:2] == [3, 1]
+    vintages = fred_collection.load_known(ws).knowledge.vintages
+    assert vintages == {"DGS10": date(2026, 9, 1), "GDP": date(2026, 8, 28)}
+
+
+def test_a_recovered_batch_closes_only_between_queries() -> None:
+    moment = datetime(2026, 9, 10, 3, tzinfo=UTC)
+
+    def retained(request: fred.Request, size: int) -> provider_collection.Retained:
+        response = Response(200, (), b"x" * size, moment, moment)
+        receipt = provider_collection.receipt_bytes(
+            request, response, outcome="COMPLETED", provider_status=None,
+            attempt=Attempt("job", 1),
+        )  # fmt: skip
+        return provider_collection.Retained("fred", receipt, response.body)
+
+    first, last = date(2026, 9, 1), date(2026, 9, 9)
+    items = [
+        retained(fred.vintage_dates("DGS10", first, last), 1),
+        retained(fred.observations("DGS10", first, last), 1),
+        retained(fred.observations("DGS10", first, last, fred.PAGE_LIMIT), 1),
+        retained(fred.observations("DGS10", first, last, 2 * fred.PAGE_LIMIT), 1),
+        retained(fred.vintage_dates("GDP", first, last), 50),
+        retained(fred.series_csv("DEXKOUS"), 1),
+    ]
+    joins = fred_collection._continues  # noqa: SLF001 -- the rule recovery applies
+    sizes = [len(chunk) for chunk in provider_collection.chunks(items, 1, 1_000, joins)]
+    # The query's later pages stay with its first page past the count bound.
+    assert sizes == [1, 3, 1, 1]
+    assert [len(chunk) for chunk in provider_collection.chunks(items, 1, 1_000)] == [1] * 6
+    # The byte bound closes a batch too.
+    sizes = [len(chunk) for chunk in provider_collection.chunks(items, 100, 50, joins)]
+    assert sizes == [5, 1]
+
+
+def test_three_transport_failures_in_a_row_stop_the_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "aas"
+    initialize(root)
+    fake = FakeFred(date(2026, 9, 9))
+    _history(fake)
+    fake.fail = {"fredgraph.csv", "vintagedates"}
+    monkeypatch.setattr("aegis_alpha.data.opendart.urllib_transport", lambda **_: fake)
+    key = tmp_path / "fred-key"
+    key.write_text(FRED_KEY + "\n")
+    os.chmod(key, 0o600)  # noqa: PTH101 -- explicit owner-only secret mode
+    code = main(["collect", "fred", "run", "--home", str(root), "--key-file", str(key)])
+    run = json.loads(capsys.readouterr().out)
+    assert (run["stopped"], run["exit_code"], run["uncertain"]) == ("transport_failures", 1, 3)
+    assert code == 1
+    # The CSV and the first two series failed; no later series was asked.
+    assert [name for name, _ in fake.calls] == ["fredgraph.csv", "vintagedates", "vintagedates"]
+
+
+def test_a_series_stops_at_its_first_incomplete_window_and_resumes_there(
+    ws: Workspace,
+) -> None:
+    fake = FakeFred(date(2026, 9, 9))
+    days = [date(2019, 1, 1) + timedelta(days=offset) for offset in range(2500)]
+    for offset, day in enumerate(days):
+        fake.publish("DGS10", date(2019, 1, 1) + timedelta(days=offset % 40), str(offset), day)
+    policy = fred.FredPolicy(alfred_series=("DGS10",), csv_series={})
+    clock = FakeClock(FRED_NOW)
+    client = fred.FredClient(FRED_KEY, fake, clock)
+    boundary = days[1989]  # the first window's last vintage date
+    fake.fail_starts = {boundary.isoformat()}
+    first = fred_collection.collect_fred(ws, client, policy=policy, clock=clock,
+                                         sleep=lambda _: None)  # fmt: skip
+    assert first["incomplete_queries"] == {"DGS10": 1}
+    (window1,) = _sources(first, "fred-alfred-observations-")
+    rows = set(_rows(ws, str(window1["source_id"]), "observations",
+                     "series_id, observation_date, realtime_start, value"))  # fmt: skip
+    assert rows == _expected_periods(fake, "DGS10", boundary)
+    assert fred_collection.load_known(ws).knowledge.vintages == {"DGS10": boundary}
+    fake.fail_starts = set()
+    clock.advance(hours=1)
+    second = fred_collection.collect_fred(ws, client, policy=policy, clock=clock,
+                                          sleep=lambda _: None)  # fmt: skip
+    assert (
+        fake.asked("vintagedates")[-1]["realtime_start"]
+        == (boundary + timedelta(days=1)).isoformat()
+    )
+    assert fake.asked("observations")[-1]["realtime_start"] == boundary.isoformat()
+    (window2,) = _sources(second, "fred-alfred-observations-")
+    later = set(_rows(ws, str(window2["source_id"]), "observations",
+                      "series_id, observation_date, realtime_start, value"))  # fmt: skip
+    assert rows.isdisjoint(later)
+    assert rows | later == _expected_periods(fake, "DGS10", date(2026, 9, 9))
+    assert fred_collection.load_known(ws).knowledge.vintages == {"DGS10": days[-1]}
+
+
+def test_receipts_and_batches_have_fixed_canonical_bytes() -> None:
+    request = fred.series_csv("DEXKOUS")
+    moment = datetime(2026, 9, 10, 3, tzinfo=UTC)
+    body = b"observation_date,DEXKOUS\n"
+    response = Response(200, (("content-type", "text/csv"),), body, moment, moment)
+    receipt = provider_collection.receipt_bytes(
+        request, response, outcome="COMPLETED", provider_status=None,
+        attempt=Attempt("job-1", 1),
+    )  # fmt: skip
+    raw = hashlib.sha256(body).hexdigest()
+    spelled = {
+        "attempt": 1,
+        "fingerprint": request.fingerprint,
+        "headers": [["content-type", "text/csv"]],
+        "http_status": 200,
+        "job_id": "job-1",
+        "outcome": "COMPLETED",
+        "provider_status": None,
+        "raw": {"sha256": raw, "size": len(body)},
+        "request": {"endpoint": "series_csv", "parameters_json": '{"id":"DEXKOUS"}'},
+        "requested_at_utc": "2026-09-10T03:00:00.000000Z",
+        "retrieved_at_utc": "2026-09-10T03:00:00.000000Z",
+        "schema_version": "aas-fred-receipt-v1",
+        "selection": None,
+    }
+    assert receipt == json.dumps(spelled, sort_keys=True, separators=(",", ":")).encode()
+    digest = hashlib.sha256(receipt).hexdigest()
+    assert digest == "40524eb1dfd01e17127fddbbe1dc1da09de67db02b77807f05764b471aba5600"
+    batch = provider_collection.Batch.of(
+        "fred", [provider_collection.Retained("fred", receipt, body)]
+    )
+    manifest = {"receipts": [{"sha256": digest, "size": len(receipt)}],
+                "schema_version": "aas-fred-batch-v1"}  # fmt: skip
+    assert batch.manifest == json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    # The batch's files, by their raw/ path: the manifest, each receipt, its response.
+    named = sorted((hashlib.sha256(f).hexdigest(), len(f)) for f in (batch.manifest, receipt, body))
+    identity = ["aas-source-id-v1", 1, [[f"{h[:2]}/{h}", size, h] for h, size in named]]
+    spelled_id = hashlib.sha256(
+        json.dumps(identity, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+    source_id = batch.content("collect-receipts").source_id
+    assert source_id == f"fred-collect-receipts-{spelled_id}"
+    assert source_id == (
+        "fred-collect-receipts-2cf577283b96aa0eb1224f3a9d8ff0762668ac3ea7b7549b14196030260c49ff"
+    )
+
+
 # --- SEC --------------------------------------------------------------------------------------
 
 CIK, OTHER = "0000000101", "0000000202"
@@ -516,6 +718,58 @@ def test_the_next_run_asks_only_what_is_missing(ws: Workspace) -> None:
         sec_collection.plan_sec(ws, now=clock.now, policy=sec.SecPolicy(issuers="all"))["requests"]
         == {}
     )
+
+
+def test_an_sec_batch_whose_receipts_did_not_commit_loses_no_filing(
+    ws: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _sec_fake()
+    clock = FakeClock(SEC_NOW)
+    derived = _interrupt_receipts(monkeypatch, "sec")
+    with pytest.raises(KeyboardInterrupt):
+        _sec_run(ws, fake, clock, batch_size=3)
+    # The three indexes' entries committed; their receipts did not, so no day is covered.
+    assert [item.rsplit("-", 1)[0] for item in derived] == ["sec-daily-index-entries"]
+    assert sec_collection.load_known(ws).knowledge.days == {}
+    calls = len(fake.calls)
+    result = _sec_run(ws, fake, clock, batch_size=3)
+    assert result["recovered_receipts"] == 3
+    entries = cast("list[dict[str, object]]", result["sources"])[0]
+    assert (entries["source_id"], entries["reused"]) == (derived[0], True)
+    # The indexes are known again, so the run asks the holiday again (read too early)
+    # and every document the indexes name.
+    assert fake.calls[calls:] == [
+        ("daily_index", "2026-09-16"),
+        ("submissions", CIK), ("submissions", OTHER), ("companyfacts", CIK),
+    ]  # fmt: skip
+    known = sec_collection.load_known(ws).knowledge
+    assert known.listed == {Q2.accession, EVENT.accession, FOREIGN.accession}
+    assert known.reported == {Q2.accession}
+    assert verify_workspace(ws)["verified"] is True
+
+
+def test_an_uncertain_document_ask_is_asked_again_the_next_day(ws: Workspace) -> None:
+    fake = _sec_fake()
+    fake.fail = {"submissions"}
+    clock = FakeClock(SEC_NOW)
+    first = _sec_run(ws, fake, clock)
+    assert first["uncertain"] == 2
+    assert first["stopped"] is None  # the companyfacts answer between them reset the count
+    fake.fail = set()
+    clock.advance(hours=2)
+    calls = len(fake.calls)
+    _sec_run(ws, fake, clock)
+    # An ask without an answer counts as asked: not again the same day.
+    assert [call for call in fake.calls[calls:] if call[0] == "submissions"] == []
+    clock.advance(days=1)
+    calls = len(fake.calls)
+    _sec_run(ws, fake, clock)
+    assert [call for call in fake.calls[calls:] if call[0] == "submissions"] == [
+        ("submissions", CIK), ("submissions", OTHER),
+    ]  # fmt: skip
+    assert sec_collection.load_known(ws).knowledge.listed == {
+        Q2.accession, EVENT.accession, FOREIGN.accession,
+    }  # fmt: skip
 
 
 def test_registered_issuers_limit_the_documents(ws: Workspace) -> None:

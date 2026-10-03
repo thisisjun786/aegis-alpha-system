@@ -2,15 +2,17 @@
 
 ``collect_sec`` runs one bounded collection on an admitted writable workspace:
 
-1. settle attempts an interrupted run left (``collection_ledger.recover``) and commit the
-   receipts it retained but did not commit;
+1. settle attempts an interrupted run left (``collection_ledger.recover``), complete the
+   sources its commit left prepared, and commit the receipts it retained but did not
+   commit, in batches of the run's bounds;
 2. read what is known (``load_known``) from this collector's committed batches: the index
    days answered, the filings those indexes name, the filings submissions answers listed
    and the filings companyfacts answers reported facts of;
 3. read every uncovered weekday's daily index up to yesterday (New York), then ask each
    filer's submissions document for its wanted filings that are not listed yet, and its
    companyfacts for its wanted reports that have no facts yet (``data.sec_collect``);
-4. commit the batch as content sources of its files:
+4. commit each batch (up to ``batch_size`` receipts or ``batch_bytes`` of responses) as
+   content sources of its files, the receipts source last:
 
    - ``sec-collect-receipts``: every receipt, with the selection a document ask recorded;
    - ``sec-daily-index-entries``: every line of every answered index;
@@ -358,11 +360,12 @@ def collect_sec(  # noqa: PLR0913 -- every bound of one run is explicit
             raise ValueError(f"{name} must be a positive integer")
     now = clock()
     settled = ledger.recover(workspace.state, PROVIDER, at_us=collection.epoch_us(now))
+    collection.finish_sources(workspace, PROVIDER)
     before = load_known(workspace)
     recovered = collection.orphans(workspace, PROVIDER, before.committed_receipts)
     committed: list[dict[str, object]] = []
-    if recovered:
-        committed.extend(commit_sec_batch(workspace, collection.Batch.of(PROVIDER, recovered)))
+    for chunk in collection.chunks(recovered, batch_size, batch_bytes):
+        committed.extend(commit_sec_batch(workspace, collection.Batch.of(PROVIDER, chunk)))
     known = load_known(workspace) if recovered else before
     caller = collection.Caller(
         workspace, PROVIDER, policy.sha256, client.request, classify, sec.stops_run,

@@ -2,8 +2,9 @@
 
 Every series, value, CIK, company and accession here is made up. The fakes answer in the
 providers' shapes, including ALFRED's clipping of a real-time period to the asked window
-and its limit of 2000 vintage dates per observations window, so a collector that relied
-on unclipped periods or one unbounded window fails against them.
+and a limit on the vintage dates of one observations window. FRED's own limit is 2000; the
+fake refuses a window over the collector's margin of 1990 (its start included), so a
+collector that relied on unclipped periods, one unbounded window or no margin fails.
 """
 
 from __future__ import annotations
@@ -47,6 +48,8 @@ class FakeFred:
     today: date
     history: dict[str, list[Period]] = field(default_factory=dict)
     fail: set[str] = field(default_factory=set)
+    # Observations windows (by realtime_start) whose calls fail in transport.
+    fail_starts: set[str] = field(default_factory=set)
     answers: dict[str, HttpAnswer] = field(default_factory=dict)
     calls: list[tuple[str, dict[str, str]]] = field(default_factory=list)
     crash_after: int | None = None
@@ -73,7 +76,9 @@ class FakeFred:
         if self.crash_after is not None and len(self.calls) >= self.crash_after:
             raise KeyboardInterrupt  # the process dies mid-run
         self.calls.append((endpoint, parameters))
-        if endpoint in self.fail:
+        if endpoint in self.fail or (
+            endpoint == "observations" and parameters.get("realtime_start") in self.fail_starts
+        ):
             raise TransportError("synthetic transport failure")
         if endpoint in self.answers:
             return self.answers[endpoint]
@@ -92,7 +97,7 @@ class FakeFred:
             days = [day.isoformat() for day in self.vintages(series) if start <= day <= end]
             return self._page(parameters, "vintage_dates", days, limit, offset)
         inside = [day for day in self.vintages(series) if start <= day <= end]
-        if len(inside) > 2000:  # noqa: PLR2004 -- FRED's vintage-date limit
+        if len(inside) > 1990:  # noqa: PLR2004 -- the collector's margin below FRED's 2000
             return _fred_error(400, f"Bad Request.  There are {len(inside)} vintage dates.")
         rows = sorted(
             (
@@ -162,12 +167,12 @@ class SecFact:
 
 
 def index_bytes(day: date, filings: list[SecFiling], extra: tuple[str, ...] = ()) -> bytes:
+    """A daily ``master`` index laid out line for line as EDGAR's, with synthetic entries."""
     lines = [
-        "Description:           Daily Index of EDGAR Dissemination Feed by Company Name",
+        "Description:           Daily Index of EDGAR Dissemination Feed",
         f"Last Data Received:    {day:%B} {day.day}, {day.year}",
         "Comments:              webmaster@sec.gov",
         "Anonymous FTP:         ftp://ftp.sec.gov/edgar/",
-        " ",
         " ",
         "CIK|Company Name|Form Type|Date Filed|File Name",
         "-" * 80,
@@ -241,6 +246,8 @@ class FakeSec:
     # Accessions EDGAR has not yet added to their filer's submissions document.
     unlisted: set[str] = field(default_factory=set)
     refuse: int | None = None
+    # Endpoints whose calls fail in transport after they are logged.
+    fail: set[str] = field(default_factory=set)
     calls: list[tuple[str, str]] = field(default_factory=list)
 
     def __call__(  # noqa: PLR0911 -- one answer per route
@@ -256,6 +263,8 @@ class FakeSec:
             stamp = url.rsplit(".", 2)[-2]
             day = date(int(stamp[:4]), int(stamp[4:6]), int(stamp[6:]))
             self.calls.append(("daily_index", day.isoformat()))
+            if "daily_index" in self.fail:
+                raise TransportError("synthetic transport failure")
             listed = [f for f in self.filings if f.filed == day]
             if day in self.holidays or day.weekday() >= 5:  # noqa: PLR2004 -- weekend
                 return HttpAnswer(404, TEXT, b"Not Found")
@@ -263,12 +272,16 @@ class FakeSec:
         cik = url.rsplit("CIK", 1)[-1].removesuffix(".json")
         if url.startswith("https://data.sec.gov/submissions/"):
             self.calls.append(("submissions", cik))
+            if "submissions" in self.fail:
+                raise TransportError("synthetic transport failure")
             mine = [f for f in self.filings if f.cik == cik and f.accession not in self.unlisted]
             if not mine:
                 return HttpAnswer(404, TEXT, b"Not Found")
             return HttpAnswer(200, JSON, submissions_bytes(cik, mine))
         assert url.startswith("https://data.sec.gov/api/xbrl/companyfacts/")
         self.calls.append(("companyfacts", cik))
+        if "companyfacts" in self.fail:
+            raise TransportError("synthetic transport failure")
         if cik not in self.facts:
             return HttpAnswer(404, TEXT, b"Not Found")
         return HttpAnswer(200, JSON, companyfacts_bytes(cik, self.facts[cik]))

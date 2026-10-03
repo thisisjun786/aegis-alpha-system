@@ -135,11 +135,12 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
 - `provider_collection` holds what the native US collectors share: the ledgered, paced and
   budgeted `Caller.ask`, canonical `aas-<provider>-receipt-v1` receipts (with the document
   selection an ask recorded) and `aas-<provider>-batch-v1` batches whose derived tables are
-  content sources of the batch's files. `sec_collection` (`aas collect sec`) reads daily
+  content sources of the batch's files, committed before the receipts source that marks the
+  batch complete. `sec_collection` (`aas collect sec`) reads daily
   indexes, then each filer's submissions and companyfacts once a run, keeping only the rows
   of the filings it wanted; `fred_collection` (`aas collect fred`) asks ALFRED vintage dates
   after each series' latest collected vintage day and then observations windows of at most
-  2000 vintage dates chained on their last vintage, keeping only rows that do not start on a
+  1990 vintage dates chained on their last vintage, keeping only rows that do not start on a
   window's start (ALFRED clips periods to the window), and commits each CSV download as the
   `fred-series-csv` source `fred.series_csv@1` would import. See the US collection section of
   `dev-notes/design/data-vertical.md`.

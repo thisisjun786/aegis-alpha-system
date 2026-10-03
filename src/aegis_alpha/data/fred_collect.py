@@ -13,15 +13,17 @@ Endpoints (``Request.provider`` is ``fred``):
 
 ALFRED reports a row's real-time period clipped to the query window: a vintage that began
 before the query's ``realtime_start`` is reported as starting on it, and a period that ends
-after ``realtime_end`` as ending on it. One observations window may also span at most 2000
-vintage dates. So, for each series:
+after ``realtime_end`` as ending on it. FRED also refuses an observations window that spans
+more than 2000 vintage dates; the collector asks windows of at most 1990, counting a window's
+start when it is a vintage date, so the window stays inside the limit however FRED counts
+that start. So, for each series:
 
 1. ``vintage_dates`` lists the vintage dates after the latest vintage day already collected
    (``known``), or all of them from the ALFRED origin (1776-07-04) when nothing is known, up
    to the last ended FRED (St. Louis, ``America/Chicago``) day. None means the series is
    current.
 2. The observations windows run from ``known`` (or the origin) to that day, each spanning at
-   most 2000 vintage dates and each starting on the last vintage date of the window before
+   most 1990 vintage dates and each starting on the last vintage date of the window before
    it (``observation_windows``).
 3. In every window that does not start at the origin, a row starting on the window's start
    restates a period an earlier window or collection already holds (clipped, or genuinely
@@ -63,8 +65,9 @@ FRED_ZONE: Final = ZoneInfo("America/Chicago")
 ORIGIN: Final = date(1776, 7, 4)
 PAGE_LIMIT: Final = 100_000
 VINTAGE_LIMIT: Final = 10_000
-# FRED refuses an observations window that spans more vintage dates than this.
-MAX_WINDOW_VINTAGES: Final = 2_000
+# FRED refuses an observations window that spans more than 2000 vintage dates; a window
+# holds at most this many, its start included, which leaves a margin below that limit.
+MAX_WINDOW_VINTAGES: Final = 1_990
 DEFAULT_ALFRED_SERIES: Final = (*MACRO_SERIES_IDS, "DEXKOUS")
 DEFAULT_CSV_SERIES: Final[Mapping[str, str]] = {"DEXKOUS": "fx.usdkrw.fred"}
 ALFRED_DATASET: Final = "macro.us.alfred"
@@ -423,7 +426,7 @@ def next_vintage_page(request: Request, count: int) -> Request | None:
 def observation_windows(
     start: date, vintages: Sequence[date], end: date
 ) -> list[tuple[date, date]]:
-    """Windows from ``start`` to ``end`` over ``vintages``, each spanning at most 2000.
+    """Windows from ``start`` to ``end`` over ``vintages``, each spanning at most 1990.
 
     Each window after the first starts on the last vintage date of the one before it, so a
     period starting on a window's start was already read whole by the window before. The

@@ -3,6 +3,7 @@
 # ruff: noqa: PLR2004 -- synthetic counts are the expected values
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 from collections.abc import Mapping
@@ -42,6 +43,15 @@ def test_a_request_names_its_window_and_never_its_key() -> None:
     assert (
         request.fingerprint
         != fred.vintage_dates("DGS10", date(2026, 9, 1), date(2026, 9, 9)).fingerprint
+    )
+    # The documented formula, spelled out: sha256 of the canonical JSON
+    # ["aas-fred-request-v1", endpoint, parameters_json].
+    parameters = json.dumps(request.parameters, sort_keys=True, separators=(",", ":"))
+    spelled = json.dumps(["aas-fred-request-v1", "observations", parameters],
+                         separators=(",", ":")).encode()  # fmt: skip
+    assert request.fingerprint == hashlib.sha256(spelled).hexdigest()
+    assert request.fingerprint == (
+        "f8775e34d73ec79f1df60ca9b768e7316b2aa4551ebf97ac3e6deb5a29cd777f"
     )
     with pytest.raises(ValueError, match="runs forward"):
         fred.observations("DGS10", date(2026, 9, 9), date(2026, 9, 1))
@@ -105,24 +115,25 @@ def test_answers_are_classified_and_a_refused_key_stops_the_run() -> None:
     assert fred.classify(csv, Response(200, (), b"DATE,DEXKOUS\n", moment, moment))[0] == FAILED
 
 
-def test_windows_span_at_most_2000_vintages_and_chain_on_their_last_vintage() -> None:
+def test_windows_span_at_most_1990_vintages_and_chain_on_their_last_vintage() -> None:
     days = [date(2000, 1, 1) + timedelta(days=index) for index in range(4500)]
     end = days[-1] + timedelta(days=3)
     windows = fred.observation_windows(fred.ORIGIN, days, end)
     assert windows == [
-        (fred.ORIGIN, days[1999]),
-        (days[1999], days[3998]),
-        (days[3998], end),
+        (fred.ORIGIN, days[1989]),
+        (days[1989], days[3978]),
+        (days[3978], end),
     ]
+    # Each window stays below FRED's limit of 2000, its start counted or not.
     for first, last in windows:
-        assert sum(first <= day <= last for day in days) <= 2000
+        assert sum(first <= day <= last for day in days) <= 1990
     # Every vintage after the first window's start is inside some window's (start, end].
     for day in days:
         assert any(first < day <= last for first, last in windows)
     # From a known day, the known day counts as a vintage of the first window.
     known = days[100]
     later = fred.observation_windows(known, days[101:2101], end)
-    assert later == [(known, days[2099]), (days[2099], end)]
+    assert later == [(known, days[2089]), (days[2089], end)]
     assert fred.observation_windows(known, [], end) == []
 
 
