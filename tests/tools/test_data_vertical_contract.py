@@ -13,7 +13,7 @@ _DECISION = _ROOT / "dev-notes/decisions/0017-data-vertical-contract.md"
 _INDEX = _ROOT / "dev-notes/decisions/README.md"
 _HEADING = "## 계약과 테스트 대응표"
 _ROW = re.compile(
-    r"^\| (?P<id>DV-\d{2}) \| (?P<sentence>[^|]+?) \| "
+    r"^\| (?P<id>DV-\d{2,}) \| (?P<sentence>[^|]+?) \| "
     r"`(?P<path>tests/[\w/]+\.py)::(?P<test>test_\w+)` \| (?P<status>\S+) \|$"
 )
 _STATUSES = {"구현", "예정"}

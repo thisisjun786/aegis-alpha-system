@@ -968,7 +968,7 @@ def flags_digest(
 # --- planning ------------------------------------------------------------------------------
 
 
-def _head(workspace: Workspace, dataset_id: str) -> str | None:
+def dataset_head(workspace: Workspace, dataset_id: str) -> str | None:
     """The dataset's current head, refusing a market head the catalog has not recorded."""
     market = workspace.market.execute(
         "SELECT generation_id FROM market_generations WHERE dataset_id=? "
@@ -986,9 +986,23 @@ def _head(workspace: Workspace, dataset_id: str) -> str | None:
     return head
 
 
+def generation_spec(workspace: Workspace, generation_id: str) -> PromotionSpec:
+    """The retained spec of one promoted generation, refusing any other generation."""
+    marker = marker_for(workspace.market, generation_id)
+    operation = get_operation(workspace.state, str(marker["operation_id"]))
+    if operation is None or operation["kind"] != OPERATION_KIND:
+        raise ValueError("a promotion extends only a chain of promoted generations")
+    catalog = workspace.state.execute(
+        "SELECT transform_hash FROM dataset_versions WHERE generation_id=?", (generation_id,)
+    ).fetchone()
+    if catalog is None:
+        raise ValueError(f"generation {generation_id} is not cataloged")
+    return parse_spec(_read_raw(workspace, str(catalog[0])), str(catalog[0]))
+
+
 def _check_parent(workspace: Workspace, spec: PromotionSpec) -> int:
     """Hold the parent CAS and a parent chain's time rules; return the new sequence."""
-    head = _head(workspace, spec.dataset_id)
+    head = dataset_head(workspace, spec.dataset_id)
     if head != spec.parent:
         raise ParentChangedError(
             f"dataset {spec.dataset_id} head is {head}, not the spec parent {spec.parent}; "
@@ -997,15 +1011,7 @@ def _check_parent(workspace: Workspace, spec: PromotionSpec) -> int:
     if spec.parent is None:
         return 1
     marker = marker_for(workspace.market, spec.parent)
-    operation = get_operation(workspace.state, str(marker["operation_id"]))
-    if operation is None or operation["kind"] != OPERATION_KIND:
-        raise ValueError("a promotion extends only a chain of promoted generations")
-    catalog = workspace.state.execute(
-        "SELECT transform_hash FROM dataset_versions WHERE generation_id=?", (spec.parent,)
-    ).fetchone()
-    if catalog is None:
-        raise ValueError("the parent generation is not cataloged")
-    parent = parse_spec(_read_raw(workspace, str(catalog[0])), str(catalog[0]))
+    parent = generation_spec(workspace, spec.parent)
     if parent.domain != spec.domain or parent.dataset_id != spec.dataset_id:
         raise ValueError("the parent generation belongs to another dataset")
     if parent.time_rule_identities() != spec.time_rule_identities():

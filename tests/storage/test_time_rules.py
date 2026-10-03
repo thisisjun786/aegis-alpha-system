@@ -228,3 +228,24 @@ def test_source_column_is_its_own_value_and_base() -> None:
         published, clamped=False, held=False
     )
     assert bound(published, published, published - 1).held is True
+
+
+def test_declared_session_end_is_a_record_rule_on_its_bound() -> None:
+    rule = parse_rule(
+        "available_at_us",
+        {"rule": "declared_session_end@1", "basis": "record", "input": "b", "args": {}},
+        {"b": "utc_us"},
+    )
+    computed = rule_sql(rule, "b", None)
+    bounded = us(at("2025-01-06T06:30:00"))
+    connection = duckdb.connect()
+    assert connection.execute(
+        f"SELECT {computed.value}, {computed.base} FROM (SELECT ?::BIGINT AS b)", [bounded]
+    ).fetchone() == (bounded, bounded)
+    # The bound comes from the record's date, so a correction cannot carry it as its own time.
+    with pytest.raises(ValueError, match="takes basis"):
+        parse_rule(
+            "revision_known_at_us",
+            {"rule": "declared_session_end@1", "basis": "revision", "input": "b", "args": {}},
+            {"b": "utc_us"},
+        )

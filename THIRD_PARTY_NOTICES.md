@@ -36,6 +36,15 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+## exchange_calendars
+
+Source: [gerrymanoim/exchange_calendars](https://github.com/gerrymanoim/exchange_calendars),
+release 4.13.2. License: Apache-2.0.
+
+| AAS material | Source and changes |
+| --- | --- |
+| `src/aegis_alpha/storage/calendar_declarations/xnys.json`, `xkrx.json` | Session dates and local hours for 1990-01-01..2027-12-31 taken from the library's `XNYS` and `XKRX` schedules by `scripts/calendar_declarations.py`, which does not import the library at runtime and is not an AAS dependency. The script restates each schedule as hour regimes, closed regime weekdays and sessions with other hours, and applies AAS corrections it lists with their evidence: KRX election-day and 2026 holiday closures, one KRX session evidenced by traded volume, KRX CSAT-day hours 2021-2026, and regular hours for one KRX session. Behavior checks: `tests/storage/test_calendar_declaration.py` against published holidays, early closes and late opens. |
+
 ## Data and strategy rights
 
 The software license grants no rights to market/provider datasets, collected

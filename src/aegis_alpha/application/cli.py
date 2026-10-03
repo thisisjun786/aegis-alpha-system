@@ -7,6 +7,7 @@ from pathlib import Path
 
 from aegis_alpha.application import (
     backtest_cli,
+    calendar_cli,
     compute_cli,
     data_cli,
     etf_cli,
@@ -51,6 +52,7 @@ def _parser() -> argparse.ArgumentParser:
     research_cli.add_commands(commands)
     etf_cli.add_commands(commands)
     identity_cli.add_commands(commands)
+    calendar_cli.add_commands(commands)
     return parser
 
 
@@ -142,6 +144,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912 -- explic
                 result = etf_cli.execute(args)
             case "identity":
                 result = identity_cli.execute(args)
+            case "calendar":
+                result = calendar_cli.execute(args)
             case "providers" | "collect":
                 result = provider_cli.execute(args)
             case "legacy-db" | "legacy-data":

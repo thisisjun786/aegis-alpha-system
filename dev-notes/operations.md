@@ -258,7 +258,7 @@ bundle의 identity binding이 된다. `show`는 읽기 전용이다. 문서 형�
 원천 자료실 자료를 공급자별 시장 dataset으로 승격하는 명령(`aas data promote`), 원천 ID 연결
 (`aas db source-link`), core schema 업그레이드(`aas db migrate`), 원천 은퇴(`aas db source-retire`)와
 compact(`aas db compact`)의 계약은 [데이터 수직 계약](design/data-vertical.md)이 소유한다. 현재 CLI에는
-`aas db migrate`, `aas data promote`·`promotions`와 위 [원본 자료 이전과 조회](#원본-자료-이전과-조회)의
+`aas db migrate`, `aas data promote`·`promotions`, `aas calendar refresh`와 위 [원본 자료 이전과 조회](#원본-자료-이전과-조회)의
 `source-link`가 있다. 은퇴와 compact는 그 계약의 대응표 행이 `구현`이 될 때 이 절에 추가된다.
 승격된 dataset을 읽는 소비자 경로(`read_heads`)가 연결되기 전까지 원천 자료의 연구 입력은 아래
 `register-*` 경로가 맡는다.
@@ -280,6 +280,35 @@ flag 분포, 시간 규칙별 null·상한 적용 수, op 분포, stale 행, 계
 공급자를 호출하지 않으며, 설정된 공유 계산 예산이 있으면 그 예산 안에서 돈다. `promotions`는
 승격 intent마다 단계, generation, dataset version, 행 수, 명세 해시와 매퍼를 나열한다.
 
+### 선언 달력 갱신
+
+```bash
+aas calendar refresh --plan
+aas calendar refresh [--calendar XKRX] [--calendar XNYS]
+aas calendar refresh --declaration /path/to/declaration.json --sha256 SHA256 [--plan]
+```
+
+`calendar refresh`는 `aas-calendar-declaration-v1` 선언 문서를 그 달력의 `sessions.<mic>` dataset의
+다음 generation으로 승격한다. 인자가 없으면 패키지에 든 XKRX·XNYS 선언을 모두 쓰고, `--declaration`은
+운영자가 만든 선언 하나를 파일 SHA-256과 함께 받는다. 실행은 선언 bytes를 `raw/`에 두고 원천 자료실에
+날짜마다 한 행인 원천 테이블(`calendar-declared-sessions-<hex>`)을 commit한 뒤 `calendar.declared@1`
+매퍼로 승격한다. 원천 테이블 commit에는 `pyarrow`(legacy extra)가 필요하다. 같은 선언을 다시 실행하면
+원천을 재사용하고 빈 delta라 아무것도 쓰지 않는다. 바뀐 날짜만 새 generation의 SUPERSEDE가 되고
+이전 generation과 그 pin은 그대로 남는다.
+
+`--plan`은 아무것도 쓰지 않는다. 원천이 이미 commit돼 있으면 `aas data promote --plan`과 같은 승격
+계획을, 아니면 head 선언과 날짜 단위로 비교한 추가·변경·불변 수와 변경 표본을 보고한다. 응답은
+선언 요약(연도별 개장·휴장 수), 다음 해 말까지 덮는지(`coverage.covers_next_year`), head generation,
+원천 ID를 함께 담는다. head를 만든 선언보다 이른 `declared_at`의 선언, 같은 `declared_at`의 다른
+내용, 다른 달력·시간대, 현재보다 늦은 `declared_at`, head 선언의 날짜를 모두 덮지 않는 범위는 거부한다.
+head가 있으면 `--plan`도 head의 원천 테이블을 `pyarrow`로 검증한다. 계획에 stale 행이 남는 선언은
+게시하지 않고 거부한다. strict 소비자는 달력 시점(`declared_session_end@1`)을 binding grant로 허용한다.
+
+임시 휴장처럼 공표된 변경은 패키지 선언을 복사해 그 날짜를 `closed`나 `sessions`에 반영하고
+`declared_at`을 공표 시각 이후로 올린 문서를 `--declaration`으로 갱신한다. 다음 해 선언과 정정된
+과거 일정은 `scripts/calendar_declarations.py`로 패키지 선언을 다시 만들어 리뷰한다. 선언 형식, 시점
+규칙, 순서 규칙은 [데이터 수직 계약](design/data-vertical.md#선언-달력)이 소유한다.
+
 `--plan`은 state·market을 읽기 전용으로 열어 각 저장소의 버전, 인식한 `schema_migrations` checksum,
 남은 단계(`backup`, `intent`, `market`, `state`, `receipt`, `complete`)를 보고하고 아무것도 쓰지 않는다.
 실행은 실행 중인 run이나 PREPARED 작업이 없을 때만 시작하고, 검증된 백업을 만든 뒤 intent를 기록하고
@@ -294,7 +323,8 @@ market과 state를 각각 한 트랜잭션으로 올린 다음 설치 영수증�
 1. `[owner]` 예약 수집을 멈추고 새 루트 복원본에서 전 과정을 먼저 실행해 시간·메모리·verify를 기록한다.
 2. `[owner]` 다른 장치에 `aas db backup`을 만들고 백업 ID를 기록한다.
 3. `aas db migrate --to 2 --backup-output DIR`, 이어서 `aas db source-link --apply`.
-4. 명세마다 `aas data promote --plan`을 확인한 뒤 실행하고 generation마다 verify한다. 실패하면
+4. `aas calendar refresh --plan`을 확인하고 실행해 달력 generation을 먼저 만든다. 이어서 명세마다
+   `aas data promote --plan`을 확인한 뒤 실행하고 generation마다 verify한다. 실패하면
    `aas db recover`로 게시만 재개한다. 공급자를 다시 호출하지 않는다.
 5. `[owner]` 승인된 수집기를 설정의 호출 상한과 함께 예약 실행으로 켠다.
 6. `aas db source-retire --plan`으로 은퇴 후보와 거부 이유를 확인하고 `--apply`로 증명을 통과한
