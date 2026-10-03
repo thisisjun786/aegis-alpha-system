@@ -260,3 +260,62 @@ def test_merge_drops_a_weighed_file_the_lane_no_longer_selects(tmp_path: Path) -
     shard.write_text(json.dumps({"tests/engine/test_bundle.py": 4.0}))
     assert main(["merge", "--out", str(out), str(shard)]) == 0
     assert load_weights(out) == {"tests/engine/test_bundle.py": 4000}
+
+
+def _run_on_workers(tmp_path: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    environment = {key: value for key, value in os.environ.items() if key != "PYTEST_ADDOPTS"}
+    return subprocess.run(  # noqa: S603 -- fixed pytest argv against this checkout
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            "-n",
+            "2",
+            "--dist",
+            "loadfile",
+            f"--basetemp={tmp_path / 'inner'}",
+            *arguments,
+        ],
+        cwd=_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+@pytest.mark.parametrize(
+    ("arguments", "status", "summary"),
+    [
+        (("--test-shard", "1/2"), 0, "test shard 1/2: 1 files, "),
+        (("--test-shard", "2/2"), 0, "test shard 2/2: 0 files, 0 tests"),
+        (("-k", "nothing_matches_this"), 5, None),
+    ],
+)
+def test_shards_on_xdist_workers_keep_the_serial_exit_status_and_summary(
+    tmp_path: Path, arguments: tuple[str, ...], status: int, summary: str | None
+) -> None:
+    # The controller never collects; the workers hand it the shard's outcome.
+    result = _run_on_workers(tmp_path, "tests/engine/test_bundle.py", *arguments)
+    assert result.returncode == status, result.stdout + result.stderr
+    if summary is not None:
+        assert summary in result.stdout
+
+
+def test_xdist_controller_alone_records_every_file_duration(tmp_path: Path) -> None:
+    out = tmp_path / "durations.json"
+    result = _run_on_workers(
+        tmp_path,
+        "--test-durations-out",
+        str(out),
+        "tests/engine/test_bundle.py",
+        "tests/engine/test_requirements.py",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert list(load_weights(out)) == [
+        "tests/engine/test_bundle.py",
+        "tests/engine/test_requirements.py",
+    ]

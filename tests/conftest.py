@@ -6,6 +6,7 @@ import tempfile
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -13,14 +14,19 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import Engine, create_engine, inspect, make_url, text
 
+from tests.isolation import isolate, live_roots, live_state_refusal
+
 if TYPE_CHECKING:
     from sqlalchemy.engine import URL
 
-# Production has no data-root default.  The test process installs one explicit,
-# already-existing synthetic root before test modules import path-bound
-# constants.  A caller-provided root (for mounted real-input acceptance) wins.
-_PYTEST_DATA_ROOT = tempfile.TemporaryDirectory(prefix="aas-pytest-data-root-")
-os.environ.setdefault("AAS_DATA_ROOT", os.path.realpath(_PYTEST_DATA_ROOT.name))
+# One isolation tree per test process (per xdist worker) under TMPDIR, installed before
+# test modules import path-bound constants: HOME, XDG_*_HOME, AAS_HOME and the synthetic
+# AAS_DATA_ROOT (production has no data-root default) all live in it.  A caller-provided
+# AAS_HOME or AAS_DATA_ROOT (mounted real-input acceptance) wins; the session-start guard
+# refuses any of them that resolves inside live state.  See tests/isolation.py.
+_OPERATOR_HOME = os.environ.get("HOME")
+_PYTEST_ROOT = tempfile.TemporaryDirectory(prefix="aas-pytest-")
+isolate(Path(os.path.realpath(_PYTEST_ROOT.name)), os.environ)
 
 from aegis_alpha.data import canonical_generation_schema  # noqa: E402, F401
 from aegis_alpha.metadata.schema import metadata  # noqa: E402
@@ -38,6 +44,13 @@ _DATABASE_SUFFIX = "_test"
 # a test that opens PostgreSQL without the fixture must carry
 # ``@pytest.mark.database`` itself.
 _DATABASE_FIXTURE = "test_database"
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    del session
+    refusal = live_state_refusal(os.environ, live_roots(_OPERATOR_HOME))
+    if refusal is not None:
+        pytest.exit(refusal, returncode=pytest.ExitCode.USAGE_ERROR)
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:

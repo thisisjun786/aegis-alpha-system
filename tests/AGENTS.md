@@ -5,7 +5,7 @@
 Tests mirror current source owners: application, engine, storage, container, data,
 collection, identity and metadata. `tools/` checks CI selection, aggregation,
 security and verifier behavior. Provider-neutral JSON fixtures are synthetic.
-The root `conftest.py` owns network, data-root and disposable DB isolation.
+The root `conftest.py` owns network, home, data-root and disposable DB isolation.
 
 ## CONVENTIONS
 - **PostgreSQL tests are `database`** (current contracts; decisions 0010/0012).
@@ -21,10 +21,17 @@ The root `conftest.py` owns network, data-root and disposable DB isolation.
   drops it only when prefix, suffix, and owner token all match.
 - `clean_postgres` runs `alembic upgrade head`, then deletes every table in reverse dependency
   order *before and after* each test. Schema state is migration-derived, never hand-built.
-- `AAS_DATA_ROOT` is `setdefault` to a session `TemporaryDirectory` **before** `aegis_alpha`
-  imports — that ordering is why `tests/conftest.py` carries `# noqa: E402`. A caller-supplied
-  root wins; it must still contain only synthetic disposable test inputs, never
-  recovered or production data.
+- **Every test process runs in its own isolated home.** Before `aegis_alpha` imports (that
+  ordering is why `tests/conftest.py` carries `# noqa: E402`), `tests/isolation.py` creates one
+  `aas-pytest-*` tree under `TMPDIR` per process (per xdist worker) and points `HOME` and
+  `XDG_{CONFIG,DATA,STATE,CACHE}_HOME` into it. `AAS_HOME` and `AAS_DATA_ROOT` are `setdefault`
+  into the same tree: a caller-supplied root (mounted real-input acceptance) wins, and it
+  must still contain only synthetic disposable test inputs, never recovered or production data.
+- **A run aimed at live state stops before any test.** At session start the guard refuses the
+  run (exit 4) when `HOME`'s `.aas` or `.local/share/aegis-alpha`, an `XDG_*_HOME`, or a set
+  `AAS_HOME`, `AAS_DATA_ROOT`, `AAS_DATA_CONFIG`, `AAS_INSTALL_CONFIG`, `AAS_COLLECTION_STATE`
+  or `AAS_COLLECTION_CONFIG` resolves inside the account's or the starting `HOME`'s `~/.aas`
+  or `~/.local/share/aegis-alpha`, or inside `/state/aas`.
 - No `__init__.py` anywhere under `tests/`. Support helpers resolve two ways: bare
   (through pytest directory insertion) and dotted (through the configured project Python path).
 - `ruff select = ["ALL"]` applies to tests; the only per-file relief is `INP001` and `S101`.
@@ -32,6 +39,17 @@ The root `conftest.py` owns network, data-root and disposable DB isolation.
 - `addopts = ["--strict-config", "--strict-markers"]` — an unregistered marker fails the run.
 - `tmp_path_retention_policy = "failed"`: a passing test's `tmp_path` is removed at teardown,
   so scratch (memory-backed in CI) holds one test's stores at a time. Failed tests keep theirs.
+- **The database-free lane runs whole files in parallel processes.** `verify-lane-test` passes
+  `-n "${AAS_TEST_WORKERS:-auto}" --dist loadfile`: one file runs start to finish in one
+  worker, so module fixtures are built once per file, and process-global state (`os.environ`,
+  `chdir`, signal handlers, `/proc/self/fd`) is never shared between workers. A test that
+  needs a resource shared across processes (a fixed path outside `tmp_path`, a port, a
+  system-wide lock) carries `@pytest.mark.xdist_group("<reason>")` and a
+  `# Serial: <reason>` comment; there is none today. `AAS_TEST_WORKERS=0` runs serially.
+- **Fast local loop.** `uv run --no-sync pytest -n auto --dist loadfile -m 'not database'
+  <paths>` for the area you change; `./scripts/verify-lane-test` for the whole lane. For
+  fsync-heavy storage tests use `TMPDIR=/dev/shm/aas-$USER`, never `/tmp` (a stray `/tmp/.git`
+  makes storage refuse paths). Use `AAS_TEST_WORKERS=0`, or omit `-n`, to debug in one process.
 - **Sharding is file-granular and deterministic.** `sharding.py` (registered from `conftest.py`)
   adds `--test-shard INDEX/COUNT`. After marker selection it balances whole test files over the
   shards by the measured seconds in `shard_weights.json`; a file the table lacks is estimated
@@ -52,4 +70,5 @@ The root `conftest.py` owns network, data-root and disposable DB isolation.
   hang-forever *child process* bodies whose termination is under test, and lock-contention
   suites poll `pg_blocking_pids` under an explicit deadline — copy those shapes, not a bare wait.
 - Do not run PG-backed suites concurrently against one database; isolation is per session, and
-  the repo forbids parallelizing tests that share mutable fixtures.
+  the repo forbids parallelizing tests that share mutable fixtures. `verify-lane-database`
+  runs serially in one process.
