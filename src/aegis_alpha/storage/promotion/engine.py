@@ -576,13 +576,7 @@ def _resolved(workspace: Workspace, spec: PromotionSpec) -> str:
     market = workspace.market
     column = _resolved_column(spec)
     if column is None:
-        # A domain whose instrument is optional, mapped without an identity key, names none.
-        unnamed = (
-            ", CAST(NULL AS VARCHAR) AS instrument_id"
-            if "instrument_id" in dict(DOMAINS[spec.domain])
-            else ""
-        )
-        return f"SELECT m.*{unnamed}, 1 AS _aas_matches FROM {_t('map')} m"
+        return f"SELECT m.*, 1 AS _aas_matches FROM {_t('map')} m"
     market.execute(
         f"CREATE OR REPLACE TEMP TABLE {_t('res')} AS SELECT m._aas_pin, m._aas_ordinal, "
         "count(DISTINCT i.instrument_id) AS matches, min(i.instrument_id) AS instrument_id "

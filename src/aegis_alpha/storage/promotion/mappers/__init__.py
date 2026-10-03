@@ -31,8 +31,8 @@ each source's request hash from the manifest's table and metadata and refuses th
 when it differs from the marker and completed operation, so what the mapper reads from
 the manifest is pinned like the rows.
 
-A domain whose ``instrument_id`` is optional (fundamentals, filings) may be mapped
-without an identity key; its rows then name no instrument.
+A domain whose ``instrument_id`` is optional (fundamentals) may be mapped without an
+identity key; the mapper then emits ``instrument_id`` itself (NULL for an issuer row).
 
 A mapper may join generations of other datasets that its spec arguments pin
 (``references``): SEC company facts read each filing's acceptance time from a pinned

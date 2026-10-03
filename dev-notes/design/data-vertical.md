@@ -286,9 +286,9 @@ microsecond 시각(FX의 `fixing_at_us`)이면 그 UTC 날짜다. reader가 같�
 단계에서 접두사가 다른 원천 pin을 거부한다. 그래서 한 공급자의 행이 다른 공급자의 dataset에 들어가지
 않는다. 접두사를 선언하지 않은 매퍼는 열이 맞는 원천을 모두 읽는다.
 
-- `instrument_id`가 선택인 도메인(재무, 공시)은 identity key가 없는 매퍼로 승격할 수 있고 그 행의
-  instrument는 null이다. `instrument_id`가 필수인 도메인은 instrument를 해석하는 매퍼만 쓴다. 명세는
-  해석하는 매퍼에만 identity snapshot을 pin한다.
+- `instrument_id`가 선택인 도메인(재무)은 identity key가 없는 매퍼로도 승격할 수 있고, 그 매퍼는
+  `instrument_id`를 직접 낸다(발행인 단위 행은 null). `instrument_id`가 필수인 도메인은 instrument를
+  해석하는 매퍼만 쓴다.
 - 매퍼는 다른 dataset의 generation을 참조(`references`)로 조인할 수 있다. 참조마다 도메인과 매퍼 인자의
   generation pin이 있고, 엔진은 pin을 달력 pin처럼 marker·카탈로그·chain으로 확인한 뒤 그 dataset의 도메인이
   참조의 도메인인지 보고, chain의 TOMBSTONE이 아닌 head 행의 도메인 열을 참조 테이블에 적재한다. 매퍼는

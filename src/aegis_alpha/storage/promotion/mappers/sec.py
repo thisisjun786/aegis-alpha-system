@@ -1,7 +1,8 @@
 """SEC submissions as ``filings`` and SEC company facts as ``fundamentals``.
 
 Both mappers are issuer level: the issuer is ``mint_issuer('sec_cik', cik)`` of the
-ten-digit CIK, the SEC issuer anchor, and no instrument is resolved. A CIK of another
+ten-digit CIK, the SEC issuer anchor, and no instrument is resolved (a fundamentals row
+names none). A CIK of another
 spelling leaves the row without an issuer, which the promotion refuses as a missing
 required column.
 
@@ -97,6 +98,9 @@ class SecSubmissions:
     row_flags: Final[Mapping[str, str]] = {}
     manifest_items: Final = None
 
+    # The filings table of an SEC submissions archive (``sec.submissions_filings@1``).
+    source_prefixes: Final = ("sec-submissions-filings-",)
+
     @property
     def partition_sql(self) -> str:
         return _day('"filingDate"')
@@ -154,6 +158,8 @@ class SecCompanyfacts:
     domain: Final = "fundamentals"
     date_column: Final = "period_end"
     partition_sql: Final = "filed"
+    # Company facts tables come from several normalizations; their columns are checked.
+    source_prefixes: Final = ()
     row_flags: Final[Mapping[str, str]] = {}
     manifest_items: Final = None
     time_inputs: Final[Mapping[str, InputKind]] = {"accepted_at": "utc_us", "filed": "date"}
@@ -215,7 +221,7 @@ class SecCompanyfacts:
         return (
             "SELECT f._aas_pin, f._aas_ordinal, f._aas_row_hash, "  # noqa: S608 -- engine-named relation
             "epoch_us(f.retrieved_at) AS _aas_ingested_at_us, "
-            f"{_issuer('f.cik')} AS issuer_id, "
+            f"{_issuer('f.cik')} AS issuer_id, CAST(NULL AS VARCHAR) AS instrument_id, "
             "f.taxonomy || ':' || f.tag AS concept, f.period_start, f.period_end, "
             f"{span} AS fiscal_period, f.unit, {dimensions} AS dimensions_hash, "
             f"f.form, {accession} AS accession, a.accepted_at_us, "

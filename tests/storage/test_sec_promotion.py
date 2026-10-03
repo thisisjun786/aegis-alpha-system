@@ -69,7 +69,11 @@ def _commit(
     workspace: Workspace, schema: pa.Schema, table: str, rows: list[tuple[object, ...]], tag: str
 ) -> dict[str, str]:
     _, digest, size = put_raw(workspace.paths.raw, f"synthetic-sec-{tag}".encode())
-    content = SourceContent("synthetic", f"sec-{table}", 1, (SourceFile(digest, size),))
+    # Filings tables carry the submissions loader's provider and shape, as the mapper requires.
+    provider, shape = (
+        ("sec", "submissions-filings") if table == "filings" else ("synthetic", "facts")
+    )
+    content = SourceContent(provider, shape, 1, (SourceFile(digest, size),))
     columns = list(zip(*rows, strict=True))
     arrow = pa.table(
         {name: list(column) for name, column in zip(schema.names, columns, strict=True)},
@@ -227,7 +231,7 @@ def test_filings_take_the_recorded_acceptance_instant(ws: Workspace) -> None:
     document = json.loads(_spec([pin], domain="filings", dataset="filings.us.sec")[0])
     assert parse_spec(*_encoded(document)).identity_snapshot is None
     document["identity_snapshot"] = {"snapshot_id": "s", "content_hash": "0" * 64}
-    with pytest.raises(ValueError, match="others pin none"):
+    with pytest.raises(ValueError, match="pins none"):
         parse_spec(*_encoded(document))
 
 
@@ -450,3 +454,9 @@ def test_a_repeated_listing_is_read_once(ws: Workspace) -> None:
     pin = _commit(ws, SUBMISSION_FILINGS.schema(), "filings", [listing, changed], "f2")
     with pytest.raises(ValueError, match="natural keys repeat"):
         _apply(ws, _spec([pin], domain="filings", dataset="filings.us.sec.alt"))
+
+
+def test_filings_read_only_submissions_filings_sources(ws: Workspace) -> None:
+    facts = _commit(ws, FACT_SCHEMA, "facts", [_fact(A1, "100")], "c1")
+    with pytest.raises(ValueError, match="sec-submissions-filings-"):
+        parse_spec(*_spec([facts], domain="filings", dataset="filings.us.sec"))
