@@ -191,8 +191,10 @@ ICU 시간대 자료로 푼 값이고, `timezone_version`은 그 자료를 가�
 
 예정된 매퍼 목록: `norgate.prices_none`, `norgate.prices_adjusted`, `norgate.master`,
 `norgate.dividends`, `norgate.index_membership`, `norgate.reference_series`,
-`fmp.profile`, `fmp.actions`, `sec.submissions`, `sec.companyfacts`, `dart.corp_codes`,
-`dart.fnltt`, `dart.list`, `kind.listings`, `fred.alfred`, `fx.series`.
+`fmp.profile`, `fmp.actions`, `sec.submissions`, `sec.companyfacts`,
+`dart.fnltt`, `dart.list`, `fred.alfred`, `fx.series`. identity 원천을 읽는 매퍼(`eodhd.kr_symbol`,
+`kind.listings`, `dart.corp_codes`)는 typed generation이 아니라 등록 문서를 만들며
+[KR 등록](#kr-등록)이 소유한다.
 
 자연키가 겹치는 원천 행 두 개는 승격을 거부한다. 어느 쪽을 고를지 추정하지 않는다.
 instrument는 pin한 identity snapshot에서 매퍼의 assertion key와 token이 같고, 해석 시각이 유효
@@ -566,6 +568,45 @@ identity 문서로 투영한다. 선택한 assertion마다 member 하나이고, 
   소비자 allowance를 이 크기에 맞추는 일은 소비자 연결(PR 27)의 몫이다. `aas db verify`는 part를
   각자 검증하고 manifest는 part header와 경계만으로 확인한다.
 
+### KR 등록
+
+KR identity는 세 원천을 identity 매퍼로 읽어 `aas-identity-registry-v1` 문서 하나로 만들고, 그 문서를
+다른 등록 문서와 같은 `aas identity register`로 덧붙인다. 코드는 `storage/kr_identity.py`다.
+
+| 매퍼 | 원천 | 만드는 행 |
+| --- | --- | --- |
+| `eodhd.kr_symbol@1` | EODHD 거래소 종목 목록(`KO` 유가증권, `KQ` 코스닥, 상장·상폐 목록) | `Isin`이 검사 숫자가 맞는 KR ISIN인 행의 instrument `mint('krx_isin', Isin)`(venue는 두 시장의 운영자 `XKRX`, asset_type은 `common_stock`·`preferred_stock`·`etf`), assertion `eodhd`/`eodhd_symbol`(`<Code>.<Exchange>`, `eodhd.bars@1`이 해석하는 token)과 `eodhd`/`krx_short_code`(`Code`) |
+| `kind.listings@1` | KIND 상장법인목록(유가증권, 코스닥) | assertion `kind`/`krx_short_code`, 유효 구간은 상장일의 Asia/Seoul 0시부터 |
+| `dart.corp_codes@1` | DART `corpCode.xml` 응답(원천 자료실의 `corp_codes` receipt 한 행) | 종목코드가 있는 회사의 issuer `mint('dart_corp_code', corp_code)`(이름은 `corp_name`), 그 종목코드의 instrument에 대한 `dart`/`issuer` assertion과 instrument 행의 issuer |
+
+- KIND와 DART는 ISIN을 싣지 않으므로 EODHD가 정확히 하나의 ISIN에 묶은 단축코드로만 instrument에
+  닿는다. 단축코드·종목코드·이름에서 ISIN이나 ID를 유도하지 않는다.
+- 다음은 해석하지 않고 이유와 함께 보고한다: ISIN이 없거나(`isin_missing`), 검사 숫자가 틀리거나
+  (`isin_invalid`), KR ISIN이 아님(`isin_not_kr`), 알 수 없는 종목 유형(`type_unknown`), 원화가 아님
+  (`currency_not_krw`), 한 심볼이 두 ISIN을 가짐(`symbol_ambiguous`), 한 ISIN이 두 단축코드나 두 유형을
+  가짐(`isin_ambiguous`), 한 단축코드가 두 ISIN을 가짐(`short_code_ambiguous`), 한 종목코드를 두 회사가
+  가짐(`stock_code_ambiguous`), 한 회사가 두 종목코드를 가짐(`corp_code_ambiguous`), 종목코드가 ETF를 가리킴(`stock_code_is_etf`), 단축코드가 instrument에
+  닿지 않음(`short_code_unresolved`), 다듬어지지 않은 회사명(`corp_name_invalid`). 다른 목록에서 ISIN이
+  비어 있는 같은 심볼은 ISIN을 실은 목록의 주장을 무효로 만들지 않는다.
+- EODHD 목록에는 날짜가 없으므로 그 assertion은 공급자 시계열 전체에서 유효하다(`valid_from_us`는
+  int64 최소값, `valid_to_us`는 null). 모든 assertion의 `known_from_us`는 그 원천 receipt가 기록한
+  수집 시각이다. AAS가 그 주장이 공개돼 있었다고 보일 수 있는 가장 이른 시각이며 보수적 상한이다.
+  그래서 그 시각보다 이른 결정 시점의 strict 멤버십 판정은 이 assertion을 보지 않는다. 승격의 identity
+  해석은 지식 구간이 아니라 유효 구간과 정정 여부로 하므로 이력 전체의 가격을 해석한다.
+  `source_snapshot_id`는 원천의 `sl:` ID이고 `source_hash`는 그 주장이 나온 원천 행의
+  `aas-source-row-v1` 해시다. ETF와 DART 종목코드가 가리키지 않는 종목(우선주 등)은 issuer가 null이다.
+- 문서의 issuer는 corp code, instrument는 ISIN, assertion은 (provider, namespace, token) 순이므로 같은
+  원천에서 늘 같은 bytes가 나온다.
+
+KIND 목록과 EODHD 종목 목록 수집물은 `aas identity kr-import`가 내용 원천으로 commit한다. KIND는
+receipt(`response.json`)와 그것이 크기·SHA-256으로 가리키는 응답 하나가 한 단위이고
+(`kind-listings-<hex>`, 테이블 `listings`), EODHD는 수집 job 하나의 `complete.json`과 그것이 나열한
+파일이 한 단위다(`qveris-eodhd-exchange-symbols-<hex>`, 테이블 `symbols`). 행은 응답의 셀 값을 텍스트
+그대로(KIND는 EUC-KR 응답의 공백만 접은 셀 텍스트) 담고 요청 목록, 거래소, 상폐 요청 여부, job 상태,
+수집 시각을 함께 싣는다. 공급자 경고(`RAW_ACQUIRED_WITH_WARNINGS`)는 행의 job 상태로 남는다.
+receipt가 기록한 크기·해시와 다른 파일, 완료 문서에 없는 파일은 거부한다. `aas identity kr-build`는
+commit된 원천을 pin과 대조해 읽고 문서와 보고를 새 파일에 쓰며 설치본에는 쓰지 않는다.
+
 ## 대량 게시와 reader
 
 - `storage/bulk_generation.py`가 대량 게시를 소유한다. 입력은 연결에 보이는 staging 테이블이나 view
@@ -818,3 +859,11 @@ state v2:
 | DV-98 | 과거 날짜의 정정(휴장, 이른 마감, 재개장)은 SUPERSEDE로 게시되고 정정 선언을 받은 시각부터 알려지며, 두 선언 사이 cutoff의 strict 읽기는 grant 아래 이전 선언을, grant 없이는 아무 행도 돌려주지 않는다 | `tests/storage/test_calendar_refresh.py::test_past_corrections_are_known_from_their_declaration` | 구현 |
 | DV-99 | stale 행이 남는 선언 갱신은 게시하지 않고 거부한다 | `tests/storage/test_calendar_refresh.py::test_refresh_refuses_a_stale_plan` | 구현 |
 | DV-100 | `declared_session_end@1`은 입력 상한을 값과 물리 기준으로 쓰고 근거 `record`만 받는다 | `tests/storage/test_time_rules.py::test_declared_session_end_is_a_record_rule_on_its_bound` | 구현 |
+| DV-101 | KR instrument는 검사 숫자가 맞는 KR ISIN에서만 발급되고 EODHD 심볼·단축코드 assertion은 수집 시각부터 알려진다 | `tests/storage/test_kr_identity.py::test_kr_instruments_are_minted_from_isin_never_from_a_code` | 구현 |
+| DV-102 | 없거나 틀리거나 KR이 아닌 ISIN과 심볼·ISIN·단축코드의 모호한 매칭은 이유와 함께 미해결로 남는다 | `tests/storage/test_kr_identity.py::test_missing_invalid_and_ambiguous_isins_stay_unresolved` | 구현 |
+| DV-103 | KIND 상장일과 DART issuer 연결은 하나의 ISIN에 묶인 단축코드로만 instrument에 닿는다 | `tests/storage/test_kr_identity.py::test_kind_and_dart_reach_an_instrument_only_through_one_isin` | 구현 |
+| DV-104 | KR 원천 단위는 receipt가 기록한 크기·SHA-256과 완료 문서의 파일 목록으로 확인된다 | `tests/storage/test_kr_identity.py::test_kr_receipts_are_checked_against_their_recorded_bytes` | 구현 |
+| DV-105 | DART 매퍼는 완료된 `corp_codes` receipt 하나의 해시가 맞는 압축 문서만 읽고 다듬어지지 않은 회사명을 거부한다 | `tests/storage/test_kr_identity.py::test_dart_receipt_must_be_one_completed_corp_code_archive` | 구현 |
+| DV-106 | KR 원천은 내용 원천으로 재사용되고 commit된 원천에서 만든 문서는 누락 참조 없이 한 번에 등록된다 | `tests/storage/test_kr_identity.py::test_kr_sources_import_as_content_and_register_as_one_document` | 구현 |
+| DV-107 | KR 등록의 snapshot은 `eodhd.bars@1` 승격에서 심볼을 instrument로 해석하고 ISIN이 없는 심볼은 미해결로 둔다 | `tests/storage/test_kr_identity.py::test_kr_registry_resolves_eodhd_bars_in_promotion` | 구현 |
+| DV-108 | `identity kr-import --plan`은 쓰지 않고 `kr-build`는 새 파일에만 쓰며 그 문서는 `identity register`로 등록된다 | `tests/storage/test_kr_identity.py::test_kr_cli_imports_builds_and_registers` | 구현 |

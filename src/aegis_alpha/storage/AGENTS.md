@@ -112,6 +112,13 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   project the registry into a chunked manifest (`membership_pins.register_identity_manifest`):
   deterministic v1 parts named `<root>#NNNNN`, a suffix single documents may not use.
   A manifest root holds no members; a root with members is read as a v1 document.
+- `kr_identity` builds the KR registry document from three identity mappers
+  (`eodhd.kr_symbol@1`, `kind.listings@1`, `dart.corp_codes@1`) over committed sources and
+  commits collected KIND and EODHD symbol-list receipts as content sources. Only a KR ISIN
+  with a valid check digit mints an instrument; KIND and DART reach it only through a short
+  code EODHD binds to exactly one ISIN, and every missing or ambiguous match stays
+  unresolved with its reason rather than being derived from a code or a name. Assertions
+  are known from their receipt's retrieval instant and cite the source row hash.
 - Every contract in that document has a row in its contract/test table. A change
   that implements a `예정` row adds the named test and flips the row to `구현` in
   the same change; `tests/tools/test_data_vertical_contract.py` enforces both directions.

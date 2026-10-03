@@ -253,6 +253,34 @@ issuer, instrument, 정정 대상)를 보고한다. 충돌이나 누락이 하�
 bundle의 identity binding이 된다. `show`는 읽기 전용이다. 문서 형식, ID 발급 규칙, 충돌 정의는
 [데이터 수직 계약](design/data-vertical.md#identity-등록과-chunked-문서)이 소유한다.
 
+### KR identity
+
+```bash
+aas identity kr-import --kind-receipt KIND_DIR/response.json --eodhd-job JOB_DIR [--plan]
+aas identity kr-build --eodhd SOURCE_ID [--eodhd SOURCE_ID] [--kind SOURCE_ID] \
+  [--dart SOURCE_ID] --output registry.json [--report report.json]
+aas identity register --file registry.json --sha256 SHA256 --plan
+```
+
+`kr-import`는 수집해 둔 KIND 상장법인목록 receipt와 EODHD 거래소 종목 목록 job 디렉터리를 읽어 원본
+bytes를 `raw/`에 두고 내용 원천(`kind-listings-<hex>`, `qveris-eodhd-exchange-symbols-<hex>`)으로
+commit한다. 두 옵션 모두 반복할 수 있고, 같은 수집물을 다시 넣으면 원천을 재사용한다. `--plan`은 원천 ID,
+행 수, commit 여부만 보고하고 쓰지 않는다. commit에는 `pyarrow`(legacy extra)가 필요하다. 공급자를
+호출하지 않는다.
+
+`kr-build`는 설치본을 읽기 전용으로 열어 지정한 원천을 pin과 대조해 읽고, `eodhd.kr_symbol@1`,
+`kind.listings@1`, `dart.corp_codes@1` 매퍼로 `aas-identity-registry-v1` 문서를 `--output`에 쓴다.
+`--dart`는 DART `corp_codes` receipt 한 행을 담은 원천 자료실 `receipts` 테이블의 원천 ID다. 출력과
+`--report`는 새 파일이어야 하며 기존 파일은 덮어쓰지 않는다. 응답은 문서 SHA-256, issuer·instrument·
+assertion 수, 매퍼별 행 보고, 미해결 key의 이유별 수와 표본이다. 등록은 그 파일과 SHA-256으로 위
+`register`를 실행한다. `sl:` 원천 연결이 없으면 `register --plan`이 누락 원천으로 보고하므로 먼저
+`aas db source-link --apply`로 연결한다. 해석 규칙과 미해결 이유는
+[KR 등록](design/data-vertical.md#kr-등록)이 소유한다.
+
+`scripts/kr_identity_report.py`는 market 파일을 읽기 전용으로 열고 수집물 파일에서 같은 문서를
+메모리에서 만들어, 일봉 원천(`--symbols-prefix`, `--table`)의 EODHD 심볼이 몇 개 해석되는지와
+미해결 심볼을 이유별로 보고한다. 설치본에 쓰지 않는 검토 근거다.
+
 ## 원천 자료의 승격과 은퇴
 
 원천 자료실 자료를 공급자별 시장 dataset으로 승격하는 명령(`aas data promote`), 원천 ID 연결
