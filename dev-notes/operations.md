@@ -291,8 +291,8 @@ commit한다. 두 옵션 모두 반복할 수 있고, 같은 수집물을 다시
 원천 자료실 자료를 공급자별 시장 dataset으로 승격하는 명령(`aas data promote`), 원천 ID 연결
 (`aas db source-link`), core schema 업그레이드(`aas db migrate`), 원천 은퇴(`aas db source-retire`)와
 compact(`aas db compact`)의 계약은 [데이터 수직 계약](design/data-vertical.md)이 소유한다. 현재 CLI에는
-`aas db migrate`, `aas data promote`·`promotions`, `aas calendar refresh`와 위 [원본 자료 이전과 조회](#원본-자료-이전과-조회)의
-`source-link`가 있다. 은퇴와 compact는 그 계약의 대응표 행이 `구현`이 될 때 이 절에 추가된다.
+`aas db migrate`, `aas data promote`·`promotions`, `aas calendar refresh`, `aas import legacy`와 위
+[원본 자료 이전과 조회](#원본-자료-이전과-조회)의 `source-link`가 있다. 은퇴와 compact는 그 계약의 대응표 행이 `구현`이 될 때 이 절에 추가된다.
 승격된 dataset을 읽는 소비자 경로(`read_heads`)가 연결되기 전까지 원천 자료의 연구 입력은 아래
 `register-*` 경로가 맡는다.
 
@@ -312,6 +312,35 @@ flag 분포, 시간 규칙별 null·상한 적용 수, op 분포, stale 행, 계
 기존 generation을 검증해 돌려주고, 중단된 승격은 같은 명령이나 `aas db recover`가 끝낸다. 승격은
 공급자를 호출하지 않으며, 설정된 공유 계산 예산이 있으면 그 예산 안에서 돈다. `promotions`는
 승격 intent마다 단계, generation, dataset version, 행 수, 명세 해시와 매퍼를 나열한다.
+
+### legacy 원천 편입
+
+```bash
+aas import legacy --manifest /path/to/legacy-import.json --sha256 SHA256 --plan
+aas import legacy --manifest /path/to/legacy-import.json --sha256 SHA256
+aas import legacy --manifest /path/to/legacy-import.json --sha256 SHA256 --verify
+```
+
+`import legacy`는 `aas-legacy-import-v1` manifest가 나열한 legacy 원본(Norgate 내보내기와 지수 구성 수집,
+SEC submissions·companyfacts archive, KIND·BOK·OECD 응답, FRED CSV, FMP 비수정 가격 snapshot, Norgate identity
+authority)을 `raw/`에 보존하고 원천 자료실의 내용 원천으로 commit한다. manifest 형식, loader별 완결 단위와
+출력 열, 거부 규칙은 [데이터 수직 계약](design/data-vertical.md#legacy-원천-편입)이 소유한다. 실제 경로와 기대
+수를 담은 manifest는 비공개로 두고 저장소에 넣지 않는다. 테이블 commit에는 `pyarrow`(legacy extra)가 필요하다.
+
+`--plan`은 설치본을 열지 않는다. 원본만 읽어 단위마다 행을 검증하고 원천 ID, 행 수, digest, loader의 대조
+지표와 manifest `expect`의 일치 여부(`reconciled`)를 보고하며 아무것도 쓰지 않는다. 원본은 사용자가 소유한
+단일 link의 비공개 파일이어야 한다. 그룹·기타 권한이 있는 원본은 `--plan`에서도 같은 이유로 거부되므로
+편입 전에 그 디렉터리의 권한을 `go-rwx`로 바꾼다. 실행은 단위마다 원본을 `raw/`에 보존하고 테이블을 commit하며
+다시 실행하면 commit된 원천을 재사용한다. 중단되면 같은 명령을 다시 실행한다. `--verify`는 설치본을
+읽기 전용으로 열어 계획한 원천과 보존한 색인 파일이 모두 완료·동일·연결됐고 `raw/`의 원본이 온전한지 확인한다.
+보고는 항목마다 어떤 단위도 덮지 않는 파일을 `uncovered`(수, bytes, 앞의 경로)로 싣는다. 남길 파일은 manifest
+항목의 `retain` 패턴으로 `raw/`에 보존하고, 버려도 되는 파일은 `exclude` 패턴으로 기록한다. `complete`는
+`unmatched`가 0이고 `reconciled`가 참이며 `uncovered`가 0일 때만 참이고, 그때만 그 manifest의 항목 경로를 지울 수
+있다. 항목 경로가 아닌 디렉터리는 지우지 않는다. `--verify`가 `complete`가 아니거나 `--plan`·실행이
+`reconciled`가 아니면 보고를 출력하고 종료 코드 1로 끝나므로 스크립트는 종료 코드를 삭제 조건으로 쓴다. 원본 bytes는 `raw/`로 복사되므로 원본
+크기만큼의 디스크 공간과, 계획·검증마다 원본 전체를 다시 읽는 I/O 시간이 필요하다. 편입한 원천은 원천
+자료실 metadata로 `aas db verify`의 할당에 청구되므로, 수백 개 commit을 더한 설치본의 verify는 공유 계산 예산
+환경(`AAS_*_LIMIT*`, `AAS_COMPUTE_LOCK_FILE`)을 설정해 실행한다. 설정하지 않은 기본 할당은 그 metadata를 거부할 수 있다.
 
 ### 선언 달력 갱신
 
@@ -355,13 +384,16 @@ market과 state를 각각 한 트랜잭션으로 올린 다음 설치 영수증�
 
 1. `[owner]` 예약 수집을 멈추고 새 루트 복원본에서 전 과정을 먼저 실행해 시간·메모리·verify를 기록한다.
 2. `[owner]` 다른 장치에 `aas db backup`을 만들고 백업 ID를 기록한다.
-3. `aas db migrate --to 2 --backup-output DIR`, 이어서 `aas db source-link --apply`.
+3. `aas db migrate --to 2 --backup-output DIR`, 이어서 `aas db source-link --apply`. legacy 원본은
+   `aas import legacy --plan`의 `reconciled`를 확인한 뒤 실행하고 `--verify`로 `complete`를 확인한다.
 4. `aas calendar refresh --plan`을 확인하고 실행해 달력 generation을 먼저 만든다. 이어서 명세마다
    `aas data promote --plan`을 확인한 뒤 실행하고 generation마다 verify한다. 실패하면
    `aas db recover`로 게시만 재개한다. 공급자를 다시 호출하지 않는다.
 5. `[owner]` 승인된 수집기를 설정의 호출 상한과 함께 예약 실행으로 켠다.
 6. `aas db source-retire --plan`으로 은퇴 후보와 거부 이유를 확인하고 `--apply`로 증명을 통과한
    원천을 일괄 은퇴한다. `aas db compact --to NEW_ROOT`와 deep verify 뒤 설정 경로를 바꾼다.
+   설치본 밖 legacy 원본은 그 manifest의 `aas import legacy --verify`가 `complete`(미대조 파일 0 포함)이고
+   종료 코드가 0일 때 그 항목 경로만 지운다.
 
 ## 검사·복구·백업
 
