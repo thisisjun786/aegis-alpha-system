@@ -631,14 +631,15 @@ dataset의 백필은 연도 단위 generation, 이후 유지보수는 세션 단
 `sessions.xkrx`의 committed head, 그리고 dataset head를 parent로 적은 정규 문서다.
 
 1. 이력: 원천 ID 접두어 하나(`--history-lineage`)의 모든 `bars` 테이블을 pin하고 달력 연도마다
-   `eodhd.bars@1`로 승격한다.
+   `eodhd.bars@1`로 승격한다. 행이 있는데 날짜가 있는 행이 하나도 없으면 명령이 거부한다.
 2. 보류된 이력 행: 같은 접두어의 행이 있는 `quarantine` 테이블을 pin하고, 그 행들의 연도 전체를
    generation 하나로 `eodhd.bars_quarantine@1`로 승격한다. 행은 값 없는 `invalid` bar가 된다. 행이 있는
    테이블에 매핑된 이유와 날짜를 가진 행이 하나도 없으면 단계를 만들지 않고 그 행 수를
    `held_unmapped_rows`로 보고하므로 이력 연도는 막히지 않는다.
 3. 부분 응답 일간 내려받기: 원천 ID 접두어 하나(`--bulk-lineage`)의 `quarantine` 테이블 중 행이 KR
    거래소(`KO`, `KQ` → `KRW`)를 가리키는 것을 세션 날짜마다 `eodhd.bulk_quarantine@1`로 승격한다. KR과
-   다른 거래소를 섞은 테이블은 거부한다.
+   다른 거래소를 섞은 테이블은 거부한다. 어느 행도 거래소를 말하지 않는 테이블(깨진 JSON이나
+   `exchange_short_name` 없음)은 pin하지 않고 원천 ID와 행 수를 `bulk_unclassified_tables`로 보고한다.
 
 테이블은 원천의 `sl:` 연결 시각, 같으면 원천 ID 순서로 놓인다. 보류 행과 부분 응답 모두 테이블 digest가
 같은 반복 내려받기는 가장 이른 연결 하나만 pin하고, 그 연결 시각이 행의 수집 시각이 된다. 내용이 다른
@@ -1173,3 +1174,5 @@ state v2:
 | DV-157 | `partition_row_count@1`의 기준은 부분 응답 flag가 없는 완결 날짜에서만 나와 앞선 부분 응답 날과 같은 수도 `below_reference`가 된다 | `tests/storage/test_kr_prices.py::test_partial_days_are_counted_against_complete_dates_only` | 구현 |
 | DV-158 | 같은 날짜의 내용이 다른 내려받기는 연결 순서대로 이어지는 generation이 되어 나중 것이 자기 수집 시각으로 SUPERSEDE한다 | `tests/storage/test_kr_prices.py::test_a_later_different_download_of_a_day_supersedes_the_earlier` | 구현 |
 | DV-159 | 매핑된 이유와 날짜가 없는 보류 행만 있으면 보류 단계 없이 `held_unmapped_rows`를 보고하고 이력 단계는 계획된다 | `tests/storage/test_kr_prices.py::test_held_rows_without_a_mapped_date_plan_no_held_step` | 구현 |
+| DV-160 | 행이 있지만 날짜가 없는 이력 lineage는 거부된다 | `tests/storage/test_kr_prices.py::test_undated_history_is_refused` | 구현 |
+| DV-161 | 거래소를 말하지 않는 부분 응답 테이블은 pin되지 않고 `bulk_unclassified_tables`에 남는다 | `tests/storage/test_kr_prices.py::test_bulk_tables_naming_no_exchange_are_listed` | 구현 |

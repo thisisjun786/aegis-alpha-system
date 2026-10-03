@@ -485,10 +485,13 @@ def _stage_items(
         if not isinstance(items, list):
             lacking.append(source.pin.source_id)
             continue
-        rows = [(index, formats.canonical(item).decode()) for item in items]
-        for start in range(0, len(rows), _BATCH):
+        for start in range(0, len(items), _BATCH):
             market.executemany(
-                f"INSERT INTO {MANIFEST_ITEMS} VALUES (?, ?)", rows[start : start + _BATCH]
+                f"INSERT INTO {MANIFEST_ITEMS} VALUES (?, ?)",
+                [
+                    (index, formats.canonical(item).decode())
+                    for item in items[start : start + _BATCH]
+                ],
             )
     if unverified:
         plan.refusals.append(

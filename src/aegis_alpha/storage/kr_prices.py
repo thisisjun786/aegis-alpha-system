@@ -32,7 +32,9 @@ and date become successive generations of that date in link order: generation ``
 each exchange's ``k``-th download (or its last, when it has fewer), so a later download
 supersedes an earlier one with its own ingestion time and flag. A held lineage whose
 nonempty tables have no row with a mapped reason and date plans no held step and reports
-those rows as ``held_unmapped_rows``.
+those rows as ``held_unmapped_rows``; a history lineage whose nonempty tables have no
+dated row is refused. A bulk table whose rows name no exchange at all (malformed JSON or
+no ``exchange_short_name``) is not pinned and is listed in ``bulk_unclassified_tables``.
 
 ``--plan`` writes nothing and plans every step as the next child of the current head;
 a step after an unapplied one is therefore planned against a head that lacks it. An
@@ -154,6 +156,9 @@ def _history_steps(workspace: Workspace, lineage: str, *, reference: bool) -> li
         workspace.market.execute(f"SELECT min(a), max(b) FROM ({union}) t(a, b)").fetchone(),  # noqa: S608
     )
     if first is None or last is None:
+        rows = sum(count for _, _, count in tables)
+        if rows:
+            raise ValueError(f"{rows} {_HISTORY_TABLE} rows of lineage {lineage} have no date")
         return []
     name = "eodhd.bars_adjusted@1" if reference else "eodhd.bars@1"
     pins = tuple(pin for pin, _, _ in tables)
@@ -216,6 +221,7 @@ def _bulk_steps(
     )
     kept: dict[str, tuple[dict[str, str], frozenset[str], list[date]]] = {}
     repeated: list[str] = []
+    unclassified: list[dict[str, object]] = []
     for pin, target, rows in _tables(workspace, lineage, _BULK_TABLE):
         if not rows:
             continue
@@ -223,6 +229,9 @@ def _bulk_steps(
             f"SELECT DISTINCT {day}, {exchange} FROM {formats.quote_identifier(target)}"  # noqa: S608
         ).fetchall()
         exchanges = {str(row[1]) for row in found if row[1] is not None}
+        if not exchanges:
+            unclassified.append({"source_id": pin["source_id"], "rows": rows})
+            continue
         if not exchanges & set(CURRENCIES):
             continue
         if not exchanges <= set(CURRENCIES):
@@ -239,6 +248,7 @@ def _bulk_steps(
         )
     report["bulk_tables"] = len(kept)
     report["bulk_repeated_tables"] = len(repeated)
+    report["bulk_unclassified_tables"] = unclassified
     # Insertion order is link order, so each exchange's downloads of a day are in it too.
     by_day: dict[date, dict[frozenset[str], list[dict[str, str]]]] = {}
     for pin, covered, days in kept.values():

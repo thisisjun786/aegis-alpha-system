@@ -564,3 +564,27 @@ def test_held_rows_without_a_mapped_date_plan_no_held_step(ws: Workspace) -> Non
         "history"
     ]
     assert planned["held_unmapped_rows"] == 1
+
+
+def test_undated_history_is_refused(ws: Workspace) -> None:
+    undated = add_source(
+        ws, [bar("AAA.KO", cast("date", None), 100.0, retrieved=LATE)], tag="history"
+    )
+    register_symbols(ws, undated["source_id"])
+    _calendar(ws)
+    with pytest.raises(ValueError, match="1 bars rows of lineage synthetic-kr-bars have no date"):
+        _backfill(ws, apply=False)
+
+
+def test_bulk_tables_naming_no_exchange_are_listed(ws: Workspace) -> None:
+    history = add_source(ws, [bar("AAA.KO", D1, 100.0, retrieved=LATE)], tag="history")
+    register_symbols(ws, history["source_id"])
+    _calendar(ws)
+    broken = add_bulk_source(
+        ws, [("provider_reported_partial", "{not json")], tag="broken", linked=LATER
+    )
+    planned = _backfill(ws, apply=False)
+    assert planned["bulk_unclassified_tables"] == [{"rows": 1, "source_id": broken["source_id"]}]
+    assert [step["kind"] for step in cast("list[dict[str, object]]", planned["steps"])] == [
+        "history"
+    ]
