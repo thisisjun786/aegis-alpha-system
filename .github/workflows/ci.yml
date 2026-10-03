@@ -8,7 +8,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: aas-ci-${{ github.base_ref }}-${{ github.event.pull_request.number }}
+  # A title or body edit that keeps the base runs in its own `-edit` group, so it never
+  # cancels the run a push started; it still runs, because a skipped gate would satisfy
+  # the required check. A retarget stays in the main group and replaces obsolete runs.
+  group: aas-ci-${{ github.base_ref }}-${{ github.event.pull_request.number }}${{ github.event.action == 'edited' && !github.event.changes.base && '-edit' || '' }}
   cancel-in-progress: true
 
 env:
@@ -114,6 +117,17 @@ jobs:
       - run: ./scripts/verify-lane-test
         env:
           AAS_TEST_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+          # Seconds per test file as CI measures them, in the shard weight format;
+          # `python -m tests.sharding merge` joins the shards into the weight table.
+          PYTEST_ADDOPTS: --test-durations-out=${{ runner.temp }}/durations-${{ matrix.shard }}.json
+      - name: Publish measured test durations
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-durations-${{ matrix.shard }}
+          path: ${{ runner.temp }}/durations-${{ matrix.shard }}.json
+          retention-days: 14
+          overwrite: true
 
   database:
     needs: changes

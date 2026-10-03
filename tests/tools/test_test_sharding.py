@@ -11,7 +11,16 @@ from pathlib import Path
 
 import pytest
 
-from tests.sharding import WEIGHTS, estimates, load_weights, parse_shard, partition, select
+from tests.sharding import (
+    WEIGHTS,
+    estimates,
+    load_weights,
+    main,
+    merge,
+    parse_shard,
+    partition,
+    select,
+)
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -52,6 +61,19 @@ def test_measured_weight_wins_and_unknown_files_use_the_measured_rate() -> None:
         ["tests/a/test_slow.py"],
         ["tests/a/test_fast.py", "tests/a/test_new.py"],
     ]
+
+
+@pytest.mark.parametrize("count", range(1, 7))
+def test_selected_shards_cover_every_file_exactly_once(count: int) -> None:
+    # Uneven sizes, partial weights and more shards than some directories have files.
+    counts = {f"tests/d{index % 3}/test_{index:02d}.py": index % 7 + 1 for index in range(17)}
+    weights = {name: (index * 1300) % 9000 for index, name in enumerate(counts) if index % 2}
+    nodeids = [f"{name}::test_{case}" for name, size in counts.items() for case in range(size)]
+    shards = [select(nodeids, weights, index, count) for index in range(1, count + 1)]
+    assert frozenset().union(*shards) == frozenset(counts)
+    for left in range(count):
+        for right in range(left + 1, count):
+            assert not shards[left] & shards[right], (left + 1, right + 1)
 
 
 def test_more_shards_than_files_leaves_empty_shards() -> None:
@@ -142,9 +164,15 @@ def test_empty_shard_passes_but_an_empty_selection_does_not(
     assert result.returncode == status, result.stdout + result.stderr
 
 
-def test_durations_are_recorded_in_the_weight_format(tmp_path: Path) -> None:
+@pytest.mark.parametrize("via", ["argv", "PYTEST_ADDOPTS"])
+def test_durations_are_recorded_in_the_weight_format(tmp_path: Path, via: str) -> None:
+    # CI passes the option through PYTEST_ADDOPTS so the lane script stays unchanged.
     out = tmp_path / "durations.json"
     environment = {key: value for key, value in os.environ.items() if key != "PYTEST_ADDOPTS"}
+    option = ["--test-durations-out", str(out)]
+    if via == "PYTEST_ADDOPTS":
+        environment["PYTEST_ADDOPTS"] = f"--test-durations-out={out}"
+        option = []
     result = subprocess.run(  # noqa: S603 -- fixed pytest argv against this checkout
         [
             sys.executable,
@@ -154,8 +182,7 @@ def test_durations_are_recorded_in_the_weight_format(tmp_path: Path) -> None:
             "-p",
             "no:cacheprovider",
             f"--basetemp={tmp_path / 'inner'}",
-            "--test-durations-out",
-            str(out),
+            *option,
             "tests/engine/test_bundle.py",
         ],
         cwd=_ROOT,
@@ -167,3 +194,38 @@ def test_durations_are_recorded_in_the_weight_format(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert list(load_weights(out)) == ["tests/engine/test_bundle.py"]
+
+
+def test_shard_durations_merge_into_the_weight_table(tmp_path: Path) -> None:
+    first, second, out = (
+        tmp_path / "durations-1.json",
+        tmp_path / "durations-2.json",
+        tmp_path / "w.json",
+    )
+    first.write_text(json.dumps({"tests/b/test_b.py": 2.25, "tests/a/test_a.py": 0}))
+    second.write_text(json.dumps({"tests/c/test_c.py": 61.04}))
+    assert main(["merge", "--out", str(out), str(first), str(second)]) == 0
+    assert out.read_text() == (
+        '{\n  "tests/a/test_a.py": 0,\n  "tests/b/test_b.py": 2.2,\n'
+        '  "tests/c/test_c.py": 61.0\n}\n'
+    )
+    assert load_weights(out) == {
+        "tests/a/test_a.py": 0,
+        "tests/b/test_b.py": 2200,
+        "tests/c/test_c.py": 61000,
+    }
+
+
+def test_merge_refuses_a_file_measured_by_two_shards(tmp_path: Path) -> None:
+    first, second = tmp_path / "durations-1.json", tmp_path / "durations-2.json"
+    first.write_text(json.dumps({"tests/a/test_a.py": 1.0}))
+    second.write_text(json.dumps({"tests/a/test_a.py": 2.0}))
+    with pytest.raises(ValueError, match="more than one shard"):
+        merge([first, second])
+
+
+def test_merge_validates_each_input(tmp_path: Path) -> None:
+    bad = tmp_path / "durations-1.json"
+    bad.write_text(json.dumps({"src/a.py": 1.0}))
+    with pytest.raises(ValueError, match="test file path"):
+        merge([bad])
