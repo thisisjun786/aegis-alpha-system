@@ -1,4 +1,4 @@
-"""``aas maintain plan|run|receipt``: the scheduled daily pass and its install receipt."""
+"""``aas maintain plan|run|receipt|cutover-check``: the daily pass, its receipt and cutover."""
 
 from __future__ import annotations
 
@@ -39,6 +39,45 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
     receipt = sub.add_parser("receipt", help="Record the running installation's install receipt")
     home_option(receipt)
     receipt.add_argument("--lock", type=Path, help="The uv.lock the tool was installed from")
+    check = sub.add_parser(
+        "cutover-check",
+        help="Check the operations cutover read-only; --record keeps a passing report",
+    )
+    home_option(check)
+    check.add_argument(
+        "--backup", type=Path, required=True, help="The deep backup taken after the cutover"
+    )
+    check.add_argument(
+        "--expect-provider",
+        action="append",
+        default=[],
+        choices=("kind", "dart", "sec", "fred", "qveris"),
+        help="A provider section that must be enabled (repeatable)",
+    )
+    check.add_argument(
+        "--legacy-manifest",
+        action="append",
+        default=[],
+        type=Path,
+        help="An imported legacy-import manifest whose entry paths were deleted (repeatable)",
+    )
+    check.add_argument(
+        "--legacy-verify",
+        action="append",
+        default=[],
+        type=Path,
+        help="An `aas import legacy --verify` report of a named manifest (repeatable)",
+    )
+    check.add_argument(
+        "--removed",
+        action="append",
+        default=[],
+        type=Path,
+        help="Another deleted legacy path (repeatable)",
+    )
+    check.add_argument(
+        "--record", action="store_true", help="Keep a passing report in raw/ and runtime/"
+    )
 
 
 def execute(args: argparse.Namespace) -> dict[str, object]:
@@ -65,6 +104,8 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         from aegis_alpha.application.install_receipt import write_receipt
 
         return write_receipt(paths, lock=args.lock)
+    if args.maintain_command == "cutover-check":
+        return _cutover_check(home, args)
     config = load_config(paths)
     targets = storage_lock_targets(home, paths.stores())
     apply = args.maintain_command == "run"
@@ -86,3 +127,34 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             )
     except (sqlite3.Error, duckdb.Error):
         raise ValueError("local database operation failed; run aas db verify") from None
+
+
+def _cutover_check(home: Path, args: argparse.Namespace) -> dict[str, object]:
+    import sqlite3
+
+    import duckdb
+
+    from aegis_alpha.application.cutover import (
+        CutoverRequest,
+        check_cutover,
+        read_backup,
+        write_record,
+    )
+    from aegis_alpha.storage.workspace import open_workspace
+
+    backup = read_backup(args.backup)
+    request = CutoverRequest(
+        expect_providers=tuple(args.expect_provider),
+        legacy_manifests=tuple(args.legacy_manifest),
+        legacy_verify=tuple(args.legacy_verify),
+        removed=tuple(args.removed),
+    )
+    try:
+        with open_workspace(home) as workspace:
+            report = check_cutover(workspace, backup, request)
+            paths = workspace.paths
+    except (sqlite3.Error, duckdb.Error):
+        raise ValueError("local database operation failed; run aas db verify") from None
+    if args.record and report["passed"] is True:
+        report = {**report, "record_sha256": write_record(paths, report, request.legacy_verify)}
+    return {**report, "exit_code": 0 if report["passed"] is True else 1}
