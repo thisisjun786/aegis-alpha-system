@@ -82,12 +82,16 @@ class _NorgateActions:
     time_inputs: Final[Mapping[str, InputKind]] = {"ex_date": "date"}
     row_flags: Final[Mapping[str, str]] = {}
     manifest_items: Final = None
+    expands: Final = False
     name: str
     major: int
 
     def check_args(self, args: Mapping[str, object]) -> None:
         exact_args(f"{self.name}@{self.major}", args, {"timezone"})
         zone_arg(f"{self.name}@{self.major}", args)
+
+    def outcome(self, args: Mapping[str, object]) -> None:
+        del args
 
     def source_columns(self) -> Mapping[str, frozenset[str]]:
         return {
@@ -180,6 +184,7 @@ class NorgateStatus:
     time_inputs: Final[Mapping[str, InputKind]] = {"status_date": "date"}
     row_flags: Final[Mapping[str, str]] = {}
     manifest_items: Final = None
+    expands: Final = False
     # The master is one snapshot; it has no session date to partition on.
     partition_sql: Final = "CAST(NULL AS DATE)"
 
@@ -205,6 +210,9 @@ class NorgateStatus:
     def identity(self, args: Mapping[str, object]) -> IdentityKey:
         del args
         return _IDENTITY
+
+    def outcome(self, args: Mapping[str, object]) -> None:
+        del args
 
     def select(self, source: str, args: Mapping[str, object]) -> str:
         zone = str(args["timezone"])

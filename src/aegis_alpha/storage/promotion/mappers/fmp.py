@@ -177,12 +177,16 @@ class _FmpActions:
     time_inputs: Final[Mapping[str, InputKind]] = {"ex_date": "date"}
     row_flags: Final[Mapping[str, str]] = {}
     manifest_items: Final = None
+    expands: Final = False
     name: str
     major: int
     values: tuple[str, ...]
 
     def check_args(self, args: Mapping[str, object]) -> None:
         _revision_arg(f"{self.name}@{self.major}", args)
+
+    def outcome(self, args: Mapping[str, object]) -> None:
+        del args
 
     def identity(self, args: Mapping[str, object]) -> IdentityKey:
         del args
