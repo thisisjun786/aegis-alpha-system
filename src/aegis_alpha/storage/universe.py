@@ -208,11 +208,12 @@ def index_pairs(  # noqa: C901 -- one pass classifies every pair beside its refu
     source: str,
     report: MapperReport,
     days: dict[str, set[date]] | None = None,
-) -> list[Pair]:
-    """``norgate.index_membership@1`` over one staged table: its accepted pairs.
+) -> tuple[list[Pair], list[tuple[str, str]]]:
+    """``norgate.index_membership@1`` over one staged table: accepted pairs and every key.
 
     Every pair counts one mapper row; refusals are counted by reason in ``report``.
     ``days`` collects every date each index's rows carry, for the daily member report.
+    The keys are the ``(asset ID, index)`` of every pair, refused pairs included.
     """
     from aegis_alpha.storage.source_library_schema import quoted  # noqa: PLC0415
 
@@ -223,6 +224,7 @@ def index_pairs(  # noqa: C901 -- one pass classifies every pair beside its refu
     pairs: list[Pair] = []
     runs: dict[tuple[object, object], list[Interval]] = defaultdict(list)
     heads: list[tuple[object, ...]] = []
+    keys: list[tuple[str, str]] = []
     for row in connection.execute(query).fetchall():
         assetid, index, kind, *_rest = row
         if kind == "run":
@@ -231,6 +233,7 @@ def index_pairs(  # noqa: C901 -- one pass classifies every pair beside its refu
             heads.append(tuple(row))
     for assetid, index, _, rows, bad_value, bad_date, unordered, first, last in heads:
         report.rows += 1
+        keys.append((str(assetid), str(index)))
         name = _canonical_text(index)
         if type(assetid) is not int or assetid <= 0:
             report.refuse("assetid_invalid")
@@ -255,7 +258,7 @@ def index_pairs(  # noqa: C901 -- one pass classifies every pair beside its refu
                     tuple(sorted(runs[assetid, index])),
                 )
             )
-    return pairs
+    return pairs, keys
 
 
 # --- documents ------------------------------------------------------------------------------
@@ -436,22 +439,25 @@ def build_index_universes(
     pairs: list[Pair] = []
     known: dict[str, int] = {}
     index_days: dict[str, set[date]] = {}
+    seen: dict[tuple[str, str], int] = defaultdict(int)
     for source in sorted(sources):
         known[LINK_PREFIX + source] = link_instant(state, source)
         target = _pinned_table(workspace, source, MEMBERSHIP_TABLE)
-        pairs.extend(
-            index_pairs(workspace.market, target, LINK_PREFIX + source, report, index_days)
+        accepted, keys = index_pairs(
+            workspace.market, target, LINK_PREFIX + source, report, index_days
         )
-    seen: dict[tuple[str, str], int] = defaultdict(int)
-    for pair in pairs:
-        seen[pair.assetid, pair.index] += 1
+        pairs.extend(accepted)
+        for key in keys:
+            seen[key] += 1
+    # A pair two sources carry is refused in every source, whatever either copy holds; a
+    # copy already refused for its own reason keeps that reason.
     repeated = {key for key, count in seen.items() if count > 1}
-    for key in repeated:
-        report.accepted -= seen[key]
-        report.refused["pair_repeated"] = report.refused.get("pair_repeated", 0) + seen[key]
     by_index: dict[str, list[Pair]] = defaultdict(list)
     for pair in pairs:
-        if (pair.assetid, pair.index) not in repeated:
+        if (pair.assetid, pair.index) in repeated:
+            report.accepted -= 1
+            report.refuse("pair_repeated")
+        else:
             by_index[pair.index].append(pair)
     selected = sorted(by_index) if not indexes else sorted(set(indexes))
     missing = sorted(set(selected) - set(by_index))

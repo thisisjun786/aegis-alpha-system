@@ -232,6 +232,25 @@ def test_index_pairs_with_unreadable_values_are_refused(ws: Workspace) -> None:
         build_index_universes(ws, ["norgate-index-membership-absent"], version="v1")
 
 
+def test_a_pair_two_sources_carry_is_refused_when_one_copy_is_refused(ws: Workspace) -> None:
+    """A clean copy does not stand in for a pair another source carries and contradicts."""
+    days = [day.isoformat() for day in _days(date(2016, 5, 2), 3)]
+    first = _commit_membership(ws, "a", _rows(1, INDEX, [(days[0], "1"), (days[1], "2")]))
+    rows = [
+        *_rows(1, INDEX, [(days[0], "1"), (days[1], "1"), (days[2], "0")]),
+        *_rows(2, INDEX, [(days[0], "1")]),
+    ]
+    second = _commit_membership(ws, "b", rows)
+    _register_master(ws, [master(assetid, f"S{assetid}") for assetid in (1, 2)])
+    build = build_index_universes(ws, [first, second], version="v1")
+    assert build.report.refused == {"constituent_invalid": 1, "pair_repeated": 1}
+    assert build.report.accepted == 1
+    (universe,) = build.universes
+    assert {m["instrument_id"] for m in universe.members} == {
+        mint_instrument("norgate_assetid", "2")
+    }
+
+
 def test_index_universes_register_and_read_back(ws: Workspace) -> None:
     days = _days(date(2020, 6, 1), 10)
     rows = [
@@ -389,14 +408,50 @@ def test_universe_parts_are_filled_source_by_source(
     assert members is not None
     assert [m["instrument_id"] for m in members.members] == [f"I{i:03d}" for i in range(40)]
     assert verify_workspace(ws)["verified"] is True
-    # The same member key under another source in a later part is refused on read and verify.
-    with atomic(ws.state):
-        ws.state.execute(
-            "INSERT INTO universe_members VALUES (?,?,?,?,?,?,?,?)",
-            (pin.universe_id, parts[0].version, "I001", 0, 10, 0, None, sources[1]),
+
+
+def test_a_member_key_repeated_across_parts_is_refused(
+    ws: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Parts in source order can still repeat one member key; reading and verify refuse it."""
+    monkeypatch.setattr(membership_pins, "_MAX_BYTES", 4096)
+    body, sources = _two_source_universe(ws, 40)
+    members = cast("list[dict[str, object]]", body["members"])
+    assert members[0]["source_snapshot_id"] == sources[0]
+    members.append({**members[0], "source_snapshot_id": sources[1]})
+    canonical = membership_pins._canonical  # noqa: SLF001 -- the whole check is what is bypassed
+    with monkeypatch.context() as patched:
+        # Admit the repeated key past the whole-document check and the registration read,
+        # so each part is a valid v1 document in valid source order and only the repeat is
+        # left for the cross-part rule.
+        patched.setattr(
+            membership_pins,
+            "_canonical",
+            lambda value, *, identity, bounded=True: (
+                dict(cast("dict[str, object]", value))
+                if not bounded
+                else canonical(value, identity=identity, bounded=bounded)
+            ),
         )
-    with pytest.raises(ValueError, match=r"mismatch|repeat|order"):
+        patched.setattr(membership_pins, "verify_membership_pin", lambda *_a, **_k: None)
+        pin = register_universe_manifest(ws.state, body)
+    parts = cast("tuple[UniversePin, ...]", membership_parts(ws.state, pin))
+    holding = [
+        part.version
+        for part in parts
+        if ws.state.execute(
+            "SELECT 1 FROM universe_members WHERE universe_id=? AND version=? "
+            "AND instrument_id='I000'",
+            (pin.universe_id, part.version),
+        ).fetchone()
+    ]
+    # Source A's copy is in the first part and source B's in a later one.
+    assert len(holding) == 2  # noqa: PLR2004 -- one copy per source
+    assert holding[0] == parts[0].version
+    with pytest.raises(ValueError, match="repeat a universe member"):
         read_membership_pins(ws.state, None, pin, max_materialization_bytes=_ALLOWANCE)
+    with pytest.raises(ValueError, match="repeat a universe member"):
+        verify_workspace(ws)
 
 
 def test_universe_cli_plans_registers_and_shows(tmp_path: Path) -> None:
@@ -409,6 +464,10 @@ def test_universe_cli_plans_registers_and_shows(tmp_path: Path) -> None:
     report = tmp_path / "report.json"
     arguments = ["universe", "index", "--home", str(home), "--source", source, "--version", "v1"]
     assert main([*arguments, "--plan"]) == 0
+    with open_workspace(home) as workspace:
+        assert workspace.state.execute("SELECT count(*) FROM universe_versions").fetchone()[0] == 0
+    # A report path that cannot be created is refused before anything is registered.
+    assert main([*arguments, "--report", str(tmp_path / "absent" / "report.json")]) != 0
     with open_workspace(home) as workspace:
         assert workspace.state.execute("SELECT count(*) FROM universe_versions").fetchone()[0] == 0
     assert main([*arguments, "--report", str(report)]) == 0

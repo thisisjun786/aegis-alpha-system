@@ -63,6 +63,12 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             with open_workspace(home, writable=False, require_strategies=False) as workspace:
                 return universe.show_universe(workspace.state, args.universe_id, args.version)
         writes = not args.plan
+        report = args.report
+        if report is not None and (
+            report.exists() or report.is_symlink() or not report.parent.is_dir()
+        ):
+            # Checked before anything is registered, so a refused path never follows a write.
+            raise ValueError(f"cannot create new file {report.name}: it exists or has no folder")
         with open_workspace(
             home, writable=writes, strategy_write=writes, require_strategies=False
         ) as workspace:

@@ -901,7 +901,8 @@ Norgate security master 하나에서 모두 나온다.
   지수 이름이 다듬어진 텍스트가 아님(`indexname_invalid`), 값이 `0`/`1`이 아님(`constituent_invalid`),
   날짜가 `YYYY-MM-DD`가 아님(`date_invalid`), 날짜가 원천 행 순서로 엄격히 증가하지 않음
   (`dates_not_increasing`, 같은 날짜의 반복 포함), 두 원천이 같은 쌍을 실음(`pair_repeated`, 이어 붙이지
-  않는다). 보고의 행 단위는 쌍이다.
+  않는다). 두 원천이 실은 쌍은 한 사본이 다른 이유로 거부돼도 다른 사본을 받지 않는다: 이미 거부된 사본은
+  제 이유를 유지하고 나머지 사본이 `pair_repeated`가 된다. 보고의 행 단위는 쌍이다.
 - 상장 universe의 member는 master 행마다 `first_date`의 New York 0시부터 `last_date` 다음 날의 New York
   0시까지다. 상장 중이고 `last_date`가 없는 행은 master의 마지막 관측 세션(`through`, US 등록과 같은
   정의)까지다. `first_date`가 없거나(`listing_start_unknown`), 상폐 행에 `last_date`가 없거나
@@ -1241,5 +1242,6 @@ state v2:
 | DV-166 | 값·날짜·순서·지수 이름이 정규가 아닌 쌍은 이유와 함께 통째로 거부하고, 등록되지 않은 asset ID는 미해결로 보고한다 | `tests/storage/test_universe.py::test_index_pairs_with_unreadable_values_are_refused` | 구현 |
 | DV-167 | 지수 universe는 chunked 문서로 등록되고 재등록은 같은 pin이며, 읽기와 `aas db verify`를 통과한다 | `tests/storage/test_universe.py::test_index_universes_register_and_read_back` | 구현 |
 | DV-168 | 상장 universe의 member는 master 행의 `first_date`부터 `last_date` 다음 날까지이고 `last_date` 없는 상장 행은 `through`까지다 | `tests/storage/test_universe.py::test_listing_universe_spans_each_master_listing` | 구현 |
-| DV-169 | universe part는 원천별로 채우고, 두 part에 걸친 같은 member key는 읽기에서 거부한다 | `tests/storage/test_universe.py::test_universe_parts_are_filled_source_by_source` | 구현 |
-| DV-170 | `aas universe --plan`은 쓰지 않고, 등록한 universe를 `aas universe show`가 읽는다 | `tests/storage/test_universe.py::test_universe_cli_plans_registers_and_shows` | 구현 |
+| DV-169 | universe part는 원천별로 채우고, 원천 순서가 맞아도 두 part에 걸친 같은 member key는 읽기와 verify에서 거부한다 | `tests/storage/test_universe.py::test_universe_parts_are_filled_source_by_source`, `tests/storage/test_universe.py::test_a_member_key_repeated_across_parts_is_refused` | 구현 |
+| DV-170 | `aas universe --plan`은 쓰지 않고, 만들 수 없는 `--report` 경로는 등록 전에 거부하며, 등록한 universe를 `aas universe show`가 읽는다 | `tests/storage/test_universe.py::test_universe_cli_plans_registers_and_shows` | 구현 |
+| DV-171 | 두 원천이 실은 쌍은 한 사본이 다른 이유로 거부돼도 나머지 사본을 받지 않고 `pair_repeated`로 거부한다 | `tests/storage/test_universe.py::test_a_pair_two_sources_carry_is_refused_when_one_copy_is_refused` | 구현 |
