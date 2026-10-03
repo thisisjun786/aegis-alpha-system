@@ -194,7 +194,11 @@ chain을 준비하고 각 결정 시각을 그 chain에서 투영한다. strict 
 인지 시각, 참조 가격을 제외한다. 관측 연구 계약은 언제나 reference이므로 strict PIT는 인지
 시각이 모두 알려져 있어도 한 행도 고르지 않는다. 명시한 observed snapshot 연구 모드는 인증되지 않은 채 남고
 strict 읽기를 바꾸지 않는다. coverage는 요청 격자 전체를 기록하며 잘린 이력을 성공으로
-돌려주지 않는다. 등록·조회 명령과 문서 필드는
+돌려주지 않는다. `storage/read_heads`는 같은 투영을 DuckDB 안에서 한다. 소비자 binding의 순서 있는
+pin과 cutover 구간, 규칙 grant, flag 제외를 해석하고 필터를 scan으로 내리며, 행과 함께 binding hash와
+규칙 출처를 담은 읽기 영수증을 돌려준다. 작업 공간 진입점은 `market_inputs.load_pinned_heads`이고
+규칙 출처는 generation의 보존 증거에서 읽는다([데이터 수직 계약](design/data-vertical.md#대량-게시와-reader)).
+등록·조회 명령과 문서 필드는
 [operations](operations.md#원본-자료의-연구-입력-등록과-고정-조회)가 소유한다. 이 경로는
 원본의 진위나 PIT 자격을 인증하지 않으며 백테스트 입력으로 자동 승격하지 않는다.
 

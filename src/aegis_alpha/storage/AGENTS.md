@@ -136,6 +136,24 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   Discovery starts at the publications rather than the contract table, because a lost
   contract would otherwise hide a committed generation behind an empty scan while the
   integrity checks still pass.
+- `read_heads` projects pinned chains inside DuckDB with exactly `market.project_heads`
+  semantics; the property tests in `tests/storage/test_read_heads.py` hold the two
+  together, so a change to either changes both. A `HeadBinding` (`aas-head-binding-v1`)
+  holds ordered exact pins with contiguous `[from, to)` cutovers, the time rules it grants
+  for strict reads and the quality flags it excludes, and its hash covers all of them. A
+  pin never reads outside its interval and an uncovered date is reported, never filled.
+  An ungranted rule's time is null to a strict read; an excluded revision is never
+  available and removes the head it supersedes once known. Filters on natural-key columns
+  run before projection and others on the projected head, because a revision can move a
+  non-key date. Pins, chain links and per-generation row counts are checked before any row
+  is read (`rehash=True` rehashes every delta), and the result is sized in SQL before it
+  is fetched. Every read returns an `aas-head-read-v1` receipt that records whether every
+  delta was rehashed. A record without a head reports the reason `market_inputs` reports. `market_inputs.load_pinned_heads`
+  is the workspace entry: it checks each generation against the catalog and derives its
+  time-rule provenance from retained evidence (promotion spec, research transform or sealed
+  import), refusing a generation that has none rather than trusting a caller. A corrupted
+  provenance object is an integrity error and one too large for the allocation is
+  `ComputeResourceError`, never "not retained".
 - `market_inputs` reads pinned generations with explicit pins and a caller-owned
   compute budget, replaying the full chain per decision. Strict PIT excludes later
   revisions, unknown knowledge and reference prices; observed snapshot research is
