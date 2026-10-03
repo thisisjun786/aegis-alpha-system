@@ -1235,15 +1235,39 @@ _RECORDED_TIME_TRANSFORMS = frozenset(
 )
 
 
+# Every provenance format (promotion spec, research transform, sealed import) is read under
+# this cap when it is written, so a larger raw object is an opaque commitment.
+_PROVENANCE_BYTES = 64 * 1024 * 1024
+
+
 def _retained_document(
     workspace: Workspace, digest: str, budget: ComputeBudget
 ) -> Mapping[str, object] | None:
-    """Decode one raw object as a JSON object, or None when raw retains no such object."""
+    """Decode one raw object as a JSON object, or None when raw holds no such document.
+
+    Only an absent object, one larger than any provenance format, or bytes that are not a
+    JSON object are "no document". A hash mismatch is corruption, and a document whose
+    decoded form does not fit the caller's allocation is a resource refusal.
+    """
     _digest(digest)
-    if not (workspace.paths.raw / digest[:2] / digest).is_file():
-        return None
+    relative = digest[:2] + "/" + digest
+    with DescriptorTree.open_path(workspace.paths.raw) as tree:
+        if not tree.exists(relative):
+            return None
+        size = tree.stat(relative).st_size
+        if size > _PROVENANCE_BYTES:
+            return None
+        # Decoded JSON costs up to 32 bytes per encoded byte; charge it before reading.
+        if 32 * size > budget.available_bytes:
+            raise ComputeResourceError(
+                f"provenance document of {size} bytes needs {32 * size} bytes to decode; "
+                f"admitted materialization budget is {budget.available_bytes} bytes"
+            )
+        payload = tree.read_bytes(relative, max_bytes=size)
+    if hashlib.sha256(payload).hexdigest() != digest:
+        raise ValueError("retained provenance document hash mismatch")
     try:
-        body = decode_json(_raw_payload(workspace, digest, budget))
+        body = decode_json(payload)
     except (ValueError, TypeError, RecursionError):
         # Raw bytes that are not a JSON object are an opaque commitment, not a spec.
         return None

@@ -586,7 +586,7 @@ def test_incremental_verify_checks_links_and_leaf_rows(tmp_path: Path) -> None:
     connection.execute(
         "UPDATE market_generations SET request_hash=? WHERE generation_id='g1'", ["f" * 64]
     )
-    with pytest.raises(ValueError, match="hash/count mismatch"):
+    with pytest.raises(ValueError, match="chain link mismatch"):
         verify_generation_bulk(connection, "g2", budget=BUDGET)
     connection.close()
 

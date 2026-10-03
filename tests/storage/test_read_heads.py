@@ -25,7 +25,9 @@ import pytest
 
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.serialization import canonical_json_bytes
-from aegis_alpha.storage import market
+from aegis_alpha.storage import market, market_inputs, publication
+from aegis_alpha.storage import read_heads as heads_module
+from aegis_alpha.storage.import_document import parse_import
 from aegis_alpha.storage.market_inputs import (
     GenerationPin,
     generation_time_rules,
@@ -45,6 +47,7 @@ from aegis_alpha.storage.read_heads import (
 from aegis_alpha.storage.workspace import initialize, open_workspace
 from tests.storage.test_market_inputs import pin as legacy_pin
 from tests.storage.test_market_inputs import prices
+from tests.storage.test_publication import document as import_document
 from tests.storage.test_research_inputs import _source_row
 
 if TYPE_CHECKING:
@@ -358,6 +361,111 @@ def test_ungranted_rule_rows_excluded_from_strict(store: duckdb.DuckDBPyConnecti
                 )
 
 
+def _within(row: Row, domain: str, low: date | None, high: date | None) -> bool:
+    day = _day(row["effective_date" if domain == "corporate_actions" else "session_date"])
+    return (low is None or low <= day) and (high is None or day < high)
+
+
+def test_multi_pin_reads_match_each_pin_projection(store: duckdb.DuckDBPyConnection) -> None:
+    """Each pin serves exactly its own chain's heads inside its own interval."""
+    # Six seeds cover every (domain, shape) pair.
+    for seed in range(6):
+        rng = random.Random(300 + seed)
+        domain = ("prices", "corporate_actions")[seed % 2]
+        shape = ("providers", "same_dataset", "a_b_a")[seed % 3]
+        first = _chain(store, rng, domain=domain, dataset=f"multi{seed}a")
+        cut, later = sorted(rng.sample(DAYS[1:], 2))
+        if shape == "same_dataset":
+            # An early generation up to the cut, the head of the same chain from it: the two
+            # pins share every ancestor generation.
+            spans = [(first[0], None, cut), (first[-1], cut, None)]
+        else:
+            second = _chain(store, rng, domain=domain, dataset=f"multi{seed}b")
+            spans = [(first[-1], None, cut), (second[-1], cut, None)]
+            if shape == "a_b_a":
+                spans = [(first[-1], None, cut), (second[-1], cut, later), (first[-1], later, None)]
+        binding = HeadBinding(
+            domain,
+            tuple(HeadPin(_pin(store, generation), low, high) for generation, low, high in spans),
+        )
+        for cutoff, ingested in _cutoffs(rng, 5):
+            expected = [
+                (ordinal, row)
+                for ordinal, (generation, low, high) in enumerate(spans)
+                for row in market.project_heads(
+                    _history(store, generation), cutoff_us=cutoff, ingestion_cutoff_us=ingested
+                )
+                if _within(row, domain, low, high)
+            ]
+            read = _read(store, binding, HeadQuery(cutoff_us=cutoff, ingestion_cutoff_us=ingested))
+            assert [(row.pin, dict(row.values)) for row in read.rows] == expected, (
+                seed,
+                shape,
+                cutoff,
+                ingested,
+            )
+
+
+def test_coverage_reasons_match_market_inputs(store: duckdb.DuckDBPyConnection) -> None:
+    """A single-pin strict read reports the reasons ``market_inputs._absence`` reports."""
+    absence = market_inputs._absence  # noqa: SLF001 -- the reader this one replaces
+    decision = market_inputs._Decision  # noqa: SLF001
+    for seed in range(8):
+        rng = random.Random(200 + seed)
+        role = ("canonical", "reference")[seed % 2]
+        chain = _chain(store, rng, domain="prices", dataset=f"parity{seed}", roles=(role,))
+        history = _history(store, chain[-1])
+        binding = HeadBinding("prices", (HeadPin(_pin(store, chain[-1])),))
+        for cutoff, ingested in _cutoffs(rng, 8):
+            if cutoff is None:
+                continue
+            query = HeadQuery(
+                cutoff_us=cutoff, ingestion_cutoff_us=ingested, subjects=("A", "B"), grid=DAYS
+            )
+            report = _read(store, binding, query).coverage
+            assert report is not None
+            heads = {
+                (row["instrument_id"], row["session_date"]): row
+                for row in market.project_heads(
+                    history, cutoff_us=cutoff, ingestion_cutoff_us=ingested
+                )
+            }
+            for cell in report.cells:
+                head = heads.get((cell.instrument_id, cell.session_date))
+                if head is None:
+                    candidates = tuple(
+                        row
+                        for row in history
+                        if (row["instrument_id"], row["session_date"])
+                        == (cell.instrument_id, cell.session_date)
+                    )
+                    expected = (
+                        absence(candidates, decision(cutoff, "strict_pit", ingested), "price"),
+                    )
+                else:
+                    state = str(head["value_state"])
+                    expected = () if state == "present" else (state,)
+                assert cell.reasons == expected, (seed, cutoff, ingested, cell)
+                assert cell.present == (head is not None and head["value_state"] == "present")
+    # A retained revision whose availability is unknown or later is not a plain data gap.
+    connection = duckdb.connect()
+    market.initialize_market(connection, "synthetic")
+    late, unknown = _rows(
+        "prices",
+        [("A", DAYS[0], "late", 10, Decimal(5)), ("A", DAYS[1], "unknown", 10, Decimal(5))],
+    )
+    late["available_at_us"] = late["ingested_at_us"] = 50
+    unknown["available_at_us"] = None
+    pin = _publish(connection, "kr", [late, unknown])
+    query = HeadQuery(cutoff_us=20, subjects=("A",), grid=DAYS[:2])
+    report = _read(connection, HeadBinding("prices", (HeadPin(pin),)), query).coverage
+    assert report is not None
+    assert [cell.reasons for cell in report.cells] == [
+        ("price_unavailable",),
+        ("unknown_price_evidence",),
+    ]
+
+
 def _rows(domain: str, specs: list[tuple[str, date, str, int, Decimal | None]]) -> list[Row]:
     """Explicit price ASSERTs: (instrument, day, revision, known/available time, close)."""
     rows = []
@@ -426,6 +534,32 @@ def test_rule_grant_changes_strict_reads_only() -> None:
     inspection = _read(connection, HeadBinding("prices", (HeadPin(pin),)), HeadQuery(), rules)
     assert len(inspection.rows) == 1
     assert withheld.receipt["binding_hash"] != granted.receipt["binding_hash"]
+    # A correction known only by an ungranted rule leaves the earlier head served, and the
+    # cell says a grant held something back.
+    first = _publish(connection, "us", _rows("prices", [("A", DAYS[0], "u1", 10, Decimal(5))]))
+    original = _rows("prices", [("A", DAYS[0], "u1", 10, Decimal(5))])[0]
+    correction = {
+        **original,
+        "revision_id": "u2",
+        "supersedes_revision_id": "u1",
+        "op": "SUPERSEDE",
+        "close": Decimal(7),
+        "available_at_us": 20,
+        "revision_known_at_us": 20,
+        "ingested_at_us": 20,
+    }
+    second = _publish(connection, "us", [correction], version="2", parent=first.generation_id)
+    stale = _read(
+        connection,
+        HeadBinding("prices", (HeadPin(second),)),
+        HeadQuery(cutoff_us=30, subjects=("A",), grid=(DAYS[0],)),
+        {first.generation_id: RECORDED_TIMES, second.generation_id: TimeRules(LAG, LAG)},
+    )
+    assert [row.values["revision_id"] for row in stale.rows] == ["u1"]
+    assert stale.coverage is not None
+    assert [(cell.present, cell.reasons) for cell in stale.coverage.cells] == [
+        (True, ("ungranted_time_rule",))
+    ]
 
 
 def test_cutover_gap_is_reported_not_filled() -> None:
@@ -489,10 +623,26 @@ def test_cutover_gap_is_reported_not_filled() -> None:
         (HeadPin(first, to_date=DAYS[2]), HeadPin(second, from_date=DAYS[3])),
         (HeadPin(first, to_date=DAYS[2]), HeadPin(second, from_date=DAYS[1])),
         (HeadPin(first), HeadPin(second)),
-        (HeadPin(first, to_date=DAYS[2]), HeadPin(first, from_date=DAYS[2])),
     ):
-        with pytest.raises(ValueError, match=r"contiguous|distinct"):
+        with pytest.raises(ValueError, match="contiguous"):
             HeadBinding("prices", pins)
+    # One generation may serve two separate intervals around another provider's.
+    returning = HeadBinding(
+        "prices",
+        (
+            HeadPin(second, to_date=DAYS[1]),
+            HeadPin(first, from_date=DAYS[1], to_date=DAYS[3]),
+            HeadPin(second, from_date=DAYS[3]),
+        ),
+    )
+    read = _read(connection, returning, query)
+    assert [(row.pin, row.values["session_date"], row.values["close"]) for row in read.rows] == [
+        (0, DAYS[0], Decimal(20)),
+        (1, DAYS[2], Decimal(12)),
+        (2, DAYS[3], Decimal(23)),
+    ]
+    assert read.coverage is not None
+    assert [cell.reasons for cell in read.coverage.cells] == [(), ("missing_price",), (), ()]
 
 
 def _flag(
@@ -598,19 +748,21 @@ def test_head_binding_and_receipt_formats_are_frozen() -> None:
         "heads_hash",
         "mode",
         "query",
+        "rehashed",
         "schema",
         "time_rules",
         "withheld_rules",
     ]
     assert read.receipt["schema"] == "aas-head-read-v1"
-    assert read.receipt_hash == ("c9ca40f40e256ec074334be679ca10cf95273c21ed65cf7d46373fd9030b9f33")
+    assert read.receipt["rehashed"] is False
+    assert read.receipt_hash == ("03b0d9322c8be4ae6ab0098f75f398f275df075e6f1b3837092fc70b6298b7db")
 
 
 def test_pins_are_verified_before_rows_are_read(store: duckdb.DuckDBPyConnection) -> None:
     chain = _chain(store, random.Random(7), domain="prices", dataset="verified")
     pin = _pin(store, chain[-1])
     binding = HeadBinding("prices", (HeadPin(pin),))
-    assert _read(store, binding, rehash=True).rows
+    assert _read(store, binding, rehash=True).receipt["rehashed"] is True
     for wrong in (
         replace(pin, chain_hash="0" * 64),
         replace(pin, manifest_hash="0" * 64),
@@ -622,6 +774,17 @@ def test_pins_are_verified_before_rows_are_read(store: duckdb.DuckDBPyConnection
         _read(store, HeadBinding("calendar_sessions", (HeadPin(pin),)))
     with pytest.raises(ValueError, match="time-rule provenance"):
         _read(store, binding, rules={pin.generation_id: RECORDED_TIMES})
+    # A broken link in an intermediate marker fails before any row is read, while every
+    # generation's row count still matches.
+    linked = _chain(store, random.Random(8), domain="prices", dataset="linked")
+    linked_binding = HeadBinding("prices", (HeadPin(_pin(store, linked[-1])),))
+    assert _read(store, linked_binding).rows
+    store.execute(
+        "UPDATE market_generations SET delta_hash = ? WHERE generation_id = ?",
+        ["f" * 64, linked[1]],
+    )
+    with pytest.raises(ValueError, match="chain link mismatch"):
+        _read(store, linked_binding)
     # A value edited in place passes the link and count checks and fails the rehash.
     store.execute(
         "UPDATE prices SET source_row_hash = ? WHERE generation_id = ? AND revision_id = "
@@ -637,21 +800,25 @@ def test_pins_are_verified_before_rows_are_read(store: duckdb.DuckDBPyConnection
     )
     with pytest.raises(ValueError, match="hash/count mismatch"):
         _read(store, binding)
-    # A broken link anywhere in the chain fails before any row is read.
-    store.execute(
-        "UPDATE market_generations SET delta_hash = ? WHERE generation_id = ?",
-        ["f" * 64, chain[0]],
-    )
-    with pytest.raises(ValueError, match="hash/count mismatch"):
-        _read(store, binding)
 
 
-def test_head_read_is_admitted_before_rows_are_fetched(store: duckdb.DuckDBPyConnection) -> None:
+def test_head_read_is_admitted_before_rows_are_fetched(
+    store: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
     chain = _chain(store, random.Random(11), domain="prices", dataset="budget")
     binding = HeadBinding("prices", (HeadPin(_pin(store, chain[-1])),))
     tiny = ComputeBudget(Fraction(1), 32 * 1024 * 1024)
     narrow = HeadQuery(subjects=("A",), from_date=DAYS[0], to_date=DAYS[1])
-    assert _values(_read(store, binding, narrow, budget=tiny)) is not None
+    assert _values(_read(store, binding, narrow, budget=tiny)) == [
+        row
+        for row in market.project_heads(_history(store, chain[-1]))
+        if row["instrument_id"] == "A" and row["session_date"] == DAYS[0]
+    ]
+
+    def fetched(*_: object) -> object:
+        pytest.fail("rows were fetched before the read was admitted")
+
+    monkeypatch.setattr(heads_module, "_fetch", fetched)
     with pytest.raises(ComputeResourceError, match="head read memory estimate"):
         _read(store, binding, budget=replace(tiny, reserved_bytes=8 * 1024 * 1024 - 70_000))
 
@@ -741,6 +908,34 @@ def test_time_rule_provenance_comes_from_retained_evidence(tmp_path: Path) -> No
             load_pinned_heads(
                 workspace, HeadBinding("prices", (HeadPin(opaque),)), strict, budget=BUDGET
             )
+        # A generation published from a sealed aas-market-import-v1 document has recorded times.
+        body = json.loads(import_document())
+        body.update(
+            dataset_id="prices.us.sealed", generation_id="sealed-g1", operation_id="sealed-op1"
+        )
+        body["rows"][0]["revision_id"] = "sealed-r1"
+        publication.publish_document(workspace, parse_import(json.dumps(body).encode()))
+        sealed = _pin(workspace.market, "sealed-g1")
+        assert generation_time_rules(workspace, sealed.generation_id, budget=BUDGET) == (
+            RECORDED_TIMES
+        )
+        imported = load_pinned_heads(
+            workspace,
+            HeadBinding("prices", (HeadPin(sealed),)),
+            HeadQuery(cutoff_us=100),
+            budget=BUDGET,
+        )
+        assert [row.values["revision_id"] for row in imported.rows] == ["sealed-r1"]
+        # A retained document that no longer matches its address is corruption, and one too
+        # large to decode within the allocation is a resource refusal; neither is "missing".
+        tiny = replace(BUDGET, reserved_bytes=BUDGET.available_bytes - 1024)
+        with pytest.raises(ComputeResourceError, match="provenance document"):
+            generation_time_rules(workspace, promoted.generation_id, budget=tiny)
+        path = workspace.paths.raw / digest[:2] / digest
+        path.chmod(0o600)
+        path.write_bytes(_spec((DAY_END, LAG)))
+        with pytest.raises(ValueError, match="provenance document hash mismatch"):
+            generation_time_rules(workspace, promoted.generation_id, budget=BUDGET)
         # A pin the catalog does not hold is refused before any read.
         unlisted = _publish(
             workspace.market,

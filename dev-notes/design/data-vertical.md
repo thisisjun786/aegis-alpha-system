@@ -226,6 +226,9 @@ reader는 generation의 규칙 출처를 호출자에게서 받지 않고 그 ge
 출처다. 그 문서가 `aas-{price,sessions,proxy,observation}-transform-v1` 변환이거나 marker
 `request_hash`의 raw 문서가 봉인된 `aas-market-import-v1`이면 시점은 원천 열이나 문서에 기록된
 값이므로 `source_column@1`이다. 어느 것도 아닌 generation은 출처가 보존되지 않았으므로 읽지 않는다.
+raw에 없는 객체, 출처 형식의 크기 한도(64 MiB)를 넘는 객체, JSON 객체가 아닌 바이트만 "문서 없음"이다.
+주소와 hash가 다른 raw 객체는 손상으로 거부하고, 해석한 문서가 호출자 할당에 들어가지 않으면
+`ComputeResourceError`로 거부한다.
 
 ### revision 시점
 
@@ -314,6 +317,8 @@ dataset 이름은 `<domain>.<market>.<provider>[.ref][.r<N>]`다. 한 dataset의
 
 - 구간은 겹치지 않고 빈틈 없이 순서대로 이어진다(앞 pin의 `to`가 다음 pin의 `from`). 각 날짜에는
   정확히 한 pin만 적용되고, pin은 자기 구간 밖의 행을 돌려주지 않는다.
+- 같은 generation이 떨어진 두 구간의 pin이 될 수 있다(정규 공급자 → 공백 기간의 보충 공급자 → 정규
+  공급자). 투영은 pin 순번마다 따로 한다.
 - pin 구간 안의 날짜에 그 pin의 head가 없으면 다른 pin으로 대체하지 않고 누락(`missing_<domain>`)으로,
   어느 pin도 덮지 않는 날짜는 `outside_cutover`로 coverage에 보고한다.
 - 같은 날짜에 두 공급자 값을 섞거나 평균내지 않는다.
@@ -497,11 +502,16 @@ identity 문서로 투영한다. 선택한 assertion마다 member 하나이고, 
   - 결과는 head 행(pin 번호, 도메인 값, 그 revision의 quality flag), 격자를 준 경우의 coverage, 읽기
     영수증이다. 영수증 `aas-head-read-v1`은 `binding`, `binding_hash`, `query`, `mode`,
     `time_rules`(`[pin, generation_id, available 규칙, known 규칙]` 목록), `applied_rules`,
-    `withheld_rules`, `heads`(행 수), `heads_hash`(`[pin, record_id, revision_id]` 목록의 정규 JSON
-    SHA-256)를 가진 정규 JSON이고, 그 SHA-256이 영수증 hash다.
+    `withheld_rules`, `rehashed`(모든 delta를 다시 해시했는지; 거짓이면 구조 확인만 한 읽기),
+    `heads`(행 수), `heads_hash`(`[pin, record_id, revision_id]` 목록의 정규 JSON SHA-256)를 가진 정규
+    JSON이고, 그 SHA-256이 영수증 hash다.
   - coverage 이유는 `ungranted_time_rule`, `flag_excluded`, `outside_cutover`, `tombstone`,
     `unknown_<domain>_evidence`, `<domain>_unavailable`, `reference_price`, `missing_<domain>`과
-    head의 `value_state`다(가격은 `price`, 달력은 `session`).
+    head의 `value_state`다(가격은 `price`, 달력은 `session`). head가 없는 record의 이유는
+    `market_inputs`의 strict reader와 같게, cutoff까지 알려진 마지막 revision이 정한다. 그 revision의
+    공개 시점이 null이면 `unknown_<domain>_evidence`, cutoff 뒤면 `<domain>_unavailable`이다. head를
+    돌려준 칸에도 grant가 막은 정정이나 제외한 revision이 있으면 `ungranted_time_rule`이나
+    `flag_excluded`를 남기고, 칸은 present로 둔다.
 - 분할조정·총수익 가격은 reader가 unadjusted 가격과 cutoff 시점까지 알려진 `corporate_actions`로
   계산한다. 공급자 조정 가격은 reference로만 남는다.
 
@@ -662,3 +672,5 @@ state v2:
 | DV-79 | `read_heads`는 fetch 전에 결과 크기를 SQL로 재어 할당을 넘으면 `ComputeResourceError`로 거부한다 | `tests/storage/test_read_heads.py::test_head_read_is_admitted_before_rows_are_fetched` | 구현 |
 | DV-80 | inspection·연구 읽기는 grant와 무관하고 grant 하나는 그 규칙의 시점만 strict에 허용한다 | `tests/storage/test_read_heads.py::test_rule_grant_changes_strict_reads_only` | 구현 |
 | DV-81 | strict 실행 준비는 사용한 `read_heads` 읽기 영수증을 run에 그대로 기록한다 | `tests/application/test_backtest_prepare.py::test_strict_preparation_records_head_read_receipt` | 예정 |
+| DV-82 | pin 하나의 strict 읽기는 `market_inputs` strict reader와 같은 coverage 이유를 보고한다 | `tests/storage/test_read_heads.py::test_coverage_reasons_match_market_inputs` | 구현 |
+| DV-83 | 여러 pin의 읽기는 각 pin chain의 `project_heads`를 그 pin 구간으로 거른 것과 같다 | `tests/storage/test_read_heads.py::test_multi_pin_reads_match_each_pin_projection` | 구현 |

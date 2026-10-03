@@ -22,8 +22,9 @@ projection changes the other in the same change.
   that cannot fit the caller's allocation fails as ``ComputeResourceError`` instead of
   materializing first.
 - Each read returns a receipt (``aas-head-read-v1``): the binding, the query, every
-  generation's rule provenance, the rules the read relied on or withheld, and a digest
-  of the selected heads. A run records that receipt rather than restating it.
+  generation's rule provenance, the rules the read relied on or withheld, whether every
+  delta was rehashed, and a digest of the selected heads. A run records that receipt
+  rather than restating it.
 """
 
 from __future__ import annotations
@@ -161,8 +162,7 @@ def _check_pins(pins: object) -> None:
     if any(not isinstance(item, HeadPin) for item in items):
         raise TypeError("binding pins must be head pins")
     heads = cast("tuple[HeadPin, ...]", items)
-    if len({item.pin.generation_id for item in heads}) != len(heads):
-        raise ValueError("binding pins must be distinct generations")
+    # One generation may serve several intervals (A -> B -> A); rows partition by pin ordinal.
     for previous, current in pairwise(heads):
         # Contiguous: each date belongs to exactly one pin and no pin is skipped.
         if previous.to_date is None or previous.to_date != current.from_date:
@@ -485,26 +485,47 @@ def _flagged(*, flags: bool) -> tuple[str, str, str]:
     )
 
 
-def _events(query: HeadQuery, reference: str, params: dict[str, object]) -> tuple[str, str]:
-    """``market.project_heads`` per row: 'set' the head, 'pop' it, or NULL to skip the row."""
+@dataclass(frozen=True, slots=True)
+class _Events:
+    """Per-row SQL: the projection event and what coverage reports about the row."""
+
+    event: str  # 'set' the head, 'pop' it, or NULL to skip the row (``market.project_heads``)
+    withheld: str  # a grant would have let the row through
+    seen: str  # the read can see the row at all (known by the cutoff)
+    state: str  # what the row means to coverage when it is the latest row seen
+
+
+def _events(query: HeadQuery, reference: str, params: dict[str, object]) -> _Events:
     if query.cutoff_us is None:
-        return (
+        return _Events(
             "CASE WHEN _excluded THEN CASE WHEN op <> 'ASSERT' THEN 'pop' END ELSE 'set' END",
             "false",
+            "true",
+            "CASE WHEN _excluded THEN 'flag_excluded' WHEN op = 'TOMBSTONE' THEN 'tombstone' "
+            "ELSE 'present' END",
         )
     params["cutoff"] = query.cutoff_us
-    return (
+    return _Events(
         (
             "CASE WHEN _known IS NULL OR _known > $cutoff THEN NULL "
             "WHEN _avail IS NULL OR _avail > $cutoff OR _excluded "
             "THEN CASE WHEN op <> 'ASSERT' THEN 'pop' END "
             f"WHEN {reference} THEN NULL ELSE 'set' END"
         ),
-        # Rows a grant would have let through, for coverage reasons only.
         (
             "(revision_known_at_us IS NOT NULL AND revision_known_at_us <= $cutoff AND "
             "(NOT _k_ok OR (NOT _a_ok AND available_at_us IS NOT NULL "
             "AND available_at_us <= $cutoff)))"
+        ),
+        "(_known IS NOT NULL AND _known <= $cutoff)",
+        # The order of ``market_inputs._absence`` for the latest revision known by the cutoff.
+        (
+            "CASE WHEN _excluded THEN 'flag_excluded' "
+            "WHEN _avail IS NULL THEN CASE WHEN NOT _a_ok AND available_at_us IS NOT NULL "
+            "THEN 'ungranted_time_rule' ELSE 'unknown_evidence' END "
+            "WHEN _avail > $cutoff THEN 'unavailable' "
+            f"WHEN {reference} THEN 'reference_price' "
+            "WHEN op = 'TOMBSTONE' THEN 'tombstone' ELSE 'present' END"
         ),
     )
 
@@ -524,7 +545,7 @@ def _projection(
     excluded_cte, excluded_join, excluded = _exclusion(binding, flags=flags, params=params)
     flag_cte, flag_join, flag_select = _flagged(flags=flags)
     reference = "price_role = 'reference'" if domain == "prices" else "false"
-    event, withheld = _events(query, reference, params)
+    events = _events(query, reference, params)
     selected = ", ".join(f'r."{name}"' for name in names)
     final = "" if query.grid is not None else " AND _event = 'set' AND op <> 'TOMBSTONE'"
     sql = f"""
@@ -543,22 +564,22 @@ WITH gens AS (
     FROM "{domain}" d JOIN gens g ON d.generation_id = g.generation_id {excluded_join}
   ) WHERE {" AND ".join(pre) or "true"}
 ), events AS (
-  SELECT *, {event} AS _event, {withheld} AS _withheld FROM cand
+  SELECT *, {events.event} AS _event, {events.withheld} AS _withheld, {events.seen} AS _seen,
+         {events.state} AS _state FROM cand
 ), ranked AS (
   SELECT *,
          bool_or(_withheld) OVER w AS _withheld_any,
-         bool_or(_excluded) OVER w AS _excluded_any,
+         bool_or(_excluded AND _seen) OVER w AS _excluded_any,
          bool_or(revision_known_at_us IS NULL) OVER w AS _unknown_any,
-         bool_or({reference}) OVER w AS _reference_any
+         arg_max(_state, CASE WHEN _seen THEN _seq END) OVER w AS _last_state
   FROM events
   WINDOW w AS (PARTITION BY _pin, record_id)
   QUALIFY row_number() OVER (
     PARTITION BY _pin, record_id ORDER BY (_event IS NOT NULL) DESC, _seq DESC
   ) = 1
 )
-SELECT {selected}, r._pin, r._subject, r._day, r._event, r._excluded, r._avail,
-       NOT r._a_ok AND r.available_at_us IS NOT NULL AS _a_masked, r._withheld_any,
-       r._excluded_any, r._unknown_any, r._reference_any, {flag_select} AS _flags
+SELECT {selected}, r._pin, r._subject, r._day, r._event, r._withheld_any, r._excluded_any,
+       r._unknown_any, r._last_state, {flag_select} AS _flags
 FROM (SELECT * FROM ranked WHERE {" AND ".join(post) or "true"}{final}) r {flag_join}
 ORDER BY r._pin, r.record_id"""  # noqa: S608 -- code-owned schema and fragments; values are parameters
     return _Projection(
@@ -603,34 +624,36 @@ def _admit(
         )
 
 
-def _reasons(  # noqa: C901, PLR0911 -- one decision per absence kind
-    row: Mapping[str, object], token: str, *, strict: bool
-) -> tuple[str, ...]:
-    event, op = row["_event"], row["op"]
+def _reasons(row: Mapping[str, object], token: str, *, strict: bool) -> tuple[str, ...]:
+    """A record's coverage reasons, in ``market_inputs._absence`` terms when it has no head.
+
+    A served head keeps any withheld correction or excluded revision as a reason, so a
+    consumer can tell which cells were served a value a grant or an exclusion held back.
+    """
     extra = []
     if row["_withheld_any"]:
         extra.append("ungranted_time_rule")
     if row["_excluded_any"]:
         extra.append("flag_excluded")
-    if event == "set" and op != "TOMBSTONE":
-        state = row.get("value_state", "present")
-        return () if state == "present" else (str(state),)
-    if event == "set":
-        return ("tombstone",)
-    if event == "pop":
-        if row["_excluded"]:
-            return tuple(dict.fromkeys(["flag_excluded", *extra]))
-        if row["_avail"] is None:
-            if row["_a_masked"]:
-                return tuple(dict.fromkeys(["ungranted_time_rule", *extra]))
-            return tuple(dict.fromkeys([f"unknown_{token}_evidence", *extra]))
-        return tuple(dict.fromkeys([f"{token}_unavailable", *extra]))
+    if row["_event"] == "set":
+        if row["op"] == "TOMBSTONE":
+            first: list[str] = ["tombstone"]
+        else:
+            state = row.get("value_state", "present")
+            first = [] if state == "present" else [str(state)]
+        return tuple(dict.fromkeys([*first, *extra]))
+    # No head: the latest revision the read could see says why.
+    last = row["_last_state"]
+    if last is not None and last != "present":
+        reason = {
+            "unknown_evidence": f"unknown_{token}_evidence",
+            "unavailable": f"{token}_unavailable",
+        }.get(str(last), str(last))
+        return tuple(dict.fromkeys([reason, *extra]))
     if extra:
         return tuple(extra)
     if strict and row["_unknown_any"]:
         return (f"unknown_{token}_evidence",)
-    if strict and row["_reference_any"]:
-        return ("reference_price",)
     return (f"missing_{token}",)
 
 
@@ -694,12 +717,14 @@ def _coverage(binding: HeadBinding, query: HeadQuery, records: list[_Record]) ->
     return CoverageReport(tuple(cells), tuple(report_reasons))
 
 
-def _receipt(
+def _receipt(  # noqa: PLR0913 -- the read's inputs, its verification and its result
     binding: HeadBinding,
     query: HeadQuery,
     chains: list[list[dict[str, object]]],
     time_rules: Mapping[str, TimeRules],
     rows: tuple[HeadRow, ...],
+    *,
+    rehash: bool,
 ) -> dict[str, object]:
     provenance = []
     present: set[str] = set()
@@ -719,6 +744,8 @@ def _receipt(
         "time_rules": provenance,
         "applied_rules": sorted(present & set(binding.granted_rules)) if strict else [],
         "withheld_rules": sorted(present - set(binding.granted_rules)) if strict else [],
+        # True when every delta was rehashed; false is a structure-only check.
+        "rehashed": rehash,
         "heads": len(rows),
         "heads_hash": hashlib.sha256(canonical_json_bytes(heads)).hexdigest(),
     }
@@ -776,7 +803,7 @@ def read_heads(  # noqa: PLR0913 -- binding, query and the caller-owned resource
         ) from error
     rows = tuple(record.head for record in records if record.head is not None)
     coverage = _coverage(binding, query, records) if query.grid is not None else None
-    receipt = _receipt(binding, query, chains, time_rules, rows)
+    receipt = _receipt(binding, query, chains, time_rules, rows, rehash=rehash)
     return HeadRead(
         rows,
         coverage,

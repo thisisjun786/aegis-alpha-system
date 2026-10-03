@@ -838,7 +838,7 @@ def verify_chain_links(chain: list[dict[str, object]]) -> None:
             row_count=marker["row_count"],
         )
         if link != marker["chain_hash"]:
-            raise ValueError("market generation logical hash/count mismatch")
+            raise ValueError("market generation chain link mismatch")
         parent_hash = link
 
 
