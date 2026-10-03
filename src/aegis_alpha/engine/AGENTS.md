@@ -54,6 +54,11 @@ and common tracking-window evidence. It returns missingness and exclusions,
 never resolves ticker identities, fetches profiles, certifies sources, or changes
 an asset registry. Import this owner directly.
 
+`fx_conversion` owns the granted FX conversion rule `fx_latest_fixing_on_or_before@1`:
+explicit conversion terms (price and account currency, fixing series, maximum fixing age,
+signal currency) applied to explicitly supplied fixings. It reads no store, picks no series
+and never carries a rate past its granted age.
+
 `risk` owns explicit supplied-session covariance, volatility, bounded two-asset
 weights and caller-defined drawdown/reset rules. Its results do not certify
 undocumented source strategy semantics or infer execution cadence.
