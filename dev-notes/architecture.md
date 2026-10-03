@@ -87,7 +87,11 @@ pin을 실제 저장 소유자에서 검증한 뒤 판단 슬롯마다 `engine.r
 내보내기를 소유한다. 엔진은 저장소·DuckDB·환경을 import하지 않고 application이 계산 소스
 해시와 Python·Decimal 컨텍스트 정체성을 넘긴다. 결과는 `aas backtest`가 읽는 봉투와
 `aas-prepared-backtest-v1` 출처 문서이며 `certified=false`다. 이 경로는 체결을 계산하거나
-run·요청을 등록하지 않는다. `storage/input_pins.py`·`membership_pins.py`는 관례·정의·
+run·요청을 등록하지 않는다. 가격·세션·거시 입력은 native transform generation 대신 승격한
+generation의 head binding(`heads` 참조)으로 묶을 수 있고, 그때 판단마다 그 cutoff의 `read_heads`
+읽기로 신호를 고르며 조정 신호는 비조정 bar와 cutoff까지 알려진 기업행동에서 유도한다. 출처 문서는
+그 읽기 영수증을 그대로 싣는다([데이터 수직 계약](design/data-vertical.md#strict-실행-준비의-head-binding)).
+`storage/input_pins.py`·`membership_pins.py`는 관례·정의·
 identity·universe·입력 묶음 문서를 불변으로 등록·재해시하고, `storage/run_schema.py`와
 `backtest_requests.py`는 후속 run 소비자를 위한 추가 스키마와 정규 요청 바이트 저장 API다.
 요청 형식·등록 순서·실행 조건은 [operations](operations.md#저장한-전략과-입력의-준비)가 소유한다.

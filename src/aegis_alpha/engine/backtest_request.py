@@ -43,20 +43,34 @@ _LABELS = {
     "universe": ("aas-universe-version-v1", _J),
     "derived": ("aas-derived-definition-v1", _J),
     "membership": ("aas-ensemble-membership-v1", _J),
+    "heads": ("aas-head-binding-v1", _J),
     **{"convention:" + kind: ("aas-convention-v1", _J) for kind in _CONVENTION_KINDS},
 }
-_ROLE_KINDS = {
-    "signal_prices": "generation",
-    "execution_prices": "generation",
-    "sessions": "generation",
-    "identity": "identity",
-    "universe": "universe",
-    "membership": "membership",
-    "macro": "generation",
-    "derived": "derived",
-    "proxy": "generation",
-    **{kind: "convention:" + kind for kind in _CONVENTION_KINDS},
+# The reference kinds each role accepts. A ``heads`` reference is an ``aas-head-binding-v1``
+# document: ordered exact generation pins with cutovers, time-rule grants and flag exclusions.
+_ROLE_KINDS: dict[str, tuple[str, ...]] = {
+    "signal_prices": ("generation", "heads"),
+    "execution_prices": ("generation", "heads"),
+    "sessions": ("generation", "heads"),
+    "identity": ("identity",),
+    "universe": ("universe",),
+    "membership": ("membership",),
+    "macro": ("generation", "heads"),
+    "derived": ("derived",),
+    "proxy": ("generation",),
+    "actions": ("heads",),
+    **{kind: ("convention:" + kind,) for kind in _CONVENTION_KINDS},
 }
+# The market domains a ``heads`` reference may bind in each role.
+_HEAD_DOMAINS = {
+    "signal_prices": ("prices",),
+    "execution_prices": ("prices",),
+    "sessions": ("calendar_sessions",),
+    "macro": ("macro_observations", "fx_rates"),
+    "actions": ("corporate_actions",),
+}
+_HEAD_RULE = r"^[a-z][a-z0-9_]*@[1-9][0-9]*$"
+_HEAD_FLAG = r"^[a-z][a-z0-9_]*$"
 _MULTIPLE = frozenset({"signal_prices", "execution_prices", "macro", "derived", "proxy"})
 _REQUIRED = frozenset(
     {
@@ -296,6 +310,35 @@ _PIN_SHAPES = {
     ),
     "identity": _shape({"snapshot_id": _TEXT, "content_hash": _HASH}),
     "universe": _shape({"universe_id": _TEXT, "version": _VERSION, "content_hash": _HASH}),
+    "heads": _shape(
+        {
+            "domain": {
+                "enum": sorted({item for kinds in _HEAD_DOMAINS.values() for item in kinds})
+            },
+            "pins": _items(
+                _shape(
+                    {
+                        "dataset_id": _TEXT,
+                        "version": _VERSION,
+                        "generation_id": _TEXT,
+                        "chain_hash": _HASH,
+                        "manifest_hash": _HASH,
+                        "from": _nullable(_DATE),
+                        "to": _nullable(_DATE),
+                    }
+                ),
+                minimum=1,
+            ),
+            "granted_rules": {
+                **_items({"type": "string", "pattern": _HEAD_RULE}),
+                "uniqueItems": True,
+            },
+            "excluded_flags": {
+                **_items({"type": "string", "pattern": _HEAD_FLAG}),
+                "uniqueItems": True,
+            },
+        }
+    ),
     **{
         kind: _shape({"kind": _const(kind), "id": _TEXT, "version": _VERSION, "hash": _HASH})
         for kind in ("derived", "membership")
@@ -315,7 +358,7 @@ def _ref_properties(kind: str) -> Record:
     return {
         "ref_kind": _const(kind),
         "ref_id": _TEXT,
-        "ref_version": _const(schema) if kind == "identity" else version,
+        "ref_version": _const(schema) if kind in ("identity", "heads") else version,
         "hash": _HASH,
         "hash_format": _const(fmt),
     }
@@ -339,7 +382,8 @@ _BINDING = {
                 "ref_schema": _const(_LABELS[kind][0]),
             }
         )
-        for role, kind in _ROLE_KINDS.items()
+        for role, kinds in _ROLE_KINDS.items()
+        for kind in kinds
     ]
 }
 _BINDINGS = {
@@ -554,6 +598,9 @@ def _ref(value: object) -> Record:
         expected = (pin["snapshot_id"], "aas-identity-snapshot-v1", pin["content_hash"])
     elif kind == "universe":
         expected = (pin["universe_id"], pin["version"], pin["content_hash"])
+    elif kind == "heads":
+        binding_hash = _head_binding(pin)
+        expected = (binding_hash, "aas-head-binding-v1", binding_hash)
     else:
         expected_kind = kind.removeprefix("convention:")
         if pin["kind"] != expected_kind:
@@ -561,9 +608,47 @@ def _ref(value: object) -> Record:
         expected = (pin["id"], pin["version"], pin["hash"])
     if (identity, version, digest) != expected:
         raise ValueError("reference identity disagrees with complete pin")
-    if kind != "identity":
+    if kind not in ("identity", "heads"):
         _version(version, convention=kind.startswith("convention:"))
     return row
+
+
+def _head_binding(pin: Record) -> str:
+    """Admit one head binding as ``storage.read_heads.HeadBinding`` would; return its hash.
+
+    The hash is that of the canonical ``aas-head-binding-v1`` document, so the descriptor
+    must already be in that document's spelling: grants and exclusions sorted and unique,
+    intervals ordered and contiguous with only the first start and last end open.
+    """
+    _text(pin["domain"])
+    pins = _rows(pin["pins"])
+    if not pins:
+        raise ValueError("head binding requires at least one pin")
+    previous: date | None = None
+    for index, item in enumerate(pins):
+        _fields(
+            item,
+            {"dataset_id", "version", "generation_id", "chain_hash", "manifest_hash", "from", "to"},
+        )
+        for key in ("dataset_id", "generation_id"):
+            _text(item[key])
+        _version(item["version"])
+        for key in ("chain_hash", "manifest_hash"):
+            _hash(item[key])
+        start = None if item["from"] is None else _day(item["from"])
+        end = None if item["to"] is None else _day(item["to"])
+        if start is not None and end is not None and not start < end:
+            raise ValueError("head pin cutover interval must be nonempty")
+        if index and (previous is None or start != previous):
+            raise ValueError("head pin cutover intervals must be ordered and contiguous")
+        previous = end
+    for key, pattern in (("granted_rules", _HEAD_RULE), ("excluded_flags", _HEAD_FLAG)):
+        values = [_text(value) for value in _array(pin[key])]
+        if any(re.fullmatch(pattern, value) is None for value in values):
+            raise ValueError("head binding grants are id@version and exclusions are flag names")
+        if values != sorted(set(values)):
+            raise ValueError("head binding grants and exclusions must be sorted and unique")
+    return content_sha256({"schema": "aas-head-binding-v1", **pin})
 
 
 def _binding(value: object, refs: dict[tuple[str, str, str], Record]) -> Record:
@@ -581,7 +666,7 @@ def _binding(value: object, refs: dict[tuple[str, str, str], Record]) -> Record:
         },
     )
     role, ordinal = _binding_key(row)
-    if role not in _ROLE_KINDS or row["ref_kind"] != _ROLE_KINDS[role]:
+    if role not in _ROLE_KINDS or row["ref_kind"] not in _ROLE_KINDS[role]:
         raise ValueError("unsupported role/reference pairing")
     if role not in _MULTIPLE and ordinal != 0:
         raise ValueError("singleton role requires ordinal zero")
@@ -687,6 +772,33 @@ def _selections(body: Record, bindings: dict[tuple[str, int], Record]) -> None:
         body[field] = [selected[key] for key in sorted(selected)]
 
 
+def _head_roles(body: Record, bindings: dict[tuple[str, int], Record]) -> None:
+    """Hold each head binding to its role's domain and bind actions exactly when used.
+
+    A canonical signal selection read through a head binding is an adjusted series the
+    preparation derives from unadjusted bars and the ``actions`` binding's corporate
+    actions, so that binding is required by such a selection and by nothing else.
+    """
+    refs = {_ref_key(ref): ref for ref in _rows(body["refs"])}
+    for (role, _), binding in bindings.items():
+        if binding["ref_kind"] != "heads":
+            continue
+        domain = _object(refs[_ref_key(binding)]["pin"])["domain"]
+        if domain not in _HEAD_DOMAINS[role]:
+            raise ValueError("head binding domain does not serve its role")
+    derived = any(
+        _key(row["binding"])[0] == "signal_prices"
+        and bindings[_key(row["binding"])]["ref_kind"] == "heads"
+        and row["price_role"] == "canonical"
+        and row["basis"] != "unadjusted"
+        for row in _rows(body["price_inputs"])
+    )
+    if derived != (("actions", 0) in bindings):
+        raise ValueError(
+            "an actions binding is required by, and only by, a derived canonical signal series"
+        )
+
+
 def _account(value: object, start: date, end: date, envelope: Record) -> Record:
     account = _fields(value, {"currency", "initial_cash", "cashflows"})
     _text(account["currency"])
@@ -749,6 +861,7 @@ def _prepare(document: object) -> Record:
     _strategy(body["strategy"])
     bindings = _bindings_and_refs(body)
     _selections(body, bindings)
+    _head_roles(body, bindings)
     _account_and_dates(body)
     comparison = _fields(body["comparison"], {"benchmark", "risk_free", "fx"})
     for role, value in comparison.items():

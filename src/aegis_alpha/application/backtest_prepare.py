@@ -61,6 +61,7 @@ from aegis_alpha.engine.requirements import ExecutionDefinition
 from aegis_alpha.engine.schedule import DecisionSlot, ScheduleRequest, Session, decision_slots
 from aegis_alpha.engine.signals import MacroPoint
 from aegis_alpha.storage import market
+from aegis_alpha.storage.adjusted_prices import load_adjusted_prices
 from aegis_alpha.storage.input_pins import (
     ConventionPin,
     DefinitionPin,
@@ -75,15 +76,26 @@ from aegis_alpha.storage.market_inputs import (
     PriceInputRequest,
     ReaderMode,
     admit_native_input,
+    check_sessions,
     load_pinned_heads,
     load_pinned_observations,
     load_pinned_prices,
     load_pinned_proxy,
+    load_pinned_revisions,
     load_pinned_sessions,
+    verify_head_binding,
     verify_sealed_publication,
 )
 from aegis_alpha.storage.membership_pins import IdentityPin, UniversePin, read_membership_pins
-from aegis_alpha.storage.read_heads import HeadBinding, HeadQuery, HeadRead
+from aegis_alpha.storage.read_heads import (
+    BINDING_SCHEMA,
+    HeadBinding,
+    HeadQuery,
+    HeadRead,
+    RevisionRead,
+    head_binding,
+    project_revisions,
+)
 from aegis_alpha.storage.source_library import admit_source_table
 from aegis_alpha.storage.source_reader import SourcePin, resolve_source
 from aegis_alpha.storage.strategies import load_strategy
@@ -137,12 +149,14 @@ CALCULATION_MODULES = (
     "aegis_alpha.engine.signals",
     "aegis_alpha.engine.strategy_config",
     "aegis_alpha.engine.tolerance",
+    "aegis_alpha.storage.adjusted_prices",
     "aegis_alpha.storage.import_document",
     "aegis_alpha.storage.input_pins",
     "aegis_alpha.storage.market",
     "aegis_alpha.storage.market_inputs",
     "aegis_alpha.storage.market_schema",
     "aegis_alpha.storage.membership_pins",
+    "aegis_alpha.storage.read_heads",
     "aegis_alpha.storage.research_inputs",
     "aegis_alpha.storage.rowset",
     "aegis_alpha.storage.source_library",
@@ -424,6 +438,54 @@ class _Visibility:
             if row["available_at_us"] is None or cast("int", row["available_at_us"]) <= cutoff
         )
 
+    def project_revisions(self, read: RevisionRead, cutoff: int) -> History:
+        """``project`` over a revision read, with its binding's grants and exclusions."""
+        strict = self.mode == "strict_pit"
+        if read.strict != strict:
+            raise ValueError("revision read mode disagrees with the request cutoff mode")
+        revisions = (
+            read.revisions
+            if strict
+            else tuple(
+                item
+                for item in read.revisions
+                if item.values["revision_known_at_us"] is None
+                or cast("int", item.values["revision_known_at_us"]) <= cutoff
+            )
+        )
+        heads = project_revisions(
+            revisions,
+            strict=strict,
+            cutoff_us=cutoff if strict else None,
+            ingestion_cutoff_us=self.ingestion,
+        )
+        return tuple(
+            MappingProxyType(dict(head.values))
+            for head in heads
+            if head.values["available_at_us"] is None
+            or cast("int", head.values["available_at_us"]) <= cutoff
+        )
+
+    def query(
+        self,
+        cutoff: int,
+        subjects: tuple[str, ...],
+        start: date,
+        end: date,
+        roles: tuple[str, ...] | None = None,
+    ) -> HeadQuery:
+        """One head read at ``cutoff``: strict PIT, or research under a knowledge ceiling."""
+        strict = self.mode == "strict_pit"
+        return HeadQuery(
+            cutoff_us=cutoff if strict else None,
+            ingestion_cutoff_us=self.ingestion,
+            known_ceiling_us=None if strict else cutoff,
+            subjects=subjects,
+            from_date=start,
+            to_date=end + timedelta(days=1),
+            price_roles=roles,
+        )
+
     def observed(self, row: Row, economic: date) -> date:
         known = tuple(
             cast("int", row[key])
@@ -435,7 +497,26 @@ class _Visibility:
         return _utc_day(max(known)) if known else economic
 
 
-def _sessions(history: History, visibility: _Visibility, cutoff: int) -> tuple[Session, ...]:
+@dataclass(frozen=True, slots=True)
+class _Calendar:
+    """The pinned sessions, which every decision projects at its own cutoff.
+
+    ``history`` is every revision (the schedule's candidate sessions). A head-bound
+    calendar also keeps its revision read, so each projection applies the binding's
+    grants and exclusions exactly as ``read_heads`` would at that cutoff.
+    """
+
+    history: History
+    revisions: RevisionRead | None = None
+    pin: GenerationPin | None = None
+
+    def project(self, visibility: _Visibility, cutoff: int) -> History:
+        if self.revisions is None:
+            return visibility.project(self.history, cutoff)
+        return visibility.project_revisions(self.revisions, cutoff)
+
+
+def _sessions(calendar: _Calendar, visibility: _Visibility, cutoff: int) -> tuple[Session, ...]:
     return tuple(
         Session(
             _text(row["calendar_id"]),
@@ -447,9 +528,45 @@ def _sessions(history: History, visibility: _Visibility, cutoff: int) -> tuple[S
             _text(row["timezone_version"]),
         )
         for row in sorted(
-            visibility.project(history, cutoff), key=lambda row: _day(row["session_date"])
+            calendar.project(visibility, cutoff), key=lambda row: _day(row["session_date"])
         )
     )
+
+
+def _calendar(
+    loader: _Loader, convention: Row, visibility: _Visibility, period_end: date
+) -> _Calendar:
+    """Load the pinned sessions: a native sessions generation, or a head-bound calendar.
+
+    A head-bound calendar is read once as its revisions over the request's window (the
+    history start through the period end), so each decision projects the calendar known at
+    its own cutoff under the binding's grants. Its rows must be the convention's calendar.
+    """
+    if loader.bindings["sessions", 0]["ref_kind"] == "generation":
+        pin = _generation(loader.bindings["sessions", 0])
+        loader.native(pin, "aas-sessions-transform-v1")
+        history = load_pinned_sessions(loader.workspace, pin, budget=loader.budget).history
+        return _Calendar(history, pin=pin)
+    binding = loader.binding(("sessions", 0))
+    read = load_pinned_revisions(
+        loader.workspace,
+        binding,
+        HeadQuery(
+            ingestion_cutoff_us=visibility.ingestion,
+            subjects=(_text(convention["calendar_id"]),),
+            from_date=visibility.history_start,
+            to_date=period_end + timedelta(days=1),
+        ),
+        strict=visibility.mode == "strict_pit",
+        budget=loader.budget,
+    )
+    loader.head_read(("sessions", 0), "calendar", None, read.receipt, read.receipt_hash)
+    history = tuple(item.values for item in read.revisions)
+    for row in history:
+        if any(row[key] != convention[key] for key in ("calendar_id", "venue", "timezone_version")):
+            raise ValueError("session calendar/venue/timezone conflicts with request")
+    check_sessions(history)
+    return _Calendar(history, read)
 
 
 def _stored_strategy(
@@ -484,13 +601,46 @@ class _Loader:
     bindings: Mapping[tuple[str, int], Row]
     sources: dict[SourcePin, None] = field(default_factory=dict)
     evidence: list[Row] = field(default_factory=list)
+    reads: list[Row] = field(default_factory=list)
     charge: int = 0
 
     def retain(self, name: str, value: object) -> None:
+        self._charge(value)
+        self.evidence.append({"name": name, "value": value})
+
+    def _charge(self, value: object) -> None:
         self.charge += len(canonical_json_bytes(value)) * 32
         if self.charge > self.budget.available_bytes:
             raise ComputeResourceError("prepared histories exceed aggregate materialization budget")
-        self.evidence.append({"name": name, "value": value})
+
+    def head_read(
+        self,
+        key: tuple[str, int],
+        purpose: str,
+        decision: date | None,
+        receipt: Mapping[str, object],
+        receipt_hash: str,
+    ) -> None:
+        """Record one head read's receipt exactly as the reader returned it."""
+        entry = {
+            "role": key[0],
+            "ordinal": key[1],
+            "purpose": purpose,
+            "decision_date": None if decision is None else decision.isoformat(),
+            "receipt": dict(receipt),
+            "receipt_sha256": receipt_hash,
+        }
+        self._charge(entry)
+        self.reads.append(entry)
+
+    def binding(self, key: tuple[str, int]) -> HeadBinding:
+        """The head binding a ``heads`` reference names, already admitted by the request."""
+        ref = self.bindings[key]
+        binding = head_binding({"schema": BINDING_SCHEMA, **_row(ref["pin"])})
+        if binding.binding_hash != ref["hash"]:
+            raise ValueError("head binding reference disagrees with its document")
+        verify_head_binding(self.workspace, binding, budget=self.budget)
+        return binding
 
     def native(self, pin: GenerationPin, schema: str) -> History:
         admitted = admit_native_input(
@@ -584,13 +734,40 @@ def _membership(loader: _Loader, bundle: EngineBundle) -> EnsembleMembership:
 
 
 @dataclass(frozen=True, slots=True)
+class _HeadPrices:
+    """One price selection read through a head binding, decision by decision.
+
+    ``actions`` is set for a canonical selection whose basis is adjusted: those prices are
+    derived from the binding's unadjusted bars and the corporate actions known at each
+    cutoff, never read from a provider's adjusted series.
+    """
+
+    binding: HeadBinding
+    actions: HeadBinding | None
+    instruments: tuple[str, ...]
+    currency: str
+    basis: str
+    price_role: str
+
+
+@dataclass(frozen=True, slots=True)
 class _Prices:
     role: str
-    series: PinnedPriceSeries
+    ordinal: int
+    series: PinnedPriceSeries | None
     sources: tuple[SourcePin, ...]
+    identities: History
+    universe: History
+    heads: _HeadPrices | None = None
+
+    @property
+    def instruments(self) -> tuple[str, ...]:
+        if self.heads is not None:
+            return self.heads.instruments
+        return cast("PinnedPriceSeries", self.series).request.instrument_ids
 
 
-def _prices(loader: _Loader, body: Row, calendar: Row, sessions: History) -> tuple[_Prices, ...]:
+def _memberships(loader: _Loader) -> tuple[IdentityPin, UniversePin, History, History]:
     ip = _row(loader.bindings["identity", 0]["pin"])
     up = _row(loader.bindings["universe", 0]["pin"])
     identity = IdentityPin(_text(ip["snapshot_id"]), _text(ip["content_hash"]))
@@ -611,14 +788,65 @@ def _prices(loader: _Loader, body: Row, calendar: Row, sessions: History) -> tup
             if member is not None
         ),
     )
+    return (
+        identity,
+        universe,
+        memberships.identity.members if memberships.identity is not None else (),
+        memberships.universe.members if memberships.universe is not None else (),
+    )
+
+
+def _head_instruments(loader: _Loader, instruments: tuple[str, ...], calendar: Row) -> None:
+    """The same identity and venue admission ``load_pinned_prices`` applies to its request."""
+    for instrument in instruments:
+        identity = loader.workspace.state.execute(
+            "SELECT asset_type, venue FROM instruments WHERE instrument_id=?", (instrument,)
+        ).fetchone()
+        if (
+            identity is None
+            or identity["venue"] != calendar["venue"]
+            or identity["asset_type"] == "proxy"
+        ):
+            raise ValueError("unknown or incompatible instrument identity/venue")
+
+
+def _prices(loader: _Loader, body: Row, calendar: Row, sessions: _Calendar) -> tuple[_Prices, ...]:
+    identity, universe, identities, members = _memberships(loader)
     history, period = _row(body["history"]), _row(body["period"])
     start = _day(history["start"])  # Request validation places this before period.start.
     end = max(_day(history["end"]), _day(period["end"]))
     grid = tuple(
-        sorted({day for row in sessions if start <= (day := _day(row["session_date"])) <= end})
+        sorted(
+            {day for row in sessions.history if start <= (day := _day(row["session_date"])) <= end}
+        )
     )
     result = []
     for selection in _rows(body["price_inputs"]):
+        key = _row(selection["binding"])
+        role, ordinal = _text(key["role"]), cast("int", key["ordinal"])
+        instruments = cast("tuple[str, ...]", selection["instrument_ids"])
+        if loader.bindings[role, ordinal]["ref_kind"] == "heads":
+            _head_instruments(loader, instruments, calendar)
+            derived = (
+                role == "signal_prices"
+                and selection["price_role"] == "canonical"
+                and selection["basis"] != "unadjusted"
+            )
+            heads = _HeadPrices(
+                loader.binding((role, ordinal)),
+                loader.binding(("actions", 0)) if derived else None,
+                instruments,
+                _text(selection["currency"]),
+                _text(selection["basis"]),
+                _text(selection["price_role"]),
+            )
+            result.append(_Prices(role, ordinal, None, (), identities, members, heads))
+            continue
+        if sessions.pin is None:
+            raise ValueError(
+                "a native price generation is read against a sessions generation, "
+                "not a head-bound calendar"
+            )
         pin = _generation(_selection_ref(selection, loader.bindings))
         admitted = admit_native_input(
             loader.workspace, pin, expected_schema="aas-price-transform-v1", budget=loader.budget
@@ -627,8 +855,8 @@ def _prices(loader: _Loader, body: Row, calendar: Row, sessions: History) -> tup
         loader.retain(pin.generation_id, admitted.history)
         request = PriceInputRequest(
             pin,
-            _generation(loader.bindings["sessions", 0]),
-            cast("tuple[str, ...]", selection["instrument_ids"]),
+            sessions.pin,
+            instruments,
             grid,
             _text(selection["currency"]),
             _text(selection["basis"]),
@@ -640,14 +868,109 @@ def _prices(loader: _Loader, body: Row, calendar: Row, sessions: History) -> tup
             identity_pin=identity,
             universe_pin=universe,
         )
+        series = load_pinned_prices(loader.workspace, request, budget=loader.budget)
         result.append(
             _Prices(
-                _text(_row(selection["binding"])["role"]),
-                load_pinned_prices(loader.workspace, request, budget=loader.budget),
+                role,
+                ordinal,
+                series,
                 admitted.source_pins,
+                series.identities,
+                series.universe,
             )
         )
     return tuple(result)
+
+
+def _head_bars(
+    loader: _Loader, item: _Prices, read: tuple[str, HeadQuery], decision: date | None
+) -> tuple[Row, ...]:
+    """One head read of a price selection: provider bars, or bars derived at the cutoff."""
+    heads = cast("_HeadPrices", item.heads)
+    purpose, query = read
+    if heads.actions is not None:
+        adjusted = load_adjusted_prices(
+            loader.workspace,
+            heads.binding,
+            heads.actions,
+            replace(query, price_roles=("canonical",)),
+            basis=heads.basis,
+            budget=loader.budget,
+        )
+        loader.head_read(
+            (item.role, item.ordinal), purpose, decision, adjusted.receipt, adjusted.receipt_hash
+        )
+        return tuple(row.values for row in adjusted.rows)
+    result = load_pinned_heads(
+        loader.workspace,
+        heads.binding,
+        replace(query, price_roles=(heads.price_role,)),
+        budget=loader.budget,
+    )
+    loader.head_read(
+        (item.role, item.ordinal), purpose, decision, result.receipt, result.receipt_hash
+    )
+    # A dataset may carry several bases of one bar (a provider's split-adjusted and total
+    # return references); the selection names one of them.
+    return tuple(row.values for row in result.rows if row.values["basis"] == heads.basis)
+
+
+def _admit_bar(row: Row, heads: _HeadPrices, seen: set[tuple[object, date]]) -> None:
+    """Refuse a bar the selection cannot read as its one daily bar per session."""
+    if row["currency"] != heads.currency:
+        raise ValueError("price currency/basis/role/interval conflicts with request")
+    if row["interval"] != "1d":
+        raise ValueError("price currency/basis/role/interval conflicts with request")
+    key = (row["instrument_id"], _day(row["session_date"]))
+    if key in seen:
+        raise ValueError("duplicate daily price identity")
+    seen.add(key)
+
+
+def _head_signal(
+    loader: _Loader,
+    item: _Prices,
+    visibility: _Visibility,
+    slot: DecisionSlot,
+    calendar: _Calendar,
+) -> History:
+    """The signal bars a decision may use, read at its own cutoff.
+
+    The same cells ``_eligible_prices`` admits: a present bar of an open session of the
+    calendar known at the cutoff, no later than the decision and ended by the cutoff,
+    inside the history window, whose instrument the identity and universe pins hold at
+    the bar's end as known at the cutoff.
+    """
+    heads = cast("_HeadPrices", item.heads)
+    cutoff = slot.cutoff_us
+    end = min(visibility.history_end, slot.decision_date)
+    if end < visibility.history_start:
+        return ()
+    query = visibility.query(cutoff, heads.instruments, visibility.history_start, end)
+    opened = {
+        session.session_date
+        for session in _sessions(calendar, visibility, cutoff)
+        if session.status == "open"
+    }
+    seen: set[tuple[object, date]] = set()
+    selected = []
+    for row in _head_bars(loader, item, ("decision", query), slot.decision_date):
+        _admit_bar(row, heads, seen)
+        day = _day(row["session_date"])
+        instrument = _text(row["instrument_id"])
+        bar_end = cast("int", row["bar_end_us"])
+        if (
+            row["value_state"] == "present"
+            and day in opened
+            and day <= slot.decision_date
+            and bar_end <= cutoff
+            and (row["available_at_us"] is None or cast("int", row["available_at_us"]) <= cutoff)
+            and visibility.history_start <= day <= visibility.history_end
+            and _active(item.identities, instrument, bar_end, cutoff)
+            and _active(item.universe, instrument, bar_end, cutoff)
+        ):
+            selected.append(row)
+    return tuple(sorted(selected, key=lambda row: _day(row["session_date"])))
 
 
 def _eligible_prices(
@@ -687,14 +1010,27 @@ def _eligible_prices(
 
 
 def _price_points(
-    prices: tuple[_Prices, ...], visibility: _Visibility, slot: DecisionSlot
+    loader: _Loader,
+    prices: tuple[_Prices, ...],
+    calendar: _Calendar,
+    visibility: _Visibility,
+    slot: DecisionSlot,
 ) -> dict[str, tuple[PricePoint, ...]]:
     result: dict[str, tuple[PricePoint, ...]] = {}
     for selected in prices:
         if selected.role != "signal_prices":
             continue
-        rows = _eligible_prices(selected.series, visibility, slot.cutoff_us, slot.decision_date)
-        for instrument in selected.series.request.instrument_ids:
+        rows = (
+            _eligible_prices(
+                cast("PinnedPriceSeries", selected.series),
+                visibility,
+                slot.cutoff_us,
+                slot.decision_date,
+            )
+            if selected.heads is None
+            else _head_signal(loader, selected, visibility, slot, calendar)
+        )
+        for instrument in selected.instruments:
             result[instrument] = tuple(
                 PricePoint(
                     _day(row["session_date"]),
@@ -716,13 +1052,90 @@ class _Auxiliary:
     field: str
     identity: tuple[str, str]
     prices: PinnedPriceSeries | None = None
+    # A head-bound macro or FX selection: read at each decision's cutoff.
+    binding: HeadBinding | None = None
+    key: tuple[str, int] = ("macro", 0)
+    unit: str = ""
+
+
+_FX_SERIES = re.compile(r"[A-Z]{3}/[A-Z]{3}")
+
+
+def _macro_value(item: _Auxiliary, row: Row) -> tuple[object, date, object]:
+    """A head-bound row's series, economic date and value, with its unit checked.
+
+    A macro observation is keyed by series and period. An FX fixing is the series
+    ``BASE/QUOTE`` dated by the UTC day of its fixing instant, and the unit a selection
+    declares for it is the quote currency it is stated in.
+    """
+    if item.domain == "fx_rates":
+        if row["quote_currency"] != item.unit:
+            raise ValueError("an FX selection's unit is its quote currency")
+        series = _text(row["base_currency"]) + "/" + _text(row["quote_currency"])
+        return series, _utc_day(row["fixing_at_us"]), row["rate"]
+    if row["unit"] != item.unit:
+        raise ValueError("macro unit mismatch")
+    return row["series_id"], _day(row["observation_period"]), row["value"]
+
+
+def _head_macro(
+    loader: _Loader, item: _Auxiliary, query: HeadQuery, decision: date | None
+) -> History:
+    read = load_pinned_heads(
+        loader.workspace, cast("HeadBinding", item.binding), query, budget=loader.budget
+    )
+    purpose = "admission" if decision is None else "decision"
+    loader.head_read(item.key, purpose, decision, read.receipt, read.receipt_hash)
+    return tuple(row.values for row in read.rows)
+
+
+def _head_auxiliary(loader: _Loader, selection: Row, visibility: _Visibility) -> _Auxiliary:
+    key = _row(selection["binding"])
+    position = (_text(key["role"]), cast("int", key["ordinal"]))
+    binding = loader.binding(position)
+    series = _text(selection["series_id"])
+    if binding.domain == "fx_rates" and _FX_SERIES.fullmatch(series) is None:
+        raise ValueError("an FX selection names its series BASE/QUOTE")
+    item = _Auxiliary(
+        series,
+        binding.domain,
+        (),
+        series,
+        "value",
+        ("heads", binding.binding_hash),
+        binding=binding,
+        key=position,
+        unit=_text(selection["unit"]),
+    )
+    # The pin must carry the series, as a native macro generation must; a series it does
+    # not hold by the knowledge cutoff would otherwise reach replay as silence.
+    rows = _head_macro(
+        loader,
+        item,
+        visibility.query(
+            visibility.ceiling, (series,), visibility.history_start, visibility.history_end
+        ),
+        None,
+    )
+    if not rows:
+        raise ValueError("macro binding holds no head of " + series + " by the knowledge cutoff")
+    for row in rows:
+        _macro_value(item, row)
+    return item
 
 
 def _auxiliary(
-    loader: _Loader, body: Row, definition: ExecutionDefinition, template: PriceInputRequest
+    loader: _Loader,
+    body: Row,
+    definition: ExecutionDefinition,
+    template: PriceInputRequest | None,
+    visibility: _Visibility,
 ) -> tuple[_Auxiliary, ...]:
     result = []
     for selection in _rows(body["macro_inputs"]):
+        if _selection_ref(selection, loader.bindings)["ref_kind"] == "heads":
+            result.append(_head_auxiliary(loader, selection, visibility))
+            continue
         pin = _generation(_selection_ref(selection, loader.bindings))
         domain, history = loader.generation(pin)
         series = _text(selection["series_id"])
@@ -733,6 +1146,16 @@ def _auxiliary(
         result.append(
             _Auxiliary(series, domain, history, series, "value", (pin.dataset_id, pin.version))
         )
+    return (*result, *_derived_auxiliary(loader, body, definition, template))
+
+
+def _derived_auxiliary(
+    loader: _Loader,
+    body: Row,
+    definition: ExecutionDefinition,
+    template: PriceInputRequest | None,
+) -> tuple[_Auxiliary, ...]:
+    result = []
     specs = {spec.series_id: spec for spec in definition.derived_series}
     for selection in _rows(body["derived_inputs"]):
         doc = loader.definition(_selection_ref(selection, loader.bindings))
@@ -748,6 +1171,11 @@ def _auxiliary(
                 _reject_observation_contract(loader.workspace, history)
             prices = None
             if domain == "prices":
+                if template is None:
+                    raise ValueError(
+                        "a derived price input is read like a native price generation, "
+                        "which needs a native price selection and sessions generation"
+                    )
                 history = loader.native(pin, "aas-price-transform-v1")
                 prices = load_pinned_prices(
                     loader.workspace,
@@ -829,9 +1257,41 @@ def _check_derived_domain(domain: str, history: History, series: str, field_name
         raise ValueError("derived feature history has ambiguous contract identity")
 
 
-def _aux_points(
-    item: _Auxiliary, visibility: _Visibility, slot: DecisionSlot
+def _head_aux_points(
+    loader: _Loader, item: _Auxiliary, visibility: _Visibility, slot: DecisionSlot
 ) -> tuple[tuple[date, float, date], ...]:
+    """A head-bound series as known at the decision's cutoff, within the history window."""
+    cutoff = slot.cutoff_us
+    end = min(visibility.history_end, slot.decision_date)
+    if end < visibility.history_start:
+        return ()
+    rows = _head_macro(
+        loader,
+        item,
+        visibility.query(cutoff, (item.series,), visibility.history_start, end),
+        slot.decision_date,
+    )
+    result = []
+    for row in rows:
+        series, economic, value = _macro_value(item, row)
+        if (
+            series != item.series
+            or row["value_state"] != "present"
+            or (row["available_at_us"] is not None and cast("int", row["available_at_us"]) > cutoff)
+            or not visibility.history_start <= economic <= end
+        ):
+            continue
+        result.append((economic, _number(value), visibility.observed(row, economic)))
+    if len({point[0] for point in result}) != len(result):
+        raise ValueError("ambiguous auxiliary observation dates")
+    return tuple(sorted(result))
+
+
+def _aux_points(
+    loader: _Loader, item: _Auxiliary, visibility: _Visibility, slot: DecisionSlot
+) -> tuple[tuple[date, float, date], ...]:
+    if item.binding is not None:
+        return _head_aux_points(loader, item, visibility, slot)
     cutoff = slot.cutoff_us
     result = []
     rows = (
@@ -865,13 +1325,13 @@ def _aux_points(
 
 
 def _aux_inputs(
-    items: tuple[_Auxiliary, ...], visibility: _Visibility, slot: DecisionSlot
+    loader: _Loader, items: tuple[_Auxiliary, ...], visibility: _Visibility, slot: DecisionSlot
 ) -> tuple[dict[str, tuple[MacroPoint, ...]], dict[str, Mapping[str, object]]]:
     macro: dict[str, tuple[MacroPoint, ...]] = {}
     fields: dict[str, dict[str, object]] = {}
     identities: dict[str, dict[str, tuple[str, str]]] = {}
     for item in items:
-        points = _aux_points(item, visibility, slot)
+        points = _aux_points(loader, item, visibility, slot)
         if item.field == "value":
             macro[item.name] = tuple(MacroPoint(*point) for point in points)
         else:
@@ -901,7 +1361,7 @@ def _proxies(loader: _Loader, body: Row, prices: tuple[_Prices, ...]) -> tuple[_
         instrument: item.sources
         for item in prices
         if item.role == "execution_prices"
-        for instrument in item.series.request.instrument_ids
+        for instrument in item.instruments
     }
     for selection in _rows(body["proxy_rules"]):
         pin = _generation(_selection_ref(selection, loader.bindings))
@@ -999,8 +1459,31 @@ def _warmup(
             raise ValueError(f"missing monthly bucket for {asset}; required start {required_start}")
 
 
+def _execution_rows(
+    loader: _Loader, selected: _Prices, dates: tuple[date, ...], visibility: _Visibility
+) -> History:
+    """The execution bars of the period, as known at the request's ceiling."""
+    if selected.heads is None:
+        return visibility.project(
+            cast("PinnedPriceSeries", selected.series).history, visibility.ceiling
+        )
+    if not dates:
+        return ()
+    query = visibility.query(visibility.ceiling, selected.instruments, dates[0], dates[-1])
+    rows = _head_bars(loader, selected, ("outcomes", query), None)
+    seen: set[tuple[object, date]] = set()
+    for row in rows:
+        _admit_bar(row, selected.heads, seen)
+    return tuple(
+        row
+        for row in rows
+        if row["available_at_us"] is None
+        or cast("int", row["available_at_us"]) <= visibility.ceiling
+    )
+
+
 def _outcomes(
-    prices: tuple[_Prices, ...], dates: tuple[date, ...], visibility: _Visibility
+    loader: _Loader, prices: tuple[_Prices, ...], dates: tuple[date, ...], visibility: _Visibility
 ) -> tuple[tuple[Mapping[str, float], ...], tuple[Mapping[str, float], ...]]:
     opening: dict[date, dict[str, float]] = {day: {} for day in dates}
     closing: dict[date, dict[str, float]] = {day: {} for day in dates}
@@ -1009,12 +1492,12 @@ def _outcomes(
             continue
         # Outcomes are not signal knowledge at a past decision. They are the
         # separately pinned period observations under the request's global ceiling.
-        for row in visibility.project(selected.series.history, visibility.ceiling):
+        for row in _execution_rows(loader, selected, dates, visibility):
             day = _day(row["session_date"])
             symbol = _text(row["instrument_id"])
             if (
                 day not in opening
-                or symbol not in selected.series.request.instrument_ids
+                or symbol not in selected.instruments
                 or row["value_state"] != "present"
                 or cast("int", row["bar_end_us"]) > visibility.ceiling
             ):
@@ -1032,7 +1515,7 @@ def _types(workspace: Workspace, prices: tuple[_Prices, ...]) -> dict[str, str]:
             instrument
             for item in prices
             if item.role == "execution_prices"
-            for instrument in item.series.request.instrument_ids
+            for instrument in item.instruments
         ),
     )
 
@@ -1123,14 +1606,14 @@ def _complete_automatic_months(
 
 
 def _schedule(
-    history: History, visibility: _Visibility, request: ScheduleRequest
+    calendar: _Calendar, visibility: _Visibility, request: ScheduleRequest
 ) -> tuple[DecisionSlot, ...]:
     # Candidate dates come from retained history, not a future revised latest grid.
     # Every accepted pair is independently selected by T16 at its own ceiling.
     candidates = sorted(
         {
             (_day(row["session_date"]), cast("int", row["close_at_us"]))
-            for row in history
+            for row in calendar.history
             if row["status"] == "open"
             and request.period_start <= _day(row["session_date"]) < request.period_end
         }
@@ -1142,7 +1625,7 @@ def _schedule(
         if explicit is not None and day not in explicit:
             continue
         cutoff = min(visibility.ceiling, close + request.decision_latency_us)
-        grid = _sessions(history, visibility, cutoff)
+        grid = _sessions(calendar, visibility, cutoff)
         opens = tuple(session for session in grid if session.status == "open")
         if not any(
             session.session_date == day and session.close_at_us == close for session in opens
@@ -1189,7 +1672,7 @@ def _schedule(
         raise ValueError("explicit decision has no eligible pinned session pair")
     if explicit is None:
         _complete_automatic_months(
-            _sessions(history, visibility, visibility.ceiling), request, resolved_months
+            _sessions(calendar, visibility, visibility.ceiling), request, resolved_months
         )
     return tuple(selected[day] for day in sorted(selected))
 
@@ -1210,7 +1693,7 @@ def _execution_selection(
         instrument
         for item in prices
         if item.role == "execution_prices"
-        for instrument in item.series.request.instrument_ids
+        for instrument in item.instruments
     }
     if selected != expected:
         raise ValueError("execution selection must match exact assets and proxy transitions")
@@ -1231,14 +1714,14 @@ def _target_memberships(
     targets: Mapping[date, Mapping[str, float]],
     slots: tuple[DecisionSlot, ...],
     prices: tuple[_Prices, ...],
-    sessions: History,
+    sessions: _Calendar,
     visibility: _Visibility,
 ) -> None:
     selected = {
-        instrument: item.series
+        instrument: item
         for item in prices
         if item.role == "execution_prices"
-        for instrument in item.series.request.instrument_ids
+        for instrument in item.instruments
     }
     for slot in slots:
         # Economic validity uses the execution open admitted at this cutoff,
@@ -1302,9 +1785,7 @@ def prepare_backtest(
     )
     loader = _Loader(workspace, budget, bindings)
     period = _row(body["period"])
-    sessions_pin = _generation(bindings["sessions", 0])
-    loader.native(sessions_pin, "aas-sessions-transform-v1")
-    sessions = load_pinned_sessions(workspace, sessions_pin, budget=budget).history
+    sessions = _calendar(loader, calendar, visibility, _day(period["end"]))
     schedule = ScheduleRequest(
         definition.calendar,
         _text(calendar["calendar_id"]),
@@ -1339,13 +1820,18 @@ def prepare_backtest(
     _complete_calendar(grid, visibility.history_start, schedule.period_end)
     membership = _membership(loader, bundle)
     prices = _prices(loader, body, calendar, sessions)
-    auxiliary = _auxiliary(loader, body, definition, prices[0].series.request)
+    template = next((item.series.request for item in prices if item.series is not None), None)
+    auxiliary = _auxiliary(loader, body, definition, template, visibility)
     proxies = _proxies(loader, body, prices)
     _execution_selection(prices, proxies, definition)
     decisions, features = _decisions(
-        bundle, definition, slots, visibility, (membership, prices, auxiliary, proxies)
+        bundle,
+        definition,
+        slots,
+        visibility,
+        (loader, sessions, membership, prices, auxiliary, proxies),
     )
-    opening, closing = _outcomes(prices, dates, visibility)
+    opening, closing = _outcomes(loader, prices, dates, visibility)
     sources = tuple(
         asdict(pin)
         for pin in sorted(
@@ -1375,6 +1861,8 @@ def prepare_backtest(
             "definition": definition,
             "conventions": tuple(decode_json(raw) for raw in conventions),
             "stored_inputs": loader.evidence,
+            # Every head read the preparation made, with the receipt its reader returned.
+            "head_reads": loader.reads,
             "source_pins": sources,
             "slots": slots,
             "decisions": decisions,
@@ -2209,19 +2697,24 @@ def _decisions(
     slots: tuple[DecisionSlot, ...],
     visibility: _Visibility,
     loaded: tuple[
-        EnsembleMembership, tuple[_Prices, ...], tuple[_Auxiliary, ...], tuple[_Proxy, ...]
+        _Loader,
+        _Calendar,
+        EnsembleMembership,
+        tuple[_Prices, ...],
+        tuple[_Auxiliary, ...],
+        tuple[_Proxy, ...],
     ],
 ) -> tuple[tuple[ReplayReceipt, ...], Mapping[date, Mapping[str, AssetFeatures]]]:
-    membership, prices, auxiliary, proxies = loaded
+    loader, calendar, membership, prices, auxiliary, proxies = loaded
     receipts = []
     features = {}
     for slot in slots:
-        points = _price_points(prices, visibility, slot)
+        points = _price_points(loader, prices, calendar, visibility, slot)
         points.update(
             {proxy.logical: _proxy_points(proxy, visibility, slot.cutoff_us) for proxy in proxies}
         )
         _warmup(definition, points, slot, visibility)
-        macro, derived = _aux_inputs(auxiliary, visibility, slot)
+        macro, derived = _aux_inputs(loader, auxiliary, visibility, slot)
         knowledge_as_of = _utc_day(slot.cutoff_us)
         features[slot.decision_date] = build_feature_matrix(
             points,

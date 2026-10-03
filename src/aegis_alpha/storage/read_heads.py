@@ -226,6 +226,71 @@ class HeadBinding:
         return next((index for index, item in enumerate(self.pins) if item.covers(day)), None)
 
 
+_PIN_KEYS: Final = frozenset(
+    {"dataset_id", "version", "generation_id", "chain_hash", "manifest_hash", "from", "to"}
+)
+_BINDING_KEYS: Final = frozenset({"schema", "domain", "pins", "granted_rules", "excluded_flags"})
+
+
+def _bound(value: object) -> date | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError("cutover bounds must be YYYY-MM-DD text or null")
+    day = date.fromisoformat(value)
+    if day.isoformat() != value:
+        raise ValueError("cutover bounds must be YYYY-MM-DD text")
+    return day
+
+
+def head_binding(document: Mapping[str, object]) -> HeadBinding:
+    """Parse one ``aas-head-binding-v1`` document back into the binding it spells.
+
+    The document must be exactly what ``HeadBinding.document()`` writes (sorted grants and
+    exclusions, ISO dates), so its canonical bytes and the binding hash are one identity.
+    """
+    if not isinstance(document, Mapping) or set(document) != _BINDING_KEYS:
+        raise ValueError("head binding document requires exactly its five fields")
+    if document["schema"] != BINDING_SCHEMA:
+        raise ValueError("unsupported head binding schema")
+    pins = document["pins"]
+    if not isinstance(pins, list | tuple):
+        raise TypeError("head binding pins must be a list")
+    parsed = []
+    for item in cast("list[object]", pins):
+        if not isinstance(item, Mapping) or set(item) != _PIN_KEYS:
+            raise ValueError("head pin requires exactly its seven fields")
+        entry = cast("Mapping[str, object]", item)
+        parsed.append(
+            HeadPin(
+                GenerationPin(
+                    *(
+                        cast("str", entry[key])
+                        for key in (
+                            "dataset_id",
+                            "version",
+                            "generation_id",
+                            "chain_hash",
+                            "manifest_hash",
+                        )
+                    )
+                ),
+                _bound(entry["from"]),
+                _bound(entry["to"]),
+            )
+        )
+    lists = []
+    for key in ("granted_rules", "excluded_flags"):
+        values = document[key]
+        if not isinstance(values, list | tuple):
+            raise TypeError("head binding grants and exclusions must be lists")
+        lists.append(tuple(cast("list[str]", values)))
+    binding = HeadBinding(cast("str", document["domain"]), tuple(parsed), lists[0], lists[1])
+    if canonical_json_bytes(binding.document()) != canonical_json_bytes(dict(document)):
+        raise ValueError("head binding document is not in its canonical spelling")
+    return binding
+
+
 @dataclass(frozen=True, slots=True)
 class HeadQuery:
     """Cutoffs and pushdown filters; a cutoff makes the read strict point-in-time."""
@@ -769,6 +834,48 @@ def _coverage(binding: HeadBinding, query: HeadQuery, records: list[_Record]) ->
     return CoverageReport(tuple(cells), tuple(report_reasons))
 
 
+def _generation_params(
+    binding: HeadBinding,
+    chains: list[list[dict[str, object]]],
+    time_rules: Mapping[str, TimeRules],
+    *,
+    strict: bool,
+) -> dict[str, object]:
+    """The ``gens`` parameters: each generation's pin, sequence, interval and granted times."""
+    params: dict[str, object] = {"g": [], "p": [], "s": [], "a": [], "k": [], "f": [], "t": []}
+    for ordinal, (item, chain) in enumerate(zip(binding.pins, chains, strict=True)):
+        for marker in chain:
+            rules = time_rules[str(marker["generation_id"])]
+            for key, value in (
+                ("g", marker["generation_id"]),
+                ("p", ordinal),
+                ("s", marker["sequence"]),
+                ("a", not strict or rules.granted("available_at_us", binding.granted_rules)),
+                ("k", not strict or rules.granted("revision_known_at_us", binding.granted_rules)),
+                ("f", item.from_date),
+                ("t", item.to_date),
+            ):
+                cast("list[object]", params[key]).append(value)
+    return params
+
+
+def _provenance(
+    chains: list[list[dict[str, object]]], time_rules: Mapping[str, TimeRules]
+) -> tuple[list[list[object]], set[str]]:
+    """Each generation's ``[pin, generation, available rule, known rule]`` and its granted rules.
+
+    The second value holds the rules a grant decides: neither recorded nor always null.
+    """
+    provenance: list[list[object]] = []
+    present: set[str] = set()
+    for ordinal, chain in enumerate(chains):
+        for marker in chain:
+            rules = time_rules[str(marker["generation_id"])]
+            provenance.append([ordinal, marker["generation_id"], rules.available, rules.known])
+            present.update({rules.available, rules.known} - FREE_RULES)
+    return provenance, present
+
+
 def _receipt(  # noqa: PLR0913 -- the read's inputs, its verification and its result
     binding: HeadBinding,
     query: HeadQuery,
@@ -778,13 +885,7 @@ def _receipt(  # noqa: PLR0913 -- the read's inputs, its verification and its re
     *,
     rehash: bool,
 ) -> dict[str, object]:
-    provenance = []
-    present: set[str] = set()
-    for ordinal, chain in enumerate(chains):
-        for marker in chain:
-            rules = time_rules[str(marker["generation_id"])]
-            provenance.append([ordinal, marker["generation_id"], rules.available, rules.known])
-            present.update({rules.available, rules.known} - FREE_RULES)
+    provenance, present = _provenance(chains, time_rules)
     strict = query.cutoff_us is not None
     heads = [[row.pin, row.values["record_id"], row.values["revision_id"]] for row in rows]
     return {
@@ -829,24 +930,8 @@ def read_heads(  # noqa: PLR0913 -- binding, query and the caller-owned resource
     try:
         limit_duckdb(connection, budget)
         chains = _verify_pins(connection, binding, time_rules, budget=budget, rehash=rehash)
-        params: dict[str, object] = {"g": [], "p": [], "s": [], "a": [], "k": [], "f": [], "t": []}
         strict = query.cutoff_us is not None
-        for ordinal, (item, chain) in enumerate(zip(binding.pins, chains, strict=True)):
-            for marker in chain:
-                rules = time_rules[str(marker["generation_id"])]
-                for key, value in (
-                    ("g", marker["generation_id"]),
-                    ("p", ordinal),
-                    ("s", marker["sequence"]),
-                    ("a", not strict or rules.granted("available_at_us", binding.granted_rules)),
-                    (
-                        "k",
-                        not strict or rules.granted("revision_known_at_us", binding.granted_rules),
-                    ),
-                    ("f", item.from_date),
-                    ("t", item.to_date),
-                ):
-                    cast("list[object]", params[key]).append(value)
+        params = _generation_params(binding, chains, time_rules, strict=strict)
         projection = _projection(connection, binding, query, params, held=held)
         _admit(connection, projection, query, budget)
         records = _fetch(connection, projection)
@@ -879,4 +964,178 @@ def read_heads(  # noqa: PLR0913 -- binding, query and the caller-owned resource
         MappingProxyType(receipt),
         hashlib.sha256(canonical_json_bytes(receipt)).hexdigest(),
         kept,
+    )
+
+
+REVISIONS_SCHEMA: Final = "aas-head-revisions-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class Revision:
+    """One stored revision as a read of its binding sees it.
+
+    In a strict read a time the binding does not grant is already null. ``excluded`` says
+    the revision carries a flag the binding excludes.
+    """
+
+    pin: int
+    values: Mapping[str, object]
+    excluded: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RevisionRead:
+    """Every revision a read of the binding may project, oldest generation first per pin."""
+
+    revisions: tuple[Revision, ...]
+    strict: bool
+    receipt: Mapping[str, object]
+    receipt_hash: str
+    certified: bool = field(default=False, init=False)
+
+
+def project_revisions(
+    revisions: tuple[Revision, ...],
+    *,
+    strict: bool,
+    cutoff_us: int | None = None,
+    ingestion_cutoff_us: int | None = None,
+) -> tuple[HeadRow, ...]:
+    """The heads ``read_heads`` returns for the same binding at ``cutoff_us``.
+
+    The SQL events of ``read_heads`` applied in generation order: a strict read skips a
+    revision it cannot know, removes the prior head when it knows a revision it cannot
+    use, and never selects a reference price; every read removes the prior head at an
+    excluded revision. Revisions must come from ``read_revisions`` with the same mode.
+    """
+    if strict != (cutoff_us is not None):
+        raise ValueError("a strict projection needs a cutoff and a research one none")
+    heads: dict[tuple[int, str], Revision] = {}
+    for revision in revisions:
+        values = revision.values
+        key = (revision.pin, str(values["record_id"]))
+        if (
+            ingestion_cutoff_us is not None
+            and cast("int", values["ingested_at_us"]) > ingestion_cutoff_us
+        ):
+            continue
+        known, available = values["revision_known_at_us"], values["available_at_us"]
+        if cutoff_us is not None and (known is None or cast("int", known) > cutoff_us):
+            continue
+        if revision.excluded or (
+            cutoff_us is not None and (available is None or cast("int", available) > cutoff_us)
+        ):
+            if values["op"] != "ASSERT":
+                heads.pop(key, None)
+            continue
+        if cutoff_us is not None and values.get("price_role") == "reference":
+            continue
+        heads[key] = revision
+    return tuple(
+        HeadRow(revision.pin, revision.values)
+        for key, revision in sorted(heads.items())
+        if revision.values["op"] != "TOMBSTONE"
+    )
+
+
+def read_revisions(  # noqa: PLR0913 -- binding, query and the caller-owned resources
+    connection: duckdb.DuckDBPyConnection,
+    binding: HeadBinding,
+    query: HeadQuery,
+    *,
+    strict: bool,
+    time_rules: Mapping[str, TimeRules],
+    budget: ComputeBudget,
+    rehash: bool = False,
+) -> RevisionRead:
+    """Read the revisions a consumer projects at many cutoffs, verified like ``read_heads``.
+
+    A consumer that decides at many instants (a schedule choosing each decision on the
+    calendar known at that decision) reads once and projects with ``project_revisions``.
+    The query holds no cutoff: the consumer supplies one per projection. Every filter must
+    run on natural-key columns, because a filter on a projected head cannot be applied to
+    a revision. In a strict read the times the binding does not grant are returned null,
+    exactly as ``read_heads`` treats them.
+    """
+    import duckdb  # noqa: PLC0415 -- capacity errors at the budgeted query boundary
+
+    if not isinstance(binding, HeadBinding) or not isinstance(query, HeadQuery):
+        raise TypeError("read_revisions requires a head binding and a head query")
+    if query.cutoff_us is not None or query.grid is not None:
+        raise ValueError("a revision read takes its cutoffs at projection and has no grid")
+    if strict and query.known_ceiling_us is not None:
+        raise ValueError("a known ceiling belongs to a research read only")
+    if DOMAIN_VERSIONS[binding.domain] > market_version(connection):
+        raise ValueError(f"the {binding.domain} domain needs aas db migrate --to 2")
+    domain = binding.domain
+    names = [name for name, _ in COMMON + DOMAINS[domain]]
+    try:
+        limit_duckdb(connection, budget)
+        chains = _verify_pins(connection, binding, time_rules, budget=budget, rehash=rehash)
+        params = _generation_params(binding, chains, time_rules, strict=strict)
+        pre, post = _filters(binding, query, params)
+        if post:
+            raise ValueError("a revision read filters natural-key columns only")
+        flags = market_version(connection) >= 2  # noqa: PLR2004 -- quality_flags arrive in v2
+        excluded_cte, excluded_join, excluded = _exclusion(binding, flags=flags, params=params)
+        selected = ", ".join(f'"{name}"' for name in names)
+        sql = f"""
+WITH gens AS (
+  SELECT unnest($g::VARCHAR[]) AS generation_id, unnest($p::BIGINT[]) AS _pin,
+         unnest($s::BIGINT[]) AS _seq, unnest($a::BOOLEAN[]) AS _a_ok,
+         unnest($k::BOOLEAN[]) AS _k_ok, unnest($f::DATE[]) AS _from,
+         unnest($t::DATE[]) AS _to
+){excluded_cte}
+SELECT {selected}, _pin, _subject, _excluded, NULL AS _flags FROM (
+  SELECT d.* REPLACE (
+           CASE WHEN g._a_ok THEN d.available_at_us END AS available_at_us,
+           CASE WHEN g._k_ok THEN d.revision_known_at_us END AS revision_known_at_us
+         ),
+         g._pin, g._seq, g._from, g._to,
+         {excluded} AS _excluded, {_SUBJECTS[domain][0]} AS _subject,
+         {_DATES[domain][0]} AS _day
+  FROM "{domain}" d JOIN gens g ON d.generation_id = g.generation_id {excluded_join}
+) WHERE {" AND ".join(pre) or "true"}
+ORDER BY _pin, _seq, record_id"""  # noqa: S608 -- code-owned schema and fragments; values are parameters
+        projection = _Projection(sql, tuple(names), MappingProxyType(params), domain, strict)
+        _admit(connection, projection, query, budget)
+        cursor = connection.execute(sql, params)
+        columns = [item[0] for item in cursor.description or ()]
+        revisions = []
+        while batch := cursor.fetchmany(_FETCH_ROWS):
+            for fetched in batch:
+                row = dict(zip(columns, fetched, strict=True))
+                values = {name: row[name] for name in names}
+                if values.get(PRICE_FIELDS[0]) == "ohlcv":
+                    del values[PRICE_FIELDS[0]]
+                revisions.append(
+                    Revision(int(row["_pin"]), MappingProxyType(values), bool(row["_excluded"]))
+                )
+    except duckdb.OutOfMemoryException as error:
+        raise ComputeResourceError(
+            "DuckDB cannot read revisions within admitted memory limits"
+        ) from error
+    provenance, present = _provenance(chains, time_rules)
+    listed = [
+        [item.pin, item.values["record_id"], item.values["revision_id"], item.excluded]
+        for item in revisions
+    ]
+    receipt = {
+        "schema": REVISIONS_SCHEMA,
+        "binding": binding.document(),
+        "binding_hash": binding.binding_hash,
+        "query": query.document(),
+        "mode": "strict_pit" if strict else "observed_snapshot_research",
+        "time_rules": provenance,
+        "applied_rules": sorted(present & set(binding.granted_rules)) if strict else [],
+        "withheld_rules": sorted(present - set(binding.granted_rules)) if strict else [],
+        "rehashed": rehash,
+        "revisions": len(listed),
+        "revisions_hash": hashlib.sha256(canonical_json_bytes(listed)).hexdigest(),
+    }
+    return RevisionRead(
+        tuple(revisions),
+        strict,
+        MappingProxyType(receipt),
+        hashlib.sha256(canonical_json_bytes(receipt)).hexdigest(),
     )

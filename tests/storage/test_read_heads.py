@@ -45,7 +45,9 @@ from aegis_alpha.storage.read_heads import (
     HeadQuery,
     HeadRead,
     TimeRules,
+    project_revisions,
     read_heads,
+    read_revisions,
 )
 from aegis_alpha.storage.workspace import initialize, open_workspace
 from tests.storage.test_market_inputs import pin as legacy_pin
@@ -1236,3 +1238,149 @@ def test_adjusted_receipt_pins_the_reads_and_the_rows() -> None:
             time_rules={},
             budget=BUDGET,
         )
+
+
+def _revision_binding(
+    store: duckdb.DuckDBPyConnection, rng: random.Random, seed: int, domain: str
+) -> tuple[HeadBinding, dict[str, TimeRules]]:
+    """Random rule-timed chains under one or two cutover pins, some revisions flagged."""
+    first = _chain(store, rng, domain=domain, dataset=f"rev{seed}a")
+    second = _chain(store, rng, domain=domain, dataset=f"rev{seed}b")
+    cut = rng.choice(DAYS[1:])
+    spans = (
+        [(first[-1], None, None)] if seed % 2 else [(first[-1], None, cut), (second[-1], cut, None)]
+    )
+    choices = ("source_column@1", LAG, DAY_END, "unknown_null@1")
+    rules = {
+        generation: TimeRules(rng.choice(choices), rng.choice(choices))
+        for generation in (*first, *second)
+    }
+    for generation in (*first, *second):
+        for row in _history(store, generation):
+            if row["generation_id"] == generation and rng.random() < 0.2:
+                _flag(store, generation, row, "provider_reported_partial", "")
+    binding = HeadBinding(
+        domain,
+        tuple(HeadPin(_pin(store, generation), low, high) for generation, low, high in spans),
+        granted_rules=rng.choice(((), (LAG,), (DAY_END, LAG))),
+        excluded_flags=rng.choice(((), ("provider_reported_partial",))),
+    )
+    return binding, rules
+
+
+def test_revision_projection_matches_read_heads(store: duckdb.DuckDBPyConnection) -> None:
+    """Projecting one revision read at a cutoff gives the heads a read at that cutoff gives.
+
+    Grants, exclusions, cutover pins, ingestion cutoffs and research knowledge ceilings
+    all hold, so a consumer deciding at many instants reads once.
+    """
+    for seed in range(4):
+        rng = random.Random(500 + seed)
+        domain = ("prices", "calendar_sessions")[seed // 2]
+        binding, rules = _revision_binding(store, rng, seed, domain)
+        for ingested in (None, rng.randrange(0, 140)):
+            strict = read_revisions(
+                store,
+                binding,
+                HeadQuery(ingestion_cutoff_us=ingested),
+                strict=True,
+                time_rules=rules,
+                budget=BUDGET,
+            )
+            research = read_revisions(
+                store,
+                binding,
+                HeadQuery(ingestion_cutoff_us=ingested),
+                strict=False,
+                time_rules=rules,
+                budget=BUDGET,
+            )
+            for cutoff in (0, *(rng.randrange(0, 110) for _ in range(3)), 1_000):
+                expected = _read(
+                    store, binding, HeadQuery(cutoff_us=cutoff, ingestion_cutoff_us=ingested), rules
+                )
+                projected = project_revisions(strict.revisions, strict=True, cutoff_us=cutoff)
+                assert [(row.pin, dict(row.values)) for row in projected] == [
+                    (row.pin, dict(row.values)) for row in expected.rows
+                ], (seed, ingested, cutoff)
+                ceiling = _read(
+                    store,
+                    binding,
+                    HeadQuery(known_ceiling_us=cutoff, ingestion_cutoff_us=ingested),
+                    rules,
+                )
+                candidates = tuple(
+                    item
+                    for item in research.revisions
+                    if item.values["revision_known_at_us"] is None
+                    or cast("int", item.values["revision_known_at_us"]) <= cutoff
+                )
+                assert [
+                    (row.pin, dict(row.values))
+                    for row in project_revisions(candidates, strict=False)
+                ] == [(row.pin, dict(row.values)) for row in ceiling.rows], (seed, cutoff)
+            assert strict.receipt["applied_rules"] == expected.receipt["applied_rules"]
+            assert strict.receipt["withheld_rules"] == expected.receipt["withheld_rules"]
+            assert strict.receipt["time_rules"] == expected.receipt["time_rules"]
+            assert research.receipt["applied_rules"] == []
+
+
+def test_revision_read_receipt_format_and_refusals(store: duckdb.DuckDBPyConnection) -> None:
+    rng = random.Random(600)
+    chain = _chain(store, rng, domain="prices", dataset="revprices")
+    binding = HeadBinding("prices", (HeadPin(_pin(store, chain[-1])),))
+    rules = dict.fromkeys(chain, RECORDED_TIMES)
+    read = read_revisions(
+        store, binding, HeadQuery(subjects=("A",)), strict=True, time_rules=rules, budget=BUDGET
+    )
+    listed = [
+        [item.pin, item.values["record_id"], item.values["revision_id"], item.excluded]
+        for item in read.revisions
+    ]
+    assert read.receipt == {
+        "schema": "aas-head-revisions-v1",
+        "binding": binding.document(),
+        "binding_hash": binding.binding_hash,
+        "query": HeadQuery(subjects=("A",)).document(),
+        "mode": "strict_pit",
+        "time_rules": [
+            [0, generation, "source_column@1", "source_column@1"] for generation in chain
+        ],
+        "applied_rules": [],
+        "withheld_rules": [],
+        "rehashed": False,
+        "revisions": len(listed),
+        "revisions_hash": hashlib.sha256(canonical_json_bytes(listed)).hexdigest(),
+    }
+    assert read.receipt_hash == hashlib.sha256(canonical_json_bytes(read.receipt)).hexdigest()
+    assert {item.values["instrument_id"] for item in read.revisions} == {"A"}
+    # An action's effective date is not part of its key: a revision may move it across a
+    # date filter or a cutover, so only a projected head can be filtered on it.
+    actions = _chain(store, rng, domain="corporate_actions", dataset="revactions")
+    with pytest.raises(ValueError, match="natural-key columns only"):
+        read_revisions(
+            store,
+            HeadBinding("corporate_actions", (HeadPin(_pin(store, actions[-1])),)),
+            HeadQuery(subjects=("A",)),
+            strict=True,
+            time_rules=dict.fromkeys(actions, RECORDED_TIMES),
+            budget=BUDGET,
+        )
+    with pytest.raises(ValueError, match="cutoffs at projection"):
+        read_revisions(
+            store, binding, HeadQuery(cutoff_us=1), strict=True, time_rules=rules, budget=BUDGET
+        )
+    with pytest.raises(ValueError, match="research read only"):
+        read_revisions(
+            store,
+            binding,
+            HeadQuery(known_ceiling_us=1),
+            strict=True,
+            time_rules=rules,
+            budget=BUDGET,
+        )
+    with pytest.raises(ValueError, match="strict projection needs a cutoff"):
+        project_revisions(read.revisions, strict=True)
+    tiny = replace(BUDGET, reserved_bytes=BUDGET.available_bytes - 1024)
+    with pytest.raises(ComputeResourceError, match="head read memory estimate"):
+        read_revisions(store, binding, HeadQuery(), strict=True, time_rules=rules, budget=tiny)

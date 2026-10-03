@@ -40,7 +40,13 @@ from aegis_alpha.storage.research_inputs import (
 from aegis_alpha.storage.source_reader import SourcePin
 
 if TYPE_CHECKING:
-    from aegis_alpha.storage.read_heads import HeadBinding, HeadQuery, HeadRead, TimeRules
+    from aegis_alpha.storage.read_heads import (
+        HeadBinding,
+        HeadQuery,
+        HeadRead,
+        RevisionRead,
+        TimeRules,
+    )
     from aegis_alpha.storage.workspace import Workspace
 
 type Row = Mapping[str, object]
@@ -603,6 +609,12 @@ def load_pinned_sessions(
 ) -> PinnedSessions:
     """Read the entire verified calendar chain, including unknown knowledge and closed days."""
     history = _load(workspace, pin, budget, "calendar_sessions")
+    check_sessions(history)
+    return PinnedSessions(pin, history)
+
+
+def check_sessions(history: History) -> None:
+    """Every session row is an open session with ordered hours or a closed one with none."""
     for row in history:
         match (row["status"], row["open_at_us"], row["close_at_us"]):
             case ("open", int() as opened, int() as closed) if 0 <= opened < closed:
@@ -611,7 +623,6 @@ def load_pinned_sessions(
                 pass
             case _:
                 raise ValueError("session requires ordered open/close or closed nulls")
-    return PinnedSessions(pin, history)
 
 
 def _members(
@@ -1326,20 +1337,72 @@ def load_pinned_heads(  # noqa: PLR0913 -- binding, query and the caller-owned r
     """
     from aegis_alpha.storage.read_heads import read_heads  # noqa: PLC0415 -- see above
 
+    return read_heads(
+        workspace.market,
+        binding,
+        query,
+        time_rules=_binding_time_rules(workspace, binding, budget),
+        budget=budget,
+        rehash=rehash,
+        held=held,
+    )
+
+
+def _binding_time_rules(
+    workspace: Workspace, binding: HeadBinding, budget: ComputeBudget
+) -> dict[str, TimeRules]:
+    """Each pinned generation's catalog check and retained time-rule provenance."""
     rules = {}
     for item in binding.pins:
         for marker in market.generation_chain(workspace.market, item.pin.generation_id):
             _verify_catalog(workspace, marker)
             generation = str(marker["generation_id"])
             rules[generation] = generation_time_rules(workspace, generation, budget=budget)
-    return read_heads(
+    return rules
+
+
+def verify_head_binding(
+    workspace: Workspace, binding: HeadBinding, *, budget: ComputeBudget
+) -> dict[str, TimeRules]:
+    """Check a binding's pins as a read would, without reading any row.
+
+    Every pin must equal its marker and every generation of its chain must be a committed
+    catalog version with retained time-rule provenance. Returns that provenance.
+    """
+    for item in binding.pins:
+        head = market.generation_chain(workspace.market, item.pin.generation_id)[-1]
+        if (
+            any(
+                head[key] != getattr(item.pin, key)
+                for key in ("dataset_id", "version", "generation_id", "chain_hash")
+            )
+            or head["request_hash"] != item.pin.manifest_hash
+            or head["domain"] != binding.domain
+        ):
+            raise ValueError("exact generation pin does not match its marker")
+    return _binding_time_rules(workspace, binding, budget)
+
+
+def load_pinned_revisions(  # noqa: PLR0913 -- binding, query, mode and the caller-owned resources
+    workspace: Workspace,
+    binding: HeadBinding,
+    query: HeadQuery,
+    *,
+    strict: bool,
+    budget: ComputeBudget,
+    rehash: bool = False,
+) -> RevisionRead:
+    """``read_revisions`` under workspace admission, with retained time-rule provenance."""
+    from aegis_alpha.storage.read_heads import read_revisions  # noqa: PLC0415 -- see above
+
+    return read_revisions(
         workspace.market,
         binding,
         query,
-        time_rules=rules,
+        strict=strict,
+        time_rules=_binding_time_rules(workspace, binding, budget),
         budget=budget,
         rehash=rehash,
-        held=held,
     )
 
 

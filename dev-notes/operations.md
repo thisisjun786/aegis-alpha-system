@@ -678,15 +678,20 @@ run 등록, 결과 저장은 하지 않는다. 봉투 회계는 별도 `aas back
   `ref_version`, `hash`, `ref_schema`, `hash_format`이다. 필수 역할은 `signal_prices`,
   `execution_prices`, `sessions`, `identity`, `universe`, `membership`, `calendar`, `basis`,
   `cost`, `execution`이고, `macro`·`derived`·`proxy`는 전략 정의가 요구할 때만, `benchmark`·
-  `risk_free`·`fx`는 0 또는 1개다. 여러 개를 허용하는 역할은 `signal_prices`·`execution_prices`·
-  `macro`·`derived`·`proxy`뿐이며 ordinal은 역할 안에서 0부터 연속이다.
+  `risk_free`·`fx`는 0 또는 1개다. `actions`는 `heads`로 묶은 canonical 신호 선택이 조정 basis일 때만,
+  그때는 반드시 1개다. 여러 개를 허용하는 역할은 `signal_prices`·`execution_prices`·
+  `macro`·`derived`·`proxy`뿐이며 ordinal은 역할 안에서 0부터 연속이다. `signal_prices`·
+  `execution_prices`·`sessions`·`macro`는 `generation` 또는 `heads` 참조를, `actions`는 `heads` 참조만 받는다.
 - `refs`: bindings가 가리키는 참조 서술자. `ref_kind`, `ref_id`, `ref_version`, `hash`,
   `schema`, `hash_format`, `pin`을 담고 같은 서술자를 두 번 넣으면 거부한다.
   `generation`의 pin은 `data inspect`가 돌려주는 `dataset_id`·`version`·`generation_id`·
   `chain_hash`·`manifest_hash`, `identity`는 `snapshot_id`·`content_hash`, `universe`는
   `universe_id`·`version`·`content_hash`, `derived`·`membership`·`convention:<kind>`는
-  `kind`·`id`·`version`·`hash`다. binding의 `hash`는 그 pin의 `chain_hash`, `content_hash`,
-  또는 문서 전체 해시와 같아야 한다.
+  `kind`·`id`·`version`·`hash`다. `heads`의 pin은 `aas-head-binding-v1` 문서에서 `schema`를 뺀
+  `domain`·`pins`(각 pin은 `generation` pin의 다섯 필드와 `from`·`to` 날짜 또는 null)·`granted_rules`·
+  `excluded_flags`이고, `ref_id`와 `hash`는 그 문서의 binding hash, `ref_version`은 `aas-head-binding-v1`이다.
+  binding의 `hash`는 그 pin의 `chain_hash`, `content_hash`, binding hash 또는 문서 전체 해시와 같아야 한다.
+  `heads` 참조의 읽기 규칙은 [데이터 수직 계약](design/data-vertical.md#strict-실행-준비의-head-binding)이 소유한다.
 - `price_inputs`: `signal_prices`·`execution_prices` binding마다 하나씩. `binding`(`role`·
   `ordinal`), 정렬된 `instrument_ids`, `currency`, `basis`(`unadjusted`·`split_adjusted`·
   `total_return`), `price_role`(`canonical`·`reference`), `interval=1d`. 신호 가격은 basis
@@ -723,11 +728,14 @@ run 등록, 결과 저장은 하지 않는다. 봉투 회계는 별도 `aas back
    generation(예: `split_adjusted`·`reference`), 체결 가격 generation(`unadjusted`·`canonical`),
    세션 달력 generation. 각 `data inspect --dataset ID --version VERSION` 출력이 `generation`
    pin이다. `aas data import`로 게시한 typed generation도 같은 pin 형식이지만, 신호·체결
-   가격과 세션 입력으로 고를 수 있는 generation은 `register-prices`/`register-sessions`의
-   native transform으로 게시하고 원본 `source-import`와 보존 테이블이 남아 있는 것뿐이다.
-   준비는 이 generation마다 native transform 문서와 보존 원본을 다시 대조해 admission하며,
+   가격과 세션 입력으로 `generation` 참조가 고를 수 있는 generation은 `register-prices`/
+   `register-sessions`의 native transform으로 게시하고 원본 `source-import`와 보존 테이블이 남아 있는
+   것뿐이다. 준비는 이 generation마다 native transform 문서와 보존 원본을 다시 대조해 admission하며,
    내용이 불투명한 generic 게시는 그 선행 조건을 대신하지 못한다. `macro` 입력의 generic
-   게시는 5번 항목대로 계속 지원한다.
+   게시는 5번 항목대로 계속 지원한다. 승격한 generation(`aas data promote`, `aas data kr-prices`,
+   `aas calendar refresh`)은 `heads` 참조로 묶는다. 그 pin은 `dataset_versions`의 committed 행이고, 각
+   generation의 시간 규칙 출처는 보존한 명세에서 읽으며, 규칙 시점은 binding의 `granted_rules`가 허용할 때만
+   strict 판단에 쓰인다.
 3. `aas data binding-import`: `aas-identity-snapshot-v1`, `aas-universe-version-v1`,
    `aas-ensemble-membership-v1` 문서. 문서 스키마에 따라 identity snapshot, universe version,
    정의(derived·membership) 또는 `aas-input-bundle-v1` 묶음을 등록하고 `pin`을 돌려준다.
@@ -763,8 +771,8 @@ lock 파일이 설치의 저장 잠금과 같은 경로면 거부한다. 요청 
 
 `<output>.preparation.json`은 `aas-prepared-backtest-v1` 문서로 `request_hash`, 의미 투영
 전체(`request`), `envelope_sha256`, 실행 정의, 읽은 관례 문서, 실제로 읽은 저장 입력의
-증거(`stored_inputs`), `source_pins`, 판단·체결 슬롯, 각 판단의 replay 영수증, feature 값,
-`certified=false`를 담는다. 봉투 자체에는 이 출처가 들어가지 않는다.
+증거(`stored_inputs`), `heads` 참조로 한 읽기마다 reader가 돌려준 영수증(`head_reads`), `source_pins`, 판단·체결 슬롯,
+각 판단의 replay 영수증, feature 값, `certified=false`를 담는다. 봉투 자체에는 이 출처가 들어가지 않는다.
 
 실패는 stdout 없이 stderr 한 줄 `{"error": ...}`와 종료 코드 1이다. 봉투를 쓴 뒤 sidecar나
 fsync 단계에서 실패하면 이미 쓴 파일이 검사용으로 남는다. 그 파일은 성공 영수증이 아니며
@@ -817,7 +825,7 @@ compute 환경이 없으면 `None`을 yield한다. 아래 실습 5단계가 이 
 정체성이고, `engine.backtest_request`의 `request_projection`·`export_envelope`는 저장소 없이
 순수 투영·내보내기만 맡는다.
 
-계산 소스 정체성은 `backtest_prepare.CALCULATION_MODULES`에 명시된 44개 모듈의
+계산 소스 정체성은 `backtest_prepare.CALCULATION_MODULES`에 명시된 47개 모듈의
 설치된 정확한 바이트를 해시한다. 엔진과 두 데이터 직렬화 helper뿐 아니라 준비의 해석·입력
 승인을 담당하는 application·storage 모듈을 포함한다. 런타임 import 탐색이나 패키지 전체
 해시는 아니며, 선택된 파일의 주석 변경도 정체성을 바꾼다. 이전 27개 범위로 생성한 정규

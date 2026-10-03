@@ -1554,6 +1554,15 @@ Norgate security master와 그보다 늦은 Norgate history 내보내기에서�
     `flag_excluded`를 남기고, 칸은 present로 둔다. 한 칸에 record가 여럿이면(같은 날짜의 canonical과
     reference 가격) head를 준 record의 이유만 그 칸의 이유다. 달력 칸은 개장한 session만 present이고
     휴장 session은 `session_closed`다. 격자의 칸은 결과 행과 함께 fetch 전 할당 검사에 포함된다.
+- 여러 cutoff에서 판단하는 소비자는 `read_revisions(connection, binding, query, strict, time_rules, budget)`
+  (작업 공간 진입점 `market_inputs.load_pinned_revisions`)로 binding의 revision을 한 번 읽고
+  `project_revisions`로 cutoff마다 투영한다. pin 확인, 시간 규칙 출처, 할당 검사는 `read_heads`와 같다.
+  strict 읽기의 revision은 grant가 없는 규칙의 시점이 null로 돌아오고, 제외한 flag가 달린 revision은
+  `excluded`로 표시된다. 투영은 `read_heads`의 SQL 판정을 generation 순서로 적용하므로 같은 cutoff의
+  `read_heads`와 같은 head를 낸다. query에는 cutoff와 격자가 없고, 모든 필터가 자연키 열에 걸려야 한다
+  (투영 뒤에만 거를 수 있는 날짜를 가진 기업행동은 `read_heads`로 읽는다). 영수증 `aas-head-revisions-v1`은
+  `binding`, `binding_hash`, `query`, `mode`, `time_rules`, `applied_rules`, `withheld_rules`, `rehashed`,
+  `revisions`(행 수), `revisions_hash`(`[pin, record_id, revision_id, excluded]` 목록의 정규 JSON SHA-256)다.
 - 분할조정·총수익 가격은 reader가 unadjusted 가격과 cutoff 시점까지 알려진 `corporate_actions`로
   계산한다. 공급자 조정 가격은 reference로만 남는다. `storage/adjusted_prices.py`의
   `read_adjusted_prices(connection, prices, actions, query, basis, time_rules, budget)`가 가격 binding과
@@ -1608,7 +1617,54 @@ pin(`observations`) 대신 canonical 가격 binding(`prices`: `aas-head-binding-
 - 자산 유형은 상태 저장소의 instrument 분류에서 온다(`etf` → `ETF`). 관측 경로의 `OBSERVATION`과 다르다.
 - 봉인 준비 문서는 `observations` 대신 `prices`에 `binding_hash`, 읽기 영수증 `head_read`
   (`aas-head-read-v1` 전체)와 그 SHA-256을 싣는다. `resolved_calendar.observed_calendar_ref`는 binding
-  hash를 가리킨다. 실행은 여전히 `research-uncertified`이며 엄격 경로의 승인(DV-81)은 다루지 않는다.
+  hash를 가리킨다. 실행은 `research-uncertified`이다. strict 실행 준비의 head binding은 다음 절이 다룬다.
+
+### strict 실행 준비의 head binding
+
+`aas-prepare-request-v1` 요청은 가격·세션·거시 입력을 기존 `generation` 참조 대신 `heads` 참조로 묶을 수
+있다. `heads` 참조의 `pin`은 `aas-head-binding-v1` 문서에서 `schema`를 뺀 것(`domain`, cutover 구간을 가진
+순서 있는 `pins`, `granted_rules`, `excluded_flags`)이고, `ref_id`와 `hash`는 그 문서의 binding hash,
+`ref_version`은 `aas-head-binding-v1`이다. 요청 admission은 문서가 그 정규 표기(정렬·유일한 grant와 제외,
+순서대로 빈틈 없는 구간, 첫 시작과 마지막 끝만 열림)인지와 hash를 다시 계산해 확인하므로, 요청의 hash와
+`HeadBinding.binding_hash`는 같은 정체성이다. `backtest_prepare.prepare_backtest`가 그 binding을
+`market_inputs.load_pinned_heads`·`load_pinned_revisions`와 `adjusted_prices.load_adjusted_prices`로
+읽는다. `generation` 참조의 native transform 경로는 그대로다.
+
+| 역할 | 받는 참조 | `heads`의 도메인 |
+| --- | --- | --- |
+| `signal_prices`, `execution_prices` | `generation`, `heads` | `prices` |
+| `sessions` | `generation`, `heads` | `calendar_sessions` |
+| `macro` | `generation`, `heads` | `macro_observations`, `fx_rates` |
+| `actions` | `heads` | `corporate_actions` |
+
+- 읽기는 판단마다 그 판단의 cutoff로 한다. `strict_pit` 요청은 cutoff가 있는 strict 읽기이고 binding의
+  grant가 규칙 시점을 정하며, `observed_snapshot_research` 요청은 그 cutoff를 지식 상한으로 한 연구 읽기다.
+  수집 cutoff는 요청의 `ingestion_cutoff_us`다. 신호 날짜 구간은 이력 시작부터 이력 끝과 판단일 중 이른 날까지다.
+- `heads`로 묶은 canonical 신호 선택의 basis가 조정 basis이면 신호 가격은 공급자 조정 가격이 아니라 그
+  binding의 비조정 bar와 `actions` binding의 기업행동으로 판단 cutoff에서 유도한다(`aas-adjustment-v1`).
+  그래서 cutoff까지 알려지지 않은 기업행동은 앞선 bar에 닿지 않고, grant가 막았거나 시점 근거가 없는
+  기업행동 앞의 bar는 값 없이 `invalid`가 되어 신호에서 빠진다. `actions`는 그런 선택이 있을 때만,
+  그때는 반드시 하나 묶는다. `reference` 신호 선택은 그 basis의 행을 저장된 그대로 읽으며 strict 읽기는
+  reference 가격을 고르지 않는다.
+- 신호 bar는 `_eligible_prices`가 받는 칸과 같은 조건으로만 쓴다: `present`이고, 판단 cutoff에 알려진
+  달력의 개장 세션이며, 판단일 이전이고 cutoff까지 끝났으며, 이력 구간 안이고, identity와 universe pin이
+  그 bar의 끝 시각에 그 instrument를 cutoff 기준으로 담는다. 선택 통화와 다른 통화의 bar, `1d`가 아닌 bar,
+  한 instrument·세션의 두 번째 bar는 거부한다. instrument는 상태 저장소에 달력 venue로 등록돼 있어야 한다.
+- 체결 가격은 기간 세션 전체를 요청의 지식 cutoff로 한 번 읽는다. 기간 밖이나 `present`가 아닌 bar는 쓰지 않는다.
+- `heads`로 묶은 달력은 이력 시작부터 기간 끝까지 그 달력의 revision을 한 번 읽고(`aas-head-revisions-v1`),
+  판단마다 그 cutoff로 투영한다. 행의 달력·venue·timezone version이 calendar 관례와 다르면 거부한다.
+  native 가격 generation과 파생 가격 입력은 native 세션 generation과 함께 읽히므로 `heads` 달력과 함께
+  묶을 수 없다.
+- 거시 선택의 subject는 `series_id`이고 행의 단위는 선택의 `unit`과 같아야 한다. FX 선택의 `series_id`는
+  `BASE/QUOTE`이고, 경제 날짜는 고시 시각의 UTC 날짜, 값은 `rate`, 선택의 `unit`은 호가 통화다. 준비는
+  지식 cutoff로 한 번 읽어 binding이 그 series의 head를 가지는지 확인하고(`admission`), 판단마다 다시 읽는다.
+- 봉인 준비 문서(`aas-prepared-backtest-v1`)의 `head_reads`는 준비가 한 읽기마다 역할·ordinal·목적
+  (`calendar`, `admission`, `decision`, `outcomes`)·판단일과 reader가 돌려준 영수증(`aas-head-read-v1`,
+  `aas-adjusted-read-v1`, `aas-head-revisions-v1`) 전체와 그 SHA-256을 싣는다. `aas run execute`는 이 문서를
+  run에 그대로 봉인한다. run의 입력 bundle은 `heads` 참조를 binding hash로만 가리키므로, 실행은 그 binding
+  문서를 그 hash 주소로 `raw/`에 남기고 bundle 검증은 그 문서를 다시 읽어 pin·catalog·시간 규칙 출처를 확인한다.
+- `heads` 입력은 envelope의 `source_pins`에 원천을 싣지 않는다. 그 출처는 읽기 영수증의 pin과 chain이다.
+  proxy 규칙은 native 체결 원천에 묶이므로 `generation`으로 묶은 체결 가격에만 붙는다.
 
 ## 스키마 v2
 
@@ -1766,7 +1822,7 @@ state v2:
 | DV-78 | generation의 시간 규칙 출처는 보존 증거(승격 명세, 연구 변환, 봉인 import 문서)에서 오고, 출처가 없거나 catalog에 없는 pin은 읽지 않는다 | `tests/storage/test_read_heads.py::test_time_rule_provenance_comes_from_retained_evidence` | 구현 |
 | DV-79 | `read_heads`는 fetch 전에 결과 크기를 SQL로 재어 할당을 넘으면 `ComputeResourceError`로 거부한다 | `tests/storage/test_read_heads.py::test_head_read_is_admitted_before_rows_are_fetched` | 구현 |
 | DV-80 | inspection·연구 읽기는 grant와 무관하고 grant 하나는 그 규칙의 시점만 strict에 허용한다 | `tests/storage/test_read_heads.py::test_rule_grant_changes_strict_reads_only` | 구현 |
-| DV-81 | strict 실행 준비는 사용한 `read_heads` 읽기 영수증을 run에 그대로 기록한다 | `tests/application/test_backtest_prepare.py::test_strict_preparation_records_head_read_receipt` | 예정 |
+| DV-81 | strict 실행 준비는 사용한 `read_heads` 읽기 영수증을 run에 그대로 기록한다 | `tests/application/test_strict_head_inputs.py::test_strict_preparation_records_head_read_receipt` | 구현 |
 | DV-82 | pin 하나의 strict 읽기는 `market_inputs` strict reader와 같은 coverage 이유를 보고한다 | `tests/storage/test_read_heads.py::test_coverage_reasons_match_market_inputs` | 구현 |
 | DV-83 | 여러 pin의 읽기는 각 pin chain의 `project_heads`를 그 pin 구간으로 거른 것과 같다 | `tests/storage/test_read_heads.py::test_multi_pin_reads_match_each_pin_projection` | 구현 |
 | DV-84 | 승격 `--plan`은 같은 계산을 보고하고 저장소에 아무것도 쓰지 않는다 | `tests/storage/test_promotion_cli.py::test_promote_plan_writes_nothing_and_apply_publishes` | 구현 |
@@ -1976,3 +2032,17 @@ state v2:
 | DV-288 | KIND 목록의 코드 하나라도 KRX 단축코드가 아니면 cohort를 좁히지 않는다 | `tests/storage/test_kr_collection.py::test_a_kind_list_with_a_malformed_code_never_narrows_the_cohort` | 구현 |
 | DV-289 | 응답 없는 완료 공시 목록 행은 읽히지 않은 행이고 그 날을 덮지 않는다 | `tests/storage/test_kr_collection.py::test_a_completed_list_row_without_its_page_is_unreadable` | 구현 |
 | DV-290 | batch는 응답 bytes 상한에서도 끝난다 | `tests/storage/test_kr_collection.py::test_a_batch_ends_at_its_byte_budget` | 구현 |
+| DV-291 | revision 읽기를 cutoff로 투영하면 grant·flag 제외·cutover·수집 cutoff·연구 지식 상한 아래에서 같은 cutoff의 `read_heads`와 같은 head가 나온다 | `tests/storage/test_read_heads.py::test_revision_projection_matches_read_heads` | 구현 |
+| DV-292 | `aas-head-revisions-v1` 영수증 형식은 고정돼 있고, cutoff·격자·자연키가 아닌 필터를 가진 revision 읽기와 할당을 넘는 읽기는 거부된다 | `tests/storage/test_read_heads.py::test_revision_read_receipt_format_and_refusals` | 구현 |
+| DV-293 | 비조정 bar와 분할에서 판단 cutoff로 유도한 canonical 신호는 공급자 조정 reference와 같은 판단을 내고, 체결은 비조정 bar를 읽는다 | `tests/application/test_strict_head_inputs.py::test_derived_canonical_signal_decides_like_the_native_reference_series` | 구현 |
+| DV-294 | grant가 없는 가격 규칙은 strict 준비에서 bar를 막고 연구 준비에서는 막지 않는다 | `tests/application/test_strict_head_inputs.py::test_an_ungranted_price_rule_withholds_strict_bars_but_not_research` | 구현 |
+| DV-295 | grant가 막은, cutoff가 아는 기업행동은 조용히 빠지지 않고 그 앞의 bar를 신호에서 뺀다 | `tests/application/test_strict_head_inputs.py::test_a_known_action_withheld_by_its_grant_is_never_dropped` | 구현 |
+| DV-296 | 판단 뒤에 알려진 기업행동은 그 판단의 신호를 조정하지 않는다 | `tests/application/test_strict_head_inputs.py::test_an_action_known_after_a_decision_does_not_adjust_it` | 구현 |
+| DV-297 | grant가 없는 달력 규칙의 세션은 strict 준비가 알지 못한다 | `tests/application/test_strict_head_inputs.py::test_an_ungranted_calendar_knows_no_session` | 구현 |
+| DV-298 | native 가격 generation은 `heads` 달력과 함께 묶이지 않는다 | `tests/application/test_strict_head_inputs.py::test_a_native_price_generation_needs_a_sessions_generation` | 구현 |
+| DV-299 | `heads`로 묶은 거시 series는 같은 값의 native generation과 같은 신호를 내고, 단위가 다르거나 cutoff까지 head가 없으면 거부된다 | `tests/application/test_strict_head_inputs.py::test_a_head_bound_macro_series_decides_like_its_native_generation` | 구현 |
+| DV-300 | FX 고시는 `BASE/QUOTE` series로 UTC 날짜에 읽히고 그 단위는 호가 통화다 | `tests/application/test_strict_head_inputs.py::test_a_head_bound_fx_fixing_is_a_macro_series` | 구현 |
+| DV-301 | 요청의 `heads` 참조 hash와 reader의 binding hash는 같은 정체성이고 정규 표기가 아닌 문서는 거부된다 | `tests/application/test_strict_head_inputs.py::test_head_binding_hash_is_one_identity_across_request_and_reader` | 구현 |
+| DV-302 | 요청은 `heads` 참조를 역할의 도메인으로만 받고, hash 불일치·비정렬 grant·빈틈 있는 구간을 거부하며, `actions`는 유도 canonical 신호가 있을 때만 받는다 | `tests/application/test_strict_head_inputs.py::test_the_request_admits_head_references_only_as_their_roles_allow` | 구현 |
+| DV-303 | cutover가 있는 체결 binding은 구간마다 자기 pin의 bar를 읽는다 | `tests/application/test_strict_head_inputs.py::test_a_cutover_reads_each_interval_from_its_own_pin` | 구현 |
+| DV-304 | 규칙 시점 binding의 읽기 영수증은 grant가 허용한 규칙을 싣고 막은 규칙이 없다 | `tests/application/test_strict_head_inputs.py::test_head_reads_record_the_rules_their_grants_apply` | 구현 |
