@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -13,7 +14,7 @@ import pytest
 
 from aegis_alpha.storage.identity import mint_issuer
 from aegis_alpha.storage.promotion import formats
-from aegis_alpha.storage.promotion.mappers import REGISTRY, IdentityKey, mapper
+from aegis_alpha.storage.promotion.mappers import MANIFEST_ITEMS, REGISTRY, IdentityKey, mapper
 from tests.storage import dart_receipt_support as dart
 from tests.storage.kr_identity_support import DART_COLUMNS
 
@@ -29,6 +30,16 @@ def test_eodhd_bars_maps_synthetic_fixture() -> None:
         "dart.fnltt@1",
         "dart.fnltt_filings@1",
         "eodhd.bars@1",
+        "eodhd.bars_adjusted@1",
+        "eodhd.bars_quarantine@1",
+        "eodhd.bulk_quarantine@1",
+        "eodhd.bulk_quarantine_adjusted@1",
+        "fred.alfred@1",
+        "fred.fx_series@1",
+        "norgate.fx_closes@1",
+        "norgate.fx_history@1",
+        "bok.observations@1",
+        "oecd.observations@1",
     }
     args = {"timezone": "Asia/Seoul"}
     bars.check_args(args)
@@ -148,6 +159,228 @@ def test_calendar_declared_maps_synthetic_fixture() -> None:
     ] * 2
 
 
+def _bulk(**fields: object) -> str:
+    document: dict[str, object] = {
+        "code": "005930",
+        "exchange_short_name": "KO",
+        "date": "2025-01-02",
+        "open": 10,
+        "high": 12,
+        "low": 9,
+        "close": 11,
+        "adjusted_close": 10.5,
+        "volume": 100,
+    }
+    document.update(fields)
+    return json.dumps({key: value for key, value in document.items() if value != "absent"})
+
+
+def test_eodhd_bulk_quarantine_maps_synthetic_fixture() -> None:
+    bulk = mapper("eodhd.bulk_quarantine@1")
+    args = {"timezone": "Asia/Seoul", "currencies": {"KO": "KRW", "KQ": "KRW"}}
+    bulk.check_args(args)
+    for wrong in ({"timezone": "Asia/Seoul"}, {**args, "currencies": {"KO": "krw"}}):
+        with pytest.raises(ValueError, match=r"takes exactly|ISO currencies"):
+            bulk.check_args(wrong)
+    assert bulk.identity(args) == IdentityKey("eodhd", "eodhd_symbol")
+    assert bulk.row_flags == {"provider_reported_partial": "_aas_f_provider_reported_partial"}
+    connection = duckdb.connect()
+    connection.execute("SET TimeZone='UTC'")
+    connection.execute(
+        "CREATE TABLE src (_aas_pin INTEGER, _aas_ordinal BIGINT, _aas_row_hash VARCHAR, "
+        "reason VARCHAR, source_row_json VARCHAR)"
+    )
+    partial = "provider_reported_partial"
+    rows = [
+        (partial, _bulk()),
+        (partial, _bulk(code="035720", exchange_short_name="KQ", open=None, high=None,
+                        low=None, close=None, volume=None)),
+        (partial, _bulk(low=-1)),
+        (partial, _bulk(volume="absent")),
+        (partial, _bulk(volume=2**53 + 1)),
+        (partial, _bulk(volume=-(2**64) - 1)),
+        (partial, _bulk(close="11")),
+        (partial, _bulk(exchange_short_name="US")),
+        ("invalid_price_or_volume", _bulk()),
+        (partial, _bulk(date="2025-1-2")),
+        (partial, "{not json"),
+    ]  # fmt: skip
+    connection.executemany(
+        "INSERT INTO src VALUES (0, ?, 'h', ?, ?)",
+        [(index, reason, text) for index, (reason, text) in enumerate(rows)],
+    )
+    mapped = connection.execute(
+        f"SELECT _aas_ordinal, _aas_id_token, _aas_id_at_us, session_date, interval, bar_end_us, "
+        f"basis, currency, price_role, value_state, open, close, volume, _aas_ingested_at_us, "
+        f"_aas_t_session_date, _aas_f_provider_reported_partial "
+        f"FROM ({bulk.select('src', args)}) ORDER BY _aas_ordinal"
+    ).fetchall()
+    start = _us(datetime(2025, 1, 1, 15, tzinfo=UTC))
+    day = 86_400 * 10**6
+    session = date(2025, 1, 2)
+    assert mapped[0] == (
+        0, "005930.KO", start, session, "1d", start + day - 1, "unadjusted", "KRW",
+        "canonical", "present", 10.0, 11.0, 100.0, None, session, True,
+    )  # fmt: skip
+    # Every value null is missing; negative, partial, too-wide and mistyped are invalid.
+    assert [(row[1], row[9], row[11]) for row in mapped[1:7]] == [
+        ("035720.KQ", "missing", None),
+        ("005930.KO", "invalid", None),
+        ("005930.KO", "invalid", None),
+        ("005930.KO", "invalid", None),
+        ("005930.KO", "invalid", None),
+        ("005930.KO", "invalid", None),
+    ]
+    # An exchange without a declared currency has none; another hold reason, a date in
+    # another spelling and unparsable JSON have no session date.
+    assert mapped[7][7] is None
+    assert [(row[3], row[15]) for row in mapped[8:]] == [(None, False), (None, True), (None, True)]
+    assert mapped[10][1] is None
+    partitions = connection.execute(
+        f"SELECT ({bulk.partition_sql}) FROM src ORDER BY _aas_ordinal"
+    ).fetchall()
+    assert [row[0] for row in partitions] == [session] * 8 + [None] * 3
+
+
+def test_eodhd_adjusted_close_maps_close_only_reference() -> None:
+    connection = duckdb.connect()
+    connection.execute("SET TimeZone='UTC'")
+    connection.execute(
+        "CREATE TABLE bars (_aas_pin INTEGER, _aas_ordinal BIGINT, _aas_row_hash VARCHAR, "
+        "provider_symbol VARCHAR, date DATE, adjusted_close DOUBLE, currency VARCHAR, "
+        "retrieved_at TIMESTAMPTZ)"
+    )
+    collected = datetime(2025, 1, 10, tzinfo=UTC)
+    connection.executemany(
+        "INSERT INTO bars VALUES (0, ?, 'h', 'AAA.KO', ?, ?, 'KRW', ?)",
+        [(1, date(2025, 1, 2), 1234.5678, collected), (2, date(2025, 1, 3), None, collected)],
+    )
+    connection.execute(
+        "CREATE TABLE bulk (_aas_pin INTEGER, _aas_ordinal BIGINT, _aas_row_hash VARCHAR, "
+        "reason VARCHAR, source_row_json VARCHAR)"
+    )
+    connection.execute(
+        "INSERT INTO bulk VALUES (0, 1, 'h', 'provider_reported_partial', ?)",
+        [_bulk(adjusted_close=-3.0)],
+    )
+    history = mapper("eodhd.bars_adjusted@1")
+    held = mapper("eodhd.bulk_quarantine_adjusted@1")
+    assert history.numeric_columns({}) == held.numeric_columns({}) == {"close": "DOUBLE"}
+    assert "adjusted_close" in history.source_columns()
+    assert "close" not in history.source_columns()
+    columns = "fields, basis, price_role, value_state, open, high, low, close, volume"
+    zone = {"timezone": "Asia/Seoul"}
+    assert connection.execute(
+        f"SELECT {columns} FROM ({history.select('bars', zone)}) ORDER BY _aas_ordinal"
+    ).fetchall() == [
+        ("close", "total_return", "reference", "present", None, None, None, 1234.5678, None),
+        ("close", "total_return", "reference", "missing", None, None, None, None, None),
+    ]
+    bulk_args = {**zone, "currencies": {"KO": "KRW"}}
+    assert connection.execute(
+        f"SELECT {columns}, _aas_f_provider_reported_partial "
+        f"FROM ({held.select('bulk', bulk_args)})"
+    ).fetchall() == [
+        ("close", "total_return", "reference", "invalid", None, None, None, None, None, True)
+    ]
+
+
+def test_eodhd_bars_quarantine_maps_held_history_rows() -> None:
+    held = mapper("eodhd.bars_quarantine@1")
+    args = {"timezone": "Asia/Seoul", "currencies": {"KO": "KRW", "KQ": "KRW"}}
+    held.check_args(args)
+    with pytest.raises(ValueError, match="takes exactly"):
+        held.check_args({"timezone": "Asia/Seoul"})
+    assert held.manifest_items == "jobs"
+    assert held.identity(args) == IdentityKey("eodhd", "eodhd_symbol")
+    connection = duckdb.connect()
+    connection.execute("SET TimeZone='UTC'")
+    connection.execute(
+        "CREATE TABLE src (_aas_pin INTEGER, _aas_ordinal BIGINT, _aas_row_hash VARCHAR, "
+        "source_fingerprint VARCHAR, reason VARCHAR, source_row_json VARCHAR)"
+    )
+    zero = json.dumps(
+        {
+            "date": "2025-01-02",
+            "open": 0,
+            "high": 0,
+            "low": 0,
+            "close": 0,
+            "adjusted_close": 0,
+            "volume": 25607,
+        }
+    )
+    crossed = json.dumps(
+        {
+            "date": "2025-01-03",
+            "open": 1680,
+            "high": 1740,
+            "low": 1685,
+            "close": 1685,
+            "adjusted_close": 1000.0038,
+            "volume": 104011,
+        }
+    )
+    rows = [
+        (0, "fa", "invalid_price_or_volume", zero),
+        (0, "fb", "inconsistent_ohlc", crossed),
+        (0, "fc", "invalid_price_or_volume", zero),  # listed twice: no symbol
+        (0, "fd", "invalid_price_or_volume", zero),  # instant without offset
+        (0, "fz", "invalid_price_or_volume", zero),  # not in the manifest
+        (0, "fa", "duplicate_row", zero),  # an unmapped reason has no session date
+        (1, "fa", "invalid_price_or_volume", zero),  # another pin's jobs
+    ]  # fmt: skip
+    connection.executemany(
+        "INSERT INTO src VALUES (?, ?, 'h', ?, ?, ?)",
+        [(pin, index, *row) for index, (pin, *row) in enumerate(rows)],
+    )
+    connection.execute(f"CREATE TABLE {MANIFEST_ITEMS} (_aas_pin INTEGER, item VARCHAR)")
+    done = "2025-01-10T00:00:00.5+09:00"
+    jobs = [
+        (0, {"fingerprint": "fa", "symbol": "005930.KO", "completed_at_utc": done}),
+        (0, {"fingerprint": "fb", "symbol": "035720.KQ", "completed_at_utc": done}),
+        (0, {"fingerprint": "fc", "symbol": "000001.KO", "completed_at_utc": done}),
+        (0, {"fingerprint": "fc", "symbol": "000002.KO", "completed_at_utc": done}),
+        (0, {"fingerprint": "fd", "symbol": "000003.KO", "completed_at_utc": "2025-01-10"}),
+        (1, {"fingerprint": "fa", "symbol": "000004.US", "completed_at_utc": done}),
+    ]
+    connection.executemany(
+        f"INSERT INTO {MANIFEST_ITEMS} VALUES (?, ?)",
+        [(pin, json.dumps(job)) for pin, job in jobs],
+    )
+    mapped = connection.execute(
+        f"SELECT _aas_ordinal, _aas_id_token, _aas_id_at_us, session_date, bar_end_us, "
+        f"currency, basis, price_role, value_state, open, high, low, close, volume, "
+        f"_aas_ingested_at_us, _aas_t_session_date "
+        f"FROM ({held.select('src', args)}) ORDER BY _aas_ordinal"
+    ).fetchall()
+    start = _us(datetime(2025, 1, 1, 15, tzinfo=UTC))
+    day = 86_400 * 10**6
+    completed = _us(datetime(2025, 1, 9, 15, 0, 0, 500_000, tzinfo=UTC))
+    session = date(2025, 1, 2)
+    # The collector's held rows are invalid bars that keep no values, even all-zero ones.
+    assert mapped[0] == (
+        0, "005930.KO", start, session, start + day - 1, "KRW", "unadjusted", "canonical",
+        "invalid", None, None, None, None, None, completed, session,
+    )  # fmt: skip
+    assert mapped[1][1:4] == ("035720.KQ", start + day, date(2025, 1, 3))
+    assert mapped[1][8:14] == ("invalid", None, None, None, None, None)
+    assert [(row[1], row[5], row[14]) for row in mapped[2:5]] == [
+        (None, None, None),
+        ("000003.KO", "KRW", None),
+        (None, None, None),
+    ]
+    assert mapped[5][3] is None
+    # The other pin's jobs name the fingerprint for that pin only; its exchange has no currency.
+    assert (mapped[6][1], mapped[6][5]) == ("000004.US", None)
+    partitions = connection.execute(
+        f"SELECT ({held.partition_sql}) FROM src ORDER BY _aas_ordinal"
+    ).fetchall()
+    assert [row[0] for row in partitions] == [
+        session, date(2025, 1, 3), session, session, session, None, session,
+    ]  # fmt: skip
+
+
 def _dart_source(rows: list[tuple[object, ...]]) -> duckdb.DuckDBPyConnection:
     connection = duckdb.connect()
     connection.execute("SET TimeZone='UTC'")
@@ -164,6 +397,7 @@ def _dart_source(rows: list[tuple[object, ...]]) -> duckdb.DuckDBPyConnection:
 
 
 _CORP, _OTHER = "00000101", "00000202"
+_ARGS: dict[str, object] = {"december_year_end": [_CORP, _OTHER]}
 _NUMBER = "20250814000123"
 _RETRIEVED_US = _us(datetime(2026, 9, 12, 8, 33, 43, 268707, tzinfo=UTC))
 _LINES = [
@@ -228,9 +462,14 @@ def test_dart_receipt_outcomes_and_partition_dates() -> None:
     fnltt = mapper("dart.fnltt@1")
     connection = _dart_source(_dart_rows())
     outcomes = connection.execute(
-        f"SELECT {fnltt.outcome({})}, {fnltt.partition_date} FROM src ORDER BY _aas_ordinal"
+        f"SELECT {fnltt.outcome(_ARGS)}, {fnltt.partition_sql}, "
+        f"{fnltt.outcome({'december_year_end': [_OTHER]})}, "
+        f"{mapper('dart.fnltt_filings@1').outcome({})} FROM src ORDER BY _aas_ordinal"
     ).fetchall()
     assert [row[0] for row in outcomes] == _OUTCOMES
+    # Filings need no year end; statements of an undeclared year end are not dated.
+    assert [row[3] for row in outcomes] == _OUTCOMES
+    assert [row[2] for row in outcomes] == ["year_end_unknown", *_OUTCOMES[1:]]
     assert [row[1] for row in outcomes] == [
         date(2025, 1, 1),
         date(2025, 1, 1),
@@ -244,12 +483,11 @@ def test_dart_receipt_outcomes_and_partition_dates() -> None:
         None,
         date(2025, 1, 1),
     ]
-    assert mapper("dart.fnltt_filings@1").outcome({}) == fnltt.outcome({})
 
 
 def test_dart_fnltt_maps_synthetic_fixture() -> None:
     fnltt = mapper("dart.fnltt@1")
-    fnltt.check_args({})
+    fnltt.check_args(_ARGS)
     assert fnltt.identity({}) is None
     assert fnltt.expands
     assert fnltt.numeric_columns({}) == {"value": "VARCHAR"}
@@ -258,20 +496,19 @@ def test_dart_fnltt_maps_synthetic_fixture() -> None:
         "SELECT _aas_ordinal, _aas_item, issuer_id, concept, period_start, period_end, "
         "fiscal_period, unit, dimensions_hash, form, accession, accepted_at_us, value, "
         "value_state, _aas_ingested_at_us, _aas_t_filed_date "
-        f"FROM ({fnltt.select('src', {})}) ORDER BY _aas_ordinal, _aas_item"
+        f"FROM ({fnltt.select('src', _ARGS)}) ORDER BY _aas_ordinal, _aas_item"
     ).fetchall()
     issuer = mint_issuer("dart_corp_code", _CORP)
     filed, end = date(2025, 8, 14), date(2025, 6, 30)
     year, quarter = date(2025, 1, 1), date(2025, 4, 1)
 
-    def dims(name: str, sj: str, order: str) -> str:
+    def dims(name: str, sj: str, occurrence: str = "1") -> str:
         return formats.dimensions_hash(
             {
                 "account_detail": "-",
                 "account_nm": name,
                 "fs_div": "CFS",
-                "ord": order,
-                "rcept_no": _NUMBER,
+                "occurrence": occurrence,
                 "sj_div": sj,
             }
         )
@@ -293,13 +530,13 @@ def test_dart_fnltt_maps_synthetic_fixture() -> None:
     # half year; balance sheet lines are instants and cash flows the year to date. The
     # cumulative fields of the balance sheet and cash flow lines stay in the source.
     assert mapped[:7] == [
-        fact(0, "ifrs-full_Revenue", quarter, "Q2", dims("매출액", "IS", "1"), "1200", "present"),
-        fact(1, "ifrs-full_Revenue", year, "H1", dims("매출액", "IS", "1"), "2300", "present"),
-        fact(2, other, quarter, "Q2", dims("기타", "IS", "2"), "-5", "present"),
-        fact(4, other, None, "H1", dims("기타", "BS", "3"), None, "missing"),
-        fact(6, "ifrs-full_Equity", None, "H1", dims("자본", "BS", "4"), "12.5", "present"),
-        fact(8, "ifrs-full_Assets", None, "H1", dims("자산", "BS", "5"), None, "invalid"),
-        fact(10, "ifrs-full_CashFlows", year, "H1", dims("현금흐름", "CF", "6"), "40", "present"),
+        fact(0, "ifrs-full_Revenue", quarter, "Q2", dims("매출액", "IS"), "1200", "present"),
+        fact(1, "ifrs-full_Revenue", year, "H1", dims("매출액", "IS"), "2300", "present"),
+        fact(2, other, quarter, "Q2", dims("기타", "IS"), "-5", "present"),
+        fact(4, other, None, "H1", dims("기타", "BS"), None, "missing"),
+        fact(6, "ifrs-full_Equity", None, "H1", dims("자본", "BS"), "12.5", "present"),
+        fact(8, "ifrs-full_Assets", None, "H1", dims("자산", "BS"), None, "invalid"),
+        fact(10, "ifrs-full_CashFlows", year, "H1", dims("현금흐름", "CF"), "40", "present"),
     ]  # fmt: skip
     # No data, a failure and the corp code list give no rows. Each refused response
     # gives one row without an issuer.
@@ -310,13 +547,21 @@ def test_dart_fnltt_maps_synthetic_fixture() -> None:
     fnltt.check_args({"accept": ["mismatched", "unknown_outcome", "unreadable"]})
     kept = connection.execute(
         "SELECT DISTINCT _aas_ordinal FROM ("
-        f"{fnltt.select('src', {'accept': ['mismatched', 'unreadable']})})"
+        f"{fnltt.select('src', {**_ARGS, 'accept': ['mismatched', 'unreadable']})})"
     ).fetchall()
     assert sorted(row[0] for row in kept) == [0, 10]
     for bad in ({"other": 1}, {"accept": []}, {"accept": ["unreadable", "mismatched"]},
                 {"accept": ["no_data"]}, {"accept": "unreadable"}):  # fmt: skip
         with pytest.raises(ValueError, match="accept"):
             fnltt.check_args(bad)
+    for codes in ([], [_OTHER, _CORP], [_CORP, _CORP], ["101"], _CORP):
+        with pytest.raises(ValueError, match="december_year_end"):
+            fnltt.check_args({"december_year_end": codes})
+    # Filings state no period, so they take no year end and cannot accept one unknown.
+    filings = mapper("dart.fnltt_filings@1")
+    for bad in (_ARGS, {"accept": ["year_end_unknown"]}):
+        with pytest.raises(ValueError, match="accept"):
+            filings.check_args(bad)
 
 
 def test_dart_fnltt_reads_each_report_period() -> None:
@@ -335,7 +580,7 @@ def test_dart_fnltt_reads_each_report_period() -> None:
     )
     mapped = connection.execute(
         "SELECT form, concept, fiscal_period, period_start, period_end, value "
-        f"FROM ({fnltt.select('src', {})}) ORDER BY form, _aas_item"
+        f"FROM ({fnltt.select('src', _ARGS)}) ORDER BY form, _aas_item"
     ).fetchall()
 
     def rows(form: str, end: date, quarter: tuple[str, date], ytd: str) -> list[object]:
@@ -360,21 +605,53 @@ def test_dart_fnltt_reads_each_report_period() -> None:
     ]
 
 
-def test_dart_fnltt_reads_a_repeated_response_once() -> None:
+def test_dart_fnltt_maps_one_response_per_request() -> None:
     fnltt = mapper("dart.fnltt@1")
+    later = "2026-10-01T00:00:00Z"
     first = dart.completed(_CORP, "2025", "11012", _NUMBER, _LINES[:1])
-    again = dart.completed(
-        _CORP, "2025", "11012", _NUMBER, _LINES[:1], retrieved="2026-10-01T00:00:00Z"
-    )
+    again = dart.completed(_CORP, "2025", "11012", _NUMBER, _LINES[:1], retrieved=later)
+    # The same filing answered later in other bytes (another amount, extra fields).
     changed = dart.edited(again, _set_line(0, "thstrm_amount", "1300"))
     connection = _dart_source([again, first, changed])
+    query = (
+        "SELECT _aas_ordinal, value, _aas_ingested_at_us, accession FROM "
+        f"({fnltt.select('src', _ARGS)}) WHERE _aas_item = 0 ORDER BY _aas_ordinal"
+    )
+    # The earliest retrieval of the request's filing speaks for every response of it.
+    assert connection.execute(query).fetchall() == [(1, "1200", _RETRIEVED_US, _NUMBER)]
+    # An amendment (a larger receipt number) speaks for the request, collected when it may.
+    amendment = dart.completed(_CORP, "2025", "11012", "20251002000456", _LINES[:1],
+                               retrieved=later)  # fmt: skip
+    connection = _dart_source([first, amendment, again])
+    mapped = connection.execute(query).fetchall()
+    assert [(row[0], row[3]) for row in mapped] == [(1, "20251002000456")]
+    # The separate statements are another request and map on their own.
+    separate = dart.completed(_CORP, "2025", "11012", _NUMBER, _LINES[:1], fs_div="OFS")
+    connection = _dart_source([first, separate])
+    assert [row[0] for row in connection.execute(query).fetchall()] == [0, 1]
+
+
+def test_dart_fnltt_numbers_repeated_lines_by_order() -> None:
+    fnltt = mapper("dart.fnltt@1")
+    lines = [
+        dart.Line("x", "기타", "3", ord="12"),
+        dart.Line("x", "기타", "1", ord="2"),
+        dart.Line("x", "기타", "2", ord="7"),
+        dart.Line("x", "기타", "4", ord="7", sj_div="CIS"),
+    ]
+    connection = _dart_source([dart.completed(_CORP, "2025", "11013", _NUMBER, lines)])
     mapped = connection.execute(
-        "SELECT _aas_ordinal, value, _aas_ingested_at_us FROM "
-        f"({fnltt.select('src', {})}) WHERE _aas_item = 0 ORDER BY _aas_ordinal"
+        f"SELECT value, dimensions_hash FROM ({fnltt.select('src', _ARGS)}) ORDER BY value"
     ).fetchall()
-    # The earliest retrieval of the same bytes speaks for both; different bytes for the
-    # same filing stay, so their repeated keys are refused rather than one chosen.
-    assert mapped == [(1, "1200", _RETRIEVED_US), (2, "1300", mapped[1][2])]
+
+    def dims(sj: str, occurrence: str) -> str:
+        return formats.dimensions_hash(
+            {"account_detail": "-", "account_nm": "기타", "fs_div": "CFS",
+             "occurrence": occurrence, "sj_div": sj}
+        )  # fmt: skip
+
+    assert mapped == [("1", dims("IS", "1")), ("2", dims("IS", "2")), ("3", dims("IS", "3")),
+                      ("4", dims("CIS", "1"))]  # fmt: skip
 
 
 def test_dart_fnltt_filings_maps_synthetic_fixture() -> None:

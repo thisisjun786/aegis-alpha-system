@@ -52,6 +52,7 @@ from aegis_alpha.storage.membership_pins import (
     verify_membership_pin,
 )
 from aegis_alpha.storage.promotion import decimal_rules, formats
+from aegis_alpha.storage.promotion.mappers import MANIFEST_ITEMS
 from aegis_alpha.storage.promotion.spec import PromotionSpec, parse_spec
 from aegis_alpha.storage.promotion.time_rules import (
     CLAMP_FLAG,
@@ -60,11 +61,13 @@ from aegis_alpha.storage.promotion.time_rules import (
     rule_sql,
 )
 from aegis_alpha.storage.raw import put_raw
+from aegis_alpha.storage.source_library import source_metadata
 from aegis_alpha.storage.source_reader import resolve_source
 from aegis_alpha.storage.state import atomic, complete_operation, get_operation, prepare_operation
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
+    from datetime import date
     from pathlib import Path
 
     import duckdb
@@ -87,10 +90,12 @@ FLAG_SCHEMA: Final = (
 _DEFAULT_BUDGET: Final = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
 _MAX_RAW: Final = 64 * 1024 * 1024
 _SAMPLE: Final = 20
+_DAY_US: Final = 86_400_000_000
 _BATCH: Final = 4096
 _LINK: Final = "sl:"
 _TEMP: Final = (
     "src",
+    "items",
     "map",
     "identity",
     "res",
@@ -109,6 +114,10 @@ _TEMP: Final = (
 )
 _FLAG_ROW_BYTES: Final = 4096
 _COMPARED_KEYS: Final = tuple(name for name in NATURAL_KEYS["prices"] if name != "price_role")
+PARTIAL_FLAG: Final = "provider_reported_partial"
+PARTITION_CHECK: Final = ("partition_row_count", "1")
+_REFERENCE_WINDOW_DAYS: Final = 31
+_REFERENCE_LOOKBACK_DAYS: Final = 366
 
 
 def _t(name: str) -> str:
@@ -422,15 +431,24 @@ def _stage_sources(
     names = ", ".join(_q(name) for name, _ in columns)
     where = ""
     if spec.partition is not None:
-        day = f"({spec.mapper.partition_date})"
+        day = spec.mapper.partition_sql
         where = (
-            f" WHERE {day} >= DATE '{spec.partition.start.isoformat()}' "
-            f"AND {day} < DATE '{spec.partition.end.isoformat()}'"
+            f" WHERE ({day}) >= DATE '{spec.partition.start.isoformat()}' "
+            f"AND ({day}) < DATE '{spec.partition.end.isoformat()}'"
         )
         if spec.mapper.outcome(spec.mapper_args) is not None:
             # A response row without a partition date (another endpoint, a request that
             # cannot be read) belongs to every partition, so its outcome is always counted.
-            where += f" OR {day} IS NULL"
+            where += f" OR ({day}) IS NULL"
+        else:
+            undated = sum(
+                _count(market, f"SELECT count(*) FROM {_q(source.target)} WHERE ({day}) IS NULL")
+                for source in sources
+            )
+            if undated:
+                plan.refusals.append(
+                    f"{undated} source rows have no partition date, so no partition holds them"
+                )
     union = " UNION ALL ".join(
         f"SELECT {index}::INTEGER AS _aas_pin, _aas_ordinal, {names} "
         f"FROM {_q(source.target)}{where}"
@@ -454,6 +472,45 @@ def _stage_sources(
         _t("src"),
         "_aas_row_hash",
     )
+
+
+def _stage_items(
+    workspace: Workspace, spec: PromotionSpec, sources: list[_Source], plan: PromotionPlan
+) -> None:
+    """Stage the manifest list the mapper reads as ``MANIFEST_ITEMS``, one row per element."""
+    market = workspace.market
+    market.execute(
+        f"CREATE OR REPLACE TEMP TABLE {MANIFEST_ITEMS} (_aas_pin INTEGER, item VARCHAR)"
+    )
+    name = spec.mapper.manifest_items
+    if name is None:
+        return
+    lacking = []
+    unverified = []
+    for index, source in enumerate(sources):
+        try:
+            metadata = source_metadata(workspace, source.pin.source_id)
+        except ValueError:
+            unverified.append(source.pin.source_id)
+            continue
+        items = metadata.get(name) if isinstance(metadata, dict) else None
+        if not isinstance(items, list):
+            lacking.append(source.pin.source_id)
+            continue
+        for start in range(0, len(items), _BATCH):
+            market.executemany(
+                f"INSERT INTO {MANIFEST_ITEMS} VALUES (?, ?)",
+                [
+                    (index, formats.canonical(item).decode())
+                    for item in items[start : start + _BATCH]
+                ],
+            )
+    if unverified:
+        plan.refusals.append(
+            f"{len(unverified)} pinned sources have a manifest that does not match its request hash"
+        )
+    if lacking:
+        plan.refusals.append(f"{len(lacking)} pinned sources have no manifest metadata list {name}")
 
 
 def _outcomes(workspace: Workspace, spec: PromotionSpec, plan: PromotionPlan) -> None:
@@ -497,6 +554,8 @@ def _map(workspace: Workspace, spec: PromotionSpec) -> bool:
             expected[name] = numeric.get(name, kind.rstrip("?"))
     for name, kind in spec.mapper.time_inputs.items():
         expected["_aas_t_" + name] = "DATE" if kind == "date" else "BIGINT"
+    for column in spec.mapper.row_flags.values():
+        expected[column] = "BOOLEAN"
     fields = spec.domain == "prices" and "fields" in described
     if fields:
         expected["fields"] = "VARCHAR"
@@ -536,6 +595,14 @@ def _resolved(workspace: Workspace, spec: PromotionSpec) -> str:
         f"SELECT m.*, r.instrument_id, coalesce(r.matches, 0) AS _aas_matches FROM {_t('map')} m "
         f"LEFT JOIN {_t('res')} r ON {same}"
     )
+
+
+def _add_row_flags(spec: PromotionSpec, finals: list[tuple[str, str]], flags: list[_Flag]) -> None:
+    """Add the flags a mapper reads off the source row, under the mapper's ``name@major``."""
+    for position, (flag, column) in enumerate(sorted(spec.mapper.row_flags.items())):
+        alias = f"_aas_rf{position}"
+        finals.append((alias, f"coalesce({_q(column)}, false)"))
+        flags.append(_Flag(spec.mapper.name, str(spec.mapper.major), flag, "", alias))
 
 
 def _rows(
@@ -585,6 +652,7 @@ def _rows(
             alias = f"{prefix}f_{flag}"
             finals.append((alias, f"coalesce({condition}, false)"))
             flags.append(_Flag(found.rule_id, found.version, flag, column, alias))
+    _add_row_flags(spec, finals, flags)
     links = " ".join(
         f"WHEN {index} THEN {'NULL' if source.retrieved_at_us is None else source.retrieved_at_us}"
         for index, source in enumerate(sources)
@@ -618,9 +686,10 @@ def _rows(
         for index in range(len(TIME_COLUMNS))
     )
     selected.append(
-        "CASE WHEN _aas_matches = 0 THEN 'unresolved' WHEN _aas_matches > 1 THEN 'ambiguous' "
+        # A row missing a required column is malformed whether or not it resolves.
+        f"CASE WHEN {missing} THEN 'refused_required' "
+        "WHEN _aas_matches = 0 THEN 'unresolved' WHEN _aas_matches > 1 THEN 'ambiguous' "
         f"WHEN {' OR '.join(refused) or 'false'} THEN 'refused_number' "
-        f"WHEN {missing} THEN 'refused_required' "
         "WHEN _aas_ingest IS NULL THEN 'refused_ingestion' "
         f"WHEN {held} THEN 'held' ELSE 'ok' END AS _aas_status"
     )
@@ -719,11 +788,22 @@ def _diff(
     )
 
 
+def _scope_day(domain: str, column: str, alias: str) -> str:
+    """The DATE a tombstone scope tests: a DATE column, or the UTC day of a microsecond instant."""
+    kind = dict(DOMAINS[domain])[column].removesuffix("?")
+    qualified = f"{alias}.{_q(column)}"
+    if kind == "DATE":
+        return qualified
+    if kind != "BIGINT":
+        raise ValueError(f"domain column {column} is neither a DATE nor an instant")
+    return f"(DATE '1970-01-01' + CAST(floor({qualified} / {_DAY_US}.0) AS INTEGER))"
+
+
 def _scope_sql(workspace: Workspace, spec: PromotionSpec, alias: str) -> str:
     policy = spec.tombstone
     if policy.start is None or policy.end is None:
         raise ValueError("a tombstone scope needs its date interval")
-    date_column = f"{alias}.{_q(spec.mapper.date_column)}"
+    date_column = _scope_day(spec.domain, spec.mapper.date_column, alias)
     condition = (
         f"{date_column} >= DATE '{policy.start.isoformat()}' "
         f"AND {date_column} < DATE '{policy.end.isoformat()}'"
@@ -927,8 +1007,11 @@ def _flags(
     selects = []
     for (rule_id, version, name), members in sorted(groups.items()):
         ordered = sorted(members, key=lambda item: item.detail)
+        # A row flag names no column; its detail is NULL.
         detail = (
-            "concat_ws(',', "
+            "CAST(NULL AS VARCHAR)"
+            if all(not item.detail for item in ordered)
+            else "concat_ws(',', "
             + ", ".join(
                 f"CASE WHEN {item.condition} THEN {formats.sql_literal(item.detail)} END"
                 for item in ordered
@@ -1008,6 +1091,92 @@ def flags_digest(
         batch_rows=batch,
     )
     return digest, count
+
+
+def _partition_check(
+    workspace: Workspace, spec: PromotionSpec, chain: list[str], flags: list[_Flag]
+) -> dict[str, object] | None:
+    """``partition_row_count@1``: a partial response's row counts against complete dates.
+
+    For each session date of rows the mapper flags ``provider_reported_partial``, the
+    check counts the source rows and the resolved ones (status ``ok`` or ``held``). Its
+    reference comes only from the parent chain's complete dates: dates whose live heads
+    carry no ``provider_reported_partial`` flag. The latest complete date on or before
+    the session anchors a 31-day window, and the reference is the largest live-head
+    count on a complete date in that window, so an earlier partial day or one short
+    complete day does not lower it. The reference date and the generation that last
+    wrote a head on it are recorded. The result is ``below_reference`` when a date
+    resolves fewer rows than its reference, ``no_reference`` when no date has one, and
+    ``at_least_reference`` otherwise. It is recorded, never a refusal: the rows are
+    promoted with their flag.
+    """
+    partial = [flag for flag in flags if flag.flag == PARTIAL_FLAG and not flag.detail]
+    if not partial:
+        return None
+    market = workspace.market
+    day = _q(spec.mapper.date_column)
+    found = market.execute(
+        f"SELECT {day}, count(*), count(*) FILTER (WHERE _aas_status IN ('ok', 'held')) "
+        f"FROM {_t('rows')} WHERE ({' OR '.join(flag.condition for flag in partial)}) "
+        f"AND {day} IS NOT NULL GROUP BY 1 ORDER BY 1"
+    ).fetchall()
+    if not found:
+        return None
+    complete: list[tuple[date, int, str]] = []
+    if chain:
+        complete = [
+            (cast("date", row[0]), int(row[1]), str(row[2]))
+            for row in market.execute(
+                f"SELECT {day}, count(*), arg_max(generation_id, sequence) FROM ("
+                f"SELECT p.record_id, p.revision_id, p.generation_id, p.op, p.{day}, g.sequence, "
+                "row_number() OVER (PARTITION BY p.record_id ORDER BY g.sequence DESC) "
+                f"AS _aas_rank FROM {_q(spec.domain)} p JOIN market_generations g "
+                "ON g.generation_id = p.generation_id "
+                "WHERE p.generation_id IN (SELECT unnest(?::VARCHAR[])) "
+                f"AND p.{day} >= ?::DATE - INTERVAL {_REFERENCE_LOOKBACK_DAYS} DAY "
+                f"AND p.{day} <= ?::DATE) h "
+                "WHERE _aas_rank = 1 AND op <> 'TOMBSTONE' GROUP BY 1 "
+                "HAVING NOT bool_or(EXISTS (SELECT 1 FROM quality_flags f "
+                "WHERE f.generation_id = h.generation_id AND f.record_id = h.record_id "
+                "AND f.revision_id = h.revision_id AND f.flag = ?)) ORDER BY 1",
+                [chain, found[0][0], found[-1][0], PARTIAL_FLAG],
+            ).fetchall()
+        ]
+    dates = []
+    for row in found:
+        session, rows, resolved = cast("date", row[0]), row[1], row[2]
+        anchor = next((item[0] for item in reversed(complete) if item[0] <= session), None)
+        window = (
+            []
+            if anchor is None
+            else [
+                item
+                for item in complete
+                if item[0] <= anchor and (anchor - item[0]).days <= _REFERENCE_WINDOW_DAYS
+            ]
+        )
+        reference = max(window, key=lambda item: (item[1], item[0])) if window else None
+        dates.append(
+            {
+                "session_date": str(session),
+                "rows": int(rows),
+                "resolved": int(resolved),
+                "reference_date": None if reference is None else str(reference[0]),
+                "reference_rows": None if reference is None else reference[1],
+                "reference_generation": None if reference is None else reference[2],
+            }
+        )
+    compared = [item for item in dates if item["reference_rows"] is not None]
+    result = (
+        "no_reference"
+        if not compared
+        else "below_reference"
+        if any(
+            cast("int", item["resolved"]) < cast("int", item["reference_rows"]) for item in compared
+        )
+        else "at_least_reference"
+    )
+    return {"rule": "@".join(PARTITION_CHECK), "result": result, "dates": dates}
 
 
 # --- planning ------------------------------------------------------------------------------
@@ -1113,6 +1282,10 @@ def _report(
     statuses = _status_counts(market)
     plan.report["source_rows"] = _count(market, f"SELECT count(*) FROM {_t('src')}")
     plan.report["mapped_rows"] = _count(market, f"SELECT count(*) FROM {_t('rows')}")
+    # A mapper that reads one series of a shared table leaves the other rows unselected.
+    plan.report["unselected_rows"] = int(plan.report["source_rows"]) - _count(
+        market, f"SELECT count(*) FROM (SELECT DISTINCT _aas_pin, _aas_ordinal FROM {_t('rows')})"
+    )
     plan.report["rows"] = statuses
     for status, count in statuses.items():
         if status.startswith("refused") and count:
@@ -1193,6 +1366,7 @@ def plan_promotion(
     calendars = _calendars(workspace, spec, budget)
     decimal_rules.install(market)
     _stage_sources(workspace, spec, sources, plan)
+    _stage_items(workspace, spec, sources, plan)
     _outcomes(workspace, spec, plan)
     fields = _map(workspace, spec)
     flags = _rows(workspace, spec, sources, calendars, fields=fields)
@@ -1204,6 +1378,9 @@ def plan_promotion(
     )
     stage_fields = spec.domain == "prices" and version >= 2  # noqa: PLR2004 -- fields arrive in v2
     _diff(workspace, spec, chain, fields=stage_fields, mapped_fields=fields)
+    check = _partition_check(workspace, spec, chain, flags)
+    if check is not None:
+        plan.report["partition_row_count"] = check
     _tombstones(workspace, spec, sources, plan)
     time_flags = _delta(
         workspace, spec, sources, flags, stage_fields=stage_fields, mapped_fields=fields
@@ -1259,8 +1436,10 @@ def _manifest(plan: PromotionPlan) -> bytes:
         raise ValueError("an empty delta has no manifest")
     marker = plan.bulk.marker
     spec = plan.spec
+    check = plan.report.get("partition_row_count")
     return formats.canonical(
-        {
+        ({} if check is None else {"partition_row_count": check})
+        | {
             "schema": MANIFEST_SCHEMA,
             "request_hash": plan.request_hash,
             "spec_sha256": spec.sha256,
@@ -1635,6 +1814,23 @@ def _complete(
                     created,
                 ),
             )
+            check = manifest.get("partition_row_count")
+            if isinstance(check, dict):
+                rule_id, rule_version = PARTITION_CHECK
+                state.execute(
+                    "INSERT INTO quality_checks(check_id, dataset_id, version, rule_id, "
+                    "rule_version, result, reason, checked_at_us) VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        "qc-" + hashlib.sha256(f"{generation_id}/{rule_id}".encode()).hexdigest(),
+                        spec.dataset_id,
+                        marker["version"],
+                        rule_id,
+                        rule_version,
+                        str(check["result"]),
+                        formats.canonical(check["dates"]).decode(),
+                        created,
+                    ),
+                )
             through = manifest["ingested_through_us"]
             if through is not None:
                 partition_id = (

@@ -44,6 +44,18 @@ SCHEMA: Final = pa.schema(
         ("retrieved_at", pa.timestamp("us", tz="UTC")),
     ]
 )
+BULK_SCHEMA: Final = pa.schema(
+    [("ordinal", pa.int64()), ("reason", pa.string()), ("source_row_json", pa.string())]
+)
+HELD_SCHEMA: Final = pa.schema(
+    [
+        ("source_fingerprint", pa.string()),
+        ("ordinal", pa.int64()),
+        ("reason", pa.string()),
+        ("source_row_json", pa.string()),
+    ]
+)
+PARTIAL: Final = "provider_reported_partial"
 SYMBOLS: Final = {"AAA.KO": "100001", "BBB.KQ": "100002", "CCC.KO": "100003"}
 DAY_RULE: Final = {
     "rule": "local_day_end@1",
@@ -116,6 +128,122 @@ def add_source(
     }
 
 
+def bulk_row(  # noqa: PLR0913 -- one synthetic provider row spells every JSON field
+    code: str,
+    exchange: str,
+    day: date,
+    close: float | None,
+    *,
+    adjusted: float | None = None,
+    volume: float | None = 1000,
+    reason: str = PARTIAL,
+) -> tuple[str, str]:
+    """A held bulk row (reason, provider JSON) whose open, high and low equal its close."""
+    document = {
+        "code": code,
+        "exchange_short_name": exchange,
+        "date": day.isoformat(),
+        "open": close,
+        "high": close,
+        "low": close,
+        "close": close,
+        "adjusted_close": close if adjusted is None else adjusted,
+        "volume": volume,
+    }
+    return reason, json.dumps(document, sort_keys=True)
+
+
+def add_bulk_source(
+    workspace: Workspace,
+    rows: list[tuple[str, str]],
+    *,
+    tag: str,
+    linked: datetime | None = None,
+) -> dict[str, str]:
+    """Commit held bulk rows as one content source table ``quarantine``; return its pin.
+
+    ``linked`` fixes the commit clock, which is the rows' ingestion: they carry no
+    collection instant of their own.
+    """
+    if linked is not None:
+        stamp = us(linked) * 1000
+        with patch.object(time, "time_ns", lambda: stamp):
+            return add_bulk_source(workspace, rows, tag=tag)
+    _, digest, size = put_raw(workspace.paths.raw, f"synthetic-bulk-{tag}".encode())
+    content = SourceContent("synthetic", "kr-bulk", 1, (SourceFile(digest, size),))
+    table = pa.table(
+        {
+            "ordinal": list(range(len(rows))),
+            "reason": [row[0] for row in rows],
+            "source_row_json": [row[1] for row in rows],
+        },
+        schema=BULK_SCHEMA,
+    )
+    result = source_library.import_content_arrow(
+        workspace, content, "quarantine", table.to_reader()
+    )
+    tables = result["tables"]
+    assert isinstance(tables, list)
+    return {
+        "source_id": content.source_id,
+        "source_sha256": content.sha256,
+        "table": "quarantine",
+        "digest": str(tables[0]["digest"]),
+    }
+
+
+def held_row(fingerprint: str, day: date, *, reason: str = "invalid_price_or_volume") -> tuple:
+    """A held history row (job fingerprint, reason, provider JSON) with all-zero prices."""
+    document = dict.fromkeys(("open", "high", "low", "close", "adjusted_close"), 0)
+    return fingerprint, reason, json.dumps({**document, "date": day.isoformat(), "volume": 0})
+
+
+def add_held_source(  # noqa: PLR0913 -- the explicit ID, its rows and manifest jobs
+    workspace: Workspace,
+    rows: list[tuple[str, str, str]],
+    jobs: list[dict[str, str]] | None,
+    *,
+    lineage: str,
+    tag: str,
+    linked: datetime,
+) -> dict[str, str]:
+    """Commit held history rows under an explicit ID with ``jobs`` metadata; return its pin.
+
+    This is the shape of the collector's history downloads: one ``quarantine`` table per
+    download, the job list (fingerprint, symbol, completion instant) in the manifest.
+    ``jobs=None`` commits a manifest without the list.
+    """
+    stamp = us(linked) * 1000
+    with patch.object(time, "time_ns", lambda: stamp):
+        _, digest, _ = put_raw(workspace.paths.raw, f"synthetic-held-{tag}".encode())
+        source_id = f"{lineage}-{digest[:16]}-quarantine"
+        table = pa.table(
+            {
+                "source_fingerprint": [row[0] for row in rows],
+                "ordinal": list(range(len(rows))),
+                "reason": [row[1] for row in rows],
+                "source_row_json": [row[2] for row in rows],
+            },
+            schema=HELD_SCHEMA,
+        )
+        result = source_library.import_arrow(
+            workspace,
+            source_id,
+            digest,
+            "quarantine",
+            table.to_reader(),
+            metadata={} if jobs is None else {"jobs": jobs},
+        )
+    tables = result["tables"]
+    assert isinstance(tables, list)
+    return {
+        "source_id": source_id,
+        "source_sha256": digest,
+        "table": "quarantine",
+        "digest": str(tables[0]["digest"]),
+    }
+
+
 def register_symbols(
     workspace: Workspace, link: str, symbols: dict[str, str] | None = None, *, name: str = "kr"
 ) -> dict[str, str]:
@@ -166,13 +294,14 @@ def spec(  # noqa: PLR0913 -- every spec field a test varies
     partition: dict[str, str] | None = None,
     quality: Sequence[Mapping[str, object]] | None = None,
     decimals: dict[str, str] | None = None,
+    mapper: Mapping[str, object] | None = None,
 ) -> tuple[bytes, str]:
     """Exact spec bytes and their SHA-256."""
     document = {
         "schema_version": "aas-promotion-v1",
         "target": {"domain": "prices", "dataset_id": dataset, "parent": parent},
         "sources": sources,
-        "mapper": {"name": "eodhd.bars@1", "args": {"timezone": ZONE}},
+        "mapper": mapper or {"name": "eodhd.bars@1", "args": {"timezone": ZONE}},
         "partition": partition,
         "time_rules": rules or {"available_at_us": DAY_RULE, "revision_known_at_us": DAY_RULE},
         "decimal_rule": decimals or DECIMALS,

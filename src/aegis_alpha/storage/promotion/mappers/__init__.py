@@ -5,6 +5,8 @@ for the same input takes a new major. It reads only the source relation it is gi
 its spec arguments: never the network, a clock, randomness or the environment. The
 promotion engine owns everything common to all mappers (source row hashes, identity
 resolution, decimal and time rules, record and revision identity, head diff, flags).
+A mapper whose source shape more than one provider's sources share names the source ID
+prefixes it reads, so a spec cannot promote one provider's rows into another's dataset.
 
 ``select`` returns one SELECT over the source relation with these columns:
 
@@ -17,14 +19,23 @@ resolution, decimal and time rules, record and revision identity, head diff, fla
   instrument: the identity key token and the instant at which it is resolved;
 - every domain column except ``instrument_id`` (and ``fields`` when the mapper emits it),
   with each numeric column left as its raw source value for the spec's decimal rule;
-- one ``_aas_t_<name>`` column per time input the mapper declares.
+- one ``_aas_t_<name>`` column per time input the mapper declares;
+- one BOOLEAN column per row flag the mapper declares (``row_flags``).
+
+A mapper that declares ``manifest_items`` may also read ``MANIFEST_ITEMS``: one row
+``(_aas_pin INTEGER, item VARCHAR)`` per element of that list in each pinned source's
+commit manifest ``metadata``, the element as canonical JSON text. The engine recomputes
+each source's request hash from the manifest's table and metadata and refuses the plan
+when it differs from the marker and completed operation, so what the mapper reads from
+the manifest is pinned like the rows.
 
 A domain whose ``instrument_id`` is optional (fundamentals, filings) may be mapped
 without an identity key; its rows then name no instrument. A mapper whose source rows
 are responses rather than facts declares an ``outcome`` over a staged source row
 (completed, no data, failed, ...), which the promotion records as coverage in place of
 rows that a response without data cannot give. A partition stages such a mapper's
-source rows whose partition date is NULL in every partition, so each is counted.
+source rows whose partition date is NULL in every partition, so each is counted, and
+refuses them for every other mapper.
 """
 
 from __future__ import annotations
@@ -34,6 +45,8 @@ from dataclasses import dataclass
 from typing import Final, Protocol
 
 from aegis_alpha.storage.promotion.time_rules import InputKind
+
+MANIFEST_ITEMS: Final = "_aas_p_items"
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,8 +71,18 @@ class Mapper(Protocol):
     def domain(self) -> str: ...
 
     @property
-    def partition_date(self) -> str:
-        """SQL over the source columns: the DATE a spec partition selects source rows by."""
+    def source_prefixes(self) -> tuple[str, ...]:
+        """Source ID prefixes a pinned source must start with; empty accepts any source."""
+        ...
+
+    @property
+    def partition_sql(self) -> str:
+        """SQL over the source columns giving the DATE a spec partition tests.
+
+        A row with no partition date never falls in a partition, and a partitioned plan
+        refuses such rows rather than dropping them, except for a mapper that declares an
+        ``outcome``: its undated rows are staged in every partition and counted there.
+        """
         ...
 
     @property
@@ -69,11 +92,28 @@ class Mapper(Protocol):
 
     @property
     def date_column(self) -> str:
-        """The domain DATE column that a tombstone scope's date interval tests."""
+        """The domain column a tombstone scope's dates test: a DATE, or an instant's UTC day."""
         ...
 
     @property
     def time_inputs(self) -> Mapping[str, InputKind]: ...
+
+    @property
+    def row_flags(self) -> Mapping[str, str]:
+        """Each quality flag the source row itself carries and the BOOLEAN column saying so.
+
+        The engine attaches the flag, under the mapper's ``name@major`` as its rule, to the
+        revision a flagged row produces.
+        """
+        ...
+
+    @property
+    def manifest_items(self) -> str | None:
+        """The list in each pinned source's commit manifest ``metadata`` the mapper reads.
+
+        None when the mapper reads only the source rows.
+        """
+        ...
 
     def check_args(self, args: Mapping[str, object]) -> None:
         """Refuse arguments the mapper does not define."""
@@ -102,13 +142,36 @@ def _registry() -> dict[str, Mapper]:
         DartFnltt,
         DartFnlttFilings,
     )
-    from aegis_alpha.storage.promotion.mappers.eodhd import EodhdBars  # noqa: PLC0415 -- registry
+    from aegis_alpha.storage.promotion.mappers.eodhd import (  # noqa: PLC0415 -- registry
+        EodhdBars,
+        EodhdBarsAdjusted,
+        EodhdBarsQuarantine,
+        EodhdBulkQuarantine,
+        EodhdBulkQuarantineAdjusted,
+    )
+    from aegis_alpha.storage.promotion.mappers.fred import FredAlfred  # noqa: PLC0415
+    from aegis_alpha.storage.promotion.mappers.fx import (  # noqa: PLC0415
+        fred_fx_series,
+        norgate_fx_history,
+    )
+    from aegis_alpha.storage.promotion.mappers.korea import KoreaObservations  # noqa: PLC0415
+    from aegis_alpha.storage.promotion.mappers.norgate import NorgateFxCloses  # noqa: PLC0415
 
     mappers: tuple[Mapper, ...] = (
         CalendarDeclared(),
         DartFnltt(),
         DartFnlttFilings(),
         EodhdBars(),
+        EodhdBarsAdjusted(),
+        EodhdBarsQuarantine(),
+        EodhdBulkQuarantine(),
+        EodhdBulkQuarantineAdjusted(),
+        FredAlfred(),
+        fred_fx_series(),
+        NorgateFxCloses(),
+        norgate_fx_history(),
+        KoreaObservations("bok"),
+        KoreaObservations("oecd"),
     )
     return {f"{mapper.name}@{mapper.major}": mapper for mapper in mappers}
 

@@ -24,6 +24,8 @@ if TYPE_CHECKING:
     from aegis_alpha.storage.workspace import Workspace
 
 RETRIEVED: Final = "2026-09-12T08:33:43.268707Z"
+# The synthetic corp codes whose fiscal year ends in December.
+DECEMBER: Final = ("00000101", "00000202", "00000303")
 TABLE: Final = "receipts"
 
 
@@ -194,8 +196,14 @@ def spec(  # noqa: PLR0913 -- one spec spells its target, sources and mapper
     partition: dict[str, str] | None = None,
     args: dict[str, object] | None = None,
 ) -> tuple[bytes, str]:
-    """Exact spec bytes and their SHA-256 for a DART receipts promotion."""
+    """Exact spec bytes and their SHA-256 for a DART receipts promotion.
+
+    A statements spec declares every synthetic corp code a December year end unless
+    ``args`` says otherwise.
+    """
     domain = "fundamentals" if mapper == "dart.fnltt@1" else "filings"
+    if domain == "fundamentals":
+        args = {"december_year_end": list(DECEMBER), **(args or {})}
     document = {
         "schema_version": "aas-promotion-v1",
         "target": {"domain": domain, "dataset_id": dataset, "parent": parent},

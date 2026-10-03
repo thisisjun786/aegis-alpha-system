@@ -39,11 +39,14 @@ class CalendarDeclared:
     name: Final = "calendar.declared"
     major: Final = 1
     provider: Final = "calendar"
+    source_prefixes: Final = ()
     domain: Final = "calendar_sessions"
-    partition_date: Final = '"session_date"'
+    partition_sql: Final = '"session_date"'
     expands: Final = False
     date_column: Final = "session_date"
     time_inputs: Final[Mapping[str, InputKind]] = {"public_by": "utc_us"}
+    row_flags: Final[Mapping[str, str]] = {}
+    manifest_items: Final = None
 
     def check_args(self, args: Mapping[str, object]) -> None:
         if set(args) != {"timezone_version"}:

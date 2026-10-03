@@ -68,14 +68,13 @@ def _facts(workspace: Workspace, generation_id: str | None = None) -> list[dict[
     return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
 
 
-def _dims(name: str, order: str, number: str = ORIGINAL) -> str:
+def _dims(name: str, occurrence: str) -> str:
     return formats.dimensions_hash(
         {
             "account_detail": "-",
             "account_nm": name,
             "fs_div": "CFS",
-            "ord": order,
-            "rcept_no": number,
+            "occurrence": occurrence,
             "sj_div": "IS",
         }
     )
@@ -108,8 +107,9 @@ def test_statements_promote_as_issuer_fundamentals_with_coverage(ws: Workspace) 
         [
             ("ifrs-full_Revenue", "Q2", _dims("매출액", "1"), Decimal(1200)),
             ("ifrs-full_Revenue", "H1", _dims("매출액", "1"), Decimal(2300)),
-            ("-표준계정코드 미사용-", "Q2", _dims("기타", "2"), Decimal(-5)),
-            ("-표준계정코드 미사용-", "Q2", _dims("기타", "3"), Decimal(7)),
+            # The repeated line is the second of its account and name.
+            ("-표준계정코드 미사용-", "Q2", _dims("기타", "1"), Decimal(-5)),
+            ("-표준계정코드 미사용-", "Q2", _dims("기타", "2"), Decimal(7)),
         ],
         key=lambda item: (item[1], item[2]),
     )
@@ -216,34 +216,66 @@ def test_an_unreadable_response_refuses_the_promotion(ws: Workspace) -> None:
     assert ws.market.execute("SELECT count(*) FROM fundamentals").fetchone() == (0,)
 
 
-def test_an_amendment_adds_records_under_its_own_filing(ws: Workspace) -> None:
+def test_an_amendment_supersedes_the_values_it_restates(ws: Workspace) -> None:
     first = dart.add_receipts(ws, [dart.completed(CORP, "2025", "11012", ORIGINAL, LINES)], tag="a")
     base = _apply(ws, dart.spec([first]))
-    amended = [LINES[0], dart.Line("-표준계정코드 미사용-", "기타", "-6", ord="2")]
+    amended = [LINES[0], dart.Line("-표준계정코드 미사용-", "기타", "-6", ord="2"), LINES[2]]
     later = "2026-10-01T00:00:00Z"
     second = dart.add_receipts(
         ws,
         [
-            # The same filing collected again later, and its amendment.
+            # The same filing collected again later, and its amendment: the request maps
+            # the amendment alone.
             dart.completed(CORP, "2025", "11012", ORIGINAL, LINES, retrieved=later),
-            dart.completed(CORP, "2025", "11012", AMENDED, amended, fs_div="OFS", retrieved=later),
+            dart.completed(CORP, "2025", "11012", AMENDED, amended, retrieved=later),
         ],
         tag="b",
     )
-    child = _apply(ws, dart.spec([second], parent=str(base["generation_id"])))
-    assert (child["operations"], child["unchanged"]) == ({"ASSERT": 3}, 4)
+    document = dart.spec([second], parent=str(base["generation_id"]))
+    plan = _plan(ws, document)
+    assert (plan["refusals"], plan["mapped_rows"]) == ([], 4)
+    child = _apply(ws, document)
+    # Every line names the amendment now, so each record takes a new revision.
+    assert child["operations"] == {"SUPERSEDE": 4}
     added = _facts(ws, str(child["generation_id"]))
     assert {row["accession"] for row in added} == {AMENDED}
     assert {row["available_at_us"] for row in added} == {END_AMENDED}
-    assert {row["op"] for row in _facts(ws)} == {"ASSERT"}
-    # The earlier filing's facts stay; the amendment's facts are told apart by its number.
-    assert len(_facts(ws)) == 7
-    revenue = {
-        cast("str", row["dimensions_hash"])
-        for row in _facts(ws)
-        if row["concept"] == "ifrs-full_Revenue" and row["fiscal_period"] == "Q2"
-    }
-    assert len(revenue) == 2
+    before = {row["record_id"] for row in _facts(ws, str(base["generation_id"]))}
+    assert {row["record_id"] for row in added} == before
+    restated = [row["value"] for row in added if row["dimensions_hash"] == _dims("기타", "1")]
+    assert restated == [Decimal(-6)]
+    # A read as of the original's day sees the original, as of the amendment's the amendment.
+    heads = (
+        "SELECT accession, count(*) FROM (SELECT accession, row_number() OVER ("
+        "PARTITION BY record_id ORDER BY revision_known_at_us DESC) AS rank "
+        "FROM fundamentals WHERE available_at_us <= ?) WHERE rank = 1 GROUP BY 1"
+    )
+    assert ws.market.execute(heads, [END_ORIGINAL]).fetchall() == [(ORIGINAL, 4)]
+    assert ws.market.execute(heads, [END_AMENDED]).fetchall() == [(AMENDED, 4)]
+    assert verify_workspace(ws)["verified"] is True
+
+
+def test_a_year_end_the_spec_does_not_declare_is_refused(ws: Workspace) -> None:
+    other = "00000909"
+    pin = dart.add_receipts(
+        ws,
+        [
+            dart.completed(CORP, "2025", "11012", ORIGINAL, LINES),
+            dart.completed(other, "2025", "11012", "20250814000999", LINES[:1]),
+        ],
+        tag="year-end",
+    )
+    plan = _plan(ws, dart.spec([pin]))
+    assert plan["source_outcomes"] == {"completed": 1, "year_end_unknown": 1}
+    assert plan["refusals"] == ["1 rows required refused"]
+    # A grant leaves the undated issuer out; it stays counted and no period is guessed.
+    result = _apply(ws, dart.spec([pin], args={"accept": ["year_end_unknown"]}))
+    assert result["source_outcomes"] == {"completed": 1, "year_end_unknown": 1}
+    assert {row["issuer_id"] for row in _facts(ws)} == {ISSUER}
+    # Filings carry no period, so every issuer's filing maps.
+    filings = _apply(ws, dart.spec([pin], mapper="dart.fnltt_filings@1", dataset="filings.kr.dart"))
+    assert filings["source_outcomes"] == {"completed": 2}
+    assert filings["operations"] == {"ASSERT": 2}
 
 
 def test_a_partition_selects_requests_by_business_year(ws: Workspace) -> None:

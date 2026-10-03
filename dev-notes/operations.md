@@ -324,7 +324,7 @@ uv run --no-sync python -m scripts.us_identity_report --market MARKET.duckdb \
 원천 자료실 자료를 공급자별 시장 dataset으로 승격하는 명령(`aas data promote`), 원천 ID 연결
 (`aas db source-link`), core schema 업그레이드(`aas db migrate`), 원천 은퇴(`aas db source-retire`)와
 compact(`aas db compact`)의 계약은 [데이터 수직 계약](design/data-vertical.md)이 소유한다. 현재 CLI에는
-`aas db migrate`, `aas data promote`·`promotions`, `aas calendar refresh`, `aas import legacy`와 위
+`aas db migrate`, `aas data promote`·`promotions`·`kr-prices`, `aas calendar refresh`, `aas import legacy`와 위
 [원본 자료 이전과 조회](#원본-자료-이전과-조회)의 `source-link`가 있다. 은퇴와 compact는 그 계약의 대응표 행이 `구현`이 될 때 이 절에 추가된다.
 승격된 dataset을 읽는 소비자 경로(`read_heads`)가 연결되기 전까지 원천 자료의 연구 입력은 아래
 `register-*` 경로가 맡는다.
@@ -338,8 +338,8 @@ aas data promotions
 ```
 
 `promote --plan`은 설치본을 읽기 전용으로 열어 명세가 요청하는 승격을 끝까지 계산하고 아무것도
-쓰지 않는다. 응답은 원천 행 수, 매핑 행 수, 응답을 담는 원천(DART 재무제표 응답 등)의 결과 분포
-(`source_outcomes`: 완료·자료 없음·실패·읽을 수 없음·요청 불일치), 행 상태(승격 가능·보류·미해결·거부), 미해결 token 표본, 숫자 규칙
+쓰지 않는다. 응답은 원천 행 수, 매핑 행 수, 매퍼가 고르지 않은 행 수, 응답을 담는 원천(DART 재무제표 응답 등)의 결과 분포
+(`source_outcomes`: 완료·자료 없음·실패·읽을 수 없음·요청 불일치·결산월 미선언), 행 상태(승격 가능·보류·미해결·거부), 미해결 token 표본, 숫자 규칙
 flag 분포, 시간 규칙별 null·상한 적용 수, op 분포, stale 행, 계획한 marker, 그리고 설치본의 전제
 부족(`blocking`: core schema v2, `sl:` 연결, identity snapshot 등록)과 자료 문제(`refusals`)를 담는다.
 `--plan` 없이 실행하면 둘 중 하나라도 있을 때 아무것도 쓰지 않고 거부한다. delta가 비면 generation을
@@ -349,6 +349,10 @@ flag 분포, 시간 규칙별 null·상한 적용 수, op 분포, stale 행, 계
 기존 generation을 검증해 돌려주고, 중단된 승격은 같은 명령이나 `aas db recover`가 끝낸다. 승격은
 공급자를 호출하지 않으며, 설정된 공유 계산 예산이 있으면 그 예산 안에서 돈다. `promotions`는
 승격 intent마다 단계, generation, dataset version, 행 수, 명세 해시와 매퍼를 나열한다.
+
+ALFRED vintage(`fred.alfred@1`)는 generation 하나에 관측마다 vintage를 하나만 담으므로 백필은 계약의
+[거시와 FX 매퍼](design/data-vertical.md#거시와-fx-매퍼)가 정한 vintage 구간마다 명세 하나를 만들어, 직전
+generation을 parent로 순서대로 승격한다. 구간 없이 원천 전체를 계획하면 반복된 자연키로 거부된다.
 
 ### legacy 원천 편입
 
@@ -381,6 +385,30 @@ authority)을 `raw/`에 보존하고 원천 자료실의 내용 원천으로 com
 크기만큼의 디스크 공간과, 계획·검증마다 원본 전체를 다시 읽는 I/O 시간이 필요하다. 편입한 원천은 원천
 자료실 metadata로 `aas db verify`의 할당에 청구되므로, 수백 개 commit을 더한 설치본의 verify는 공유 계산 예산
 환경(`AAS_*_LIMIT*`, `AAS_COMPUTE_LOCK_FILE`)을 설정해 실행한다. 설정하지 않은 기본 할당은 그 metadata를 거부할 수 있다.
+
+### KR 가격 승격
+
+```bash
+aas data kr-prices --identity-snapshot ID --lag-us MICROSECONDS \
+  --history-lineage SOURCE_ID_PREFIX [--bulk-lineage SOURCE_ID_PREFIX] [--reference] [--plan]
+```
+
+`kr-prices`는 EODHD KR 일봉 이력(`--history-lineage`의 `bars` 테이블, 연도마다), 그 이력에서 수집기가
+보류한 행(같은 접두어의 `quarantine` 테이블, 값 없는 `invalid` bar로 한 번), 공급자가 부분 응답이라고
+경고한 일간 내려받기(`--bulk-lineage`의 KR `quarantine` 테이블, 세션 날짜마다)를 `prices.kr.eodhd`의
+generation으로 차례로 승격한다. `--reference`는 이력과 부분 응답 단계를 adjusted close로
+`prices.kr.eodhd.ref`에 만든다. 전제는 core schema v2, 원천의 `sl:` 연결, 등록된 KR identity snapshot(`--identity-snapshot`),
+`sessions.xkrx`의 committed generation이다. `--lag-us`는 `session_close_plus_lag@1`이 XKRX 마감에 더하는
+상한이며 명세와 transform hash에 들어간다. 부분 응답 행은 flag `provider_reported_partial`과 함께
+승격되고 generation마다 `partition_row_count@1` 행 수 대조가 `quality_checks`에 남는다. 같은 날짜를
+다시 받은 내용이 다른 내려받기는 `sl:` 연결 순서대로 그 날짜의 다음 generation이 되어 앞의 것을
+SUPERSEDE한다.
+
+`--plan`은 설치본을 읽기 전용으로 열어 모든 단계를 현재 head의 자식으로 계획하고, 단계별 `promote
+--plan` 보고와 합계를 낸다. 실행은 단계마다 앞 단계가 남긴 head를 parent로 승격하고 첫 거부에서
+멈추며, 같은 명령을 다시 실행하면 이미 게시된 단계는 빈 delta라 아무것도 쓰지 않는다. 연도 단위 대량
+게시의 DuckDB 메모리는 [대량 게시](design/data-vertical.md#대량-게시와-reader)의 할당 결정(AAS-54)을
+따른다. 단계 순서와 규칙은 [데이터 수직 계약](design/data-vertical.md#kr-가격)이 소유한다.
 
 ### 선언 달력 갱신
 
@@ -427,7 +455,8 @@ market과 state를 각각 한 트랜잭션으로 올린 다음 설치 영수증�
 3. `aas db migrate --to 2 --backup-output DIR`, 이어서 `aas db source-link --apply`. legacy 원본은
    `aas import legacy --plan`의 `reconciled`를 확인하고, `[owner]` 항목마다 `uncovered` 파일을 manifest의
    `retain`·`exclude`로 기록한 뒤 실행하고 `--verify`로 `complete`를 확인한다.
-4. `aas calendar refresh --plan`을 확인하고 실행해 달력 generation을 먼저 만든다. 이어서 명세마다
+4. `aas calendar refresh --plan`을 확인하고 실행해 달력 generation을 먼저 만든다. 이어서 KR identity를
+   등록하고 `aas data kr-prices --plan`을 확인한 뒤 실행한다. 다른 dataset은 명세마다
    `aas data promote --plan`을 확인한 뒤 실행하고 generation마다 verify한다. 실패하면
    `aas db recover`로 게시만 재개한다. 공급자를 다시 호출하지 않는다.
 5. `[owner]` 승인된 수집기를 설정의 호출 상한과 함께 예약 실행으로 켠다.
