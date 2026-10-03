@@ -9,8 +9,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 import pyarrow as pa
 
@@ -105,6 +106,21 @@ def completed(  # noqa: PLR0913 -- one receipt spells its request and response
     )
 
 
+def replaced(receipt: tuple[object, ...], raw: bytes) -> tuple[object, ...]:
+    """``receipt`` answering with ``raw`` instead, its recorded hash that of ``raw``."""
+    return (*receipt[:5], base64.b64encode(raw).decode(), hashlib.sha256(raw).hexdigest(),
+            *receipt[7:])  # fmt: skip
+
+
+def edited(
+    receipt: tuple[object, ...], edit: Callable[[dict[str, Any]], None]
+) -> tuple[object, ...]:
+    """``receipt`` with its response document changed by ``edit`` and hashed again."""
+    document = json.loads(base64.b64decode(str(receipt[5])))
+    edit(document)
+    return replaced(receipt, json.dumps(document, ensure_ascii=False).encode())
+
+
 def no_data(
     corp: str, year: str, report: str, *, outcome: str = "NO_DATA", retrieved: str = RETRIEVED
 ) -> tuple[object, ...]:
@@ -169,13 +185,14 @@ DAY_RULE: Final = {
 }
 
 
-def spec(
+def spec(  # noqa: PLR0913 -- one spec spells its target, sources and mapper
     sources: list[dict[str, str]],
     *,
     mapper: str = "dart.fnltt@1",
     dataset: str = "fundamentals.kr.dart",
     parent: str | None = None,
     partition: dict[str, str] | None = None,
+    args: dict[str, object] | None = None,
 ) -> tuple[bytes, str]:
     """Exact spec bytes and their SHA-256 for a DART receipts promotion."""
     domain = "fundamentals" if mapper == "dart.fnltt@1" else "filings"
@@ -183,7 +200,7 @@ def spec(
         "schema_version": "aas-promotion-v1",
         "target": {"domain": domain, "dataset_id": dataset, "parent": parent},
         "sources": sources,
-        "mapper": {"name": mapper, "args": {}},
+        "mapper": {"name": mapper, "args": args or {}},
         "partition": partition,
         "time_rules": {"available_at_us": DAY_RULE, "revision_known_at_us": DAY_RULE},
         "decimal_rule": {"value": "decimal_text@1"} if domain == "fundamentals" else {},

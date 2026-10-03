@@ -23,7 +23,8 @@ A domain whose ``instrument_id`` is optional (fundamentals, filings) may be mapp
 without an identity key; its rows then name no instrument. A mapper whose source rows
 are responses rather than facts declares an ``outcome`` over a staged source row
 (completed, no data, failed, ...), which the promotion records as coverage in place of
-rows that a response without data cannot give.
+rows that a response without data cannot give. A partition stages such a mapper's
+source rows whose partition date is NULL in every partition, so each is counted.
 """
 
 from __future__ import annotations

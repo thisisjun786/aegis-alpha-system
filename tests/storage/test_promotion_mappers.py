@@ -3,12 +3,13 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import duckdb
+import pytest
 
 from aegis_alpha.storage.identity import mint_issuer
 from aegis_alpha.storage.promotion import formats
@@ -165,29 +166,85 @@ def _dart_source(rows: list[tuple[object, ...]]) -> duckdb.DuckDBPyConnection:
 _CORP, _OTHER = "00000101", "00000202"
 _NUMBER = "20250814000123"
 _RETRIEVED_US = _us(datetime(2026, 9, 12, 8, 33, 43, 268707, tzinfo=UTC))
+_LINES = [
+    # A quarter amount with its year to date; the second line repeats the account name
+    # under another order, as DART statements do.
+    dart.Line("ifrs-full_Revenue", "매출액", "1200", cumulative="2300", ord="1"),
+    dart.Line("-표준계정코드 미사용-", "기타", "-5", ord="2"),
+    dart.Line("-표준계정코드 미사용-", "기타", "", ord="3", sj_div="BS"),
+    dart.Line("ifrs-full_Equity", "자본", "12.5", ord="4", sj_div="BS", cumulative="9"),
+    dart.Line("ifrs-full_Assets", "자산", "1,000", ord="5", sj_div="BS"),
+    dart.Line("ifrs-full_CashFlows", "현금흐름", "40", ord="6", sj_div="CF", cumulative="40"),
+]
+
+
+def _set_line(index: int, name: str, value: str) -> Callable[[dict[str, Any]], None]:
+    def edit(document: dict[str, Any]) -> None:
+        document["list"][index][name] = value
+
+    return edit
 
 
 def _dart_rows() -> list[tuple[object, ...]]:
-    lines = [
-        # A this-term amount and a cumulative one; the second line repeats the account
-        # name under another order, as DART statements do.
-        dart.Line("ifrs-full_Revenue", "매출액", "1200", cumulative="2300", ord="1"),
-        dart.Line("-표준계정코드 미사용-", "기타", "-5", ord="2"),
-        dart.Line("-표준계정코드 미사용-", "기타", "", ord="3", sj_div="BS"),
-        dart.Line("ifrs-full_Equity", "자본", "12.5", ord="4", sj_div="BS", cumulative=""),
-        dart.Line("ifrs-full_Assets", "자산", "1,000", ord="5", sj_div="BS"),
-    ]
-    damaged = dart.completed(_OTHER, "2025", "11012", _NUMBER, lines[:1], raw=b"not the bytes")
-    # A response whose lines name another corp than its request names no issuer.
-    foreign = dart.completed(_OTHER, "2024", "11011", "20250320000001", lines[:1])
+    good = dart.completed(_CORP, "2025", "11012", _NUMBER, _LINES)
+    damaged = dart.completed(_OTHER, "2025", "11012", _NUMBER, _LINES[:1], raw=b"not the bytes")
+    foreign = dart.completed(_OTHER, "2024", "11011", "20250320000001", _LINES[:1])
+    two = dart.completed(_CORP, "2023", "11011", "20240315000009", _LINES[:2])
     return [
-        dart.completed(_CORP, "2025", "11012", _NUMBER, lines),
+        good,
         dart.no_data(_CORP, "2025", "11013"),
         dart.no_data(_CORP, "2025", "11014", outcome="FAILED"),
         dart.corp_codes(),
         damaged,
+        # Lines that name another corp than the request.
         (*foreign[:3], dart.request(_CORP, "2024", "11011"), *foreign[4:]),
+        # A later line that names another report, then another receipt number.
+        dart.edited(good, _set_line(1, "reprt_code", "11014")),
+        dart.edited(two, _set_line(1, "rcept_no", "20240401000001")),
+        # A receipt number whose first eight digits are no date, and a request whose
+        # business year is not a year.
+        dart.edited(good, _set_line(1, "rcept_no", "20251399000123")),
+        (*good[:3], dart.request(_CORP, "25", "11012"), *good[4:]),
+        dart.no_data(_CORP, "2025", "11011", outcome="RETRY"),
     ]
+
+
+_OUTCOMES = [
+    "completed",
+    "no_data",
+    "failed",
+    "other_endpoint",
+    "unreadable",
+    "mismatched",
+    "mismatched",
+    "mismatched",
+    "unreadable",
+    "unreadable",
+    "unknown_outcome",
+]
+
+
+def test_dart_receipt_outcomes_and_partition_dates() -> None:
+    fnltt = mapper("dart.fnltt@1")
+    connection = _dart_source(_dart_rows())
+    outcomes = connection.execute(
+        f"SELECT {fnltt.outcome({})}, {fnltt.partition_date} FROM src ORDER BY _aas_ordinal"
+    ).fetchall()
+    assert [row[0] for row in outcomes] == _OUTCOMES
+    assert [row[1] for row in outcomes] == [
+        date(2025, 1, 1),
+        date(2025, 1, 1),
+        date(2025, 1, 1),
+        None,
+        date(2025, 1, 1),
+        date(2024, 1, 1),
+        date(2025, 1, 1),
+        date(2023, 1, 1),
+        date(2025, 1, 1),
+        None,
+        date(2025, 1, 1),
+    ]
+    assert mapper("dart.fnltt_filings@1").outcome({}) == fnltt.outcome({})
 
 
 def test_dart_fnltt_maps_synthetic_fixture() -> None:
@@ -197,19 +254,6 @@ def test_dart_fnltt_maps_synthetic_fixture() -> None:
     assert fnltt.expands
     assert fnltt.numeric_columns({}) == {"value": "VARCHAR"}
     connection = _dart_source(_dart_rows())
-    outcomes = connection.execute(
-        f"SELECT _aas_ordinal, {fnltt.outcome({})}, {fnltt.partition_date} FROM src "
-        "ORDER BY _aas_ordinal"
-    ).fetchall()
-    year = date(2025, 1, 1)
-    assert outcomes == [
-        (0, "completed", year),
-        (1, "no_data", year),
-        (2, "failed", year),
-        (3, "other_endpoint", None),
-        (4, "unreadable", year),
-        (5, "completed", date(2024, 1, 1)),
-    ]
     mapped = connection.execute(
         "SELECT _aas_ordinal, _aas_item, issuer_id, concept, period_start, period_end, "
         "fiscal_period, unit, dimensions_hash, form, accession, accepted_at_us, value, "
@@ -218,11 +262,12 @@ def test_dart_fnltt_maps_synthetic_fixture() -> None:
     ).fetchall()
     issuer = mint_issuer("dart_corp_code", _CORP)
     filed, end = date(2025, 8, 14), date(2025, 6, 30)
+    year, quarter = date(2025, 1, 1), date(2025, 4, 1)
 
-    def dims(name: str, sj: str, order: str, detail: str = "-") -> str:
+    def dims(name: str, sj: str, order: str) -> str:
         return formats.dimensions_hash(
             {
-                "account_detail": detail,
+                "account_detail": "-",
                 "account_nm": name,
                 "fs_div": "CFS",
                 "ord": order,
@@ -232,27 +277,104 @@ def test_dart_fnltt_maps_synthetic_fixture() -> None:
         )
 
     def fact(  # noqa: PLR0913, PLR0917 -- one expected fundamentals row
-        item: int, concept: str, period: str, key: str, value: str | None, state: str
+        item: int,
+        concept: str,
+        start: date | None,
+        period: str,
+        key: str,
+        value: str | None,
+        state: str,
     ) -> tuple[object, ...]:
-        return (0, item, issuer, concept, None, end, period, "KRW", key, "11012", _NUMBER,
+        return (0, item, issuer, concept, start, end, period, "KRW", key, "11012", _NUMBER,
                 None, value, state, _RETRIEVED_US, filed)  # fmt: skip
 
     other = "-표준계정코드 미사용-"
+    # An income statement line measures the second quarter and its cumulative amount the
+    # half year; balance sheet lines are instants and cash flows the year to date. The
+    # cumulative fields of the balance sheet and cash flow lines stay in the source.
     assert mapped[:7] == [
-        fact(0, "ifrs-full_Revenue", "H1", dims("매출액", "IS", "1"), "1200", "present"),
-        fact(1, "ifrs-full_Revenue", "H1-cumulative", dims("매출액", "IS", "1"), "2300",
-             "present"),
-        fact(2, other, "H1", dims("기타", "IS", "2"), "-5", "present"),
-        fact(4, other, "H1", dims("기타", "BS", "3"), None, "missing"),
-        fact(6, "ifrs-full_Equity", "H1", dims("자본", "BS", "4"), "12.5", "present"),
-        fact(7, "ifrs-full_Equity", "H1-cumulative", dims("자본", "BS", "4"), None, "missing"),
-        fact(8, "ifrs-full_Assets", "H1", dims("자산", "BS", "5"), None, "invalid"),
+        fact(0, "ifrs-full_Revenue", quarter, "Q2", dims("매출액", "IS", "1"), "1200", "present"),
+        fact(1, "ifrs-full_Revenue", year, "H1", dims("매출액", "IS", "1"), "2300", "present"),
+        fact(2, other, quarter, "Q2", dims("기타", "IS", "2"), "-5", "present"),
+        fact(4, other, None, "H1", dims("기타", "BS", "3"), None, "missing"),
+        fact(6, "ifrs-full_Equity", None, "H1", dims("자본", "BS", "4"), "12.5", "present"),
+        fact(8, "ifrs-full_Assets", None, "H1", dims("자산", "BS", "5"), None, "invalid"),
+        fact(10, "ifrs-full_CashFlows", year, "H1", dims("현금흐름", "CF", "6"), "40", "present"),
     ]  # fmt: skip
-    # No data, a failure and the corp code list give no rows. A damaged response gives
-    # one row without an issuer, and a line that disagrees with its request gives its
-    # amounts without one.
-    assert [(row[0], row[2]) for row in mapped[7:]] == [(4, None), (5, None), (5, None)]
-    assert mapped[8][3] == "ifrs-full_Revenue"
+    # No data, a failure and the corp code list give no rows. Each refused response
+    # gives one row without an issuer.
+    refused = [i for i, name in enumerate(_OUTCOMES) if name in {"unreadable", "mismatched",
+               "unknown_outcome"}]  # fmt: skip
+    assert [(row[0], row[1], row[2]) for row in mapped[7:]] == [(i, 0, None) for i in refused]
+    # A spec may grant leaving refused responses out; they still count as outcomes.
+    fnltt.check_args({"accept": ["mismatched", "unknown_outcome", "unreadable"]})
+    kept = connection.execute(
+        "SELECT DISTINCT _aas_ordinal FROM ("
+        f"{fnltt.select('src', {'accept': ['mismatched', 'unreadable']})})"
+    ).fetchall()
+    assert sorted(row[0] for row in kept) == [0, 10]
+    for bad in ({"other": 1}, {"accept": []}, {"accept": ["unreadable", "mismatched"]},
+                {"accept": ["no_data"]}, {"accept": "unreadable"}):  # fmt: skip
+        with pytest.raises(ValueError, match="accept"):
+            fnltt.check_args(bad)
+
+
+def test_dart_fnltt_reads_each_report_period() -> None:
+    fnltt = mapper("dart.fnltt@1")
+    lines = [
+        dart.Line("is", "is", "1", cumulative="2"),
+        dart.Line("cis", "cis", "3", cumulative="4", sj_div="CIS", ord="2"),
+        dart.Line("cf", "cf", "5", sj_div="CF", ord="3"),
+        dart.Line("sce", "sce", "6", sj_div="SCE", ord="4"),
+        dart.Line("bs", "bs", "7", sj_div="BS", ord="5"),
+    ]
+    reports = {"11013": "20250515000001", "11012": "20250814000001",
+               "11014": "20251114000001", "11011": "20260310000001"}  # fmt: skip
+    connection = _dart_source(
+        [dart.completed(_CORP, "2025", code, number, lines) for code, number in reports.items()]
+    )
+    mapped = connection.execute(
+        "SELECT form, concept, fiscal_period, period_start, period_end, value "
+        f"FROM ({fnltt.select('src', {})}) ORDER BY form, _aas_item"
+    ).fetchall()
+
+    def rows(form: str, end: date, quarter: tuple[str, date], ytd: str) -> list[object]:
+        start = date(2025, 1, 1)
+        # A first-quarter or annual report's cumulative amount measures the same period.
+        both = form in {"11012", "11014"}
+        return [
+            (form, "is", *quarter, end, "1"),
+            *([(form, "is", ytd, start, end, "2")] if both else []),
+            (form, "cis", *quarter, end, "3"),
+            *([(form, "cis", ytd, start, end, "4")] if both else []),
+            (form, "cf", ytd, start, end, "5"),
+            (form, "sce", ytd, start, end, "6"),
+            (form, "bs", ytd, None, end, "7"),
+        ]
+
+    assert mapped == [
+        *rows("11011", date(2025, 12, 31), ("FY", date(2025, 1, 1)), "FY"),
+        *rows("11012", date(2025, 6, 30), ("Q2", date(2025, 4, 1)), "H1"),
+        *rows("11013", date(2025, 3, 31), ("Q1", date(2025, 1, 1)), "Q1"),
+        *rows("11014", date(2025, 9, 30), ("Q3", date(2025, 7, 1)), "9M"),
+    ]
+
+
+def test_dart_fnltt_reads_a_repeated_response_once() -> None:
+    fnltt = mapper("dart.fnltt@1")
+    first = dart.completed(_CORP, "2025", "11012", _NUMBER, _LINES[:1])
+    again = dart.completed(
+        _CORP, "2025", "11012", _NUMBER, _LINES[:1], retrieved="2026-10-01T00:00:00Z"
+    )
+    changed = dart.edited(again, _set_line(0, "thstrm_amount", "1300"))
+    connection = _dart_source([again, first, changed])
+    mapped = connection.execute(
+        "SELECT _aas_ordinal, value, _aas_ingested_at_us FROM "
+        f"({fnltt.select('src', {})}) WHERE _aas_item = 0 ORDER BY _aas_ordinal"
+    ).fetchall()
+    # The earliest retrieval of the same bytes speaks for both; different bytes for the
+    # same filing stay, so their repeated keys are refused rather than one chosen.
+    assert mapped == [(1, "1200", _RETRIEVED_US), (2, "1300", mapped[1][2])]
 
 
 def test_dart_fnltt_filings_maps_synthetic_fixture() -> None:
@@ -261,14 +383,10 @@ def test_dart_fnltt_filings_maps_synthetic_fixture() -> None:
     assert not filings.expands
     assert filings.identity({}) is None
     rows = _dart_rows()
-    # A response whose lines name two receipt numbers names no filing.
-    split = dart.body(_CORP, "2023", "11011", "20240315000009", [dart.Line("a", "a", "1")])
-    mixed = json.loads(split)
-    mixed["list"].append({**mixed["list"][0], "rcept_no": "20240401000001"})
-    raw = json.dumps(mixed).encode()
-    receipt = dart.completed(_CORP, "2023", "11011", "20240315000009", [], raw=raw)
-    rows.append((*receipt[:6], hashlib.sha256(raw).hexdigest(), *receipt[7:]))
-    connection = _dart_source(rows)
+    # The separate statements of the same filing, collected later, name the same filing.
+    separate = dart.completed(_CORP, "2025", "11012", _NUMBER, _LINES[:1], fs_div="OFS",
+                              retrieved="2026-10-01T00:00:00Z")  # fmt: skip
+    connection = _dart_source([*rows, separate])
     mapped = connection.execute(
         "SELECT _aas_ordinal, issuer_id, filing_id, form, filed_date, accepted_at_us, "
         "period_end, _aas_ingested_at_us, _aas_t_filed_date "
@@ -277,5 +395,6 @@ def test_dart_fnltt_filings_maps_synthetic_fixture() -> None:
     issuer = mint_issuer("dart_corp_code", _CORP)
     filed = date(2025, 8, 14)
     assert mapped[0] == (0, issuer, _NUMBER, "11012", filed, None, None, _RETRIEVED_US, filed)
-    assert [(row[0], row[1]) for row in mapped[1:]] == [(4, None), (5, None), (6, None)]
-    assert mapped[3][2:5] == ("20240315000009", "11011", date(2024, 3, 15))
+    refused = [i for i, name in enumerate(_OUTCOMES) if name not in {"completed", "no_data",
+               "failed", "other_endpoint"}]  # fmt: skip
+    assert [(row[0], row[1]) for row in mapped[1:]] == [(i, None) for i in refused]

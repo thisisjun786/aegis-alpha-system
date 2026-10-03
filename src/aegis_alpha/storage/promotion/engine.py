@@ -19,6 +19,7 @@ from __future__ import annotations
 # ruff: noqa: S608 -- every dynamic identifier is engine-owned and quoted; values are bound.
 import hashlib
 import json
+import time
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import TYPE_CHECKING, Final, cast
@@ -426,6 +427,10 @@ def _stage_sources(
             f" WHERE {day} >= DATE '{spec.partition.start.isoformat()}' "
             f"AND {day} < DATE '{spec.partition.end.isoformat()}'"
         )
+        if spec.mapper.outcome(spec.mapper_args) is not None:
+            # A response row without a partition date (another endpoint, a request that
+            # cannot be read) belongs to every partition, so its outcome is always counted.
+            where += f" OR {day} IS NULL"
     union = " UNION ALL ".join(
         f"SELECT {index}::INTEGER AS _aas_pin, _aas_ordinal, {names} "
         f"FROM {_q(source.target)}{where}"
@@ -1340,11 +1345,68 @@ def promote(
         if plan.blocking or plan.refusals:
             raise ValueError("promotion refused: " + "; ".join([*plan.blocking, *plan.refusals]))
         if not plan.delta_rows:
-            return {**result, "published": False, "empty_delta": True}
+            covered = _record_coverage(workspace, plan)
+            return {**result, "published": False, "empty_delta": True, "coverage_check": covered}
         marker = _publish(workspace, plan, budget)
         return {**result, "published": True, "marker": marker}
     finally:
         _drop(workspace.market)
+
+
+def _record_coverage(workspace: Workspace, plan: PromotionPlan) -> str | None:
+    """Record an empty delta's source outcomes on the head it left unchanged.
+
+    A request whose sources change no row publishes no generation, yet its responses
+    (no data, failures) are coverage. Only a mapper that declares outcomes records it,
+    as a ``promotion_coverage@1`` check on the parent's dataset version whose reason
+    names the request, spec and sources; the spec and request stay in ``raw/``. The
+    check ID is the request's, so repeating the request records nothing new. Without
+    a parent there is no version to hold the check, and the result says so (None).
+    """
+    spec = plan.spec
+    if "source_outcomes" not in plan.report or spec.parent is None:
+        return None
+    state = workspace.state
+    version = state.execute(
+        "SELECT dataset_id, version FROM dataset_versions WHERE generation_id=? "
+        "AND status='committed'",
+        (spec.parent,),
+    ).fetchone()
+    if version is None or str(version[0]) != spec.dataset_id:
+        raise ValueError("the parent generation has no committed catalog version; recover it")
+    for payload in (spec.raw, plan.request):
+        put_raw(workspace.paths.raw, payload)
+    reason = {
+        "request_hash": plan.request_hash,
+        "spec_sha256": spec.sha256,
+        "sources": [
+            {"source_id": pin.source_id, "table": pin.table, "digest": pin.table_digest}
+            for pin in spec.sources
+        ],
+        **{
+            key: plan.report[key]
+            for key in ("source_outcomes", "rows", "unchanged", "stale")
+            if key in plan.report
+        },
+    }
+    check_id = "qc-" + hashlib.sha256(f"{plan.request_hash}/coverage".encode()).hexdigest()
+    with atomic(state):
+        state.execute(
+            "INSERT INTO quality_checks(check_id, dataset_id, version, rule_id, rule_version, "
+            "result, reason, checked_at_us) VALUES (?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(check_id) DO NOTHING",
+            (
+                check_id,
+                spec.dataset_id,
+                str(version[1]),
+                "promotion_coverage",
+                "1",
+                "recorded",
+                formats.canonical(reason).decode(),
+                time.time_ns() // 1000,
+            ),
+        )
+    return check_id
 
 
 def _pending_plan(

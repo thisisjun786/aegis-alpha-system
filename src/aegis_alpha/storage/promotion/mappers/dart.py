@@ -7,42 +7,68 @@ its ``endpoint``, ``outcome``, ``request_json`` (whose ``parameters_json`` names
 ``retrieved_at_utc``. Other columns (fingerprints, validation notes) stay in the source
 row and its hash.
 
-A row reads as ``completed`` only when it is a ``financials`` request that completed, its
-response bytes decode to UTF-8 text whose SHA-256 is the recorded one, and that text is a
-JSON document with provider status ``000`` and a nonempty ``list`` of statement lines.
-Every other row is coverage, never a fact: ``no_data`` (the provider had no statement for
-the request), ``failed``, ``other_endpoint`` (the corp code list shares the table),
-``unreadable`` (a completed financials response that fails any check above) and
-``unknown_outcome``. An ``unreadable`` or ``unknown_outcome`` row maps to one row with no
-issuer, which the promotion refuses as a missing required column, so a damaged response
-is never skipped silently.
+Each ``financials`` row has one outcome, the first that applies:
+
+- ``unreadable``: the request does not name an eight-digit corp code, a four-digit
+  business year, a known report code and ``CFS`` or ``OFS``; or the request completed
+  but its response bytes are not UTF-8 text whose SHA-256 is the recorded one, or that
+  text is not a JSON document with provider status ``000`` and a nonempty ``list`` of
+  statement lines. Every line has an ``sj_div`` of ``BS``, ``IS``, ``CIS``, ``CF`` or
+  ``SCE``, a 14-digit ``rcept_no`` that starts with a calendar date, a numeric ``ord``, a
+  three-letter ``currency`` and ``account_id``, ``account_nm`` and ``account_detail``, so a
+  completed response maps whole.
+- ``no_data`` (the provider had no statement for the request) and ``failed``.
+- ``mismatched``: a completed response in which a line names another corp code, business
+  year or report code than the request, or the lines name more than one receipt number.
+- ``completed``: every other completed response. Only these give rows.
+- ``unknown_outcome``: an outcome other than ``COMPLETED``, ``NO_DATA`` and ``FAILED``.
+
+Rows of other endpoints (the corp code list shares the table) are ``other_endpoint``.
+An ``unreadable``, ``mismatched`` or ``unknown_outcome`` row maps to one row with no
+issuer, which the promotion refuses as a missing required column. The mapper argument
+``accept`` (a sorted list of those outcome names) grants a promotion that leaves such
+rows out instead; they stay counted in the promotion's ``source_outcomes``.
 
 Shared rules of both mappers:
 
 - The issuer is ``mint_issuer('dart_corp_code', corp_code)`` of the request's eight-digit
-  corp code, the DART issuer anchor. A statement line whose corp code, business year or
-  report code differs from its request has no issuer and is refused.
-- The filing is the line's receipt number ``rcept_no`` (14 digits), whose first eight
-  digits are the receipt date in Korea; that date is ``filed_date`` and the one time input.
-  OpenDART answers with the statements of the latest filing for a report, so the receipt
-  number names the filing (an amendment included) whose values the row holds.
+  corp code, the DART issuer anchor.
+- The filing is the response's receipt number ``rcept_no`` (14 digits), whose first eight
+  digits are the receipt date in Korea; that date is ``filed_date`` and the one time
+  input. OpenDART answers with the statements of the latest filing for a report, so the
+  receipt number names the filing (an amendment included) whose values the rows hold.
 - ``form`` is the OpenDART report code: ``11011`` annual, ``11012`` half-year, ``11013``
   first quarter, ``11014`` third quarter.
+- Responses that repeat a filing in one promotion are read once, the earliest retrieval
+  speaking for them and the others staying in the source: for statements, the same
+  response bytes collected twice; for filings, any responses of one filing (its
+  consolidated and separate statements included). Two different statement responses
+  of one filing both map, and the promotion refuses the natural keys they repeat.
 
-``dart.fnltt@1`` writes one fundamentals row per statement line and amount field the
-line carries: ``thstrm_amount`` (this term) always and ``thstrm_add_amount`` (this term
-cumulative) when present. Prior-period comparatives (``frmtrm_*``, ``bfefrmtrm_*``)
+``dart.fnltt@1`` writes one fundamentals row per statement line and the period it
+measures. DART states no period dates; the fiscal year is taken to run January to
+December of ``bsns_year``, which is exact for an issuer with a December year end and a
+period label otherwise. The report covers the year to date through its end month (3, 6,
+9 or 12) and its quarter (the last three months of that). By OpenDART's definitions:
+
+- ``thstrm_amount`` of an income statement (``IS``, ``CIS``) measures the quarter:
+  ``Q1``, ``Q2``, ``Q3`` or ``FY`` for the annual report;
+- ``thstrm_add_amount`` of an income statement in a half-year or third-quarter report
+  measures the year to date, ``H1`` or ``9M``. In the other reports it measures the same
+  period as ``thstrm_amount`` (or is empty) and stays in the source;
+- ``thstrm_amount`` of a cash flow or equity statement (``CF``, ``SCE``) measures the year
+  to date: ``Q1``, ``H1``, ``9M`` or ``FY``;
+- ``thstrm_amount`` of a balance sheet (``BS``) is the instant at the report's end; it
+  takes the year-to-date label and no ``period_start``.
+
+``period_start`` is the first day of the measured period and ``period_end`` the last day
+of the report's end month. Prior-period comparatives (``frmtrm_*``, ``bfefrmtrm_*``)
 stay in the source.
 
 - ``concept`` is ``account_id`` as DART spells it (``-표준계정코드 미사용-`` for a line
   without a standard account), ``unit`` is the line's currency, and ``value`` is the
   amount text for ``decimal_text@1``: ``present`` for a decimal number, ``missing`` for
   an empty field and ``invalid`` (no value) for any other text.
-- DART states no period dates. ``fiscal_period`` is the report slot (``FY``, ``H1``,
-  ``Q1``, ``Q3``) for this-term amounts and the slot with ``-cumulative`` for cumulative
-  ones. ``period_end`` is the slot's nominal end in ``bsns_year`` (``03-31``, ``06-30``,
-  ``09-30``, ``12-31``), which is the period end for an issuer with a December year end
-  and a slot label otherwise; ``period_start`` is NULL.
 - ``dimensions_hash`` is ``aas-dimensions-v1`` of ``fs_div``, ``sj_div``,
   ``account_nm``, ``account_detail``, ``ord`` and ``rcept_no``. DART repeats an account
   and its name inside one statement, so the line order is part of the line, and every
@@ -51,9 +77,7 @@ stay in the source.
 
 ``dart.fnltt_filings@1`` writes one filings row per completed response: the filing
 ``rcept_no`` with its ``form`` and ``filed_date``. ``accepted_at_us`` and ``period_end``
-are NULL because the response states neither. Two responses naming one filing (its
-consolidated and separate statements) repeat a natural key and are promoted in separate
-generations, where the second is unchanged.
+are NULL because the response states neither.
 
 A spec partition selects requests by business year: the partition date of a row is
 January 1 of its request's ``bsns_year``.
@@ -61,7 +85,7 @@ January 1 of its request's ``bsns_year``.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Final
 
 from aegis_alpha.storage.identity import ISSUER_FORMAT
@@ -79,69 +103,92 @@ _COLUMNS: Final = (
 )
 _INSTANT: Final = r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,6})?Z"
 _DECIMAL: Final = r"-?[0-9]+(\.[0-9]+)?"
-SLOTS: Final = {"11011": ("FY", 12), "11012": ("H1", 6), "11013": ("Q1", 3), "11014": ("Q3", 9)}
-AMOUNTS: Final = ("thstrm_amount", "thstrm_add_amount")
-DIMENSIONS: Final = ("account_detail", "account_nm", "fs_div", "ord", "rcept_no", "sj_div")
-REFUSED_OUTCOMES: Final = frozenset({"unreadable", "unknown_outcome"})
+# Report code: (year-to-date label, quarter label, end month).
+REPORTS: Final = {
+    "11011": ("FY", "FY", 12),
+    "11012": ("H1", "Q2", 6),
+    "11013": ("Q1", "Q1", 3),
+    "11014": ("9M", "Q3", 9),
+}
+STATEMENTS: Final = ("BS", "CF", "CIS", "IS", "SCE")
+REFUSED_OUTCOMES: Final = frozenset({"mismatched", "unknown_outcome", "unreadable"})
 
 
-def _param(name: str) -> str:
-    return f"json_extract_string(_d_params, '$.{name}')"
+def _quoted(names: Iterable[str]) -> str:
+    return ", ".join(f"'{name}'" for name in sorted(names))
+
+
+def _params() -> str:
+    """The request's ``parameters_json`` document, NULL unless both levels are JSON."""
+    inner = (
+        "CASE WHEN json_valid(request_json) THEN "
+        "json_extract_string(request_json, '$.parameters_json') END"
+    )
+    return f"CASE WHEN json_valid({inner}) THEN {inner} END"
+
+
+def _param(params: str, name: str) -> str:
+    return f"json_extract_string({params}, '$.{name}')"
 
 
 def _item(name: str) -> str:
     return f"json_extract_string(_d_j, '$.{name}')"
 
 
-_PARAMS: Final = (
-    "CASE WHEN json_valid(request_json) THEN "
-    "json_extract_string(request_json, '$.parameters_json') END"
-)
 _BODY: Final = (
     "CASE WHEN endpoint = 'financials' AND outcome = 'COMPLETED' "
     "THEN try(decode(try(from_base64(raw_base64)))) END"
 )
 
 
-def _outcome(body: str) -> str:
-    """A receipt row's outcome, given the SQL of its decoded financials response text."""
-    readable = (
-        f"{body} IS NOT NULL AND sha256({body}) = raw_sha256 AND json_valid({body}) "
-        f"AND json_extract_string({body}, '$.status') = '000' "
-        f"AND json_type({body}, '$.list') = 'ARRAY' AND json_array_length({body}, '$.list') > 0"
+def _document(text: str) -> str:
+    """The JSON document ``text`` holds, NULL when it is not JSON."""
+    return f"CASE WHEN json_valid({text}) THEN CAST({text} AS JSON) END"
+
+
+def _outcome(body: str, params: str) -> str:
+    """A receipt row's outcome, given the SQL of its response text and request parameters."""
+    request = (
+        f"regexp_full_match({_param(params, 'corp_code')}, '[0-9]{{8}}') "
+        f"AND regexp_full_match({_param(params, 'bsns_year')}, '[0-9]{{4}}') "
+        f"AND {_param(params, 'reprt_code')} IN ({_quoted(REPORTS)}) "
+        f"AND {_param(params, 'fs_div')} IN ('CFS', 'OFS')"
     )
+    # DuckDB evaluates both sides of AND, so JSON is read only through a guarded document.
+    document = _document(body)
+    lines = f"json_extract({document}, '$.list[*]')"
+    number = "json_extract_string(j, '$.rcept_no')"
+    line = (
+        f"json_extract_string(j, '$.sj_div') IN ({_quoted(STATEMENTS)}) "
+        f"AND regexp_full_match({number}, '[0-9]{{14}}') "
+        f"AND try_strptime(substr({number}, 1, 8), '%Y%m%d') IS NOT NULL "
+        "AND regexp_full_match(json_extract_string(j, '$.ord'), '[0-9]+') "
+        "AND regexp_full_match(json_extract_string(j, '$.currency'), '[A-Z]{3}') "
+        "AND json_extract_string(j, '$.account_id') IS NOT NULL "
+        "AND json_extract_string(j, '$.account_nm') IS NOT NULL "
+        "AND json_extract_string(j, '$.account_detail') IS NOT NULL"
+    )
+    readable = (
+        f"{body} IS NOT NULL AND sha256({body}) = raw_sha256 AND {document} IS NOT NULL "
+        f"AND json_extract_string({document}, '$.status') = '000' "
+        f"AND json_type({document}, '$.list') = 'ARRAY' "
+        f"AND json_array_length({document}, '$.list') > 0 "
+        f"AND len(list_filter({lines}, lambda j: NOT coalesce({line}, false))) = 0"
+    )
+    differs = " OR ".join(
+        f"json_extract_string(j, '$.{name}') IS DISTINCT FROM {_param(params, name)}"
+        for name in ("corp_code", "bsns_year", "reprt_code")
+    )
+    numbers = f"list_distinct(list_transform({lines}, lambda j: {number}))"
+    agrees = f"len(list_filter({lines}, lambda j: {differs})) = 0 AND len({numbers}) = 1"
     return (
         "CASE WHEN endpoint IS DISTINCT FROM 'financials' THEN 'other_endpoint' "
+        f"WHEN NOT coalesce({request}, false) THEN 'unreadable' "
         "WHEN outcome = 'NO_DATA' THEN 'no_data' WHEN outcome = 'FAILED' THEN 'failed' "
-        f"WHEN outcome = 'COMPLETED' THEN CASE WHEN {readable} THEN 'completed' "
-        "ELSE 'unreadable' END ELSE 'unknown_outcome' END"
+        f"WHEN outcome = 'COMPLETED' THEN CASE WHEN NOT coalesce({readable}, false) "
+        f"THEN 'unreadable' WHEN {agrees} THEN 'completed' ELSE 'mismatched' END "
+        "ELSE 'unknown_outcome' END"
     )
-
-
-def _receipts(source: str) -> str:
-    """Each source row with its request parameters, response text and outcome."""
-    decoded = (
-        f"SELECT *, CASE WHEN json_valid({_PARAMS}) THEN {_PARAMS} END AS _d_params, "  # noqa: S608 -- engine-named relation
-        f"{_BODY} AS _d_body FROM {source}"
-    )
-    return f"SELECT *, {_outcome('_d_body')} AS _d_outcome FROM ({decoded})"  # noqa: S608 -- engine-named relation
-
-
-def _lines(source: str) -> str:
-    """One row per statement line of a completed response, one NULL line for a refused row."""
-    refused = ", ".join(f"'{name}'" for name in sorted(REFUSED_OUTCOMES))
-    return (
-        "SELECT * EXCLUDE (_d_body, _d_lines), unnest(_d_lines) AS _d_j, "  # noqa: S608 -- engine-named relation
-        "generate_subscripts(_d_lines, 1) - 1 AS _d_line FROM ("
-        "SELECT *, CASE WHEN _d_outcome = 'completed' THEN json_extract(_d_body, '$.list[*]') "
-        "ELSE [CAST(NULL AS JSON)] END AS _d_lines "
-        f"FROM ({_receipts(source)}) WHERE _d_outcome = 'completed' OR _d_outcome IN ({refused}))"
-    )
-
-
-def _matching(value: str, pattern: str) -> str:
-    """``value`` when the whole text matches ``pattern``, else NULL."""
-    return f"CASE WHEN regexp_full_match({value}, '{pattern}') THEN {value} END"
 
 
 def _ingested() -> str:
@@ -151,36 +198,76 @@ def _ingested() -> str:
     )
 
 
-def _issuer() -> str:
-    """The minted DART issuer of a line that agrees with its request, else NULL."""
-    corp = _param("corp_code")
-    agrees = (
-        f"_d_outcome = 'completed' AND regexp_full_match({corp}, '[0-9]{{8}}') "
-        f"AND {_item('corp_code')} = {corp} "
-        f"AND {_item('bsns_year')} = {_param('bsns_year')} "
-        f"AND {_item('reprt_code')} = {_param('reprt_code')}"
+def _accepted(args: Mapping[str, object]) -> frozenset[str]:
+    accepted = args.get("accept", [])
+    assert isinstance(accepted, list)  # noqa: S101 -- check_args admitted the spec
+    return frozenset(str(name) for name in accepted)
+
+
+def _lines(source: str, args: Mapping[str, object], *, filing_only: bool) -> str:
+    """One row per statement line of a response read once, one NULL line for a refused row.
+
+    Completed responses that repeat a filing keep the earliest retrieval. For filings
+    (``filing_only``) a filing is its corp code, report and receipt number, which fix
+    every filings column. For statements it is also the business year, ``fs_div`` and
+    the exact response bytes, so two different responses for one filing both stay and
+    the promotion refuses the natural keys they repeat.
+    """
+    receipts = f"SELECT *, {_params()} AS _d_params, {_BODY} AS _d_body FROM {source}"  # noqa: S608 -- engine-named relation
+    outcomes = (
+        f"SELECT *, {_outcome('_d_body', '_d_params')} AS _d_outcome, "  # noqa: S608 -- engine-named relation
+        f"{_ingested()} AS _d_ingested FROM ({receipts})"
     )
+    keys = (
+        ("corp_code", "reprt_code")
+        if filing_only
+        else ("corp_code", "bsns_year", "reprt_code", "fs_div")
+    )
+    filing = ", ".join(_param("_d_params", name) for name in keys)
+    if not filing_only:
+        filing += ", raw_sha256"
+    first = (
+        f"row_number() OVER (PARTITION BY _d_outcome, {filing}, "
+        f"json_extract_string({_document('_d_body')}, '$.list[0].rcept_no') "
+        "ORDER BY _d_ingested NULLS LAST, _aas_pin, _aas_ordinal) = 1"
+    )
+    refused = REFUSED_OUTCOMES - _accepted(args)
+    kept = f"_d_outcome = 'completed' AND {first}"
+    if refused:
+        kept += f" OR _d_outcome IN ({_quoted(refused)})"
+    return (
+        "SELECT * EXCLUDE (_d_body, _d_lines), unnest(_d_lines) AS _d_j, "  # noqa: S608 -- engine-named relation
+        "generate_subscripts(_d_lines, 1) - 1 AS _d_line FROM ("
+        "SELECT *, CASE WHEN _d_outcome = 'completed' "
+        f"THEN json_extract({_document('_d_body')}, '$.list[*]') "
+        "ELSE [CAST(NULL AS JSON)] END AS _d_lines "
+        f"FROM ({outcomes}) QUALIFY {kept})"
+    )
+
+
+def _issuer() -> str:
+    """The minted DART issuer of a completed response's request, else NULL."""
+    corp = _param("_d_params", "corp_code")
     anchor = f'["{ISSUER_FORMAT}","dart_corp_code","'
-    return f"CASE WHEN {agrees} THEN 'iss-' || sha256('{anchor}' || {corp} || '\"]') END"
+    return (
+        f"CASE WHEN _d_outcome = 'completed' "
+        f"THEN 'iss-' || sha256('{anchor}' || {corp} || '\"]') END"
+    )
 
 
 def _filing() -> tuple[str, str]:
-    """(receipt number, filed date) of a line, NULL unless the number is 14 digits."""
+    """(receipt number, filed date) of a line of a completed response."""
     number = _item("rcept_no")
-    valid = f"regexp_full_match({number}, '[0-9]{{14}}')"
-    filed = f"CAST(try_strptime(substr({number}, 1, 8), '%Y%m%d') AS DATE)"
-    return f"CASE WHEN {valid} THEN {number} END", f"CASE WHEN {valid} THEN {filed} END"
+    return number, f"CAST(try_strptime(substr({number}, 1, 8), '%Y%m%d') AS DATE)"
 
 
 def _form() -> str:
-    codes = ", ".join(f"'{code}'" for code in sorted(SLOTS))
     code = _item("reprt_code")
-    return f"CASE WHEN {code} IN ({codes}) THEN {code} END"
+    return f"CASE WHEN {code} IN ({_quoted(REPORTS)}) THEN {code} END"
 
 
 def _partition() -> str:
-    params = f"CASE WHEN json_valid({_PARAMS}) THEN {_PARAMS} END"
-    year = f"json_extract_string({params}, '$.bsns_year')"
+    year = _param(_params(), "bsns_year")
     return (
         f"CASE WHEN regexp_full_match({year}, '[0-9]{{4}}') "
         f"THEN make_date(CAST({year} AS INTEGER), 1, 1) END"
@@ -198,8 +285,20 @@ class _Receipts:
         return _partition()
 
     def check_args(self, args: Mapping[str, object]) -> None:
-        if args:
-            raise ValueError("DART receipt mappers take no arguments")
+        if not set(args) <= {"accept"}:
+            raise ValueError("DART receipt mappers take only an accept argument")
+        if "accept" in args:
+            accepted = args["accept"]
+            if (
+                not isinstance(accepted, list)
+                or not accepted
+                or accepted != sorted(set(accepted))
+                or not set(accepted) <= REFUSED_OUTCOMES
+            ):
+                raise ValueError(
+                    "accept is a sorted nonempty list of distinct outcomes among "
+                    + ", ".join(sorted(REFUSED_OUTCOMES))
+                )
 
     def source_columns(self) -> Mapping[str, frozenset[str]]:
         return dict.fromkeys(_COLUMNS, _TEXT)
@@ -209,7 +308,30 @@ class _Receipts:
 
     def outcome(self, args: Mapping[str, object]) -> str:
         del args
-        return _outcome(_BODY)
+        return _outcome(_BODY, _params())
+
+
+def _period(field: str) -> tuple[str, str]:
+    """(fiscal_period, period_start) SQL of a line's amount ``field`` (0 this term, 1 add)."""
+    slot, sheet = _item("reprt_code"), _item("sj_div")
+    year = f"CAST({_item('bsns_year')} AS INTEGER)"
+    ytd = " ".join(f"WHEN '{code}' THEN '{label}'" for code, (label, _, _) in REPORTS.items())
+    quarter = " ".join(f"WHEN '{code}' THEN '{label}'" for code, (_, label, _) in REPORTS.items())
+    first = " ".join(
+        f"WHEN '{code}' THEN {1 if label == 'FY' else month - 2}"
+        for code, (_, label, month) in REPORTS.items()
+    )
+    measures_quarter = f"{field} = 0 AND {sheet} IN ('CIS', 'IS')"
+    label = (
+        f"CASE WHEN {measures_quarter} THEN CASE {slot} {quarter} END "
+        f"ELSE CASE {slot} {ytd} END END"
+    )
+    start = (
+        f"CASE WHEN {sheet} = 'BS' THEN CAST(NULL AS DATE) "
+        f"WHEN {measures_quarter} THEN make_date({year}, CASE {slot} {first} END, 1) "
+        f"ELSE make_date({year}, 1, 1) END"
+    )
+    return label, start
 
 
 class DartFnltt(_Receipts):
@@ -224,26 +346,26 @@ class DartFnltt(_Receipts):
         return {"value": "VARCHAR"}
 
     def select(self, source: str, args: Mapping[str, object]) -> str:
-        del args
         number, filed = _filing()
         slot = _item("reprt_code")
-        names = " ".join(f"WHEN '{code}' THEN '{name}'" for code, (name, _) in SLOTS.items())
-        months = " ".join(f"WHEN '{code}' THEN {month}" for code, (_, month) in SLOTS.items())
-        period = f"(CASE {slot} {names} END)"
-        year = f"TRY_CAST({_item('bsns_year')} AS INTEGER)"
+        months = " ".join(f"WHEN '{code}' THEN {month}" for code, (_, _, month) in REPORTS.items())
         end = (
-            f"CASE WHEN regexp_full_match({_item('bsns_year')}, '[0-9]{{4}}') THEN "
-            f"last_day(make_date({year}, CASE {slot} {months} END, 1)) END"
+            f"last_day(make_date(CAST({_item('bsns_year')} AS INTEGER), "
+            f"CASE {slot} {months} END, 1))"
         )
-        amount = f"CASE WHEN _d_field = 0 THEN {_item(AMOUNTS[0])} ELSE {_item(AMOUNTS[1])} END"
+        label, start = _period("_d_field")
+        amount = (
+            f"CASE WHEN _d_field = 0 THEN {_item('thstrm_amount')} "
+            f"ELSE {_item('thstrm_add_amount')} END"
+        )
         dimensions = dimensions_hash_sql(
             [
                 ("account_detail", _item("account_detail")),
                 ("account_nm", _item("account_nm")),
-                ("fs_div", _matching(_param("fs_div"), "CFS|OFS")),
-                ("ord", _matching(_item("ord"), "[0-9]+")),
+                ("fs_div", _param("_d_params", "fs_div")),
+                ("ord", _item("ord")),
                 ("rcept_no", number),
-                ("sj_div", _matching(_item("sj_div"), "[A-Z]+")),
+                ("sj_div", _item("sj_div")),
             ]
         )
         state = (
@@ -251,22 +373,24 @@ class DartFnltt(_Receipts):
             f"WHEN regexp_full_match(_d_amount, '{_DECIMAL}') THEN 'present' "
             "WHEN _d_amount IS NOT NULL THEN 'invalid' END"
         )
+        # The year to date of an income statement in a half-year or third-quarter report.
+        cumulative = (
+            f"{_item('sj_div')} IN ('CIS', 'IS') AND {slot} IN ('11012', '11014') "
+            "AND json_exists(_d_j, '$.thstrm_add_amount')"
+        )
         fields = (
             "SELECT *, "  # noqa: S608 -- engine-named relation
             f"{amount} AS _d_amount FROM (SELECT *, unnest([0, 1]) AS _d_field FROM ("
-            f"{_lines(source)})) WHERE _d_field = 0 OR json_exists(_d_j, '$.{AMOUNTS[1]}')"
+            f"{_lines(source, args, filing_only=False)})) "
+            f"WHERE _d_field = 0 OR (_d_outcome = 'completed' AND {cumulative})"
         )
         return (
             "SELECT _aas_pin, _aas_ordinal, _aas_row_hash, "  # noqa: S608 -- engine-named relation
             "2 * _d_line + _d_field AS _aas_item, "
-            f"{_ingested()} AS _aas_ingested_at_us, "
+            "_d_ingested AS _aas_ingested_at_us, "
             f"{_issuer()} AS issuer_id, {_item('account_id')} AS concept, "
-            "CAST(NULL AS DATE) AS period_start, "
-            f"{end} AS period_end, "
-            f"CASE WHEN _d_field = 0 THEN {period} ELSE {period} || '-cumulative' END "
-            "AS fiscal_period, "
-            f"CASE WHEN regexp_full_match({_item('currency')}, '[A-Z]{{3}}') "
-            f"THEN {_item('currency')} END AS unit, "
+            f"{start} AS period_start, {end} AS period_end, {label} AS fiscal_period, "
+            f"{_item('currency')} AS unit, "
             f"{dimensions} AS dimensions_hash, {_form()} AS form, {number} AS accession, "
             "CAST(NULL AS BIGINT) AS accepted_at_us, "
             f"CASE WHEN {state} = 'present' THEN _d_amount END AS value, "
@@ -286,23 +410,15 @@ class DartFnlttFilings(_Receipts):
         return {}
 
     def select(self, source: str, args: Mapping[str, object]) -> str:
-        del args
         number, filed = _filing()
-        # A response holds one filing: every line names the same receipt number, so the
-        # first line speaks for the response and a disagreeing line voids the filing.
-        same = (
-            "count(DISTINCT coalesce(json_extract_string(_d_j, '$.rcept_no'), '')) "
-            "OVER (PARTITION BY _aas_pin, _aas_ordinal) = 1"
-        )
-        lines = (
-            "SELECT *, "  # noqa: S608 -- engine-named relation
-            f"{same} AS _d_one FROM ({_lines(source)})"
-        )
+        # Every line of a completed response names the same receipt number, so the first
+        # line speaks for the response.
         return (
             "SELECT _aas_pin, _aas_ordinal, _aas_row_hash, "  # noqa: S608 -- engine-named relation
-            f"{_ingested()} AS _aas_ingested_at_us, "
-            f"CASE WHEN _d_one THEN {_issuer()} END AS issuer_id, "
+            "_d_ingested AS _aas_ingested_at_us, "
+            f"{_issuer()} AS issuer_id, "
             f"{number} AS filing_id, {_form()} AS form, {filed} AS filed_date, "
             "CAST(NULL AS BIGINT) AS accepted_at_us, CAST(NULL AS DATE) AS period_end, "
-            f"{filed} AS _aas_t_filed_date FROM ({lines}) WHERE _d_line = 0"
+            f"{filed} AS _aas_t_filed_date FROM ({_lines(source, args, filing_only=True)}) "
+            "WHERE _d_line = 0"
         )

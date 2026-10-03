@@ -106,15 +106,21 @@ def test_statements_promote_as_issuer_fundamentals_with_coverage(ws: Workspace) 
         for row in facts
     ] == sorted(
         [
-            ("ifrs-full_Revenue", "H1", _dims("매출액", "1"), Decimal(1200)),
-            ("ifrs-full_Revenue", "H1-cumulative", _dims("매출액", "1"), Decimal(2300)),
-            ("-표준계정코드 미사용-", "H1", _dims("기타", "2"), Decimal(-5)),
-            ("-표준계정코드 미사용-", "H1", _dims("기타", "3"), Decimal(7)),
+            ("ifrs-full_Revenue", "Q2", _dims("매출액", "1"), Decimal(1200)),
+            ("ifrs-full_Revenue", "H1", _dims("매출액", "1"), Decimal(2300)),
+            ("-표준계정코드 미사용-", "Q2", _dims("기타", "2"), Decimal(-5)),
+            ("-표준계정코드 미사용-", "Q2", _dims("기타", "3"), Decimal(7)),
         ],
         key=lambda item: (item[1], item[2]),
     )
     for row in facts:
-        assert (row["issuer_id"], row["instrument_id"], row["period_start"]) == (ISSUER, None, None)
+        # The second quarter, or the half year for the cumulative amount.
+        start = date(2025, 4, 1) if row["fiscal_period"] == "Q2" else date(2025, 1, 1)
+        assert (row["issuer_id"], row["instrument_id"], row["period_start"]) == (
+            ISSUER,
+            None,
+            start,
+        )
         assert (row["period_end"], row["unit"], row["form"], row["accession"]) == (
             date(2025, 6, 30),
             "KRW",
@@ -147,6 +153,53 @@ def test_statements_promote_as_issuer_fundamentals_with_coverage(ws: Workspace) 
     child = dart.spec([pin], parent=str(result["generation_id"]))
     again = _apply(ws, child)
     assert (again["published"], again["empty_delta"], again["unchanged"]) == (False, True, 4)
+    assert verify_workspace(ws)["verified"] is True
+
+
+def test_coverage_without_new_rows_is_recorded_on_the_head(ws: Workspace) -> None:
+    first = dart.add_receipts(ws, [dart.completed(CORP, "2025", "11012", ORIGINAL, LINES)], tag="a")
+    base = _apply(ws, dart.spec([first]))
+    # Later responses without a statement change no row; their coverage stays recorded.
+    later = dart.add_receipts(
+        ws,
+        [
+            dart.no_data(CORP, "2025", "11013"),
+            dart.no_data(CORP, "2025", "11014", outcome="FAILED"),
+        ],
+        tag="b",
+    )
+    document = dart.spec([first, later], parent=str(base["generation_id"]))
+    result = _apply(ws, document)
+    assert (result["published"], result["empty_delta"]) == (False, True)
+    checks = ws.state.execute(
+        "SELECT check_id, version, result, reason FROM quality_checks "
+        "WHERE dataset_id='fundamentals.kr.dart' AND rule_id='promotion_coverage'"
+    ).fetchall()
+    assert [(row[0], row[1], row[2]) for row in checks] == [
+        (result["coverage_check"], "1", "recorded")
+    ]
+    reason = json.loads(checks[0][3])
+    assert reason["request_hash"] == result["request_hash"]
+    assert reason["spec_sha256"] == document[1]
+    assert [item["source_id"] for item in reason["sources"]] == [
+        first["source_id"],
+        later["source_id"],
+    ]
+    assert reason["source_outcomes"] == {"completed": 1, "failed": 1, "no_data": 1}
+    assert reason["unchanged"] == 4
+    # The spec and request stay as raw evidence; repeating the request adds no check.
+    assert (ws.paths.raw / document[1][:2] / document[1]).read_bytes() == document[0]
+    repeated = _apply(ws, document)
+    assert repeated["coverage_check"] == result["coverage_check"]
+    (count,) = ws.state.execute(
+        "SELECT count(*) FROM quality_checks WHERE rule_id='promotion_coverage'"
+    ).fetchone()
+    assert count == 1
+    assert verify_workspace(ws)["verified"] is True
+    # A first promotion with no rows has no version to hold its coverage.
+    empty = dart.add_receipts(ws, [dart.no_data("00000303", "2025", "11013")], tag="c")
+    alone = _apply(ws, dart.spec([empty], dataset="fundamentals.kr.dart.solo"))
+    assert (alone["empty_delta"], alone["coverage_check"]) == (True, None)
 
 
 def test_an_unreadable_response_refuses_the_promotion(ws: Workspace) -> None:
@@ -156,7 +209,7 @@ def test_an_unreadable_response_refuses_the_promotion(ws: Workspace) -> None:
     )
     plan = _plan(ws, dart.spec([pin]))
     assert plan["source_outcomes"] == {"completed": 1, "unreadable": 1}
-    assert plan["rows"] == {"ok": 4, "refused_required": 1}
+    assert plan["rows"] == {"ok": 3, "refused_required": 1}
     assert plan["refusals"] == ["1 rows required refused"]
     with pytest.raises(ValueError, match="required refused"):
         _apply(ws, dart.spec([pin]))
@@ -188,7 +241,7 @@ def test_an_amendment_adds_records_under_its_own_filing(ws: Workspace) -> None:
     revenue = {
         cast("str", row["dimensions_hash"])
         for row in _facts(ws)
-        if row["concept"] == "ifrs-full_Revenue" and row["fiscal_period"] == "H1"
+        if row["concept"] == "ifrs-full_Revenue" and row["fiscal_period"] == "Q2"
     }
     assert len(revenue) == 2
 
@@ -206,13 +259,31 @@ def test_a_partition_selects_requests_by_business_year(ws: Workspace) -> None:
     )
     document = dart.spec([pin], partition={"from": "2024-01-01", "to": "2025-01-01"})
     plan = _plan(ws, document)
-    assert plan["source_outcomes"] == {"completed": 1}
+    # A row without a business year (the corp code list) is counted in every partition.
+    assert plan["source_outcomes"] == {"completed": 1, "other_endpoint": 1}
     result = _apply(ws, document)
     facts = _facts(ws, str(result["generation_id"]))
     assert {(row["accession"], row["period_end"], row["fiscal_period"]) for row in facts} == {
-        ("20250320000001", date(2024, 12, 31), "FY"),
-        ("20250320000001", date(2024, 12, 31), "FY-cumulative"),
+        ("20250320000001", date(2024, 12, 31), "FY")
     }
+
+
+def test_a_request_without_a_business_year_refuses_every_partition(ws: Workspace) -> None:
+    good = dart.completed(CORP, "2024", "11011", "20250320000001", LINES[:1])
+    yearless = (*good[:3], dart.request(CORP, "24", "11011"), *good[4:])
+    pin = dart.add_receipts(ws, [good, yearless], tag="yearless")
+    for start, end in (("2024-01-01", "2025-01-01"), ("2030-01-01", "2031-01-01")):
+        plan = _plan(ws, dart.spec([pin], partition={"from": start, "to": end}))
+        assert cast("dict[str, int]", plan["source_outcomes"])["unreadable"] == 1
+        assert plan["refusals"] == ["1 rows required refused"]
+    # A spec that grants leaving unreadable responses out promotes the rest and keeps
+    # counting them.
+    granted = dart.spec(
+        [pin], partition={"from": "2024-01-01", "to": "2025-01-01"}, args={"accept": ["unreadable"]}
+    )
+    result = _apply(ws, granted)
+    assert result["source_outcomes"] == {"completed": 1, "unreadable": 1}
+    assert len(_facts(ws, str(result["generation_id"]))) == 1
 
 
 def test_filings_promote_one_row_per_filing(ws: Workspace) -> None:
@@ -227,7 +298,7 @@ def test_filings_promote_one_row_per_filing(ws: Workspace) -> None:
     ).fetchall()
     assert rows == [(ISSUER, ORIGINAL, "11012", date(2025, 8, 14), None, None, "ASSERT",
                      END_ORIGINAL)]  # fmt: skip
-    # Both statements of one filing in one generation repeat its key and are refused.
+    # Both statements of one filing in one generation are read once.
     both = dart.add_receipts(ws, [consolidated, separate], tag="f2")
     repeated = _plan(
         ws,
@@ -238,7 +309,7 @@ def test_filings_promote_one_row_per_filing(ws: Workspace) -> None:
             parent=str(result["generation_id"]),
         ),
     )
-    assert repeated["refusals"] == ["1 natural keys repeat across 2 source rows"]
+    assert (repeated["refusals"], repeated["mapped_rows"], repeated["unchanged"]) == ([], 1, 1)
     # Promoted on its own, the other statement names the same filing and changes nothing.
     alone = dart.add_receipts(ws, [separate], tag="f3")
     again = _apply(
