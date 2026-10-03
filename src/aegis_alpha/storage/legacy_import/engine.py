@@ -71,6 +71,7 @@ from aegis_alpha.storage.legacy_import.public import (
     FredSeriesCsv,
     KoreaPublicResponse,
     SecArchive,
+    SecSubmissionsFilings,
 )
 from aegis_alpha.storage.source_identity import SourceContent, SourceFile
 
@@ -91,6 +92,7 @@ LOADERS: Final[dict[str, Loader]] = {
         IdentityAuthority(),
         SecArchive("sec.submissions_zip@1", SUBMISSIONS),
         SecArchive("sec.companyfacts_zip@1", COMPANYFACTS),
+        SecSubmissionsFilings(),
         FredSeriesCsv(),
         KoreaPublicResponse(),
         FmpNonSplit(),

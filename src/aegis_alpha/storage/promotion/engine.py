@@ -1,6 +1,7 @@
 """``aas data promote``: one hashed spec turns pinned source tables into one generation.
 
-Order: verify the pinned sources, identity snapshot and calendars; map the source rows in
+Order: verify the pinned sources, identity snapshot, calendars and the generations a mapper
+references; map the source rows in
 DuckDB; resolve instruments; apply the decimal and time rules; diff against the parent
 head; compute quality flags; plan the bulk generation; then (apply only) retain the spec,
 request and manifest in ``raw/``, record the intent, commit marker, rows and flags in one
@@ -52,7 +53,12 @@ from aegis_alpha.storage.membership_pins import (
     verify_membership_pin,
 )
 from aegis_alpha.storage.promotion import decimal_rules, formats
-from aegis_alpha.storage.promotion.mappers import MANIFEST_ITEMS, resolved_column
+from aegis_alpha.storage.promotion.mappers import (
+    MANIFEST_ITEMS,
+    reference_table,
+    references,
+    resolved_column,
+)
 from aegis_alpha.storage.promotion.spec import PromotionSpec, parse_spec
 from aegis_alpha.storage.promotion.time_rules import (
     CLAMP_FLAG,
@@ -367,6 +373,29 @@ def _calendars(workspace: Workspace, spec: PromotionSpec, budget: ComputeBudget)
         )
         tables[index] = name
     return tables
+
+
+def _references(workspace: Workspace, spec: PromotionSpec, budget: ComputeBudget) -> None:
+    """Load the head rows of each generation the mapper references into its temp table.
+
+    The pin is checked like a calendar pin, and its dataset must hold the referenced
+    domain. Only the domain columns of non-TOMBSTONE heads are loaded.
+    """
+    for name, reference in references(spec.mapper, spec.mapper_args).items():
+        chain = _verify_pin(workspace, reference.pin, budget)
+        found = workspace.state.execute(
+            "SELECT domain FROM datasets WHERE dataset_id=?", (reference.pin.dataset_id,)
+        ).fetchone()
+        if found is None or str(found[0]) != reference.domain:
+            raise ValueError(
+                f"mapper reference {name} must pin a {reference.domain} dataset generation"
+            )
+        columns = ", ".join(_q(column) for column, _ in DOMAINS[reference.domain])
+        workspace.market.execute(
+            f"CREATE OR REPLACE TEMP TABLE {reference_table(name)} AS SELECT {columns} "
+            f"FROM ({_heads_sql(reference.domain)}) WHERE op <> 'TOMBSTONE'",
+            [chain],
+        )
 
 
 # --- the SQL pipeline ----------------------------------------------------------------------
@@ -1219,6 +1248,41 @@ def generation_spec(workspace: Workspace, generation_id: str) -> PromotionSpec:
     return parse_spec(_read_raw(workspace, str(catalog[0])), str(catalog[0]))
 
 
+def _descends(workspace: Workspace, before: GenerationPin, after: GenerationPin) -> bool:
+    """Whether ``after`` is ``before`` or a later generation of the same dataset chain."""
+    if before == after:
+        return True
+    chain = [
+        str(item["generation_id"])
+        for item in generation_chain(workspace.market, after.generation_id)
+    ]
+    return after.dataset_id == before.dataset_id and before.generation_id in chain
+
+
+def _check_evidence_pins(workspace: Workspace, parent: PromotionSpec, spec: PromotionSpec) -> None:
+    """Hold each calendar and mapper reference pin at the parent's generation or later.
+
+    These pins are evidence the rules and the mapper read, not the rule: a chain may move
+    one to a descendant generation of the same dataset, never back or across datasets.
+    """
+    for column in TIME_COLUMNS:
+        before = parent.time_rules[column].calendar
+        after = spec.time_rules[column].calendar
+        if before is not None and after is not None and not _descends(workspace, before, after):
+            raise ValueError(
+                f"the {column} calendar pin must be the parent's calendar generation "
+                "or a descendant of it"
+            )
+    earlier = references(parent.mapper, parent.mapper_args)
+    for name, reference in references(spec.mapper, spec.mapper_args).items():
+        found = earlier.get(name)
+        if found is not None and not _descends(workspace, found.pin, reference.pin):
+            raise ValueError(
+                f"the mapper's {name} pin must be the parent's {name} generation "
+                "or a descendant of it"
+            )
+
+
 def _check_parent(workspace: Workspace, spec: PromotionSpec) -> int:
     """Hold the parent CAS and a parent chain's time rules; return the new sequence."""
     head = dataset_head(workspace, spec.dataset_id)
@@ -1238,20 +1302,7 @@ def _check_parent(workspace: Workspace, spec: PromotionSpec) -> int:
             "time rules differ from the parent chain's; a new rule generation is a new dataset "
             "(append .r<N> to the dataset ID) promoted from its first generation"
         )
-    for column in TIME_COLUMNS:
-        before = parent.time_rules[column].calendar
-        after = spec.time_rules[column].calendar
-        if before is None or after is None or before == after:
-            continue
-        chain = [
-            str(item["generation_id"])
-            for item in generation_chain(workspace.market, after.generation_id)
-        ]
-        if after.dataset_id != before.dataset_id or before.generation_id not in chain:
-            raise ValueError(
-                f"the {column} calendar pin must be the parent's calendar generation "
-                "or a descendant of it"
-            )
+    _check_evidence_pins(workspace, parent, spec)
     return int(cast("int", marker["sequence"])) + 1
 
 
@@ -1369,6 +1420,7 @@ def plan_promotion(
     sources = _sources(workspace, spec, plan)
     _identity(workspace, spec, plan, budget)
     calendars = _calendars(workspace, spec, budget)
+    _references(workspace, spec, budget)
     decimal_rules.install(market)
     _stage_sources(workspace, spec, sources, plan)
     _stage_items(workspace, spec, sources, plan)
@@ -1488,6 +1540,11 @@ def _manifest(plan: PromotionPlan) -> bytes:
 def _drop(market: duckdb.DuckDBPyConnection) -> None:
     for name in _TEMP:
         market.execute(f"DROP TABLE IF EXISTS temp.{_t(name)}")
+    for (name,) in market.execute(
+        "SELECT table_name FROM duckdb_tables() WHERE temporary AND starts_with(table_name, ?)",
+        [reference_table("")],
+    ).fetchall():
+        market.execute(f"DROP TABLE IF EXISTS temp.{_q(str(name))}")
 
 
 # --- apply, recovery and verification ------------------------------------------------------

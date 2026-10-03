@@ -32,7 +32,7 @@ from aegis_alpha.storage.source_library import read_table
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
 _ROOT = Path(__file__).resolve().parents[2]
 _HISTORY_COLUMNS = "Open,High,Low,Close,Volume,Turnover,Unadjusted Close,Dividend"
@@ -584,6 +584,228 @@ def test_sec_archive_refuses_a_corrupt_deflate_stream(tmp_path: Path) -> None:
     assert report["reconciled"] is False
 
 
+_FILING_KEYS = (
+    "accessionNumber",
+    "filingDate",
+    "reportDate",
+    "acceptanceDateTime",
+    "act",
+    "form",
+    "fileNumber",
+    "filmNumber",
+    "items",
+    "core_type",
+    "size",
+    "isXBRL",
+    "isInlineXBRL",
+    "primaryDocument",
+    "primaryDocDescription",
+)
+
+
+def _filings(*rows: tuple[str, str, str, str, int]) -> dict[str, list[object]]:
+    """Parallel filing arrays as SEC writes them; ``isXBRLNumeric`` is absent."""
+    arrays: dict[str, list[object]] = {key: [] for key in _FILING_KEYS}
+    for accession, filed, report, accepted, size in rows:
+        values = {
+            "accessionNumber": accession,
+            "filingDate": filed,
+            "reportDate": report,
+            "acceptanceDateTime": accepted,
+            "act": "34",
+            "form": "10-Q",
+            "fileNumber": "001-00001",
+            "filmNumber": "1",
+            "items": "",
+            "core_type": "10-Q",
+            "size": size,
+            "isXBRL": 1,
+            "isInlineXBRL": 0,
+            "primaryDocument": "q.htm",
+            "primaryDocDescription": "FORM 10-Q",
+        }
+        for key in _FILING_KEYS:
+            arrays[key].append(values[key])
+    return arrays
+
+
+def _submissions(
+    tmp_path: Path,
+    *,
+    pages: dict[str, object] | None = None,
+    listed: int = 1,
+    listed_name: str = "CIK0000000001-submissions-001.json",
+) -> tuple[Path, Path]:
+    """A submissions archive: one filer document, its one older page and a text member."""
+    stamp = (2026, 9, 5, 4, 25, 4)
+    filer = {
+        "cik": "0000000001",
+        "name": "Synthetic Filer",
+        "filings": {
+            "recent": _filings(
+                ("0000000001-26-000002", "2026-08-03", "2026-06-30", "2026-08-03T20:05:01.000Z", 9),
+                ("0000000001-26-000001", "2026-05-04", "", "2026-05-04T12:00:00.000Z", 8),
+            ),
+            "files": [
+                {
+                    "name": listed_name,
+                    "filingCount": listed,
+                    "filingFrom": "1999-01-04",
+                    "filingTo": "1999-01-04",
+                }
+            ],
+        },
+    }
+    page = _filings(("0000000001-99-000001", "1999-01-04", "", "1999-01-04T05:00:00.000Z", 7))
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(zipfile.ZipInfo("CIK0000000001.json", stamp), _json(filer))
+        for name, document in (pages or {"CIK0000000001-submissions-001.json": page}).items():
+            archive.writestr(zipfile.ZipInfo(name, stamp), _json(document))
+        archive.writestr(zipfile.ZipInfo("placeholder.txt", stamp), b"x")
+    payload = buffer.getvalue()
+    root = tmp_path / "legacy" / "sec-filings"
+    archive_path = _private(root / "submissions.zip", payload)
+    receipt = {"bytes": len(payload), "sha256": _sha(payload), "members": 3}
+    return archive_path, _private(root / "receipt.json", _json(receipt))
+
+
+def _filings_entry(archive_path: Path, receipt_path: Path, **expect: int) -> dict[str, object]:
+    entry = _entry("sec-filings", "sec.submissions_filings@1", archive_path, **expect)
+    entry["args"] = {"evidence": [str(receipt_path)]}
+    return entry
+
+
+def test_sec_submissions_filings_reads_every_listed_filing(tmp_path: Path, home: Path) -> None:
+    archive_path, receipt_path = _submissions(tmp_path)
+    manifest = _manifest([_filings_entry(archive_path, receipt_path, filings=3, pages=1)])
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        report = apply_import(workspace, manifest)
+        (source,) = _sources(report)
+        rows = _rows(workspace, source)
+    assert str(source["source_id"]).startswith("sec-submissions-filings-")
+    assert report["reconciled"] is True
+    metrics = cast("dict[str, int]", _only(report)["metrics"])
+    assert metrics["expanded_bytes"] == sum(
+        info.file_size for info in zipfile.ZipFile(archive_path).infolist()
+    )
+    assert metrics == {
+        "members": 3,
+        "json_members": 2,
+        "expanded_bytes": metrics["expanded_bytes"],
+        "receipts": 1,
+        "filers": 1,
+        "pages": 1,
+        "filings": 3,
+        "other_members": 1,
+        "missing_pages": 0,
+        "unlisted_pages": 0,
+        "miscounted_pages": 0,
+        "unknown_members": 0,
+    }
+    # Members in archive order, array positions in order; values as SEC wrote them.
+    assert [
+        (
+            row["member"],
+            row["cik"],
+            row["accessionNumber"],
+            row["reportDate"],
+            row["acceptanceDateTime"],
+            row["size"],
+            row["isXBRLNumeric"],
+        )
+        for row in rows
+    ] == [
+        (
+            "CIK0000000001.json",
+            "0000000001",
+            "0000000001-26-000002",
+            "2026-06-30",
+            "2026-08-03T20:05:01.000Z",
+            9,
+            None,
+        ),
+        (
+            "CIK0000000001.json",
+            "0000000001",
+            "0000000001-26-000001",
+            "",
+            "2026-05-04T12:00:00.000Z",
+            8,
+            None,
+        ),
+        (
+            "CIK0000000001-submissions-001.json",
+            "0000000001",
+            "0000000001-99-000001",
+            "",
+            "1999-01-04T05:00:00.000Z",
+            7,
+            None,
+        ),
+    ]
+
+
+def test_sec_submissions_filings_count_page_discrepancies(tmp_path: Path) -> None:
+    page = _filings(("0000000001-99-000001", "1999-01-04", "", "1999-01-04T05:00:00.000Z", 7))
+    archive_path, receipt_path = _submissions(
+        tmp_path,
+        listed=2,
+        pages={
+            "CIK0000000001-submissions-001.json": page,
+            "CIK0000000002-submissions-001.json": page,
+        },
+    )
+    receipt = json.loads(receipt_path.read_bytes())
+    receipt["members"] = 4
+    _private(receipt_path, _json(receipt))
+    report = plan_import(_manifest([_filings_entry(archive_path, receipt_path)]))
+    metrics = cast("dict[str, int]", _only(report)["metrics"])
+    assert (metrics["miscounted_pages"], metrics["unlisted_pages"], metrics["missing_pages"]) == (
+        1,
+        1,
+        0,
+    )
+    assert report["reconciled"] is False
+    pinned = _filings_entry(archive_path, receipt_path, miscounted_pages=1, unlisted_pages=1)
+    assert plan_import(_manifest([pinned]))["reconciled"] is True
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        (lambda arrays: arrays.update(extra=["x"]), "unknown array 'extra'"),
+        (lambda arrays: arrays["form"].append("10-K"), "unequal lengths"),
+        (lambda arrays: arrays["size"].__setitem__(0, "7"), "size values must be integers"),
+        (lambda arrays: arrays["form"].__setitem__(0, 10), "form values must be text"),
+    ],
+)
+def test_sec_submissions_filings_refuse_unknown_shapes(
+    tmp_path: Path, change: object, reason: str
+) -> None:
+    page = _filings(("0000000001-99-000001", "1999-01-04", "", "1999-01-04T05:00:00.000Z", 7))
+    cast("Callable[[dict[str, list[object]]], None]", change)(page)
+    archive_path, receipt_path = _submissions(
+        tmp_path, pages={"CIK0000000001-submissions-001.json": page}
+    )
+    report = plan_import(_manifest([_filings_entry(archive_path, receipt_path)]))
+    assert reason in _refusal(report)
+
+
+@pytest.mark.parametrize(
+    "listed_name", ["CIK0000000002-submissions-001.json", "CIK0000000001-page-001.json"]
+)
+def test_sec_submissions_filings_refuse_a_page_of_another_filer(
+    tmp_path: Path, listed_name: str
+) -> None:
+    page = _filings(("0000000002-99-000001", "1999-01-04", "", "1999-01-04T05:00:00.000Z", 7))
+    archive_path, receipt_path = _submissions(
+        tmp_path, pages={listed_name: page}, listed_name=listed_name
+    )
+    report = plan_import(_manifest([_filings_entry(archive_path, receipt_path)]))
+    assert "lists a page of another filer" in _refusal(report)
+
+
 def _small_originals(
     tmp_path: Path,
 ) -> tuple[dict[str, dict[str, object]], pa.Table, dict[str, object]]:
@@ -970,6 +1192,7 @@ def _all_loaders(tmp_path: Path) -> dict[str, dict[str, object]]:
             **_entry(name, loader, archive_path, members=2),
             "args": {"evidence": [str(receipt_path)]},
         }
+    entries["sec.submissions_filings@1"] = _filings_entry(*_submissions(tmp_path), filings=3)
     entries["norgate.history_export@1"] = _entry(
         "equity", "norgate.history_export@1", _export(tmp_path), rows=4
     )

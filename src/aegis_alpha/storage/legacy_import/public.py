@@ -9,6 +9,20 @@ through this index. Every receipt that states the archive's hash, size, member c
 expanded size must agree with the archive. Receipts are optional; the ``receipts`` metric
 counts them so a manifest can pin how many the archive must carry.
 
+``sec.submissions_filings@1`` reads the same submissions archive and receipts as one unit and
+writes the filings its documents list. A filer document ``CIK##########.json`` holds the
+recent filings as parallel arrays under ``filings.recent`` and names its older pages under
+``filings.files``; a page ``CIK##########-submissions-###.json`` holds the same arrays at its
+top level. Each array position is one row, members in central-directory order and positions
+in array order: the member name, the member's ten-digit CIK and each array's value as SEC
+wrote it (text stays text; ``size`` and the XBRL markers stay integers). An array a document
+lacks is null in its rows. A key outside the known arrays, arrays of unequal length, a value
+of another JSON type, a filer document whose ``cik`` is not its member's or a listed page
+whose name is not a ``CIK##########-submissions-###.json`` of that CIK refuses the unit.
+Pages a filer lists but the archive lacks (``missing_pages``), pages no filer lists
+(``unlisted_pages``), pages whose filing count differs from the listing (``miscounted_pages``)
+and JSON members of any other name (``unknown_members``) are discrepancy metrics.
+
 ``fred.series_csv@1`` reads one FRED download (``observation_date,<SERIES>``) as text rows.
 
 ``korea.public_response@1`` reads a directory of request directories, each holding
@@ -28,12 +42,14 @@ inventory of that run's parts, so it is retained as evidence and checked only fo
 
 from __future__ import annotations
 
+# ruff: noqa: TRY004 -- untrusted legacy bytes raise one ingress error type, ValueError.
 import hashlib
 import re
 import zipfile
 import zlib
+from collections import Counter
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, BinaryIO, Final, cast
 
 from aegis_alpha.storage.legacy_import.loaders import (
     MAX_FILE_BYTES,
@@ -67,6 +83,33 @@ _MEMBER_COLUMNS: Final = (
     ("sha256", "string"),
 )
 SUBMISSIONS: Final = Table("sec", "submissions-zip", "members", _MEMBER_COLUMNS)
+# The parallel arrays of an SEC submissions document, in SEC's order, and their types.
+FILING_ARRAYS: Final = (
+    ("accessionNumber", "string"),
+    ("filingDate", "string"),
+    ("reportDate", "string"),
+    ("acceptanceDateTime", "string"),
+    ("act", "string"),
+    ("form", "string"),
+    ("fileNumber", "string"),
+    ("filmNumber", "string"),
+    ("items", "string"),
+    ("core_type", "string"),
+    ("size", "int64"),
+    ("isXBRL", "int64"),
+    ("isInlineXBRL", "int64"),
+    ("isXBRLNumeric", "int64"),
+    ("primaryDocument", "string"),
+    ("primaryDocDescription", "string"),
+)
+SUBMISSION_FILINGS: Final = Table(
+    "sec",
+    "submissions-filings",
+    "filings",
+    (("member", "string"), ("cik", "string"), *FILING_ARRAYS),
+)
+_FILER: Final = re.compile(r"CIK([0-9]{10})\.json")
+_PAGE: Final = re.compile(r"CIK([0-9]{10})-submissions-[0-9]{3}\.json")
 COMPANYFACTS: Final = Table("sec", "companyfacts-zip", "members", _MEMBER_COLUMNS)
 FRED: Final = Table(
     "fred",
@@ -151,7 +194,7 @@ class SecArchive:
         files = (entry.path, *(Path(item) for item in evidence))
         return [Unit(entry.path.name, tuple(dict.fromkeys(files)), (self.table,))]
 
-    def batches(  # noqa: C901 -- the archive, its members and its receipts in one read
+    def batches(
         self, unit: Unit, table: Table, source: Bytes, run: Run
     ) -> Iterator[pa.RecordBatch]:
         rows: list[tuple[object, ...]] = []
@@ -203,22 +246,17 @@ class SecArchive:
                         rows = []
         if rows:
             yield record_batch(table, rows)
-        observed = {
-            "sha256": archive_file.sha256,
-            "bytes": archive_file.size_bytes,
-            "members": members,
-            "json_members": json_members,
-            "expanded_bytes": expanded,
-        }
-        for path in unit.files[1:]:
-            receipt = json_object(
-                json_document(source.read(path, max_bytes=MAX_INDEX_BYTES), path.name), path.name
-            )
-            if "sha256" not in receipt:
-                raise ValueError(f"SEC archive receipt does not name the archive: {path.name}")
-            for key, value in observed.items():
-                if key in receipt and receipt[key] != value:
-                    raise ValueError(f"SEC archive receipt {path.name} disagrees on {key}")
+        _check_receipts(
+            unit,
+            source,
+            {
+                "sha256": archive_file.sha256,
+                "bytes": archive_file.size_bytes,
+                "members": members,
+                "json_members": json_members,
+                "expanded_bytes": expanded,
+            },
+        )
         run.metrics["members"] += members
         run.metrics["receipts"] += len(unit.files) - 1
         run.metrics["json_members"] += json_members
@@ -226,6 +264,206 @@ class SecArchive:
 
     def finish(self, entry: Entry, source: OriginalBytes, run: Run) -> None:
         del entry, source, run
+
+
+def _check_receipts(unit: Unit, source: Bytes, observed: dict[str, object]) -> None:
+    """Refuse a receipt that does not name the archive or disagrees with what was read."""
+    for path in unit.files[1:]:
+        receipt = json_object(
+            json_document(source.read(path, max_bytes=MAX_INDEX_BYTES), path.name), path.name
+        )
+        if "sha256" not in receipt:
+            raise ValueError(f"SEC archive receipt does not name the archive: {path.name}")
+        for key, value in observed.items():
+            if key in receipt and receipt[key] != value:
+                raise ValueError(f"SEC archive receipt {path.name} disagrees on {key}")
+
+
+def _open_archive(handle: BinaryIO, name: str) -> zipfile.ZipFile:
+    try:
+        return zipfile.ZipFile(handle)
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError, EOFError) as error:
+        raise ValueError(f"SEC archive is not a zip file: {name}") from error
+
+
+def _member_bytes(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> bytes:
+    if info.flag_bits & 1:
+        raise ValueError(f"SEC archive member is encrypted: {info.filename}")
+    if info.file_size > MAX_FILE_BYTES:
+        raise ValueError(f"SEC archive member exceeds its bound: {info.filename}")
+    try:
+        return archive.read(info)
+    except (
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+        zlib.error,
+        NotImplementedError,
+        RuntimeError,
+        OSError,
+        EOFError,
+    ) as error:
+        raise ValueError(
+            f"SEC archive member is unreadable or fails its CRC: {info.filename}"
+        ) from error
+
+
+def _filing_rows(arrays: dict[str, object], member: str, cik: str) -> list[tuple[object, ...]]:
+    """One row per position of a submissions document's parallel filing arrays."""
+    kinds = dict(FILING_ARRAYS)
+    unknown = sorted(set(arrays) - set(kinds))
+    if unknown:
+        raise ValueError(f"SEC submissions document {member} has unknown array {unknown[0]!r}")
+    lengths = set()
+    for name, values in arrays.items():
+        if not isinstance(values, list):
+            raise ValueError(f"SEC submissions {member} {name} must be a JSON list")
+        lengths.add(len(values))
+        for value in values:
+            if value is None:
+                continue
+            if kinds[name] == "string" and not isinstance(value, str):
+                raise ValueError(f"SEC submissions {member} {name} values must be text")
+            if kinds[name] == "int64" and (isinstance(value, bool) or not isinstance(value, int)):
+                raise ValueError(f"SEC submissions {member} {name} values must be integers")
+    if len(lengths) > 1:
+        raise ValueError(f"SEC submissions {member} arrays have unequal lengths")
+    count = next(iter(lengths), 0)
+    columns = [
+        cast("list[object]", arrays[name]) if name in arrays else [None] * count
+        for name, _ in FILING_ARRAYS
+    ]
+    return [(member, cik, *values) for values in zip(*columns, strict=True)] if count else []
+
+
+class SecSubmissionsFilings:
+    """``sec.submissions_filings@1``."""
+
+    name = "sec.submissions_filings@1"
+    arg_names = frozenset({"evidence"})
+    metric_names = frozenset(
+        {
+            "members",
+            "json_members",
+            "expanded_bytes",
+            "receipts",
+            "filers",
+            "pages",
+            "filings",
+            "other_members",
+            "missing_pages",
+            "unlisted_pages",
+            "miscounted_pages",
+            "unknown_members",
+        }
+    )
+    zero_metrics = frozenset(
+        {"missing_pages", "unlisted_pages", "miscounted_pages", "unknown_members"}
+    )
+    table = SUBMISSION_FILINGS
+
+    def units(self, entry: Entry, source: OriginalBytes, run: Run) -> list[Unit]:
+        return SecArchive(self.name, self.table).units(entry, source, run)
+
+    def batches(
+        self, unit: Unit, table: Table, source: Bytes, run: Run
+    ) -> Iterator[pa.RecordBatch]:
+        rows: list[tuple[object, ...]] = []
+        metrics: Counter[str] = Counter()
+        listed: dict[str, int] = {}
+        found: dict[str, int] = {}
+        with source.stream(unit.files[0]) as handle:
+            archive_file = source.seen[unit.files[0]]
+            with _open_archive(handle, unit.name) as archive:
+                for info in archive.infolist():
+                    payload = _member_bytes(archive, info)
+                    metrics["members"] += 1
+                    metrics["expanded_bytes"] += info.file_size
+                    name = info.filename
+                    if not name.endswith(".json"):
+                        metrics["other_members"] += 1
+                        continue
+                    metrics["json_members"] += 1
+                    filer, page = _FILER.fullmatch(name), _PAGE.fullmatch(name)
+                    if filer is None and page is None:
+                        metrics["unknown_members"] += 1
+                        continue
+                    document = json_object(json_document(payload, name), name)
+                    if filer is not None:
+                        cik = filer.group(1)
+                        arrays = _filer_arrays(document, name, cik, listed)
+                        metrics["filers"] += 1
+                    else:
+                        cik = cast("re.Match[str]", page).group(1)
+                        arrays = document
+                        metrics["pages"] += 1
+                    produced = _filing_rows(arrays, name, cik)
+                    if page is not None:
+                        found[name] = len(produced)
+                    metrics["filings"] += len(produced)
+                    rows.extend(produced)
+                    while len(rows) >= _BATCH:
+                        yield record_batch(table, rows[:_BATCH])
+                        rows = rows[_BATCH:]
+        if rows:
+            yield record_batch(table, rows)
+        _check_receipts(
+            unit,
+            source,
+            {
+                "sha256": archive_file.sha256,
+                "bytes": archive_file.size_bytes,
+                "members": metrics["members"],
+                "json_members": metrics["json_members"],
+                "expanded_bytes": metrics["expanded_bytes"],
+            },
+        )
+        metrics["receipts"] = len(unit.files) - 1
+        metrics["missing_pages"] = len(set(listed) - set(found))
+        metrics["unlisted_pages"] = len(set(found) - set(listed))
+        metrics["miscounted_pages"] = sum(
+            1 for page, count in found.items() if page in listed and listed[page] != count
+        )
+        run.metrics.update(metrics)
+
+    def finish(self, entry: Entry, source: OriginalBytes, run: Run) -> None:
+        del entry, source, run
+
+
+def _filer_arrays(
+    document: dict[str, object], name: str, cik: str, listed: dict[str, int]
+) -> dict[str, object]:
+    """A filer document's recent filing arrays; its listed pages go into ``listed``."""
+    stated = document.get("cik")
+    if (
+        isinstance(stated, bool)
+        or not isinstance(stated, str | int)
+        or str(stated).zfill(10) != cik
+    ):
+        raise ValueError(f"SEC submissions document {name} names another CIK")
+    filings = json_object(document.get("filings"), f"{name} filings")
+    if set(filings) != {"recent", "files"}:
+        raise ValueError(f"SEC submissions {name} filings keys are unknown")
+    pages = _page_list(filings["files"], name)
+    for page, _ in pages:
+        named = _PAGE.fullmatch(page)
+        if named is None or named.group(1) != cik:
+            raise ValueError(f"SEC submissions {name} lists a page of another filer: {page}")
+    listed.update(pages)
+    return json_object(filings["recent"], f"{name} filings.recent")
+
+
+def _page_list(value: object, name: str) -> list[tuple[str, int]]:
+    """The (page member, filing count) pairs a filer document lists under ``filings.files``."""
+    if not isinstance(value, list):
+        raise ValueError(f"SEC submissions {name} filings.files must be a JSON list")
+    pages = []
+    for item in value:
+        entry = json_object(item, f"{name} filings.files entry")
+        page, count = entry.get("name"), entry.get("filingCount")
+        if not isinstance(page, str) or isinstance(count, bool) or not isinstance(count, int):
+            raise ValueError(f"SEC submissions {name} lists a page without name and filingCount")
+        pages.append((page, count))
+    return pages
 
 
 class FredSeriesCsv:

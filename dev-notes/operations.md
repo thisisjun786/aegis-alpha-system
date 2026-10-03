@@ -444,7 +444,7 @@ aas import legacy --manifest /path/to/legacy-import.json --sha256 SHA256 --verif
 ```
 
 `import legacy`는 `aas-legacy-import-v1` manifest가 나열한 legacy 원본(Norgate 내보내기와 지수 구성 수집,
-SEC submissions·companyfacts archive, KIND·BOK·OECD 응답, FRED CSV, FMP 비수정 가격 snapshot, Norgate identity
+SEC submissions·companyfacts archive와 submissions archive의 공시 행, KIND·BOK·OECD 응답, FRED CSV, FMP 비수정 가격 snapshot, Norgate identity
 authority)을 `raw/`에 보존하고 원천 자료실의 내용 원천으로 commit한다. manifest 형식, loader별 완결 단위와
 출력 열, 거부 규칙은 [데이터 수직 계약](design/data-vertical.md#legacy-원천-편입)이 소유한다. 실제 경로와 기대
 수를 담은 manifest는 비공개로 두고 저장소에 넣지 않는다. 테이블 commit에는 `pyarrow`(legacy extra)가 필요하다.

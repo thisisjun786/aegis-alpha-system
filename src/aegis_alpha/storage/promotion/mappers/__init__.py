@@ -41,6 +41,12 @@ a staged source row (completed, no data, failed, ...), which the promotion recor
 coverage in place of rows that a response without data cannot give. A partition stages
 such a mapper's source rows whose partition date is NULL in every partition, so each is
 counted, and refuses them for every other mapper.
+
+A mapper may join generations of other datasets that its spec arguments pin
+(``references``): SEC company facts read each filing's acceptance time from a pinned
+``filings`` generation. The engine verifies each pin, loads the head rows of its chain
+(no TOMBSTONE) with the referenced domain's columns into ``reference_table(name)``, and
+the mapper's SELECT reads that table as it reads the source relation.
 """
 
 from __future__ import annotations
@@ -49,9 +55,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Final, Protocol
 
+from aegis_alpha.storage.market_inputs import GenerationPin
 from aegis_alpha.storage.promotion.time_rules import InputKind
 
 MANIFEST_ITEMS: Final = "_aas_p_items"
+_PIN_KEYS: Final = frozenset(
+    {"dataset_id", "version", "generation_id", "chain_hash", "manifest_hash"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +70,37 @@ class IdentityKey:
 
     provider: str
     namespace: str
+
+
+@dataclass(frozen=True, slots=True)
+class Reference:
+    """A generation of another dataset that a mapper joins, pinned in its spec arguments."""
+
+    domain: str
+    pin: GenerationPin
+
+
+def reference_pin(value: object, name: str) -> GenerationPin:
+    """A mapper argument's generation pin: exactly the five pin fields, each exact text."""
+    if not isinstance(value, dict) or set(value) != _PIN_KEYS:
+        raise ValueError(
+            f"{name} must pin dataset_id, version, generation_id, chain_hash and manifest_hash"
+        )
+    for key, item in value.items():
+        if not isinstance(item, str) or not item or item != item.strip() or "\x00" in item:
+            raise ValueError(f"{name} {key} must be exact nonempty text")
+    return GenerationPin(**{key: str(item) for key, item in value.items()})
+
+
+def reference_table(name: str) -> str:
+    """The engine's temp table holding the head rows of the reference ``name``."""
+    return f"_aas_p_ref_{name}"
+
+
+def references(found: Mapper, args: Mapping[str, object]) -> Mapping[str, Reference]:
+    """The pinned generations ``found`` joins under ``args``; most mappers join none."""
+    method = getattr(found, "references", None)
+    return {} if method is None else method(args)
 
 
 class Mapper(Protocol):
@@ -191,6 +232,10 @@ def _registry() -> dict[str, Mapper]:
         NorgateReferenceCloses,
         NorgateReferenceHistory,
     )
+    from aegis_alpha.storage.promotion.mappers.sec import (  # noqa: PLC0415 -- registry
+        SecCompanyfacts,
+        SecSubmissions,
+    )
 
     mappers: tuple[Mapper, ...] = (
         CalendarDeclared(),
@@ -220,6 +265,8 @@ def _registry() -> dict[str, Mapper]:
         KindIndustry(),
         NorgateClassification(),
         SecSic(),
+        SecCompanyfacts(),
+        SecSubmissions(),
     )
     return {f"{mapper.name}@{mapper.major}": mapper for mapper in mappers}
 
