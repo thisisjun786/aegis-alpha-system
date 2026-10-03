@@ -27,6 +27,7 @@ from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.storage import market, market_inputs, publication
 from aegis_alpha.storage import read_heads as heads_module
+from aegis_alpha.storage.adjusted_prices import read_adjusted_prices
 from aegis_alpha.storage.import_document import parse_import
 from aegis_alpha.storage.market_inputs import (
     GenerationPin,
@@ -1042,3 +1043,100 @@ def test_time_rule_provenance_comes_from_retained_evidence(tmp_path: Path) -> No
             load_pinned_heads(
                 workspace, HeadBinding("prices", (HeadPin(unlisted),)), strict, budget=BUDGET
             )
+
+
+def _actions(specs: list[tuple[str, str, date, Decimal, int]]) -> list[Row]:
+    """Corporate action ASSERTs: (instrument, type, ex-date, amount or ratio, known time)."""
+    rows = []
+    for instrument, kind, day, value, at in specs:
+        row: Row = {
+            "instrument_id": instrument,
+            "action_id": f"{kind}:{day.isoformat()}",
+            "action_type": kind,
+            "ex_date": day,
+            "record_date": None,
+            "pay_date": None,
+            "effective_date": day,
+            "amount": value if kind == "dividend" else None,
+            "ratio": value if kind != "dividend" else None,
+            "currency": "USD" if kind == "dividend" else None,
+            "value_state": "present",
+            "revision_id": f"{kind}-{day.isoformat()}",
+            "supersedes_revision_id": None,
+            "op": "ASSERT",
+            "available_at_us": at,
+            "revision_known_at_us": at,
+            "ingested_at_us": at,
+            "source_snapshot_id": "synthetic-source",
+            "source_row_hash": hashlib.sha256(f"{kind}{day}".encode()).hexdigest(),
+        }
+        row["record_id"] = market.record_identity(
+            "corporate_actions", [row[k] for k in NATURAL_KEYS["corporate_actions"]]
+        )
+        rows.append(row)
+    return rows
+
+
+def test_adjustment_ignores_actions_after_cutoff() -> None:
+    connection = duckdb.connect()
+    market.initialize_market(connection, "synthetic")
+    bars = _publish(
+        connection,
+        "prices.us.synthetic",
+        _rows(
+            "prices",
+            [
+                ("A", DAYS[0], "b0", 1, Decimal(100)),
+                ("A", DAYS[1], "b1", 2, Decimal(100)),
+                ("A", DAYS[2], "b2", 3, Decimal(50)),
+                ("A", DAYS[3], "b3", 4, Decimal(49)),
+            ],
+        ),
+    )
+    market.publish_generation(
+        connection,
+        dataset_id="actions.us.synthetic",
+        version="1",
+        generation_id="actions-g1",
+        operation_id="op-actions-g1",
+        request_hash=hashlib.sha256(b"actions-g1").hexdigest(),
+        parent_id=None,
+        domain="corporate_actions",
+        # A 2:1 split known at 30; a dividend of 1 known only at 80.
+        rows=_actions(
+            [("A", "split", DAYS[2], Decimal(2), 30), ("A", "dividend", DAYS[3], Decimal(1), 80)]
+        ),
+    )
+    actions = _pin(connection, "actions-g1")
+    exdate = "exdate_open@1"
+    rules = {bars.generation_id: RECORDED_TIMES, actions.generation_id: TimeRules(exdate, exdate)}
+    prices_binding = HeadBinding("prices", (HeadPin(bars),))
+
+    def closes(cutoff: int, basis: str, grants: tuple[str, ...] = (exdate,)) -> list[object]:
+        read = read_adjusted_prices(
+            connection,
+            prices_binding,
+            HeadBinding("corporate_actions", (HeadPin(actions),), grants),
+            HeadQuery(cutoff_us=cutoff),
+            basis=basis,
+            time_rules=rules,
+            budget=BUDGET,
+        )
+        ordered = sorted(read.rows, key=lambda row: _day(row.values["session_date"]))
+        return [row.values["close"] for row in ordered]
+
+    # Before the split is known, every bar stays as traded.
+    assert closes(20, "total_return") == [Decimal(100), Decimal(100), Decimal(50), Decimal(49)]
+    # The split is known, the dividend is not: earlier bars halve and nothing more.
+    assert closes(60, "total_return") == [Decimal(50), Decimal(50), Decimal(50), Decimal(49)]
+    # Once the dividend is known it is reinvested at the close before its ex-date, 50, so
+    # earlier bars take the factor 49/50.
+    assert closes(90, "total_return") == [Decimal(49), Decimal(49), Decimal(49), Decimal(49)]
+    assert closes(90, "split_adjusted") == [Decimal(50), Decimal(50), Decimal(50), Decimal(49)]
+    # Without a grant for the action rule, a strict read knows no action at all.
+    assert closes(90, "split_adjusted", grants=()) == [
+        Decimal(100),
+        Decimal(100),
+        Decimal(50),
+        Decimal(49),
+    ]
