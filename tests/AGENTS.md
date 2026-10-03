@@ -38,7 +38,8 @@ The root `conftest.py` owns network, data-root and disposable DB isolation.
   from its test count at the table's mean rate. Every CI `tests` shard publishes the seconds it
   measured as the `test-durations-<INDEX>` artifact; when shard durations drift apart, refresh
   the table from one run's artifacts with `python -m tests.sharding merge durations-*.json`
-  (it refuses inputs that leave out a weighed file that still exists, such as a missing shard),
+  (it refuses inputs that leave out a weighed file the `-m "not database"` lane still runs,
+  such as a missing shard; a deleted, renamed or wholly `database`-marked file leaves the table),
   or locally from an unsharded `-m "not database"` run with
   `--test-durations-out tests/shard_weights.json`.
 
