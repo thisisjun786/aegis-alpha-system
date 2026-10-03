@@ -65,7 +65,7 @@ def _tables(
     return found
 
 
-def _master(connection: duckdb.DuckDBPyConnection, source_id: str) -> LinkedRows:
+def read_master(connection: duckdb.DuckDBPyConnection, source_id: str) -> LinkedRows:
     matches = [
         found for found in _tables(connection, source_id, MASTER_TABLE) if found[0] == source_id
     ]
@@ -140,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, help="New file for the full JSON report")
     args = parser.parse_args(argv)
     with duckdb.connect(str(args.market), read_only=True) as connection:
-        registry = build_us_registry(_master(connection, args.master))
+        registry = build_us_registry(read_master(connection, args.master))
         kinds = {
             "bars": _bar_keys(connection, args.bars) if args.bars else None,
             "quarantine": _quarantine_keys(connection, args.quarantine, args.quarantine_reason)

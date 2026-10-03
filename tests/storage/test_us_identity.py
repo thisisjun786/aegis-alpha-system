@@ -11,6 +11,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, cast
 
+import duckdb
 import pyarrow as pa
 import pytest
 
@@ -68,6 +69,9 @@ FUND_LIKE = cusip("78462F10")
 CIK_A = "0000000101"
 CIK_B = "0000000202"
 FMP_US = (FMP_RETRIEVED - datetime(1970, 1, 1, tzinfo=UTC)) // datetime.resolution
+# A last observed session after every synthetic retrieval, so FMP and SEC rows fall
+# inside the ticker claims they are matched by.
+OBSERVED = "2027-06-30"
 
 
 def _assertions(registry: UsRegistry) -> list[dict[str, Any]]:
@@ -198,7 +202,9 @@ def test_ticker_claims_are_bounded_by_the_master() -> None:
         master(12, "LAST"),
     ]
     registry = build_us_registry(
-        linked(rows), fmp=[fmp_rows([profile("XYZ", CIK_A), profile("NODATE", CIK_A)])]
+        linked(rows),
+        fmp=[fmp_rows([profile("XYZ", CIK_A), profile("NODATE", CIK_A)])],
+        sec=[in_memory(submissions([(CIK_A, "Synthetic A Inc", ["XYZ"])]))],
     )
     assert registry.through == date(2026, 7, 28)
     end = session_start_us(date(2026, 7, 29))
@@ -220,8 +226,17 @@ def test_ticker_claims_are_bounded_by_the_master() -> None:
         )
         for row in _assertions(registry)
     }
-    for key in (("eodhd", "eodhd_symbol", "XYZ.US"), ("fmp", "fmp_symbol", "XYZ")):
-        assert claims[key] == registry.intervals["XYZ.US"]
+    assert claims[("eodhd", "eodhd_symbol", "XYZ.US")] == registry.intervals["XYZ.US"]
+    # FMP and SEC rows retrieved after through may describe a later holder of the ticker.
+    assert registry.unresolved["fmp"] == {
+        "fmp_after_master_through": ["XYZ"],
+        "not_a_listed_norgate_ticker": ["NODATE"],
+    }
+    assert registry.unresolved["issuers"] == {
+        "sec_after_master_through": ["XYZ"],
+        "sec_ticker_missing": ["CLS-A", "PLAIN"],
+    }
+    assert not {key for key in claims if key[0] in {"fmp", "sec"}}
     assert claims[("norgate", "norgate_symbol", "XYZ")] == registry.intervals["XYZ.US"]
     assert claims[("norgate", "norgate_symbol", "XYZ-202001")] == (UNBOUNDED, None)
     assert not {key for key in claims if key[2] in {"NODATE", "LOST", "LAST", "NODATE.US"}}
@@ -304,7 +319,7 @@ def test_provider_symbols_reach_only_a_unique_active_ticker() -> None:
 def test_issuer_needs_sec_and_fmp_to_agree() -> None:
     archive = submissions(
         [
-            (CIK_A, "Synthetic A Inc", ["AAA", "AAB"]),
+            (CIK_A, "Synthetic A Inc", ["AAA", "AAB", "NOFMP"]),
             (CIK_B, "Synthetic B Corp", ["BBB", "SHARED"]),
             ("0000000303", "Synthetic C Ltd", ["SHARED", "CCC"]),
         ]
@@ -313,12 +328,13 @@ def test_issuer_needs_sec_and_fmp_to_agree() -> None:
     registry = build_us_registry(
         linked(
             [
-                master(1, "AAA"),
+                master(1, "AAA", last_date=OBSERVED),
                 master(2, "AAB"),
                 master(3, "BBB"),
                 master(4, "SHARED"),
                 master(5, "CCC"),
                 master(6, "NOSEC"),
+                master(7, "NOFMP"),
             ]
         ),
         fmp=[
@@ -348,10 +364,12 @@ def test_issuer_needs_sec_and_fmp_to_agree() -> None:
         "4": None,
         "5": None,
         "6": None,
+        "7": None,
     }
     assert registry.unresolved["issuers"] == {
         "fmp_cik_differs": ["BBB"],
         "fmp_cik_missing": ["CCC"],
+        "fmp_profile_missing": ["NOFMP"],
         "sec_ticker_ambiguous": ["SHARED"],
         "sec_ticker_missing": ["NOSEC"],
     }
@@ -370,6 +388,11 @@ def test_issuer_needs_sec_and_fmp_to_agree() -> None:
         first["known_from_us"] == (later - datetime(1970, 1, 1, tzinfo=UTC)) // datetime.resolution
     )
     assert first["known_from_us"] > LINKED
+    # SEC and FMP state today's ticker-to-CIK mapping, so the link holds from the later of
+    # their instants, and an earlier CIK can still be registered as its own link.
+    assert (first["valid_from_us"], first["valid_to_us"]) == (first["known_from_us"], None)
+    second = links[issuer_link_token(issuer, _instrument(2))]
+    assert second["valid_from_us"] == max(FMP_US, LINKED)
 
 
 def test_sec_members_are_read_through_their_index() -> None:
@@ -414,7 +437,7 @@ def test_fmp_disagreement_and_shared_identifiers_stay_unresolved() -> None:
     registry = build_us_registry(
         linked(
             [
-                master(1, "AAA"),
+                master(1, "AAA", last_date=OBSERVED),
                 master(2, "TWO"),
                 master(3, "EUR"),
                 master(4, "FUND", etf=True),
@@ -467,7 +490,7 @@ def test_fmp_disagreement_and_shared_identifiers_stay_unresolved() -> None:
 
 
 def test_us_sources_register_as_one_document(ws: Workspace, tmp_path: Path) -> None:
-    master_rows = [master(131684, "AAA"), master(255128, "FUND", etf=True)]
+    master_rows = [master(131684, "AAA", last_date=OBSERVED), master(255128, "FUND", etf=True)]
     master_id = commit(ws, "norgate-master", "observations", table(master_rows, MASTER_SCHEMA))
     fmp_table = table([profile("AAA", CIK_A, APPLE_LIKE)], FMP_SCHEMA)
     fmp_id = commit(ws, "fmp-profiles", "observations", fmp_table)
@@ -592,7 +615,10 @@ def _register(ws: Workspace, registry: UsRegistry) -> dict[str, object]:
 
 def test_a_us_build_reads_every_registered_us_source(ws: Workspace) -> None:
     master_id = commit(
-        ws, "norgate-master", "observations", table([master(1, "AAA")], MASTER_SCHEMA)
+        ws,
+        "norgate-master",
+        "observations",
+        table([master(1, "AAA", last_date=OBSERVED)], MASTER_SCHEMA),
     )
     first = commit(ws, "fmp-one", "observations", table([profile("AAA", CIK_A)], FMP_SCHEMA))
     _register(ws, build_from_workspace(ws, master=master_id, fmp=[first]))
@@ -600,7 +626,10 @@ def test_a_us_build_reads_every_registered_us_source(ws: Workspace) -> None:
     with pytest.raises(ValueError, match=first):
         build_from_workspace(ws, master=master_id)
     other_master = commit(
-        ws, "norgate-master-two", "observations", table([master(1, "AAA")], MASTER_SCHEMA)
+        ws,
+        "norgate-master-two",
+        "observations",
+        table([master(1, "AAA", last_date=OBSERVED)], MASTER_SCHEMA),
     )
     with pytest.raises(ValueError, match=master_id):
         build_from_workspace(ws, master=other_master, fmp=[first])
@@ -649,7 +678,7 @@ def test_an_fmp_row_without_a_retrieval_instant_refuses_its_symbol() -> None:
     index = naive.columns.index("retrieved_at_utc")
     naive_row = (*row[:index], datetime(2026, 8, 29), *row[index + 1 :])  # noqa: DTZ001
     registry = build_us_registry(
-        linked([master(1, "AAA"), master(2, "BBB"), master(3, "CCC")]),
+        linked([master(1, "AAA", last_date=OBSERVED), master(2, "BBB"), master(3, "CCC")]),
         fmp=[
             fmp_rows([profile("BBB", CIK_B, retrieved=None), profile("CCC", CIK_B)]),
             type(naive)("sl:fmp-naive", naive.columns, (naive_row,)),
@@ -710,7 +739,10 @@ def test_only_an_sec_submissions_zip_source_is_read(ws: Workspace) -> None:
 
 def test_a_corrected_registered_claim_is_not_reported_withdrawn(ws: Workspace) -> None:
     master_id = commit(
-        ws, "norgate-master", "observations", table([master(1, "AAA")], MASTER_SCHEMA)
+        ws,
+        "norgate-master",
+        "observations",
+        table([master(1, "AAA", last_date=OBSERVED)], MASTER_SCHEMA),
     )
     first = commit(ws, "fmp-one", "observations", table([profile("AAA", CIK_A)], FMP_SCHEMA))
     registry = build_from_workspace(ws, master=master_id, fmp=[first])
@@ -806,3 +838,27 @@ def test_the_report_script_resolves_bulk_and_quarantined_us_rows(tmp_path: Path)
         1,
     )
     assert quarantine["rows"]["unresolved"] == {"not_a_listed_norgate_ticker": ["MUTUAL.US"]}
+
+
+def test_the_report_reads_the_master_as_us_build_does(tmp_path: Path) -> None:
+    home = tmp_path / "aas"
+    initialize(home)
+    rows = [
+        master(131684, "AAA", last_date=OBSERVED),
+        master(2, "XYZ-202001", delisted=True, last_date="2020-01-15"),
+        master(3, "XYZ", first_date="2019-06-03"),
+        master(4, "NODATE", first_date=None),
+    ]
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        master_id = commit(workspace, "norgate-master", "observations", table(rows, MASTER_SCHEMA))
+        built = build_from_workspace(workspace, master=master_id)
+        market = workspace.paths.market
+    with duckdb.connect(str(market), read_only=True) as connection:
+        reported = build_us_registry(us_identity_report.read_master(connection, master_id))
+    assert built.through == date(2027, 6, 30)
+    assert (reported.symbols, reported.intervals, reported.through) == (
+        built.symbols,
+        built.intervals,
+        built.through,
+    )
+    assert reported.unresolved == built.unresolved

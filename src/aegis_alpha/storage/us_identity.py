@@ -29,12 +29,16 @@ listing's ``first_date``, or of the day after the last ``last_date`` of a delist
 whose ``<ticker>-YYYYMM`` symbol shows an earlier holder, whichever is later, until the
 New York start of the day after the master's last observed session (its ``through``
 date). Extending a claim past ``through`` needs newer evidence registered as a later
-interval.
+interval. An FMP profile or SEC filer matched by ticker names the listing only when it was
+retrieved inside that interval (``fmp_after_master_through``, ``sec_after_master_through``
+and the ``before_ticker_claim`` pair otherwise).
 
 Every claim cites its source as ``sl:<source_id>`` with the ``aas-source-row-v1`` hash of
 the row it came from. A Norgate or SEC claim is known from its source's ``sl:`` link
 instant (the source rows record no retrieval instant), an FMP claim from the instant its
 row was retrieved, and an issuer link from the latest of the three instants it rests on.
+An issuer link is valid from the later of its SEC and FMP instants: both state today's
+ticker-to-CIK mapping, not since when, so an earlier CIK can be added as its own link.
 The build input is cumulative (``check_registered``). The contract is in
 dev-notes/design/data-vertical.md.
 """
@@ -693,13 +697,28 @@ def _bounded(
     return kept
 
 
+def _outside(at: int, interval: tuple[int, int]) -> str | None:
+    """Why a ticker-matched row retrieved at ``at`` cannot name the claim's listing."""
+    start, end = interval
+    if at < start:
+        return "before_ticker_claim"
+    if at >= end:
+        return "after_master_through"
+    return None
+
+
 def _profiles(
     profiles: Mapping[str, list[Profile]],
     refused: Mapping[str, str],
     tickers: Mapping[str, Listing],
+    bounds: _Bounds,
     unresolved: dict[str, list[str]],
 ) -> dict[str, Profile]:
-    """The one agreed profile of each listed ticker, judged against its Norgate listing."""
+    """The one agreed profile of each listed ticker, judged against its Norgate listing.
+
+    The profile names the listing only when it was retrieved while the listing's ticker
+    claim holds; a profile retrieved outside it may describe another holder of the ticker.
+    """
     agreed: dict[str, Profile] = {}
     for symbol in sorted({*profiles, *refused}):
         listing = tickers.get(symbol)
@@ -717,8 +736,11 @@ def _profiles(
             reason = "fmp_type_differs"
         else:
             first = min(group, key=lambda profile: profile.evidence.order())
-            agreed[symbol] = first
-            continue
+            outside = _outside(first.evidence.known_from_us, bounds.intervals[listing.assetid])
+            if outside is None:
+                agreed[symbol] = first
+                continue
+            reason = f"fmp_{outside}"
         unresolved[reason].append(symbol)
     return agreed
 
@@ -759,42 +781,59 @@ def _fmp_assertions(
     return assertions
 
 
+def _inside(listed: Sequence[Filer], interval: tuple[int, int]) -> list[Filer] | str:
+    """The SEC filers of a ticker retrieved inside its claim, or why there are none."""
+    if not listed:
+        return "sec_ticker_missing"
+    found = [filer for filer in listed if _outside(filer.evidence.known_from_us, interval) is None]
+    if found:
+        return found
+    earliest = min(listed, key=lambda item: item.evidence.order())
+    return f"sec_{_outside(earliest.evidence.known_from_us, interval)}"
+
+
 def _issuers(
     filers: Sequence[Filer],
     agreed: Mapping[str, Profile],
     tickers: Mapping[str, Listing],
+    bounds: _Bounds,
     unresolved: dict[str, list[str]],
-) -> tuple[list[Record], dict[str, tuple[str, Evidence]]]:
-    """Issuer links of listed tickers that SEC and FMP tie to the same CIK."""
+) -> tuple[list[Record], dict[str, tuple[str, Evidence, int]]]:
+    """Issuer links of listed tickers that SEC and FMP tie to the same CIK.
+
+    Only SEC filers retrieved while the listing's ticker claim holds count. Both sources
+    state the current ticker-to-CIK mapping, not since when, so a link is valid from the
+    later of the SEC and FMP instants and known from the latest of all three.
+    """
     by_ticker: dict[str, list[Filer]] = defaultdict(list)
     for filer in filers:
         for ticker in set(filer.tickers):
             by_ticker[ticker].append(filer)
     names: dict[str, Filer] = {}
-    links: dict[str, tuple[str, Evidence]] = {}
+    links: dict[str, tuple[str, Evidence, int]] = {}
     for ticker, listing in sorted(tickers.items()):
-        found = by_ticker.get(ticker, [])
+        found = _inside(by_ticker.get(ticker, []), bounds.intervals[listing.assetid])
+        if isinstance(found, str):
+            unresolved[found].append(ticker)
+            continue
         ciks = {filer.cik for filer in found}
         profile = agreed.get(ticker)
-        if not ciks:
-            unresolved["sec_ticker_missing"].append(ticker)
-            continue
         if len(ciks) > 1:
             unresolved["sec_ticker_ambiguous"].append(ticker)
             continue
         filer = min(found, key=lambda item: item.evidence.order())
-        if profile is None or profile.cik is None:
+        if profile is None:
+            unresolved["fmp_profile_missing"].append(ticker)
+            continue
+        if profile.cik is None:
             unresolved["fmp_cik_missing"].append(ticker)
             continue
         if profile.cik != filer.cik:
             unresolved["fmp_cik_differs"].append(ticker)
             continue
-        known = max(
-            filer.evidence.known_from_us,
-            profile.evidence.known_from_us,
-            listing.evidence.known_from_us,
-        )
-        links[listing.assetid] = (filer.cik, replace(filer.evidence, known_from_us=known))
+        valid = max(filer.evidence.known_from_us, profile.evidence.known_from_us)
+        known = max(valid, listing.evidence.known_from_us)
+        links[listing.assetid] = (filer.cik, replace(filer.evidence, known_from_us=known), valid)
         earliest = names.get(filer.cik)
         if earliest is None or filer.evidence.order() < earliest.evidence.order():
             names[filer.cik] = filer
@@ -832,7 +871,7 @@ def _accepted(
 def _listing_assertions(
     accepted: Sequence[Listing],
     repeated: set[str],
-    links: Mapping[str, tuple[str, Evidence]],
+    links: Mapping[str, tuple[str, Evidence, int]],
     bounds: _Bounds,
 ) -> list[Record]:
     """Norgate's own claims and the issuer link of every accepted listing.
@@ -851,10 +890,10 @@ def _listing_assertions(
             key = ("norgate", namespace, token)
             assertions.append(_assertion(listing.assetid, key, interval, listing.evidence))
         if listing.assetid in links:
-            cik, link = links[listing.assetid]
+            cik, link, since = links[listing.assetid]
             token = issuer_link_token(mint_issuer("sec_cik", cik), listing.instrument_id)
             key = ("sec", "issuer", token)
-            assertions.append(_assertion(listing.assetid, key, _ALWAYS, link))
+            assertions.append(_assertion(listing.assetid, key, (since, None), link))
     return assertions
 
 
@@ -921,9 +960,11 @@ def build_us_registry(
         unresolved["tickers"],
     )
     profiles, refused, mappers[FMP_MAPPER] = map_fmp_profiles(fmp)
-    agreed = _profiles(profiles, refused, tickers, unresolved["fmp"])
+    agreed = _profiles(profiles, refused, tickers, bounds, unresolved["fmp"])
     filers, mappers[SEC_MAPPER] = _sec_filers(sec)
-    issuers, links = _issuers(filers, agreed, tickers, unresolved["issuers"]) if sec else ([], {})
+    issuers, links = (
+        _issuers(filers, agreed, tickers, bounds, unresolved["issuers"]) if sec else ([], {})
+    )
     eodhd, symbols, intervals, mappers[EODHD_MAPPER] = _eodhd(
         tickers, bounds, unresolved["tickers"]
     )

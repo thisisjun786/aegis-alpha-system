@@ -744,7 +744,9 @@ Norgate security master 하나에서 모두 나온다.
   (`fmp_profile_ambiguous`), USD가 아닌 FMP 행(`fmp_currency_not_usd`), Norgate와 다른 ETF 여부
   (`fmp_type_differs`), 두 티커가 같은 CUSIP·ISIN(`cusip_ambiguous`, `isin_ambiguous`, 그 식별자
   assertion만 빠진다), SEC에 없는 티커(`sec_ticker_missing`), 두 CIK가 싣는 티커
-  (`sec_ticker_ambiguous`), CIK가 없는 FMP 행(`fmp_cik_missing`), SEC와 다른 FMP CIK(`fmp_cik_differs`).
+  (`sec_ticker_ambiguous`), 합의된 FMP profile이 없는 티커(`fmp_profile_missing`: FMP 행이 없거나 위
+  FMP 이유로 미해결인 경우), 합의된 FMP profile에 CIK가 없는 티커(`fmp_cik_missing`), SEC와 다른 FMP
+  CIK(`fmp_cik_differs`).
   master 행 중 asset ID가 양의 정수가 아니거나(`assetid_invalid`), 심볼이 다듬어진 텍스트가 아니거나
   (`symbol_invalid`), USD가 아니거나(`currency_not_usd`), 상폐 여부가 불리언이 아닌 행
   (`listing_state_unknown`)은 거부하고, 같은 asset ID의 두 행은 둘 다 등록하지 않으며(`assetid_repeated`),
@@ -766,9 +768,18 @@ Norgate security master 하나에서 모두 나온다.
     뒤로 구간을 늘리려면 더 새로운 근거(예: 이후 수집한 EODHD 심볼 목록이나 SEC 티커 파일)를 새 매퍼
     버전으로 읽어 `through` 다음 날부터의 구간으로 등록한다. 겹치지 않는 구간이므로 기존 주장과 충돌하지
     않는다.
-  - asset ID, 상폐 행의 접미사 심볼(그 상장만의 영구 이름)과 issuer 연결은 공급자 시계열 전체
-    (`valid_from_us`는 int64 최소값, `valid_to_us`는 null)다. FMP의 CUSIP·ISIN은 profile이 수집 시점의
-    현재 값만 말하므로 그 수집 시각부터 유효하다.
+  - 티커로 대조하는 FMP profile과 SEC member는 그 수집 시각이 상장의 티커 구간 안일 때만 그 상장을
+    가리킨다. 구간 밖에서 수집한 행은 다른 보유자를 말할 수 있으므로 해석하지 않는다
+    (`fmp_before_ticker_claim`, `fmp_after_master_through`, `sec_before_ticker_claim`,
+    `sec_after_master_through`). SEC member의 수집 시각은 그 원천 `sl:` 연결의 `retrieved_at_us`다.
+  - asset ID와 상폐 행의 접미사 심볼(그 상장만의 영구 이름)은 공급자 시계열 전체(`valid_from_us`는
+    int64 최소값, `valid_to_us`는 null)다. FMP의 CUSIP·ISIN은 profile이 수집 시점의 현재 값만 말하므로
+    그 수집 시각부터 유효하다. issuer 연결도 SEC와 FMP가 지금의 티커-CIK 대응만 말하므로 두 수집 시각 중
+    늦은 시각부터 유효하다. 지주회사 재편처럼 그 전의 CIK가 따로 있으면 그 기간을 겹치지 않는 별도
+    issuer 연결로 더한다.
+  - US 매퍼는 master 하나만 티커 구간을 만들므로 `through` 뒤의 EODHD bar와 그 뒤에 수집한 FMP·SEC 행은
+    해석되지 않는다. `prices.us.eodhd` 승격은 `through` 다음 날부터의 구간을 등록하는 날짜 있는 US 심볼
+    매퍼(이후 수집한 EODHD US exchange-symbol 목록 등)가 생기기 전까지 그 행을 미해결로 둔다.
 - 지식 시각: Norgate master와 SEC member 색인은 행에 수집 시각이 없으므로 그 원천 `sl:` 연결의
   `retrieved_at_us`(편입 intent가 완료된 시각)부터 알려진다. FMP 주장은 그 행의 `retrieved_at_utc`부터,
   issuer 연결은 기대는 세 근거(SEC, FMP, Norgate) 중 가장 늦은 시각부터 알려진다. 연결되지 않은 원천은
@@ -1064,7 +1075,7 @@ state v2:
 | DV-125 | 보존한 `raw/` 사본이 주소와 다르거나 크기가 다르면 legacy 단위 읽기를 거부한다 | `tests/storage/test_legacy_import.py::test_retained_bytes_refuse_a_changed_raw_object` | 구현 |
 | DV-126 | US instrument는 Norgate asset ID에서만 발급되고 master 행이 하나씩 instrument가 되며 Norgate 주장은 원천 연결 시각부터 알려진다 | `tests/storage/test_us_identity.py::test_us_instruments_are_minted_from_norgate_asset_ids` | 구현 |
 | DV-127 | EODHD·FMP 심볼은 상장 행 하나의 티커로만 instrument에 닿고 두 상장 행이 같은 티커면 미해결이다 | `tests/storage/test_us_identity.py::test_provider_symbols_reach_only_a_unique_active_ticker` | 구현 |
-| DV-128 | issuer 연결은 SEC가 티커를 하나의 CIK에 싣고 FMP가 같은 CIK를 줄 때만 생기며 세 근거 중 가장 늦은 시각부터 알려진다 | `tests/storage/test_us_identity.py::test_issuer_needs_sec_and_fmp_to_agree` | 구현 |
+| DV-128 | issuer 연결은 SEC가 티커를 하나의 CIK에 싣고 FMP가 같은 CIK를 줄 때만 생기며 SEC·FMP 중 늦은 수집 시각부터 유효하고 세 근거 중 가장 늦은 시각부터 알려진다. FMP profile이 없는 티커와 CIK가 없는 profile은 이유가 다르다 | `tests/storage/test_us_identity.py::test_issuer_needs_sec_and_fmp_to_agree` | 구현 |
 | DV-129 | SEC 매퍼는 member 색인으로 archive를 읽고 기록과 다른 archive·member bytes를 거부한다 | `tests/storage/test_us_identity.py::test_sec_members_are_read_through_their_index` | 구현 |
 | DV-130 | 서로 다른 FMP 행, Norgate와 다른 유형·통화, 두 티커가 공유한 CUSIP·ISIN은 미해결로 남고 CUSIP·ISIN은 수집 시각부터 유효하다 | `tests/storage/test_us_identity.py::test_fmp_disagreement_and_shared_identifiers_stay_unresolved` | 구현 |
 | DV-131 | commit된 US 원천에서 만든 문서는 누락 참조·충돌 없이 한 번에 등록되고 legacy bindings와의 asset ID 집합 비교를 보고한다 | `tests/storage/test_us_identity.py::test_us_sources_register_as_one_document` | 구현 |
@@ -1081,3 +1092,5 @@ state v2:
 | DV-142 | `scripts/us_identity_report.py`는 market 파일만 읽기 전용으로 열어 bulk·격리 행의 US 해석을 이유별로 보고한다 | `tests/storage/test_us_identity.py::test_the_report_script_resolves_bulk_and_quarantined_us_rows` | 구현 |
 | DV-143 | legacy 항목의 보존 파일은 경로·SHA-256·크기·이유를 담은 보존 목록 원천으로 commit되고, 목록 원천이 없거나 연결된 보존 bytes가 없으면 `--verify`가 `unmatched`로 센다 | `tests/storage/test_legacy_import.py::test_uncovered_files_keep_verify_incomplete` | 구현 |
 | DV-144 | 압축 해제가 깨진 SEC member나 지수 구성 gzip은 그 단위를 이유와 함께 거부하고 나머지 계획은 이어진다 | `tests/storage/test_legacy_import.py::test_sec_archive_refuses_a_corrupt_deflate_stream` | 구현 |
+| DV-145 | 상장의 티커 구간 밖에서 수집한 FMP profile과 SEC member는 그 상장에 FMP·issuer 주장을 만들지 않고 이유와 함께 미해결로 남는다 | `tests/storage/test_us_identity.py::test_ticker_claims_are_bounded_by_the_master` | 구현 |
+| DV-146 | `us_identity_report`가 읽은 master는 `us-build`와 같은 심볼·구간·`through`·미해결 이유를 낸다 | `tests/storage/test_us_identity.py::test_the_report_reads_the_master_as_us_build_does` | 구현 |
