@@ -181,12 +181,12 @@ DuckDB 안에서 흐르고 Python으로 통째로 올라오지 않는다. 엄격
 | `target` | `domain`, `dataset_id`, `parent`(직전 generation ID, 첫 generation은 null) |
 | `sources` | 순서 있는 원천 pin 목록. 각 항목은 `source_id`, `source_sha256`, `table`, `digest`(commit manifest의 테이블 digest). 같은 원천 테이블은 한 번만 pin한다 |
 | `mapper` | `name`(`name@major`)과 그 매퍼가 정의한 인자 `args` |
-| `partition` | null 또는 `from`·`to` 날짜. 매퍼의 파티션 날짜가 `[from, to)`인 원천 행만 승격한다. 백필은 구간 하나가 generation 하나다 |
+| `partition` | null 또는 `from`·`to` 날짜. 매퍼의 파티션 날짜가 `[from, to)`인 원천 행만 승격한다. 백필은 구간 하나가 generation 하나다. |
 | `time_rules` | `available_at_us`, `revision_known_at_us` 각각의 `rule`(`id@version`), 입력 근거 `basis`(`revision`·`record`), 규칙이 읽는 매퍼의 시간 입력 `input`(없으면 null), 그 규칙의 인자 `args` |
 | `decimal_rule` | 매퍼가 내는 숫자 열마다 `id@version` 하나 |
 | `quality_rules` | `rule`(`id@version`)과 `args`의 목록. 같은 규칙은 한 번만 쓴다 |
 | `tombstone_policy` | `{"mode": "never"}`, 또는 `absent_in_full_snapshot`과 전체 snapshot인 pin 하나(`source`: `source_id`, `table`), 그것이 빠짐없이 담는 범위(`scope`: instrument ID 목록 또는 모든 instrument인 null, `from`·`to` 날짜 구간). 범위는 `partition` 안에 있다. 부재는 그 snapshot의 행으로만 판단하고, 다른 pin의 행이 범위 안에 있으면 계획이 거부하므로 그 행은 별도 generation으로 승격한다 |
-| `identity_snapshot` | instrument를 해석한 identity snapshot pin(`snapshot_id`, `content_hash`). instrument가 없는 도메인(거시·FX·달력)은 null |
+| `identity_snapshot` | 매퍼의 identity key를 해석할 identity snapshot pin(`snapshot_id`, `content_hash`). instrument 도메인은 늘 pin한다. identity key가 없는 매퍼(거시·FX·달력, 영구 anchor에서 주체 ID를 발급하는 분류 매퍼)는 null |
 
 `request_hash = sha256(정규 JSON ["aas-promotion-request-v1", 명세 SHA-256, 원천 digest 목록, parent])`다.
 그 정규 JSON 요청 문서도 `raw/`에 보존한다. generation ID는 `prm-<request_hash>`, intent의 operation
@@ -208,7 +208,7 @@ flag → 대량 게시 계획이다. 원천 확인은 pin한 테이블마다 완
 계산해 대조한다. `--plan`은 같은 계산을 하고 아무것도 쓰지 않는다. 읽기 전용으로 연 설치본에서
 돌며, 계산에 쓰는 것은 그 연결의 임시 테이블뿐이다. 보고는 원천 행 수, 행 상태(`ok`, `held`,
 `unresolved`, `ambiguous`, `refused_*`), 매퍼가 고르지 않은 원천 행 수(`unselected_rows`, 여러 시계열을
-담은 원천에서 한 시계열만 읽는 매퍼), 미해결 token 표본, 해석 전 매핑 행 전체의 숫자 flag 분포,
+담은 원천에서 한 시계열만 읽는 매퍼나 분류가 없는 회사처럼 매퍼가 정의상 고르지 않는 행), 미해결 token 표본, 해석 전 매핑 행 전체의 숫자 flag 분포,
 시간 규칙별 null·상한 적용 수, 반복된 자연키, op 분포, 변하지 않은 행과 stale 행 수,
 head와 시점이 다르게 계산되는 변하지 않은 행 수(`time_drift`), delta의 flag 분포, 부분 응답 행이 있으면
 그 행 수 대조(`partition_row_count`), 계획한 marker를 담는다.
@@ -249,13 +249,16 @@ fixture와 독립 기대값으로 검증한다. 원천 행 해시, identity 해�
 revision 정체성, head 비교, flag는 매퍼가 아니라 승격 엔진(`storage/promotion/engine.py`)이 모든
 매퍼에 같게 적용한다.
 
-매퍼의 relation은 원천 행 위치와 해시를 그대로 넘기고, 행의 수집 시각(없으면 null), instrument
-도메인이면 identity token과 그 token을 해석할 시각, `instrument_id`를 뺀 도메인 열, 원천 값 그대로의
+매퍼의 relation은 원천 행 위치와 해시를 그대로 넘기고, 행의 수집 시각(없으면 null), identity key가
+있으면 그 token과 token을 해석할 시각, key가 해석하는 열(`instrument_id`, 분류는 `subject_id`)을 뺀
+도메인 열, 원천 값 그대로의
 숫자 열, 선언한 시간 입력 열, 원천 행 자체가 싣는 품질 flag의 불리언 열을 낸다. 매퍼는 원천 열 이름과
 허용 타입, 숫자 열의 원천 타입, identity assertion key(provider, namespace), 파티션 날짜(원천 열에서
 날짜를 내는 SQL 식), tombstone 범위가 쓰는 도메인 날짜 열, 행 flag를 선언한다. 행 flag는 그 행이 만든
 revision에 매퍼의 `name@major`를 규칙으로 해서 달리고 `detail`은 null이다. 필수 도메인 열이 빈 행은
 identity 해석과 무관하게 `refused_required`이므로, 모양이 잘못된 행이 미해결 행으로 조용히 빠지지 않는다.
+모든 행이 instrument를 가리키는 도메인의 매퍼는 identity key를 가진다. 분류의 주체는 원천이 주체의 영구
+anchor를 실을 때 매퍼가 그 anchor로 ID를 직접 발급하고 identity key를 갖지 않는다.
 매퍼는 pin한 원천의 commit manifest `metadata`에서 읽을 목록 이름 하나(`manifest_items`)를 선언할 수
 있다. 엔진은 원천마다 그 목록의 원소를 정규 JSON 텍스트 한 행으로 펼쳐 넘기고, 목록이 없는 원천은
 계획 거부로 보고한다. 엔진은 목록을 넘기기 전에 원천의 request hash를 manifest의 표와 `metadata`에서
@@ -321,6 +324,8 @@ ICU 시간대 자료로 푼 값이고, `timezone_version`은 그 자료를 가�
 시각이 그 날짜 안에서 개장이 먼저여야 하고 휴장 행은 둘 다 비어야 하며, 그 밖의 행은 `status`가 비어
 필수 열 누락으로 거부된다. 시간 입력은 `public_by` 하나다.
 
+분류 매퍼 `norgate.classification@1`, `sec.sic@1`, `kind.industry@1`은 [분류](#분류)가 소유한다.
+
 예정된 매퍼 목록: `norgate.prices_none`, `norgate.prices_adjusted`,
 `norgate.dividends`, `norgate.reference_series`,
 `fmp.actions`, `sec.submissions`, `sec.companyfacts`,
@@ -334,7 +339,8 @@ generation이 아니라 universe 문서를 만들며 [universe 등록](#universe
 instrument는 pin한 identity snapshot에서 매퍼의 assertion key와 token이 같고, 해석 시각이 유효
 구간 안이며, 아직 정정되지 않은(`known_to_us`가 null인) member로 해석한다. 해석되는 instrument가
 없거나(`unresolved`) 둘 이상인(`ambiguous`) 행은 승격하지 않고 수와 원천 token을 미해결 보고에
-남긴다. 티커·경로·날짜로 instrument ID를 만들지 않는다.
+남긴다. 분류 매퍼의 identity key는 같은 방법으로 `subject_id`를 해석한다. 티커·경로·날짜로
+instrument ID를 만들지 않는다.
 
 ### 거시와 FX 매퍼
 
@@ -667,6 +673,60 @@ KRX 토요일 session은 확인되지 않은 반일 마감 대신 평일 마감�
 비교한다. 거래일은 거래량이 있는 행 수가 앞뒤 30일 최대값의 5% 이상인 날짜이고, 보고는 선언 session 중
 거래가 없는 날짜(행 없음과 얇은 거래), 선언이 닫은 거래일, 거래 흔적 없이 행만 있는 휴장일 수다.
 
+## 분류
+
+분류는 주체(instrument 또는 issuer)가 공급자의 분류 체계에서 갖는 값이다. 코드는
+`storage/promotion/mappers/classifications.py`이고 `classifications`(v2) 도메인으로 승격한다.
+
+- 분류 원천은 모두 snapshot이다. 주체의 지금 분류만 말하고 그 분류가 언제 시작됐는지는 말하지 않는다.
+  그래서 행의 `effective_from`은 snapshot 날짜이고 `effective_to`는 null이며, 과거로 소급하지 않는다.
+  이후 snapshot은 자기 날짜의 행으로 다시 승격한다. 자연키에 `effective_from`이 들어가므로 같은
+  dataset의 다음 generation에서 ASSERT가 되고 앞의 행은 그대로 남는다. 읽는 쪽은 cutoff에 알려진 행
+  가운데 묻는 날짜 이하에서 `effective_from`이 가장 늦은 행을 고른다.
+- `scheme`은 공급자 분류 이름, `code`는 그 값, `label`은 공급자 원문이다. 체계 사이를 번역하지 않는다.
+- 주체 ID는 [identity 등록](#identity-등록과-chunked-문서)과 같은 발급 규칙을 따른다. 주체의 영구
+  anchor(Norgate asset ID, SEC CIK)를 싣는 원천은 매퍼가 SQL로 같은 `mint` 값을 계산하고 identity
+  snapshot을 pin하지 않는다. 코드만 싣는 원천(KRX 단축코드)은 identity key로 pin한 snapshot에서 해석한다.
+  티커·이름·날짜로 주체 ID를 만들지 않는다.
+- 필수 값이 없거나 형식이 틀린 행은 주체나 코드를 비워 필수 열 누락으로 거부되고, 고치지 않는다.
+  분류가 아예 없는 원천 행(SIC나 그 설명이 없는 SEC 회사, 업종이 빈 KIND 행)은 행을 내지 않고 보고의
+  `unselected_rows`에 남는다.
+- 시간 입력은 snapshot 날짜 `as_of`와, 원천이 기록하면 수집 시각 `observed_at`이다. 날짜만 있는
+  snapshot의 시점은 `local_day_end@1(as_of)`이므로 strict 읽기는 그 규칙을 grant한 소비자에게만 보이고,
+  수집 시각이 있는 snapshot은 `source_column@1(observed_at)`부터 알려진다. 어느 쪽이든 snapshot 전
+  cutoff의 읽기는 그 행을 돌려주지 않는다.
+- 파티션 날짜는 Norgate가 `first_date`, SEC가 `latest_filing_date`의 `YYYY-MM-DD` 텍스트이고, KIND가
+  수집 시각의 Asia/Seoul 날짜다. 파티션 날짜가 없는 행은 `partition`이 있는 명세에서 거부된다.
+
+| 매퍼 | 원천 | 행 |
+| --- | --- | --- |
+| `norgate.classification@1` | Norgate security master(`assetid`, `subtype1`..`subtype3`, `exchange`, `exchange_full`, 텍스트 `first_date`·`last_date`). 인자 `scheme`과 내보내기 날짜 `as_of` | instrument `mint('norgate_assetid', assetid)`. `norgate.security_type`: code는 유형 경로 `subtype1 > subtype2 > subtype3`(있는 단계만, 건너뛴 단계 없이), label은 가장 구체적인 단계. `norgate.exchange`: code는 `exchange`, label은 `exchange_full` |
+| `sec.sic@1` | `aas import sec-companies`가 SEC submissions archive에서 commit한 `companies` 테이블. 인자 `as_of`는 archive 수집 날짜 | issuer `mint('sec_cik', member의 10자리 CIK)`. code는 네 자리 SIC, label은 `sicDescription` |
+| `kind.industry@1` | `aas identity kr-import`가 commit한 KIND 상장 목록(`short_code`, `industry`, `retrieved_at_utc`). 인자 없음 | instrument는 identity key(`kind`, `krx_short_code`)를 수집 시각에 해석한 값. `as_of`는 그 수집 시각의 Asia/Seoul 날짜. KIND 업종은 코드가 없으므로 code와 label이 모두 업종 원문 |
+
+- Norgate: asset ID가 양의 정수(18자리 이하)가 아니거나 `first_date`·`last_date`가 `as_of`보다 늦은
+  행(선언한 내보내기 날짜와 모순)은 주체가 없고, 유형 단계가 비거나 건너뛴 행과 거래소 이름이 빈 행은
+  코드가 없다. 날짜로 읽을 수 없는 날짜 텍스트는 모순의 근거로 쓰지 않는다.
+- SEC: member 이름이 `CIK##########.json`이고 문서의 `cik`가 같은 CIK(0 채움 무시)를 말하며 최신
+  공시일(`latest_filing_date`)이 `as_of`보다 늦지 않을 때만 issuer가 나온다. 쪽 나눈 이력 member와
+  다른 CIK를 말하는 문서는 주체가 없다. 네 자리가 아닌 SIC는 코드가 없다. 설명 없이 SIC만 싣는 회사(미배정 `0000` 포함)는 분류가 없는 행이다.
+- KIND: `retrieved_at_utc`가 `Z`로 끝나는 UTC 시각이 아니면 수집 시각과 날짜가 없어 거부된다.
+  snapshot에서 해석되지 않는 단축코드는 다른 승격처럼 미해결 보고에 남는다.
+
+`aas import sec-companies --source SOURCE_ID [--plan]`은 `sec.submissions_zip@1`로 편입한
+`sec-submissions-zip-*` 내용 원천의 member 색인으로 `raw/`의 archive를 읽고, `CIK##########.json`
+member마다 한 행을 내용 원천 `sec-submissions-companies-*`(테이블 `companies`)로 commit한다. 원본 파일은
+같은 archive이므로 같은 bytes는 늘 같은 원천 ID가 되고 다시 실행하면 재사용한다. 공급자를 호출하지 않는다.
+
+- archive는 원천이 기록한 크기·SHA-256, member는 색인 행의 크기·SHA-256과 같아야 하며 다르면 거부한다.
+  UTF-8 JSON 객체가 아닌 CIK member는 archive가 색인과 다르다는 뜻이므로 편입 전체를 거부한다.
+- 행은 문서 값을 텍스트로 보존한다: `member`, `member_sha256`, 문서의 `cik`, `name`, `entityType`
+  (`entity_type`), `sic`, `sicDescription`(`sic_description`). 문자열은 그대로, 다른 JSON 값은 정규 JSON,
+  없는 키는 null이다. `latest_filing_date`는 `filings.recent.filingDate` 텍스트의 최댓값(문서가 나열한
+  가장 새 공시일)이고 없으면 null이다.
+- `--plan`은 모든 member를 읽어 member 수, CIK 문서 수, SIC가 있는 문서 수, 원천 ID와 commit 여부를
+  보고하고 아무것도 쓰지 않는다.
+
 ## 대상 dataset
 
 | dataset | 도메인·역할 | 원천과 규칙 |
@@ -687,7 +747,9 @@ KRX 토요일 session은 확인되지 않은 반일 마감 대신 평일 마감�
 | `macro.us.alfred` | `macro_observations` | ALFRED vintage(`fred.alfred@1`). vintage 구간마다 generation 하나, 정정은 SUPERSEDE. 두 시점은 `local_day_end@1(realtime_start)` |
 | `macro.kr.bok`, `macro.kr.oecd` | `macro_observations` | `bok.observations@1`, `oecd.observations@1`. vintage가 없어 두 시점은 `unknown_null@1` |
 | `fx.usdkrw.norgate`, `fx.usdkrw.fred` | `fx_rates` | `norgate.fx_closes@1`(source library 기준 시리즈, 동결, 2026-09-08까지) 또는 `norgate.fx_history@1`(legacy 내보내기 편입본), 시간대 `Etc/GMT+12`. `fred.fx_series@1`(DEXKOUS), 시간대 `America/New_York`, H.10 발표 지연 때문에 두 시점은 `unknown_null@1`. 우선순위는 소비자 pin |
-| `classifications.*` | `classifications`(v2) | Norgate 분류, SEC SIC, KIND 업종. known은 snapshot 시각이며 과거로 소급하지 않음 |
+| `classifications.us.norgate` | `classifications`(v2) | Norgate 증권 유형(`norgate.security_type`)과 상장 거래소(`norgate.exchange`). [분류](#분류) snapshot이며 과거로 소급하지 않음 |
+| `classifications.us.sec` | `classifications`(v2) | SEC SIC(`sec.sic`), issuer 주체 |
+| `classifications.kr.kind` | `classifications`(v2) | KIND 업종(`kind.industry`), 단축코드를 identity snapshot으로 해석 |
 
 identity 원천(Norgate master, SEC submissions, FMP profile, DART 고유번호, KIND 목록)은 typed generation이
 아니라 아래 [identity 등록](#identity-등록과-chunked-문서)으로 state에 들어간다. 지수 구성과 상장 universe도
@@ -1082,7 +1144,7 @@ pin(`observations`) 대신 canonical 가격 binding(`prices`: `aas-head-binding-
 - query는 연구 모드이고 시간 규칙 grant를 쓰지 않는다. 지식 상한은 선언의 `knowledge_time`이고 subject는
   `instrument_map`의 instrument ID, 역할은 `canonical`, 날짜는 이력·기간 시작 중 이른 날부터 둘의 끝 중
   늦은 날까지다. 그래서 패널은 pin한 chain이 그 instrument에 가진 첫 세션부터 시작한다.
-- 행은 `basis='unadjusted'`의 canonical bar여야 하고 통화는 선언 통화와 같아야 한다. `present`가 아닌
+- 행은 `basis='unadjusted'`, `interval='1d'`의 canonical bar여야 하고 통화는 선언 통화와 같아야 한다. `present`가 아닌
   bar와 공개 시점이 상한보다 늦은 head는 패널에 넣지 않으며 이전 값으로 대체하지 않는다. 같은
   instrument·세션의 bar가 둘이면 거부한다. 읽은 행이 없는 `instrument_map` 열쇠도 거부한다.
 - 한 bar가 자기 시가와 종가를 내므로 두 패널은 basis·조정·세션이 같다. 세션 순서는 bar의 `bar_end_us`로
@@ -1353,14 +1415,26 @@ state v2:
 | DV-180 | 두 원천이 실은 쌍은 한 사본이 다른 이유로 거부돼도 나머지 사본을 받지 않고 `pair_repeated`로 거부한다 | `tests/storage/test_universe.py::test_a_pair_two_sources_carry_is_refused_when_one_copy_is_refused` | 구현 |
 | DV-181 | 원천 순서가 맞아도 두 part에 걸친 같은 member key는 읽기와 verify에서 거부한다 | `tests/storage/test_universe.py::test_a_member_key_repeated_across_parts_is_refused` | 구현 |
 | DV-182 | 끝 날짜가 `9999-12-31`인 상장은 `listing_end_invalid`로 거부되고 `through`를 옮기지 않는다 | `tests/storage/test_universe.py::test_a_listing_ending_on_the_last_representable_date_is_refused` | 구현 |
-| DV-183 | 연구 모드의 지식 상한은 그보다 늦게 알려진 revision만 빼고 시점 없는 revision은 남기며, 설정했을 때만 query 문서에 들어간다 | `tests/storage/test_read_heads.py::test_research_known_ceiling_matches_snapshot_candidates` | 구현 |
-| DV-184 | canonical 가격 pin에서 유도한 연구 실행 패널은 같은 값의 관측 패널과 같은 날짜·시가·종가·판단을 낸다 | `tests/application/test_research_prices.py::test_the_price_route_matches_the_observation_route` | 구현 |
-| DV-185 | 가격 pin 연구 실행의 봉인 준비 문서는 그 읽기의 `aas-head-read-v1` 영수증과 해시를 싣는다 | `tests/application/test_research_prices.py::test_the_sealed_preparation_carries_the_head_read_receipt` | 구현 |
-| DV-186 | `krw_tick@1`로 승격한 `prices.kr.eodhd` chain의 KRW 실행은 원 단위 가격으로 같은 판단을 낸다 | `tests/application/test_research_prices.py::test_a_krw_run_over_a_promoted_chain_decides_like_the_usd_run` | 구현 |
-| DV-187 | 선언 지식 시점 뒤에 알려진 정정은 연구 패널에 들어가지 않는다 | `tests/application/test_research_prices.py::test_a_revision_received_after_the_knowledge_time_is_not_read` | 구현 |
-| DV-188 | 선언 통화와 다른 가격과 pin이 싣지 않은 instrument는 거부된다 | `tests/application/test_research_prices.py::test_a_price_run_refuses_what_the_pins_do_not_carry` | 구현 |
-| DV-189 | 선언은 패널 원천을 정확히 하나만 든다: 둘 다 든 선언, 관측 열쇠의 `instrument_map`, 이어지지 않는 pin은 거부된다 | `tests/application/test_research_prices.py::test_a_declaration_names_exactly_one_panel_source` | 구현 |
-| DV-190 | 패널 원천이 없는 선언은 거부된다 | `tests/application/test_research_prices.py::test_a_declaration_with_neither_panel_source_is_refused` | 구현 |
-| DV-191 | `present`가 아닌 bar와 공개 시점이 상한보다 늦은 head는 패널에서 빠지고 그 세션은 다른 값으로 채워지지 않는다 | `tests/application/test_research_prices.py::test_a_skipped_bar_leaves_its_session_empty_and_is_not_filled` | 구현 |
-| DV-192 | canonical unadjusted가 아닌 행과 같은 instrument·세션의 두 번째 bar는 거부된다 | `tests/application/test_research_prices.py::test_a_price_panel_refuses_rows_it_cannot_read_as_one_bar_per_session` | 구현 |
-| DV-193 | 가격 pin 선언은 sleeve와 composition 모두 `aas run research`로 기록되고 `aas run rerun --declaration`이 준비와 결과를 재현한다 | `tests/application/test_research_prices.py::test_a_priced_run_is_recorded_and_reproduces_from_its_declaration` | 구현 |
+| DV-183 | `norgate.classification@1`은 asset ID로 instrument를 발급하고 유형 경로·거래소를 옮기며, 비정규 asset ID·`as_of` 뒤 날짜·빈 단계는 주체나 코드를 비운다 | `tests/storage/test_classifications.py::test_norgate_classification_maps_synthetic_fixture` | 구현 |
+| DV-184 | `sec.sic@1`은 member와 문서가 같은 CIK를 말할 때만 issuer를 발급하고 SIC나 그 설명이 없는 회사는 행을 내지 않는다 | `tests/storage/test_classifications.py::test_sec_sic_maps_synthetic_fixture` | 구현 |
+| DV-185 | `kind.industry@1`은 단축코드를 수집 시각에 해석할 token으로 내고 `effective_from`은 그 시각의 Asia/Seoul 날짜다 | `tests/storage/test_classifications.py::test_kind_industry_maps_synthetic_fixture` | 구현 |
+| DV-186 | 영구 anchor로 발급하는 분류 매퍼는 identity snapshot을 pin하지 않고 identity key가 있는 매퍼는 pin한다 | `tests/storage/test_classifications.py::test_classification_subjects_resolve_or_mint` | 구현 |
+| DV-187 | 분류 snapshot은 snapshot 전 cutoff에서 반환되지 않고 날짜 규칙 시점은 grant한 strict 읽기에만 보인다 | `tests/storage/test_classifications.py::test_classifications_are_not_returned_before_the_snapshot` | 구현 |
+| DV-188 | 이후 snapshot은 자기 날짜의 행을 더하고 앞의 행을 바꾸지 않으며 같은 snapshot의 재승격은 빈 delta다 | `tests/storage/test_classifications.py::test_a_later_snapshot_adds_rows_of_its_own_date` | 구현 |
+| DV-189 | 선언한 `as_of`보다 늦은 날짜를 싣는 snapshot 행은 승격을 거부한다 | `tests/storage/test_classifications.py::test_snapshot_rows_dated_after_as_of_refuse_the_promotion` | 구현 |
+| DV-190 | KIND 업종은 단축코드를 pin한 snapshot으로 해석하고 수집 시각 전에는 보이지 않는다 | `tests/storage/test_classifications.py::test_kind_industries_resolve_short_codes_through_the_snapshot` | 구현 |
+| DV-191 | `import sec-companies`는 CIK member마다 문서 값을 텍스트로 commit하고 다시 실행하면 재사용하며, SIC나 그 설명이 없는 회사는 `unselected_rows`로 보고된다 | `tests/storage/test_classifications.py::test_sec_companies_import_and_promote_sic` | 구현 |
+| DV-192 | `import sec-companies --plan`은 쓰지 않고 실행은 같은 원천 ID를 commit한다 | `tests/storage/test_classifications.py::test_sec_companies_cli_plans_and_imports` | 구현 |
+| DV-193 | `partition`이 있는 분류 명세는 파티션 날짜가 없는 Norgate 행을 거부한다 | `tests/storage/test_classifications.py::test_a_partitioned_plan_refuses_undated_norgate_rows` | 구현 |
+| DV-194 | UTF-8 JSON 객체가 아닌 CIK member는 `import sec-companies` 전체를 거부하고 아무것도 commit하지 않는다 | `tests/storage/test_classifications.py::test_sec_companies_refuse_a_member_that_is_not_a_json_object` | 구현 |
+| DV-195 | 연구 모드의 지식 상한은 그보다 늦게 알려진 revision만 빼고 시점 없는 revision은 남기며, 설정했을 때만 query 문서에 들어간다 | `tests/storage/test_read_heads.py::test_research_known_ceiling_matches_snapshot_candidates` | 구현 |
+| DV-196 | canonical 가격 pin에서 유도한 연구 실행 패널은 같은 값의 관측 패널과 같은 날짜·시가·종가·판단을 낸다 | `tests/application/test_research_prices.py::test_the_price_route_matches_the_observation_route` | 구현 |
+| DV-197 | 가격 pin 연구 실행의 봉인 준비 문서는 그 읽기의 `aas-head-read-v1` 영수증과 해시를 싣는다 | `tests/application/test_research_prices.py::test_the_sealed_preparation_carries_the_head_read_receipt` | 구현 |
+| DV-198 | `krw_tick@1`로 승격한 `prices.kr.eodhd` chain의 KRW 실행은 원 단위 가격으로 같은 판단을 낸다 | `tests/application/test_research_prices.py::test_a_krw_run_over_a_promoted_chain_decides_like_the_usd_run` | 구현 |
+| DV-199 | 선언 지식 시점 뒤에 알려진 정정은 연구 패널에 들어가지 않는다 | `tests/application/test_research_prices.py::test_a_revision_received_after_the_knowledge_time_is_not_read` | 구현 |
+| DV-200 | 선언 통화와 다른 가격과 pin이 싣지 않은 instrument는 거부된다 | `tests/application/test_research_prices.py::test_a_price_run_refuses_what_the_pins_do_not_carry` | 구현 |
+| DV-201 | 선언은 패널 원천을 정확히 하나만 든다: 둘 다 든 선언, 관측 열쇠의 `instrument_map`, 이어지지 않는 pin은 거부된다 | `tests/application/test_research_prices.py::test_a_declaration_names_exactly_one_panel_source` | 구현 |
+| DV-202 | 패널 원천이 없는 선언은 거부된다 | `tests/application/test_research_prices.py::test_a_declaration_with_neither_panel_source_is_refused` | 구현 |
+| DV-203 | `present`가 아닌 bar와 공개 시점이 상한보다 늦은 head는 패널에서 빠지고 그 세션은 다른 값으로 채워지지 않는다 | `tests/application/test_research_prices.py::test_a_skipped_bar_leaves_its_session_empty_and_is_not_filled` | 구현 |
+| DV-204 | canonical unadjusted가 아닌 행, `1d`가 아닌 bar, 같은 instrument·세션의 두 번째 bar는 거부된다 | `tests/application/test_research_prices.py::test_a_price_panel_refuses_rows_it_cannot_read_as_one_daily_bar_per_session` | 구현 |
+| DV-205 | 가격 pin 선언은 sleeve와 composition 모두 `aas run research`로 기록되고 `aas run rerun --declaration`이 준비와 결과를 재현한다 | `tests/application/test_research_prices.py::test_a_priced_run_is_recorded_and_reproduces_from_its_declaration` | 구현 |

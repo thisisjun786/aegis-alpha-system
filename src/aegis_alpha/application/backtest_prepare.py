@@ -1410,6 +1410,9 @@ _MINIMUM_RESEARCH_SESSIONS = 2
 RESEARCH_SOURCE_MODULES = (
     "aegis_alpha.application.backtest_prepare",
     "aegis_alpha.application.research_run",
+    # The price route selects its bars here, so a change to that selection is a change
+    # to what a price-pinned run decides on.
+    "aegis_alpha.storage.read_heads",
 )
 # What this installation can actually carry out. The engine contract evaluates at the
 # prior calendar month end and the accounting fills at the next supplied session open,
@@ -1638,6 +1641,10 @@ def _price_panels(
         seen.add(name)
         if (row["basis"], row["price_role"]) != ("unadjusted", "canonical"):
             raise ValueError("a price-pinned research run reads only canonical unadjusted bars")
+        if row["interval"] != "1d":
+            # The panels are session panels: any other bar would stand in for a session's
+            # open and close, or meet the daily bar of its session as a repeat.
+            raise ValueError("a price-pinned research run reads only daily bars")
         if _text(row["currency"]) != declaration.conventions.currency:
             raise ValueError("price currency is not the declared account currency")
         if row["value_state"] != "present":

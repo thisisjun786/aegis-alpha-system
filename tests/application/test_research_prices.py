@@ -444,11 +444,15 @@ def test_a_skipped_bar_leaves_its_session_empty_and_is_not_filled(
             lambda rows: _changed(rows, "REF_X", DAYS[6], basis="total_return"),
             "reads only canonical unadjusted bars",
         ),
+        (
+            lambda rows: _changed(rows, "REF_X", DAYS[6], interval="1h"),
+            "reads only daily bars",
+        ),
         (lambda rows: [*rows, rows[-1]], "price panel repeats one session"),
     ],
-    ids=["reference-role", "adjusted-basis", "repeated-session"],
+    ids=["reference-role", "adjusted-basis", "intraday-bar", "repeated-session"],
 )
-def test_a_price_panel_refuses_rows_it_cannot_read_as_one_bar_per_session(
+def test_a_price_panel_refuses_rows_it_cannot_read_as_one_daily_bar_per_session(
     installation: tuple[Path, Document, Document],
     monkeypatch: pytest.MonkeyPatch,
     rewrite: Callable[[list[HeadRow]], list[HeadRow]],

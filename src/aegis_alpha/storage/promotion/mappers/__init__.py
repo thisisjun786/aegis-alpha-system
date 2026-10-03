@@ -12,12 +12,17 @@ prefixes it reads, so a spec cannot promote one provider's rows into another's d
 
 - ``_aas_pin``, ``_aas_ordinal``, ``_aas_row_hash`` passed through unchanged;
 - ``_aas_ingested_at_us`` (BIGINT, NULL when the source row has no collection time);
-- ``_aas_id_token`` (VARCHAR) and ``_aas_id_at_us`` (BIGINT) when the domain names an
-  instrument: the identity key token and the instant at which it is resolved;
-- every domain column except ``instrument_id`` (and ``fields`` when the mapper emits it),
-  with each numeric column left as its raw source value for the spec's decimal rule;
+- ``_aas_id_token`` (VARCHAR) and ``_aas_id_at_us`` (BIGINT) when the mapper has an
+  identity key: the key's token and the instant at which it is resolved;
+- every domain column except the one the identity key resolves (``instrument_id``, or a
+  classification's ``subject_id``) and ``fields`` when the mapper emits it, with each
+  numeric column left as its raw source value for the spec's decimal rule;
 - one ``_aas_t_<name>`` column per time input the mapper declares;
 - one BOOLEAN column per row flag the mapper declares (``row_flags``).
+
+A domain whose rows always name an instrument needs a mapper with an identity key. A
+classification's subject may instead come from a source that carries the subject's
+permanent anchor; that mapper mints the ID itself and has no identity key.
 
 A mapper that declares ``manifest_items`` may also read ``MANIFEST_ITEMS``: one row
 ``(_aas_pin INTEGER, item VARCHAR)`` per element of that list in each pinned source's
@@ -115,8 +120,22 @@ class Mapper(Protocol):
     def select(self, source: str, args: Mapping[str, object]) -> str: ...
 
 
+# The domain column an identity key resolves into when it is not ``instrument_id``.
+_RESOLVED: Final = {"classifications": "subject_id"}
+
+
+def resolved_column(domain: str) -> str:
+    """The column of ``domain`` that a mapper's identity key resolves through the snapshot."""
+    return _RESOLVED.get(domain, "instrument_id")
+
+
 def _registry() -> dict[str, Mapper]:
     from aegis_alpha.storage.promotion.mappers.calendar import CalendarDeclared  # noqa: PLC0415
+    from aegis_alpha.storage.promotion.mappers.classifications import (  # noqa: PLC0415
+        KindIndustry,
+        NorgateClassification,
+        SecSic,
+    )
     from aegis_alpha.storage.promotion.mappers.eodhd import (  # noqa: PLC0415 -- registry
         EodhdBars,
         EodhdBarsAdjusted,
@@ -145,6 +164,9 @@ def _registry() -> dict[str, Mapper]:
         norgate_fx_history(),
         KoreaObservations("bok"),
         KoreaObservations("oecd"),
+        KindIndustry(),
+        NorgateClassification(),
+        SecSic(),
     )
     return {f"{mapper.name}@{mapper.major}": mapper for mapper in mappers}
 

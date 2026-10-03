@@ -42,7 +42,7 @@ from aegis_alpha.storage.market_inputs import GenerationPin
 from aegis_alpha.storage.market_schema import COMMON, DOMAINS
 from aegis_alpha.storage.membership_pins import IdentityPin
 from aegis_alpha.storage.promotion import decimal_rules
-from aegis_alpha.storage.promotion.mappers import Mapper, mapper
+from aegis_alpha.storage.promotion.mappers import Mapper, mapper, resolved_column
 from aegis_alpha.storage.promotion.time_rules import TIME_COLUMNS, TimeRule, parse_rule
 from aegis_alpha.storage.source_reader import SourcePin
 
@@ -291,10 +291,21 @@ def _mapper(value: object, domain: str) -> tuple[str, Mapper, dict[str, object]]
 
 
 def _identity(
-    value: object, found: Mapper, args: Mapping[str, object], *, instruments: bool
+    value: object, found: Mapper, args: Mapping[str, object], *, required: bool, resolvable: bool
 ) -> IdentityPin | None:
-    if instruments != (value is not None) or instruments != (found.identity(args) is not None):
-        raise ValueError("an instrument domain pins an identity snapshot; others pin none")
+    """The snapshot pin of a mapper with an identity key; a mapper without one pins none.
+
+    ``required``: every row of the domain names an instrument, so its mapper resolves one.
+    ``resolvable``: the domain has a column an identity key can resolve into.
+    """
+    resolves = found.identity(args) is not None
+    if resolves != (value is not None) or (required and not resolves):
+        raise ValueError(
+            "an instrument domain pins an identity snapshot; a mapper that resolves no "
+            "subject pins none"
+        )
+    if resolves and not resolvable:
+        raise ValueError(f"domain {found.domain} has no column an identity key resolves")
     if value is None:
         return None
     item = _object(value, {"snapshot_id", "content_hash"}, "identity_snapshot")
@@ -346,7 +357,13 @@ def parse_spec(raw: bytes, sha256: str) -> PromotionSpec:
         conversions[column] = decimal_rules.check_column(
             _text(name, "decimal rule"), column, numeric[column], domain=domain
         )
-    pin = _identity(body["identity_snapshot"], found, args, instruments="instrument_id" in kinds)
+    pin = _identity(
+        body["identity_snapshot"],
+        found,
+        args,
+        required="instrument_id" in kinds,
+        resolvable=resolved_column(domain) in kinds,
+    )
     return PromotionSpec(
         raw=raw,
         sha256=sha256,
