@@ -32,6 +32,9 @@ def test_eodhd_bars_maps_synthetic_fixture() -> None:
         "norgate.fx_history@1",
         "bok.observations@1",
         "oecd.observations@1",
+        "kind.industry@1",
+        "norgate.classification@1",
+        "sec.sic@1",
     }
     args = {"timezone": "Asia/Seoul"}
     bars.check_args(args)
