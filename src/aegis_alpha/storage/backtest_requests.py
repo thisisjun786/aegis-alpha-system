@@ -2,8 +2,9 @@
 
 Two root shapes are stored here, and the store never converts one into the other. An
 aas-backtest-request-v1 describes an executable run and keeps every refusal the engine
-puts on it. An aas-research-run-v1 describes a declared uncertified research run over
-reference observations, which no executable request can describe. Both are held to the
+puts on it. A declared research run describes an uncertified research run over reference
+observations or canonical price pins read in research mode, which no executable request
+can describe. Both are held to the
 same content identity: exactly canonical bytes, a hash over those bytes, and bindings
 that agree with the bundle the request is registered against.
 """
@@ -93,6 +94,12 @@ _RESEARCH_ROOT = frozenset(
 # strategy, so it names neither a root strategy nor a root membership. Derived from the
 # sleeve root the way the contract derives it, which keeps one mirror rather than two.
 _COMPOSITION_ROOT = (_RESEARCH_ROOT - {"strategy", "membership"}) | {"composition"}
+# A declaration reads its panels from pinned observations or from canonical price pins,
+# named by the one key it carries; each root has one variant per panel source.
+_PRICE_ROOTS = (
+    (_RESEARCH_ROOT - {"observations"}) | {"prices"},
+    (_COMPOSITION_ROOT - {"observations"}) | {"prices"},
+)
 
 
 def request_schema(body: dict[str, object]) -> str:
@@ -106,13 +113,13 @@ def request_schema(body: dict[str, object]) -> str:
         if body["schema"] != BACKTEST_REQUEST_SCHEMA or body["hash_format"] != HASH_FORMAT:
             raise ValueError("invalid backtest request root/schema")
         return BACKTEST_REQUEST_SCHEMA
-    if body.keys() == _RESEARCH_ROOT:
+    if body.keys() in (_RESEARCH_ROOT, _PRICE_ROOTS[0]):
         if body["schema_version"] != RESEARCH_REQUEST_SCHEMA:
             raise ValueError("invalid research run root/schema")
         if body["execution_mode"] != RESEARCH_EXECUTION_MODE:
             raise ValueError("a stored research run must declare " + RESEARCH_EXECUTION_MODE)
         return RESEARCH_REQUEST_SCHEMA
-    if body.keys() == _COMPOSITION_ROOT:
+    if body.keys() in (_COMPOSITION_ROOT, _PRICE_ROOTS[1]):
         if body["schema_version"] != COMPOSITION_REQUEST_SCHEMA:
             raise ValueError("invalid research composition root/schema")
         if body["execution_mode"] != RESEARCH_EXECUTION_MODE:

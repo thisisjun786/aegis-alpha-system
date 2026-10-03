@@ -105,6 +105,11 @@ identity·universe·입력 묶음 문서를 불변으로 등록·재해시하고
 선언은 같은 run을 가리키고, 복원한 설치본에서 바이트 단위로 재현된다. 월별 기준 실행은
 `fill-next-session-open-v1` 을 이름으로 선언하고 일별 기준 실행은 체결 시점을 미해결로
 남긴다. 어느 쪽도 원본 동치를 주장하지 않으며 봉인 문서의 `source_parity` 는 `unknown` 이다.
+선언은 패널 원천으로 관측 pin(`observations`) 대신 canonical 가격 binding(`prices`)을 들 수 있다.
+그때 open·close 패널은 `read_heads`의 연구 모드 읽기 한 번에서 같은 비조정 bar의 시가와 종가로
+나오고, 봉인 문서는 그 읽기 영수증(`aas-head-read-v1`)을 그대로 싣는다. 그래서 KRW 실행은
+승격한 `prices.kr.eodhd` chain을 그 instrument의 첫 세션부터 읽는다
+([데이터 수직 계약](design/data-vertical.md#연구-실행의-canonical-가격-패널)).
 정식 run 기록은 run add-on 버전에 달려 있다. `run_details` 의 `request_schema` 는 명시적 허용
 목록이고 v1은 `aas-backtest-request-v1` 하나만 담았으므로, 선언된 연구 실행을 기록하려면
 `aas db run-migrate` 가 설치본을 먼저 넓힌다. 그 명령은 백업·내구 의도·한 트랜잭션짜리 리빌드·

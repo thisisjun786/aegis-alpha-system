@@ -1099,7 +1099,10 @@ Norgate security master 하나에서 모두 나온다.
     "pins": [{"dataset_id", "version", "generation_id", "chain_hash", "manifest_hash", "from", "to"}],
     "granted_rules", "excluded_flags"}`(목록은 정렬)의 SHA-256이 binding hash다.
   - query(`HeadQuery`)는 cutoff, 수집 cutoff, subject 목록, 날짜 구간, 가격 역할, coverage 격자다.
-    cutoff가 있으면 strict PIT, 없으면 연구 모드다. subject는 도메인의 주체 열(가격은
+    cutoff가 있으면 strict PIT, 없으면 연구 모드다. 연구 모드의 query는 지식 상한(`known_ceiling_us`)을
+    가질 수 있고, 그러면 `revision_known_at_us`가 상한보다 늦은 revision은 투영 전에 빠지고 그 시점이
+    없는 revision은 남는다(관측 연구 패널의 `_Visibility.candidates`와 같다). 상한은 설정했을 때만
+    query 문서에 들어가므로 상한 없는 읽기의 영수증 바이트는 그대로다. subject는 도메인의 주체 열(가격은
     `instrument_id`, 달력은 `calendar_id`, 재무·공시는 `issuer_id`, 거시는 `series_id`, FX는
     `base/quote`, 분류는 `subject_id`), 날짜는 도메인의 날짜 열(가격·달력은 `session_date`, 기업행동은
     `effective_date`, 재무는 `period_end`, 공시는 `filed_date`, `*_us` 열은 UTC 날짜)이다.
@@ -1130,6 +1133,29 @@ Norgate security master 하나에서 모두 나온다.
     휴장 session은 `session_closed`다. 격자의 칸은 결과 행과 함께 fetch 전 할당 검사에 포함된다.
 - 분할조정·총수익 가격은 reader가 unadjusted 가격과 cutoff 시점까지 알려진 `corporate_actions`로
   계산한다. 공급자 조정 가격은 reference로만 남는다.
+
+### 연구 실행의 canonical 가격 패널
+
+선언한 미인증 연구 실행(`aas-research-run-v2`, `aas-research-composition-v1`)은 패널 원천으로 보존 관측
+pin(`observations`) 대신 canonical 가격 binding(`prices`: `aas-head-binding-v1`의 pin과 cutover, flag 제외
+목록)을 들 수 있다. 선언 최상위에는 둘 중 정확히 하나만 있다. `backtest_prepare._price_panels`가
+`market_inputs.load_pinned_heads`로 그 binding을 한 번 읽어 open과 close 패널을 함께 만든다.
+
+- query는 연구 모드이고 시간 규칙 grant를 쓰지 않는다. 지식 상한은 선언의 `knowledge_time`이고 subject는
+  `instrument_map`의 instrument ID, 역할은 `canonical`, 날짜는 이력·기간 시작 중 이른 날부터 둘의 끝 중
+  늦은 날까지다. 그래서 패널은 pin한 chain이 그 instrument에 가진 첫 세션부터 시작한다.
+- 행은 `basis='unadjusted'`, `interval='1d'`의 canonical bar여야 하고 통화는 선언 통화와 같아야 한다. `present`가 아닌
+  bar와 공개 시점이 상한보다 늦은 head는 패널에 넣지 않으며 이전 값으로 대체하지 않는다. 같은
+  instrument·세션의 bar가 둘이면 거부한다. 읽은 행이 없는 `instrument_map` 열쇠도 거부한다.
+- 한 bar가 자기 시가와 종가를 내므로 두 패널은 basis·조정·세션이 같다. 세션 순서는 bar의 `bar_end_us`로
+  정하며 이것은 지식 시점이 아니라 bar의 경제 시점이다. 일정은 관측 경로와 같은 날짜 기반 월말 판단이다.
+- 읽기는 `read_heads`의 기본값대로 구조만 확인한다(`rehash=False`): pin·chain link·행 수는 확인하고 delta
+  행 값은 다시 해시하지 않으며 영수증의 `rehashed`가 거짓으로 이를 기록한다. 관측 경로는 보존 관측 내용을
+  다시 확인하므로 두 경로의 내용 확인 범위는 다르다. 행 값 확인은 `aas db verify`의 몫이다.
+- 자산 유형은 상태 저장소의 instrument 분류에서 온다(`etf` → `ETF`). 관측 경로의 `OBSERVATION`과 다르다.
+- 봉인 준비 문서는 `observations` 대신 `prices`에 `binding_hash`, 읽기 영수증 `head_read`
+  (`aas-head-read-v1` 전체)와 그 SHA-256을 싣는다. `resolved_calendar.observed_calendar_ref`는 binding
+  hash를 가리킨다. 실행은 여전히 `research-uncertified`이며 엄격 경로의 승인(DV-81)은 다루지 않는다.
 
 ## 스키마 v2
 
@@ -1401,3 +1427,14 @@ state v2:
 | DV-192 | `import sec-companies --plan`은 쓰지 않고 실행은 같은 원천 ID를 commit한다 | `tests/storage/test_classifications.py::test_sec_companies_cli_plans_and_imports` | 구현 |
 | DV-193 | `partition`이 있는 분류 명세는 파티션 날짜가 없는 Norgate 행을 거부한다 | `tests/storage/test_classifications.py::test_a_partitioned_plan_refuses_undated_norgate_rows` | 구현 |
 | DV-194 | UTF-8 JSON 객체가 아닌 CIK member는 `import sec-companies` 전체를 거부하고 아무것도 commit하지 않는다 | `tests/storage/test_classifications.py::test_sec_companies_refuse_a_member_that_is_not_a_json_object` | 구현 |
+| DV-195 | 연구 모드의 지식 상한은 그보다 늦게 알려진 revision만 빼고 시점 없는 revision은 남기며, 설정했을 때만 query 문서에 들어간다 | `tests/storage/test_read_heads.py::test_research_known_ceiling_matches_snapshot_candidates` | 구현 |
+| DV-196 | canonical 가격 pin에서 유도한 연구 실행 패널은 같은 값의 관측 패널과 같은 날짜·시가·종가·판단을 낸다 | `tests/application/test_research_prices.py::test_the_price_route_matches_the_observation_route` | 구현 |
+| DV-197 | 가격 pin 연구 실행의 봉인 준비 문서는 그 읽기의 `aas-head-read-v1` 영수증과 해시를 싣는다 | `tests/application/test_research_prices.py::test_the_sealed_preparation_carries_the_head_read_receipt` | 구현 |
+| DV-198 | `krw_tick@1`로 승격한 `prices.kr.eodhd` chain의 KRW 실행은 원 단위 가격으로 같은 판단을 낸다 | `tests/application/test_research_prices.py::test_a_krw_run_over_a_promoted_chain_decides_like_the_usd_run` | 구현 |
+| DV-199 | 선언 지식 시점 뒤에 알려진 정정은 연구 패널에 들어가지 않는다 | `tests/application/test_research_prices.py::test_a_revision_received_after_the_knowledge_time_is_not_read` | 구현 |
+| DV-200 | 선언 통화와 다른 가격과 pin이 싣지 않은 instrument는 거부된다 | `tests/application/test_research_prices.py::test_a_price_run_refuses_what_the_pins_do_not_carry` | 구현 |
+| DV-201 | 선언은 패널 원천을 정확히 하나만 든다: 둘 다 든 선언, 관측 열쇠의 `instrument_map`, 이어지지 않는 pin은 거부된다 | `tests/application/test_research_prices.py::test_a_declaration_names_exactly_one_panel_source` | 구현 |
+| DV-202 | 패널 원천이 없는 선언은 거부된다 | `tests/application/test_research_prices.py::test_a_declaration_with_neither_panel_source_is_refused` | 구현 |
+| DV-203 | `present`가 아닌 bar와 공개 시점이 상한보다 늦은 head는 패널에서 빠지고 그 세션은 다른 값으로 채워지지 않는다 | `tests/application/test_research_prices.py::test_a_skipped_bar_leaves_its_session_empty_and_is_not_filled` | 구현 |
+| DV-204 | canonical unadjusted가 아닌 행, `1d`가 아닌 bar, 같은 instrument·세션의 두 번째 bar는 거부된다 | `tests/application/test_research_prices.py::test_a_price_panel_refuses_rows_it_cannot_read_as_one_daily_bar_per_session` | 구현 |
+| DV-205 | 가격 pin 선언은 sleeve와 composition 모두 `aas run research`로 기록되고 `aas run rerun --declaration`이 준비와 결과를 재현한다 | `tests/application/test_research_prices.py::test_a_priced_run_is_recorded_and_reproduces_from_its_declaration` | 구현 |

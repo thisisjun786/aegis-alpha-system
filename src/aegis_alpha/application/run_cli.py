@@ -70,7 +70,7 @@ def _research_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) 
     """
     research = sub.add_parser(
         "research",
-        help="Record one declared UNCERTIFIED research run over pinned observations",
+        help="Record one declared UNCERTIFIED research run over observations or price pins",
     )
     home_option(research)
     research.add_argument(

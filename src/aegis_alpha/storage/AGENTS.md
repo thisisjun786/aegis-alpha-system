@@ -321,7 +321,11 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   it does name. Observation panels cannot be bound, because there is no role for reference
   observations and adding one would put adjusted reference data in the namespace the
   executable price roles use; a calendar cannot be bound either, because it is a declared
-  name over the panel's own dates rather than a published generation. An
+  name over the panel's own dates rather than a published generation. A declaration that
+  reads canonical price pins (its root carries `prices` in place of `observations`; each
+  research root has exactly those two variants) binds no price either: the binding vocabulary
+  has no research price role, and the declaration hash plus the sealed `aas-head-read-v1`
+  receipt cover those pins. An
   `aas-research-run-v2` bundle is therefore required to be exactly the membership it pins.
   An `aas-research-composition-v1` pins one membership per sleeve while the vocabulary
   holds a single membership, so binding one of the two would leave `bundle_id` describing
