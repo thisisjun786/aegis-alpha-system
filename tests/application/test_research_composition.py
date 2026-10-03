@@ -12,7 +12,6 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from datetime import date
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, cast
 
@@ -42,8 +41,10 @@ from aegis_alpha.engine import (
 from aegis_alpha.storage.input_pins import register_definition
 from aegis_alpha.storage.strategy_import import register_strategy
 from aegis_alpha.storage.workspace import initialize, open_workspace
-from tests.application.test_backtest_prepare import BUDGET, DAYS, micros, stored_request
+from tests.application.installation_template import copy_template
+from tests.application.test_backtest_prepare import BUDGET, DAYS, stored_request
 from tests.application.test_research_execution import (
+    CLOCK_NS,
     _declaration,
     _panel,
     _prepared,
@@ -185,29 +186,38 @@ def _register(workspace: object, root: Path, name: str, raw: bytes, member: Docu
     }
 
 
-@pytest.fixture
-def composed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> tuple[Path, Document, Document, Document]:
+def _build_composed(root: Path) -> list[Document]:
     """One installation carrying an observation panel and two registered sleeves."""
-    monkeypatch.setattr(time, "time_ns", lambda: micros(date(2026, 6, 1)) * 1000)
-    home = tmp_path / "home"
+    home = root / "home"
     _ = initialize(home)
     offense_raw, offense_member = _bundle("syn-offense", ["ASSET_B", "REF_X"], [CANARY])
     # The defensive sleeve holds a different asset, so a switched decision is visible in
     # the targets rather than only in the record of which sleeve ran.
     defense_raw, defense_member = _bundle("syn-defense", ["REF_X"], [])
     with open_workspace(home, writable=True, strategy_write=True) as workspace:
-        body = stored_request(workspace, tmp_path)
-        close = _panel(workspace, tmp_path, "obs-close", "close")
-        opening = _panel(workspace, tmp_path, "obs-open", "open")
-        offense = _register(workspace, tmp_path, "syn-offense", offense_raw, offense_member)
-        defense = _register(workspace, tmp_path, "syn-defense", defense_raw, defense_member)
+        body = stored_request(workspace, root)
+        close = _panel(workspace, root, "obs-close", "close")
+        opening = _panel(workspace, root, "obs-open", "open")
+        offense = _register(workspace, root, "syn-offense", offense_raw, offense_member)
+        defense = _register(workspace, root, "syn-defense", defense_raw, defense_member)
         workspace.state.commit()
         assert workspace.strategies is not None
         workspace.strategies.commit()
         _ = workspace.market.execute("CHECKPOINT")
-    return home, _wide(_declaration(body, close, opening)), offense, defense
+    return [_wide(_declaration(body, close, opening)), offense, defense]
+
+
+@pytest.fixture
+def composed(
+    tmp_path_factory: pytest.TempPathFactory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Document, Document, Document]:
+    """A private copy of the composed installation, built once per process."""
+    # The test body keeps the clock a fresh build pinned for it.
+    monkeypatch.setattr(time, "time_ns", lambda: CLOCK_NS)
+    base, offense, defense = copy_template(
+        "research-composed", tmp_path_factory, tmp_path, CLOCK_NS, _build_composed
+    )
+    return tmp_path / "home", base, offense, defense
 
 
 def _wide(base: Document) -> Document:
