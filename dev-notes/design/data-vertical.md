@@ -774,7 +774,11 @@ EDGAR는 날짜로만 받은 공시(전자 접수 이전 공시 등)의 접수 �
 그 시각은 실제 접수보다 이를 수 있으므로 매퍼는 `filingDate`의 New York 현지 0시와 같은 접수 시각을 null로
 둔다. 그런 공시의 시점은 알 수 없음이고 공시일로 채우지 않는다. 시간 입력은 접수 시각 `accepted_at`
 (`source_column@1`)과 `filed_date`이고 명세 파티션은 `filingDate`로 원천 행을 고른다. `filingDate`가
-날짜 표기가 아닌 행은 어느 파티션에도 들지 않으므로 파티션 명세가 거부한다. 행에 수집 시각이
+날짜 표기가 아닌 행은 어느 파티션에도 들지 않으므로 파티션 명세가 거부한다.
+
+SEC는 일부 공시를 두 번 나열한다(제출자의 최근 공시와 이전 쪽, 또는 두 쪽). CIK, accession, 공시일·보고일,
+접수 시각, 양식이 모두 같은 행은 한 나열이므로 원천 순서의 첫 행만 읽고 나머지는 원천에 남는다. 같은
+accession이라도 그 값 중 하나라도 다른 행은 모두 매핑되어 겹치는 자연키가 승격을 거부한다. 행에 수집 시각이
 없으므로 수집 시각은 원천의 `sl:` 연결 시각이다.
 
 `sec.companyfacts@1`은 SEC companyfacts의 사실 테이블(사실마다 `cik`, `taxonomy`, `tag`, `unit`,
@@ -1502,3 +1506,4 @@ state v2:
 | DV-204 | 매퍼 참조는 참조 도메인의 dataset generation만 pin할 수 있다 | `tests/storage/test_sec_promotion.py::test_a_filings_reference_must_pin_a_filings_generation` | 구현 |
 | DV-205 | `aas-dimensions-v1` 형식은 고정 입력과 기대 값으로 고정돼 있고 SQL 계산이 Python과 같다 | `tests/storage/test_promotion_formats.py::test_dimensions_hash_format_is_frozen` | 구현 |
 | DV-206 | SQL의 JSON 문자열 표기는 모든 code point에서 `json.dumps`와 같다 | `tests/storage/test_promotion_formats.py::test_json_string_sql_matches_json_dumps` | 구현 |
+| DV-207 | SEC가 두 번 나열한 같은 공시는 한 번 읽히고, 값이 다른 같은 accession의 행은 둘 다 매핑되어 승격을 거부한다 | `tests/storage/test_sec_promotion.py::test_a_repeated_listing_is_read_once` | 구현 |

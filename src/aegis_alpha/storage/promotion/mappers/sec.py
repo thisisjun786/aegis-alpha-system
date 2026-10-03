@@ -17,6 +17,11 @@ lists, its fields as SEC wrote them. It writes one ``filings`` row per row:
   microseconds. EDGAR states no acceptance instant for filings it holds only by date: it
   writes their local midnight in New York. Such an instant, and any other spelling, is
   NULL, so the row's time is unknown rather than earlier than the filing.
+- SEC lists some filings twice (in a filer's recent filings and an older page, or in two
+  pages). Rows that state the same CIK, accession, dates, acceptance and form are one
+  listing, read once from its first row in source order; rows of one accession that
+  differ in any of those fields all map, and the promotion refuses the natural key they
+  repeat.
 - The time inputs are ``accepted_at`` (the acceptance instant, for
   ``source_column@1``) and ``filed_date``. A spec partition selects rows by
   ``filingDate``.
@@ -66,6 +71,8 @@ _DAY: Final = "[0-9]{4}-[0-9]{2}-[0-9]{2}"
 _INSTANT: Final = "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?Z"
 _DECIMAL: Final = "[+-]?([0-9]+(\\.[0-9]*)?|\\.[0-9]+)([eE][+-]?[0-9]+)?"
 FILINGS_REFERENCE: Final = "filings"
+# The fields a submissions row states about its filing; a repeated listing repeats them all.
+_LISTING: Final = 'cik, "accessionNumber", "filingDate", "reportDate", "acceptanceDateTime", form'
 
 
 def _issuer(cik: str) -> str:
@@ -135,7 +142,8 @@ class SecSubmissions:
             f"{report} AS period_end, "
             f"{accepted} AS _aas_t_accepted_at, _s_filed AS _aas_t_filed_date "
             f"FROM (SELECT *, {filed} AS _s_filed, "
-            f"{instant} AS _s_instant FROM {source})"
+            f"{instant} AS _s_instant FROM {source} QUALIFY row_number() OVER ("
+            f"PARTITION BY {_LISTING} ORDER BY _aas_pin, _aas_ordinal) = 1)"
         )
 
 

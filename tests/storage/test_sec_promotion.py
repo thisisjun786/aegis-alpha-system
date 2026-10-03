@@ -435,3 +435,18 @@ def test_a_filings_reference_must_pin_a_filings_generation(ws: Workspace) -> Non
             *_spec([facts], domain="fundamentals", dataset="fundamentals.us.sec", filings=calendar),
             apply=False,
         )
+
+
+def test_a_repeated_listing_is_read_once(ws: Workspace) -> None:
+    listing = _filing("0000000001", A1, "2025-02-10", "2025-02-10T21:30:00.000Z")
+    paged = (
+        "CIK0000000001-submissions-001.json",
+        *listing[1:],
+    )
+    result, _ = _filings(ws, [listing, paged], "f1")
+    assert (result["source_rows"], result["operations"]) == (2, {"ASSERT": 1})
+    # Listings of one accession that state different fields are both mapped and refused.
+    changed = _filing("0000000001", A1, "2025-02-11", "2025-02-10T21:30:00.000Z")
+    pin = _commit(ws, SUBMISSION_FILINGS.schema(), "filings", [listing, changed], "f2")
+    with pytest.raises(ValueError, match="natural keys repeat"):
+        _apply(ws, _spec([pin], domain="filings", dataset="filings.us.sec.alt"))
