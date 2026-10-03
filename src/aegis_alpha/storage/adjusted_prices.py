@@ -21,7 +21,8 @@ The derivation (``aas-adjustment-v1``) works per instrument on the bars read, ol
   dates, grid or not, and returns only the grid's dates; a grid date after that bar and
   before the ex-date is a session with no bar, so the dividend has no close.
 - An action that cannot be applied (another action type, a value that is not ``present``, a
-  dividend in another currency, no close on the session before it, or a dividend not below
+  dividend in a currency other than the close it is reinvested at, no close on the session
+  before it, or a dividend not below
   that close) leaves every earlier bar ``invalid`` with no values, with the reason
   ``unadjustable_action``. Nothing is skipped silently. ``split_adjusted`` ignores dividends
   entirely.
@@ -81,6 +82,9 @@ _SCALE: Final = Decimal("0.000000000001")
 _PRECISION: Final = 50
 # One derived row: its dict, the copied values and its factor, beside the row it came from.
 _ROW_BYTES: Final = 2048
+# What one head-read row or cell holds live while the next read runs: the admission charge
+# of a wide price row (read_heads charges about 5.7 KB per KR price row) with room to spare.
+_HELD_ROW_BYTES: Final = 6 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,7 +139,7 @@ def _dividend(
     amount = _decimal(action.get("amount"))
     if (
         action.get("value_state") != "present"
-        or action.get("currency") != bars[-1].get("currency")
+        or action.get("currency") != bar.get("currency")
         or close is None
         or amount is None
         or not 0 < amount < close
@@ -344,6 +348,13 @@ def actions_query(query: HeadQuery) -> HeadQuery:
     )
 
 
+def _retaining(budget: ComputeBudget, read: HeadRead) -> ComputeBudget:
+    """``budget`` with ``read`` reserved, so a later read or derivation never charges its bytes."""
+    cells = len(read.coverage.cells) if read.coverage is not None else 0
+    held = _HELD_ROW_BYTES * (len(read.rows) + len(read.held) + cells)
+    return replace(budget, reserved_bytes=budget.reserved_bytes + held)
+
+
 def series_query(query: HeadQuery) -> HeadQuery:
     """The price read the derivation uses: the query without its grid, so no bar is missed."""
     return query if query.grid is None else replace(query, grid=None)
@@ -367,25 +378,32 @@ def read_adjusted_prices(  # noqa: PLR0913 -- two bindings, the query and caller
 ) -> AdjustedRead:
     """Read unadjusted bars and the actions known by the same cutoff, then derive ``basis``.
 
-    ``time_rules`` covers every generation of both bindings, as for ``read_heads``.
+    ``time_rules`` covers every generation of both bindings, as for ``read_heads``. Each
+    read's rows stay reserved in ``budget`` while the next read and the derivation run.
     """
     _check(prices, actions)
 
-    def read(binding: HeadBinding, part: HeadQuery, *, held: bool = False) -> HeadRead:
+    def read(
+        binding: HeadBinding, part: HeadQuery, allowed: ComputeBudget, *, held: bool = False
+    ) -> HeadRead:
         return read_heads(
             connection,
             binding,
             part,
             time_rules=time_rules,
-            budget=budget,
+            budget=allowed,
             rehash=rehash,
             held=held,
         )
 
-    series = read(prices, series_query(query))
-    price_read = series if query.grid is None else read(prices, query)
-    action_read = read(actions, actions_query(query), held=True)
-    rows = _derive(series, action_read, query, basis, budget)
+    series = read(prices, series_query(query), budget)
+    budget = _retaining(budget, series)
+    price_read = series
+    if query.grid is not None:
+        price_read = read(prices, query, budget)
+        budget = _retaining(budget, price_read)
+    action_read = read(actions, actions_query(query), budget, held=True)
+    rows = _derive(series, action_read, query, basis, _retaining(budget, action_read))
     return _result(price_read, series, action_read, basis, rows)
 
 
@@ -404,11 +422,17 @@ def load_adjusted_prices(  # noqa: PLR0913 -- two bindings, the query and caller
 
     _check(prices, actions)
 
-    def read(binding: HeadBinding, part: HeadQuery, *, held: bool = False) -> HeadRead:
-        return load_pinned_heads(workspace, binding, part, budget=budget, rehash=rehash, held=held)
+    def read(
+        binding: HeadBinding, part: HeadQuery, allowed: ComputeBudget, *, held: bool = False
+    ) -> HeadRead:
+        return load_pinned_heads(workspace, binding, part, budget=allowed, rehash=rehash, held=held)
 
-    series = read(prices, series_query(query))
-    price_read = series if query.grid is None else read(prices, query)
-    action_read = read(actions, actions_query(query), held=True)
-    rows = _derive(series, action_read, query, basis, budget)
+    series = read(prices, series_query(query), budget)
+    budget = _retaining(budget, series)
+    price_read = series
+    if query.grid is not None:
+        price_read = read(prices, query, budget)
+        budget = _retaining(budget, price_read)
+    action_read = read(actions, actions_query(query), budget, held=True)
+    rows = _derive(series, action_read, query, basis, _retaining(budget, action_read))
     return _result(price_read, series, action_read, basis, rows)

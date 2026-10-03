@@ -192,14 +192,16 @@ class _FmpActions:
         del args
         return IdentityKey("fmp", "fmp_symbol")
 
-    def _select(self, source: str, args: Mapping[str, object], kind: str, columns: str) -> str:
+    def _select(
+        self, source: str, args: Mapping[str, object], key: str, kind: str, columns: str
+    ) -> str:
         zone = str(args["timezone"])
         revision = int(str(args["revision"]))
         return (
             "SELECT _aas_pin, _aas_ordinal, _aas_row_hash, "  # noqa: S608 -- engine-named relation
             "epoch_us(retrieved_at_utc) AS _aas_ingested_at_us, "
             f"symbol AS _aas_id_token, {zone_start_us(zone, 'date')} AS _aas_id_at_us, "
-            f"{kind} || ':' || strftime(date, '%Y-%m-%d') AS action_id, {kind} AS action_type, "
+            f"{key} || ':' || strftime(date, '%Y-%m-%d') AS action_id, {kind} AS action_type, "
             f"date AS ex_date, {columns}, date AS _aas_t_ex_date "
             f"FROM ({revision_runs(source, _KEY, self.values)}) "
             f"WHERE _aas_new AND _aas_revision = {revision} AND NOT _aas_tied"
@@ -237,6 +239,7 @@ class FmpDividends(_FmpActions):
             source,
             args,
             "'dividend'",
+            "'dividend'",
             '"recordDate" AS record_date, "paymentDate" AS pay_date, date AS effective_date, '
             f'CASE WHEN {present} THEN "dividend" END AS amount, '
             "CAST(NULL AS DECIMAL(38,12)) AS ratio, 'USD' AS currency, "
@@ -247,8 +250,10 @@ class FmpDividends(_FmpActions):
 class FmpSplits(_FmpActions):
     """``fmp.splits@1``: ``numerator / denominator`` new shares per old share.
 
-    ``splitType`` names the action (``SPLIT_TYPES``). A ratio whose two terms are not
-    finite and positive is ``invalid`` and keeps no ratio.
+    ``splitType`` names the action (``SPLIT_TYPES``); a missing or empty type is
+    ``unspecified_split``. ``action_id`` is ``split:<ex-date>`` whatever the type, so a
+    revision that corrects the type supersedes the earlier action instead of adding one. A
+    ratio whose two terms are not finite and positive is ``invalid`` and keeps no ratio.
     """
 
     name: Final = "fmp.splits"
@@ -274,11 +279,13 @@ class FmpSplits(_FmpActions):
         kind = (
             'CASE "splitType" '
             + " ".join(f"WHEN '{name}' THEN '{action}'" for name, action in SPLIT_TYPES.items())
-            + " ELSE coalesce(replace(\"splitType\", '-', '_'), 'unspecified_split') END"
+            + " ELSE coalesce(nullif(replace(\"splitType\", '-', '_'), ''), "
+            "'unspecified_split') END"
         )
         return self._select(
             source,
             args,
+            "'split'",
             kind,
             "CAST(NULL AS DATE) AS record_date, CAST(NULL AS DATE) AS pay_date, "
             "date AS effective_date, CAST(NULL AS DECIMAL(38,12)) AS amount, "

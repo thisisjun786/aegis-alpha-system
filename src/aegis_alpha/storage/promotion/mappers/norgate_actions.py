@@ -18,8 +18,9 @@ input is ``ex_date`` (``exdate_open@1``).
   selected. The amount is the cash per share as paid: the capital-basis dividend times the
   row's ``unadjusted_close / close``, rounded to binary32 (the precision of all three
   inputs) for ``float_shortest@1``. ``action_id`` is ``dividend:<ex-date>``, the currency
-  ``USD``. A row whose dividend, close or unadjusted close is not finite and positive is
-  ``invalid`` and keeps no amount.
+  ``USD``. Any nonzero dividend is selected: a row whose dividend, close or unadjusted close
+  is not finite and positive is ``invalid`` and keeps no amount. A next row whose ``date`` is
+  not at midnight gives no ex-date, which refuses the row.
 - ``norgate.capital_adjustments@1`` selects the sessions where the series' capital factor
   ``f = unadjusted_close / close`` steps. The ratio is ``f`` of the asset's previous row
   over ``f`` of this row: the new shares per old share of every capital event Norgate folds
@@ -28,7 +29,10 @@ input is ``ex_date`` (``exdate_open@1``).
   differs from 1 by more than one part in a million: binary32 storage moves ``f`` between
   consecutive rows by less than that (the live parts' largest such move is below 2e-7 and
   the smallest real event above 1e-5). Rows with a close or unadjusted close that is not
-  finite and positive carry no factor and are skipped. ``action_id`` is
+  finite and positive carry no factor. A row is compared with the last row that has one;
+  when a factorless row lies between them, the step's session is unknown, so the action is
+  ``invalid`` with no ratio on the row that shows it. A step on a row whose ``date`` is not
+  at midnight has no ex-date, which refuses the row. ``action_id`` is
   ``capital_adjustment:<ex-date>``.
 
 Neither mapper can be partitioned: each reads the asset's neighbouring row, which a partition
@@ -42,7 +46,8 @@ session of Norgate's series, which can be later than the listing itself (``reaso
 the day after ``last_date``, the series' last session (``reason`` ``norgate_last_date``).
 Neither has an end. The time input ``status_date`` is the date the event is read from, so a
 delisting is never known before the series' last session, and the instrument is resolved at
-the local start of that date. A date that is not ``YYYY-MM-DD`` leaves the event without a
+the local start of that date. A date that is not ``YYYY-MM-DD``, a ``last_date`` before
+``first_date`` or a delisting on the last representable date leaves the event without a
 start, which refuses the row.
 """
 
@@ -142,9 +147,10 @@ class NorgateDividends(_NorgateActions):
             "CAST(NULL AS DECIMAL(38,12)) AS ratio, 'USD' AS currency, "
             f"CASE WHEN {present} THEN 'present' ELSE 'invalid' END AS value_state, "
             "_aas_ex AS _aas_t_ex_date "
-            f'FROM (SELECT *, lead({_DAY}) OVER (PARTITION BY assetid ORDER BY "date") AS _aas_ex '
+            f'FROM (SELECT *, lead({_DAY}) OVER (PARTITION BY assetid ORDER BY "date") AS _aas_ex, '
+            'lead("date") OVER (PARTITION BY assetid ORDER BY "date") AS _aas_next '
             f"FROM {source} WHERE adjustment_type = 'CAPITAL') "
-            'WHERE ("dividend" > 0 OR isnan("dividend")) AND _aas_ex IS NOT NULL'
+            'WHERE ("dividend" <> 0 OR isnan("dividend")) AND _aas_next IS NOT NULL'
         )
 
 
@@ -160,17 +166,25 @@ class NorgateCapitalAdjustments(_NorgateActions):
         zone = str(args["timezone"])
         factor = 'CAST("unadjusted_close" AS DOUBLE) / "close"'
         usable = f"{_positive('close')} AND {_positive('unadjusted_close')}"
+        series = 'OVER (PARTITION BY assetid ORDER BY "date"'
+        factors = (
+            f"SELECT *, {_DAY} AS _aas_day, CASE WHEN {usable} THEN {factor} END AS _aas_f "  # noqa: S608 -- engine-named relation
+            f"FROM {source} WHERE adjustment_type = 'CAPITAL'"
+        )
+        # The last factor before this row, and whether the row just before carries it.
         steps = (
-            f"SELECT *, {_DAY} AS _aas_day, lag({factor}) OVER (PARTITION BY assetid "  # noqa: S608 -- engine-named relation
-            f'ORDER BY "date") / ({factor}) AS _aas_step FROM {source} '
-            f"WHERE adjustment_type = 'CAPITAL' AND {usable}"
+            f"SELECT *, last_value(_aas_f IGNORE NULLS) {series} ROWS BETWEEN UNBOUNDED "  # noqa: S608 -- code-owned fragments
+            f"PRECEDING AND 1 PRECEDING) / _aas_f AS _aas_step, "
+            f"lag(_aas_f) {series}) IS NOT NULL AS _aas_adjacent FROM ({factors})"
         )
         return (
             self._action(zone, "capital_adjustment", "_aas_day")
-            + "CAST(NULL AS DECIMAL(38,12)) AS amount, CAST(_aas_step AS FLOAT) AS ratio, "
-            "CAST(NULL AS VARCHAR) AS currency, 'present' AS value_state, "
+            + "CAST(NULL AS DECIMAL(38,12)) AS amount, "
+            "CASE WHEN _aas_adjacent THEN CAST(_aas_step AS FLOAT) END AS ratio, "
+            "CAST(NULL AS VARCHAR) AS currency, "
+            "CASE WHEN _aas_adjacent THEN 'present' ELSE 'invalid' END AS value_state, "
             "_aas_day AS _aas_t_ex_date "
-            f"FROM ({steps}) WHERE abs(_aas_step - 1) > {STEP_TOLERANCE} AND _aas_day IS NOT NULL"
+            f"FROM ({steps}) WHERE abs(_aas_step - 1) > {STEP_TOLERANCE}"
         )
 
 
@@ -218,7 +232,13 @@ class NorgateStatus:
         zone = str(args["timezone"])
         event = str(args["event"])
         day = iso_day(f'"{_EVENTS[event]}"')
-        start = day if event == "listed" else f"({day} + 1)"
+        first, last = iso_day('"first_date"'), iso_day('"last_date"')
+        # A series that ends before it starts has no consistent listing or delisting.
+        ordered = f"coalesce({last} >= {first}, true)"
+        if event == "listed":
+            start = f"CASE WHEN {ordered} THEN {day} END"
+        else:
+            start = f"CASE WHEN {ordered} AND {day} < DATE '9999-12-31' THEN {day} + 1 END"
         where = "" if event == "listed" else " WHERE is_delisted"
         return (
             "SELECT _aas_pin, _aas_ordinal, _aas_row_hash, "  # noqa: S608 -- engine-named relation

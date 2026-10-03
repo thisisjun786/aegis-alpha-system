@@ -168,6 +168,12 @@ def test_norgate_dividends_are_paid_cash_on_the_next_session() -> None:
                 _part(7, D[4], 103.0, 412.0, dividend=0.5),
                 _part(8, D[0], 50.0, 50.0, dividend=0.125),
                 _part(8, D[2], 51.0, 51.0),
+                # A negative dividend is malformed evidence, kept as invalid.
+                _part(9, D[0], 10.0, 10.0, dividend=-0.5),
+                _part(9, D[1], 10.0, 10.0),
+                # A next row that is not at midnight gives no ex-date: the row is refused.
+                _part(10, D[0], 10.0, 10.0, dividend=0.5),
+                {**_part(10, D[1], 10.0, 10.0), "date": _midnight(D[1]) + timedelta(hours=1)},
             ],
             PART_SCHEMA,
         ),
@@ -187,6 +193,9 @@ def test_norgate_dividends_are_paid_cash_on_the_next_session() -> None:
         # The next session of the series, even across a day it does not trade.
         ("8", _edt_start(D[2]), None, "dividend:2020-08-07", "dividend", D[2], D[2], 0.125,
          None, "USD", "present", D[2]),
+        ("9", _edt_start(D[1]), None, "dividend:2020-08-06", "dividend", D[1], D[1], None,
+         None, "USD", "invalid", D[1]),
+        ("10", None, None, None, "dividend", None, None, 0.5, None, "USD", "present", None),
     ]  # fmt: skip
     # A neighbouring row is part of the mapping, so no partition may cut a series.
     partition = mapper("norgate.dividends@1").partition_sql
@@ -208,8 +217,12 @@ def test_norgate_capital_adjustments_step_the_price_factor() -> None:
                 _part(8, D[0], 60.0, 90.0),
                 _part(8, D[1], 61.0, 61.0),  # 3:2 split
                 _part(10, D[0], 10.0, 20.0),
-                # A step on a row that is not at midnight has no session: never an action.
+                # A step on a row that is not at midnight has no ex-date: the row is refused.
                 {**_part(10, D[1], 10.0, 10.0), "date": _midnight(D[1]) + timedelta(hours=1)},
+                # A factorless row between two factors hides the step's session.
+                _part(11, D[0], 25.0, 100.0),
+                _part(11, D[1], 0.0, 100.0),
+                _part(11, D[2], 100.0, 100.0),
                 {**_part(9, D[0], 10.0, 40.0), "adjustment_type": "TOTALRETURN"},
                 {**_part(9, D[1], 10.0, 10.0), "adjustment_type": "TOTALRETURN"},
             ],
@@ -228,6 +241,9 @@ def test_norgate_capital_adjustments_step_the_price_factor() -> None:
          "present", D[2]),
         ("8", "capital_adjustment:2020-08-06", "capital_adjustment", D[1], D[1], None, 1.5, None,
          "present", D[1]),
+        ("10", None, "capital_adjustment", None, None, None, 2.0, None, "present", None),
+        ("11", "capital_adjustment:2020-08-07", "capital_adjustment", D[2], D[2], None, None,
+         None, "invalid", D[2]),
     ]  # fmt: skip
 
 
@@ -242,6 +258,11 @@ def test_norgate_status_reads_listing_and_delisting_from_the_master() -> None:
                  "last_date": "2010-05-28"},
                 {"assetid": 3, "is_delisted": True, "first_date": "2001-2-5",
                  "last_date": "2010-5-28"},
+                # A series that ends before it starts, and a delisting on the last date.
+                {"assetid": 4, "is_delisted": True, "first_date": "2010-05-28",
+                 "last_date": "2001-02-05"},
+                {"assetid": 5, "is_delisted": True, "first_date": "2001-02-05",
+                 "last_date": "9999-12-31"},
             ],
             STATUS_SCHEMA,
         ),
@@ -258,7 +279,11 @@ def test_norgate_status_reads_listing_and_delisting_from_the_master() -> None:
         ("1", jan, "norgate:listed", jan, None, "listed", "norgate_first_date", date(1990, 1, 2)),
         ("2", feb, "norgate:listed", feb, None, "listed", "norgate_first_date", date(2001, 2, 5)),
         ("3", None, "norgate:listed", None, None, "listed", "norgate_first_date", None),
-    ]
+        # No start refuses the row.
+        ("4", _edt_start(date(2010, 5, 28)), "norgate:listed", None, None, "listed",
+         "norgate_first_date", date(2010, 5, 28)),
+        ("5", feb, "norgate:listed", feb, None, "listed", "norgate_first_date", date(2001, 2, 5)),
+    ]  # fmt: skip
     # A delisting starts the day after the series' last session and is read from that date.
     assert _mapped(
         connection, "norgate.status@1", {"timezone": NEW_YORK, "event": "delisted"}, columns
@@ -266,6 +291,10 @@ def test_norgate_status_reads_listing_and_delisting_from_the_master() -> None:
         ("2", _edt_start(date(2010, 5, 28)), "norgate:delisted", _edt_start(date(2010, 5, 29)),
          None, "delisted", "norgate_last_date", date(2010, 5, 28)),
         ("3", None, "norgate:delisted", None, None, "delisted", "norgate_last_date", None),
+        ("4", feb, "norgate:delisted", None, None, "delisted", "norgate_last_date",
+         date(2001, 2, 5)),
+        ("5", _us(datetime(9999, 12, 31, 5, tzinfo=UTC)), "norgate:delisted", None, None,
+         "delisted", "norgate_last_date", date(9999, 12, 31)),
     ]  # fmt: skip
 
 
@@ -323,6 +352,10 @@ def test_fmp_actions_select_each_run_and_never_a_tied_key() -> None:
                 _fmp("CCC", date(2021, 1, 4), 1, numerator=1.0, denominator=0.0,
                      splitType="spin-off"),
                 _fmp("DDD", date(2021, 1, 4), 1, numerator=1.0, denominator=10.0, splitType=None),
+                _fmp("EEE", date(2021, 1, 4), 1, numerator=2.0, denominator=1.0, splitType=""),
+                # A correction of the type keeps the action: the same key, superseded.
+                _fmp("AAA", date(2020, 8, 31), 2, numerator=4.0, denominator=1.0,
+                     splitType="stock-dividend"),
             ],
             FMP_SPLITS,
         ),
@@ -331,14 +364,19 @@ def test_fmp_actions_select_each_run_and_never_a_tied_key() -> None:
         connection,
         "fmp.splits@1",
         {"timezone": NEW_YORK, "revision": 1},
-        "_aas_id_token, action_type, ratio, amount, value_state",
+        "_aas_id_token, action_id, action_type, ratio, amount, value_state",
     )
     assert splits == [
-        ("AAA", "split", 4.0, None, "present"),
-        ("BBB", "stock_dividend", 2.0 / 3.0, None, "present"),
-        ("CCC", "spin_off", None, None, "invalid"),
-        ("DDD", "unspecified_split", 0.1, None, "present"),
+        ("AAA", "split:2020-08-31", "split", 4.0, None, "present"),
+        ("BBB", "split:2021-01-04", "stock_dividend", 2.0 / 3.0, None, "present"),
+        ("CCC", "split:2021-01-04", "spin_off", None, None, "invalid"),
+        ("DDD", "split:2021-01-04", "unspecified_split", 0.1, None, "present"),
+        ("EEE", "split:2021-01-04", "unspecified_split", 2.0, None, "present"),
     ]
+    corrected = _mapped(
+        connection, "fmp.splits@1", {"timezone": NEW_YORK, "revision": 2}, "action_id, action_type"
+    )
+    assert corrected == [("split:2020-08-31", "stock_dividend")]
 
 
 @pytest.fixture
@@ -778,6 +816,11 @@ def test_adjustment_marks_bars_before_an_unadjustable_action() -> None:
         (),
         (),
     ]
+    # A dividend is matched against the currency of the close it is reinvested at.
+    redenominated = [*bars[:3], {**bars[3], "currency": "CAD"}]
+    cad = _event("dividend", D[3], "1", currency="CAD")
+    assert [item[0] for item in derived_from(redenominated, [cad])][:3] == [None, None, None]
+    assert derived_from(redenominated, [_event("dividend", D[3], "1")])[0][2] == "present"
     with pytest.raises(ValueError, match="adjusted basis"):
         adjust(bars, [], "unadjusted")
     with pytest.raises(ValueError, match="two bars"):
