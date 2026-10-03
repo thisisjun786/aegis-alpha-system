@@ -63,6 +63,17 @@ def retired_sources(workspace: Workspace) -> dict[str, dict[str, object]]:
     }
 
 
+def committed_source_ids(workspace: Workspace) -> set[str]:
+    """Every source an import has completed: the listed ones and the retired ones.
+
+    An importer deciding whether a unit is already committed asks this, not
+    ``list_sources``; a retired source is committed, its tables are just gone.
+    """
+    return {str(row["source_id"]) for row in list_sources(workspace)} | set(
+        retired_sources(workspace)
+    )
+
+
 def manifest_digest(manifest_json: str) -> str:
     """The digest a retirement records: SHA-256 of the commit manifest text as stored.
 
@@ -110,8 +121,6 @@ def _prepare(
     request = hashlib.sha256(schema.encoded([source_id, digest, kind, detail]).encode()).hexdigest()
     op_id = "source:" + hashlib.sha256(source_id.encode()).hexdigest()
     previous = _marker(workspace, source_id)
-    if previous and (record := retired_sources(workspace).get(source_id)) is not None:
-        raise ValueError(_retired_message(source_id, record))
     if previous and (previous[0], previous[1], previous[2], previous[3]) != (
         op_id,
         request,
@@ -119,6 +128,19 @@ def _prepare(
         kind,
     ):
         raise ValueError("source ID already identifies different content")
+    if previous and source_id in retired_sources(workspace):
+        # The same request for a retired source is its earlier import: reused, never rebuilt.
+        return (
+            op_id,
+            request,
+            {
+                "source_id": source_id,
+                "reused": True,
+                "retired": True,
+                "tables": json.loads(str(previous[4]))["tables"],
+                "link": link_source(workspace, source_id),
+            },
+        )
     prepare_operation(
         workspace.state,
         operation_id=op_id,

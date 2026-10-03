@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 from typing import cast
 
@@ -17,11 +18,17 @@ from aegis_alpha.storage import compaction
 from aegis_alpha.storage.backup import backup
 from aegis_alpha.storage.compaction import compact
 from aegis_alpha.storage.paths import read_json
+from aegis_alpha.storage.promotion.engine import promote
+from aegis_alpha.storage.runs import RunResult, commit_run, open_run, read_run
 from aegis_alpha.storage.source_library import retired_sources
 from aegis_alpha.storage.source_retirement import retire_sources
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace
+from tests.storage.promotion_support import add_source, at, bar, register_symbols
+from tests.storage.promotion_support import spec as promotion_spec
 from tests.storage.retirement_support import ROWS, commit, group, other_device, spec
+from tests.storage.test_runs import BUDGET as RUN_BUDGET
+from tests.storage.test_runs import RESULT, intent, prepared
 
 _ROOT = Path(__file__).resolve().parents[2]
 _WIDE = pa.schema([("symbol", pa.string()), ("payload", pa.string())])
@@ -88,6 +95,39 @@ def test_compaction_reclaims_retired_space_and_verifies_the_same(
         assert read_json(target / "installation.json")["installation_id"] == (
             rebuilt.installation_id
         )
+
+
+def test_compaction_copies_rows_that_reference_other_rows(tmp_path: Path) -> None:
+    """Promoted generation chains and run results hold foreign keys; parents land first."""
+    fx = prepared(tmp_path / "source")
+    home = fx.home
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        identity = register_symbols(workspace, commit(workspace, "identity"))
+        parent = None
+        for number in range(3):
+            day = date(2025, 1, 2 + number)
+            pin = add_source(
+                workspace,
+                [bar("AAA.KO", day, 100.0 + number, retrieved=at("2025-01-10T00:00:00"))],
+                tag=f"p{number}",
+            )
+            raw, digest = promotion_spec([pin], identity, parent=parent)
+            parent = str(promote(workspace, raw, digest, apply=True)["generation_id"])
+        handle = open_run(workspace, intent(fx, "run-compacted"))
+        commit_run(workspace, handle, RunResult(RESULT), budget=RUN_BUDGET)
+        before = verify_workspace(workspace, budget=RUN_BUDGET)
+        run = read_run(workspace, "run-compacted", budget=RUN_BUDGET)
+        counts = {
+            table: workspace.market.execute(f"SELECT count(*) FROM {table}").fetchone()  # noqa: S608 -- fixed names
+            for table in ("market_generations", "prices", "result_commits")
+        }
+    assert counts["market_generations"] == (3,)
+    report = compact(home, tmp_path / "compacted", budget=RUN_BUDGET)
+    assert report["verification"] == before
+    with open_workspace(tmp_path / "compacted") as rebuilt:
+        assert read_run(rebuilt, "run-compacted", budget=RUN_BUDGET) == run
+        for table, count in counts.items():
+            assert rebuilt.market.execute(f"SELECT count(*) FROM {table}").fetchone() == count  # noqa: S608 -- fixed names
 
 
 def test_interrupted_compaction_preserves_original(

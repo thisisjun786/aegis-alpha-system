@@ -71,16 +71,21 @@ def commit(
     return content.source_id
 
 
-def group(
+def group(  # noqa: PLR0913 -- every field a test varies
     retire: Sequence[str],
     equivalent: Sequence[str],
     *,
     columns: Sequence[str] = COLUMNS,
     equivalent_columns: Sequence[str] | None = None,
+    uncompared: Sequence[str] | None = None,
     reason: str = "a copy of the export",
 ) -> dict[str, object]:
+    """One group; by default the ``path`` column of ``bars`` is the one left uncompared."""
+    if uncompared is None:
+        uncompared = ["path"] if tuple(columns) == COLUMNS else []
     return {
         "reason": reason,
+        "uncompared": list(uncompared),
         "retire": {"sources": list(retire), "table": "bars", "columns": list(columns)},
         "equivalent": {
             "sources": list(equivalent),

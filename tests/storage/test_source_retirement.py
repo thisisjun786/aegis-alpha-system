@@ -20,7 +20,7 @@ from aegis_alpha.storage import publication, source_library, source_retirement
 from aegis_alpha.storage.backup import backup
 from aegis_alpha.storage.promotion.engine import promote
 from aegis_alpha.storage.publication import recover_operations
-from aegis_alpha.storage.raw import verify_raw
+from aegis_alpha.storage.raw import put_raw, verify_raw
 from aegis_alpha.storage.rowset import rowset_hash
 from aegis_alpha.storage.source_retirement import (
     RetirementError,
@@ -243,8 +243,12 @@ def test_unreferenced_equivalent_backed_up_source_is_retired(
         again = retire_sources(workspace, request, backup_root=tmp_path / "backup", apply=True)
         assert again["retired"] == []
         assert _group_status(again) == [("already_retired", []), ("already_retired", [])]
-        with pytest.raises(ValueError, match="is retired"):
-            commit(workspace, "copy", ROWS[::-1], path="normalized")
+        # Importing the same unit again is its earlier import, reused and never rebuilt.
+        assert commit(workspace, "copy", ROWS[::-1], path="normalized") == copy
+        assert not _present(workspace, copy)
+        assert source_library.committed_source_ids(workspace) == {export, copy, first, second}
+        with pytest.raises(ValueError, match="different content"):
+            commit(workspace, "copy", ROWS, path="other")
         target = retire_sources(
             workspace,
             spec(group([export], [first])),
@@ -549,3 +553,165 @@ def test_source_retire_command_plans_without_writing(home: Path, tmp_path: Path)
     # A backup on the installation's own device is no backup for retirement.
     assert applied["retired"] == []
     assert _group_status(applied) == [("refused", ["backup_on_installation_device"])]
+
+
+def test_a_column_left_out_is_declared_and_recorded(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        export = commit(workspace, "export")
+        # Every symbol differs: compared on ``ok`` alone the two are equal multisets.
+        renamed = commit(
+            workspace, "renamed", [("ZZZ", *row[1:]) for row in ROWS], path="normalized"
+        )
+    backup(home, tmp_path / "backup")
+    other_device(monkeypatch, tmp_path / "backup")
+    left_out = ["symbol", "day", "close", "volume", "seen", "path"]
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        silent = plan_retirement(
+            workspace,
+            spec(group([renamed], [export], columns=["ok"], uncompared=["path"])),
+            backup_root=tmp_path / "backup",
+        )
+        assert silent.groups[0].reasons == ["uncompared_columns_differ"]
+        assert silent.groups[0].retire_digest == silent.groups[0].equivalent_digest
+        over = plan_retirement(
+            workspace,
+            spec(group([renamed], [export], uncompared=["path", "absent"])),
+            backup_root=tmp_path / "backup",
+        )
+        assert "uncompared_columns_differ" in over.groups[0].reasons
+        request = spec(group([renamed], [export], columns=["ok"], uncompared=left_out))
+        planned = retire_sources(workspace, request, backup_root=tmp_path / "backup", apply=False)
+        (reported,) = cast("list[dict[str, object]]", planned["groups"])
+        assert (reported["status"], reported["compared"]) == ("retire", "partial_columns")
+        assert reported["uncompared_columns"] == left_out
+        assert planned["partial_column_groups"] == 1
+        (source,) = cast("list[dict[str, object]]", planned["sources"])
+        assert source["uncompared_columns"] == left_out
+        applied = retire_sources(workspace, request, backup_root=tmp_path / "backup", apply=True)
+        assert applied["retired"] == [renamed]
+        recorded = json.loads(str(_records(workspace)[renamed]["equivalence_spec"]))
+        assert recorded["uncompared"] == left_out
+        assert recorded["retire"]["columns"] == ["ok"]
+    raw = json.dumps(
+        {
+            "schema_version": "aas-source-retirement-v1",
+            "groups": [group([renamed], [export], uncompared=["path", "ok"])],
+        }
+    ).encode()
+    with pytest.raises(RetirementError, match="uncompared"):
+        source_retirement.parse_spec(raw, hashlib.sha256(raw).hexdigest())
+
+
+def test_feature_inputs_and_bindings_are_references(writable: Workspace) -> None:
+    donor = commit(writable, "donor")
+    bound = commit(writable, "bound")
+    digest = "a" * 64
+    with writable.state:
+        writable.state.execute(
+            "INSERT INTO feature_contracts VALUES (?,?,?,?,?)",
+            ("synthetic-proxy", "1", "{}", "aas-proxy-transform-v1", digest),
+        )
+        writable.state.execute(
+            "INSERT INTO feature_inputs VALUES (?,?,?,?,?,?,?)",
+            ("synthetic-proxy", "1", 0, "donor_source:bars", donor, digest, digest),
+        )
+        writable.state.execute(
+            "INSERT INTO input_bundles VALUES (?,?,?)", ("b-synthetic", digest, "synthetic")
+        )
+        writable.state.execute(
+            "INSERT INTO input_bindings VALUES (?,?,?,?,?,?,?)",
+            ("b-synthetic", "prices", 0, "source", bound, "v1", digest),
+        )
+    found = source_retirement.source_references(writable, {donor, bound})
+    assert found == {
+        donor: ["state.feature_inputs.ref_id"],
+        bound: ["state.input_bindings.ref_id"],
+    }
+    export = commit(writable, "export")
+    plan = plan_retirement(
+        writable, spec(group([donor], [export]), group([bound], [export])), backup_root=None
+    )
+    assert all("referenced" in group.reasons for group in plan.groups)
+
+
+def test_a_source_a_strategy_registration_names_is_referenced(home: Path, tmp_path: Path) -> None:
+    from tests.storage.test_strategy_registry import (  # noqa: PLC0415
+        _import,
+        _register,
+        _strategies,
+    )
+
+    digest = _import(home, tmp_path, "synthetic-records", _strategies())
+    with open_workspace(home) as workspace:
+        assert source_retirement.source_references(workspace, {"synthetic-records"}) == {
+            "synthetic-records": []
+        }
+    _register(home, "synthetic-records", digest)
+    with open_workspace(home) as workspace:
+        assert source_retirement.source_references(workspace, {"synthetic-records"}) == {
+            "synthetic-records": ["strategies.strategy_registrations.source_id"]
+        }
+
+
+def test_a_retired_legacy_unit_is_reused_and_verified(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aegis_alpha.storage.legacy_import.engine import (  # noqa: PLC0415
+        apply_import,
+        verify_import,
+    )
+    from aegis_alpha.storage.source_identity import SourceContent, SourceFile  # noqa: PLC0415
+    from tests.storage.test_legacy_import import (  # noqa: PLC0415
+        _entry,
+        _export,
+        _manifest,
+        _sources,
+    )
+
+    manifest = _manifest([_entry("equity", "norgate.history_export@1", _export(tmp_path))])
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        unit = _sources(apply_import(workspace, manifest))[0]
+        (manifest_json,) = cast(
+            "tuple[str]",
+            workspace.market.execute(
+                "SELECT manifest_json FROM source_library_commits WHERE source_id=?",
+                [unit["source_id"]],
+            ).fetchone(),
+        )
+        (table,) = json.loads(manifest_json)["tables"]
+        rows = workspace.market.execute(
+            f'SELECT * EXCLUDE (_aas_ordinal) FROM "{table["target"]}"'  # noqa: S608 -- marker name
+        ).to_arrow_table()
+        _, raw_digest, size = put_raw(workspace.paths.raw, b"synthetic-copy")
+        copy = SourceContent("synthetic", "history", 1, (SourceFile(raw_digest, size),))
+        source_library.import_content_arrow(workspace, copy, table["name"], rows.to_reader())
+    backup(home, tmp_path / "backup")
+    other_device(monkeypatch, tmp_path / "backup")
+    request = spec(
+        {
+            "reason": "the same rows under another source",
+            "uncompared": [],
+            "retire": {
+                "sources": [unit["source_id"]],
+                "table": table["name"],
+                "columns": table["columns"],
+            },
+            "equivalent": {
+                "sources": [copy.source_id],
+                "table": table["name"],
+                "columns": table["columns"],
+            },
+        }
+    )
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        applied = retire_sources(workspace, request, backup_root=tmp_path / "backup", apply=True)
+        assert applied["retired"] == [unit["source_id"]]
+        again = _sources(apply_import(workspace, manifest))
+    assert [source["reused"] for source in again] == [True, True]
+    with open_workspace(home) as workspace:
+        verified = verify_import(workspace, manifest)
+    assert [source["status"] for source in _sources(verified)] == ["retired", "committed"]
+    assert verified["unmatched"] == 0
+    assert verified["complete"] is True

@@ -60,10 +60,16 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   holds every commit. `--apply` retains the records in `raw/`, prepares a `source-retire` intent,
   drops the tables in one DuckDB transaction and writes `source_retirements`; repeating it or
   `db recover` finishes the intent, and `quarantine` refuses one that already dropped a table.
+  Every retired-table column outside the comparison is named in the group's `uncompared` list
+  (the plan reports such a group as `partial_columns`, the record's `equivalence_spec` keeps the
+  list); the digest is an unkeyed multiset and proves the compared columns only.
   Markers, links and `raw/` stay; `source_library` hides a retired source from listings and
-  readers, refuses its re-import and verifies it from its record.
+  readers, verifies it from its record, and treats a same-request re-import as reused
+  (`committed_source_ids` is the importers' "already committed" set; `legacy_import --verify`
+  matches a retired unit as `retired`).
 - `compaction` owns `aas db compact --to NEW_ROOT`: verify, rewrite every store into a new root
-  (SQLite backup plus `VACUUM`, DuckDB `COPY FROM DATABASE`), copy `raw/`, `runs/` and `secrets/`,
+  (SQLite backup plus `VACUUM`, DuckDB `COPY FROM DATABASE … (SCHEMA)` then rows parent-first
+  along foreign keys, a self-referencing table one chain level at a time), copy `raw/`, `runs/` and `secrets/`,
   and require the same logical verification there before the new receipt is `ready`. The original
   installation is never changed; switching `AAS_HOME` is the operator's step.
 - `promotion/` implements that path. `spec` parses the document, `mappers` is the registry

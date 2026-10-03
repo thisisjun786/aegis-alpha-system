@@ -394,8 +394,10 @@ flag 분포, 시간 규칙별 null·상한 적용 수, op 분포, stale 행, 계
 승격 intent마다 단계, generation, dataset version, 행 수, 명세 해시와 매퍼를 나열한다.
 
 `source-retire`는 `aas-source-retirement-v1` 문서의 group마다 참조, 동치 digest, 다른 장치 백업을 확인한다.
-`--plan`은 설치본을 읽기 전용으로 열고, `--backup` 없이도 group별 상태와 이유, 양쪽 행 수와 digest,
-원천별 참조 위치, 후보·은퇴 가능 행의 합계를 보고한다. 백업을 넘기면 그 백업의 모든 파일을 다시 해시하므로
+`--plan`은 설치본을 읽기 전용으로 열고, `--backup` 없이도 group별 상태와 이유, 증명 범위(`compared`와
+`uncompared_columns`), 양쪽 행 수와 digest, 원천별 참조 위치, 후보·은퇴 가능 행의 합계를 보고한다. group의
+`uncompared`는 은퇴할 테이블의 비교 밖 열을 정확히 나열해야 하고, 그 열은 은퇴 뒤 백업이나 원본 bytes에서만
+다시 얻는다. 백업을 넘기면 그 백업의 모든 파일을 다시 해시하므로
 백업 크기만큼 시간이 걸린다. `--apply`는 v2 설치본에서 실행 중인 run이나 다른 PREPARED 작업이 없을 때
 증명을 통과한 group을 모두 은퇴하고 나머지를 이유와 함께 보고한다. 응답의 `retired`는 은퇴한 원천,
 `retired_rows`는 그 행 수, `operation_id`는 intent다. 같은 문서를 다시 실행하면 이미 은퇴한 group을
@@ -591,8 +593,9 @@ market과 state를 각각 한 트랜잭션으로 올린 다음 설치 영수증�
    `aas data promote --plan`을 확인한 뒤 실행하고 generation마다 verify한다. 실패하면
    `aas db recover`로 게시만 재개한다. 공급자를 다시 호출하지 않는다.
 5. `[owner]` 승인된 수집기를 설정의 호출 상한과 함께 예약 실행으로 켠다.
-6. `aas db source-retire --plan`으로 은퇴 후보와 거부 이유를 확인하고 2단계의 다른 장치 백업으로
-   `--apply`해 증명을 통과한 원천을 일괄 은퇴한다. `aas db compact --to NEW_ROOT`가 새 루트에서 검증을
+6. 승격을 마친 뒤 `aas db source-retire --plan`으로 은퇴 후보, 참조, 거부 이유와 `partial_columns` group을
+   확인하고 2단계의 다른 장치 백업으로 `--apply`해 증명을 통과한 원천을 일괄 은퇴한다. `[owner]`
+   `uncompared` 열이 있는 group은 문서에 그 열을 이름으로 적은 소유자 허가로만 은퇴한다. `aas db compact --to NEW_ROOT`가 새 루트에서 검증을
    통과하면 `AAS_HOME`을 새 루트로 바꾼다.
    설치본 밖 legacy 원본은 그 manifest의 `aas import legacy --verify`가 `complete`(미대조 파일 0 포함)이고
    종료 코드가 0일 때 그 항목 경로만 지운다.

@@ -2,13 +2,15 @@
 
 ``aas db source-retire --spec FILE --sha256 H [--backup DIR] --plan|--apply`` reads one
 ``aas-source-retirement-v1`` document. Each group names the sources to retire, the sources
-they are equivalent to, one table on each side and the columns compared position by
-position. A group is retired whole or not at all, and only when
+they are equivalent to, one table on each side, the columns compared position by position
+and, as ``uncompared``, every column of the retired table left out of the comparison. A
+group is retired whole or not at all, and only when
 
 1. no committed generation, binding, identity or universe row refers to any of its
    sources (a source's own ``sl:`` link is lineage, not a reference),
 2. the ``aas-rowset-v1`` digest of the compared columns' row multiset is the same on
-   both sides (``equivalence_digest``), and
+   both sides (``equivalence_digest``), and every retired table's columns are exactly the
+   compared ones plus the declared ``uncompared`` ones, and
 3. the verified backup ``--backup`` names holds every one of its commits and lives on
    another device than the installation.
 
@@ -17,6 +19,11 @@ position. A group is retired whole or not at all, and only when
 transaction, writes one immutable ``source_retirements`` row per source and completes the
 intent. Commit markers, ``sl:`` links and ``raw/`` bytes stay. Repeating the command or
 ``aas db recover`` finishes an interrupted intent from its retained records.
+
+The digest proves the compared columns only, as an unkeyed multiset. An ``uncompared``
+column is dropped on the owner's grant in the hashed document, the plan reports such a
+group as ``partial_columns`` and every record's ``equivalence_spec`` names those columns;
+their values come back only from the backup or the source's original bytes.
 """
 
 from __future__ import annotations
@@ -65,7 +72,7 @@ MAX_SPEC_BYTES: Final = 8 * 1024 * 1024
 _MAX_DOCUMENT: Final = 64 * 1024 * 1024
 _SEARCH_CHUNK: Final = 8 * 1024 * 1024
 _SIDE_KEYS: Final = frozenset({"sources", "table", "columns"})
-_GROUP_KEYS: Final = frozenset({"reason", "retire", "equivalent"})
+_GROUP_KEYS: Final = frozenset({"reason", "retire", "equivalent", "uncompared"})
 _DEFAULT_BUDGET: Final = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
 _BATCH_ROWS: Final = 65_536
 _ROW_OBJECT_BYTES: Final = 256
@@ -120,6 +127,7 @@ class Group:
     reason: str
     retire: Side
     equivalent: Side
+    uncompared: tuple[str, ...] = ()
 
     def equivalence_spec(self) -> str:
         """The canonical ``equivalence_spec`` text every retired source of the group records."""
@@ -129,6 +137,7 @@ class Group:
                 "rowset_format": ROWSET_FORMAT,
                 "retire": self.retire.document(),
                 "equivalent": self.equivalent.document(),
+                "uncompared": list(self.uncompared),
             }
         ).decode()
 
@@ -146,6 +155,7 @@ class _Source:
     rows: int = 0
     digest: str | None = None
     targets: tuple[str, ...] = ()
+    uncompared: tuple[str, ...] | None = None
     references: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
 
@@ -197,9 +207,9 @@ def _keys(value: object, keys: frozenset[str], name: str) -> dict[str, object]:
     return cast("dict[str, object]", value)
 
 
-def _names(value: object, name: str) -> tuple[str, ...]:
-    if not isinstance(value, list) or not value:
-        raise RetirementError(f"{name} must be a nonempty list")
+def _names(value: object, name: str, *, empty: bool = False) -> tuple[str, ...]:
+    if not isinstance(value, list) or (not value and not empty):
+        raise RetirementError(f"{name} must be a {'' if empty else 'nonempty '}list")
     names = []
     for item in value:
         if not isinstance(item, str) or not item or item != item.strip() or "\x00" in item:
@@ -250,7 +260,10 @@ def parse_spec(raw: bytes, sha256: str) -> RetirementSpec:  # noqa: C901 -- one 
         equivalent = _side(item["equivalent"], f"groups[{number}].equivalent")
         if len(retire.columns) != len(equivalent.columns):
             raise RetirementError(f"groups[{number}] compares unequal column counts")
-        groups.append(Group(reason, retire, equivalent))
+        uncompared = _names(item["uncompared"], f"groups[{number}].uncompared", empty=True)
+        if set(uncompared) & set(retire.columns):
+            raise RetirementError(f"groups[{number}] declares a compared column uncompared")
+        groups.append(Group(reason, retire, equivalent, uncompared))
     retiring = [(source, group.retire.table) for group in groups for source in group.retire.sources]
     if len(set(retiring)) != len(retiring):
         raise RetirementError("a source table is retired by more than one group")
@@ -283,12 +296,13 @@ def _table(manifest: dict[str, object], name: str) -> dict[str, object] | None:
 # --- references ---------------------------------------------------------------------------
 
 
-def source_references(workspace: Workspace, source_ids: set[str]) -> dict[str, list[str]]:
+def source_references(workspace: Workspace, source_ids: set[str]) -> dict[str, list[str]]:  # noqa: C901 -- one search per store
     """Where each source is still referenced, outside its own ``sl:`` link.
 
     State rows that name a snapshot or source (identity assertions, universe members,
     dataset sources, input bindings and feature inputs), every market table outside the
-    source library with a ``source_snapshot_id`` or ``source_id`` column, and every
+    source library with a ``source_snapshot_id`` or ``source_id`` column, every strategy
+    registry registration (``strategy_registry``) whose records it holds, and every
     retained document a committed generation is evidenced by (promotion spec, research
     transform, import document) whose JSON names the source.
     """
@@ -334,6 +348,13 @@ def source_references(workspace: Workspace, source_ids: set[str]) -> dict[str, l
             [wanted],
         ).fetchall():
             found[names[value]].append(f"market.{table}.{column}")
+    if workspace.strategies is not None:
+        from aegis_alpha.storage.strategy_registry import (  # noqa: PLC0415
+            registry_source_references,
+        )
+
+        for source in registry_source_references(workspace.strategies) & source_ids:
+            found[source].append("strategies.strategy_registrations.source_id")
     _document_references(workspace, names, found)
     return {source: sorted(set(places)) for source, places in found.items()}
 
@@ -611,6 +632,7 @@ class RetirementPlan:
         candidates = list(self.sources.values())
         retirable = {source for group in self.retirable() for source in group.group.retire.sources}
         refused = Counter(reason for group in self.groups for reason in group.reasons)
+        partial = [group for group in self.groups if group.group.uncompared]
         return {
             "spec_sha256": self.spec.sha256,
             "backup_root": self.backup.root,
@@ -621,6 +643,7 @@ class RetirementPlan:
             "retirable_rows": sum(self.sources[source].rows for source in retirable),
             "referenced_sources": sum(1 for source in candidates if source.references),
             "references": sum(len(source.references) for source in candidates),
+            "partial_column_groups": len(partial),
             "refusals": dict(sorted(refused.items())),
             "groups": [
                 {
@@ -630,6 +653,9 @@ class RetirementPlan:
                     if group.already_retired
                     else ("retire" if not group.reasons else "refused"),
                     "reasons": group.reasons,
+                    # What the digest proves: every column, or only the compared ones.
+                    "compared": "partial_columns" if group.group.uncompared else "all_columns",
+                    "uncompared_columns": list(group.group.uncompared),
                     "sources": len(group.group.retire.sources),
                     "rows": group.retire_rows,
                     "equivalent_sources": len(group.group.equivalent.sources),
@@ -645,6 +671,9 @@ class RetirementPlan:
                     "group": source.group,
                     "rows": source.rows,
                     "digest": source.digest,
+                    "uncompared_columns": None
+                    if source.uncompared is None
+                    else list(source.uncompared),
                     "references": source.references,
                     "reasons": source.reasons,
                 }
@@ -699,6 +728,12 @@ def plan_retirement(  # noqa: C901, PLR0912, PLR0915 -- one ordered proof per gr
             entry.targets = tuple(str(table["target"]) for table in tables)
             if any(table.get("format") != "arrow" for table in tables):
                 entry.reasons.append("store_unsupported")
+            if (retired_table := _table(manifest, group.retire.table)) is not None:
+                columns = cast("list[str]", retired_table["columns"])
+                compared = set(group.retire.columns)
+                entry.uncompared = tuple(column for column in columns if column not in compared)
+                if set(entry.uncompared) != set(group.uncompared):
+                    entry.reasons.append("uncompared_columns_differ")
             if source in targets_of_retired:
                 entry.reasons.append("equivalence_target_of_a_retired_source")
         for source in group.equivalent.sources:
