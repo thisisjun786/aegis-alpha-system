@@ -1,8 +1,12 @@
-"""SQL pieces the text-valued macro and FX mappers share.
+"""SQL pieces the text-valued macro, FX and daily price mappers share.
 
-- A value is ``present`` only when its source text is a plain decimal that ``decimal_text@1``
-  converts; empty text, no text, and FRED's ``.`` are ``missing``; any other text is
-  ``invalid`` and keeps no value. Nothing is trimmed or repaired.
+- One predicate decides whether a source text is a value. It is ``present`` only when the
+  text is a decimal that ``decimal_text@1`` converts (an optional sign, digits with an
+  optional point, an optional exponent) and lies in the mapper's ``sign`` range: ``any`` for
+  a macro value, ``nonnegative`` for a price or volume, ``positive`` for an FX rate. Empty
+  text, no text, and FRED's ``.`` are ``missing``; any other text is ``invalid`` and keeps
+  no value. Nothing is trimmed or repaired.
+- A bar is ``present`` when every value is, ``missing`` when none is, else ``invalid``.
 - A time input never precedes the Unix epoch. Market times are nonnegative, so a source day
   before 1970-01-01 gives that day instead: a later day is still an upper bound on when the
   row was public, which is all a time rule claims.
@@ -14,7 +18,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from typing import Final
+from typing import Final, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aegis_alpha.storage.promotion.formats import sql_literal
@@ -26,13 +30,26 @@ _SERIES: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._$^-]{0,63}")
 EPOCH_DAY: Final = "DATE '1970-01-01'"
 
 
-def decimal_state(text: str) -> str:
+Sign = Literal["any", "nonnegative", "positive"]
+_OUT_OF_RANGE: Final[dict[str, str]] = {"nonnegative": "< 0", "positive": "<= 0"}
+
+
+def decimal_state(text: str, sign: Sign = "any") -> str:
     """``present``, ``missing`` or ``invalid`` for a source text column."""
+    present = f"regexp_full_match({text}, {sql_literal(DECIMAL_TEXT_SQL)})"
+    if sign != "any":
+        present += f" AND NOT coalesce(TRY_CAST({text} AS DOUBLE) {_OUT_OF_RANGE[sign]}, false)"
     return (
         f"CASE WHEN {text} IS NULL OR {text} IN ('', '.') THEN 'missing' "
-        f"WHEN regexp_full_match({text}, {sql_literal(DECIMAL_TEXT_SQL)}) THEN 'present' "
-        "ELSE 'invalid' END"
+        f"WHEN {present} THEN 'present' ELSE 'invalid' END"
     )
+
+
+def bar_state(states: list[str]) -> str:
+    """A bar is ``present`` when every value is, ``missing`` when none is, else ``invalid``."""
+    present = " AND ".join(f"({state}) = 'present'" for state in states)
+    missing = " AND ".join(f"({state}) = 'missing'" for state in states)
+    return f"CASE WHEN {present} THEN 'present' WHEN {missing} THEN 'missing' ELSE 'invalid' END"
 
 
 def iso_day(text: str) -> str:
@@ -48,13 +65,24 @@ def epoch_floor(day: str) -> str:
     return f"CASE WHEN {day} < {EPOCH_DAY} THEN {EPOCH_DAY} ELSE {day} END"
 
 
+def zone_start_us(zone: str, day: str) -> str:
+    """UTC microseconds of the start of ``day`` in the IANA ``zone``."""
+    return f"epoch_us(timezone({sql_literal(zone)}, CAST({day} AS TIMESTAMP)))"
+
+
 def day_end_us(zone: str, day: str) -> str:
     """The last microsecond of ``day`` in the IANA ``zone``, as UTC microseconds."""
     literal = sql_literal(zone)
     return f"(epoch_us(timezone({literal}, CAST({day} AS TIMESTAMP) + INTERVAL 1 DAY)) - 1)"
 
 
+def exact_args(name: str, args: Mapping[str, object], keys: set[str]) -> None:
+    if set(args) != keys:
+        raise ValueError(f"{name} takes exactly the arguments {sorted(keys)}")
+
+
 def zone_arg(name: str, args: Mapping[str, object]) -> str:
+    """The checked IANA ``timezone`` argument of mapper ``name``."""
     zone = args.get("timezone")
     if not isinstance(zone, str) or _ZONE.fullmatch(zone) is None:
         raise ValueError(f"{name} timezone must be an IANA zone name")
