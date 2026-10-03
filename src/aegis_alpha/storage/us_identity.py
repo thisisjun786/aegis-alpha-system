@@ -597,8 +597,10 @@ def map_norgate_exports(
     A series needs a positive asset ID, a trimmed symbol, a known database (the two US
     equity databases or a reference database of ``REFERENCE_TYPES``) and ``YYYY-MM-DD``
     first and last dates. Series of one asset ID from several sources merge when they agree
-    on symbol and database, keeping the earliest evidence; an asset ID whose series disagree
-    is refused whole (``export_assetid_repeated``).
+    on symbol and database, spanning every source's dates; the merged series cites the
+    earliest source that reaches its last date, so a later source's extension is never
+    known from an earlier instant. An asset ID whose series disagree is refused whole
+    (``export_assetid_repeated``).
     """
     report = MapperReport()
     found: dict[str, list[ExportSeries]] = defaultdict(list)
@@ -638,14 +640,12 @@ def map_norgate_exports(
             report.refuse("export_assetid_repeated")
             repeated.append(assetid)
             continue
-        first = min(group, key=lambda item: item.evidence.order())
-        series.append(
-            replace(
-                first,
-                first_date=min(item.first_date for item in group),
-                last_date=max(item.last_date for item in group),
-            )
+        last = max(item.last_date for item in group)
+        reaching = min(
+            (item for item in group if item.last_date == last),
+            key=lambda item: item.evidence.order(),
         )
+        series.append(replace(reaching, first_date=min(item.first_date for item in group)))
     return series, repeated, report
 
 
@@ -1382,6 +1382,13 @@ def build_us_registry(
     if exports:
         series, conflicting, mappers[EXPORT_MAPPER] = map_norgate_exports(exports)
         unresolved["exports"]["export_assetid_repeated"].extend(conflicting)
+        # The master lists US equities only; an export naming one of its asset IDs as a
+        # reference series contradicts it, so that series gives no instrument and no name.
+        known = {listing.assetid for listing in listings}
+        differing = [item.assetid for item in series if not item.equity and item.assetid in known]
+        if differing:
+            unresolved["exports"]["export_database_differs_from_master"].extend(differing)
+            series = [item for item in series if item.assetid not in set(differing)]
         _export_instruments(series, listings, exported)
         holders: dict[str, set[str]] = defaultdict(set)
         for listing in accepted:

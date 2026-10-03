@@ -1038,7 +1038,11 @@ Norgate security master와 그보다 늦은 Norgate history 내보내기에서�
     구간이므로 충돌하지 않는다. 두 상장 시리즈가 같은 티커면 `export_ticker_ambiguous`, master가 그 티커를 준
     다른 상장을 내보내기가 그 티커의 이전 상폐 보유자로 보여 주지 않으면 언제 옮겨 갔는지 알 수 없으므로
     `export_ticker_moved`, 시작이 창 끝 이후면 `export_ticker_reused`로 미해결이다. 같은 asset ID의 시리즈가
-    여러 원천에서 심볼이나 database가 다르면 그 asset ID 전체를 거부한다(`export_assetid_repeated`).
+    여러 원천에서 심볼이나 database가 다르면 그 asset ID 전체를 거부한다(`export_assetid_repeated`). 같으면
+    모든 원천의 날짜를 합치고, 마지막 날짜에 닿는 원천 중 가장 이른 원천을 근거로 삼으므로 나중 원천이 늘린
+    구간이 더 이른 시각부터 알려지지 않는다. master는 미국 주식만 담으므로 master의 asset ID를 기준 시리즈
+    database로 내보낸 시리즈는 instrument도 이름도 만들지 않고 `export_database_differs_from_master`로
+    미해결이다.
   - 티커로 대조하는 FMP profile과 SEC member는 그 수집 시각을 담은 티커 주장(master 구간 또는 내보내기 창)의
     시리즈만 가리킨다. FMP 행들의 합의도 주장마다 그 안에서 수집한 행만으로 판단하고, 합의한 주장마다 그
     구간의 FMP 심볼 주장이 생긴다. ETF 여부는 master 행의 것이며 master에 없는 시리즈는 ETF가 아니다. 어느
@@ -1478,3 +1482,4 @@ state v2:
 | DV-208 | 같은 시각에 수집한 서로 다른 FMP 응답은 승격에서 자연키 반복으로 거부되고, 그 bar의 뒤 정정은 revision 2에 들지 않는다 | `tests/storage/test_us_prices.py::test_fmp_tied_responses_are_refused_and_never_revised` | 구현 |
 | DV-209 | 한 시리즈의 issuer 연결은 모든 티커 주장 중 가장 이른 유효 시작의 CIK이고, 다른 CIK를 대는 주장은 처리 순서와 무관하게 미해결이다 | `tests/storage/test_us_identity.py::test_a_series_links_to_the_earliest_valid_cik_of_all_its_claims` | 구현 |
 | DV-210 | `calendar_compare`는 텍스트 날짜·거래량을 읽고 읽히지 않는 날짜의 행을 session이 아닌 `undated_rows`로 센다 | `tests/tools/test_calendar_compare.py::test_text_dates_and_volumes_are_read_and_undated_rows_counted` | 구현 |
+| DV-211 | 여러 내보내기에 걸친 시리즈는 마지막 날짜에 닿는 원천을 근거로 삼고, master asset ID를 기준 시리즈로 내보낸 시리즈는 `export_database_differs_from_master`로 미해결이다 | `tests/storage/test_us_prices.py::test_export_series_cite_their_extent_and_respect_the_master` | 구현 |

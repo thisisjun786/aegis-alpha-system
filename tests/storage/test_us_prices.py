@@ -41,6 +41,7 @@ from tests.storage.us_identity_support import (
     MASTER_SCHEMA,
     commit,
     cusip,
+    link_instant,
     master,
     profile,
     table,
@@ -972,3 +973,39 @@ def test_exports_extend_ticker_claims_past_the_master(ws: Workspace) -> None:
     )
     assert not registered["conflicts"]
     assert not any(cast("dict[str, list[object]]", registered["missing"]).values())
+
+
+def test_export_series_cite_their_extent_and_respect_the_master(ws: Workspace) -> None:
+    master_id = commit(
+        ws,
+        "norgate-master",
+        "observations",
+        table(
+            [master(1, "AAA", last_date="2026-07-28"), master(2, "BBB", last_date="2026-07-28")],
+            MASTER_SCHEMA,
+        ),
+    )
+    _export(ws, [history(1, "AAA", "2026-07-27", "10"), history(1, "AAA", "2026-08-20", "10")])
+    later = _export(
+        ws,
+        [
+            history(1, "AAA", "2026-07-27", "10"),
+            history(1, "AAA", "2026-09-08", "10"),
+            # The master lists asset 2 as a US equity.
+            history(2, "$BAD", "2026-09-08", "1", database="US Indices"),
+        ],
+    )
+    registry = build_from_workspace(ws, master=master_id, exports=export_sources(ws))
+    assert registry.unresolved["exports"] == {"export_database_differs_from_master": ["2"]}
+    claims = {
+        (row["provider"], row["namespace"], row["token"]): row
+        for row in cast("list[dict[str, Any]]", registry.document["assertions"])
+        if row["valid_from_us"] == _edt_start(date(2026, 7, 29))
+    }
+    # The window reaches 2026-09-08 only through the later export, so it cites that export.
+    window = claims["eodhd", "eodhd_symbol", "AAA.US"]
+    assert window["valid_to_us"] == _edt_start(date(2026, 9, 9))
+    assert window["known_from_us"] >= link_instant(ws, later["source_id"])
+    assert window["source_snapshot_id"].endswith(later["source_id"])
+    assertions = cast("list[dict[str, Any]]", registry.document["assertions"])
+    assert "$BAD" not in {row["token"] for row in assertions}
