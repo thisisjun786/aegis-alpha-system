@@ -13,7 +13,9 @@ A change of shape takes a new name (``-v2``); none of these is ever reinterprete
 
 Source values keep the representation of ``source_library_digest.scalar`` (float as
 ``float_hex``, bytes as ``base64``) and add one tagged form for each temporal type, so
-no value is ever rendered through a locale, a time zone or a float printer.
+no value is ever rendered through a locale, a time zone or a float printer. A naive
+nanosecond timestamp (DuckDB ``TIMESTAMP_NS``, as pandas-written Parquet stores dates) is
+``{"local_ns": integer}``; Python has no such type, so it enters as ``LocalNanoseconds``.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import hashlib
 import json
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Final
 
@@ -59,9 +62,17 @@ SOURCE_ROW_TYPES: Final = frozenset(
         "BLOB",
         "DATE",
         "TIMESTAMP",
+        "TIMESTAMP_NS",
         "TIMESTAMP WITH TIME ZONE",
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class LocalNanoseconds:
+    """A naive nanosecond timestamp: nanoseconds since 1970-01-01 00:00 on the local clock."""
+
+    value: int
 
 
 def canonical(value: object) -> bytes:
@@ -73,7 +84,7 @@ def digest(value: object) -> str:
     return hashlib.sha256(canonical(value)).hexdigest()
 
 
-def source_value(value: object) -> object:
+def source_value(value: object) -> object:  # noqa: PLR0911 -- one tagged form per type
     """The JSON form one source cell takes inside ``aas-source-row-v1``."""
     if value is None or isinstance(value, (bool, int, str)):
         return value
@@ -81,6 +92,8 @@ def source_value(value: object) -> object:
         return {"float_hex": value.hex()}
     if isinstance(value, bytes):
         return {"base64": base64.b64encode(value).decode("ascii")}
+    if isinstance(value, LocalNanoseconds):
+        return {"local_ns": value.value}
     if isinstance(value, datetime):
         if value.tzinfo is None:
             return {"local_us": (value - _EPOCH) // _MICROSECOND}
@@ -178,6 +191,8 @@ def _value_sql(column: str, kind: str) -> tuple[str, str | None]:  # noqa: PLR09
         return "'{\"utc_us\":' || CAST(epoch_us(" + column + ") AS VARCHAR) || '}'", None
     if kind == "TIMESTAMP":
         return "'{\"local_us\":' || CAST(epoch_us(" + column + ") AS VARCHAR) || '}'", None
+    if kind == "TIMESTAMP_NS":
+        return "'{\"local_ns\":' || CAST(epoch_ns(" + column + ") AS VARCHAR) || '}'", None
     raise ValueError(f"source column type {kind} has no aas-source-row-v1 form")
 
 

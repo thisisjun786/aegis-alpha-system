@@ -9,7 +9,7 @@ Both read a table the legacy import keeps as text and promote the rows of the sp
   (``norgate-history-csv-*``): the export's ``bars`` as ``symbol``, ``date``, ``close``.
 
 ``rate`` is the source text of the quote currency per one unit of the base, converted by
-``decimal_text@1``: ``present`` only for a positive plain decimal, ``missing`` for no text,
+``decimal_text@1``: ``present`` only for a positive decimal, ``missing`` for no text,
 empty text or FRED's ``.``, ``invalid`` otherwise. ``fixing_at_us`` is the last
 microsecond of the row's date in the spec's ``timezone``; the time input ``fixing_date`` is
 that date. A date that is not ``YYYY-MM-DD`` leaves the required fixing time empty, so the
@@ -75,11 +75,7 @@ class TextFxSeries:
     def select(self, source: str, args: Mapping[str, object]) -> str:
         day = iso_day(self._day)
         value = self._value
-        state = (
-            f"CASE WHEN {decimal_state(value)} = 'present' AND "
-            f"TRY_CAST({value} AS DOUBLE) <= 0 THEN 'invalid' "
-            f"ELSE {decimal_state(value)} END"
-        )
+        state = decimal_state(value, "positive")
         return (
             "SELECT _aas_pin, _aas_ordinal, _aas_row_hash, "  # noqa: S608 -- engine-named relation
             "CAST(NULL AS BIGINT) AS _aas_ingested_at_us, "

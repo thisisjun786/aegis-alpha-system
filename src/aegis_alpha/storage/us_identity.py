@@ -80,12 +80,27 @@ MASTER_MAPPER: Final = "norgate.master@1"
 EODHD_MAPPER: Final = "eodhd.us_symbol@1"
 FMP_MAPPER: Final = "fmp.profile@1"
 SEC_MAPPER: Final = "sec.tickers@1"
+EXPORT_MAPPER: Final = "norgate.export_listing@1"
+EXPORT_TABLE: Final = "bars"
+EXPORT_PREFIX: Final = "norgate-history-csv-"
 MASTER_TABLE: Final = "observations"
 FMP_TABLE: Final = "observations"
 SEC_TABLE: Final = "members"
 BINDINGS_TABLE: Final = "observations"
 SEC_PREFIX: Final = "sec-submissions-zip-"
 VENUE: Final = "XNYS"
+REFERENCE_VENUE: Final = "XXXX"
+"""ISO 10383's "no market": a reference series (an index, a rate) trades on no venue."""
+LISTED_DATABASE: Final = "US Equities"
+DELISTED_DATABASE: Final = "US Equities Delisted"
+REFERENCE_TYPES: Final = {
+    "US Indices": "index",
+    "World Indices": "index",
+    "Economic": "economic_series",
+    "Forex Spot": "fx_spot",
+    "Cash Commodities": "commodity",
+    "Continuous Futures": "continuous_future",
+}
 ASSETID_SET_FORMAT: Final = "aas-norgate-assetids-v1"
 NEW_YORK: Final = ZoneInfo("America/New_York")
 _DELISTED_SYMBOL: Final = re.compile(r"(.+)-[0-9]{6}")
@@ -212,6 +227,61 @@ def read_rows(
         items = (item for batch in reader for item in batch.to_pylist())
     rows = [tuple(item[name] for name in columns) for item in items if keep is None or keep(item)]
     return SourceRows(LINK_PREFIX + source_id, columns, tuple(rows))
+
+
+def read_export_rows(workspace: Workspace, source_id: str) -> ExportRows:
+    """One linked export source's series: each group's first row and its date span.
+
+    The table is verified against its marker like ``read_rows``; the grouping runs in
+    DuckDB, so only one row per series reaches Python.
+    """
+    from aegis_alpha.storage.source_library import list_sources, list_tables  # noqa: PLC0415
+    from aegis_alpha.storage.source_library_schema import connections, quoted  # noqa: PLC0415
+    from aegis_alpha.storage.source_reader import SourcePin, resolve_source  # noqa: PLC0415
+
+    if not source_id.startswith(EXPORT_PREFIX):
+        raise ValueError(f"{EXPORT_MAPPER} reads {EXPORT_PREFIX}* sources, not {source_id}")
+    linked = link_instant(workspace.state, source_id)
+    source = next((row for row in list_sources(workspace) if row["source_id"] == source_id), None)
+    described = next(
+        (row for row in list_tables(workspace, source_id) if row["name"] == EXPORT_TABLE), None
+    )
+    if source is None or described is None:
+        raise ValueError(f"{source_id} is not a committed source with a {EXPORT_TABLE} table")
+    pin = SourcePin(source_id, str(source["sha256"]), EXPORT_TABLE, str(described["digest"]))
+    resolved = resolve_source(workspace, pin)
+    columns = tuple(cast("list[str]", resolved["columns"]))
+    target = quoted(str(resolved["target"]))
+    names = ",".join(quoted(column) for column in columns)
+    connection = cast("duckdb.DuckDBPyConnection", connections(workspace)[str(resolved["store"])])
+    query = (
+        f"SELECT {names}, s.first_day, s.last_day FROM {target} t JOIN ("  # noqa: S608
+        'SELECT min(_aas_ordinal) AS first_ordinal, min("date") AS first_day, '
+        f'max("date") AS last_day FROM {target} GROUP BY "assetid", "symbol", "database") s '
+        "ON t._aas_ordinal = s.first_ordinal ORDER BY t._aas_ordinal"
+    )
+    reader = connection.execute(query).to_arrow_reader(65536)
+    rows: list[tuple[object, ...]] = []
+    spans: list[tuple[object, object]] = []
+    for batch in reader:
+        for item in batch.to_pylist():
+            rows.append(tuple(item[name] for name in columns))
+            spans.append((item["first_day"], item["last_day"]))
+    return ExportRows(
+        SourceRows(LINK_PREFIX + source_id, columns, tuple(rows)), tuple(spans), linked
+    )
+
+
+def export_sources(workspace: Workspace) -> list[str]:
+    """Every committed ``norgate-history-csv-*`` source with a ``bars`` table, in ID order."""
+    from aegis_alpha.storage.source_library import list_sources, list_tables  # noqa: PLC0415
+
+    return sorted(
+        source_id
+        for source in list_sources(workspace)
+        if (source_id := str(source["source_id"])).startswith(EXPORT_PREFIX)
+        and any(table["name"] == EXPORT_TABLE for table in list_tables(workspace, source_id))
+    )
 
 
 def link_instant(state: sqlite3.Connection, source_id: str) -> int:
@@ -475,6 +545,110 @@ def map_sec_tickers(
     return filers, report
 
 
+# --- norgate.export_listing@1 ------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ExportSeries:
+    """One series of a Norgate history export: what its export record says, and its dates."""
+
+    assetid: str
+    symbol: str
+    database: str
+    first_date: date
+    last_date: date
+    evidence: Evidence
+
+    @property
+    def equity(self) -> bool:
+        return self.database in {LISTED_DATABASE, DELISTED_DATABASE}
+
+    @property
+    def listed(self) -> bool:
+        return self.database == LISTED_DATABASE
+
+    @property
+    def instrument_id(self) -> str:
+        return mint_instrument("norgate_assetid", self.assetid)
+
+
+@dataclass(frozen=True, slots=True)
+class ExportRows:
+    """The first row of each series of one export source, with the series' date span.
+
+    ``rows`` holds one source row per (asset ID, symbol, database) group, the one with the
+    smallest ordinal, which the series' claims cite; ``spans`` holds that group's smallest
+    and largest ``date`` text in the same order.
+    """
+
+    rows: SourceRows
+    spans: tuple[tuple[object, object], ...]
+    linked_at_us: int
+
+
+_EXPORT_COLUMNS: Final = ("assetid", "symbol", "database", "date")
+
+
+def map_norgate_exports(
+    sources: Sequence[ExportRows],
+) -> tuple[list[ExportSeries], list[str], MapperReport]:
+    """``norgate.export_listing@1``: each exported series, refusing what it cannot stand on.
+
+    A series needs a positive asset ID, a trimmed symbol, a known database (the two US
+    equity databases or a reference database of ``REFERENCE_TYPES``) and ``YYYY-MM-DD``
+    first and last dates. Series of one asset ID from several sources merge when they agree
+    on symbol and database, spanning every source's dates; the merged series cites the
+    earliest source that reaches its last date, so a later source's extension is never
+    known from an earlier instant. An asset ID whose series disagree is refused whole
+    (``export_assetid_repeated``).
+    """
+    report = MapperReport()
+    found: dict[str, list[ExportSeries]] = defaultdict(list)
+    for source in sources:
+        _require(source.rows, _EXPORT_COLUMNS, EXPORT_MAPPER)
+        for (row, row_hash), (first, last) in zip(source.rows.records(), source.spans, strict=True):
+            report.rows += 1
+            raw_id = row["assetid"]
+            assetid = _identifier(
+                IdentifierType.NORGATE_ASSETID,
+                str(raw_id) if type(raw_id) is int and raw_id > 0 else None,
+            )
+            symbol = _text(row["symbol"])
+            database = row["database"]
+            start, end = _day(first), _day(last)
+            if assetid is None:
+                report.refuse("assetid_invalid")
+            elif symbol is None:
+                report.refuse("symbol_invalid")
+            elif database not in REFERENCE_TYPES and database not in {
+                LISTED_DATABASE,
+                DELISTED_DATABASE,
+            }:
+                report.refuse("database_unknown")
+            elif start is None or end is None or end < start:
+                report.refuse("dates_invalid")
+            else:
+                report.accepted += 1
+                evidence = Evidence(source.rows.snapshot_id, row_hash, source.linked_at_us)
+                found[assetid].append(
+                    ExportSeries(assetid, symbol, str(database), start, end, evidence)
+                )
+    series: list[ExportSeries] = []
+    repeated: list[str] = []
+    for assetid, group in sorted(found.items(), key=lambda item: int(item[0])):
+        if len({(item.symbol, item.database) for item in group}) > 1:
+            report.refuse("export_assetid_repeated")
+            repeated.append(assetid)
+            continue
+        last = max(item.last_date for item in group)
+        reaching = min(
+            (item for item in group if item.last_date == last),
+            key=lambda item: item.evidence.order(),
+        )
+        series.append(replace(reaching, first_date=min(item.first_date for item in group)))
+    return series, repeated, report
+
+
 # --- registry -----------------------------------------------------------------------------
 
 
@@ -529,6 +703,10 @@ class UsRegistry:
     """The valid interval of each resolved EODHD US symbol's claim."""
     through: date | None = None
     """The master's last observed session; ticker claims end the day after it."""
+    windows: dict[str, tuple[str, int, int]] = field(default_factory=dict)
+    """Each EODHD US symbol an export lists after ``through``: (instrument, start, end)."""
+    export_through: date | None = None
+    """The exports' last observed equity session; export ticker claims end the day after it."""
 
     def raw(self) -> bytes:
         return formats.canonical(self.document)
@@ -552,16 +730,23 @@ class UsRegistry:
         symbols: dict[str, set[str]] = defaultdict(set)
         for symbol, day, count in bars:
             status = self.symbols.get(symbol, "unresolved:not_a_listed_norgate_ticker")
-            if status.startswith("ins-"):
+            window = self.windows.get(symbol)
+            at = session_start_us(day)
+            if window is not None and window[1] <= at < window[2]:
+                reason = "resolved"
+            elif status.startswith("ins-"):
                 start, end = self.intervals[symbol]
-                at = session_start_us(day)
                 reason = (
                     "resolved"
                     if start <= at < end
                     else "before_ticker_claim"
                     if at < start
+                    else "after_export_through"
+                    if window is not None
                     else "after_master_through"
                 )
+            elif window is not None:
+                reason = "before_ticker_claim" if at < window[1] else "after_export_through"
             else:
                 reason = status.removeprefix("unresolved:")
             rows[reason] += count
@@ -599,6 +784,10 @@ class UsRegistry:
             "instruments_with_issuer": sum(row["issuer"] is not None for row in instruments),
             "assetids_sha256": assetid_set_sha256(self.assetids()),
             "through": None if self.through is None else self.through.isoformat(),
+            "export_through": None
+            if self.export_through is None
+            else self.export_through.isoformat(),
+            "export_symbols": len(self.windows),
             "assertions": dict(sorted(kinds.items())),
             "mappers": {name: report.json() for name, report in sorted(self.mappers.items())},
             "unresolved_count": {
@@ -697,147 +886,242 @@ def _bounded(
     return kept
 
 
-def _outside(at: int, interval: tuple[int, int]) -> str | None:
-    """Why a ticker-matched row retrieved at ``at`` cannot name the claim's listing."""
-    start, end = interval
-    if at < start:
+@dataclass(frozen=True, slots=True)
+class _Claim:
+    """One interval in which a US ticker names one Norgate series.
+
+    The master gives a bounded listed ticker one claim that ends the day after its last
+    observed session; a history export can give the ticker a later claim. ``after`` names
+    the bound that an instant at or past ``end`` lies beyond.
+    """
+
+    assetid: str
+    start: int
+    end: int
+    etf: bool
+    evidence: Evidence
+    after: str
+
+    @property
+    def interval(self) -> tuple[int, int]:
+        return (self.start, self.end)
+
+
+def _master_claims(tickers: Mapping[str, Listing], bounds: _Bounds) -> dict[str, list[_Claim]]:
+    return {
+        ticker: [
+            _Claim(
+                listing.assetid,
+                *bounds.intervals[listing.assetid],
+                etf=listing.asset_type == "etf",
+                evidence=listing.evidence,
+                after="after_master_through",
+            )
+        ]
+        for ticker, listing in tickers.items()
+    }
+
+
+def _outside(at: int, claims: Sequence[_Claim]) -> str:
+    """Why a ticker-matched row retrieved at ``at`` names none of the ticker's claims."""
+    if at < claims[0].start:
         return "before_ticker_claim"
-    if at >= end:
-        return "after_master_through"
-    return None
+    if at >= claims[-1].end:
+        return claims[-1].after
+    return "between_ticker_claims"
+
+
+def _by_claim[T](
+    rows: Sequence[T], instant: Callable[[T], int], claims: Sequence[_Claim], prefix: str
+) -> dict[_Claim, list[T]] | str:
+    """The rows each claim holds by their retrieval instant, or why no claim holds any.
+
+    The reason is ``<prefix>_ticker_missing`` when there are no rows, otherwise
+    ``<prefix>_<position>`` placing the earliest row against the claims.
+    """
+    if not rows:
+        return f"{prefix}_ticker_missing"
+    found: dict[_Claim, list[T]] = {}
+    for claim in claims:
+        inside = [row for row in rows if claim.start <= instant(row) < claim.end]
+        if inside:
+            found[claim] = inside
+    if found:
+        return found
+    return f"{prefix}_{_outside(min(instant(row) for row in rows), claims)}"
 
 
 def _profiles(
     profiles: Mapping[str, list[Profile]],
     refused: Mapping[str, str],
-    tickers: Mapping[str, Listing],
-    bounds: _Bounds,
+    claims: Mapping[str, list[_Claim]],
     unresolved: dict[str, list[str]],
-) -> dict[str, Profile]:
-    """The one agreed profile of each listed ticker, judged against its Norgate listing.
+) -> dict[tuple[str, _Claim], Profile]:
+    """The one agreed profile of each ticker claim, judged against the claim's series.
 
-    Only profiles retrieved while the listing's ticker claim holds are judged; a profile
-    retrieved outside it may describe another holder of the ticker.
+    A profile is judged only against the claim that holds when it was retrieved; a
+    profile retrieved outside every claim may describe another holder of the ticker.
     """
-    agreed: dict[str, Profile] = {}
+    agreed: dict[tuple[str, _Claim], Profile] = {}
     for symbol in sorted({*profiles, *refused}):
-        listing = tickers.get(symbol)
-        if listing is None:
+        held = claims.get(symbol)
+        if held is None:
             unresolved["not_a_listed_norgate_ticker"].append(symbol)
             continue
-        group = profiles.get(symbol, [])
-        interval = bounds.intervals[listing.assetid]
-        inside = [row for row in group if _outside(row.evidence.known_from_us, interval) is None]
         if symbol in refused:
-            reason = refused[symbol]
-        elif not inside:
-            earliest = min(group, key=lambda profile: profile.evidence.order())
-            reason = f"fmp_{_outside(earliest.evidence.known_from_us, interval)}"
-        elif len({profile.statement() for profile in inside}) > 1:
-            reason = "fmp_profile_ambiguous"
-        elif inside[0].currency != "USD":
-            reason = "fmp_currency_not_usd"
-        elif inside[0].etf != (listing.asset_type == "etf"):
-            reason = "fmp_type_differs"
-        else:
-            agreed[symbol] = min(inside, key=lambda profile: profile.evidence.order())
+            unresolved[refused[symbol]].append(symbol)
             continue
-        unresolved[reason].append(symbol)
+        found = _by_claim(
+            profiles[symbol], lambda profile: profile.evidence.known_from_us, held, "fmp"
+        )
+        if isinstance(found, str):
+            unresolved[found].append(symbol)
+            continue
+        reasons: set[str] = set()
+        for claim, inside in found.items():
+            if len({profile.statement() for profile in inside}) > 1:
+                reasons.add("fmp_profile_ambiguous")
+            elif inside[0].currency != "USD":
+                reasons.add("fmp_currency_not_usd")
+            elif inside[0].etf != claim.etf:
+                reasons.add("fmp_type_differs")
+            else:
+                agreed[symbol, claim] = min(inside, key=lambda profile: profile.evidence.order())
+        for reason in sorted(reasons):
+            unresolved[reason].append(symbol)
     return agreed
 
 
-def _shared(claims: Mapping[str, str], unresolved: dict[str, list[str]], reason: str) -> set[str]:
-    """Identifier values (CUSIP, ISIN) two tickers claim: neither claim is kept."""
+def _shared(
+    values: Iterable[tuple[str, str]], unresolved: dict[str, list[str]], reason: str
+) -> set[str]:
+    """Identifier values (CUSIP, ISIN) two series claim: neither claim is kept."""
     owners: dict[str, set[str]] = defaultdict(set)
-    for ticker, value in claims.items():
-        owners[value].add(ticker)
+    for assetid, value in values:
+        owners[value].add(assetid)
     shared = {value for value, found in owners.items() if len(found) > 1}
     unresolved[reason].extend(sorted(shared))
     return shared
 
 
 def _fmp_assertions(
-    agreed: Mapping[str, Profile],
-    tickers: Mapping[str, Listing],
-    bounds: _Bounds,
-    unresolved: dict[str, list[str]],
+    agreed: Mapping[tuple[str, _Claim], Profile], unresolved: dict[str, list[str]]
 ) -> list[Record]:
-    cusips = {ticker: profile.cusip for ticker, profile in agreed.items() if profile.cusip}
-    isins = {ticker: profile.isin for ticker, profile in agreed.items() if profile.isin}
-    shared_cusips = _shared(cusips, unresolved, "cusip_ambiguous")
-    shared_isins = _shared(isins, unresolved, "isin_ambiguous")
+    """The FMP symbol of every agreed claim and the CUSIP and ISIN its profile names.
+
+    A profile states the identifiers current when it was retrieved, not since when, so
+    an identifier holds from that instant; one series' identifier stated by several
+    claims' profiles is claimed once, from the earliest of them.
+    """
+    shared = {
+        namespace: _shared(
+            (
+                (claim.assetid, value)
+                for (_, claim), profile in agreed.items()
+                if (value := getattr(profile, namespace))
+            ),
+            unresolved,
+            f"{namespace}_ambiguous",
+        )
+        for namespace in ("cusip", "isin")
+    }
     assertions: list[Record] = []
-    for ticker, profile in agreed.items():
-        assetid, evidence = tickers[ticker].assetid, profile.evidence
-        symbol = ("fmp", "fmp_symbol", ticker)
-        assertions.append(_assertion(assetid, symbol, bounds.intervals[assetid], evidence))
-        # A profile states the identifiers current when it was retrieved, not since when.
-        retrieved: Interval = (evidence.known_from_us, None)
-        if profile.cusip and profile.cusip not in shared_cusips:
-            key = ("fmp", "cusip", profile.cusip)
-            assertions.append(_assertion(assetid, key, retrieved, evidence))
-        if profile.isin and profile.isin not in shared_isins:
-            key = ("fmp", "isin", profile.isin)
-            assertions.append(_assertion(assetid, key, retrieved, evidence))
+    identifiers: dict[tuple[str, str, str], tuple[str, Evidence]] = {}
+    for (ticker, claim), profile in agreed.items():
+        key = ("fmp", "fmp_symbol", ticker)
+        assertions.append(_assertion(claim.assetid, key, claim.interval, profile.evidence))
+        for namespace, values in shared.items():
+            value = getattr(profile, namespace)
+            if not value or value in values:
+                continue
+            key = ("fmp", namespace, value)
+            earlier = identifiers.get(key)
+            if earlier is None or profile.evidence.order() < earlier[1].order():
+                identifiers[key] = (claim.assetid, profile.evidence)
+    for key, (assetid, evidence) in identifiers.items():
+        assertions.append(_assertion(assetid, key, (evidence.known_from_us, None), evidence))
     return assertions
 
 
-def _inside(listed: Sequence[Filer], interval: tuple[int, int]) -> list[Filer] | str:
-    """The SEC filers of a ticker retrieved inside its claim, or why there are none."""
-    if not listed:
-        return "sec_ticker_missing"
-    found = [filer for filer in listed if _outside(filer.evidence.known_from_us, interval) is None]
-    if found:
-        return found
-    earliest = min(listed, key=lambda item: item.evidence.order())
-    return f"sec_{_outside(earliest.evidence.known_from_us, interval)}"
+def _link(
+    inside: Sequence[Filer],
+    profile: Profile | None,
+    claim: _Claim,
+) -> tuple[Filer, int, int] | str:
+    """One claim's SEC filer and the link's valid and known instants, or why it has none."""
+    if len({filer.cik for filer in inside}) > 1:
+        return "sec_ticker_ambiguous"
+    filer = min(inside, key=lambda item: item.evidence.order())
+    if profile is None:
+        return "fmp_profile_missing"
+    if profile.cik is None:
+        return "fmp_cik_missing"
+    if profile.cik != filer.cik:
+        return "fmp_cik_differs"
+    valid = max(filer.evidence.known_from_us, profile.evidence.known_from_us)
+    return filer, valid, max(valid, claim.evidence.known_from_us)
 
 
 def _issuers(
     filers: Sequence[Filer],
-    agreed: Mapping[str, Profile],
-    tickers: Mapping[str, Listing],
-    bounds: _Bounds,
+    agreed: Mapping[tuple[str, _Claim], Profile],
+    claims: Mapping[str, list[_Claim]],
     unresolved: dict[str, list[str]],
 ) -> tuple[list[Record], dict[str, tuple[str, Evidence, int]]]:
-    """Issuer links of listed tickers that SEC and FMP tie to the same CIK.
+    """Issuer links of ticker claims that SEC and FMP tie to the same CIK.
 
-    Only SEC filers retrieved while the listing's ticker claim holds count. Both sources
-    state the current ticker-to-CIK mapping, not since when, so a link is valid from the
-    later of the SEC and FMP instants and known from the latest of all three.
+    Only SEC filers retrieved while a claim holds count for it. Both sources state the
+    current ticker-to-CIK mapping, not since when, so a link is valid from the later of
+    the SEC and FMP instants and known from the latest of those and the series' own
+    evidence. A series links once, by its earliest-valid link over all its claims; a claim
+    naming another CIK for it stays unresolved.
     """
     by_ticker: dict[str, list[Filer]] = defaultdict(list)
     for filer in filers:
         for ticker in set(filer.tickers):
             by_ticker[ticker].append(filer)
-    names: dict[str, Filer] = {}
-    links: dict[str, tuple[str, Evidence, int]] = {}
-    for ticker, listing in sorted(tickers.items()):
-        found = _inside(by_ticker.get(ticker, []), bounds.intervals[listing.assetid])
+    candidates: list[tuple[str, str, Filer, int, int]] = []
+    for ticker, held in sorted(claims.items()):
+        found = _by_claim(
+            by_ticker.get(ticker, []), lambda filer: filer.evidence.known_from_us, held, "sec"
+        )
         if isinstance(found, str):
             unresolved[found].append(ticker)
             continue
-        ciks = {filer.cik for filer in found}
-        profile = agreed.get(ticker)
-        if len(ciks) > 1:
-            unresolved["sec_ticker_ambiguous"].append(ticker)
+        reasons: set[str] = set()
+        for claim, inside in found.items():
+            judged = _link(inside, agreed.get((ticker, claim)), claim)
+            if isinstance(judged, str):
+                reasons.add(judged)
+                continue
+            filer, valid, known = judged
+            candidates.append((claim.assetid, ticker, filer, valid, known))
+        for reason in sorted(reasons):
+            unresolved[reason].append(ticker)
+    return _chosen(candidates, unresolved)
+
+
+def _chosen(
+    candidates: Sequence[tuple[str, str, Filer, int, int]], unresolved: dict[str, list[str]]
+) -> tuple[list[Record], dict[str, tuple[str, Evidence, int]]]:
+    """Each series' earliest-valid link among its (assetid, ticker, filer, valid, known)."""
+    links: dict[str, tuple[str, Evidence, int]] = {}
+    for assetid, _, filer, valid, known in sorted(
+        candidates, key=lambda item: (item[3], item[2].evidence.order(), item[1])
+    ):
+        if assetid not in links:
+            links[assetid] = (filer.cik, replace(filer.evidence, known_from_us=known), valid)
+    names: dict[str, Filer] = {}
+    differing: set[str] = set()
+    for assetid, ticker, filer, _, _ in candidates:
+        if links[assetid][0] != filer.cik:
+            differing.add(ticker)
             continue
-        filer = min(found, key=lambda item: item.evidence.order())
-        if profile is None:
-            unresolved["fmp_profile_missing"].append(ticker)
-            continue
-        if profile.cik is None:
-            unresolved["fmp_cik_missing"].append(ticker)
-            continue
-        if profile.cik != filer.cik:
-            unresolved["fmp_cik_differs"].append(ticker)
-            continue
-        valid = max(filer.evidence.known_from_us, profile.evidence.known_from_us)
-        known = max(valid, listing.evidence.known_from_us)
-        links[listing.assetid] = (filer.cik, replace(filer.evidence, known_from_us=known), valid)
-        earliest = names.get(filer.cik)
-        if earliest is None or filer.evidence.order() < earliest.evidence.order():
+        named = names.get(filer.cik)
+        if named is None or filer.evidence.order() < named.evidence.order():
             names[filer.cik] = filer
+    if differing:
+        unresolved["sec_cik_differs_across_claims"].extend(sorted(differing))
     issuers = [
         {**_anchor("sec_cik", cik), "name": filer.name} for cik, filer in sorted(names.items())
     ]
@@ -870,12 +1154,9 @@ def _accepted(
 
 
 def _listing_assertions(
-    accepted: Sequence[Listing],
-    repeated: set[str],
-    links: Mapping[str, tuple[str, Evidence, int]],
-    bounds: _Bounds,
+    accepted: Sequence[Listing], repeated: set[str], bounds: _Bounds
 ) -> list[Record]:
-    """Norgate's own claims and the issuer link of every accepted listing.
+    """Norgate's own claims of every accepted listing.
 
     A delisted row's suffixed symbol names it for good; a listed row's symbol is its
     ticker and is bounded like the ticker's other claims.
@@ -890,11 +1171,16 @@ def _listing_assertions(
         for namespace, token, interval in claims:
             key = ("norgate", namespace, token)
             assertions.append(_assertion(listing.assetid, key, interval, listing.evidence))
-        if listing.assetid in links:
-            cik, link, since = links[listing.assetid]
-            token = issuer_link_token(mint_issuer("sec_cik", cik), listing.instrument_id)
-            key = ("sec", "issuer", token)
-            assertions.append(_assertion(listing.assetid, key, (since, None), link))
+    return assertions
+
+
+def _issuer_assertions(links: Mapping[str, tuple[str, Evidence, int]]) -> list[Record]:
+    """The ``sec``/``issuer`` link of every linked series, valid from its later instant."""
+    assertions: list[Record] = []
+    for assetid, (cik, link, since) in sorted(links.items()):
+        instrument = mint_instrument("norgate_assetid", assetid)
+        key = ("sec", "issuer", issuer_link_token(mint_issuer("sec_cik", cik), instrument))
+        assertions.append(_assertion(assetid, key, (since, None), link))
     return assertions
 
 
@@ -933,20 +1219,151 @@ def _sec_filers(
     return filers, report
 
 
+@dataclass(slots=True)
+class _Exported:
+    """What the exports add: instruments, claims and the EODHD symbols of their window."""
+
+    instruments: list[Record] = field(default_factory=list)
+    assertions: list[Record] = field(default_factory=list)
+    windows: dict[str, tuple[str, int, int]] = field(default_factory=dict)
+    through: date | None = None
+
+
+def _export_instruments(
+    series: Sequence[ExportSeries], listings: Sequence[Listing], exported: _Exported
+) -> None:
+    """Instruments the master does not know, and the permanent names exports give them.
+
+    An asset ID the master lists (even one it lists twice) is never minted again. A new
+    equity is ``unclassified`` on ``XNYS``; a reference series takes its database's type on
+    the ``XXXX`` venue. A reference or delisted symbol (``<ticker>-YYYYMM``) names its series
+    for good, so it holds for all time when no master row and no other series has it.
+    """
+    known = {listing.assetid for listing in listings}
+    master_symbols = {listing.symbol for listing in listings}
+    counts: dict[str, int] = defaultdict(int)
+    for item in series:
+        counts[item.symbol] += 1
+    for item in series:
+        if item.assetid not in known:
+            exported.instruments.append(
+                {
+                    **_anchor("norgate_assetid", item.assetid),
+                    "asset_type": "unclassified" if item.equity else REFERENCE_TYPES[item.database],
+                    "venue": VENUE if item.equity else REFERENCE_VENUE,
+                }
+            )
+            key = ("norgate", "norgate_assetid", item.assetid)
+            exported.assertions.append(_assertion(item.assetid, key, _ALWAYS, item.evidence))
+        if (
+            not item.listed
+            and counts[item.symbol] == 1
+            and item.symbol not in master_symbols
+            and (not item.equity or _DELISTED_SYMBOL.fullmatch(item.symbol) is not None)
+        ):
+            key = ("norgate", "norgate_symbol", item.symbol)
+            exported.assertions.append(_assertion(item.assetid, key, _ALWAYS, item.evidence))
+
+
+def _export_tickers(
+    series: Sequence[ExportSeries],
+) -> tuple[dict[str, list[ExportSeries]], dict[str, date], dict[str, set[str]]]:
+    """Listed series by ticker, and each ticker's delisted holders' last date and IDs."""
+    held: dict[str, date] = {}
+    held_by: dict[str, set[str]] = defaultdict(set)
+    spelled: dict[str, list[ExportSeries]] = defaultdict(list)
+    for item in series:
+        if item.listed:
+            spelled[us_ticker(item.symbol)].append(item)
+            continue
+        match = _DELISTED_SYMBOL.fullmatch(item.symbol) if item.equity else None
+        if match is not None:
+            base = us_ticker(match[1])
+            held[base] = max(item.last_date, held.get(base, item.last_date))
+            held_by[base].add(item.assetid)
+    return spelled, held, held_by
+
+
+def _export_window(  # noqa: PLR0913 -- the window reads the master's view of every ticker
+    series: Sequence[ExportSeries],
+    *,
+    holders: Mapping[str, set[str]],
+    master: Mapping[str, Listing],
+    through: date | None,
+    exported: _Exported,
+    unresolved: dict[str, list[str]],
+) -> dict[str, _Claim]:
+    """Ticker claims of the export's listed series after the master's ``through``.
+
+    The window runs from the New York start of the day after ``through`` to that of the day
+    after the exports' last equity session. A listed series' ticker holds in it from the
+    later of the window start, the series' first date and the day after the last date of a
+    delisted ``<ticker>-YYYYMM`` series. A ticker two listed series share is ambiguous, and
+    a ticker the master gave to another listing is held over only when the export shows
+    that listing as the ticker's delisted earlier holder; otherwise when it moved is unknown.
+    Norgate's symbol and the EODHD symbol are claimed here; FMP and SEC rows retrieved
+    inside the window are judged against the returned claim like the master's.
+    """
+    days = [item.last_date for item in series if item.equity]
+    exported.through = max(days, default=None)
+    claims: dict[str, _Claim] = {}
+    if through is None or exported.through is None or exported.through <= through:
+        return claims
+    opens = through + timedelta(days=1)
+    closes = exported.through + timedelta(days=1)
+    spelled, held, held_by = _export_tickers(series)
+    for ticker, group in sorted(spelled.items()):
+        if len(group) > 1:
+            unresolved["export_ticker_ambiguous"].append(ticker)
+            continue
+        item = group[0]
+        moved = holders.get(ticker, set()) - {item.assetid}
+        if not moved <= held_by.get(ticker, set()):
+            unresolved["export_ticker_moved"].append(ticker)
+            continue
+        start = max(opens, item.first_date)
+        if ticker in held:
+            start = max(start, held[ticker] + timedelta(days=1))
+        if start >= closes:
+            unresolved["export_ticker_reused"].append(ticker)
+            continue
+        listing = master.get(item.assetid)
+        claim = _Claim(
+            item.assetid,
+            session_start_us(start),
+            session_start_us(closes),
+            etf=listing is not None and listing.asset_type == "etf",
+            evidence=item.evidence,
+            after="after_export_through",
+        )
+        for key in (
+            ("norgate", "norgate_symbol", item.symbol),
+            ("eodhd", "eodhd_symbol", f"{ticker}.US"),
+        ):
+            exported.assertions.append(_assertion(item.assetid, key, claim.interval, item.evidence))
+        exported.windows[f"{ticker}.US"] = (item.instrument_id, *claim.interval)
+        claims[ticker] = claim
+    return claims
+
+
 def build_us_registry(
     master: LinkedRows,
     *,
     fmp: Sequence[SourceRows] = (),
     sec: Sequence[tuple[LinkedRows, SourceFile, ArchiveOpener]] = (),
+    exports: Sequence[ExportRows] = (),
 ) -> UsRegistry:
     """Build the US ``aas-identity-registry-v1`` document from pinned source rows.
 
-    Norgate is a frozen source, so one master names every instrument. The document lists
-    issuers by CIK, instruments by asset ID and assertions by provider, namespace and
-    token, so the same sources always give the same bytes.
+    Norgate is a frozen source: one master names the listed and delisted instruments, and
+    its later history exports add the series it lacks and the ticker claims of the sessions
+    they show after the master's last one. The document lists issuers by CIK, instruments by
+    asset ID and assertions by provider, namespace and token, so the same sources always
+    give the same bytes.
     """
     unresolved: dict[str, dict[str, list[str]]] = {
-        key: defaultdict(list) for key in ("listings", "tickers", "fmp", "identifiers", "issuers")
+        key: defaultdict(list)
+        for key in ("listings", "tickers", "fmp", "identifiers", "issuers", "exports")
     }
     mappers: dict[str, MapperReport] = {}
     listings, mappers[MASTER_MAPPER] = map_norgate_master(master)
@@ -960,31 +1377,57 @@ def build_us_registry(
         bounds,
         unresolved["tickers"],
     )
+    claims = _master_claims(tickers, bounds)
+    exported = _Exported()
+    if exports:
+        series, conflicting, mappers[EXPORT_MAPPER] = map_norgate_exports(exports)
+        unresolved["exports"]["export_assetid_repeated"].extend(conflicting)
+        # The master lists US equities only; an export naming one of its asset IDs as a
+        # reference series contradicts it, so that series gives no instrument and no name.
+        known = {listing.assetid for listing in listings}
+        differing = [item.assetid for item in series if not item.equity and item.assetid in known]
+        if differing:
+            unresolved["exports"]["export_database_differs_from_master"].extend(differing)
+            series = [item for item in series if item.assetid not in set(differing)]
+        _export_instruments(series, listings, exported)
+        holders: dict[str, set[str]] = defaultdict(set)
+        for listing in accepted:
+            if listing.listed and listing.symbol not in repeated:
+                holders[us_ticker(listing.symbol)].add(listing.assetid)
+        windows = _export_window(
+            series,
+            holders=holders,
+            master={listing.assetid: listing for listing in accepted},
+            through=bounds.through,
+            exported=exported,
+            unresolved=unresolved["exports"],
+        )
+        for ticker, claim in windows.items():
+            claims.setdefault(ticker, []).append(claim)
     profiles, refused, mappers[FMP_MAPPER] = map_fmp_profiles(fmp)
-    agreed = _profiles(profiles, refused, tickers, bounds, unresolved["fmp"])
+    agreed = _profiles(profiles, refused, claims, unresolved["fmp"])
     filers, mappers[SEC_MAPPER] = _sec_filers(sec)
-    issuers, links = (
-        _issuers(filers, agreed, tickers, bounds, unresolved["issuers"]) if sec else ([], {})
-    )
+    issuers, links = _issuers(filers, agreed, claims, unresolved["issuers"]) if sec else ([], {})
     eodhd, symbols, intervals, mappers[EODHD_MAPPER] = _eodhd(
         tickers, bounds, unresolved["tickers"]
     )
     assertions = [
-        *_listing_assertions(accepted, repeated, links, bounds),
+        *_listing_assertions(accepted, repeated, bounds),
+        *_issuer_assertions(links),
         *eodhd,
-        *_fmp_assertions(agreed, tickers, bounds, unresolved["identifiers"]),
+        *_fmp_assertions(agreed, unresolved["identifiers"]),
+        *exported.assertions,
     ]
-    instruments = [
-        {
-            **_anchor("norgate_assetid", listing.assetid),
-            "issuer": None
-            if listing.assetid not in links
-            else _anchor("sec_cik", links[listing.assetid][0]),
-            "asset_type": listing.asset_type,
-            "venue": VENUE,
-        }
+    instruments: list[Record] = [
+        {**_anchor("norgate_assetid", listing.assetid), "asset_type": listing.asset_type}
+        | {"venue": VENUE}
         for listing in accepted
     ]
+    instruments.extend(exported.instruments)
+    for row in instruments:
+        link = links.get(str(row["anchor_token"]))
+        row["issuer"] = None if link is None else _anchor("sec_cik", link[0])
+    instruments.sort(key=lambda row: int(str(row["anchor_token"])))
     document: dict[str, object] = {
         "schema": REGISTRY_SCHEMA,
         "issuers": issuers,
@@ -1006,9 +1449,12 @@ def build_us_registry(
         frozenset(
             [master.rows.snapshot_id, *(rows.snapshot_id for rows in fmp)]
             + [members.rows.snapshot_id for members, _, _ in sec]
+            + [source.rows.snapshot_id for source in exports]
         ),
         intervals=intervals,
         through=bounds.through,
+        windows=exported.windows,
+        export_through=exported.through,
     )
 
 
@@ -1141,19 +1587,21 @@ def sec_archive(
     return archives[0], opener_for(archives[0])
 
 
-def build_from_workspace(
+def build_from_workspace(  # noqa: PLR0913 -- one keyword per source kind
     workspace: Workspace,
     *,
     master: str,
     fmp: Sequence[str] = (),
     sec: Sequence[str] = (),
+    exports: Sequence[str] = (),
     bindings: str | None = None,
 ) -> UsRegistry:
     """Build the registry from committed, linked sources named by their source IDs.
 
     The sources must include every source the workspace's registered US assertions cite
-    (``check_registered``). ``bindings`` names a legacy identity-bindings table to compare
-    the minted asset IDs with; it adds no claim.
+    (``check_registered``). ``exports`` names Norgate history export sources
+    (``norgate.export_listing@1``). ``bindings`` names a legacy identity-bindings table to
+    compare the minted asset IDs with; it adds no claim.
     """
     state = workspace.state
     # Every claim cites its source's sl: link, so an unlinked FMP source is refused here
@@ -1172,6 +1620,7 @@ def build_from_workspace(
         master_rows,
         fmp=[read_rows(workspace, source, FMP_TABLE) for source in fmp],
         sec=sec_inputs,
+        exports=[read_export_rows(workspace, source) for source in exports],
     )
     if bindings is not None:
         registry.bindings = compare_bindings(
