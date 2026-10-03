@@ -605,12 +605,20 @@ market과 state를 각각 한 트랜잭션으로 올린 다음 설치 영수증�
 ## 검사·복구·백업
 
 ```bash
-aas db verify
+aas db verify [--deep]
 aas db recover
 aas db quarantine --operation OPERATION_ID --reason REASON
-aas db backup --output /path/to/new-backup
-aas --home /path/to/new-home db restore --backup /path/to/new-backup
+aas db backup --output /path/to/new-backup [--deep]
+aas --home /path/to/new-home db restore --backup /path/to/new-backup [--deep]
 ```
+
+`db verify`, `db backup`, `db restore`, `db compact`는 기본으로 원천 자료실 테이블의 기록된 열과 행 수,
+승격 chain의 link와 마지막 delta를 대조하고 저장된 행을 다시 해시하지 않는다. `--deep`은 원천 테이블과
+승격 delta의 모든 행을 다시 해시해 기록된 digest와 비교한다. 두 방식의 보고 형식은 같고, 백업·복원
+응답의 `deep`이 어느 쪽으로 검증했는지 알려 준다. 기본 검증은 원천 행 값을 읽지 않으므로 수억 행
+설치본에서도 행 수 집계만큼만 걸린다. 행 값 손상까지 확인하려면 정기적으로, 그리고 백업을 삭제 근거로 쓰기 전에 `--deep`을
+실행한다. `migrate`·`run-install`·`run-migrate`가 만드는 백업은 기본 검증을 쓰고, compact는 새로 쓴 루트를
+항상 deep으로 검증한다.
 
 `db verify`, `db backup`, `db restore`, `db run-install`, `db migrate`도 설정된 공유 계산 예산을 사용한다.
 CLI는 저장소 잠금을 잡기 전에 계산 lease를 확보한다. Python 호출자는 검증·백업·복원과

@@ -188,11 +188,17 @@ def _market(workspace: Workspace, target: Path, budget: ComputeBudget | None) ->
             connection.close()
 
 
-def compact(home: Path, to: Path, *, budget: ComputeBudget | None = None) -> dict[str, object]:
-    """Rebuild the installation at ``home`` into the new root ``to`` and verify it there."""
+def compact(
+    home: Path, to: Path, *, budget: ComputeBudget | None = None, deep: bool = False
+) -> dict[str, object]:
+    """Rebuild the installation at ``home`` into the new root ``to`` and verify it there.
+
+    The original is verified by recorded digests unless ``deep``. The new root's rows
+    are rewritten rather than copied as bytes, so they are always rehashed there.
+    """
     root = resolve_home(home)
     with open_workspace(root, writable=True) as workspace:
-        before = verify_workspace(workspace, budget=budget)
+        before = verify_workspace(workspace, budget=budget, deep=deep)
         if before["pending_operations"] or before["orphan_generations"]:
             raise ValueError("compaction requires recovered operations and no orphan generations")
         if workspace.state.execute("SELECT 1 FROM runs WHERE status='RUNNING'").fetchone():
@@ -226,7 +232,7 @@ def compact(home: Path, to: Path, *, budget: ComputeBudget | None = None) -> dic
             for name in ("backups", "runtime"):
                 private_directory(target / name, create=True)
             with open_workspace(target, validating_restore=True) as rebuilt:
-                after = verify_workspace(rebuilt, budget=budget)
+                after = verify_workspace(rebuilt, budget=budget, deep=True)
             if after != before:
                 raise ValueError("compacted logical verification differs from the original")  # noqa: TRY301 -- persist the failed receipt
         except BaseException:

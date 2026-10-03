@@ -5,9 +5,10 @@ import json
 import shutil
 import sqlite3
 from contextlib import closing
+from datetime import date
 from fractions import Fraction
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -1525,3 +1526,115 @@ def test_membership_verification_uses_the_caller_allowance(
         with pytest.raises(ComputeResourceError, match="synthetic membership refusal"):
             verify_workspace(workspace, budget=budget)
     assert seen == [allowance]
+
+
+def _sqlite_source(path: Path) -> str:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("CREATE TABLE notes(label TEXT, amount INTEGER)")
+        connection.executemany("INSERT INTO notes VALUES (?,?)", [("a", 1), ("b", 2)])
+        connection.commit()
+    finally:
+        connection.close()
+    path.chmod(0o600)
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _no_row_read(*_args: object) -> tuple[int, str]:
+    raise AssertionError("a default verification read a stored source row")
+
+
+def test_default_verify_compares_digests_and_deep_rehashes(  # noqa: PLR0915 -- one store, every mode
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aegis_alpha.storage import source_library  # noqa: PLC0415
+    from aegis_alpha.storage.promotion.engine import promote  # noqa: PLC0415
+    from tests.storage.promotion_support import (  # noqa: PLC0415
+        add_source,
+        at,
+        bar,
+        register_symbols,
+        spec,
+    )
+
+    home = tmp_path / "home"
+    initialize(home)
+    snapshot = tmp_path / "notes.sqlite3"
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        source_library.import_sqlite(workspace, snapshot, "notes", _sqlite_source(snapshot))
+        first_pin = add_source(
+            workspace, [bar("AAA.KO", date(2025, 1, 2), 100.0, retrieved=at("2025-01-10"))], tag="a"
+        )
+        identity = register_symbols(workspace, first_pin["source_id"])
+        first = promote(workspace, *spec([first_pin], identity), apply=True)
+        second_pin = add_source(
+            workspace, [bar("AAA.KO", date(2025, 1, 3), 101.0, retrieved=at("2025-01-11"))], tag="b"
+        )
+        promote(
+            workspace,
+            *spec([second_pin], identity, parent=str(first["generation_id"])),
+            apply=True,
+        )
+        bars = source_library.list_tables(workspace, second_pin["source_id"])[0]["target"]
+        notes = source_library.list_tables(workspace, "notes")[0]["target"]
+    with open_workspace(home) as workspace:
+        deep = verify_workspace(workspace, deep=True)
+        # The default reads no stored source row, yet reports exactly what deep does.
+        monkeypatch.setattr(source_library, "arrow_digest", _no_row_read)
+        monkeypatch.setattr(source_library, "sqlite_digest", _no_row_read)
+        assert verify_workspace(workspace) == deep
+        monkeypatch.undo()
+    assert deep["dataset_versions"] == len((first_pin, second_pin))
+    assert deep["source_library"] == {"sources": 3, "tables": 3, "rows": 4, "linked": 2}
+
+    def tamper(store: str, statement: str) -> None:
+        with open_workspace(home, writable=True, strategy_write=True) as workspace:
+            connection = workspace.market if store == "market" else workspace.strategies
+            assert connection is not None
+            connection.execute(statement)
+            if store == "strategies":
+                cast("sqlite3.Connection", connection).commit()
+
+    # A changed value keeps every recorded count: only a deep verification rehashes it,
+    # and the same holds for backup and restore.
+    tamper("market", f'UPDATE "{bars}" SET close = close + 1')  # noqa: S608
+    tamper("strategies", f'UPDATE "{notes}" SET amount = amount + 1')  # noqa: S608
+    tamper(
+        "market",
+        "UPDATE prices SET currency='XXX' WHERE generation_id="  # noqa: S608
+        f"'{first['generation_id']}'",
+    )
+    with open_workspace(home) as workspace:
+        assert verify_workspace(workspace) == deep
+        with pytest.raises(ValueError, match="hash/count mismatch"):
+            verify_workspace(workspace, deep=True)
+    archive = tmp_path / "digest-backup"
+    receipt = backup(home, archive)
+    assert receipt["deep"] is False
+    with pytest.raises(ValueError, match="hash/count mismatch"):
+        backup(home, tmp_path / "deep-backup", deep=True)
+    assert not (tmp_path / "deep-backup").exists()
+    restored = restore(archive, tmp_path / "restored")
+    assert (restored["verification"], restored["deep"]) == (deep, False)
+    with pytest.raises(ValueError, match="hash/count mismatch"):
+        restore(archive, tmp_path / "deep-restore", deep=True)
+    tamper(
+        "market",
+        "UPDATE prices SET currency='KRW' WHERE generation_id="  # noqa: S608
+        f"'{first['generation_id']}'",
+    )
+    with open_workspace(home) as workspace, pytest.raises(ValueError, match="content/count"):
+        verify_workspace(workspace, deep=True)
+    # A missing row, an extra column or a missing table disagrees with the record itself.
+    tamper("strategies", f'DELETE FROM "{notes}" WHERE _aas_ordinal = 1')  # noqa: S608
+    with open_workspace(home) as workspace, pytest.raises(ValueError, match="row count"):
+        verify_workspace(workspace)
+    tamper("strategies", f"INSERT INTO \"{notes}\" VALUES (1, 'b', 2)")  # noqa: S608
+    tamper("market", f'ALTER TABLE "{bars}" ADD COLUMN extra INTEGER')
+    with open_workspace(home) as workspace, pytest.raises(ValueError, match="table/column"):
+        verify_workspace(workspace)
+    tamper("market", f'ALTER TABLE "{bars}" DROP COLUMN extra')
+    tamper("market", f'DROP TABLE "{bars}"')
+    with open_workspace(home) as workspace, pytest.raises(ValueError, match="table/column"):
+        verify_workspace(workspace)

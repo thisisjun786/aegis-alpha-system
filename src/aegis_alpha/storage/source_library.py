@@ -442,6 +442,79 @@ def _verify_manifest(
             raise ValueError("source library content/count mismatch")
 
 
+def _stored_columns(conn: sqlite3.Connection | duckdb.DuckDBPyConnection, target: str) -> list[str]:
+    """A stored source table's column names in declaration order, in either store."""
+    return [
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM pragma_table_info(?) ORDER BY cid", [target]
+        ).fetchall()
+    ]
+
+
+def _admit_table_names(
+    connections: dict[str, sqlite3.Connection | duckdb.DuckDBPyConnection], allowance: int
+) -> int:
+    """Charge every store's table-name list before a digest-only verification holds it."""
+    estimated = 0
+    for kind, conn in connections.items():
+        width = "octet_length(encode(name))" if kind == "market" else "length(CAST(name AS BLOB))"
+        estimated += cast(
+            "tuple[int]",
+            conn.execute(
+                "SELECT count(*)*2048+coalesce(sum(32*" + width + "),0) "
+                "FROM sqlite_master WHERE type='table'"
+            ).fetchone(),
+        )[0]
+        if estimated > allowance:
+            raise ComputeResourceError("source store catalog exceeds materialization budget")
+    return estimated
+
+
+def _table_names(conn: sqlite3.Connection | duckdb.DuckDBPyConnection) -> set[str]:
+    """Every table one store holds, read once instead of once per source table."""
+    return {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+
+
+def _compare_recorded(workspace: Workspace, manifest: dict[str, object], present: set[str]) -> None:
+    """Compare a commit's recorded tables with the stored ones without reading a row.
+
+    Each table the manifest names is among the store's ``present`` tables, with exactly
+    the recorded columns around the ordinal and the recorded row count. The recorded
+    content digest is what ``_verify_manifest`` recomputes, which only a deep
+    verification does.
+    """
+    conn = schema.connections(workspace)[str(manifest["store"])]
+    for table in cast("list[dict[str, object]]", manifest["tables"]):
+        target = str(table["target"])
+        columns = cast("list[str]", table["columns"])
+        expected = (
+            ["_aas_ordinal", *columns]
+            if table["format"] == "sqlite"
+            else [*columns, "_aas_ordinal"]
+        )
+        if target not in present or _stored_columns(conn, target) != expected:
+            raise ValueError("source library table/column mismatch")
+        counted = cast(
+            "tuple[int]", conn.execute("SELECT count(*) FROM " + schema.quoted(target)).fetchone()
+        )
+        if counted[0] != table["rows"]:
+            raise ValueError("source library row count mismatch")
+
+
+def _verify_stored(
+    workspace: Workspace, manifest: dict[str, object], allowance: int, present: set[str] | None
+) -> None:
+    """Rehash a live commit's tables when deep (``present`` is None), else compare records."""
+    if present is None:
+        _verify_manifest(workspace, manifest, allowance)
+    else:
+        _compare_recorded(workspace, manifest, present)
+
+
 def list_sources(workspace: Workspace) -> list[dict[str, object]]:
     """Every completed source whose tables are present; a retired source is not listed."""
     if not schema.ensure(workspace):
@@ -637,9 +710,14 @@ def read_table(
 
 
 def verify_sources(  # noqa: C901 -- live and retired commits under one admission
-    workspace: Workspace, *, budget: ComputeBudget | None = None
+    workspace: Workspace, *, budget: ComputeBudget | None = None, deep: bool = False
 ) -> dict[str, object] | None:
-    """Verify retained sources within whatever the caller's budget still allows."""
+    """Verify retained sources within whatever the caller's budget still allows.
+
+    Every marker is matched to its intent, link and retirement record. A live table is
+    compared with its recorded columns and row count; ``deep`` also rehashes its rows
+    against the recorded digest. The report is the same in both modes.
+    """
     if not schema.ensure(workspace):
         return None
     budget = budget or ComputeBudget(Fraction(1), 512 * 1024 * 1024)
@@ -649,11 +727,17 @@ def verify_sources(  # noqa: C901 -- live and retired commits under one admissio
     remaining = allowance - _admit_source_metadata(workspace, allowance)
     if remaining <= 0:
         raise ComputeResourceError("source metadata leaves no verification budget")
+    connections = schema.connections(workspace)
+    # The default holds each store's table names in place of per-table lookups.
+    remaining -= 0 if deep else _admit_table_names(connections, remaining)
     total = tables = sources = 0
     committed: list[str] = []
+    # Every marker's source ID, already charged with the metadata above.
+    marked: set[str] = set()
     retired = retired_sources(workspace)
     retired_seen: dict[str, int] = {}
-    for conn in schema.connections(workspace).values():
+    for conn in connections.values():
+        present = None if deep else _table_names(conn)
         for row in conn.execute(
             "SELECT source_id,operation_id,request_hash,source_sha256,manifest_json "
             "FROM source_library_commits"
@@ -666,6 +750,7 @@ def verify_sources(  # noqa: C901 -- live and retired commits under one admissio
                 operation["payload_hash"],
             ) != ("source_import", row[2], row[0], row[3]):
                 raise ValueError("source marker/intent mismatch")
+            marked.add(str(row[0]))
             manifest = json.loads(row[4])
             if (record := retired.get(str(row[0]))) is not None:
                 _verify_retired(
@@ -679,7 +764,7 @@ def verify_sources(  # noqa: C901 -- live and retired commits under one admissio
                 committed.append(str(row[0]))
                 retired_seen[str(row[0])] = cast("int", record["rows"])
                 continue
-            _verify_manifest(workspace, manifest, remaining)
+            _verify_stored(workspace, manifest, remaining, present)
             if operation["phase"] == "COMPLETED":
                 committed.append(str(row[0]))
                 sources += 1
@@ -688,7 +773,7 @@ def verify_sources(  # noqa: C901 -- live and retired commits under one admissio
     for row in workspace.state.execute(
         "SELECT target_id FROM storage_operations WHERE kind='source_import' AND phase='COMPLETED'"
     ):
-        if _marker(workspace, row[0]) is None:
+        if row[0] not in marked:
             raise ValueError("completed source intent lacks target marker")
     if retired.keys() - retired_seen.keys():
         raise ValueError("retired source lacks its commit marker")
