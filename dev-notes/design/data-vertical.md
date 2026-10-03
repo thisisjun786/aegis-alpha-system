@@ -1120,7 +1120,8 @@ fingerprint = sha256(정규 JSON ["aas-opendart-request-v1", endpoint, parameter
 
 관측일은 요청에 들어가지 않는다. 같은 질문을 다른 날 다시 묻는 것은 같은 요청의 다음 attempt이고,
 관측일을 담은 legacy 요청 문서도 같은 요청으로 읽힌다. 응답 결과는 `COMPLETED`(내용 있는 답),
-`NO_DATA`(공급자 상태 `013`), `FAILED`(그 밖의 답)이며 수집 경로만 정한다. 응답 bytes는 결과와 상관없이
+`NO_DATA`(공급자 상태 `013`), `FAILED`(그 밖의 답)이며 수집 경로만 정한다. corp code 답은
+`CORPCODE.xml`이 읽히고 종목코드가 있는 회사를 나열할 때만 `COMPLETED`다. 응답 bytes는 결과와 상관없이
 보존하고 판정은 승격 매퍼가 한다. 키·IP·만료 거부와 일일 한도(`010`·`011`·`012`·`020`·`021`·`901`,
 HTTP 401·403·429)는 실행을 멈춘다. 키는 공급자 URL에만 실리며 응답이 키를 되돌려 주면 그 응답을
 보존하지 않는다.
@@ -1133,15 +1134,16 @@ HTTP 401·403·429)는 실행을 멈춘다. 키는 공급자 URL에만 실리며
 
 | 이유 | 연결(`CFS`) 요청을 묻는 조건 |
 | --- | --- |
-| `never_asked` | 물은 적이 없음 |
 | `new_filing` | 그 보고서의 공시 접수일이 마지막 수집의 Seoul 날짜 이후(같은 날 포함)이고 그 수집이 오늘 전. 늦은 제출과 정정 공시다 |
+| `never_asked` | 물은 적이 없음 |
 | `season_retry` | 마지막 답이 `NO_DATA`이고 제출 기한(분기·반기 45일, 사업 90일)+30일 안에서 7일이 지남 |
-| `no_data_retry` | 마지막 답이 `NO_DATA`이고 그 시즌 뒤 90일이 지남. 직전 사업연도 이후의 보고서만이며 더 오래된 보고서는 공시가 먼저 알린다 |
 | `failed_retry` | 마지막 답이 `FAILED`이거나 답을 보존하지 못한 attempt이고 하루가 지남 |
+| `no_data_retry` | 마지막 답이 `NO_DATA`이고 그 시즌 뒤 90일이 지남. 직전 사업연도 이후의 보고서만이며 더 오래된 보고서는 공시가 먼저 알린다 |
 
 별도(`OFS`) 요청은 연결 요청의 마지막 답이 `NO_DATA`인 동안 같은 규칙을 따른다. `COMPLETED`는 새 공시가
-없으면 다시 묻지 않는다. 요청 순서는 위 표의 순서이고, 같은 이유 안에서는 최신 기간부터다. 간격은
-`CohortPolicy`의 값이며 그 해시가 원장 job의 `policy_hash`다.
+없으면 다시 묻지 않는다. 요청 순서는 위 표의 순서(`opendart_cohort.REASONS`)이고, 같은 이유 안에서는
+최신 기간부터다. 간격은 `CohortPolicy`의
+값이며 그 해시가 원장 job의 `policy_hash`다.
 
 공시 목록은 하루 단위로 읽는다. 오늘 전의 Seoul 날짜는 그 날이 끝난 뒤 받은 첫 page와 첫 page가 센
 모든 page의 답이 있을 때 덮인 것이다(첫 page가 `NO_DATA`면 공시 없는 날). 처음에는 90일 전부터 읽고,
@@ -1175,7 +1177,8 @@ attempt, HTTP 상태, 보존 header(`content-type`·`date`·`retry-after`), 요�
 `request_json`(`endpoint`·`parameters_json`), `receipt_json`, `receipt_sha256`, `raw_base64`, `raw_sha256`,
 `retrieved_at_utc`(`YYYY-MM-DDTHH:MM:SS.ffffffZ`)의 텍스트이며 `dart.fnltt@1`, `dart.fnltt_filings@1`,
 `dart.corp_codes@1`이 이 테이블을 읽는다. 공시 목록 행은 재무 매퍼에서 `other_endpoint`다. commit 전에
-중단된 실행의 `charged` receipt 중 어느 commit에도 없는 것은 다음 실행이 먼저 commit한다.
+중단된 실행의 `charged` receipt 중 어느 commit에도 없는 것은 다음 실행이 먼저 commit하고, 계획 전에 그 답을
+아는 것에 더하므로 그 요청을 다시 묻지 않는다. 한 batch에는 완료된 corp code 답이 많아야 하나다.
 
 **KIND.** `aas collect kind run`은 KIND 상장법인목록 내려받기(`corpList.do`, 시장 `stockMkt`·`kosdaqMkt`)를
 요청 `kind-kospi`·`kind-kosdaq`로 묻고, 응답과 receipt(`aas-kind-receipt-v1`: 요청 `source_id`, HTTP 상태,
@@ -1958,8 +1961,12 @@ state v2:
 | DV-276 | 수집 실행은 corp code·공시 목록·재무 순으로 묻고, batch 단위 `opendart-receipts` 원천을 DART 매퍼가 읽으며, 키는 보존되지 않는다 | `tests/storage/test_kr_collection.py::test_a_run_asks_by_phase_and_commits_receipts_the_dart_mappers_read` | 구현 |
 | DV-277 | 다음 실행은 commit된 답으로 할 일을 정하고 끝난 요청을 다시 묻지 않는다 | `tests/storage/test_kr_collection.py::test_the_next_day_asks_what_the_answers_made_due_and_nothing_else` | 구현 |
 | DV-278 | 일일 quota는 실행을 넘어 원장으로 세어진다 | `tests/storage/test_kr_collection.py::test_the_daily_quota_counts_the_ledger_across_runs` | 구현 |
-| DV-279 | 중단된 실행의 attempt는 정산되고 보존된 receipt는 다음 실행이 먼저 commit한다 | `tests/storage/test_kr_collection.py::test_an_interrupted_run_is_settled_and_its_receipts_committed_next` | 구현 |
+| DV-279 | 중단된 실행의 attempt는 정산되고, 보존된 receipt는 다음 실행이 계획 전에 알고 먼저 commit하며 그 요청을 다시 묻지 않는다 | `tests/storage/test_kr_collection.py::test_an_interrupted_run_is_settled_and_its_receipts_committed_next` | 구현 |
 | DV-280 | 키·한도 거부는 실행을 멈추고 그 답을 commit한다 | `tests/storage/test_kr_collection.py::test_a_refused_key_stops_the_run_and_keeps_the_answer` | 구현 |
 | DV-281 | 전송 실패는 `uncertain`이며 세 번 이어지면 실행을 멈추고 quota에 세어진다 | `tests/storage/test_kr_collection.py::test_transport_failures_are_uncertain_and_stop_after_three` | 구현 |
 | DV-282 | KIND 목록 수집은 `kind-listings` 원천으로 commit되고 cohort의 회사를 좁힌다 | `tests/storage/test_kr_collection.py::test_kind_lists_commit_as_listing_sources_and_narrow_the_cohort` | 구현 |
 | DV-283 | 상장법인목록 표가 아닌 KIND 답은 거부를 보고하고 원천이 되지 않는다 | `tests/storage/test_kr_collection.py::test_a_kind_answer_that_is_not_the_listing_table_is_refused` | 구현 |
+| DV-284 | 한 `opendart-receipts` 원천에는 완료된 corp code 답이 많아야 하나다 | `tests/storage/test_kr_collection.py::test_a_batch_holds_at_most_one_completed_corp_code_list` | 구현 |
+| DV-285 | marker는 commit됐지만 완료되지 않은 batch는 다음 실행이 완료하고 그 receipt를 다시 commit하지 않는다 | `tests/storage/test_kr_collection.py::test_a_commit_left_without_its_completion_is_finished_not_committed_again` | 구현 |
+| DV-286 | legacy `opendart-native` receipts 테이블의 세 형태(`raw_json`, `raw_base64`, 검증 결과)는 모두 계획에 읽힌다 | `tests/storage/test_kr_collection.py::test_legacy_receipts_tables_of_every_shape_are_read` | 구현 |
+| DV-287 | `aas-opendart-receipt-v1`, `aas-opendart-batch-v1`, `aas-kind-receipt-v1` 형식은 고정 입력과 기대 digest로 고정돼 있다 | `tests/storage/test_kr_collection.py::test_receipt_batch_and_kind_receipt_formats_are_frozen` | 구현 |

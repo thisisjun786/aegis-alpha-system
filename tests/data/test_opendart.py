@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import zipfile
 from collections.abc import Mapping
 from datetime import date
 
@@ -123,6 +125,12 @@ def test_outcomes_route_the_collector_and_keep_the_provider_status() -> None:
     assert classify(corp, _response(archive)) == (COMPLETED, None)
     assert classify(corp, _response(status("020"))) == (FAILED, "020")
     assert classify(corp, _response(b"not a zip")) == (FAILED, None)
+    # An archive that does not parse into listed companies is a failed answer, not a crash.
+    assert classify(corp, _response(corp_archive([("00000303", "")]))) == (FAILED, None)
+    broken = io.BytesIO()
+    with zipfile.ZipFile(broken, "w") as archive_file:
+        archive_file.writestr("CORPCODE.xml", b"<result><list>")
+    assert classify(corp, _response(broken.getvalue())) == (FAILED, None)
     answer = statements("00000101", "2026", "11014", "20261114000001")
     assert classify(statement, _response(answer)) == (COMPLETED, "000")
     assert classify(statement, _response(status("013"))) == (NO_DATA, "013")

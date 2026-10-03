@@ -17,9 +17,10 @@ before the attempt succeeds. A batch document (``aas-opendart-batch-v1``) lists 
 receipts of one commit in collection order, so the batch, its receipts and their
 responses are one complete unit whose boundary the bytes fix. A run interrupted before
 its commit leaves succeeded attempts whose receipts no committed batch lists; the next
-run commits them first. Rows keep the receipt's fields as text and the response as
-base64, the receipts shape ``dart.fnltt@1``, ``dart.fnltt_filings@1`` and
-``dart.corp_codes@1`` read.
+run adds their answers to what it knows before planning and commits them first. Rows
+keep the receipt's fields as text and the response as base64, the receipts shape
+``dart.fnltt@1``, ``dart.fnltt_filings@1`` and ``dart.corp_codes@1`` read; a batch holds
+at most one completed corp code list.
 
 ``collect_kind`` fetches KIND's KOSPI and KOSDAQ listed-company lists and commits each
 answer with its receipt as a ``kind-listings`` content source (``kr_identity.kind_unit``).
@@ -29,6 +30,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.util
 import json
 import time
 from collections import Counter
@@ -73,7 +75,7 @@ from aegis_alpha.storage import source_library_schema as schema
 from aegis_alpha.storage.kr_identity import KIND_TABLE, import_unit, kind_unit
 from aegis_alpha.storage.raw import put_raw
 from aegis_alpha.storage.source_identity import SourceContent, SourceFile
-from aegis_alpha.storage.source_library import list_sources, list_tables
+from aegis_alpha.storage.source_library import list_sources, list_tables, recover_source
 
 if TYPE_CHECKING:
     import duckdb
@@ -173,6 +175,21 @@ class Retained:
     @property
     def document(self) -> dict[str, object]:
         return cast("dict[str, object]", json.loads(self.receipt))
+
+    @property
+    def completed_corp_codes(self) -> bool:
+        body = self.document
+        request = cast("dict[str, object]", body["request"])
+        return request.get("endpoint") == CORP_CODES and body.get("outcome") == COMPLETED
+
+    def observe(self, knowledge: Knowledge) -> bool:
+        """Add this answer to what the planner knows, as its committed row would."""
+        row = self.row()
+        outcome = row[2]
+        return observe_row(
+            knowledge, (row[1], outcome, row[4], row[9]),
+            self.response if outcome == COMPLETED else None,
+        )  # fmt: skip
 
     def row(self) -> tuple[str | None, ...]:
         body = self.document
@@ -396,6 +413,27 @@ def kind_codes(workspace: Workspace) -> frozenset[str] | None:
     return frozenset().union(*(codes for _, codes in newest.values()))
 
 
+def finish_batches(workspace: Workspace) -> int:
+    """Complete receipt batches an interrupted commit left with a marker but no completion.
+
+    Their receipts are then committed, so they are not taken for orphans and committed again.
+    """
+    rows = workspace.state.execute(
+        "SELECT operation_id FROM storage_operations WHERE phase='PREPARED' "
+        "AND kind='source_import' AND substr(target_id,1,?)=?",
+        [len(f"{SOURCE_PREFIX}{SHAPE}-"), f"{SOURCE_PREFIX}{SHAPE}-"],
+    ).fetchall()
+    return sum(recover_source(workspace, str(row[0])) for row in rows)
+
+
+def recovered(workspace: Workspace, known: Known) -> list[Retained]:
+    """The orphans of ``known``, added to its knowledge so no plan asks them again."""
+    found = orphans(workspace, known.committed_receipts)
+    for item in found:
+        known.unreadable += not item.observe(known.knowledge)
+    return found
+
+
 def orphans(workspace: Workspace, committed: set[str]) -> list[Retained]:
     """Receipts succeeded attempts retained that no committed batch lists, oldest first."""
     found: list[Retained] = []
@@ -434,11 +472,22 @@ class Run:
 
     def flush(self, *, final: bool = False) -> None:
         while self.pending and (final or len(self.pending) >= self.batch_size):
-            chunk, self.pending = (
-                self.pending[: self.batch_size],
-                self.pending[self.batch_size :],
-            )
+            size = self._chunk_size()
+            chunk, self.pending = self.pending[:size], self.pending[size:]
             self.committed.append(commit_batch(self.workspace, Batch.of(chunk)))
+
+    def _chunk_size(self) -> int:
+        """Up to ``batch_size`` receipts, ending before a second completed corp code list.
+
+        ``dart.corp_codes@1`` reads one completed corp code list per source.
+        """
+        seen = False
+        for index, item in enumerate(self.pending[: self.batch_size]):
+            if item.completed_corp_codes:
+                if seen:
+                    return index
+                seen = True
+        return min(self.batch_size, len(self.pending))
 
     def _now_us(self) -> int:
         return _us(self.clock())
@@ -561,12 +610,15 @@ def collect_dart(  # noqa: PLR0913 -- every bound of one run is explicit
 ) -> dict[str, object]:
     """One bounded OpenDART collection; see the module documentation for the phases."""
     policy = policy or CohortPolicy()
+    if importlib.util.find_spec("pyarrow") is None:  # commits need the legacy extra
+        raise ValueError("aas collect dart run needs pyarrow (the legacy extra)")
     for name, value in (("max_calls", max_calls), ("daily_quota", daily_quota),
                         ("batch_size", batch_size)):  # fmt: skip
         if type(value) is not int or value < (0 if name == "max_calls" else 1):
             raise ValueError(f"{name} must be a positive integer")
     now = clock()
     settled = ledger.recover(workspace.state, DART_PROVIDER, at_us=_us(now))
+    finish_batches(workspace)
     known = load_known(workspace)
     used = ledger.used(workspace.state, DART_PROVIDER, since_us=_us(now) - _DAY_US)
     run = Run(
@@ -580,8 +632,8 @@ def collect_dart(  # noqa: PLR0913 -- every bound of one run is explicit
         min_interval,
         known.knowledge,
     )
-    run.pending.extend(orphans(workspace, known.committed_receipts))
-    recovered = len(run.pending)
+    run.pending.extend(recovered(workspace, known))
+    recovered_receipts = len(run.pending)
     today = seoul_day(now)
     run.ask_all(plan_corp_codes(run.knowledge, today, policy))
     run.ask_list(list_gaps(run.knowledge, today, policy))
@@ -596,7 +648,7 @@ def collect_dart(  # noqa: PLR0913 -- every bound of one run is explicit
         "seoul_date": today.isoformat(),
         "policy_sha256": policy.sha256,
         "recovered_attempts": settled,
-        "recovered_receipts": recovered,
+        "recovered_receipts": recovered_receipts,
         "known": {
             "sources": known.sources,
             "rows": known.rows,
@@ -619,18 +671,13 @@ def collect_dart(  # noqa: PLR0913 -- every bound of one run is explicit
 def plan_dart(workspace: Workspace, *, today: date, policy: CohortPolicy) -> dict[str, object]:
     """What a run on ``today`` would ask first, from committed knowledge; writes nothing."""
     known = load_known(workspace)
+    uncommitted = recovered(workspace, known)
     return plan_report(known.knowledge, today=today, policy=policy) | {
         "known": {
             "sources": known.sources,
             "rows": known.rows,
             "unreadable_rows": known.unreadable,
-            "uncommitted_receipts": len(
-                [
-                    digest
-                    for digest in ledger.charged_receipts(workspace.state, DART_PROVIDER)
-                    if digest not in known.committed_receipts
-                ]
-            ),
+            "uncommitted_receipts": len(uncommitted),
         }
     }
 

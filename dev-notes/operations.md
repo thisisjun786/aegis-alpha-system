@@ -265,7 +265,7 @@ aas identity register --file registry.json --sha256 SHA256 --plan
 `kr-import`는 수집해 둔 KIND 상장법인목록 receipt와 EODHD 거래소 종목 목록 job 디렉터리를 읽어 원본
 bytes를 `raw/`에 두고 내용 원천(`kind-listings-<hex>`, `qveris-eodhd-exchange-symbols-<hex>`)으로
 commit한다. 두 옵션 모두 반복할 수 있고, 같은 수집물을 다시 넣으면 원천을 재사용한다. `--plan`은 원천 ID,
-행 수, commit 여부만 보고하고 쓰지 않는다. commit에는 `pyarrow`(legacy extra)가 필요하다. 공급자를
+행 수, commit 여부만 보고하고 쓰지 않는다. commit에는 `pyarrow`(legacy extra)가 필요하며, 없으면 공급자를 부르기 전에 실패한다. 공급자를
 호출하지 않는다.
 
 `kr-build`는 설치본을 읽기 전용으로 열어 지정한 원천을 pin과 대조해 읽고, `eodhd.kr_symbol@1`,
@@ -1235,6 +1235,10 @@ commit에는 `pyarrow`(legacy extra)가 필요하다.
 `kind run`은 KIND 유가증권·코스닥 상장법인목록을 받아 각각 `kind-listings-<hex>` 원천으로 commit한다. 두
 목록이 모두 commit되면 다음 `dart` 계획은 그 단축코드의 회사로 좁혀진다. 목록 하나라도 commit되지 않으면
 종료 코드 1이다.
+
+첫 `dart run` 전에 `kind run`으로 두 목록을 commit한다. 두 목록이 없으면 계획은 corp code 목록에서 종목코드가
+있는 모든 회사(상장폐지·코넥스 포함)를 묻고 보고서의 `kind_filter`가 `false`다. `dart plan`으로
+`kind_filter: true`와 회사 수를 확인한 뒤 `dart run`을 켠다.
 
 승인된 수집기(OpenDART corp code·공시 목록·재무, KIND 목록)지만 패키지 설치나 이 명령은 예약 실행을
 만들지 않는다. `[owner]` 예약 실행은 운영 전환에서 키 파일과 호출 상한을 정해 켜고, 같은 키를 쓰는 legacy

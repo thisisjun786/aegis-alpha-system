@@ -399,7 +399,7 @@ def classify(request: DartRequest, response: DartResponse) -> tuple[str, str | N
         return FAILED, status
     if request.endpoint == CORP_CODES:
         try:
-            corp_code_xml(response.body)
+            listed_corp_codes(response.body)
         except ValueError:
             return FAILED, status
         return COMPLETED, None

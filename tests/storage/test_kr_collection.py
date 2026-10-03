@@ -6,21 +6,28 @@ The provider is ``tests.data.opendart_support.FakeProvider``; every company is s
 # ruff: noqa: PLR2004 -- synthetic counts are the expected values
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 from collections.abc import Iterator, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import cast
+from typing import Final, cast
 
+import pyarrow as pa
 import pytest
 
 from aegis_alpha.application.cli import main
-from aegis_alpha.data.opendart import HttpAnswer, OpenDartClient
-from aegis_alpha.data.opendart_cohort import CohortPolicy
+from aegis_alpha.data.kind import KindResponse
+from aegis_alpha.data.opendart import DartRequest, DartResponse, HttpAnswer, OpenDartClient
+from aegis_alpha.data.opendart_cohort import CohortPolicy, plan_financials
+from aegis_alpha.storage import collection_ledger as ledger
 from aegis_alpha.storage import kr_collection
 from aegis_alpha.storage.promotion.engine import promote
-from aegis_alpha.storage.source_library import list_tables
+from aegis_alpha.storage.raw import put_raw
+from aegis_alpha.storage.source_identity import SourceContent, SourceFile
+from aegis_alpha.storage.source_library import import_content_arrow, list_tables
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
 from tests.data.opendart_support import (
     KEY,
@@ -39,6 +46,11 @@ from tests.storage.kr_identity_support import kind_listing
 POLICY = CohortPolicy(first_year=2025, list_lookback_days=2)
 A, B, UNLISTED = "00000101", "00000202", "00000303"
 Q1 = "20260515000001"
+# Frozen digests of aas-opendart-receipt-v1, aas-opendart-batch-v1 and aas-kind-receipt-v1.
+RECEIPT_SHA256: Final = "bdbdefd81710247c4282351e961f5afad2565740bc5c5806db468d0d77e15db8"
+BATCH_SHA256: Final = "3244fc85c575d916c554f2a428a8ef4c2e7fad6fc79cf67e5112a16ecd2c554b"
+SOURCE_SHA256: Final = "ca260bfbb35fe47bf5c19a47bd7b7d632672df86de14ae8b1c0b6b9a38b81361"
+KIND_SHA256: Final = "f62b9e840744f756ec213b6b6e91d44bc8ff833849e9af4d7335e60c6c136712"
 
 
 @pytest.fixture
@@ -218,14 +230,55 @@ def test_an_interrupted_run_is_settled_and_its_receipts_committed_next(ws: Works
         )  # fmt: skip
     assert _ledger(ws) == ({"started": 1, "succeeded": 3}, {"charged": 3, "reserved": 4})
     assert kr_collection.load_known(ws).sources == 0
+    answered = list(provider.calls)
+    plan = kr_collection.plan_dart(ws, today=date(2026, 5, 16), policy=POLICY)
+    assert (plan["corp_codes_due"], plan["listed_corps"]) == (False, 2)
+    assert cast("dict[str, int]", plan["known"])["uncommitted_receipts"] == 3
+    provider.calls.clear()
     result = _run(ws, provider, clock)
     assert result["recovered_attempts"] == {"released": 0, "uncertain": 1}
     assert result["recovered_receipts"] == 3
+    # The interrupted run's answers are known before planning, so none is asked again.
+    assert [call for call in provider.calls if call in answered] == []
+    assert provider.asked("corpCode.xml") == []
+    assert [(p["bgn_de"], p["page_no"]) for p in provider.asked("list.json")] == []
     sources = cast("list[dict[str, object]]", result["sources"])
     assert sources[0]["rows"] == 3 + cast("int", result["provider_calls"])
     attempts, usage = _ledger(ws)
     assert attempts["uncertain"] == 1
     assert usage["uncertain"] == 1
+
+
+def _endpoints(ws: Workspace, source: dict[str, object]) -> list[str]:
+    ((store, entry),) = kr_collection._receipt_tables(ws, str(source["source_id"]), "receipts")  # noqa: SLF001 -- the collector's own table reader
+    rows = kr_collection._select(ws, store, entry, ("endpoint",), "ORDER BY _aas_ordinal")  # noqa: SLF001
+    return [str(row[0]) for row in rows]
+
+
+def test_a_batch_holds_at_most_one_completed_corp_code_list(ws: Workspace) -> None:
+    provider, clock = _provider(), _clock()
+
+    def interrupt(
+        method: str, url: str, body: bytes | None, headers: Mapping[str, str]
+    ) -> HttpAnswer:
+        if len(provider.calls) == 1:
+            raise _InterruptedError
+        return provider(method, url, body, headers)
+
+    with pytest.raises(_InterruptedError):
+        kr_collection.collect_dart(
+            ws, OpenDartClient(KEY, interrupt, clock), policy=POLICY, clock=clock,
+            sleep=lambda _: None,
+        )  # fmt: skip
+    # A week later the list is due again while the first answer is still uncommitted.
+    clock.advance(days=8)
+    provider.calls.clear()
+    result = _run(ws, provider, clock)
+    assert len(provider.asked("corpCode.xml")) == 1
+    sources = cast("list[dict[str, object]]", result["sources"])
+    lists = [_endpoints(ws, source).count("corp_codes") for source in sources]
+    assert lists[:2] == [1, 1]
+    assert max(lists) == 1
 
 
 def test_a_refused_key_stops_the_run_and_keeps_the_answer(ws: Workspace) -> None:
@@ -320,3 +373,116 @@ def test_cli_plans_without_calls_and_runs_with_a_private_key(
     monkeypatch.setattr("aegis_alpha.data.opendart.urllib_transport", _kind_provider)
     assert main(["collect", "kind", "run", "--home", str(root)]) == 0
     assert json.loads(capsys.readouterr().out)["exit_code"] == 0
+
+
+def test_a_commit_left_without_its_completion_is_finished_not_committed_again(
+    ws: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider, clock = _provider(), _clock()
+
+    def interrupt(*_args: object) -> None:
+        raise _InterruptedError
+
+    # The batch marker commits and the run stops before its operation completes.
+    with monkeypatch.context() as patch:
+        patch.setattr("aegis_alpha.storage.source_library.complete_operation", interrupt)
+        with pytest.raises(_InterruptedError):
+            _run(ws, provider, clock)
+    assert kr_collection.load_known(ws).sources == 0
+    clock.advance(days=1)
+    result = _run(ws, FakeProvider(corp_codes=provider.corp_codes), clock)
+    assert result["recovered_receipts"] == 0
+    assert cast("dict[str, int]", result["known"])["sources"] == 1
+    assert cast("dict[str, int]", result["known"])["rows"] == 14
+
+
+_LEGACY_SHAPES: Final = {
+    "raw_json": ("fingerprint", "outcome", "endpoint", "request_json", "receipt_json",
+                 "raw_json", "raw_sha256", "retrieved_at_utc"),
+    "raw_base64": ("fingerprint", "outcome", "endpoint", "request_json", "receipt_json",
+                   "raw_base64", "raw_sha256", "retrieved_at_utc"),
+    "validated": ("fingerprint", "outcome", "original_outcome", "validation_json", "endpoint",
+                  "request_json", "receipt_json", "raw_base64", "raw_sha256",
+                  "retrieved_at_utc"),
+}  # fmt: skip
+
+
+def _legacy_row(  # noqa: PLR0913, PLR0917 -- one legacy row spells every receipt field
+    shape: str, endpoint: str, outcome: str, request: str, raw: bytes, retrieved: str
+) -> dict[str, str]:
+    row = {
+        "fingerprint": hashlib.sha256(request.encode()).hexdigest(),
+        "outcome": outcome,
+        "original_outcome": "FAILED",
+        "validation_json": json.dumps({"validated_outcome": outcome}),
+        "endpoint": endpoint,
+        "request_json": request,
+        "receipt_json": "{}",
+        "raw_json": raw.decode(errors="replace"),
+        "raw_base64": base64.b64encode(raw).decode(),
+        "raw_sha256": hashlib.sha256(raw).hexdigest(),
+        "retrieved_at_utc": retrieved,
+    }
+    return {name: row[name] for name in _LEGACY_SHAPES[shape]}
+
+
+def _commit_legacy(ws: Workspace, shape: str, rows: list[dict[str, str]]) -> None:
+    _, digest, size = put_raw(ws.paths.raw, f"synthetic-legacy-{shape}".encode())
+    content = SourceContent("opendart", "native", 1, (SourceFile(digest, size),))
+    columns = _LEGACY_SHAPES[shape]
+    table = pa.table(
+        {name: [row[name] for row in rows] for name in columns},
+        schema=pa.schema([(name, pa.string()) for name in columns]),
+    )
+    import_content_arrow(ws, content, "receipts", table.to_reader())
+
+
+def test_legacy_receipts_tables_of_every_shape_are_read(ws: Workspace) -> None:
+    corp_request = json.dumps({"endpoint": "corp_codes", "parameters_json": "{}"})
+    answer = statements(A, "2025", "11011", "20250515000001")
+    _commit_legacy(ws, "raw_json", [
+        _legacy_row("raw_json", "financials", "COMPLETED", dart.request(A, "2025", "11011"),
+                    answer, "2026-05-02T00:00:00.000000Z"),
+    ])  # fmt: skip
+    _commit_legacy(ws, "raw_base64", [
+        _legacy_row("raw_base64", "corp_codes", "COMPLETED", corp_request,
+                    corp_archive([(A, "000101")]), "2026-05-01T00:00:00.000000Z"),
+    ])  # fmt: skip
+    # The validated outcome is the one read; the provider's original outcome was FAILED.
+    _commit_legacy(ws, "validated", [
+        _legacy_row("validated", "financials", "COMPLETED", dart.request(B, "2025", "11012"),
+                    statements(B, "2025", "11012", "20250814000001"),
+                    "2026-05-03T00:00:00.000000Z"),
+        _legacy_row("validated", "corp_codes", "COMPLETED", corp_request,
+                    corp_archive([(A, "000101"), (B, "000202")]),
+                    "2026-05-04T00:00:00.000000Z"),
+    ])  # fmt: skip
+    known = kr_collection.load_known(ws)
+    assert (known.sources, known.rows, known.unreadable) == (3, 4, 0)
+    assert known.knowledge.corps == (A, B)
+    for corp, report in ((A, "11011"), (B, "11012")):
+        seen = known.knowledge.seen(DartRequest.financials(corp, 2025, report, "CFS"))
+        assert seen is not None
+        assert seen.outcome == "COMPLETED"
+    planned = plan_financials(known.knowledge, date(2026, 5, 16), POLICY)
+    asked = {(p.request.parameters["corp_code"], p.request.parameters["reprt_code"])
+             for p in planned if p.request.parameters["bsns_year"] == "2025"}  # fmt: skip
+    assert not asked & {(A, "11011"), (B, "11012")}
+    assert {(A, "11012"), (B, "11011")} <= asked
+
+
+def test_receipt_batch_and_kind_receipt_formats_are_frozen() -> None:
+    at = datetime(2026, 5, 16, 1, 0, tzinfo=UTC)
+    request = DartRequest.financials(A, 2026, "11013", "CFS")
+    response = DartResponse(200, (("content-type", "application/json"),),
+                            statements(A, "2026", "11013", Q1), at, at)  # fmt: skip
+    receipt = kr_collection.receipt_bytes(
+        request, response, outcome="COMPLETED", provider_status="000",
+        attempt=ledger.Attempt("opendart:" + request.fingerprint, 1),
+    )  # fmt: skip
+    assert hashlib.sha256(receipt).hexdigest() == RECEIPT_SHA256
+    batch = kr_collection.Batch.of([kr_collection.Retained(receipt, response.body)])
+    assert hashlib.sha256(batch.manifest).hexdigest() == BATCH_SHA256
+    assert batch.content.source_id == "opendart-receipts-" + SOURCE_SHA256
+    kind = KindResponse("kind-kospi", HttpAnswer(200, (), b"synthetic listing"), at, at)
+    assert hashlib.sha256(kind.receipt()).hexdigest() == KIND_SHA256
