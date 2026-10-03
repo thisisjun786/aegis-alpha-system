@@ -75,7 +75,8 @@ def _file_hash(path: Path) -> dict[str, object]:
     return {"size_bytes": size, "sha256": hasher.hexdigest()}
 
 
-def _copy_tree(source: Path, target: Path, files: dict[str, object], prefix: str) -> None:
+def copy_tree(source: Path, target: Path, files: dict[str, object], prefix: str) -> None:
+    """Copy a private tree file by file, refusing symlinks; ``files`` receives each hash."""
     private_directory(source)
     private_directory(target, create=True)
     with DescriptorTree.open_path(source) as tree:
@@ -85,7 +86,7 @@ def _copy_tree(source: Path, target: Path, files: dict[str, object], prefix: str
         if child.is_symlink():
             raise ValueError("backup refuses symlinks")
         if child.is_dir():
-            _copy_tree(child, target / name, files, prefix + name + "/")
+            copy_tree(child, target / name, files, prefix + name + "/")
         else:
             files[prefix + name] = _copy_file(child, target / name)
 
@@ -134,8 +135,8 @@ def backup_workspace(
         files[path.name] = _file_hash(path)
     with workspace.checkpointed_market():
         files["market.duckdb"] = _copy_file(workspace.paths.market, target / "market.duckdb")
-    _copy_tree(workspace.paths.raw, target / "raw", files, "raw/")
-    _copy_tree(workspace.paths.runs, target / "runs", files, "runs/")
+    copy_tree(workspace.paths.raw, target / "raw", files, "raw/")
+    copy_tree(workspace.paths.runs, target / "runs", files, "runs/")
     # Whitelist-only export: no provider config, credentials, or external operating paths.
     original_config = read_json(workspace.paths.root / "runtime.json")
     resources = original_config.get("resources", {"threads": 2, "memory_limit": "512MB"})
@@ -190,6 +191,17 @@ def _listed_file_hash(root: Path, path: Path, relative: str) -> dict[str, object
         if isinstance(error.__cause__, PermissionError):
             raise ValueError("backup file cannot be read: " + relative) from error  # noqa: TRY004 -- a broken backup, not a caller type error
         raise
+
+
+def validated_backup(root: Path) -> dict[str, object]:
+    """Rehash every file a backup lists and return its manifest; refuse anything else."""
+    return _validated_manifest(resolve_home(root))
+
+
+def manifest_sha256(root: Path) -> str:
+    """The backup's identity: SHA-256 of its exact ``backup.json`` bytes."""
+    with DescriptorTree.open_path(root) as tree:
+        return hashlib.sha256(tree.read_bytes(_MANIFEST, max_bytes=64 * 1024 * 1024)).hexdigest()
 
 
 def _validated_manifest(root: Path) -> dict[str, object]:

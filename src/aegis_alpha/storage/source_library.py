@@ -44,6 +44,39 @@ _SHA_LENGTH = 64
 # those observations.
 _DIGEST_BYTE_FACTOR = 32
 _DIGEST_CELL_BYTES = 64
+# The storage operation that retires source tables (see ``source_retirement``).
+RETIREMENT_KIND = "source-retire"
+
+
+def retired_sources(workspace: Workspace) -> dict[str, dict[str, object]]:
+    """Every ``source_retirements`` row by source ID; a v1 state store has none."""
+    if (
+        workspace.state.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_retirements'"
+        ).fetchone()
+        is None
+    ):
+        return {}
+    return {
+        str(row["source_id"]): dict(row)
+        for row in workspace.state.execute("SELECT * FROM source_retirements")
+    }
+
+
+def manifest_digest(manifest_json: str) -> str:
+    """The digest a retirement records: SHA-256 of the commit manifest text as stored.
+
+    The manifest names every table the commit holds with its row count and content
+    digest, and it stays in ``source_library_commits`` after the tables are dropped.
+    """
+    return hashlib.sha256(manifest_json.encode()).hexdigest()
+
+
+def _retired_message(source_id: str, record: dict[str, object]) -> str:
+    return (
+        f"source {source_id} is retired; its rows are in {record['equivalent_to_source_id']} "
+        f"and backup {record['backup_id']}"
+    )
 
 
 def _identity(source_id: str, digest: str) -> None:
@@ -77,6 +110,8 @@ def _prepare(
     request = hashlib.sha256(schema.encoded([source_id, digest, kind, detail]).encode()).hexdigest()
     op_id = "source:" + hashlib.sha256(source_id.encode()).hexdigest()
     previous = _marker(workspace, source_id)
+    if previous and (record := retired_sources(workspace).get(source_id)) is not None:
+        raise ValueError(_retired_message(source_id, record))
     if previous and (previous[0], previous[1], previous[2], previous[3]) != (
         op_id,
         request,
@@ -386,14 +421,18 @@ def _verify_manifest(
 
 
 def list_sources(workspace: Workspace) -> list[dict[str, object]]:
+    """Every completed source whose tables are present; a retired source is not listed."""
     if not schema.ensure(workspace):
         return []
+    retired = retired_sources(workspace)
     result = []
     for kind, conn in schema.connections(workspace).items():
         for row in conn.execute(
             "SELECT source_id,operation_id,request_hash,source_sha256,manifest_json "
             "FROM source_library_commits"
         ).fetchall():
+            if row[0] in retired:
+                continue
             operation = get_operation(workspace.state, row[1])
             if (
                 operation
@@ -407,6 +446,8 @@ def list_sources(workspace: Workspace) -> list[dict[str, object]]:
 
 
 def _visible(workspace: Workspace, source_id: str) -> dict[str, object]:
+    if (record := retired_sources(workspace).get(source_id)) is not None:
+        raise ValueError(_retired_message(source_id, record))
     if source_id not in {row["source_id"] for row in list_sources(workspace)}:
         raise ValueError("unknown or incomplete source")
     marker = _marker(workspace, source_id)
@@ -570,7 +611,7 @@ def read_table(
     return dict(inspect_source(workspace, source_id, table_name, limit=limit))
 
 
-def verify_sources(
+def verify_sources(  # noqa: C901 -- live and retired commits under one admission
     workspace: Workspace, *, budget: ComputeBudget | None = None
 ) -> dict[str, object] | None:
     """Verify retained sources within whatever the caller's budget still allows."""
@@ -585,6 +626,8 @@ def verify_sources(
         raise ComputeResourceError("source metadata leaves no verification budget")
     total = tables = sources = 0
     committed: list[str] = []
+    retired = retired_sources(workspace)
+    retired_seen: dict[str, int] = {}
     for conn in schema.connections(workspace).values():
         for row in conn.execute(
             "SELECT source_id,operation_id,request_hash,source_sha256,manifest_json "
@@ -599,6 +642,18 @@ def verify_sources(
             ) != ("source_import", row[2], row[0], row[3]):
                 raise ValueError("source marker/intent mismatch")
             manifest = json.loads(row[4])
+            if (record := retired.get(str(row[0]))) is not None:
+                _verify_retired(
+                    workspace,
+                    conn,
+                    manifest_json=str(row[4]),
+                    manifest=manifest,
+                    record=record,
+                    operation=operation,
+                )
+                committed.append(str(row[0]))
+                retired_seen[str(row[0])] = cast("int", record["rows"])
+                continue
             _verify_manifest(workspace, manifest, remaining)
             if operation["phase"] == "COMPLETED":
                 committed.append(str(row[0]))
@@ -610,11 +665,52 @@ def verify_sources(
     ):
         if _marker(workspace, row[0]) is None:
             raise ValueError("completed source intent lacks target marker")
+    if retired.keys() - retired_seen.keys():
+        raise ValueError("retired source lacks its commit marker")
     report: dict[str, object] = {"sources": sources, "tables": tables, "rows": total}
+    # Like the link count, this appears only once a source is retired.
+    if retired_seen:
+        report["retired"] = {"sources": len(retired_seen), "rows": sum(retired_seen.values())}
     # The count appears once a link exists, so a report without links keeps its shape.
     if linked := verify_links(workspace, committed):
         report["linked"] = linked
     return report
+
+
+def table_present(conn: sqlite3.Connection | duckdb.DuckDBPyConnection, name: str) -> bool:
+    """Whether a source table exists in the store that commits it."""
+    return (
+        conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", [name]).fetchone()
+        is not None
+    )
+
+
+def _verify_retired(  # noqa: PLR0913 -- one retired commit's marker, record and intent
+    workspace: Workspace,
+    conn: sqlite3.Connection | duckdb.DuckDBPyConnection,
+    *,
+    manifest_json: str,
+    manifest: dict[str, object],
+    record: dict[str, object],
+    operation: dict[str, object],
+) -> None:
+    """A retired commit keeps its marker and link; its tables are gone as recorded."""
+    tables = cast("list[dict[str, object]]", manifest["tables"])
+    retirement = get_operation(workspace.state, str(record["operation_id"]))
+    if (
+        operation["phase"] != "COMPLETED"
+        or retirement is None
+        or (retirement["kind"], retirement["phase"]) != (RETIREMENT_KIND, "COMPLETED")
+    ):
+        raise ValueError("retired source lacks a completed import and retirement")
+    if manifest_digest(manifest_json) != record["digest"] or record["rows"] != sum(
+        cast("int", table["rows"]) for table in tables
+    ):
+        raise ValueError("retirement record does not match the retired commit manifest")
+    if any(table_present(conn, str(table["target"])) for table in tables):
+        raise ValueError("retired source table is still present")
+    if _marker(workspace, str(record["equivalent_to_source_id"])) is None:
+        raise ValueError("retired source names an equivalent source without a commit")
 
 
 def recover_source(workspace: Workspace, operation_id: str) -> bool:

@@ -51,6 +51,19 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   `request_hash`, `source_id`, `dimensions_hash`) has a frozen expected digest. Source
   retirement requires no references (the source's own `sl:` link is lineage, not a reference),
   an equivalence digest and an other-device backup, and never removes `raw/` bytes.
+- `source_retirement` owns `aas db source-retire` (`aas-source-retirement-v1`): a group of sources
+  is retired whole only when nothing outside its own `sl:` link refers to it, its compared columns'
+  `aas-rowset-v1` multiset digest equals the equivalent sources' (cells in their exact typed form,
+  encoded in DuckDB by `bulk_generation.encoded_cell_sql`), and a verified backup on another device
+  holds every commit. `--apply` retains the records in `raw/`, prepares a `source-retire` intent,
+  drops the tables in one DuckDB transaction and writes `source_retirements`; repeating it or
+  `db recover` finishes the intent, and `quarantine` refuses one that already dropped a table.
+  Markers, links and `raw/` stay; `source_library` hides a retired source from listings and
+  readers, refuses its re-import and verifies it from its record.
+- `compaction` owns `aas db compact --to NEW_ROOT`: verify, rewrite every store into a new root
+  (SQLite backup plus `VACUUM`, DuckDB `COPY FROM DATABASE`), copy `raw/`, `runs/` and `secrets/`,
+  and require the same logical verification there before the new receipt is `ready`. The original
+  installation is never changed; switching `AAS_HOME` is the operator's step.
 - `promotion/` implements that path. `spec` parses the document, `mappers` is the registry
   (one module per provider shape, `daily` holding the SQL the daily price mappers share; a
   mapper is SQL over the staged source and declares its columns, identity key, partition
