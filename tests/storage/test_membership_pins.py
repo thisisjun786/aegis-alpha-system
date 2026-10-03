@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import re
 import sqlite3
 import subprocess
 import sys
@@ -881,7 +882,6 @@ LEGACY_PART_OVERLAP_SQL = (
     "AND (x.kt IS NULL OR y.kf<x.kt) AND (y.kt IS NULL OR x.kf<y.kt))"
 )
 ISSUER = membership_pins.ISSUER_LINK_NAMESPACE
-SELF_JOIN_SIDES = 2
 OPEN_END_SHARE = 0.3
 MIN_EACH_VERDICT = 50
 
@@ -925,6 +925,12 @@ def overlap_verdicts(manifest: list[list[Member]]) -> tuple[int, int]:
 
 
 def test_part_overlap_query_materializes_the_member_join_once() -> None:
+    """The plan shape every supported SQLite must give, whatever its default for CTEs.
+
+    Some SQLite releases materialize a twice-used CTE by default and others inline it; the
+    hint fixes the materialized plan on all of them. Which side of the self-join probes
+    the automatic index is the planner's choice.
+    """
     connection = overlap_store()
     plan = [
         row[3]
@@ -932,20 +938,12 @@ def test_part_overlap_query_materializes_the_member_join_once() -> None:
             f"EXPLAIN QUERY PLAN {membership_pins.PART_OVERLAP_SQL}", (ISSUER, "[]")
         )
     ]
-    assert "MATERIALIZE m" in plan
+    assert "MATERIALIZE m" in plan, plan
     # The member join runs once inside the materialization, not once per self-join side.
-    assert sum(step.startswith("SEARCH s ") for step in plan) == 1
-    assert sum(step.startswith("SEARCH a ") for step in plan) == 1
+    assert sum(step.startswith("SEARCH s ") for step in plan) == 1, plan
+    assert sum(step.startswith("SEARCH a ") for step in plan) == 1, plan
     # The self-join probes the materialized rows by key instead of rescanning them.
-    assert any(step.startswith("SEARCH y USING AUTOMATIC") for step in plan), plan
-    legacy = [
-        row[3]
-        for row in connection.execute(
-            f"EXPLAIN QUERY PLAN {LEGACY_PART_OVERLAP_SQL}", (ISSUER, "[]")
-        )
-    ]
-    assert "MATERIALIZE m" not in legacy
-    assert sum(step.startswith("SEARCH s ") for step in legacy) == SELF_JOIN_SIDES
+    assert any(re.match(r"SEARCH [xy] USING AUTOMATIC ", step) for step in plan), plan
 
 
 def _member(
