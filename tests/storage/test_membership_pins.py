@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import sqlite3
 import subprocess
 import sys
@@ -16,7 +17,7 @@ from typing import TYPE_CHECKING, Never, cast, override
 import pytest
 
 from aegis_alpha.compute_resources import ComputeResourceError
-from aegis_alpha.storage import membership_pins
+from aegis_alpha.storage import membership_pins, state_schema
 from aegis_alpha.storage.market_inputs import IdentityPin, UniversePin
 from aegis_alpha.storage.membership_pins import (
     VerifiedMembership,
@@ -863,3 +864,170 @@ with open_workspace(Path(sys.argv[1])) as w:
     with open_workspace(home) as reader:
         assert state_image(reader) == before
     assert verify_workspace(workspace)["verified"] is True
+
+
+# The part-overlap query as first shipped, with an inlined CTE. It is the oracle that the
+# materialized product query must agree with; only its evaluation strategy was slow.
+LEGACY_PART_OVERLAP_SQL = (
+    "WITH m AS (SELECT s.snapshot_id AS part,a.provider,a.namespace,"
+    "CASE WHEN a.namespace=? THEN a.instrument_id ELSE a.token END AS token,"
+    "s.valid_from_us AS vf,s.valid_to_us AS vt,s.known_from_us AS kf,"
+    "s.known_to_us AS kt FROM identity_snapshot_members s "
+    "JOIN identity_assertions a ON a.assertion_id=s.assertion_id "
+    "WHERE s.snapshot_id IN (SELECT value FROM json_each(?))) "
+    "SELECT EXISTS(SELECT 1 FROM m x JOIN m y ON x.provider=y.provider "
+    "AND x.namespace=y.namespace AND x.token=y.token AND x.part<y.part "
+    "WHERE (x.vt IS NULL OR y.vf<x.vt) AND (y.vt IS NULL OR x.vf<y.vt) "
+    "AND (x.kt IS NULL OR y.kf<x.kt) AND (y.kt IS NULL OR x.kf<y.kt))"
+)
+ISSUER = membership_pins.ISSUER_LINK_NAMESPACE
+SELF_JOIN_SIDES = 2
+OPEN_END_SHARE = 0.3
+MIN_EACH_VERDICT = 50
+
+# One member: (provider, namespace, token, instrument_id, valid_from, valid_to, known_from,
+# known_to). A manifest is a list of parts, each a list of members.
+type Member = tuple[str, str, str, str, int, int | None, int, int | None]
+
+
+def overlap_store() -> sqlite3.Connection:
+    """The real state schema, minus the per-part guard so a part may hold its own overlap."""
+    connection = sqlite3.connect(":memory:")
+    connection.executescript(state_schema.DDL)
+    connection.execute("DROP TRIGGER identity_projection_no_overlap")
+    return connection
+
+
+def overlap_verdicts(manifest: list[list[Member]]) -> tuple[int, int]:
+    """Return (legacy, product) EXISTS verdicts; the product query runs SELECT-only."""
+    connection = overlap_store()
+    names = [membership_pins.part_name("m", index) for index in range(len(manifest))]
+    for name, part in zip(names, manifest, strict=True):
+        for ordinal, (provider, namespace, token, instrument, vf, vt, kf, kt) in enumerate(part):
+            assertion = f"{name}/{ordinal}"
+            connection.execute(
+                "INSERT INTO identity_assertions VALUES (?,?,?,?,?,?,?,?,NULL,'s',?)",
+                (assertion, instrument, provider, namespace, token, vf, vt, kf, "a" * 64),
+            )
+            connection.execute(
+                "INSERT INTO identity_snapshot_members VALUES (?,?,?,?,?,?,?)",
+                (name, ordinal, assertion, vf, vt, kf, kt),
+            )
+    parameters = (ISSUER, json.dumps(names))
+    legacy = connection.execute(LEGACY_PART_OVERLAP_SQL, parameters).fetchone()[0]
+    allowed = (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION)
+    connection.set_authorizer(
+        lambda action, *_: sqlite3.SQLITE_OK if action in allowed else sqlite3.SQLITE_DENY
+    )
+    product = connection.execute(membership_pins.PART_OVERLAP_SQL, parameters).fetchone()[0]
+    connection.close()
+    return legacy, product
+
+
+def test_part_overlap_query_materializes_the_member_join_once() -> None:
+    connection = overlap_store()
+    plan = [
+        row[3]
+        for row in connection.execute(
+            f"EXPLAIN QUERY PLAN {membership_pins.PART_OVERLAP_SQL}", (ISSUER, "[]")
+        )
+    ]
+    assert "MATERIALIZE m" in plan
+    # The member join runs once inside the materialization, not once per self-join side.
+    assert sum(step.startswith("SEARCH s ") for step in plan) == 1
+    assert sum(step.startswith("SEARCH a ") for step in plan) == 1
+    # The self-join probes the materialized rows by key instead of rescanning them.
+    assert any(step.startswith("SEARCH y USING AUTOMATIC") for step in plan), plan
+    legacy = [
+        row[3]
+        for row in connection.execute(
+            f"EXPLAIN QUERY PLAN {LEGACY_PART_OVERLAP_SQL}", (ISSUER, "[]")
+        )
+    ]
+    assert "MATERIALIZE m" not in legacy
+    assert sum(step.startswith("SEARCH s ") for step in legacy) == SELF_JOIN_SIDES
+
+
+def _member(
+    token: str,
+    valid: tuple[int, int | None] = (0, None),
+    known: tuple[int, int | None] = (0, None),
+    **key: str,
+) -> Member:
+    """A member keyed by provider "p", namespace "ticker" and instrument "I1" unless given."""
+    return (
+        key.get("provider", "p"),
+        key.get("namespace", "ticker"),
+        token,
+        key.get("instrument", "I1"),
+        *valid,
+        *known,
+    )
+
+
+@pytest.mark.parametrize(
+    ("manifest", "expected"),
+    [
+        ([[_member("A")], [_member("A")]], 1),
+        ([[_member("A", (0, 5))], [_member("A", (4, 9))]], 1),
+        ([[_member("A", (0, 5))], [_member("A", (5, 9))]], 0),
+        ([[_member("A", known=(0, 3))], [_member("A", known=(3, None))]], 0),
+        ([[_member("A", known=(0, 3))], [_member("A", known=(2, None))]], 1),
+        ([[_member("A"), _member("A", instrument="I2")], [_member("B")]], 0),
+        ([[_member("A")], [_member("B")], [_member("A", (3, 4))]], 1),
+        ([[_member("A")], [_member("A", namespace="isin")]], 0),
+        ([[_member("A")], [_member("A", provider="q")]], 0),
+        ([[_member("L1", namespace=ISSUER)], [_member("L2", namespace=ISSUER)]], 1),
+        ([[_member("L", namespace=ISSUER)], [_member("L", namespace=ISSUER, instrument="I2")]], 0),
+        ([[_member("A")]], 0),
+    ],
+    ids=[
+        "open-ended",
+        "valid-overlap",
+        "valid-adjacent",
+        "known-adjacent",
+        "known-overlap",
+        "within-part-only",
+        "non-neighbour-parts",
+        "other-namespace",
+        "other-provider",
+        "issuer-link-same-instrument",
+        "issuer-link-same-token-other-instrument",
+        "single-part",
+    ],
+)
+def test_part_overlap_matches_legacy_on_named_cases(
+    manifest: list[list[Member]], expected: int
+) -> None:
+    assert overlap_verdicts(manifest) == (expected, expected)
+
+
+def test_part_overlap_matches_legacy_on_random_manifests() -> None:
+    generator = random.Random(20261003)  # noqa: S311 -- reproducible synthetic cases
+    seen = {0: 0, 1: 0}
+
+    def bound(low: int) -> int | None:
+        return None if generator.random() < OPEN_END_SHARE else generator.randint(low + 1, low + 4)
+
+    for _ in range(400):
+        manifest = []
+        for _ in range(generator.randint(2, 4)):
+            part = []
+            for _ in range(generator.randint(1, 4)):
+                vf, kf = generator.randint(0, 6), generator.randint(0, 6)
+                part.append(
+                    _member(
+                        generator.choice("AB"),
+                        (vf, bound(vf)),
+                        (kf, bound(kf)),
+                        provider=generator.choice("pq"),
+                        namespace=generator.choice(("ticker", "isin", ISSUER)),
+                        instrument=generator.choice(("I1", "I2")),
+                    )
+                )
+            manifest.append(part)
+        legacy, product = overlap_verdicts(manifest)
+        assert product == legacy, manifest
+        seen[legacy] += 1
+    # Both verdicts occur often enough for the agreement to mean something.
+    assert min(seen.values()) >= MIN_EACH_VERDICT, seen
