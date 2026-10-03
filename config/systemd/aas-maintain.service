@@ -1,0 +1,16 @@
+[Unit]
+Description=AAS daily maintenance: collect, import, register identities and promote
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=%h
+ExecStart=%h/.local/bin/aas maintain run
+RuntimeMaxSec=22h
+TimeoutStopSec=5min
+KillSignal=SIGINT
+KillMode=mixed
+SendSIGKILL=yes
+Restart=no
+UMask=0077

@@ -104,8 +104,18 @@ def _move(connection: sqlite3.Connection, attempt: Attempt, status: str, at_us: 
     )
 
 
-def reserve(connection: sqlite3.Connection, job: Job, *, at_us: int) -> Attempt:
-    """Commit the job (once), its next attempt and a ``reserved`` usage event."""
+def reserve(
+    connection: sqlite3.Connection, job: Job, *, at_us: int, receipt_sha256: str | None = None
+) -> Attempt:
+    """Commit the job (once), its next attempt and a ``reserved`` usage event.
+
+    ``receipt_sha256`` names the evidence the collector writes before the call, when it
+    has one (a Qveris intent's job fingerprint); otherwise the event names the attempt.
+    """
+    if receipt_sha256 is not None and (
+        len(receipt_sha256) != _SHA256_LENGTH or receipt_sha256.strip("0123456789abcdef")
+    ):
+        raise ValueError("a reservation receipt is a lowercase SHA-256 digest")
     with atomic(connection):
         connection.execute(
             "INSERT INTO collection_jobs(job_id,provider,dataset_id,window_start_us,"
@@ -139,7 +149,8 @@ def reserve(connection: sqlite3.Connection, job: Job, *, at_us: int) -> Attempt:
             "completed_at_us,request_hash) VALUES(?,?,'reserved',?,NULL,?)",
             (job.job_id, number, at_us, job.fingerprint),
         )
-        _event(connection, attempt, "reserved", _digest("reserve", job.job_id, number), at_us)
+        receipt = receipt_sha256 or _digest("reserve", job.job_id, number)
+        _event(connection, attempt, "reserved", receipt, at_us)
     return attempt
 
 
@@ -160,6 +171,13 @@ def succeed(
             "UPDATE collection_jobs SET status=? WHERE job_id=?",
             (outcome.lower(), attempt.job_id),
         )
+
+
+def release(connection: sqlite3.Connection, attempt: Attempt, *, at_us: int) -> None:
+    """A ``reserved`` attempt never reached the provider: ``failed`` with a ``released`` event."""
+    with atomic(connection):
+        _move(connection, attempt, "failed", at_us)
+        _event(connection, attempt, "released", _digest("release", *_key(attempt)), at_us)
 
 
 def uncertain(connection: sqlite3.Connection, attempt: Attempt, *, at_us: int) -> None:
@@ -189,8 +207,7 @@ def recover(connection: sqlite3.Connection, provider: str, *, at_us: int) -> dic
         for job_id, number, status in rows:
             attempt = Attempt(str(job_id), int(number))
             if status == "reserved":
-                _move(connection, attempt, "failed", at_us)
-                _event(connection, attempt, "released", _digest("release", *_key(attempt)), at_us)
+                release(connection, attempt, at_us=at_us)
                 settled["released"] += 1
             else:
                 uncertain(connection, attempt, at_us=at_us)

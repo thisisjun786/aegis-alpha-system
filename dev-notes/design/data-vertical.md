@@ -17,7 +17,7 @@
 | --- | --- | --- |
 | L0 raw | 공급자 응답·내보내기 원본 bytes. 해시 경로, no-clobber | `storage/raw.py` |
 | L1 원천 자료실 | `sl_*` 테이블. 원래 열·값·행 순서를 그대로 보존하는 `source_only` 자료, legacy 원본 편입, 수집 job 적재 | `storage/source_library*.py`, `storage/legacy_import/`, `storage/qveris_import.py` |
-| L2 승격 | 승격 명세 → 매퍼 → head 비교 → 품질 flag → generation 게시 | `storage/promotion/` |
+| L2 승격 | 승격 명세 → 매퍼 → head 비교 → 품질 flag → generation 게시, 유지보수의 chain 이어 붙이기 | `storage/promotion/`, `storage/maintain_promotion.py` |
 | L3 저장 | `market.duckdb`의 typed generation과 `state.sqlite3`의 카탈로그·identity·품질·수집 기록, [dataset 카탈로그](#dataset-카탈로그) | `storage/market.py`, `storage/state.py`, `storage/identity.py`, `storage/dataset_catalog.py` |
 | L4 소비 | exact pin, cutoff, grant로 head를 투영하는 reader, 조정 가격 유도와 실행 준비 | `storage/read_heads.py`, `storage/adjusted_prices.py`, `storage/market_inputs.py`, `application/backtest_prepare.py` |
 
@@ -1410,6 +1410,158 @@ legacy 거시 목록 35개와 DEXKOUS다. 수집기 자신의 watermark는 시�
 원천을 승격할 때 앞으로 간다. 유지보수 승격은 수집된 원천마다 `vintage_partitions`의 구간을 순서대로
 승격한다.
 
+## 유지보수 실행
+
+`aas maintain run`은 하루 한 번의 제한된 실행으로 공급자 답에서 승격된 head까지 간다. 코드는
+`application/maintain.py`(단계와 보고), `application/maintain_config.py`(설정),
+`application/maintain_qveris.py`(Qveris 요청·원장·적재), `storage/maintain_identity.py`(KR identity 증분),
+`storage/maintain_promotion.py`(dataset chain 이어 붙이기), `application/install_receipt.py`(설치 receipt)이고,
+명령은 `aas maintain plan|run|receipt`, 예약은 `config/systemd/aas-maintain.{service,timer}`다.
+
+**단일 writer.** 실행은 설치본을 쓰기로 한 번 열고 그 저장소 잠금을 실행 끝까지 갖는다. 그래서 실행 중에는
+유지보수가 시장 store의 유일한 writer이고, 다른 명령이나 두 번째 실행은 `installation_busy`로 거부된다.
+
+**단계.** 순서대로 실행한다. 한 단계가 실패하면 그 사실을 기록하고 다음 단계는 commit된 것으로 계속한다.
+공급자 하나의 거부나 실패가 다른 공급자를 멈추지 않는다.
+
+| 단계 | 하는 일 |
+| --- | --- |
+| `recover` | 중단된 operation(승격, 원천 적재)을 보존한 증거로 끝내거나 남긴다. 공급자를 부르지 않는다 |
+| `runtime` | 실행 중인 interpreter·package와 설치 receipt의 차이 |
+| `calendars` | 패키지 선언마다 [선언 달력](#선언-달력) 갱신. 시계가 선언 시각보다 이르면 `declared_after_now`로 건너뛴다. 다음 해 말까지 덮지 않는 달력은 `renewal_due`에 남는다 |
+| `collect` | `jobs.enabled`일 때 켜진 공급자마다 실행 상한 안에서 KIND 목록, OpenDART rolling cohort, SEC EDGAR, FRED/ALFRED, Qveris 순으로 묻는다 |
+| `import` | 완료된 Qveris job과 KR 종목 목록을 내용 원천으로 commit한다 |
+| `identity` | 새 KR 상장을 등록하고 유지보수 identity snapshot을 pin한다 |
+| `promote` | 카탈로그 dataset chain마다 새 원천을 다음 generation으로 승격한다 |
+| `heads` | 모든 committed dataset의 head version, 행 수, `watermarks` |
+
+**설정.** `runtime.json`의 `jobs.enabled`는 예약 공급자 호출의 설치본 grant이고, `providers`의 공급자 절마다
+`"enabled": true`와 자격 증명 파일(상대 경로는 설치본 `secrets/` 안), 실행 상한을 적는다. `jobs.enabled`가
+`false`이면 수집 단계는 `jobs_disabled`이고 나머지 단계는 그대로 돈다. 알 수 없는 필드, 잘못된 타입, 빠진 필수
+필드는 어느 단계보다 먼저 설정 전체를 거부하므로 오타가 상한을 조용히 끄지 않는다. 자격 증명 파일은 그 공급자를
+부를 때만 읽는다.
+
+| 절 | 필수 | 상한과 선택 |
+| --- | --- | --- |
+| `kind` | 없음 | 없음(quota 없음) |
+| `dart` | `key_file` | `max_calls`(2,000), `daily_quota`(19,000) |
+| `sec` | `user_agent_file` | `max_calls`(2,000), `issuers`(`registered`·`all`), `since` |
+| `fred` | `key_file` | `max_calls`(500) |
+| `qveris` | `key_file`, `raw_root`(절대 경로), `since`(거래소마다 첫 날), `max_calls`, `max_credits`(십진 문자열) | `extra_sessions`(거래소마다 `since` 이전에 따로 물을 session 날짜), `identity`(절대 경로의 identity 문서), `exchanges`, `datasets`, `symbol_lists`, `symbol_list_days`(7), `forex`, `forex_lookback_days`(10), `max_http_requests`, `time_limit_seconds`(3600), `request_interval`, `timeout_seconds`(45) |
+
+Qveris의 유료 크레딧은 실행 하나의 호출 수·크레딧 상한과, page마다 다시 확인하는 계정 잔액(다른 예약을 뺀 값)
+안에서만 쓴다. 상한이 막은 요청은 묻지 않은 채 다음 실행으로 남는다.
+
+**Qveris 요청.** 요청은 공급자에게 묻는 것(도구, 하위 공급자, 시장, dataset, parameter)이고 관측일과 job ID는
+들어가지 않는다. job은 한 관측일의 묻기 하나이므로 같은 요청을 다시 묻는 것은 그날 관측일의 새 job이다. raw
+수집 root가 모든 묻기의 기록이며 묻기의 상태는 그 증거에서 읽는다.
+
+| 묻기 상태 | 증거 |
+| --- | --- |
+| `completed`·`warned` | `complete.json`(`RAW_ACQUIRED`·`RAW_ACQUIRED_WITH_WARNINGS`). 공급자 경고도 완료다 |
+| `failed` | intent가 있는 모든 page에 정산된 billing이 있고 완료가 없음. 답은 보존됐지만 쓸 수 없다 |
+| `quarantined` | billing 없는 page를 운영자가 page나 병렬 group 단위로 격리함. 결과는 알 수 없고 격리가 최악의 예약을 남겼다 |
+| `unsettled` | 격리되지 않은 billing 없는 page |
+
+덮이지 않은 요청에서 `unsettled` 묻기는 그 요청을 잡아 둔다(`held`). 그 밖에는 가장 늦은 묻기가 정한다. 이전
+관측일의 `failed`는 다시 묻고(`failed_retry`), `quarantined`도 다시 묻는다(`uncertain_retry`). 격리된 page는 다시
+실행되지 않고 요청이 새 job으로 물린다. 오늘 관측일의 묻기는 다음 날을 기다린다(`waiting`). 물은 적이 없으면
+`new`다. 종목 목록은 가장 늦은 완료의 관측일 뒤 `symbol_list_days` 동안 덮이고 그 뒤 다시 묻는다(`refresh`).
+
+실행은 이 순서로 상한이 남는 동안 묻는다. (1) 거래소(`US`는 XNYS, `KO`·`KQ`는 XKRX) 선언 달력의 열린
+session마다 일간 `prices`·`splits`·`dividends` 내려받기. 거래소의 `since`부터(관측일의 366일 전보다 이르지
+않게) 관측일 전날까지와 그 거래소의 `extra_sessions`(그 이전의 명시한 공백)이고, 날짜, 거래소, dataset 순이다. 선언 범위 밖의 날은 `undeclared_days`로 보고하고 묻지
+않는다. (2) KR 거래소 종목 목록(`KO`·`KQ`, 상장·상폐). 새 KR 상장의 identity 입력이다. (3) FX 쌍
+이력(`<PAIR>.FOREX`, 관측일의 `forex_lookback_days` 전부터).
+
+묻기 전에 실행은 앞선 실행이 남긴 `unsettled` 묻기와 완료 없이 정산된 묻기를 그 자신의 job으로 끝낸다. page를
+정산·검증만 하고 새 page는 intent 전에 거부되므로 아무것도 실행하지 않는다. 중단된 실행이 유료 호출 뒤 남긴
+묻기는 이렇게 다시 호출 없이 완료된다.
+
+**Qveris 원장.** 실행의 묻기는 모두 `collection_ledger`의 attempt다(provider `qveris`, job
+`qveris:<요청 SHA-256>`, 요청 SHA-256은 정규 JSON `["aas-qveris-request-v1", 도구, 하위 공급자, 시장, dataset,
+parameter]`). cohort 전에 `reserved`(예약의 receipt는 그 묻기의 job fingerprint), 유료 실행 직전 `started`, 그 뒤
+raw 증거로 정산한다. 완료와 정산된 실패는 그 묻기의 결정 증거(완료 문서나 billing의 SHA-256)를 나열한
+`aas-qveris-attempt-v1` receipt를 `raw/`에 두고 `succeeded`, billing 없는 page는 `uncertain`, 상한이나 잔액이
+먼저 막아 실행하지 않은 묻기는 `released` event와 함께 `failed`다. 프로세스가 중단되면(KeyboardInterrupt,
+SystemExit) 정산하지 않는다. 그 `started` attempt는 다음 실행이 묻기를 끝낸 뒤 같은 규칙으로 정산하므로 증거와
+어긋나는 `uncertain`이 남지 않는다.
+
+**적재.** 완료된 일간·FX job 중 어느 `qveris-*` 원천의 lineage에도 fingerprint가 없는 것을
+[Qveris 적재](#qveris-수집과-원천-적재)로 commit한다. 가격·기업행동 행은 설정의 identity 문서가 있을 때만
+적재하고, 없으면 `waiting_for_identity`로 보고한다. 완료된 KR 종목 목록 job은 [KR 등록](#kr-등록)의
+`qveris-eodhd-exchange-symbols-*` 원천이 된다.
+
+**identity 증분.** commit된 KR identity 원천(EODHD KR 종목 목록, KIND 목록, 완료된 `corp_codes` 답을 담은
+OpenDART receipts 테이블) 중 `sl:` 연결이 가장 새로운 유지보수 snapshot보다 늦은 것이 있거나 유지보수 snapshot이
+없으면, 등록된 KR assertion이 인용하는 모든 원천과 그 새 원천으로 KR registry 문서를 만들어 등록한다. 같은 행은
+재사용되고 충돌은 문서 전체를 거부한다. 유지보수 identity snapshot은 등록된 모든 assertion의 snapshot이고 ID는
+`maintain-`과 정렬한 assertion ID 목록의 SHA-256 앞 32자다. 그래서 registry가 그대로면 같은 snapshot이고
+assertion 집합이 바뀐 실행만 새 snapshot을 등록한다. 아무것도 등록하지 않았고 유지보수 snapshot이 없으면 승격
+template의 snapshot을 그대로 쓴다. US identity 원천(Norgate master, FMP profile, SEC archive)은 동결된 전환
+입력이라 유지보수 증분이 없다.
+
+**승격.** route 하나는 카탈로그 dataset 하나, 그것을 만드는 등록 매퍼, 수집 원천 모양(원천 ID 접두어와 테이블),
+여러 dataset이 나누는 모양이면 route한 테이블의 모든 행이 만족할 조건이다. 일부 행만 만족하는 테이블은
+`mixed`로 건너뛰고 빈 테이블은 `empty`다.
+
+| dataset | 매퍼 | 원천 | 조건 |
+| --- | --- | --- | --- |
+| `filings.us.sec` | `sec.submissions@1` | `sec-submissions-filings-*` `filings` | |
+| `fundamentals.us.sec` | `sec.companyfacts@1` | `sec-companyfacts-facts-*` `facts` | |
+| `filings.kr.dart` | `dart.fnltt_filings@1` | `opendart-receipts-*` `receipts` | |
+| `fundamentals.kr.dart` | `dart.fnltt@1` | `opendart-receipts-*` `receipts` | |
+| `macro.us.alfred` | `fred.alfred@1` | `fred-alfred-observations-*` `observations` | |
+| `fx.usdkrw.fred` | `fred.fx_series@1` | `fred-series-csv-*` `observations` | |
+| `classifications.kr.kind` | `kind.industry@1` | `kind-listings-*` `listings` | |
+| `prices.us.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.US` |
+| `prices.kr.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.KO`·`.KQ` |
+| `prices.kr.eodhd` | `eodhd.bulk_quarantine@1` | `qveris-bulk-quarantine-*` `quarantine` | 사유 `provider_reported_partial`, 거래소 `KO`·`KQ` |
+| `prices.kr.eodhd.ref` | `eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1` | 위 두 모양 | 위와 같음 |
+
+route는 chain을 이어 붙일 뿐 시작하지 않는다. template은 그 dataset에서 route의 매퍼를 쓴 가장 늦은 committed
+generation의 명세(운영자의 백필이거나 앞선 유지보수 generation)다. head가 없으면 `no_head`, 그 매퍼의 generation이
+없으면 `no_template`로 보고하고 아무것도 쓰지 않는다. 유지보수 명세는 template에서 다음만 바꾼다.
+
+- `target.parent`: dataset head.
+- `sources`: 새 원천 테이블 하나.
+- `partition`: template이 null이면 null. `fred.alfred@1`이면 그 원천의 vintage partition을 순서대로(하나가
+  generation 하나). 그 밖은 테이블의 매퍼 partition 날짜의 `[처음, 마지막 + 1일)`.
+- 매퍼·시간 규칙·품질 규칙 인자의 모든 generation pin: 그 dataset의 지금 committed head. 갱신된 달력, 같은
+  실행에서 먼저 게시된 SEC 공시가 그렇다. 그래서 route는 `filings.us.sec` 다음에 `fundamentals.us.sec`를 승격한다.
+- `identity_snapshot`: 실행에 유지보수 snapshot이 있고 template이 snapshot을 pin하면 그 snapshot.
+- `tombstone_policy`: `never`. 원천 하나는 전체 snapshot이 아니므로 유지보수 generation은 record를 지우지 않는다.
+
+매퍼와 그 인자, 시간·숫자·품질 규칙은 template 그대로이므로 유지보수가 chain의 규칙을 바꾸지 않는다. 더 늦은
+시간 규칙 세대 dataset(`<dataset>.r<N>`)도 자기 template으로 같은 방식으로 이어진다. 새 원천은 `sl:` 연결 시각,
+같으면 원천 ID 순서다. 한 원천의 모든 단계가 승격되거나 변하지 않았으면 그 원천은 그 dataset에서 끝난 것이고,
+유지보수는 dataset head version에 `maintain_source@1` 품질 검사 하나(원천 pin, 단계마다 partition·명세 SHA-256·
+generation, 결과 `promoted`·`unchanged`)를 남긴다. 검사 ID는 (dataset, 원천, 테이블)에서 나오므로 다시 쓰지
+않는다. 거부되거나 막힌 단계는 아무것도 남기지 않으므로 그 원천은 다음 실행에 다시 계획된다. 단계 사이에서
+멈춘 원천은 끝난 단계가 빈 delta로 다시 계획된다. 결과를 선언한 매퍼가 `promotion_coverage@1`을 남긴 원천도
+끝난 것이다. 운영자의 승격이 pin한 원천은 첫 유지보수 실행에서 한 번 더 계획되어 `unchanged`로 기록되고, head보다
+이른 내려받기는 `stale`이라 head를 대체하지 않는다.
+
+매퍼가 아직 없는 dataset(`actions.us.eodhd`·`actions.kr.eodhd`의 Qveris `splits`·`dividends`, `status.kr.kind`,
+identity가 해석한 US 보류 행의 `prices.us.eodhd` 재처리)의 수집 원천은 승격하지 않고 `unmapped`에 dataset별
+테이블 수로 남는다.
+
+**보고와 종료 코드.** 실행 보고(`aas-maintain-report-v1`)는 단계마다의 결과, 실패한 단계, 멈춘 공급자를 담고
+정확한 bytes를 `raw/`에, 같은 bytes를 `<runtime>/maintain-report.json`에 둔다. 종료 코드는 모든 단계가
+끝나면(예산 소진 포함) 0, 단계가 실패했거나 공급자가 거부로 멈췄으면 1, Qveris가 정산이나 격리가 필요한 불확실한
+유료 호출로 멈췄으면 2다. `plan`은 설치본을 읽기 전용으로 열어 같은 단계를 계획만 한다. 자격 증명을 읽지 않고
+공급자를 부르지 않으며 쓰지 않는다. `--promotions`는 새 원천마다의 승격 계획까지 현재 head에 대해 계산한다.
+
+**설치 receipt와 예약.** 설치형 `aas`(태그된 dev 커밋을 정확한 CPython 경로로 `uv tool install`한 것)는
+`aas maintain receipt [--lock uv.lock]`으로 `aas-install-receipt-v1`을 남긴다. 해석한 interpreter 경로,
+`sys.version`과 버전 tuple, 구현, package version과 PEP 610 `direct_url.json`(저장소, 요청한 태그, 해석된
+커밋), package `RECORD`의 SHA-256, import 경로의 모든 distribution `name==version` 목록의 SHA-256과 수, 설치에 쓴
+lock의 SHA-256이다. receipt는 `<runtime>/install-receipt.json`에, 정확한 bytes는 `raw/`에 둔다. 실행마다 실행 중인
+interpreter·package·환경을 receipt와 나란히 기록하고 다른 필드를 `differences`로 나열한다. 차이는 보고할 뿐
+거부하지 않는다. 실행 기록이 무엇이 돌았는지의 기록이다. `config/systemd/aas-maintain.service`는
+`%h/.local/bin/aas maintain run`을 실행하고(`Type=exec`, `RuntimeMaxSec=22h`, 중지는 `SIGINT`),
+`aas-maintain.timer`는 매일 03:00 UTC에 그것을 시작하며 놓친 실행은 다음 부팅에서 따라잡는다.
+
 ## identity 등록과 chunked 문서
 
 identity는 `storage/identity.py`가 state에 등록하고 `aas identity register|snapshot|show`가 CLI다.
@@ -2613,3 +2765,14 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-429 | compact는 외래 key를 가진 generation chain과 run 결과 행을 부모부터 옮기고 같은 검증을 통과한다 | `tests/storage/test_compaction.py::test_compaction_copies_rows_that_reference_other_rows` | 구현 |
 | DV-430 | 원천 ID이면서 다른 원천의 `sl:` 링크인 이름은 두 원천 모두의 참조로 센다 | `tests/storage/test_source_retirement.py::test_a_name_that_denotes_two_sources_references_both` | 구현 |
 | DV-431 | 복구가 읽을 수 없는 64 MiB 초과 기록 문서는 intent를 만들기 전에 거부한다 | `tests/storage/test_source_retirement.py::test_records_recovery_cannot_read_are_never_prepared` | 구현 |
+| DV-432 | 두 날의 유지보수 실행은 모든 chain을 head의 자식으로 이어 붙이고, 같은 날 다시 실행하면 답한 요청을 다시 묻지 않고 아무 generation도 게시하지 않는다 | `tests/application/test_maintain.py::test_two_daily_runs_continue_every_chain_and_repeat_nothing` | 구현 |
+| DV-433 | 유료 호출 뒤나 승격 게시 뒤에 중단된 실행은 다음 실행이 공급자를 다시 부르지 않고 끝내며 원장에 증거와 어긋나는 attempt가 남지 않는다 | `tests/application/test_maintain.py::test_a_killed_run_is_recovered_without_asking_any_answered_request_again` | 구현 |
+| DV-434 | 새 KR 상장은 identity 증분과 새 유지보수 snapshot으로 등록되고 같은 실행의 KR 가격·분류 generation에서 해석된다 | `tests/application/test_maintain.py::test_new_kr_listings_advance_identity_and_every_kr_chain` | 구현 |
+| DV-435 | Qveris 요청은 묻기의 raw 증거로 정해진다: 경고 완료는 덮이고, 정산된 실패는 다음 날 새 job으로, 미정산은 보류되며 자기 job으로 먼저 끝낸다 | `tests/application/test_maintain_qveris.py::test_each_ask_state_decides_its_request` | 구현 |
+| DV-436 | 격리된 Qveris 묻기는 다음 관측일에 새 job으로 다시 묻고 같은 날에는 기다린다 | `tests/application/test_maintain_qveris.py::test_a_quarantined_ask_is_asked_again_the_next_day_and_not_the_same_day` | 구현 |
+| DV-437 | 유지보수 명세는 template에서 parent·원천·partition만 바꾸고 tombstone은 `never`이며, 끝난 원천은 `maintain_source@1`로 다시 계획되지 않는다 | `tests/storage/test_maintain_promotion.py::test_new_sources_continue_the_chain_from_the_template` | 구현 |
+| DV-438 | head나 route 매퍼의 template이 없는 dataset은 유지보수가 시작하지 않고 보고한다 | `tests/storage/test_maintain_promotion.py::test_a_route_without_a_head_or_template_reports_and_starts_nothing` | 구현 |
+| DV-439 | 유지보수 명세의 generation pin은 지금 head로 바뀌고 identity는 snapshot을 pin한 template에서만 바뀐다 | `tests/storage/test_maintain_promotion.py::test_generation_pins_advance_and_the_identity_replaces_only_a_pinned_snapshot` | 구현 |
+| DV-440 | 유지보수 설정의 알 수 없는 필드·빠진 상한·잘못된 타입은 설정 전체를 거부한다 | `tests/application/test_maintain_cli.py::test_a_typo_or_missing_cap_refuses_the_whole_configuration` | 구현 |
+| DV-441 | 설치 receipt와 다른 실행 환경은 실행 보고의 차이로 남고 실행을 막지 않는다 | `tests/application/test_maintain_cli.py::test_the_install_receipt_records_the_runtime_and_reports_its_differences` | 구현 |
+| DV-442 | 유지보수 계획은 자격 증명을 읽지 않고, `jobs.enabled` grant가 없는 실행은 공급자를 부르지 않고 나머지 단계를 끝낸다 | `tests/application/test_maintain_cli.py::test_plan_reads_no_key_and_run_without_the_jobs_grant_calls_nothing` | 구현 |

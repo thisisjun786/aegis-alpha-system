@@ -1324,8 +1324,8 @@ commit에는 `pyarrow`(legacy extra)가 필요하다.
 `kind_filter: true`와 회사 수를 확인한 뒤 `dart run`을 켠다.
 
 승인된 수집기(OpenDART corp code·공시 목록·재무, KIND 목록)지만 패키지 설치나 이 명령은 예약 실행을
-만들지 않는다. `[owner]` 예약 실행은 운영 전환에서 키 파일과 호출 상한을 정해 켜고, 같은 키를 쓰는 legacy
-DART backfill unit은 그 전에 멈춘다(두 수집기는 quota를 서로 세지 않는다). 요청·cohort·원장·보존 규칙은
+만들지 않는다. 예약 실행은 [하루 유지보수 실행](#하루-유지보수-실행)이고, `[owner]` 운영 전환에서 키 파일과 호출
+상한을 정해 켠다. 같은 키를 쓰는 legacy DART backfill unit은 그 전에 멈춘다(두 수집기는 quota를 서로 세지 않는다). 요청·cohort·원장·보존 규칙은
 [KR 공시·상장 수집](design/data-vertical.md#kr-공시상장-수집)이 소유한다.
 
 ## US 공시·거시 수집
@@ -1359,8 +1359,8 @@ FRED는 시계열별 알려진 vintage 날과 완결되지 않은 창을 함께 
 `sec-submissions-filings-*`는 `sec.submissions@1`, `sec-companyfacts-facts-*`는 `sec.companyfacts@1`,
 `fred-alfred-observations-*`는 `fred.alfred@1`(원천마다 `vintage_partitions`의 구간 순서로),
 `fred-series-csv-*`는 `fred.fx_series@1`이다. 승인된 수집기(SEC 색인·submissions·companyfacts, FRED/ALFRED와
-DEXKOUS CSV)지만, 패키지 설치나 이 명령이 예약 실행을 만들지는 않는다. `[owner]` 예약 실행은 운영 전환에서
-연락처·키 파일과 호출 상한을 정해 켠다. 요청·창·선택·보존 규칙은
+DEXKOUS CSV)지만, 패키지 설치나 이 명령이 예약 실행을 만들지는 않는다. 예약 실행은
+[하루 유지보수 실행](#하루-유지보수-실행)이고, `[owner]` 운영 전환에서 연락처·키 파일과 호출 상한을 정해 켠다. 요청·창·선택·보존 규칙은
 [US 공시·거시 수집](design/data-vertical.md#us-공시거시-수집)이 소유한다.
 
 ## Qveris 원문 수집
@@ -1418,6 +1418,68 @@ aas collect qveris import --raw-root RAW --identity IDENTITY.json [--market KR] 
   설치본을 열어 정규화와 행 digest만 보고한다. identity 문서는 가격·기업행동 행에 필요하고 통화쌍
   이력에는 필요 없다. 실패한 job은 `failures`, 완료 문서가 없는 `--fingerprint`(`no_completion`)와 읽을 수
   없는 완료 문서(`unreadable_completion`)는 `missing`으로 남고 나머지 job을 적재한 뒤 종료 코드 1이다. 단위와 원천 ID 규칙은 [데이터 수직 계약](design/data-vertical.md#qveris-수집과-원천-적재)이 소유한다.
+
+## 하루 유지보수 실행
+
+```bash
+aas maintain plan [--home HOME] [--at 2026-10-03T03:00:00Z] [--promotions]
+aas maintain run [--home HOME]
+aas maintain receipt [--home HOME] [--lock uv.lock]
+```
+
+`run`은 설치본을 쓰기로 한 번 열고 끝까지 저장소 잠금을 가진 채 복구, 실행 환경 대조, 선언 달력 갱신,
+수집(KIND, OpenDART, SEC, FRED/ALFRED, Qveris), Qveris·KR 종목 목록 적재, KR identity 증분, dataset chain
+승격, head·watermark 보고를 순서대로 한다. 실행 중 다른 명령은 `installation_busy`로 거부된다. 보고는 표준
+출력과 `raw/`, `<runtime>/maintain-report.json`에 남는다. 종료 코드는 모든 단계가 끝나면 0(예산 소진 포함),
+단계 실패나 공급자 거부가 있으면 1, Qveris가 정산·격리가 필요한 유료 호출로 멈추면 2다. 종료 코드 2의 page나
+group은 [Qveris 원문 수집](#명시한-job의-수집과-적재)의 `quarantine`으로 사유와 함께 격리한다. 격리된 요청은
+다음 날 새 job으로 다시 묻는다.
+
+`plan`은 읽기 전용으로 같은 단계를 계획한다. 자격 증명을 읽지 않고 공급자를 부르지 않는다. 공급자별 계획(KR은
+`aas collect dart plan`, US는 `sec plan`·`fred plan`과 같은 보고, Qveris는 요청 창·이유별 수·보류·대기·job 목록),
+identity 증분 계획, dataset마다 새 원천과 단계를 낸다. `--promotions`는 그 단계의 승격을 현재 head에 대해
+계획한다.
+
+설정은 설치본 `runtime.json`의 `jobs`와 `providers`다. `jobs.enabled`가 `true`이고 공급자 절의 `enabled`가
+`true`인 공급자만 부른다. 자격 증명 파일은 소유자만 읽을 수 있는 한 줄 파일이며 상대 경로는 설치본 `secrets/`
+안이다. 필드와 기본값은 [유지보수 실행](design/data-vertical.md#유지보수-실행)이 소유한다.
+
+```json
+{
+  "jobs": {"enabled": true},
+  "providers": {
+    "kind": {"enabled": true},
+    "dart": {"enabled": true, "key_file": "opendart-api-key", "max_calls": 2000, "daily_quota": 19000},
+    "sec": {"enabled": true, "user_agent_file": "sec-user-agent", "max_calls": 2000, "since": "2026-08-31"},
+    "fred": {"enabled": true, "key_file": "fred-api-key", "max_calls": 500},
+    "qveris": {"enabled": true, "key_file": "qveris-api-key", "raw_root": "/path/to/raw/qveris",
+               "identity": "/path/to/qveris-bulk-identity.json",
+               "since": {"US": "2026-09-01", "KO": "2026-09-05", "KQ": "2026-09-05"},
+               "extra_sessions": {"US": ["2026-07-28"]},
+               "symbol_lists": ["KO", "KQ"], "forex": ["USDKRW"], "max_calls": 30, "max_credits": "100"}
+  }
+}
+```
+
+유지보수는 chain을 이어 붙일 뿐 시작하지 않는다. 각 dataset의 첫 generation은 운영 전환에서 운영자가
+`aas data promote`(또는 `data kr-prices`, `calendar refresh`)로 만들고, 그 뒤 실행이 새로 수집된 원천을 그
+명세의 규칙으로 이어 붙인다. head가 없는 dataset은 `no_head`로 보고된다.
+
+설치와 예약은 운영 전환의 일이다. 태그된 dev 커밋을 정확한 CPython 경로로 설치하고 receipt를 남긴다.
+
+```bash
+uv tool install --python /path/to/cpython-3.13.N/bin/python3.13 \
+  'aegis-alpha-system[legacy] @ git+https://github.com/thisisjun786/aegis-alpha-system@<tag>'
+aas maintain receipt --lock /path/to/<tag>/uv.lock
+install -m 0644 config/systemd/aas-maintain.service config/systemd/aas-maintain.timer \
+  ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now aas-maintain.timer
+```
+
+`receipt`는 interpreter 경로·버전, package의 저장소·태그·커밋과 `RECORD` 해시, 환경의 distribution 목록 해시,
+lock 해시를 `<runtime>/install-receipt.json`과 `raw/`에 남긴다. 실행마다 그 receipt와 실행 환경의 차이가 보고에
+남지만 실행을 막지는 않는다. timer는 매일 03:00 UTC에 `aas maintain run`을 시작하고 놓친 실행을 따라잡는다.
+패키지 설치나 이 명령은 unit을 설치하거나 켜지 않는다.
 
 ## 전환 중인 공급자 도구
 

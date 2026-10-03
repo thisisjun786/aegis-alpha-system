@@ -146,6 +146,8 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   `succeeded` with a `charged` event naming the retained receipt or `uncertain`. Recovery
   turns a left `reserved` into `failed`/`released` and a left `started` into `uncertain`,
   never into a success or a non-call; a quota counts unreleased reservations in its window.
+  A collector may name the reservation's evidence (a Qveris ask's job fingerprint) and
+  `release` an ask it never executed.
 - `kr_collection` runs `aas collect dart` and `aas collect kind` on a writable workspace:
   the rolling OpenDART cohort planned from every committed `opendart-*` receipts table,
   the newest KIND lists and unanswered attempts; each answer and its canonical receipt go
@@ -165,6 +167,14 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   window's start (ALFRED clips periods to the window), and commits each CSV download as the
   `fred-series-csv` source `fred.series_csv@1` would import. See the US collection section of
   `dev-notes/design/data-vertical.md`.
+- `maintain_promotion` continues catalog dataset chains for `aas maintain`: a route names a
+  dataset, its mapper and one collected source shape; each new source becomes the head's child
+  under the latest committed spec that used that mapper, with only parent, sources, partition,
+  generation pins (to current heads), the maintenance identity snapshot and a `never` tombstone
+  advanced, and a `maintain_source@1` quality check marks the source done. It never starts a
+  chain and never changes a chain's rules. `maintain_identity` rebuilds and registers the KR
+  registry when a newer KR identity source is linked and pins the `maintain-<assertion set>`
+  snapshot. See the maintenance section of `dev-notes/design/data-vertical.md`.
 - `bulk_generation` publishes a staged DuckDB table as one generation: plan without
   writing, then one transaction with the marker and `INSERT … SELECT`. DuckDB encodes and
   sorts `aas-rowset-v1` rows and `rowset.RowsetStream` digests them in admitted batches and
