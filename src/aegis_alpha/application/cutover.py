@@ -16,14 +16,18 @@ backup and the user's systemd units, read-only:
 - ``collectors``: ``jobs.enabled`` and every expected provider section are on;
 - ``install_receipt``: the installed tool recorded its receipt;
 - ``maintain_run``: the latest ``aas maintain run`` report of this installation succeeded;
-- ``legacy``: every legacy-import manifest named was imported (its exact bytes are in
-  ``raw/``) and its entry paths are gone, and every other path named as removed is gone.
+- ``legacy``: every legacy-import manifest named is retained in ``raw/`` and has a
+  ``--verify`` report for its exact bytes that is ``complete``, every source that report
+  matched is still committed (or retired) in this installation, the manifest's entry paths
+  are gone, and every other path named as removed is gone.
 
 The report also states what the cutover retired: ``source_retirements`` by backup,
 operation and reason, and the size of ``raw/`` (retirement never deletes raw bytes, so the
 archives it holds stay). ``--record`` keeps a passing report as an
 ``aas-cutover-record-v1`` document: its exact bytes in ``raw/`` and in
-``<runtime>/cutover-record.json``. A failing report is printed and never recorded.
+``<runtime>/cutover-record.json``, beside the exact bytes of every legacy ``--verify``
+report it names (the record holds their SHA-256). A failing report is printed and never
+recorded.
 """
 
 from __future__ import annotations
@@ -60,6 +64,7 @@ PROTECTED_STORES: Final = ("root", "state", "market", "raw")
 _SAMPLE: Final = 20
 _MAX_REPORT_BYTES: Final = 64 * 1024 * 1024
 _MAX_MANIFEST_BYTES: Final = 1024 * 1024
+_MATCHED: Final = frozenset({"committed", "retired"})
 _SYSTEMCTL_SECONDS: Final = 30
 
 
@@ -69,6 +74,7 @@ class CutoverRequest:
 
     expect_providers: tuple[str, ...] = ()
     legacy_manifests: tuple[Path, ...] = ()
+    legacy_verify: tuple[Path, ...] = ()
     removed: tuple[Path, ...] = ()
 
 
@@ -295,12 +301,12 @@ def _maintain_check(paths: StoragePaths, installation_id: str) -> dict[str, obje
     }
 
 
-def _read_small(path: Path) -> bytes:
+def _read_small(path: Path, max_bytes: int = _MAX_MANIFEST_BYTES) -> bytes:
     from aegis_alpha.data.descriptor_tree import DescriptorTree  # noqa: PLC0415
 
     absolute = path.absolute()
     with DescriptorTree.open_path(absolute.parent) as tree:
-        return tree.read_bytes(absolute.name, max_bytes=_MAX_MANIFEST_BYTES)
+        return tree.read_bytes(absolute.name, max_bytes=max_bytes)
 
 
 def _in_raw(raw_root: Path, payload: bytes) -> bool:
@@ -315,38 +321,147 @@ def _in_raw(raw_root: Path, payload: bytes) -> bool:
     return True
 
 
-def legacy_check(
-    raw_root: Path, manifests: Sequence[Path], removed: Sequence[Path]
+@dataclass(frozen=True, slots=True)
+class VerifyReport:
+    """One ``aas import legacy --verify`` report: its path, exact bytes and parsed document."""
+
+    path: Path
+    raw: bytes
+    document: dict[str, object]
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.raw).hexdigest()
+
+
+def read_verify_reports(paths: Sequence[Path]) -> tuple[list[VerifyReport], list[dict[str, str]]]:
+    """The ``--verify`` reports named, and the ones that could not be read as one."""
+    import json  # noqa: PLC0415
+
+    from aegis_alpha.data.descriptor_tree import DescriptorTreeError  # noqa: PLC0415
+
+    reports: list[VerifyReport] = []
+    errors: list[dict[str, str]] = []
+    for path in paths:
+        try:
+            raw = _read_small(path, _MAX_REPORT_BYTES)
+            document = json.loads(raw)
+        except (ValueError, TypeError, OSError, DescriptorTreeError) as error:
+            errors.append({"report": str(path), "error": str(error)})
+            continue
+        if not isinstance(document, dict):
+            errors.append({"report": str(path), "error": "the verify report is not an object"})
+            continue
+        reports.append(VerifyReport(path, raw, cast("dict[str, object]", document)))
+    return reports, errors
+
+
+def _verified_sources(document: dict[str, object]) -> list[dict[str, object]]:
+    found: list[dict[str, object]] = []
+    for entry in cast("list[dict[str, object]]", document.get("entries") or []):
+        found.extend(cast("list[dict[str, object]]", entry.get("sources") or []))
+        retained = cast("dict[str, object] | None", entry.get("retained"))
+        inventory = retained.get("inventory") if retained else None
+        if isinstance(inventory, dict):
+            found.append(cast("dict[str, object]", inventory))
+    return found
+
+
+def _source_state(workspace: Workspace, source_id: str) -> str:
+    from aegis_alpha.storage.source_library import _marker  # noqa: PLC0415
+    from aegis_alpha.storage.state import get_operation  # noqa: PLC0415
+
+    marker = _marker(workspace, source_id)
+    if marker is None:
+        return "missing"
+    operation = get_operation(workspace.state, str(marker[0]))
+    if operation is None or operation["phase"] != "COMPLETED":
+        return "incomplete"
+    return "committed"
+
+
+def _verification(
+    workspace: Workspace, digest: str, reports: Sequence[VerifyReport]
 ) -> dict[str, object]:
-    """Imported legacy manifests whose entry paths are gone, and other removed paths."""
+    """Whether a ``complete`` verify report of this manifest still holds in the installation."""
+    matching = [r for r in reports if r.document.get("manifest_sha256") == digest]
+    if not matching:
+        return {"passed": False, "report": None}
+    report = matching[-1]
+    document = report.document
+    sources = _verified_sources(document)
+    unmatched = [
+        {"source_id": str(item.get("source_id")), "status": str(item.get("status"))}
+        for item in sources
+        if item.get("status") not in _MATCHED
+    ]
+    absent = [
+        {"source_id": source_id, "state": state}
+        for item in sources
+        if (state := _source_state(workspace, source_id := str(item.get("source_id"))))
+        != "committed"
+    ]
+    complete = document.get("mode") == "verify" and document.get("complete") is True
+    return {
+        "passed": complete and bool(sources) and not unmatched and not absent,
+        "report": str(report.path),
+        "report_sha256": report.sha256,
+        "mode": document.get("mode"),
+        "complete": document.get("complete"),
+        "sources": len(sources),
+        "unmatched": unmatched[:_SAMPLE],
+        "not_committed": absent[:_SAMPLE],
+    }
+
+
+def legacy_check(
+    workspace: Workspace,
+    manifests: Sequence[Path],
+    verify_reports: Sequence[Path],
+    removed: Sequence[Path],
+) -> dict[str, object]:
+    """Verified legacy manifests whose entry paths are gone, and other removed paths.
+
+    A manifest passes when its exact bytes are retained in ``raw/``, a ``--verify`` report
+    of those bytes is ``complete``, every source that report lists is matched there and is
+    still committed here (a retired source keeps its commit marker), and none of its entry
+    paths exist. ``apply`` retains the manifest before its first unit, so retention alone
+    does not prove the import finished; the verify report does.
+    """
     from aegis_alpha.data.descriptor_tree import DescriptorTreeError  # noqa: PLC0415
     from aegis_alpha.storage.legacy_import.manifest import parse_manifest  # noqa: PLC0415
 
-    reports: list[dict[str, object]] = []
+    reports, unreadable = read_verify_reports(verify_reports)
+    items: list[dict[str, object]] = []
     for path in manifests:
         try:
             payload = _read_small(path)
             digest = hashlib.sha256(payload).hexdigest()
             entries = parse_manifest(payload, digest).entries
         except (ValueError, TypeError, OSError, DescriptorTreeError) as error:
-            reports.append({"manifest": str(path), "passed": False, "error": str(error)})
+            items.append({"manifest": str(path), "passed": False, "error": str(error)})
             continue
-        imported = _in_raw(raw_root, payload)
+        retained = _in_raw(workspace.paths.raw, payload)
+        verified = _verification(workspace, digest, reports)
         present = [entry.name for entry in entries if os.path.lexists(entry.path)]
-        reports.append(
+        items.append(
             {
                 "manifest": str(path),
                 "manifest_sha256": digest,
-                "imported": imported,
+                "retained": retained,
+                "verified": verified,
                 "entries": [{"name": e.name, "path": str(e.path)} for e in entries],
                 "present": present,
-                "passed": imported and not present,
+                "passed": retained and verified["passed"] is True and not present,
             }
         )
     paths = [{"path": str(p), "removed": not os.path.lexists(p)} for p in removed]
     return {
-        "passed": all(item["passed"] for item in reports) and all(p["removed"] for p in paths),
-        "manifests": reports,
+        "passed": not unreadable
+        and all(item["passed"] for item in items)
+        and all(p["removed"] for p in paths),
+        "manifests": items,
+        "unreadable_reports": unreadable,
         "removed": paths,
     }
 
@@ -403,7 +518,9 @@ def check_cutover(
         "collectors": _collectors_check(paths, request.expect_providers),
         "install_receipt": _receipt_check(paths),
         "maintain_run": _maintain_check(paths, workspace.installation_id),
-        "legacy": legacy_check(paths.raw, request.legacy_manifests, request.removed),
+        "legacy": legacy_check(
+            workspace, request.legacy_manifests, request.legacy_verify, request.removed
+        ),
     }
     failed = [name for name, check in checks.items() if check["passed"] is not True]
     return {
@@ -418,14 +535,35 @@ def check_cutover(
     }
 
 
-def write_record(paths: StoragePaths, report: dict[str, object]) -> str:
-    """Keep a passing report's exact bytes in ``raw/`` and ``<runtime>/cutover-record.json``."""
+def write_record(
+    paths: StoragePaths, report: dict[str, object], verify_reports: Sequence[Path] = ()
+) -> str:
+    """Keep a passing report's exact bytes in ``raw/`` and ``<runtime>/cutover-record.json``.
+
+    The legacy ``--verify`` reports the record names are kept in ``raw/`` first, by the
+    exact bytes whose SHA-256 the record holds.
+    """
     from aegis_alpha.data.descriptor_tree import DescriptorTree  # noqa: PLC0415
     from aegis_alpha.storage.locks import private_directory  # noqa: PLC0415
     from aegis_alpha.storage.raw import put_raw  # noqa: PLC0415
 
     if report.get("passed") is not True:
         raise ValueError("only a passing cutover check is recorded")
+    named = {
+        str(verified.get("report_sha256"))
+        for item in cast(
+            "list[dict[str, object]]",
+            cast("dict[str, dict[str, object]]", report["checks"])["legacy"]["manifests"],
+        )
+        if isinstance(verified := item.get("verified"), dict)
+    }
+    reports, _ = read_verify_reports(verify_reports)
+    kept = {r.sha256 for r in reports if r.sha256 in named}
+    if kept != named:
+        raise ValueError("a verify report the check named changed before it was recorded")
+    for verify in reports:
+        if verify.sha256 in named:
+            put_raw(paths.raw, verify.raw)
     raw = canonical_json_bytes(report)
     _, digest, _ = put_raw(paths.raw, raw)
     private_directory(paths.runtime, create=True)

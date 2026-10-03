@@ -1,8 +1,8 @@
 """``aas maintain cutover-check``: the cutover checklist and its record, offline.
 
-A synthetic installation is cut over the way the runbook does it: a legacy import whose
-original is then deleted, collectors and the install receipt configured, a succeeded
-maintenance report and a deep backup on "another device". ``systemctl`` and device
+A synthetic installation is cut over the way the runbook does it: a legacy import verified
+``complete`` whose original is then deleted, collectors and the install receipt configured,
+a succeeded maintenance report and a deep backup on "another device". ``systemctl`` and device
 numbers are fakes; nothing here reads the account's units or disks.
 """
 
@@ -29,8 +29,9 @@ from aegis_alpha.application.cutover import (
 )
 from aegis_alpha.application.install_receipt import write_receipt
 from aegis_alpha.application.maintain import REPORT_NAME
+from aegis_alpha.storage import workspace as workspace_module
 from aegis_alpha.storage.backup import backup
-from aegis_alpha.storage.legacy_import.engine import apply_import
+from aegis_alpha.storage.legacy_import.engine import apply_import, verify_import
 from aegis_alpha.storage.legacy_import.manifest import parse_manifest
 from aegis_alpha.storage.paths import load_paths
 from aegis_alpha.storage.workspace import initialize, open_workspace, write_json
@@ -115,11 +116,18 @@ def _legacy(tmp_path: Path, home: Path) -> Path:
              "args": {}, "expect": {"rows": 2}}  # fmt: skip
     raw = json.dumps({"schema_version": "aas-legacy-import-v1", "entries": [entry]}).encode()
     manifest = _private(tmp_path / "specs" / "legacy-import.json", raw)
+    parsed = parse_manifest(raw, hashlib.sha256(raw).hexdigest())
     with open_workspace(home, writable=True, strategy_write=True) as workspace:
-        report = apply_import(workspace, parse_manifest(raw, hashlib.sha256(raw).hexdigest()))
-    assert report["reconciled"] is True
+        assert apply_import(workspace, parsed)["reconciled"] is True
+        verified = verify_import(workspace, parsed)
+    assert verified["complete"] is True
+    _private(_verify_path(manifest), json.dumps(verified).encode())
     original.unlink()
     return manifest
+
+
+def _verify_path(manifest: Path) -> Path:
+    return manifest.with_name(manifest.stem + ".verify.json")
 
 
 @pytest.fixture
@@ -151,10 +159,12 @@ def _check(  # noqa: PLR0913 -- the request's parts, defaulted to a passing cuto
     run: cutover.Systemctl = CUT_OVER,
     providers: Sequence[str] = PROVIDERS,
     manifests: Sequence[Path] = (),
+    verify: Sequence[Path] | None = None,
     removed: Sequence[Path] = (),
 ) -> dict[str, object]:
     evidence = read_backup(backup_root)
-    request = CutoverRequest(tuple(providers), tuple(manifests), tuple(removed))
+    reports = [_verify_path(m) for m in manifests] if verify is None else verify
+    request = CutoverRequest(tuple(providers), tuple(manifests), tuple(reports), tuple(removed))
     with open_workspace(home) as workspace:
         return check_cutover(workspace, evidence, request, run=run)
 
@@ -176,12 +186,19 @@ def test_a_cut_over_installation_passes_and_records_it(
     assert checks["units"]["other_units"] == []
     assert checks["collectors"]["enabled"] == list(PROVIDERS)
     legacy = checks["legacy"]
-    assert cast("list[dict[str, object]]", legacy["manifests"])[0]["imported"] is True
+    item = cast("list[dict[str, object]]", legacy["manifests"])[0]
+    verified = cast("dict[str, object]", item["verified"])
+    assert (item["retained"], verified["passed"], verified["complete"]) == (True, True, True)
+    assert (
+        verified["report_sha256"] == hashlib.sha256(_verify_path(manifest).read_bytes()).hexdigest()
+    )
     assert legacy["removed"] == [{"path": str(gone), "removed": True}]
     assert report["retirements"] == {"sources": 0, "rows": 0, "by_backup": {},
                                      "by_operation": {}, "by_reason": {}}  # fmt: skip
     paths = load_paths(home)
-    digest = write_record(paths, report)
+    digest = write_record(paths, report, [_verify_path(manifest)])
+    kept = cast("str", verified["report_sha256"])
+    assert (paths.raw / kept[:2] / kept).read_bytes() == _verify_path(manifest).read_bytes()
     recorded = (paths.runtime / "cutover-record.json").read_bytes()
     assert hashlib.sha256(recorded).hexdigest() == digest
     assert (paths.raw / digest[:2] / digest).read_bytes() == recorded
@@ -318,8 +335,80 @@ def test_legacy_paths_must_be_imported_and_gone(
     assert report["failed"] == ["legacy"]
     first, second = cast("list[dict[str, object]]", legacy["manifests"])
     assert first["passed"] is True
-    assert (second["imported"], second["present"]) == (False, ["kept"])
+    assert (second["retained"], second["present"]) == (False, ["kept"])
+    assert cast("dict[str, object]", second["verified"]) == {"passed": False, "report": None}
     assert legacy["removed"] == [{"path": str(kept.parent), "removed": False}]
+
+
+def test_a_retained_manifest_without_a_complete_verify_fails(
+    cut_over: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    # apply keeps the manifest in raw/ before its first unit, so retention proves nothing.
+    home, manifest, backup_root = cut_over
+    report = json.loads(_verify_path(manifest).read_text())
+
+    def legacy(verify: Sequence[Path]) -> dict[str, object]:
+        result = _check(home, backup_root, manifests=[manifest], verify=verify)
+        assert result["failed"] == ["legacy"]
+        item = cast("list[dict[str, object]]", _checks(result)["legacy"]["manifests"])[0]
+        assert item["retained"] is True
+        return cast("dict[str, object]", item["verified"])
+
+    assert legacy([]) == {"passed": False, "report": None}
+    partial = _private(
+        tmp_path / "partial.json", json.dumps({**report, "complete": False}).encode()
+    )
+    assert legacy([partial])["complete"] is False
+    entry = report["entries"][0]
+    source = {**entry["sources"][0], "source_id": "never-committed"}
+    lost = {**report, "entries": [{**entry, "sources": [source]}]}
+    forged = _private(tmp_path / "forged.json", json.dumps(lost).encode())
+    assert legacy([forged])["not_committed"] == [
+        {"source_id": "never-committed", "state": "missing"}
+    ]
+    broken = _private(tmp_path / "broken.json", b"[]")
+    result = _check(
+        home, backup_root, manifests=[manifest], verify=[_verify_path(manifest), broken]
+    )
+    assert _checks(result)["legacy"]["unreadable_reports"] == [
+        {"report": str(broken), "error": "the verify report is not an object"}
+    ]
+
+
+def test_a_prepared_operation_fails_the_operations_check(
+    cut_over: tuple[Path, Path, Path],
+) -> None:
+    home, manifest, backup_root = cut_over
+    with open_workspace(home, writable=True) as workspace:
+        workspace.state.execute(
+            "INSERT INTO storage_operations VALUES ('source:p', 'source-import', ?, 'x', "
+            "NULL, ?, 'PREPARED', NULL, 1, NULL)",
+            ("a" * 64, "b" * 64),
+        )
+        workspace.state.commit()
+    report = _check(home, backup_root, manifests=[manifest])
+    assert report["failed"] == ["operations"]
+    operations = _checks(report)["operations"]
+    assert (operations["prepared"], operations["sample"]) == (
+        1,
+        [{"operation_id": "source:p", "kind": "source-import"}],
+    )
+
+
+def test_an_outdated_core_schema_fails_the_schema_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "v1"
+    with monkeypatch.context() as patch:
+        patch.setattr(workspace_module, "_INSTALL_VERSION", 1)
+        initialize(home)
+    with open_workspace(home) as admitted:
+        report = check_cutover(
+            admitted, read_backup(tmp_path / "none"), CutoverRequest(), run=CUT_OVER
+        )
+    schema = _checks(report)["schema"]
+    assert (schema["passed"], schema["state"]) == (False, "outdated")
+    assert "schema" in cast("list[str]", report["failed"])
 
 
 def test_retirements_are_reported_by_backup_operation_and_reason(
@@ -359,7 +448,8 @@ def test_the_command_records_only_a_passing_check(
     home, manifest, backup_root = cut_over
     monkeypatch.setattr(cutover, "systemctl", CUT_OVER)
     arguments = ["maintain", "cutover-check", "--home", str(home), "--backup", str(backup_root),
-                 "--legacy-manifest", str(manifest), "--record",
+                 "--legacy-manifest", str(manifest),
+                 "--legacy-verify", str(_verify_path(manifest)), "--record",
                  *(item for name in PROVIDERS for item in ("--expect-provider", name))]  # fmt: skip
     record = load_paths(home).runtime / "cutover-record.json"
     _maintain_report(home, status="partial")
@@ -378,7 +468,12 @@ def test_the_command_records_only_a_passing_check(
 
 
 _OPERATIONS = Path(__file__).resolve().parents[2] / "dev-notes" / "operations.md"
-_INVOCATION = re.compile(r"(?:^|[\s;&|(\"])aas((?: --home \S+)?(?: [a-z][\w-]*){1,2})")
+_INVOCATION = re.compile(r"(?:^|[\s;&|(\"`])aas((?: --home \S+)?((?: [a-z][\w-]*){1,3}))(.*)")
+_OPTION = re.compile(r"(?<![\w-])--[a-z][a-z0-9-]*")
+# Where one shell command of a bash fence ends.
+_COMMAND_END = re.compile(r"&&|\|\||[|;>]")
+# The rehearsal block's homes, backups, reports and compact target, as the test finds them.
+_REHEARSAL_OUTPUTS = 14
 
 
 def _runbook() -> str:
@@ -387,30 +482,57 @@ def _runbook() -> str:
     return rest.split("\n## ", 1)[0]
 
 
-def _help(arguments: list[str], capsys: pytest.CaptureFixture[str]) -> str:
+def _help(arguments: list[str], capsys: pytest.CaptureFixture[str]) -> str | None:
     with pytest.raises(SystemExit) as stopped:
         main([*arguments, "--help"])
-    assert stopped.value.code == 0, arguments
-    return capsys.readouterr().out
+    out = capsys.readouterr().out
+    return out if stopped.value.code == 0 else None
+
+
+def _invocations(text: str) -> list[tuple[tuple[str, ...], str]]:
+    """Every ``aas`` command the runbook names, in fences and inline spans, with its options."""
+    lines = [
+        line
+        for block in re.findall(r"```bash\n(.*?)```", text, re.DOTALL)
+        for line in block.replace("\\\n", " ").splitlines()
+    ]
+    found = [
+        (tuple(match[2].split()), _COMMAND_END.split(match[3], 1)[0])
+        for line in lines
+        for match in _INVOCATION.finditer(line)
+    ]
+    spans = (
+        _INVOCATION.match(" ".join(span.split())) for span in re.findall(r"`(aas [^`]+)`", text)
+    )
+    found.extend((tuple(match[2].split()), match[3]) for match in spans if match is not None)
+    return found
 
 
 def test_the_runbook_names_only_commands_and_options_the_cli_has(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     text = _runbook()
-    blocks = re.findall(r"```bash\n(.*?)```", text, re.DOTALL)
-    commands = {
-        tuple(words[2:] if words[:1] == ["--home"] else words)
-        for block in blocks
-        for match in _INVOCATION.finditer(block)
-        if (words := match[1].split())
-    }
+    invocations = _invocations(text)
+    commands = {words for words, _ in invocations}
     assert ("maintain", "cutover-check") in commands
-    for command in sorted(commands):
-        _help(list(command), capsys)
+    assert ("identity", "kr-build") in commands  # an inline step-4 command
+    usages: dict[tuple[str, ...], tuple[tuple[str, ...], str]] = {}
+    for words in sorted(commands):
+        # The longest word prefix that is a command; the rest are its arguments.
+        for size in range(len(words), 0, -1):
+            if (usage := _help(list(words[:size]), capsys)) is not None:
+                usages[words] = (words[:size], usage)
+                break
+        else:
+            pytest.fail(f"aas {' '.join(words)} is not a command")
+    for words, rest in invocations:
+        command, usage = usages[words]
+        options = set(_OPTION.findall(" ".join(words[len(command) :]) + rest))
+        for option in sorted(options):
+            assert option in usage, f"aas {' '.join(command)} {option}"
     check = text[text.index("aas maintain cutover-check") :].split("\n```", 1)[0]
-    usage = _help(["maintain", "cutover-check"], capsys)
-    for option in set(re.findall(r"--[a-z][a-z-]+", check)):
+    usage = usages[("maintain", "cutover-check")][1]
+    for option in set(_OPTION.findall(check)):
         assert option in usage, option
     # The runbook retires every legacy unit and enables every approved collector.
     for unit in ("aas-native-data-maintenance", "aas-qveris-korea-backfill",
@@ -419,3 +541,27 @@ def test_the_runbook_names_only_commands_and_options_the_cli_has(
     for provider in PROVIDERS:
         assert f"--expect-provider {provider}" in check
     assert "BACKUPS=~/aas-backups" in text
+
+
+def test_the_rehearsal_writes_only_paths_its_cleanup_removes() -> None:
+    text = _runbook()
+    step = text[text.index("**2. 리허설.**") : text.index("**3. ")]
+    (block,) = re.findall(r"```bash\n(.*?)```", step, re.DOTALL)
+    # Nothing outside the rehearsal's own installation and outputs is touched.
+    for forbidden in ("systemctl", "sed -i", "receipt", "import legacy", "$LEGACY", "$HOME_V2",
+                      "$HOME_V3", "$OLD_HOME", "jq ", "tar "):  # fmt: skip
+        assert forbidden not in block, forbidden
+    *body, cleanup = block.strip().splitlines()
+    assert cleanup.startswith("rm -rf -- ")
+    assert "rm " not in "\n".join(body)
+    removed = [word.strip('"') for word in cleanup.removeprefix("rm -rf -- ").split()]
+    assert 'RB="$BACKUPS/rehearsal-$TS"' in block
+    written = [
+        *re.findall(r"(?:--output|--backup-output|--to|--home|>) (\"[^\"]+\"|\S+)", block),
+        *re.findall(r"mkdir -m 0700 (.+?)(?:\n|$)", block)[0].split(),
+        *re.findall(r"(?:AAS_HOME|REPORTS)=(\"[^\"]+\"|\S+)", block),
+    ]
+    paths = [word.strip('"') for word in written if word[:1] in {'"', "$"}]
+    assert len(paths) == _REHEARSAL_OUTPUTS, paths
+    for path in paths:
+        assert any(path == root or path.startswith(root + "/") for root in removed), path

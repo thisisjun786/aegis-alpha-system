@@ -62,6 +62,13 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
         help="An imported legacy-import manifest whose entry paths were deleted (repeatable)",
     )
     check.add_argument(
+        "--legacy-verify",
+        action="append",
+        default=[],
+        type=Path,
+        help="An `aas import legacy --verify` report of a named manifest (repeatable)",
+    )
+    check.add_argument(
         "--removed",
         action="append",
         default=[],
@@ -139,6 +146,7 @@ def _cutover_check(home: Path, args: argparse.Namespace) -> dict[str, object]:
     request = CutoverRequest(
         expect_providers=tuple(args.expect_provider),
         legacy_manifests=tuple(args.legacy_manifest),
+        legacy_verify=tuple(args.legacy_verify),
         removed=tuple(args.removed),
     )
     try:
@@ -148,5 +156,5 @@ def _cutover_check(home: Path, args: argparse.Namespace) -> dict[str, object]:
     except (sqlite3.Error, duckdb.Error):
         raise ValueError("local database operation failed; run aas db verify") from None
     if args.record and report["passed"] is True:
-        report = {**report, "record_sha256": write_record(paths, report)}
+        report = {**report, "record_sha256": write_record(paths, report, request.legacy_verify)}
     return {**report, "exit_code": 0 if report["passed"] is True else 1}

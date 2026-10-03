@@ -1600,7 +1600,12 @@ system의 `network-online.target`에 순서를 걸 수 없으므로 service는 �
 | `collectors` | `runtime.json`이 유지보수 설정으로 읽히고 `jobs.enabled`이며 `--expect-provider`로 이름 붙인 공급자 절이 모두 켜짐 |
 | `install_receipt` | `aas-install-receipt-v1`이 있음. 실행 환경과의 차이는 `differences`로 보고만 한다 |
 | `maintain_run` | `<runtime>/maintain-report.json`이 이 설치본의 `run` 보고이고 `status`가 `succeeded` |
-| `legacy` | `--legacy-manifest` 파일마다 정확한 bytes가 `raw/`에 온전히 있고(`aas import legacy`가 실행됨) 모든 항목 경로가 없으며, `--removed` 경로가 모두 없음 |
+| `legacy` | `--legacy-manifest` 파일마다 정확한 bytes가 `raw/`에 온전히 있고(`retained`), 같은 manifest SHA-256의 `--legacy-verify` 보고가 `mode: verify`이고 `complete: true`이며 그 보고가 나열한 원천(unit 원천과 보존 파일 목록 원천)이 하나 이상이고 모두 `committed`나 `retired`이고 이 설치본에 `COMPLETED` operation의 commit marker로 남아 있고(`verified`), 모든 항목 경로가 없으며, `--removed` 경로가 모두 없음. 읽을 수 없는 verify 보고가 있으면 실패 |
+
+`aas import legacy` 실행은 첫 unit을 commit하기 전에 manifest bytes를 `raw/`에 남기므로 `retained`는 실행이
+시작되었다는 것만 증명한다. 편입이 끝났다는 증명은 `--verify` 보고이고, 그 보고는 원본을 다시 읽어야 만들어지므로
+원본을 지우기 직전에 만들어 둔다. 확인은 그 보고의 원천이 지금도 설치본에 commit으로 남아 있는지를 읽기 전용으로
+대조한다(은퇴한 원천도 commit marker를 유지한다).
 
 백업의 장치 조건은 `aas db source-retire`가 백업을 받아들이는 조건과 같다. 그래서 확인을 통과한 백업은 은퇴에도
 쓸 수 있고, 백업 위치와 같은 장치에 설치본 루트나 state가 있는 설치본은 다른 장치로 옮겨야 통과한다. 같은
@@ -1609,7 +1614,8 @@ system의 `network-online.target`에 순서를 걸 수 없으므로 service는 �
 보고 `aas-cutover-record-v1`은 확인 시각, `installation_id`, `passed`, 실패한 항목 이름(`failed`), 항목별 결과,
 `source_retirements`를 백업 ID·operation·이유별로 묶은 원천·행 수(`retirements`), `raw/`의 파일 수와 bytes(`raw`)를
 담는다. 은퇴와 compact는 `raw/`를 지우지 않으므로 은퇴한 원천의 원본 archive는 그 수에 남는다. `--record`는
-모든 항목이 통과한 보고만 정규 JSON bytes로 `raw/`와 `<runtime>/cutover-record.json`에 남기고 그 SHA-256을
+모든 항목이 통과한 보고만, 보고가 `report_sha256`으로 이름 붙인 verify 보고의 정확한 bytes를 먼저 `raw/`에 남긴 뒤
+(그 사이에 파일이 바뀌었으면 거부), 정규 JSON bytes로 `raw/`와 `<runtime>/cutover-record.json`에 남기고 그 SHA-256을
 `record_sha256`으로 돌려준다. 실패한 보고는 출력만 하고 기록하지 않으며 종료 코드는 1이다.
 
 ## identity 등록과 chunked 문서
@@ -2843,7 +2849,11 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-454 | deep이 아니거나, 뒤에 끝난 operation을 담지 않거나, 설치본과 같은 장치의 백업은 확인을 통과하지 않는다 | `tests/application/test_cutover.py::test_a_backup_must_be_deep_current_and_on_another_device` | 구현 |
 | DV-455 | 파일이 기록과 다르거나 없는 백업과 다른 설치본의 백업은 확인을 통과하지 않는다 | `tests/application/test_cutover.py::test_a_broken_or_foreign_backup_fails` | 구현 |
 | DV-456 | 꺼진 예상 공급자, `jobs.enabled` 거짓, 없는 설치 receipt, 성공하지 않은 유지보수 실행은 각자의 항목으로 실패한다 | `tests/application/test_cutover.py::test_collectors_receipt_and_maintenance_run_are_required` | 구현 |
-| DV-457 | 편입되지 않은 manifest, 남은 항목 경로, 남은 `--removed` 경로는 legacy 확인을 실패시킨다 | `tests/application/test_cutover.py::test_legacy_paths_must_be_imported_and_gone` | 구현 |
+| DV-457 | `raw/`에 없고 verify 보고도 없는 manifest, 남은 항목 경로, 남은 `--removed` 경로는 legacy 확인을 실패시킨다 | `tests/application/test_cutover.py::test_legacy_paths_must_be_imported_and_gone` | 구현 |
 | DV-458 | 은퇴 기록은 백업 ID·operation·이유별 원천과 행 수로 보고된다 | `tests/application/test_cutover.py::test_retirements_are_reported_by_backup_operation_and_reason` | 구현 |
 | DV-459 | `cutover-check --record`는 실패한 확인을 기록하지 않고 종료 코드 1, 통과한 확인을 기록하고 종료 코드 0이다 | `tests/application/test_cutover.py::test_the_command_records_only_a_passing_check` | 구현 |
-| DV-460 | 운영 runbook의 `aas` 명령과 `cutover-check` 옵션은 CLI에 있고, runbook은 legacy unit 넷을 은퇴하고 다섯 수집기를 기대한다 | `tests/application/test_cutover.py::test_the_runbook_names_only_commands_and_options_the_cli_has` | 구현 |
+| DV-460 | 운영 runbook의 fence와 inline `aas` 명령과 그 옵션은 CLI에 있고, runbook은 legacy unit 넷을 은퇴하고 다섯 수집기를 기대한다 | `tests/application/test_cutover.py::test_the_runbook_names_only_commands_and_options_the_cli_has` | 구현 |
+| DV-461 | `raw/`에 있는 manifest라도 verify 보고가 없거나, `complete`가 아니거나, 그 원천이 설치본에 commit으로 없거나, 읽을 수 없는 보고가 있으면 legacy 확인이 실패한다 | `tests/application/test_cutover.py::test_a_retained_manifest_without_a_complete_verify_fails` | 구현 |
+| DV-462 | `PREPARED` storage operation이 남으면 operations 확인이 실패한다 | `tests/application/test_cutover.py::test_a_prepared_operation_fails_the_operations_check` | 구현 |
+| DV-463 | core schema가 현재 버전이 아닌 설치본은 schema 확인이 `outdated`로 실패한다 | `tests/application/test_cutover.py::test_an_outdated_core_schema_fails_the_schema_check` | 구현 |
+| DV-464 | runbook 리허설은 설치본 밖 삭제·systemd·receipt를 실행하지 않고 그 모든 출력 경로를 리허설 정리가 지운다 | `tests/application/test_cutover.py::test_the_rehearsal_writes_only_paths_its_cleanup_removes` | 구현 |
