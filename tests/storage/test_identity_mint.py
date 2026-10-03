@@ -44,7 +44,7 @@ def test_ticker_anchor_is_refused(namespace: str, token: str) -> None:
         (mint_instrument, "norgate_assetid", "AAPL"),
         (mint_instrument, "norgate_assetid", "2020-08-28"),
         (mint_instrument, "norgate_assetid", "0131684"),
-        (mint_instrument, "krx_isin", "US0378331005"),
+        (mint_instrument, "krx_isin", "kr7005930003"),
         (mint_instrument, "krx_isin", "KR7005930004"),
         (mint_issuer, "sec_cik", "320193"),
         (mint_issuer, "sec_cik", "CIK0000320193"),
