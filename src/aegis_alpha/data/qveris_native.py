@@ -8,14 +8,18 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from http import HTTPStatus
 from pathlib import Path
 from types import MappingProxyType
 
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.data.qveris_contracts import (
+    ACTION_DATASETS,
     EOD_HISTORY_JSON_TOOL,
     EOD_TOOL,
+    FX_DATASET,
+    FX_MARKET,
     MAX_RESPONSE_BYTES,
     QverisJob,
     credit_value,
@@ -25,6 +29,20 @@ from aegis_alpha.data.qveris_contracts import (
 from aegis_alpha.data.qveris_payloads import validate_payload
 
 _SHA = re.compile(r"[0-9a-f]{64}")
+_RATIO = re.compile(r"(?P<new>[0-9]+(?:\.[0-9]+)?)/(?P<old>[0-9]+(?:\.[0-9]+)?)")
+_PAGE_FILES = ("intent.json", "raw", "response.json", "billing.json")
+SUPPORTED_COMPLETIONS = frozenset(
+    {
+        ("KR", "price_history", EOD_HISTORY_JSON_TOOL),
+        ("US", "price_history", EOD_HISTORY_JSON_TOOL),
+        ("INDEX", "research_price_history", EOD_HISTORY_JSON_TOOL),
+        ("CRYPTO", "research_price_history", EOD_HISTORY_JSON_TOOL),
+        (FX_MARKET, FX_DATASET, EOD_HISTORY_JSON_TOOL),
+        ("KR", "prices", EOD_TOOL),
+        ("US", "prices", EOD_TOOL),
+        *((market, dataset, EOD_TOOL) for market in ("KR", "US") for dataset in ACTION_DATASETS),
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +53,8 @@ class CompletedHistory:
     retrieved_at: datetime
     rows: tuple[Mapping[str, object], ...]
     provider_warning: bool = False
+    # ``complete.json`` followed by the four page files it pins, as read and verified.
+    evidence: tuple[bytes, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,15 +95,7 @@ def read_completed_job(  # noqa: C901, PLR0912, PLR0915 -- one complete evidence
         if (
             job.fingerprint != fingerprint
             or marker.get("fingerprint") != fingerprint
-            or (job.market, job.dataset, job.tool_id)
-            not in {
-                ("KR", "price_history", EOD_HISTORY_JSON_TOOL),
-                ("US", "price_history", EOD_HISTORY_JSON_TOOL),
-                ("INDEX", "research_price_history", EOD_HISTORY_JSON_TOOL),
-                ("CRYPTO", "research_price_history", EOD_HISTORY_JSON_TOOL),
-                ("KR", "prices", EOD_TOOL),
-                ("US", "prices", EOD_TOOL),
-            }
+            or (job.market, job.dataset, job.tool_id) not in SUPPORTED_COMPLETIONS
             or marker.get("status") not in {"RAW_ACQUIRED", "RAW_ACQUIRED_WITH_WARNINGS"}
             or type(marker.get("schema_version")) is not int
             or marker.get("schema_version") != 1
@@ -96,7 +108,7 @@ def read_completed_job(  # noqa: C901, PLR0912, PLR0915 -- one complete evidence
         ):
             raise ValueError("unsupported or inconsistent completed price history")
         pins = marker.get("files")
-        suffixes = ("intent.json", "raw", "response.json", "billing.json")
+        suffixes = _PAGE_FILES
         if not isinstance(pins, list) or len(pins) != len(suffixes):
             raise ValueError("completion must pin all four page artifacts")
         payloads = {}
@@ -167,6 +179,7 @@ def read_completed_job(  # noqa: C901, PLR0912, PLR0915 -- one complete evidence
             retrieved,
             tuple(MappingProxyType(dict(object_value(row))) for row in values),
             provider_warning=warning,
+            evidence=(body, *(payloads[suffix] for suffix in suffixes)),
         )
 
 
@@ -206,12 +219,14 @@ def _identity(symbol: str, identities: Mapping[str, Mapping[str, str]]) -> Mappi
     return identity
 
 
-def _bar(
+def _bar(  # noqa: PLR0913 -- one provider row and its resolved context
     history: CompletedHistory,
     raw: Mapping[str, object],
     ordinal: int,
     symbol: str,
     identity: Mapping[str, str],
+    *,
+    fingerprint: str,
 ) -> Mapping[str, object]:
     observed = date.fromisoformat(str(raw["date"]))
     prices = {
@@ -231,7 +246,7 @@ def _bar(
             "date": observed,
             **prices,
             "volume": volume,
-            "source_fingerprint": history.job.fingerprint,
+            "source_fingerprint": fingerprint,
             "raw_sha256": history.raw_sha256,
             "retrieved_at": history.retrieved_at,
             "source_row": ordinal,
@@ -245,6 +260,7 @@ def _normalize(
     history: CompletedHistory, identities: Mapping[str, Mapping[str, str]], fixed_symbol: str | None
 ) -> NormalizedHistory:
     accepted, rejected = [], []
+    fingerprint = history.job.fingerprint
     for ordinal, raw in enumerate(history.rows):
         if history.provider_warning:
             rejected.append(
@@ -259,7 +275,8 @@ def _normalize(
             continue
         symbol = fixed_symbol or str(raw.get("code")) + "." + str(raw.get("exchange_short_name"))
         try:
-            accepted.append(_bar(history, raw, ordinal, symbol, _identity(symbol, identities)))
+            identity = _identity(symbol, identities)
+            accepted.append(_bar(history, raw, ordinal, symbol, identity, fingerprint=fingerprint))
         except (ValueError, TypeError, KeyError) as error:
             rejected.append(
                 MappingProxyType(
@@ -274,9 +291,144 @@ def normalize_korean_price_history(
 ) -> NormalizedHistory:
     if history.job.market != "KR" or history.job.dataset != "price_history":
         raise ValueError("expected Korean single-instrument history")
+    return normalize_price_history(history, identities)
+
+
+def normalize_price_history(
+    history: CompletedHistory, identities: Mapping[str, Mapping[str, str]]
+) -> NormalizedHistory:
+    """One instrument's KR or US daily history; the job's symbol must have an identity."""
+    if history.job.market not in {"KR", "US"} or history.job.dataset != "price_history":
+        raise ValueError("expected KR or US single-instrument history")
     symbol = str(history.job.parameters["symbol"])
     _identity(symbol, identities)
     return _normalize(history, identities, symbol)
+
+
+def _held(ordinal: int, reason: str, raw: Mapping[str, object]) -> Mapping[str, object]:
+    return MappingProxyType({"ordinal": ordinal, "reason": reason, "source_row": dict(raw)})
+
+
+def _text(raw: Mapping[str, object], name: str, *, required: bool = False) -> str | None:
+    """A provider value as text: strings as sent, numbers as their shortest decimal."""
+    value = raw.get(name)
+    if value is None or value == "":
+        if required:
+            raise ValueError("missing_" + name)
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise TypeError("non_text_" + name)
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("non_finite")
+    return value if isinstance(value, str) else repr(value)
+
+
+def _positive_decimal(value: str | None, reason: str) -> None:
+    try:
+        number = Decimal(value or "")
+    except InvalidOperation:
+        raise ValueError(reason) from None
+    if not number.is_finite() or number <= 0:
+        raise ValueError(reason)
+
+
+def _action(
+    history: CompletedHistory,
+    raw: Mapping[str, object],
+    ordinal: int,
+    identities: Mapping[str, Mapping[str, str]],
+    fingerprint: str,
+) -> Mapping[str, object]:
+    symbol = str(raw.get("code")) + "." + str(raw.get("exchange"))
+    identity = _identity(symbol, identities)
+    observed = date.fromisoformat(str(raw["date"]))
+    if history.job.dataset == "splits":
+        ratio = _text(raw, "split", required=True)
+        match = _RATIO.fullmatch(ratio or "")
+        if match is None:
+            raise ValueError("invalid_split_ratio")
+        _positive_decimal(match["new"], "invalid_split_ratio")
+        _positive_decimal(match["old"], "invalid_split_ratio")
+        values: dict[str, object] = {"split": ratio}
+    else:
+        dividend = _text(raw, "dividend", required=True)
+        _positive_decimal(dividend, "invalid_dividend")
+        unadjusted = _text(raw, "unadjustedValue")
+        if unadjusted is not None:
+            _positive_decimal(unadjusted, "invalid_dividend")
+        values = {
+            "dividend": dividend,
+            "dividend_currency": _text(raw, "currency", required=True),
+            "unadjusted_value": unadjusted,
+            "declaration_date": _text(raw, "declarationDate"),
+            "record_date": _text(raw, "recordDate"),
+            "payment_date": _text(raw, "paymentDate"),
+            "period": _text(raw, "period"),
+        }
+    return MappingProxyType(
+        {
+            **identity,
+            "provider_symbol": symbol,
+            "date": observed,
+            **values,
+            "source_fingerprint": fingerprint,
+            "raw_sha256": history.raw_sha256,
+            "retrieved_at": history.retrieved_at,
+            "source_row": ordinal,
+            "independent_identity_verified": False,
+        }
+    )
+
+
+def normalize_bulk_actions(
+    history: CompletedHistory, identities: Mapping[str, Mapping[str, str]]
+) -> NormalizedHistory:
+    """One exchange-day of splits or dividends, values kept as the provider's text.
+
+    Rows of a download the gateway reported as partial are all held with the reason
+    ``provider_reported_partial``; rows without an explicit identity or with a value
+    that is not a positive decimal are held with that reason. Nothing is repaired.
+    """
+    if history.job.tool_id != EOD_TOOL or history.job.dataset not in ACTION_DATASETS:
+        raise ValueError("expected exchange bulk splits or dividends")
+    accepted, rejected = [], []
+    fingerprint = history.job.fingerprint
+    for ordinal, raw in enumerate(history.rows):
+        if history.provider_warning:
+            rejected.append(_held(ordinal, "provider_reported_partial", raw))
+            continue
+        try:
+            accepted.append(_action(history, raw, ordinal, identities, fingerprint))
+        except (ValueError, TypeError, KeyError) as error:
+            rejected.append(_held(ordinal, str(error), raw))
+    return NormalizedHistory(tuple(accepted), tuple(rejected))
+
+
+def normalize_fx_history(history: CompletedHistory) -> NormalizedHistory:
+    """One currency pair's daily history; a pair needs no instrument identity."""
+    if history.job.market != FX_MARKET or history.job.dataset != FX_DATASET:
+        raise ValueError("expected forex pair history")
+    symbol = str(history.job.parameters["symbol"])
+    pair = symbol.rpartition(".")[0]
+    currencies = {
+        "pair": pair,
+        "base_currency": pair[:3],
+        "quote_currency": pair[3:],
+    }
+    accepted, rejected = [], []
+    fingerprint = history.job.fingerprint
+    for ordinal, raw in enumerate(history.rows):
+        if history.provider_warning:
+            rejected.append(_held(ordinal, "provider_reported_partial", raw))
+            continue
+        try:
+            bar = dict(_bar(history, raw, ordinal, symbol, currencies, fingerprint=fingerprint))
+        except (ValueError, TypeError, KeyError) as error:
+            rejected.append(_held(ordinal, str(error), raw))
+            continue
+        del bar["calendar_verified"], bar["independent_identity_verified"]
+        accepted.append(MappingProxyType(bar))
+    return NormalizedHistory(tuple(accepted), tuple(rejected))
 
 
 def normalize_bulk_prices(

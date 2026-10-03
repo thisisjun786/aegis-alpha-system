@@ -22,6 +22,11 @@ MAX_PAGES = 100
 MAX_FRED_PAGE = 100_000
 MIN_RESPONSE_BYTES = 1024
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,149}")
+_PAIR = re.compile(r"[A-Z]{6}")
+FX_MARKET = "FX"
+FX_EXCHANGE = "FOREX"
+FX_DATASET = "fx_history"
+ACTION_DATASETS = frozenset({"splits", "dividends"})
 
 
 def object_value(value: object) -> dict[str, object]:
@@ -94,6 +99,24 @@ def _validate_exchange(market: str, exchange: object) -> None:
         raise ValueError("EODHD exchange does not match the reviewed market")
 
 
+def _history_dataset(job: QverisJob, code: str, exchange: str) -> str:
+    """The dataset a history route of ``job.market`` must declare, after its route checks."""
+    if job.market in {"INDEX", "CRYPTO"}:
+        expected_exchange = "INDX" if job.market == "INDEX" else "CC"
+        if job.tool_id != EOD_HISTORY_JSON_TOOL or exchange != expected_exchange:
+            raise ValueError("research history requires its reviewed JSON market route")
+        return "research_price_history"
+    if job.market == FX_MARKET:
+        # A currency pair is no instrument: ``<BASE><QUOTE>.FOREX`` on the JSON route only.
+        if job.tool_id != EOD_HISTORY_JSON_TOOL or exchange != FX_EXCHANGE:
+            raise ValueError("forex history requires the reviewed JSON FOREX route")
+        if _PAIR.fullmatch(code) is None:
+            raise ValueError("forex history requires a six-letter currency pair")
+        return FX_DATASET
+    _validate_exchange(job.market, exchange)
+    return "price_history"
+
+
 def _validate_history(job: QverisJob, params: dict[str, object]) -> None:
     if job.tool_id == EOD_HISTORY_JSON_TOOL:
         _exact_keys(params, {"symbol", "order", "from", "fmt"}, set())
@@ -105,14 +128,7 @@ def _validate_history(job: QverisJob, params: dict[str, object]) -> None:
     if not isinstance(symbol, str) or _NAME.fullmatch(symbol) is None:
         raise ValueError("invalid EODHD history symbol")
     code, separator, exchange = symbol.rpartition(".")
-    if job.market in {"INDEX", "CRYPTO"}:
-        expected_exchange = "INDX" if job.market == "INDEX" else "CC"
-        if job.tool_id != EOD_HISTORY_JSON_TOOL or exchange != expected_exchange:
-            raise ValueError("research history requires its reviewed JSON market route")
-        expected_dataset = "research_price_history"
-    else:
-        _validate_exchange(job.market, exchange)
-        expected_dataset = "price_history"
+    expected_dataset = _history_dataset(job, code, exchange)
     if (
         not separator
         or not code
