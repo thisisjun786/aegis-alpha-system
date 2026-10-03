@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING
 
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
 from aegis_alpha.engine.codec import decode_json
+from aegis_alpha.storage.market_inputs import GenerationPin
+from aegis_alpha.storage.read_heads import HeadBinding, HeadPin
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -37,6 +39,7 @@ __all__ = [
     "EXECUTION_MODE",
     "FILL_CONVENTION",
     "OBSERVATION_NAMESPACE",
+    "PANEL_SOURCES",
     "PREPARED_COMPOSITION_SCHEMA",
     "PREPARED_SCHEMA",
     "REQUIRED_UNSETTLED",
@@ -107,6 +110,10 @@ _EXPAND = frozenset({"extended-history-used", "extended-history-not-used"})
 # does, so a stored D run cannot present a fill convention as settled.
 REQUIRED_UNSETTLED = frozenset({"fill_price"})
 
+# A declaration reads its open and close panels from exactly one of two sources: pinned
+# reference observation generations, or canonical price pins read through read_heads.
+# The root names the source by the one key it carries, so neither is ever inferred.
+PANEL_SOURCES = ("observations", "prices")
 _ROOT = frozenset(
     {
         "schema_version",
@@ -130,6 +137,10 @@ _STRATEGY = frozenset(
 )
 _OBSERVATION = frozenset(
     {"dataset_id", "version", "generation_id", "chain_hash", "manifest_hash", "observation_role"}
+)
+_PRICES = frozenset({"pins", "excluded_flags"})
+_PRICE_PIN = frozenset(
+    {"dataset_id", "version", "generation_id", "chain_hash", "manifest_hash", "from", "to"}
 )
 _CALENDAR = frozenset({"calendar_id", "basis"})
 _MEMBERSHIP = frozenset({"kind", "id", "version", "hash"})
@@ -272,6 +283,9 @@ class PreparationRecord:
     # Which sleeve supplied each decision, for a composition. Empty for a sleeve run,
     # so the sealed record always states what actually ran rather than what could have.
     defensive_decisions: tuple[str, ...] = ()
+    # The aas-head-read-v1 receipt of the canonical price read, for a price-pinned run.
+    # None for an observation run, whose panels are not read through read_heads.
+    head_read: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,6 +375,14 @@ class ResearchRunRequest:
     # Absent for a sleeve run. Present only under the composition schema, which is what
     # separates a sample-level record from a sleeve-level one.
     composition: Composition | None = None
+    # The canonical price binding a price-pinned declaration reads both panels from.
+    # Exactly one of this and observations is present.
+    prices: HeadBinding | None = None
+
+    @property
+    def panel_source(self) -> str:
+        """Which of PANEL_SOURCES this declaration reads its panels from."""
+        return "prices" if self.prices is not None else "observations"
 
     @property
     def certified(self) -> bool:
@@ -371,6 +393,19 @@ class ResearchRunRequest:
     def scope(self) -> str:
         """What this declaration is a record of, named rather than inferred."""
         return "sample-composition" if self.composition is not None else "sleeve"
+
+
+def _root(value: object, allowed: frozenset[str]) -> dict[str, object]:
+    """The request root, whose panel source is whichever one key of PANEL_SOURCES it has.
+
+    The two sources are alternatives, not options: a root carrying both or neither is
+    refused, so a declaration never reads one panel source while naming the other.
+    """
+    if isinstance(value, dict) and "prices" in value:
+        if "observations" in value:
+            raise ResearchRunError("request names both observations and prices")
+        allowed = (allowed - {"observations"}) | {"prices"}
+    return _object(value, "request", allowed)
 
 
 def _object(value: object, field: str, allowed: frozenset[str]) -> dict[str, object]:
@@ -423,15 +458,69 @@ def _observations(value: object) -> tuple[ObservationPinRef, ...]:
     return tuple(pins)
 
 
-def _instrument_map(value: object) -> Mapping[str, str]:
+def _prices(value: object) -> HeadBinding:
+    """A canonical price binding: ordered exact pins with contiguous cutovers.
+
+    Grants are not declared. A research read is not strict point-in-time, so read_heads
+    ignores time-rule grants there; a grant here would be recorded as if it decided
+    something. Flag exclusions do decide what is read and are declared.
+    """
+    block = _object(value, "prices", _PRICES)
+    if not isinstance(block["pins"], list) or not block["pins"]:
+        raise ResearchRunError("prices pins must be a non-empty array")
+    pins = []
+    for index, entry in enumerate(block["pins"]):
+        row = _object(entry, "prices pins[" + str(index) + "]", _PRICE_PIN)
+        bounds = []
+        for name in ("from", "to"):
+            bound = row[name]
+            if bound is None:
+                bounds.append(None)
+                continue
+            try:
+                bounds.append(date.fromisoformat(_text(bound, "prices pin " + name)))
+            except ValueError as error:
+                raise ResearchRunError("prices pin " + name + " must be an ISO date") from error
+        pin = GenerationPin(
+            _text(row["dataset_id"], "dataset_id"),
+            _exact_version(row["version"], "price version"),
+            _text(row["generation_id"], "generation_id"),
+            _digest(row["chain_hash"], "chain_hash"),
+            _digest(row["manifest_hash"], "manifest_hash"),
+        )
+        try:
+            pins.append(HeadPin(pin, bounds[0], bounds[1]))
+        except ValueError as error:
+            raise ResearchRunError("prices pin " + str(error)) from error
+    flags = block["excluded_flags"]
+    if not isinstance(flags, list):
+        raise ResearchRunError("prices excluded_flags must be an array")
+    try:
+        return HeadBinding(
+            "prices",
+            tuple(pins),
+            excluded_flags=tuple(_text(flag, "excluded flag") for flag in flags),
+        )
+    except ValueError as error:
+        raise ResearchRunError("prices binding: " + str(error)) from error
+
+
+def _instrument_map(value: object, *, source: str) -> Mapping[str, str]:
+    """Map what the panel carries onto the asset ids the strategy knows.
+
+    An observation panel carries aas-obs- series; a price panel carries the opaque
+    instrument ids identity minted, which never use that namespace.
+    """
     if not isinstance(value, dict) or not value:
         raise ResearchRunError("instrument_map must be a non-empty object")
     mapped = {}
     for series, instrument in sorted(value.items()):
         key = _text(series, "instrument_map key")
-        if not key.startswith(OBSERVATION_NAMESPACE):
+        if (source == "observations") != key.startswith(OBSERVATION_NAMESPACE):
             raise ResearchRunError(
                 "instrument_map key must name an " + OBSERVATION_NAMESPACE + " series"
+                if source == "observations"
+                else "instrument_map key must name an instrument id, not an observation series"
             )
         mapped[key] = _text(instrument, "instrument_map[" + key + "]")
     if len(set(mapped.values())) != len(mapped):
@@ -595,7 +684,7 @@ def _execution(value: object) -> ExecutionTerms:
 def parse_research_run_request(raw: bytes) -> ResearchRunRequest:
     """Parse and validate an exact request. Refuses before anything durable is written."""
     decoded = decode_json(raw)
-    body = _object(decoded, "request", _ROOT)
+    body = _root(decoded, _ROOT)
     if body["schema_version"] != RESEARCH_RUN_SCHEMA:
         raise ResearchRunError("request is not " + RESEARCH_RUN_SCHEMA)
     strategy = _object(body["strategy"], "strategy", _STRATEGY)
@@ -618,7 +707,7 @@ def parse_research_composition_request(raw: bytes) -> ResearchRunRequest:
     admit the other.
     """
     decoded = decode_json(raw)
-    body = _object(decoded, "request", _COMPOSITION_ROOT)
+    body = _root(decoded, _COMPOSITION_ROOT)
     if body["schema_version"] != RESEARCH_COMPOSITION_SCHEMA:
         raise ResearchRunError("request is not " + RESEARCH_COMPOSITION_SCHEMA)
     block = _object(body["composition"], "composition", _COMPOSITION)
@@ -690,19 +779,20 @@ def _declared(
         raise ResearchRunError("execution_mode must be " + EXECUTION_MODE)
     conventions = _object(body["conventions"], "conventions", _CONVENTIONS)
     semantics = _semantics(body["semantics"])
+    source = "prices" if "prices" in body else "observations"
     return ResearchRunRequest(
         strategy_store_id=offense.strategy_store_id,
         strategy_id=offense.strategy_id,
         strategy_version=offense.version,
         strategy_raw_sha256=offense.raw_sha256,
         strategy_contract_sha256=offense.contract_sha256,
-        observations=_observations(body["observations"]),
+        observations=() if source == "prices" else _observations(body["observations"]),
         calendar=_calendar(body["calendar"]),
         membership=offense.membership,
         period=_window(body["period"], "period"),
         history=_window(body["history"], "history"),
         execution=_execution(body["execution"]),
-        instrument_map=_instrument_map(body["instrument_map"]),
+        instrument_map=_instrument_map(body["instrument_map"], source=source),
         conventions=DeclaredConventions(
             knowledge_time=_knowledge_time(conventions["knowledge_time"]),
             calendar=_text(conventions["calendar"], "calendar"),
@@ -717,6 +807,7 @@ def _declared(
         request_sha256=content_sha256(decoded),
         schema_version=schema,
         composition=composition,
+        prices=_prices(body["prices"]) if source == "prices" else None,
     )
 
 
@@ -775,6 +866,43 @@ def _sealed_composition(
     }
 
 
+def _sealed_panels(
+    request: ResearchRunRequest, prepared: PreparationRecord
+) -> Mapping[str, object]:
+    """The panel source the run read, under the one key its declaration used.
+
+    A price-pinned run seals the read_heads receipt itself: its binding, query, the time
+    rule of every pinned generation and the digest of the heads it returned. That is the
+    record of what the panels were, and a reader can hold it against the store.
+    """
+    if request.prices is None:
+        if prepared.head_read is not None:
+            raise ResearchRunError("an observation run has no price read to seal")
+        return {
+            "observations": [
+                {
+                    "dataset_id": pin.dataset_id,
+                    "version": pin.version,
+                    "generation_id": pin.generation_id,
+                    "chain_hash": pin.chain_hash,
+                    "manifest_hash": pin.manifest_hash,
+                    "observation_role": pin.observation_role,
+                }
+                for pin in request.observations
+            ]
+        }
+    receipt = prepared.head_read
+    if receipt is None or receipt.get("binding") != request.prices.document():
+        raise ResearchRunError("a price run seals the head read of its own binding")
+    return {
+        "prices": {
+            "binding_hash": request.prices.binding_hash,
+            "head_read": dict(receipt),
+            "head_read_sha256": content_sha256(dict(receipt)),
+        }
+    }
+
+
 def declared_provenance(request: ResearchRunRequest, prepared: PreparationRecord) -> bytes:
     """The sealed record of one declared run: what was asserted, and what it produced.
 
@@ -813,17 +941,7 @@ def declared_provenance(request: ResearchRunRequest, prepared: PreparationRecord
                 "contract_sha256": request.strategy_contract_sha256,
             },
             "composition": _sealed_composition(request, prepared),
-            "observations": [
-                {
-                    "dataset_id": pin.dataset_id,
-                    "version": pin.version,
-                    "generation_id": pin.generation_id,
-                    "chain_hash": pin.chain_hash,
-                    "manifest_hash": pin.manifest_hash,
-                    "observation_role": pin.observation_role,
-                }
-                for pin in request.observations
-            ],
+            **_sealed_panels(request, prepared),
             "calendar": {
                 "calendar_id": request.calendar.calendar_id,
                 "basis": request.calendar.basis,

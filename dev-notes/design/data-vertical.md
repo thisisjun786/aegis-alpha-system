@@ -1164,7 +1164,10 @@ Norgate security master와 그보다 늦은 Norgate history 내보내기에서�
     "pins": [{"dataset_id", "version", "generation_id", "chain_hash", "manifest_hash", "from", "to"}],
     "granted_rules", "excluded_flags"}`(목록은 정렬)의 SHA-256이 binding hash다.
   - query(`HeadQuery`)는 cutoff, 수집 cutoff, subject 목록, 날짜 구간, 가격 역할, coverage 격자다.
-    cutoff가 있으면 strict PIT, 없으면 연구 모드다. subject는 도메인의 주체 열(가격은
+    cutoff가 있으면 strict PIT, 없으면 연구 모드다. 연구 모드의 query는 지식 상한(`known_ceiling_us`)을
+    가질 수 있고, 그러면 `revision_known_at_us`가 상한보다 늦은 revision은 투영 전에 빠지고 그 시점이
+    없는 revision은 남는다(관측 연구 패널의 `_Visibility.candidates`와 같다). 상한은 설정했을 때만
+    query 문서에 들어가므로 상한 없는 읽기의 영수증 바이트는 그대로다. subject는 도메인의 주체 열(가격은
     `instrument_id`, 달력은 `calendar_id`, 재무·공시는 `issuer_id`, 거시는 `series_id`, FX는
     `base/quote`, 분류는 `subject_id`), 날짜는 도메인의 날짜 열(가격·달력은 `session_date`, 기업행동은
     `effective_date`, 재무는 `period_end`, 공시는 `filed_date`, `*_us` 열은 UTC 날짜)이다.
@@ -1195,6 +1198,29 @@ Norgate security master와 그보다 늦은 Norgate history 내보내기에서�
     휴장 session은 `session_closed`다. 격자의 칸은 결과 행과 함께 fetch 전 할당 검사에 포함된다.
 - 분할조정·총수익 가격은 reader가 unadjusted 가격과 cutoff 시점까지 알려진 `corporate_actions`로
   계산한다. 공급자 조정 가격은 reference로만 남는다.
+
+### 연구 실행의 canonical 가격 패널
+
+선언한 미인증 연구 실행(`aas-research-run-v2`, `aas-research-composition-v1`)은 패널 원천으로 보존 관측
+pin(`observations`) 대신 canonical 가격 binding(`prices`: `aas-head-binding-v1`의 pin과 cutover, flag 제외
+목록)을 들 수 있다. 선언 최상위에는 둘 중 정확히 하나만 있다. `backtest_prepare._price_panels`가
+`market_inputs.load_pinned_heads`로 그 binding을 한 번 읽어 open과 close 패널을 함께 만든다.
+
+- query는 연구 모드이고 시간 규칙 grant를 쓰지 않는다. 지식 상한은 선언의 `knowledge_time`이고 subject는
+  `instrument_map`의 instrument ID, 역할은 `canonical`, 날짜는 이력·기간 시작 중 이른 날부터 둘의 끝 중
+  늦은 날까지다. 그래서 패널은 pin한 chain이 그 instrument에 가진 첫 세션부터 시작한다.
+- 행은 `basis='unadjusted'`, `interval='1d'`의 canonical bar여야 하고 통화는 선언 통화와 같아야 한다. `present`가 아닌
+  bar와 공개 시점이 상한보다 늦은 head는 패널에 넣지 않으며 이전 값으로 대체하지 않는다. 같은
+  instrument·세션의 bar가 둘이면 거부한다. 읽은 행이 없는 `instrument_map` 열쇠도 거부한다.
+- 한 bar가 자기 시가와 종가를 내므로 두 패널은 basis·조정·세션이 같다. 세션 순서는 bar의 `bar_end_us`로
+  정하며 이것은 지식 시점이 아니라 bar의 경제 시점이다. 일정은 관측 경로와 같은 날짜 기반 월말 판단이다.
+- 읽기는 `read_heads`의 기본값대로 구조만 확인한다(`rehash=False`): pin·chain link·행 수는 확인하고 delta
+  행 값은 다시 해시하지 않으며 영수증의 `rehashed`가 거짓으로 이를 기록한다. 관측 경로는 보존 관측 내용을
+  다시 확인하므로 두 경로의 내용 확인 범위는 다르다. 행 값 확인은 `aas db verify`의 몫이다.
+- 자산 유형은 상태 저장소의 instrument 분류에서 온다(`etf` → `ETF`). 관측 경로의 `OBSERVATION`과 다르다.
+- 봉인 준비 문서는 `observations` 대신 `prices`에 `binding_hash`, 읽기 영수증 `head_read`
+  (`aas-head-read-v1` 전체)와 그 SHA-256을 싣는다. `resolved_calendar.observed_calendar_ref`는 binding
+  hash를 가리킨다. 실행은 여전히 `research-uncertified`이며 엄격 경로의 승인(DV-81)은 다루지 않는다.
 
 ## 스키마 v2
 
@@ -1466,20 +1492,31 @@ state v2:
 | DV-192 | `import sec-companies --plan`은 쓰지 않고 실행은 같은 원천 ID를 commit한다 | `tests/storage/test_classifications.py::test_sec_companies_cli_plans_and_imports` | 구현 |
 | DV-193 | `partition`이 있는 분류 명세는 파티션 날짜가 없는 Norgate 행을 거부한다 | `tests/storage/test_classifications.py::test_a_partitioned_plan_refuses_undated_norgate_rows` | 구현 |
 | DV-194 | UTF-8 JSON 객체가 아닌 CIK member는 `import sec-companies` 전체를 거부하고 아무것도 commit하지 않는다 | `tests/storage/test_classifications.py::test_sec_companies_refuse_a_member_that_is_not_a_json_object` | 구현 |
-| DV-195 | US 가격 매퍼는 등록돼 있고 Norgate 매퍼는 asset ID로, FMP 매퍼는 FMP 심볼로 해석하며 정의하지 않은 인자를 거부한다 | `tests/storage/test_us_prices.py::test_us_price_mappers_are_registered` | 구현 |
-| DV-196 | `norgate.prices_none@1`은 미국 주식 내보내기 원문을 canonical bar로 옮기고 다른 database·잘못된 날짜 행에 세션 날짜를 주지 않으며 일부 값만 있는 bar는 값 없이 `invalid`다 | `tests/storage/test_us_prices.py::test_norgate_prices_none_maps_export_text` | 구현 |
-| DV-197 | `norgate.prices_adjusted@1`은 `CAPITAL`·`TOTALRETURN` binary32 part를 `split_adjusted`·`total_return` reference bar로 옮기고 다른 조정 유형과 0시가 아닌 날짜를 거부한다 | `tests/storage/test_us_prices.py::test_norgate_prices_adjusted_maps_binary32_parts` | 구현 |
-| DV-198 | Norgate 기준 시리즈는 close 전용 reference이고 원문 close가 저장 값·날짜와 다르면 `invalid`이며 주식 내보내기 행은 기준 시리즈가 되지 않는다 | `tests/storage/test_us_prices.py::test_norgate_reference_series_are_close_only` | 구현 |
-| DV-199 | `fmp.eod_non_split@1`의 revision N은 bar마다 수집 시각순 N번째 값 구간의 첫 응답이고 같은 시각의 다른 응답은 revision 1에만 함께 들어간다 | `tests/storage/test_us_prices.py::test_fmp_revisions_select_the_first_response_of_each_run` | 구현 |
-| DV-200 | nanosecond timestamp 원천 열의 `source_row_hash`는 고정값을 재현하고 SQL과 Python에서 같다 | `tests/storage/test_us_prices.py::test_nanosecond_timestamps_hash_alike_in_sql_and_python` | 구현 |
-| DV-201 | 내보내기로 확장한 US 등록에서 Norgate canonical, EODHD(교차 대조 flag), 기준 지수가 승격되고 잘린 거래량은 flag를 단다 | `tests/storage/test_us_prices.py::test_us_prices_promote_through_the_export_registry` | 구현 |
-| DV-202 | Norgate 조정 part는 `float_shortest@1`로 승격되고 binary32 저장값에 `provider_float_storage` flag를 단다 | `tests/storage/test_us_prices.py::test_norgate_adjusted_parts_promote_with_float_storage_flags` | 구현 |
-| DV-203 | FMP 정정은 다음 revision generation의 SUPERSEDE이며 정정을 수집한 시각부터 알려진다 | `tests/storage/test_us_prices.py::test_fmp_corrections_promote_as_later_generations` | 구현 |
-| DV-204 | history 내보내기는 master에 없는 시리즈를 asset ID로 발급하고 `through` 뒤 창의 티커 주장을 만들며, 그 창에서 수집한 FMP profile은 창의 시리즈로 판단되고 모호하거나 옮겨 간 티커는 미해결이다 | `tests/storage/test_us_prices.py::test_exports_extend_ticker_claims_past_the_master` | 구현 |
-| DV-205 | 부호 있는 Norgate 기준 시리즈는 `signed_series`로 찾고, 명세의 `signed`에 들면 행이 하나도 선택되지 않으며 `signed`는 증가하는 asset ID 목록이어야 한다 | `tests/storage/test_us_prices.py::test_norgate_reference_series_are_close_only` | 구현 |
-| DV-206 | 같은 Norgate history 행은 `norgate.fx_history@1`과 `norgate.reference_history@1`에서 같은 값 판정을 받고 0만 다르다 | `tests/storage/test_us_prices.py::test_history_mappers_share_one_value_predicate` | 구현 |
-| DV-207 | history 내보내기 가격 매퍼는 `norgate-history-csv-`가 아닌 원천 pin을 명세 단계에서 거부한다 | `tests/storage/test_us_prices.py::test_history_mappers_refuse_another_providers_source` | 구현 |
-| DV-208 | 같은 시각에 수집한 서로 다른 FMP 응답은 승격에서 자연키 반복으로 거부되고, 그 bar의 뒤 정정은 revision 2에 들지 않는다 | `tests/storage/test_us_prices.py::test_fmp_tied_responses_are_refused_and_never_revised` | 구현 |
-| DV-209 | 한 시리즈의 issuer 연결은 모든 티커 주장 중 가장 이른 유효 시작의 CIK이고, 다른 CIK를 대는 주장은 처리 순서와 무관하게 미해결이다 | `tests/storage/test_us_identity.py::test_a_series_links_to_the_earliest_valid_cik_of_all_its_claims` | 구현 |
-| DV-210 | `calendar_compare`는 텍스트 날짜·거래량을 읽고 읽히지 않는 날짜의 행을 session이 아닌 `undated_rows`로 센다 | `tests/tools/test_calendar_compare.py::test_text_dates_and_volumes_are_read_and_undated_rows_counted` | 구현 |
-| DV-211 | 여러 내보내기에 걸친 시리즈는 마지막 날짜에 닿는 원천을 근거로 삼고, master asset ID를 기준 시리즈로 내보낸 시리즈는 `export_database_differs_from_master`로 미해결이다 | `tests/storage/test_us_prices.py::test_export_series_cite_their_extent_and_respect_the_master` | 구현 |
+| DV-195 | 연구 모드의 지식 상한은 그보다 늦게 알려진 revision만 빼고 시점 없는 revision은 남기며, 설정했을 때만 query 문서에 들어간다 | `tests/storage/test_read_heads.py::test_research_known_ceiling_matches_snapshot_candidates` | 구현 |
+| DV-196 | canonical 가격 pin에서 유도한 연구 실행 패널은 같은 값의 관측 패널과 같은 날짜·시가·종가·판단을 낸다 | `tests/application/test_research_prices.py::test_the_price_route_matches_the_observation_route` | 구현 |
+| DV-197 | 가격 pin 연구 실행의 봉인 준비 문서는 그 읽기의 `aas-head-read-v1` 영수증과 해시를 싣는다 | `tests/application/test_research_prices.py::test_the_sealed_preparation_carries_the_head_read_receipt` | 구현 |
+| DV-198 | `krw_tick@1`로 승격한 `prices.kr.eodhd` chain의 KRW 실행은 원 단위 가격으로 같은 판단을 낸다 | `tests/application/test_research_prices.py::test_a_krw_run_over_a_promoted_chain_decides_like_the_usd_run` | 구현 |
+| DV-199 | 선언 지식 시점 뒤에 알려진 정정은 연구 패널에 들어가지 않는다 | `tests/application/test_research_prices.py::test_a_revision_received_after_the_knowledge_time_is_not_read` | 구현 |
+| DV-200 | 선언 통화와 다른 가격과 pin이 싣지 않은 instrument는 거부된다 | `tests/application/test_research_prices.py::test_a_price_run_refuses_what_the_pins_do_not_carry` | 구현 |
+| DV-201 | 선언은 패널 원천을 정확히 하나만 든다: 둘 다 든 선언, 관측 열쇠의 `instrument_map`, 이어지지 않는 pin은 거부된다 | `tests/application/test_research_prices.py::test_a_declaration_names_exactly_one_panel_source` | 구현 |
+| DV-202 | 패널 원천이 없는 선언은 거부된다 | `tests/application/test_research_prices.py::test_a_declaration_with_neither_panel_source_is_refused` | 구현 |
+| DV-203 | `present`가 아닌 bar와 공개 시점이 상한보다 늦은 head는 패널에서 빠지고 그 세션은 다른 값으로 채워지지 않는다 | `tests/application/test_research_prices.py::test_a_skipped_bar_leaves_its_session_empty_and_is_not_filled` | 구현 |
+| DV-204 | canonical unadjusted가 아닌 행, `1d`가 아닌 bar, 같은 instrument·세션의 두 번째 bar는 거부된다 | `tests/application/test_research_prices.py::test_a_price_panel_refuses_rows_it_cannot_read_as_one_daily_bar_per_session` | 구현 |
+| DV-205 | 가격 pin 선언은 sleeve와 composition 모두 `aas run research`로 기록되고 `aas run rerun --declaration`이 준비와 결과를 재현한다 | `tests/application/test_research_prices.py::test_a_priced_run_is_recorded_and_reproduces_from_its_declaration` | 구현 |
+| DV-206 | US 가격 매퍼는 등록돼 있고 Norgate 매퍼는 asset ID로, FMP 매퍼는 FMP 심볼로 해석하며 정의하지 않은 인자를 거부한다 | `tests/storage/test_us_prices.py::test_us_price_mappers_are_registered` | 구현 |
+| DV-207 | `norgate.prices_none@1`은 미국 주식 내보내기 원문을 canonical bar로 옮기고 다른 database·잘못된 날짜 행에 세션 날짜를 주지 않으며 일부 값만 있는 bar는 값 없이 `invalid`다 | `tests/storage/test_us_prices.py::test_norgate_prices_none_maps_export_text` | 구현 |
+| DV-208 | `norgate.prices_adjusted@1`은 `CAPITAL`·`TOTALRETURN` binary32 part를 `split_adjusted`·`total_return` reference bar로 옮기고 다른 조정 유형과 0시가 아닌 날짜를 거부한다 | `tests/storage/test_us_prices.py::test_norgate_prices_adjusted_maps_binary32_parts` | 구현 |
+| DV-209 | Norgate 기준 시리즈는 close 전용 reference이고 원문 close가 저장 값·날짜와 다르면 `invalid`이며 주식 내보내기 행은 기준 시리즈가 되지 않는다 | `tests/storage/test_us_prices.py::test_norgate_reference_series_are_close_only` | 구현 |
+| DV-210 | `fmp.eod_non_split@1`의 revision N은 bar마다 수집 시각순 N번째 값 구간의 첫 응답이고 같은 시각의 다른 응답은 revision 1에만 함께 들어간다 | `tests/storage/test_us_prices.py::test_fmp_revisions_select_the_first_response_of_each_run` | 구현 |
+| DV-211 | nanosecond timestamp 원천 열의 `source_row_hash`는 고정값을 재현하고 SQL과 Python에서 같다 | `tests/storage/test_us_prices.py::test_nanosecond_timestamps_hash_alike_in_sql_and_python` | 구현 |
+| DV-212 | 내보내기로 확장한 US 등록에서 Norgate canonical, EODHD(교차 대조 flag), 기준 지수가 승격되고 잘린 거래량은 flag를 단다 | `tests/storage/test_us_prices.py::test_us_prices_promote_through_the_export_registry` | 구현 |
+| DV-213 | Norgate 조정 part는 `float_shortest@1`로 승격되고 binary32 저장값에 `provider_float_storage` flag를 단다 | `tests/storage/test_us_prices.py::test_norgate_adjusted_parts_promote_with_float_storage_flags` | 구현 |
+| DV-214 | FMP 정정은 다음 revision generation의 SUPERSEDE이며 정정을 수집한 시각부터 알려진다 | `tests/storage/test_us_prices.py::test_fmp_corrections_promote_as_later_generations` | 구현 |
+| DV-215 | history 내보내기는 master에 없는 시리즈를 asset ID로 발급하고 `through` 뒤 창의 티커 주장을 만들며, 그 창에서 수집한 FMP profile은 창의 시리즈로 판단되고 모호하거나 옮겨 간 티커는 미해결이다 | `tests/storage/test_us_prices.py::test_exports_extend_ticker_claims_past_the_master` | 구현 |
+| DV-216 | 부호 있는 Norgate 기준 시리즈는 `signed_series`로 찾고, 명세의 `signed`에 들면 행이 하나도 선택되지 않으며 `signed`는 증가하는 asset ID 목록이어야 한다 | `tests/storage/test_us_prices.py::test_norgate_reference_series_are_close_only` | 구현 |
+| DV-217 | 같은 Norgate history 행은 `norgate.fx_history@1`과 `norgate.reference_history@1`에서 같은 값 판정을 받고 0만 다르다 | `tests/storage/test_us_prices.py::test_history_mappers_share_one_value_predicate` | 구현 |
+| DV-218 | history 내보내기 가격 매퍼는 `norgate-history-csv-`가 아닌 원천 pin을 명세 단계에서 거부한다 | `tests/storage/test_us_prices.py::test_history_mappers_refuse_another_providers_source` | 구현 |
+| DV-219 | 같은 시각에 수집한 서로 다른 FMP 응답은 승격에서 자연키 반복으로 거부되고, 그 bar의 뒤 정정은 revision 2에 들지 않는다 | `tests/storage/test_us_prices.py::test_fmp_tied_responses_are_refused_and_never_revised` | 구현 |
+| DV-220 | 한 시리즈의 issuer 연결은 모든 티커 주장 중 가장 이른 유효 시작의 CIK이고, 다른 CIK를 대는 주장은 처리 순서와 무관하게 미해결이다 | `tests/storage/test_us_identity.py::test_a_series_links_to_the_earliest_valid_cik_of_all_its_claims` | 구현 |
+| DV-221 | `calendar_compare`는 텍스트 날짜·거래량을 읽고 읽히지 않는 날짜의 행을 session이 아닌 `undated_rows`로 센다 | `tests/tools/test_calendar_compare.py::test_text_dates_and_volumes_are_read_and_undated_rows_counted` | 구현 |
+| DV-222 | 여러 내보내기에 걸친 시리즈는 마지막 날짜에 닿는 원천을 근거로 삼고, master asset ID를 기준 시리즈로 내보낸 시리즈는 `export_database_differs_from_master`로 미해결이다 | `tests/storage/test_us_prices.py::test_export_series_cite_their_extent_and_respect_the_master` | 구현 |
