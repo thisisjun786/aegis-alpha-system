@@ -87,6 +87,8 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   `OriginalBytes` for a plan). Values stay the original text or JSON; a unit whose bytes
   contradict their own index is refused, never repaired. Every file below an entry root is a
   unit file, a retained index or `retain` file, an `exclude` file, or reported as uncovered.
+  An entry's retained files are named by one `legacy-retained-files-*` inventory source
+  (path, SHA-256, size, reason), so their paths survive deleting the entry root.
   `--plan` opens no installation and writes nothing; `--verify` re-derives the plan, and its
   `complete` (zero unmatched, reconciled, zero uncovered) is the precondition for deleting an
   entry root outside the store. A new format is a new loader with its own synthetic test.
@@ -141,6 +143,18 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   are known from their receipt's retrieval instant and cite the source row hash. A build
   must read every source registered KR assertions cite, and reports registered claims its
   sources no longer give (`withdrawn`) instead of closing them.
+- `us_identity` builds the US registry document from four identity mappers over committed,
+  linked sources (`norgate.master@1`, `eodhd.us_symbol@1`, `fmp.profile@1`, `sec.tickers@1`).
+  Every instrument is a Norgate asset ID (venue `XNYS`); a listed row's ticker (class `.`
+  spelled `-`) reaches EODHD and FMP symbols only when one listed row has it, and an issuer
+  CIK links only when SEC lists the ticker under one CIK and FMP names the same CIK. Every
+  disagreement stays unresolved with its reason. A ticker's claims hold only from the
+  listing's first date (or the day after a delisted earlier holder's last date) until the
+  day after the master's last observed session; later intervals need newer evidence.
+  Claims from sources without a row instant
+  are known from the source's `sl:` link; an issuer link from the latest of its evidence.
+  Builds are cumulative like `kr_identity`'s, and source rows are read through Arrow so
+  time-zone-aware timestamps need no time zone database.
 - Every contract in that document has a row in its contract/test table. A change
   that implements a `예정` row adds the named test and flips the row to `구현` in
   the same change; `tests/tools/test_data_vertical_contract.py` enforces both directions.

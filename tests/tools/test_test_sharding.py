@@ -248,3 +248,15 @@ def test_merge_refuses_to_drop_the_weight_of_a_file_that_still_exists(
     shard.write_text(json.dumps({"tests/engine/test_bundle.py": 4.0, "tests/a/test_new.py": 1.0}))
     assert main(["merge", "--out", str(out), str(shard)]) == 0
     assert load_weights(out) == {"tests/a/test_new.py": 1000, "tests/engine/test_bundle.py": 4000}
+
+
+def test_merge_drops_a_weighed_file_the_lane_no_longer_selects(tmp_path: Path) -> None:
+    # A file whose tests are all database-marked still exists but is never measured by the
+    # database-free lane again, so it must not block every later refresh.
+    database_only = "tests/metadata/test_migrations.py"
+    assert (_ROOT / database_only).exists()
+    out, shard = tmp_path / "weights.json", tmp_path / "durations-1.json"
+    out.write_text(json.dumps({database_only: 5.0, "tests/engine/test_bundle.py": 3.0}))
+    shard.write_text(json.dumps({"tests/engine/test_bundle.py": 4.0}))
+    assert main(["merge", "--out", str(out), str(shard)]) == 0
+    assert load_weights(out) == {"tests/engine/test_bundle.py": 4000}

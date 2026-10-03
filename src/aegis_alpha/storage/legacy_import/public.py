@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import re
 import zipfile
+import zlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -159,7 +160,7 @@ class SecArchive:
             archive_file = source.seen[unit.files[0]]
             try:
                 archive = zipfile.ZipFile(handle)
-            except zipfile.BadZipFile as error:
+            except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError, EOFError) as error:
                 raise ValueError(f"SEC archive is not a zip file: {unit.name}") from error
             with archive:
                 for info in archive.infolist():
@@ -170,9 +171,17 @@ class SecArchive:
                         with archive.open(info) as stream:
                             for chunk in iter(lambda s=stream: s.read(1024 * 1024), b""):
                                 member.update(chunk)
-                    except (zipfile.BadZipFile, OSError, EOFError) as error:
+                    except (
+                        zipfile.BadZipFile,
+                        zipfile.LargeZipFile,
+                        zlib.error,
+                        NotImplementedError,
+                        RuntimeError,
+                        OSError,
+                        EOFError,
+                    ) as error:
                         raise ValueError(
-                            f"SEC archive member fails its CRC: {info.filename}"
+                            f"SEC archive member is unreadable or fails its CRC: {info.filename}"
                         ) from (error)
                     year, month, day, hour, minute, second = info.date_time
                     rows.append(

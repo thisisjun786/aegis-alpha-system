@@ -34,6 +34,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import re
+import zlib
 from collections import Counter
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Final, cast
@@ -526,7 +527,7 @@ class IndexMembership:
                 raise ValueError(f"Norgate capture file {name} does not match its receipt")
             try:
                 body = gzip.decompress(raw)
-            except (OSError, EOFError) as error:
+            except (OSError, EOFError, zlib.error) as error:
                 raise ValueError(f"Norgate capture file {name} is not gzip") from error
             csv_sha = hashlib.sha256(body).hexdigest()
             if csv_sha != payload.get("csv_sha256"):

@@ -286,6 +286,39 @@ commit한다. 두 옵션 모두 반복할 수 있고, 같은 수집물을 다시
 `--table`)의 EODHD 심볼이 몇 개 해석되는지와 미해결 심볼을 이유별로 보고한다. 설치본에 쓰지 않는 검토
 근거다.
 
+### US identity
+
+```bash
+aas identity us-build --master SOURCE_ID [--fmp SOURCE_ID] ... [--sec SOURCE_ID] ... \
+  [--bindings SOURCE_ID] --output registry.json [--report report.json]
+aas identity register --file registry.json --sha256 SHA256 --plan
+```
+
+`us-build`는 설치본을 읽기 전용으로 열어 지정한 원천을 pin과 대조해 읽고, `norgate.master@1`,
+`eodhd.us_symbol@1`, `fmp.profile@1`, `sec.tickers@1` 매퍼로 `aas-identity-registry-v1` 문서를 `--output`에
+쓴다. `--master`는 Norgate security master 원천 하나, `--fmp`는 FMP company profile 원천, `--sec`는
+`aas import legacy`의 `sec.submissions_zip@1`로 편입한 SEC submissions 내용 원천이다(`raw/`의 archive를
+읽는다). `--fmp`와 `--sec`는 반복할 수 있다. 원천마다 `sl:` 연결이 있어야 하므로 명시 ID 원천은 먼저
+`aas db source-link --apply`로 연결한다. `--bindings`는 legacy identity bindings 원천과 발급한 asset ID
+집합을 비교해 보고에 싣는다. 입력의 누적 규칙, 출력·`--report` 파일 규칙, 응답 형태(`withdrawn` 포함)는
+`kr-build`와 같다. 응답에는 asset ID 집합의 `aas-norgate-assetids-v1` 해시(`assetids_sha256`)와 issuer가
+연결된 instrument 수, 티커 주장이 끝나는 master의 마지막 관측 세션(`through`)이 더 실린다. 공급자를
+호출하지 않는다. 해석 규칙과 미해결 이유는 [US 등록](design/data-vertical.md#us-등록)이 소유한다.
+
+```bash
+uv run --no-sync python -m scripts.us_identity_report --market MARKET.duckdb \
+  --master SOURCE_ID --bars qveris-bulk- --quarantine qveris-bulk- \
+  [--quarantine-reason REASON] [--output report.json]
+```
+
+`scripts/us_identity_report.py`(로직은 `application/us_identity_report.py`)는 market 파일만 읽기 전용으로
+열고 `--master`의 Norgate master로 US 문서를 메모리에서 만들어, `--bars` 접두사 아래 `bars` 테이블과
+`--quarantine` 접두사 아래 `quarantine` 테이블(`source_row_json`의 `code`, `date`, `exchange_short_name`)의
+`.US` 행을 `eodhd.bars@1`처럼 세션 날짜의 New York 0시에 해석한다. 표 종류마다 모든 행과 고유
+(심볼, 날짜) 키의 해석 수와 미해결 행·심볼 수를 이유별로 보고한다. EODHD 심볼 주장은 master에만 기대므로
+해석은 같은 master로 만든 `us-build` 문서와 같다. 문서 자체는 state의 `sl:` 연결 시각이 필요하므로 싣지
+않는다. 설치본에 쓰지 않는 검토 근거다.
+
 ## 원천 자료의 승격과 은퇴
 
 원천 자료실 자료를 공급자별 시장 dataset으로 승격하는 명령(`aas data promote`), 원천 ID 연결
@@ -338,7 +371,10 @@ authority)을 `raw/`에 보존하고 원천 자료실의 내용 원천으로 com
 다시 실행하면 commit된 원천을 재사용한다. 중단되면 같은 명령을 다시 실행한다. `--verify`는 설치본을
 읽기 전용으로 열어 계획한 원천과 보존한 색인 파일이 모두 완료·동일·연결됐고 `raw/`의 원본이 온전한지 확인한다.
 보고는 항목마다 어떤 단위도 덮지 않는 파일을 `uncovered`(수, bytes, 앞의 경로)로 싣는다. 남길 파일은 manifest
-항목의 `retain` 패턴으로 `raw/`에 보존하고, 버려도 되는 파일은 `exclude` 패턴으로 기록한다. `complete`는
+항목의 `retain` 패턴으로 `raw/`에 보존하고, 버려도 되는 파일은 `exclude` 패턴으로 기록한다. 보존 파일의 경로와
+해시는 항목의 `legacy-retained-files-*` 원천(`retained_files` 테이블)에 남으므로 항목 경로를 지운 뒤에도
+원천 자료실 테이블에서 경로로 찾을 수 있다. Norgate 내보내기 항목의 `batch-NNN/history/checkpoints/*.json`과
+최상위 수집 기록처럼 loader가 읽지 않는 파일은 `retain`이나 `exclude`로 기록하기 전까지 `uncovered`다. `complete`는
 `unmatched`가 0이고 `reconciled`가 참이며 `uncovered`가 0일 때만 참이고, 그때만 그 manifest의 항목 경로를 지울 수
 있다. 항목 경로가 아닌 디렉터리는 지우지 않는다. `--verify`가 `complete`가 아니거나 `--plan`·실행이
 `reconciled`가 아니면 보고를 출력하고 종료 코드 1로 끝나므로 스크립트는 종료 코드를 삭제 조건으로 쓴다. 원본 bytes는 `raw/`로 복사되므로 원본
@@ -389,7 +425,8 @@ market과 state를 각각 한 트랜잭션으로 올린 다음 설치 영수증�
 1. `[owner]` 예약 수집을 멈추고 새 루트 복원본에서 전 과정을 먼저 실행해 시간·메모리·verify를 기록한다.
 2. `[owner]` 다른 장치에 `aas db backup`을 만들고 백업 ID를 기록한다.
 3. `aas db migrate --to 2 --backup-output DIR`, 이어서 `aas db source-link --apply`. legacy 원본은
-   `aas import legacy --plan`의 `reconciled`를 확인한 뒤 실행하고 `--verify`로 `complete`를 확인한다.
+   `aas import legacy --plan`의 `reconciled`를 확인하고, `[owner]` 항목마다 `uncovered` 파일을 manifest의
+   `retain`·`exclude`로 기록한 뒤 실행하고 `--verify`로 `complete`를 확인한다.
 4. `aas calendar refresh --plan`을 확인하고 실행해 달력 generation을 먼저 만든다. 이어서 명세마다
    `aas data promote --plan`을 확인한 뒤 실행하고 generation마다 verify한다. 실패하면
    `aas db recover`로 게시만 재개한다. 공급자를 다시 호출하지 않는다.

@@ -174,6 +174,45 @@ def test_native_query_cancellation_interrupts_and_closes_connection(
     assert not any(thread.name.startswith("aas-price-") for thread in threading.enumerate())
 
 
+def test_native_query_cancelled_before_statement_start_is_still_interrupted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    view = _parts(tmp_path)
+    cancel, delivered, backstop = Event(), Event(), Event()
+    original_interrupt = pinned_prices._interrupt
+
+    def observed_interrupt(connection: DuckDBPyConnection) -> None:
+        original_interrupt(connection)
+        delivered.set()
+
+    def cancelled_before_start(
+        connection: DuckDBPyConnection, _paths: list[str], _request: PriceQuery
+    ) -> tuple[list[dict[str, object]], bool]:
+        cancel.set()
+        # The watcher's interrupt lands before DuckDB starts the statement below.
+        assert delivered.wait(5)
+
+        def stop_runaway() -> None:
+            backstop.set()
+            connection.interrupt()
+
+        runaway = threading.Timer(15, stop_runaway)
+        runaway.start()
+        try:
+            connection.execute("SELECT sum(i::DOUBLE) FROM range(1000000000000) t(i)").fetchone()
+        finally:
+            runaway.cancel()
+        pytest.fail("native work should be interrupted")
+
+    monkeypatch.setattr(pinned_prices, "_interrupt", observed_interrupt)
+    monkeypatch.setattr(pinned_prices, "_query_prices", cancelled_before_start)
+    with pytest.raises(ComputeCancelledError, match="cancelled"):
+        read_prices(view, tmp_path, _query(), budget=_budget(), cancel_event=cancel)
+    assert delivered.is_set()
+    assert not backstop.is_set(), "only the test backstop stopped the cancelled query"
+    assert not any(thread.name.startswith("aas-price-") for thread in threading.enumerate())
+
+
 @pytest.mark.parametrize("when", ["before", "after"])
 def test_parallel_hashing_retains_tamper_refusal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, when: str
