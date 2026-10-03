@@ -273,12 +273,13 @@ ICU 시간대 자료로 푼 값이고, `timezone_version`은 그 자료를 가�
 시각이 그 날짜 안에서 개장이 먼저여야 하고 휴장 행은 둘 다 비어야 하며, 그 밖의 행은 `status`가 비어
 필수 열 누락으로 거부된다. 시간 입력은 `public_by` 하나다.
 
-예정된 매퍼 목록: `norgate.prices_none`, `norgate.prices_adjusted`, `norgate.master`,
+예정된 매퍼 목록: `norgate.prices_none`, `norgate.prices_adjusted`,
 `norgate.dividends`, `norgate.index_membership`, `norgate.reference_series`,
-`fmp.profile`, `fmp.actions`, `sec.submissions`, `sec.companyfacts`,
-`dart.fnltt`, `dart.list`, `fred.alfred`, `fx.series`. identity 원천을 읽는 매퍼(`eodhd.kr_symbol`,
-`kind.listings`, `dart.corp_codes`)는 typed generation이 아니라 등록 문서를 만들며
-[KR 등록](#kr-등록)이 소유한다.
+`fmp.actions`, `sec.submissions`, `sec.companyfacts`,
+`dart.fnltt`, `dart.list`, `fred.alfred`, `fx.series`. identity 원천을 읽는 매퍼는 typed generation이
+아니라 등록 문서를 만든다. `eodhd.kr_symbol`, `kind.listings`, `dart.corp_codes`는
+[KR 등록](#kr-등록)이, `norgate.master`, `eodhd.us_symbol`, `fmp.profile`, `sec.tickers`는
+[US 등록](#us-등록)이 소유한다.
 
 자연키가 겹치는 원천 행 두 개는 승격을 거부한다. 어느 쪽을 고를지 추정하지 않는다.
 instrument는 pin한 identity snapshot에서 매퍼의 assertion key와 token이 같고, 해석 시각이 유효
@@ -569,7 +570,7 @@ KRX 토요일 session은 확인되지 않은 반일 마감 대신 평일 마감�
 | `fx.usdkrw.norgate`, `fx.usdkrw.fred` | `fx_rates` | 우선순위는 소비자 pin |
 | `classifications.*` | `classifications`(v2) | Norgate 분류, SEC SIC, KIND 업종. known은 snapshot 시각이며 과거로 소급하지 않음 |
 
-identity 원천(Norgate master, SEC submissions, DART 고유번호, KIND 목록)은 typed generation이
+identity 원천(Norgate master, SEC submissions, FMP profile, DART 고유번호, KIND 목록)은 typed generation이
 아니라 아래 [identity 등록](#identity-등록과-chunked-문서)으로 state에 들어간다.
 
 dataset의 백필은 연도 단위 generation, 이후 유지보수는 세션 단위(재무는 일 단위) generation으로
@@ -649,7 +650,7 @@ identity 문서로 투영한다. 선택한 assertion마다 member 하나이고, 
   manifest root 아래에 끼워 넣은 member 행은 재구성 hash가 맞지 않아 읽기와 검증에서 거부된다.
 - 읽기는 part 전부의 charge 합을 호출자 allowance에서 받은 뒤 part마다 v1으로 재구성하고, part
   사이의 정규 순서와 identity 구간 겹침을 확인한다. part는 64 MiB charge 가까이 채워지므로 manifest
-  하나를 읽는 데 part 수 × 약 64 MiB의 allowance가 필요하다(Norgate master 110 part ≈ 7 GiB).
+  하나를 읽는 데 part 수 × 약 64 MiB의 allowance가 필요하다(US 등록 전체 129,998 member는 208 part ≈ 13 GiB).
   소비자 allowance를 이 크기에 맞추는 일은 소비자 연결(PR 27)의 몫이다. `aas db verify`는 part를
   각자 검증하고 manifest는 part header와 경계만으로 확인한다.
 
@@ -708,6 +709,74 @@ receipt(`response.json`)와 그것이 크기·SHA-256으로 가리키는 응답 
 receipt가 기록한 크기·해시와 다른 파일, 완료 문서에 없는 파일은 거부한다. `aas identity kr-build`는
 commit된 원천을 pin과 대조해 읽고 문서와 보고를 새 파일에 쓰며 설치본에는 쓰지 않는다. 두 파일은
 모두 없을 때만 온전히 쓴 뒤 함께 만들어지고, 실패하면 둘 다 남지 않는다.
+
+### US 등록
+
+US identity는 네 원천을 identity 매퍼로 읽어 `aas-identity-registry-v1` 문서 하나로 만들고, 그 문서를
+`aas identity register`로 덧붙인다. 코드는 `storage/us_identity.py`다. Norgate는 동결 원천이므로 instrument는
+Norgate security master 하나에서 모두 나온다.
+
+| 매퍼 | 원천 | 만드는 행 |
+| --- | --- | --- |
+| `norgate.master@1` | Norgate security master(원천 자료실 `observations`: `assetid`, `symbol`, `is_delisted`, `currency`, `is_etf`, `first_date`, `last_date` 등) | 행마다 instrument `mint('norgate_assetid', assetid)`(venue `XNYS`), assertion `norgate`/`norgate_assetid`(그 asset ID)와 `norgate`/`norgate_symbol`(Norgate 자신의 심볼) |
+| `eodhd.us_symbol@1` | 같은 master의 상장(상폐 아님) 행 | 그 티커가 상장 행 하나에만 해당할 때 assertion `eodhd`/`eodhd_symbol`(`<티커>.US`, `eodhd.bars@1`이 해석하는 token) |
+| `fmp.profile@1` | FMP company profile(`symbol`, `cik`, `cusip`, `isin`, `isEtf`, `currency`, `retrieved_at_utc`) | 상장 티커와 같은 심볼의 행들이 서로, 그리고 Norgate 행과 맞을 때 assertion `fmp`/`fmp_symbol`, `fmp`/`cusip`, `fmp`/`isin` |
+| `sec.tickers@1` | SEC submissions archive(`sec.submissions_zip@1`로 편입한 내용 원천의 member 색인과 `raw/`의 archive) | 티커를 하나의 CIK만 싣고 FMP가 같은 CIK를 줄 때 issuer `mint('sec_cik', cik)`(이름은 SEC `name`), `sec`/`issuer` assertion과 instrument 행의 issuer |
+
+- venue는 모든 US 상장(Nasdaq, NYSE Arca, OTC 포함)이 따르는 세션 달력 `XNYS`다. 상장 거래소는
+  분류 dataset의 몫이다. asset_type은 `is_etf`가 참이면 `etf`, 그 밖은 `unclassified`이며 주식·우선주·
+  ETN 등의 구분은 분류 dataset이 기록한다.
+- 상장 행의 US 티커는 Norgate 심볼의 class 구분자 `.`를 `-`로 쓴 것이다(SEC·FMP·EODHD 표기,
+  `BRK.B` → `BRK-B`). 이 표기 규칙 말고는 티커를 바꾸지 않는다. 두 상장 행이 같은 티커가 되면 어느
+  쪽도 고르지 않는다. 상폐 행은 Norgate가 붙인 접미사 심볼(`XYZ-201203`)만 갖고 현재 티커가 없으므로
+  Norgate assertion만 받는다.
+- 티커로 instrument나 issuer를 만들지 않는다. 공급자 사이의 티커 대조는 모든 공급자가 맞을 때만
+  연결한다. 다음은 해석하지 않고 이유와 함께 보고한다: 두 상장 행의 같은 티커(`ticker_ambiguous`),
+  상장 티커가 아닌 FMP 심볼(`not_a_listed_norgate_ticker`), CIK·CUSIP·ISIN이 정규 표기가 아니거나
+  검사 숫자가 틀린 FMP 행(`fmp_identifier_invalid`), 한 심볼에 다른 내용을 주는 FMP 행들
+  (`fmp_profile_ambiguous`), USD가 아닌 FMP 행(`fmp_currency_not_usd`), Norgate와 다른 ETF 여부
+  (`fmp_type_differs`), 두 티커가 같은 CUSIP·ISIN(`cusip_ambiguous`, `isin_ambiguous`, 그 식별자
+  assertion만 빠진다), SEC에 없는 티커(`sec_ticker_missing`), 두 CIK가 싣는 티커
+  (`sec_ticker_ambiguous`), CIK가 없는 FMP 행(`fmp_cik_missing`), SEC와 다른 FMP CIK(`fmp_cik_differs`).
+  master 행 중 asset ID가 양의 정수가 아니거나(`assetid_invalid`), 심볼이 다듬어진 텍스트가 아니거나
+  (`symbol_invalid`), USD가 아니거나(`currency_not_usd`), 상폐 여부가 불리언이 아닌 행
+  (`listing_state_unknown`)은 거부하고, 같은 asset ID의 두 행은 둘 다 등록하지 않으며(`assetid_repeated`),
+  같은 심볼의 두 행은 asset ID 주장만 받는다(`symbol_repeated`). `retrieved_at_utc`가 시간대 있는 시각이
+  아닌 FMP 행은 그 심볼만 `fmp_retrieved_invalid`로 두고 빌드는 계속한다. master 날짜로 티커 구간을 정할
+  수 없는 상장 티커도 미해결이다: `first_date`가 없는 상장 행(`listing_start_unknown`), 같은 티커의 상폐
+  행에 `last_date`가 없는 경우(`ticker_reuse_unbounded`), 이전 보유 상폐 행이 master의 마지막 관측
+  세션까지 거래된 경우(`ticker_reused`).
+- SEC 매퍼는 member 색인의 `CIK##########.json` 행만 읽고 쪽 나눈 이력(`-submissions-NNN`)과 그 밖의
+  member는 건너뛴다. archive는 내용 원천이 기록한 크기·SHA-256, member는 색인 행이 기록한 크기·SHA-256과
+  같아야 하며 다르면 원천 전체를 거부한다. 문서의 `cik`가 member 이름의 CIK와 다르면 그 행을 거부한다.
+- 유효 구간: 티커는 master가 보여 주는 동안만 그 상장을 가리킨다. 상장 행의 티커에서 나온 주장
+  (Norgate 자신의 상장 심볼, EODHD `<티커>.US`, FMP 심볼)은 다음 구간에서 유효하다.
+  - 시작: 상장 행의 `first_date`와, 같은 티커의 이전 보유자를 보여 주는 상폐 행(심볼 `<티커>-YYYYMM`,
+    class 구분자는 같은 규칙으로 맞춘다) 중 가장 늦은 `last_date`의 다음 날 가운데 늦은 날의 New York 0시.
+  - 끝: master의 마지막 관측 세션(모든 행의 `first_date`·`last_date` 중 최댓값, 보고의 `through`) 다음 날의
+    New York 0시. Norgate는 동결 원천이므로 그 뒤에 누가 티커를 갖는지는 master가 말하지 않는다.
+  - `eodhd.bars@1`은 세션 날짜의 New York 0시로 해석하므로 구간 밖의 bar는 미해결로 남는다. `through`
+    뒤로 구간을 늘리려면 더 새로운 근거(예: 이후 수집한 EODHD 심볼 목록이나 SEC 티커 파일)를 새 매퍼
+    버전으로 읽어 `through` 다음 날부터의 구간으로 등록한다. 겹치지 않는 구간이므로 기존 주장과 충돌하지
+    않는다.
+  - asset ID, 상폐 행의 접미사 심볼(그 상장만의 영구 이름)과 issuer 연결은 공급자 시계열 전체
+    (`valid_from_us`는 int64 최소값, `valid_to_us`는 null)다. FMP의 CUSIP·ISIN은 profile이 수집 시점의
+    현재 값만 말하므로 그 수집 시각부터 유효하다.
+- 지식 시각: Norgate master와 SEC member 색인은 행에 수집 시각이 없으므로 그 원천 `sl:` 연결의
+  `retrieved_at_us`(편입 intent가 완료된 시각)부터 알려진다. FMP 주장은 그 행의 `retrieved_at_utc`부터,
+  issuer 연결은 기대는 세 근거(SEC, FMP, Norgate) 중 가장 늦은 시각부터 알려진다. 연결되지 않은 원천은
+  빌드가 거부한다. `source_snapshot_id`는 주장이 나온 원천의 `sl:` ID, `source_hash`는 그 행의
+  `aas-source-row-v1` 해시다. EODHD 심볼의 근거는 Norgate 행이고 issuer 연결의 근거는 SEC member 행이다.
+- 원천 행은 Arrow로 읽으므로 `TIMESTAMP WITH TIME ZONE` 열은 시간대 자료 없이 같은 순간으로 읽힌다.
+- 문서의 issuer는 CIK, instrument는 asset ID 수 순서, assertion은 (provider, namespace, token) 순이므로
+  같은 원천에서 늘 같은 bytes가 나온다.
+- 빌드 입력은 누적이다. 등록된 US assertion(provider `norgate`, `sec`, `fmp`와 `.US` EODHD 심볼)이
+  인용하는 원천은 모두 빌드 원천에 들어가야 하고, 빠지면 `us-build`는 더할 원천을 이름으로 보고하며
+  거부한다. 정정되지 않은 등록 assertion을 이번 원천이 더는 내지 않으면 `withdrawn`에 남기고 닫지 않는다.
+- `--bindings`는 legacy identity bindings 테이블(`norgate`/`norgate_assetid`/`resolved` 행의
+  `provider_identifier`)과 발급한 asset ID 집합을 비교해 보고하며 주장을 더하지 않는다. 두 집합은
+  `aas-norgate-assetids-v1` 해시(정규 JSON `["aas-norgate-assetids-v1", 오름차순 asset ID 정수]`의
+  SHA-256, 중복과 입력 순서는 무시한다)로도 보고한다.
 
 ## 대량 게시와 reader
 
@@ -986,3 +1055,20 @@ state v2:
 | DV-123 | 항목 경로 아래 어떤 단위도 덮지 않는 파일은 `uncovered`로 보고되고 `retain`·`exclude`로 기록되기 전까지 `complete`를 막으며, 보존 파일의 `raw/` 사본이 없으면 `unmatched`다 | `tests/storage/test_legacy_import.py::test_uncovered_files_keep_verify_incomplete` | 구현 |
 | DV-124 | 등록된 모든 loader에서 계획·실행·재실행·검증의 원천 ID·행 수·digest가 같고 재실행은 재사용, 검증은 `complete`다 | `tests/storage/test_legacy_import.py::test_every_loader_plans_applies_and_verifies_alike` | 구현 |
 | DV-125 | 보존한 `raw/` 사본이 주소와 다르거나 크기가 다르면 legacy 단위 읽기를 거부한다 | `tests/storage/test_legacy_import.py::test_retained_bytes_refuse_a_changed_raw_object` | 구현 |
+| DV-126 | US instrument는 Norgate asset ID에서만 발급되고 master 행이 하나씩 instrument가 되며 Norgate 주장은 원천 연결 시각부터 알려진다 | `tests/storage/test_us_identity.py::test_us_instruments_are_minted_from_norgate_asset_ids` | 구현 |
+| DV-127 | EODHD·FMP 심볼은 상장 행 하나의 티커로만 instrument에 닿고 두 상장 행이 같은 티커면 미해결이다 | `tests/storage/test_us_identity.py::test_provider_symbols_reach_only_a_unique_active_ticker` | 구현 |
+| DV-128 | issuer 연결은 SEC가 티커를 하나의 CIK에 싣고 FMP가 같은 CIK를 줄 때만 생기며 세 근거 중 가장 늦은 시각부터 알려진다 | `tests/storage/test_us_identity.py::test_issuer_needs_sec_and_fmp_to_agree` | 구현 |
+| DV-129 | SEC 매퍼는 member 색인으로 archive를 읽고 기록과 다른 archive·member bytes를 거부한다 | `tests/storage/test_us_identity.py::test_sec_members_are_read_through_their_index` | 구현 |
+| DV-130 | 서로 다른 FMP 행, Norgate와 다른 유형·통화, 두 티커가 공유한 CUSIP·ISIN은 미해결로 남고 CUSIP·ISIN은 수집 시각부터 유효하다 | `tests/storage/test_us_identity.py::test_fmp_disagreement_and_shared_identifiers_stay_unresolved` | 구현 |
+| DV-131 | commit된 US 원천에서 만든 문서는 누락 참조·충돌 없이 한 번에 등록되고 legacy bindings와의 asset ID 집합 비교를 보고한다 | `tests/storage/test_us_identity.py::test_us_sources_register_as_one_document` | 구현 |
+| DV-132 | US 등록의 snapshot은 `eodhd.bars@1` 승격에서 `.US` 심볼을 instrument로 해석하고 상장 티커가 아닌 심볼은 미해결로 둔다 | `tests/storage/test_us_identity.py::test_us_registry_resolves_eodhd_bars_in_promotion` | 구현 |
+| DV-133 | US 빌드는 등록된 US assertion의 원천을 모두 읽어야 하며 더는 나오지 않는 등록 주장을 `withdrawn`으로 보고한다 | `tests/storage/test_us_identity.py::test_a_us_build_reads_every_registered_us_source` | 구현 |
+| DV-134 | `identity us-build`는 새 파일에만 쓰고 그 문서는 `identity register`로 등록된다 | `tests/storage/test_us_identity.py::test_us_cli_builds_and_registers` | 구현 |
+| DV-135 | 상장 티커의 주장은 상장 `first_date`와 이전 상폐 보유자의 `last_date` 다음 날 중 늦은 날부터 master의 마지막 관측 세션 다음 날까지만 유효하고, 구간을 정할 수 없는 티커는 미해결이다 | `tests/storage/test_us_identity.py::test_ticker_claims_are_bounded_by_the_master` | 구현 |
+| DV-136 | `eodhd.bars@1` 승격은 master 마지막 관측 세션 뒤의 bar와 이전 보유자 시기의 bar를 미해결로 둔다 | `tests/storage/test_us_identity.py::test_us_registry_resolves_eodhd_bars_in_promotion` | 구현 |
+| DV-137 | `aas-norgate-assetids-v1` 해시는 고정값을 재현하고 중복·순서에 무관하다 | `tests/storage/test_us_identity.py::test_the_asset_id_set_hash_is_pinned` | 구현 |
+| DV-138 | 수집 시각이 없거나 시간대가 없는 FMP 행은 그 심볼만 `fmp_retrieved_invalid`로 둔다 | `tests/storage/test_us_identity.py::test_an_fmp_row_without_a_retrieval_instant_refuses_its_symbol` | 구현 |
+| DV-139 | 상한을 넘거나 archive에 없는 색인 member와 zip이 아닌 archive는 SEC 원천 전체를 거부한다 | `tests/storage/test_us_identity.py::test_sec_archives_that_do_not_match_their_index_are_refused` | 구현 |
+| DV-140 | SEC 매퍼는 zip 하나를 보존한 `sec-submissions-zip-*` 내용 원천만 읽는다 | `tests/storage/test_us_identity.py::test_only_an_sec_submissions_zip_source_is_read` | 구현 |
+| DV-141 | 이미 정정된 등록 US 주장은 이번 원천이 내지 않아도 `withdrawn`에 들지 않는다 | `tests/storage/test_us_identity.py::test_a_corrected_registered_claim_is_not_reported_withdrawn` | 구현 |
+| DV-142 | `scripts/us_identity_report.py`는 market 파일만 읽기 전용으로 열어 bulk·격리 행의 US 해석을 이유별로 보고한다 | `tests/storage/test_us_identity.py::test_the_report_script_resolves_bulk_and_quarantined_us_rows` | 구현 |
