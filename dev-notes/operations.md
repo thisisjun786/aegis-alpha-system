@@ -299,8 +299,12 @@ authority)을 `raw/`에 보존하고 원천 자료실의 내용 원천으로 com
 단일 link의 비공개 파일이어야 한다. 그룹·기타 권한이 있는 원본은 `--plan`에서도 같은 이유로 거부되므로
 편입 전에 그 디렉터리의 권한을 `go-rwx`로 바꾼다. 실행은 단위마다 원본을 `raw/`에 보존하고 테이블을 commit하며
 다시 실행하면 commit된 원천을 재사용한다. 중단되면 같은 명령을 다시 실행한다. `--verify`는 설치본을
-읽기 전용으로 열어 계획한 원천이 모두 완료·동일·연결됐고 `raw/`의 원본이 온전한지 확인하며, `unmatched`가
-0이고 `complete`가 참이어야 설치본 밖 legacy 원본을 지울 수 있다. 원본 bytes는 `raw/`로 복사되므로 원본
+읽기 전용으로 열어 계획한 원천과 보존한 색인 파일이 모두 완료·동일·연결됐고 `raw/`의 원본이 온전한지 확인한다.
+보고는 항목마다 어떤 단위도 덮지 않는 파일을 `uncovered`(수, bytes, 앞의 경로)로 싣는다. 남길 파일은 manifest
+항목의 `retain` 패턴으로 `raw/`에 보존하고, 버려도 되는 파일은 `exclude` 패턴으로 기록한다. `complete`는
+`unmatched`가 0이고 `reconciled`가 참이며 `uncovered`가 0일 때만 참이고, 그때만 그 manifest의 항목 경로를 지울 수
+있다. 항목 경로가 아닌 디렉터리는 지우지 않는다. `--verify`가 `complete`가 아니거나 `--plan`·실행이
+`reconciled`가 아니면 보고를 출력하고 종료 코드 1로 끝나므로 스크립트는 종료 코드를 삭제 조건으로 쓴다. 원본 bytes는 `raw/`로 복사되므로 원본
 크기만큼의 디스크 공간과, 계획·검증마다 원본 전체를 다시 읽는 I/O 시간이 필요하다. 편입한 원천은 원천
 자료실 metadata로 `aas db verify`의 할당에 청구되므로, 수백 개 commit을 더한 설치본의 verify는 공유 계산 예산
 환경(`AAS_*_LIMIT*`, `AAS_COMPUTE_LOCK_FILE`)을 설정해 실행한다. 설정하지 않은 기본 할당은 그 metadata를 거부할 수 있다.
@@ -355,7 +359,8 @@ market과 state를 각각 한 트랜잭션으로 올린 다음 설치 영수증�
 5. `[owner]` 승인된 수집기를 설정의 호출 상한과 함께 예약 실행으로 켠다.
 6. `aas db source-retire --plan`으로 은퇴 후보와 거부 이유를 확인하고 `--apply`로 증명을 통과한
    원천을 일괄 은퇴한다. `aas db compact --to NEW_ROOT`와 deep verify 뒤 설정 경로를 바꾼다.
-   설치본 밖 legacy 원본은 그 manifest의 `aas import legacy --verify`가 `complete`일 때만 지운다.
+   설치본 밖 legacy 원본은 그 manifest의 `aas import legacy --verify`가 `complete`(미대조 파일 0 포함)이고
+   종료 코드가 0일 때 그 항목 경로만 지운다.
 
 ## 검사·복구·백업
 

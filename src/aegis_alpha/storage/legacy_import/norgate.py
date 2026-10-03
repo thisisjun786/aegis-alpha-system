@@ -4,7 +4,14 @@
 Each result lists, per security, its asset ID, identity, column list, row count, date range
 and the SHA-256 that names its CSV under ``batch-NNN/history/``. One result file and the CSV
 files it lists are one unit. Rows keep the CSV text; the asset ID, symbol, database and
-security name come from the result record that names the file.
+security name come from the result record that names the file. The export's one
+``plan-<sha256>.json`` names every planned series: ``pending_symbols`` went through the
+batches, and ``reused`` series were exported earlier into a sibling capture directory
+(``<directory>/history/<sha256>.csv`` beside ``history/checkpoints/<manifest>.json``). The
+reused series of one checkpoint form one unit: that checkpoint and the CSV files the plan
+reuses from it, each checked against both the plan and the checkpoint record. The one
+``acquisition-<sha256>.json`` must name the plan and agree on its batch and reuse counts; the
+report states how many planned series are missing or unplanned.
 
 ``norgate.index_membership@1`` reads a capture root whose ``batch-results/*.json`` name a
 capture directory under ``batch-attempts/``. A capture directory holds ``request.json``, one
@@ -26,6 +33,8 @@ from __future__ import annotations
 import gzip
 import hashlib
 import re
+from collections import Counter
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Final, cast
 
 from aegis_alpha.storage.legacy_import.loaders import (
@@ -164,10 +173,11 @@ class HistoryExport:
 
     name = "norgate.history_export@1"
     arg_names: frozenset[str] = frozenset()
-    metric_names = frozenset({"units", "records", "rows"})
+    metric_names = frozenset(
+        {"units", "records", "rows", "planned_series", "missing_series", "unplanned_series"}
+    )
 
     def units(self, entry: Entry, source: OriginalBytes, run: Run) -> list[Unit]:
-        del run
         children = _children(entry.path)
         results = [name for name in children if _BATCH_RESULT.fullmatch(name)]
         if not results:
@@ -176,6 +186,7 @@ class HistoryExport:
         orphans = sorted(batches - {name.removesuffix("-result.json") for name in results})
         if orphans:
             raise ValueError(f"Norgate export batch {orphans[0]} has no result file")
+        reused = self._plan(entry, children, source, run, len(results))
         units = []
         for name in results:
             path = entry.path / name
@@ -184,7 +195,76 @@ class HistoryExport:
             history = entry.path / batch / "history"
             files = [path, *(history / str(record["path"]) for record in records.values())]
             units.append(Unit(name, tuple(dict.fromkeys(files)), (HISTORY,)))
+        groups: dict[tuple[str, str], dict[str, dict[str, object]]] = {}
+        for symbol, item in sorted(reused.items()):
+            groups.setdefault((str(item["directory"]), str(item["manifest"])), {})[symbol] = item
+        for (directory, checkpoint), items in sorted(groups.items()):
+            history = entry.path.parent / directory / "history"
+            files = [
+                history / "checkpoints" / f"{checkpoint}.json",
+                *(history / f"{item['sha256']}.csv" for item in items.values()),
+            ]
+            units.append(
+                Unit(
+                    f"reused/{directory}/{checkpoint}",
+                    tuple(dict.fromkeys(files)),
+                    (HISTORY,),
+                    {"reused": items},
+                )
+            )
         return units
+
+    @staticmethod
+    def _plan(
+        entry: Entry, children: list[str], source: OriginalBytes, run: Run, results: int
+    ) -> dict[str, dict[str, object]]:
+        """Read the export's plan and acquisition record; return the series it reuses."""
+        documents = {}
+        for kind in ("plan", "acquisition"):
+            names = [name for name in children if re.fullmatch(kind + r"-[0-9a-f]{64}\.json", name)]
+            if len(names) != 1:
+                raise ValueError(f"Norgate export needs exactly one {kind}-<sha256>.json")
+            payload = source.read(entry.path / names[0], max_bytes=MAX_INDEX_BYTES)
+            digest = hashlib.sha256(payload).hexdigest()
+            if names[0] != f"{kind}-{digest}.json":
+                raise ValueError(f"Norgate export {kind} file is not named by its hash")
+            documents[kind] = (digest, json_object(json_document(payload, names[0]), kind))
+        plan_sha, plan = documents["plan"]
+        _, acquisition = documents["acquisition"]
+        pending = plan.get("pending_symbols")
+        if not isinstance(pending, list):
+            raise ValueError("Norgate export plan has no pending symbol list")
+        symbols = [text(symbol, "plan pending symbol") for symbol in pending]
+        reused: dict[str, dict[str, object]] = {}
+        for symbol, value in json_object(plan.get("reused"), "plan reused").items():
+            item = json_object(value, f"plan reused {symbol}")
+            path = PurePosixPath(text(item.get("path"), f"plan reused {symbol} path"))
+            digest = _sha(item.get("sha256"), f"plan reused {symbol} sha256")
+            if path.name != digest + ".csv" or path.parent.name != "history":
+                raise ValueError(f"Norgate export plan reuses {symbol} from an unknown layout")
+            directory = path.parent.parent.name
+            relative_name(directory, f"plan reused {symbol} directory")
+            reused[symbol] = {
+                "assetid": integer(item.get("assetid"), f"plan reused {symbol} assetid"),
+                "rows": integer(item.get("rows"), f"plan reused {symbol} rows"),
+                "sha256": digest,
+                "manifest": _sha(item.get("manifest_sha256"), f"plan reused {symbol} manifest"),
+                "directory": directory,
+            }
+        planned = set(symbols) | set(reused)
+        if len(planned) != len(symbols) + len(reused):
+            raise ValueError("Norgate export plan repeats a symbol")
+        if (
+            acquisition.get("plan_sha256") != plan_sha
+            or acquisition.get("unattempted") != 0
+            or acquisition.get("batches") != results
+            or acquisition.get("reused_series") != len(reused)
+        ):
+            raise ValueError("Norgate export acquisition record disagrees with its plan or batches")
+        run.state["planned"] = planned
+        run.state["seen"] = Counter()
+        run.metrics["planned_series"] = len(planned)
+        return reused
 
     @staticmethod
     def _records(payload: bytes, name: str) -> dict[str, dict[str, object]]:
@@ -196,69 +276,115 @@ class HistoryExport:
         if integer(result.get("recorded"), f"{name} recorded") != len(records):
             raise ValueError(f"Norgate batch result counts disagree: {name}")
         for symbol, record in records.items():
-            item = json_object(record, f"{name} record")
-            if item.get("status") != "exported" or item.get("symbol") != symbol:
-                raise ValueError(f"Norgate batch record is not an export of {symbol}: {name}")
-            digest = _sha(item.get("sha256"), f"{name} record sha256")
-            if item.get("path") != digest + ".csv":
-                raise ValueError(f"Norgate batch record path is not its hash: {name}")
+            _exported(json_object(record, f"{name} record"), symbol, name)
         return cast("dict[str, dict[str, object]]", records)
 
     def batches(
         self, unit: Unit, table: Table, source: Bytes, run: Run
     ) -> Iterator[pa.RecordBatch]:
-        import pyarrow as pa  # noqa: PLC0415 -- the Arrow loaders need the legacy extra
-
         del table
-        records = self._records(source.read(unit.files[0], max_bytes=MAX_INDEX_BYTES), unit.name)
-        history = unit.files[0].parent / unit.name.removesuffix("-result.json") / "history"
-        known = dict(_HISTORY_VALUES)
         run.metrics["units"] += 1
-        for symbol, record in records.items():
-            columns = [
-                text(column, f"{symbol} column") for column in cast("list", record["columns"])
-            ]
-            if len(set(columns)) != len(columns) or not set(columns) <= set(known):
-                raise ValueError(f"Norgate record {symbol} has an unknown or repeated column")
-            if record.get("index_name") != "Date":
-                raise ValueError(f"Norgate record {symbol} is not indexed by Date")
-            identity = json_object(record.get("identity"), f"{symbol} identity")
-            assetid = integer(record.get("assetid"), f"{symbol} assetid")
-            if identity.get("assetid") != assetid or identity.get("symbol") != symbol:
-                raise ValueError(f"Norgate record {symbol} identity disagrees with the record")
-            digest = str(record["sha256"])
-            payload = source.read(history / str(record["path"]), max_bytes=MAX_FILE_BYTES)
-            if hashlib.sha256(payload).hexdigest() != digest:
-                raise ValueError(f"Norgate CSV for {symbol} does not match its recorded hash")
-            parsed = csv_table(payload, ("Date", *columns), str(record["path"]))
-            rows = len(parsed[0])
-            if rows != integer(record.get("rows"), f"{symbol} rows"):
-                raise ValueError(f"Norgate CSV for {symbol} does not have its recorded rows")
-            if rows and (
-                parsed[0][0].as_py() != _day(record.get("first_index"), "first_index")
-                or parsed[0][rows - 1].as_py() != _day(record.get("last_index"), "last_index")
-            ):
-                raise ValueError(f"Norgate CSV for {symbol} does not span its recorded dates")
-            by_name = dict(zip(("Date", *columns), parsed, strict=True))
-            constant = (
-                (assetid, pa.int64()),
-                (symbol, pa.string()),
-                (text(identity.get("database"), "database"), pa.string()),
-                (text(identity.get("securityname"), "securityname"), pa.string()),
-                (digest, pa.string()),
+        reused = cast("dict[str, dict[str, object]] | None", unit.context.get("reused"))
+        if reused is None:
+            records = self._records(
+                source.read(unit.files[0], max_bytes=MAX_INDEX_BYTES), unit.name
             )
-            arrays = [pa.repeat(pa.scalar(value, kind), rows) for value, kind in constant]
-            arrays.append(by_name["Date"])
-            arrays.extend(
-                by_name[original] if original in by_name else pa.nulls(rows, pa.string())
-                for original, _ in _HISTORY_VALUES
-            )
-            run.metrics["records"] += 1
-            run.metrics["rows"] += rows
-            yield pa.record_batch(arrays, schema=HISTORY.schema())
+            history = unit.files[0].parent / unit.name.removesuffix("-result.json") / "history"
+            for symbol, record in records.items():
+                yield _series(symbol, record, history, source, run)
+            return
+        checkpoint = unit.files[0]
+        payload = source.read(checkpoint, max_bytes=MAX_INDEX_BYTES)
+        if hashlib.sha256(payload).hexdigest() != checkpoint.stem:
+            raise ValueError(f"Norgate checkpoint is not named by its hash: {unit.name}")
+        listed = json_document(payload, checkpoint.name)
+        values = json_object(listed, "checkpoint").get("records")
+        if not isinstance(values, list):
+            raise ValueError(f"Norgate checkpoint has no record list: {unit.name}")
+        by_symbol: dict[str, dict[str, object]] = {}
+        for value in values:
+            record = json_object(value, "checkpoint record")
+            symbol = text(record.get("symbol"), "checkpoint record symbol")
+            if by_symbol.setdefault(symbol, record) is not record:
+                raise ValueError(f"Norgate checkpoint repeats {symbol}: {unit.name}")
+            _exported(record, symbol, unit.name)
+        for symbol, item in reused.items():
+            record = by_symbol.get(symbol)
+            if record is None or (
+                record.get("sha256"),
+                record.get("rows"),
+                record.get("assetid"),
+            ) != (item["sha256"], item["rows"], item["assetid"]):
+                raise ValueError(f"Norgate checkpoint does not hold the planned {symbol}")
+            yield _series(symbol, record, checkpoint.parent.parent, source, run)
 
     def finish(self, entry: Entry, source: OriginalBytes, run: Run) -> None:
-        del entry, source, run
+        del entry, source
+        planned = cast("set[str]", run.state["planned"])
+        seen = cast("Counter[str]", run.state["seen"])
+        run.metrics["missing_series"] = len(planned - set(seen))
+        run.metrics["unplanned_series"] = len(set(seen) - planned)
+
+
+def _exported(record: dict[str, object], symbol: str, name: str) -> None:
+    if record.get("status") != "exported" or record.get("symbol") != symbol:
+        raise ValueError(f"Norgate batch record is not an export of {symbol}: {name}")
+    digest = _sha(record.get("sha256"), f"{name} record sha256")
+    if record.get("path") != digest + ".csv":
+        raise ValueError(f"Norgate batch record path is not its hash: {name}")
+
+
+def _series(
+    symbol: str, record: dict[str, object], history: Path, source: Bytes, run: Run
+) -> pa.RecordBatch:
+    """One exported series: the CSV a record names, checked against that record."""
+    import pyarrow as pa  # noqa: PLC0415 -- the Arrow loaders need the legacy extra
+
+    known = dict(_HISTORY_VALUES)
+    listed = record.get("columns")
+    if not isinstance(listed, list):
+        raise ValueError(f"Norgate record {symbol} has no column list")
+    columns = [text(column, f"{symbol} column") for column in listed]
+    if len(set(columns)) != len(columns) or not set(columns) <= set(known):
+        raise ValueError(f"Norgate record {symbol} has an unknown or repeated column")
+    if record.get("index_name") != "Date":
+        raise ValueError(f"Norgate record {symbol} is not indexed by Date")
+    identity = json_object(record.get("identity"), f"{symbol} identity")
+    assetid = integer(record.get("assetid"), f"{symbol} assetid")
+    if identity.get("assetid") != assetid or identity.get("symbol") != symbol:
+        raise ValueError(f"Norgate record {symbol} identity disagrees with the record")
+    digest = _sha(record.get("sha256"), f"{symbol} sha256")
+    name = digest + ".csv"
+    payload = source.read(history / name, max_bytes=MAX_FILE_BYTES)
+    if hashlib.sha256(payload).hexdigest() != digest:
+        raise ValueError(f"Norgate CSV for {symbol} does not match its recorded hash")
+    parsed = csv_table(payload, ("Date", *columns), name)
+    rows = len(parsed[0])
+    if rows != integer(record.get("rows"), f"{symbol} rows"):
+        raise ValueError(f"Norgate CSV for {symbol} does not have its recorded rows")
+    if rows and (
+        parsed[0][0].as_py() != _day(record.get("first_index"), "first_index")
+        or parsed[0][rows - 1].as_py() != _day(record.get("last_index"), "last_index")
+    ):
+        raise ValueError(f"Norgate CSV for {symbol} does not span its recorded dates")
+    by_name = dict(zip(("Date", *columns), parsed, strict=True))
+    constant = (
+        (assetid, pa.int64()),
+        (symbol, pa.string()),
+        (text(identity.get("database"), "database"), pa.string()),
+        (text(identity.get("securityname"), "securityname"), pa.string()),
+        (digest, pa.string()),
+    )
+    arrays = [pa.repeat(pa.scalar(value, kind), rows) for value, kind in constant]
+    arrays.append(by_name["Date"])
+    arrays.extend(
+        by_name[original] if original in by_name else pa.nulls(rows, pa.string())
+        for original, _ in _HISTORY_VALUES
+    )
+    cast("Counter[str]", run.state["seen"])[symbol] += 1
+    run.metrics["records"] += 1
+    run.metrics["rows"] += rows
+    return pa.record_batch(arrays, schema=HISTORY.schema())
 
 
 class IndexMembership:
@@ -308,7 +434,7 @@ class IndexMembership:
             files = [directory / "request.json", directory / manifests[0]]
             files.append(directory / "receipts.jsonl")
             files.extend(
-                _sibling(directory / "receipts.jsonl", str(item["file"]))
+                _sibling(directory / "receipts.jsonl", text(item.get("file"), "receipt file"))
                 for _, item in _receipts(journal)
             )
             if result_path is not None:
@@ -370,10 +496,9 @@ class IndexMembership:
                 "batch result",
             )
             verification = json_object(result.get("verification"), "batch verification")
-            if (
-                result.get("request_sha256") != request_sha
-                or verification.get("journal_sha256") != manifest["journal_sha256"]
-            ):
+            if result.get("request_sha256") != request_sha or verification.get(
+                "journal_sha256"
+            ) != manifest.get("journal_sha256"):
                 raise ValueError(f"Norgate capture {unit.name} disagrees with its batch result")
         captured = cast("dict[tuple[int, str], int]", run.state["captured"])
         run.metrics["units"] += 1
@@ -382,7 +507,7 @@ class IndexMembership:
                 integer(job.get("assetid"), "job assetid"),
                 text(json_object(job.get("kwargs"), "job kwargs").get("indexname"), "indexname"),
             )
-            name = str(payload["file"])
+            name = text(payload.get("file"), "receipt file")
             raw = source.read(_sibling(journal_path, name), max_bytes=MAX_FILE_BYTES)
             file_sha = hashlib.sha256(raw).hexdigest()
             if file_sha != payload.get("sha256") or name != file_sha + ".csv.gz":

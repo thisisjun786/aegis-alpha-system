@@ -79,9 +79,11 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   content source per output table through `import_content_arrow`, from the `raw/` copies the
   apply just retained, so rows come only from bytes the ID names (`files.RetainedBytes`, and
   `OriginalBytes` for a plan). Values stay the original text or JSON; a unit whose bytes
-  contradict their own index is refused, never repaired. `--plan` opens no installation and
-  writes nothing; `--verify` re-derives the plan and is the precondition for deleting the
-  originals outside the store. A new format is a new loader with its own synthetic test.
+  contradict their own index is refused, never repaired. Every file below an entry root is a
+  unit file, a retained index or `retain` file, an `exclude` file, or reported as uncovered.
+  `--plan` opens no installation and writes nothing; `--verify` re-derives the plan, and its
+  `complete` (zero unmatched, reconciled, zero uncovered) is the precondition for deleting an
+  entry root outside the store. A new format is a new loader with its own synthetic test.
 - `bulk_generation` publishes a staged DuckDB table as one generation: plan without
   writing, then one transaction with the marker and `INSERT … SELECT`. DuckDB encodes and
   sorts `aas-rowset-v1` rows and `rowset.RowsetStream` digests them in admitted batches and

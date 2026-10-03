@@ -19,11 +19,15 @@ import pyarrow.parquet as pq
 import pytest
 
 from aegis_alpha.storage.legacy_import.engine import (
+    LOADERS,
     apply_import,
     plan_import,
     verify_import,
 )
+from aegis_alpha.storage.legacy_import.files import RetainedBytes
 from aegis_alpha.storage.legacy_import.manifest import Manifest, parse_manifest
+from aegis_alpha.storage.raw import put_raw_file
+from aegis_alpha.storage.source_identity import SourceFile
 from aegis_alpha.storage.source_library import read_table
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
 
@@ -75,8 +79,13 @@ def _record(
     }
 
 
-def _history_export(root: Path, batches: list[list[tuple[str, int, bytes]]]) -> Path:
-    """Write ``batch-NNN-result.json`` files and the CSV files each one lists."""
+def _history_export(
+    root: Path,
+    batches: list[list[tuple[str, int, bytes]]],
+    *,
+    reused: dict[str, dict[str, object]] | None = None,
+) -> Path:
+    """Write ``batch-NNN-result.json`` files, the CSV files each lists, the plan and acquisition."""
     columns = _HISTORY_COLUMNS.split(",")
     for number, batch in enumerate(batches):
         records = {}
@@ -95,7 +104,46 @@ def _history_export(root: Path, batches: list[list[tuple[str, int, bytes]]]) -> 
             "validation_layer": "synthetic",
         }
         _private(root / f"batch-{number:03d}-result.json", _json(result))
+    reused = reused or {}
+    plan = {
+        "pending_symbols": [symbol for batch in batches for symbol, _, _ in batch],
+        "reused": reused,
+    }
+    plan_raw = _json(plan)
+    _private(root / f"plan-{_sha(plan_raw)}.json", plan_raw)
+    acquisition = _json(
+        {
+            "batches": len(batches),
+            "plan_sha256": _sha(plan_raw),
+            "reused_series": len(reused),
+            "unattempted": 0,
+        }
+    )
+    _private(root / f"acquisition-{_sha(acquisition)}.json", acquisition)
     return root
+
+
+def _checkpoint(
+    directory: Path, series: list[tuple[str, int, bytes]]
+) -> dict[str, dict[str, object]]:
+    """A sibling capture: CSV files and the checkpoint listing them; the plan's reuse entries."""
+    columns = _HISTORY_COLUMNS.split(",")
+    records = []
+    for symbol, assetid, csv in series:
+        _private(directory / "history" / (_sha(csv) + ".csv"), csv)
+        records.append(_record(symbol, assetid, csv, columns, len(csv.splitlines()) - 1))
+    raw = _json({"records": records, "schema_version": "aas-norgate-reference-export-v1"})
+    _private(directory / "history" / "checkpoints" / f"{_sha(raw)}.json", raw)
+    return {
+        str(record["symbol"]): {
+            "assetid": record["assetid"],
+            "manifest_sha256": _sha(raw),
+            "path": f"/elsewhere/{directory.name}/history/{record['path']}",
+            "rows": record["rows"],
+            "sha256": record["sha256"],
+        }
+        for record in records
+    }
 
 
 def _csv(*rows: str) -> bytes:
@@ -170,12 +218,25 @@ def test_plan_reads_originals_and_writes_nothing(tmp_path: Path, home: Path) -> 
     assert _tree(home) == before_home
     assert _tree(root) == before_root
     entry = _only(report)
-    assert entry["metrics"] == {"records": 3, "rows": 4, "units": 2}
+    assert entry["metrics"] == {
+        "missing_series": 0,
+        "planned_series": 3,
+        "records": 3,
+        "rows": 4,
+        "unplanned_series": 0,
+        "units": 2,
+    }
     assert all(cast("dict", check)["matched"] for check in cast("dict", entry["expect"]).values())
     assert report["reconciled"] is True
     assert report["provider_calls"] == 0
     # Two batches share one CSV byte string; the file is counted once.
-    assert entry["files"] == len([*root.glob("*.json"), *root.rglob("*.csv")])
+    assert entry["files"] == len([*root.glob("batch-*-result.json"), *root.rglob("*.csv")])
+    # The plan and acquisition record the loader read are retained; nothing is left uncovered.
+    assert cast("dict", entry["retained"]) == {
+        "files": 2,
+        "bytes": sum(path.stat().st_size for path in root.glob("[pa][lc]*-*.json")),
+    }
+    assert cast("dict", entry["uncovered"]) == {"files": 0, "bytes": 0, "paths": []}
     sources = _sources(report)
     assert [source["rows"] for source in sources] == [2, 2]
     assert all(str(source["source_id"]).startswith("norgate-history-csv-") for source in sources)
@@ -297,6 +358,10 @@ def test_unit_contradicting_its_index_is_refused(tmp_path: Path, home: Path) -> 
     result["records"]["BBB"]["columns"] = [*_HISTORY_COLUMNS.split(","), "Adjusted"]
     _private(result_path, _json(result))
     assert "unknown or repeated column" in _refusal(plan_import(manifest))
+    # A malformed index is a refused unit, not an aborted plan.
+    del result["records"]["BBB"]["columns"]
+    _private(result_path, _json(result))
+    assert "no column list" in _refusal(plan_import(manifest))
     # A group-readable original is refused, exactly as the apply's raw admission would.
     result["records"]["BBB"]["columns"] = _HISTORY_COLUMNS.split(",")
     _private(result_path, _json(result))
@@ -314,7 +379,8 @@ def test_verify_requires_committed_identical_linked_sources(tmp_path: Path, home
     with open_workspace(home) as workspace:
         before = verify_import(workspace, manifest)
     assert before["complete"] is False
-    assert before["unmatched"] == len(_sources(before))
+    # Every planned source and both retained index files (plan, acquisition) are unmatched.
+    assert before["unmatched"] == len(_sources(before)) + 2
     assert {s["status"] for s in _sources(before)} == {"missing"}
     with open_workspace(home, writable=True, strategy_write=True) as workspace:
         apply_import(workspace, manifest)
@@ -465,7 +531,10 @@ def test_sec_archive_indexes_members_and_checks_receipts(tmp_path: Path, home: P
     assert "disagrees on sha256" in _refusal(plan_import(manifest))
 
 
-def test_small_loaders_map_their_originals(tmp_path: Path, home: Path) -> None:
+def _small_originals(
+    tmp_path: Path,
+) -> tuple[dict[str, dict[str, object]], pa.Table, dict[str, object]]:
+    """FRED, KR public, FMP and identity originals; their entries keyed by loader."""
     legacy = tmp_path / "legacy"
     fred = _private(
         legacy / "DEXKOUS.csv", b"observation_date,DEXKOUS\n2011-10-03,1180.00\n2011-10-04,\n"
@@ -559,16 +628,24 @@ def test_small_loaders_map_their_originals(tmp_path: Path, home: Path) -> None:
             }
         ),
     )
-    manifest = _manifest(
-        [
-            _entry("fred", "fred.series_csv@1", fred, rows=2),
-            _entry("korea", "korea.public_response@1", korea, units=1, listings=1),
-            _entry("fmp", "fmp.price_eod_non_split@1", legacy / "fmp", rows=1),
-            _entry(
-                "identity", "norgate.identity_authority@1", authority, mappings=1, issuer_bindings=1
-            ),
-        ],
-    )
+    entries = {
+        "fred.series_csv@1": _entry("fred", "fred.series_csv@1", fred, rows=2),
+        "korea.public_response@1": _entry(
+            "korea", "korea.public_response@1", korea, units=1, listings=1
+        ),
+        "fmp.price_eod_non_split@1": _entry(
+            "fmp", "fmp.price_eod_non_split@1", legacy / "fmp", rows=1
+        ),
+        "norgate.identity_authority@1": _entry(
+            "identity", "norgate.identity_authority@1", authority, mappings=1, issuer_bindings=1
+        ),
+    }
+    return entries, table, mapping
+
+
+def test_small_loaders_map_their_originals(tmp_path: Path, home: Path) -> None:
+    entries, table, mapping = _small_originals(tmp_path)
+    manifest = _manifest(list(entries.values()))
     with open_workspace(home, writable=True, strategy_write=True) as workspace:
         report = apply_import(workspace, manifest)
         sources = _sources(report)
@@ -635,7 +712,7 @@ def test_manifest_is_exact_strict_json() -> None:
             plan_import(parse_manifest(raw, _sha(raw)))
 
 
-def _cli(*args: str, home: Path) -> dict[str, object]:
+def _cli(*args: str, home: Path, code: int = 0) -> dict[str, object]:
     result = subprocess.run(  # noqa: S603 -- fixed interpreter, temporary synthetic home
         [sys.executable, "-m", "aegis_alpha", "import", "legacy", *args],
         env={**os.environ, "AAS_HOME": str(home), "PYTHONPATH": str(_ROOT / "src")},
@@ -645,7 +722,7 @@ def _cli(*args: str, home: Path) -> dict[str, object]:
         check=False,
         timeout=120,
     )
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == code, result.stderr
     return json.loads(result.stdout)
 
 
@@ -664,7 +741,7 @@ def test_cli_plans_applies_and_verifies(tmp_path: Path, home: Path) -> None:
     assert not (tmp_path / "none").exists()
     assert _tree(home) == before
     assert planned["reconciled"] is True
-    verified = _cli("--manifest", str(path), "--sha256", _sha(raw), "--verify", home=home)
+    verified = _cli("--manifest", str(path), "--sha256", _sha(raw), "--verify", home=home, code=1)
     assert verified["complete"] is False
     assert _tree(home) == before
     applied = _cli("--manifest", str(path), "--sha256", _sha(raw), home=home)
@@ -672,3 +749,185 @@ def test_cli_plans_applies_and_verifies(tmp_path: Path, home: Path) -> None:
     verified = _cli("--manifest", str(path), "--sha256", _sha(raw), "--verify", home=home)
     assert verified["complete"] is True
     assert _sha(raw) in {path.name for path in (home / "raw").rglob("*")}
+    # An expected count that does not match fails the plan's exit status, after the report.
+    raw = _json(
+        {
+            "schema_version": "aas-legacy-import-v1",
+            "entries": [_entry("equity", "norgate.history_export@1", root, rows=5)],
+        }
+    )
+    path = _private(tmp_path / "manifest.json", raw)
+    planned = _cli("--manifest", str(path), "--sha256", _sha(raw), "--plan", home=home, code=1)
+    assert planned["reconciled"] is False
+
+
+_SPX = _csv("1990-01-02,353.4,355.67,351.35,355.67,0,0,355.67,0.0")
+
+
+def test_reused_series_are_units_until_imported(tmp_path: Path, home: Path) -> None:
+    legacy = tmp_path / "legacy"
+    reused = _checkpoint(legacy / "history-selected-1", [("$SPX", 392, _SPX)])
+    root = _history_export(legacy / "index", [[("AAA", 131684, _AAA)]], reused=reused)
+    manifest = _manifest(
+        [_entry("index", "norgate.history_export@1", root, planned_series=2, records=2, rows=3)]
+    )
+    report = plan_import(manifest)
+    entry = _only(report)
+    assert report["reconciled"] is True
+    assert cast("dict", entry["metrics"])["missing_series"] == 0
+    assert [s["unit"] for s in _sources(report)] == [
+        "batch-000-result.json",
+        "reused/history-selected-1/" + str(reused["$SPX"]["manifest_sha256"]),
+    ]
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        sources = _sources(apply_import(workspace, manifest))
+        rows = _rows(workspace, sources[1])
+    assert [(row["symbol"], row["assetid"], row["close"]) for row in rows] == [
+        ("$SPX", 392, "355.67")
+    ]
+    with open_workspace(home) as workspace:
+        assert verify_import(workspace, manifest)["complete"] is True
+    # Without its checkpoint the reused series is a refused unit and a missing series.
+    checkpoint = next((legacy / "history-selected-1" / "history" / "checkpoints").iterdir())
+    payload = checkpoint.read_bytes()
+    checkpoint.unlink()
+    report = plan_import(manifest)
+    assert cast("dict", _only(report)["metrics"])["missing_series"] == 1
+    assert report["reconciled"] is False
+    # A checkpoint that disagrees with the plan is refused, never read in its place.
+    record = json.loads(payload)
+    record["records"][0]["rows"] = 2
+    changed = _json(record)
+    _private(checkpoint.parent / f"{_sha(changed)}.json", changed)
+    reused["$SPX"]["manifest_sha256"] = _sha(changed)
+    other = _history_export(legacy / "other", [[("AAA", 131684, _AAA)]], reused=reused)
+    report = plan_import(_manifest([_entry("other", "norgate.history_export@1", other)]))
+    assert "does not hold the planned $SPX" in _refusal(report)
+    # An acquisition record that disagrees with its plan refuses the whole entry.
+    acquisition = next(root.glob("acquisition-*.json"))
+    document = json.loads(acquisition.read_bytes())
+    document["reused_series"] = 0
+    acquisition.unlink()
+    raw = _json(document)
+    _private(root / f"acquisition-{_sha(raw)}.json", raw)
+    assert "acquisition record disagrees" in _refusal(plan_import(manifest))
+
+
+def test_uncovered_files_keep_verify_incomplete(tmp_path: Path, home: Path) -> None:
+    root = _export(tmp_path)
+    _private(root / "collect.py", b"print('collect')\n")
+    _private(root / "batch-000" / "history" / (_sha(_BBB) + ".csv"), _BBB)
+    _private(root / "batch-000" / "stderr.txt", b"")
+    manifest = _manifest([_entry("equity", "norgate.history_export@1", root)])
+    planned = _only(plan_import(manifest))
+    planned_paths = cast("dict", planned["uncovered"])["paths"]
+    assert planned["uncovered"] == {
+        "files": 3,
+        "bytes": len(b"print('collect')\n") + len(_BBB),
+        "paths": [
+            f"batch-000/history/{_sha(_BBB)}.csv",
+            "batch-000/stderr.txt",
+            "collect.py",
+        ],
+    }
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        apply_import(workspace, manifest)
+    with open_workspace(home) as workspace:
+        report = verify_import(workspace, manifest)
+    assert report["unmatched"] == 0
+    assert cast("dict", report["totals"])["uncovered_files"] == len(planned_paths)
+    assert report["complete"] is False
+    # The operator retains or excludes each leftover explicitly; retained files go to raw/.
+    entry = _entry("equity", "norgate.history_export@1", root)
+    entry["retain"] = ["*.py", "batch-*/history/*.csv"]
+    entry["exclude"] = ["batch-*/stderr.txt"]
+    manifest = _manifest([entry])
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        applied = _only(apply_import(workspace, manifest))
+    assert applied["retained"] == {
+        "files": 4,
+        "bytes": sum(
+            path.stat().st_size
+            for path in [root / "collect.py", *root.glob("plan-*"), *root.glob("acquisition-*")]
+        )
+        + len(_BBB),
+    }
+    assert applied["excluded"] == {"files": 1, "bytes": 0}
+    digest = _sha(b"print('collect')\n")
+    assert (home / "raw" / digest[:2] / digest).read_bytes() == b"print('collect')\n"
+    with open_workspace(home) as workspace:
+        assert verify_import(workspace, manifest)["complete"] is True
+    # A retained file whose raw copy is gone is unmatched.
+    (home / "raw" / digest[:2] / digest).unlink()
+    with open_workspace(home) as workspace:
+        report = verify_import(workspace, manifest)
+    assert report["complete"] is False
+    assert report["unmatched_sources"] == [
+        {"entry": "equity", "file": "collect.py", "status": "not_retained"}
+    ]
+
+
+def _all_loaders(tmp_path: Path) -> dict[str, dict[str, object]]:
+    entries, _, _ = _small_originals(tmp_path / "small")
+    membership = _entry("membership", "norgate.index_membership@1", _membership(tmp_path), pairs=3)
+    membership["args"] = {"include": ["pilot-capture"]}
+    archive_path, receipt_path, _ = _archive(tmp_path)
+    for loader in ("sec.submissions_zip@1", "sec.companyfacts_zip@1"):
+        name = loader.split(".")[1].split("_")[0]
+        entries[loader] = {
+            **_entry(name, loader, archive_path, members=2),
+            "args": {"evidence": [str(receipt_path)]},
+        }
+    entries["norgate.history_export@1"] = _entry(
+        "equity", "norgate.history_export@1", _export(tmp_path), rows=4
+    )
+    entries["norgate.index_membership@1"] = membership
+    return entries
+
+
+@pytest.mark.parametrize("loader", sorted(LOADERS))
+def test_every_loader_plans_applies_and_verifies_alike(
+    tmp_path: Path, home: Path, loader: str
+) -> None:
+    entries = _all_loaders(tmp_path)
+    assert set(entries) == set(LOADERS)
+    manifest = _manifest([entries[loader]])
+    planned = plan_import(manifest)
+    assert planned["reconciled"] is True
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        applied = apply_import(workspace, manifest)
+        again = apply_import(workspace, manifest)
+    with open_workspace(home) as workspace:
+        verified = verify_import(workspace, manifest)
+
+    def identities(report: Report) -> list[tuple[object, ...]]:
+        return [(s["unit"], s["source_id"], s["rows"], s["digest"]) for s in _sources(report)]
+
+    assert identities(planned)
+    assert identities(applied) == identities(planned) == identities(again)
+    assert identities(verified) == identities(planned)
+    assert {s["reused"] for s in _sources(again)} == {True}
+    assert again["reconciled"] is True
+    assert _only(again)["metrics"] == _only(planned)["metrics"]
+    assert verified["complete"] is True
+
+
+def test_retained_bytes_refuse_a_changed_raw_object(tmp_path: Path, home: Path) -> None:
+    original = _private(tmp_path / "legacy" / "a.csv", _AAA)
+    raw = home / "raw"
+    relative, digest, size = put_raw_file(raw, original)
+    retained = {original: SourceFile(digest, size)}
+    assert RetainedBytes(raw, retained).read(original, max_bytes=1024) == _AAA
+    copy = raw / relative
+    copy.chmod(0o600)
+    copy.write_bytes(_AAA.replace(b"499.23", b"499.24"))
+    with pytest.raises(ValueError, match="does not match its address"):
+        RetainedBytes(raw, retained).read(original, max_bytes=1024)
+    copy.write_bytes(_AAA[:-1])
+    with (
+        pytest.raises(ValueError, match="does not match its address"),
+        RetainedBytes(raw, retained).stream(original),
+    ):
+        pass
+    with pytest.raises(ValueError, match="outside its unit"):
+        RetainedBytes(raw, retained).read(tmp_path / "other.csv", max_bytes=1024)

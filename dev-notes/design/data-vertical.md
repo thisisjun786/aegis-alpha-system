@@ -89,7 +89,7 @@ FMP 동결 snapshot, Norgate identity authority)은 `aas import legacy`로 한 �
 | 필드 | 의미 |
 | --- | --- |
 | `schema_version` | `aas-legacy-import-v1` |
-| `entries` | 항목 목록. 항목마다 `name`(보고용 소문자 이름, 유일), `loader`(`name@major`), `path`(원본이 있는 절대 경로), `args`(그 loader가 정의한 인자), `expect`(loader 대조 지표 이름 → 기대 수) |
+| `entries` | 항목 목록. 항목마다 `name`(보고용 소문자 이름, 유일), `loader`(`name@major`), `path`(원본이 있는 절대 경로), `args`(그 loader가 정의한 인자), `expect`(loader 대조 지표 이름 → 기대 수), 선택 필드 `retain`·`exclude`(아래 파일 대조의 패턴 목록) |
 
 loader는 원본 형식 하나를 읽는 등록된 코드다. loader가 원본의 완결 단위, 출력 테이블의 공급자·shape·열,
 대조 지표를 정한다. major는 출력 schema major이며 열이 바뀔 때만 오른다. `name`과 `path`는 ID와 저장 값에
@@ -97,7 +97,7 @@ loader는 원본 형식 하나를 읽는 등록된 코드다. loader가 원본�
 
 | loader | 완결 단위 | 원천 ID 접두어와 테이블 | 대조 지표 |
 | --- | --- | --- | --- |
-| `norgate.history_export@1` | `batch-NNN-result.json` 하나와 그것이 나열한 `batch-NNN/history/<sha256>.csv` | `norgate-history-csv`, `bars`: result 기록의 asset ID·심볼·database·종목명·CSV 해시, `date`와 값 열 원문 | `units`, `records`, `rows` |
+| `norgate.history_export@1` | `batch-NNN-result.json` 하나와 그것이 나열한 `batch-NNN/history/<sha256>.csv`. 내보내기의 `plan-<sha256>.json`이 `reused`로 재사용한 시리즈는 형제 수집 디렉터리(`<디렉터리>/history/`)의 checkpoint 하나(`history/checkpoints/<manifest_sha256>.json`)마다 한 단위이며, 그 checkpoint와 계획이 재사용한 CSV다 | `norgate-history-csv`, `bars`: result 또는 checkpoint 기록의 asset ID·심볼·database·종목명·CSV 해시, `date`와 값 열 원문 | `units`, `records`, `rows`, `planned_series`, `missing_series`, `unplanned_series` |
 | `norgate.index_membership@1` | `batch-results/*.json` 중 family `membership`이 가리키는 `batch-attempts/` 수집 디렉터리 하나(또는 `args.include`의 수집 디렉터리): `request.json`, `manifest-*.json`, `receipts.jsonl`, 그 journal이 나열한 `index_constituent_timeseries` gzip CSV | `norgate-index-membership`, `constituents`: job ID·asset ID·심볼·지수 이름·gzip과 CSV 해시, `date`, `index_constituent` 원문 | `units`, `pairs`, `rows`, `planned_pairs`, `missing_pairs`, `unplanned_pairs`, `repeated_pairs` |
 | `norgate.identity_authority@1` | identity authority JSON 한 파일 | `norgate-identity-mappings`(`mappings`), `norgate-identity-issuer-bindings`(`issuer_bindings`). 같은 파일이라 hex를 공유한다 | `mappings`, `issuer_bindings` |
 | `sec.submissions_zip@1`, `sec.companyfacts_zip@1` | archive 하나와 `args.evidence`의 수집 영수증 | `sec-submissions-zip`, `sec-companyfacts-zip`, `members`: central directory 순서의 member 이름·압축·원래 크기·CRC-32·수정 시각·압축 방식·member bytes의 SHA-256 | `members`, `json_members`, `expanded_bytes` |
@@ -115,6 +115,10 @@ loader는 원본 형식 하나를 읽는 등록된 코드다. loader가 원본�
   archive 해시·크기·member 수) 그 단위를 거부하고 고쳐 읽지 않는다. 알 수 없는 열이나 형식도 거부한다.
 - loader가 읽은 파일은 모두 단위의 파일 목록에 있어야 하고 목록의 파일은 모두 읽혀야 한다. 원천 ID는
   그 파일 전체의 `[raw 주소, 크기, SHA-256]`에서 나온다.
+- Norgate 내보내기의 계획 시리즈는 `plan-<sha256>.json`의 `pending_symbols`와 `reused`의 합집합이다.
+  재사용 시리즈는 계획의 해시·행 수·asset ID와 checkpoint 기록이 모두 같아야 읽는다. 계획과
+  `acquisition-<sha256>.json`은 각자 이름의 해시와 같아야 하고, acquisition은 그 계획을 가리키며 batch 수와
+  재사용 수가 맞아야 한다. 하나라도 다르면 항목 전체를 거부한다. 읽지 못한 계획 시리즈는 `missing_series`로 센다.
 - 원본은 `raw/` 보존과 같은 기준으로 받아들인다. 사용자가 소유한 단일 link의 비공개(그룹·기타 권한 없음)
   일반 파일이어야 하며, 그렇지 않은 원본은 거부하고 그 이유를 보고한다.
 
@@ -129,10 +133,26 @@ loader는 원본 형식 하나를 읽는 등록된 코드다. loader가 원본�
 행을 다시 계산해 기록과 같을 때 재사용한다. 단위는 하나씩 commit하므로 중단된 편입은 같은 명령으로
 끝내고, 처음 거부된 단위에서 실행이 멈춘다. 공급자는 호출하지 않는다.
 
+항목 경로 아래의 일반 파일(경로가 파일이면 그 파일)은 모두 대조한다. 따라가지 않은 symlink도 파일로 센다.
+
+| 분류 | 파일 | 처리 |
+| --- | --- | --- |
+| 단위 | 어떤 단위의 파일 목록에 있는 파일 | 원천 ID에 들어가고 `raw/`에 보존된다 |
+| 보존 | loader가 단위를 찾으려고 읽은 색인 파일(내보내기 계획·acquisition, 지수 구성 계획, 다른 family의 batch result)과 `retain` 패턴에 맞는 파일 | 테이블 없이 bytes 그대로 `raw/`에 보존되고 `--verify`가 다시 확인한다 |
+| 제외 | `exclude` 패턴에 맞는 파일 | 편입하지 않는다는 운영자의 기록. 수와 bytes를 보고한다 |
+| 미대조 | 그 밖의 파일 | 수, bytes, 앞의 경로 20개를 `uncovered`로 보고한다 |
+
+패턴은 항목 경로 기준 상대 POSIX 경로에 맞추는 `fnmatch` 문법이며 `*`는 `/`도 넘는다. 분류는 단위, 보존,
+제외 순으로 먼저 맞는 것을 따른다. 단위 밖 형제 디렉터리의 파일(재사용 CSV, SEC 영수증)은 단위가 나열한 파일만
+보존되며 그 디렉터리의 나머지 파일은 대조하지 않는다.
+
 `--verify`는 설치본을 읽기 전용으로 열고 계획을 원본에서 다시 계산한 뒤, 계획한 원천마다 commit이 완료됐고
-테이블 이름·행 수·digest가 같으며 `sl:` 연결이 유도와 같고 연결된 원본이 `raw/`에서 다시 해시해 맞는지
-확인한다. 그렇지 않은 원천과 거부된 단위는 `unmatched`로 센다. `unmatched`가 0이고 `reconciled`가 참이면
-`complete`이며, 이것이 설치본 밖 legacy 원본을 지우기 위한 대조표의 전제다.
+테이블 이름·행 수·digest가 같으며 `sl:` 연결이 유도와 같고 연결된 원본이 `raw/`에서 다시 해시해 맞는지,
+보존 파일마다 `raw/` 사본이 다시 해시해 맞는지 확인한다. 그렇지 않은 원천·보존 파일과 거부된 단위는
+`unmatched`로 센다. `unmatched`가 0이고 `reconciled`가 참이며 미대조 파일이 0이면 `complete`다. 설치본 밖
+legacy 원본은 `complete`인 manifest의 항목 경로만 지울 수 있다. 항목 경로가 아닌 디렉터리(형제 수집 디렉터리,
+내보내기 상위 디렉터리)는 그 자체를 항목으로 대조하기 전에는 지우지 않는다. CLI는 `--verify`가 `complete`가
+아니거나 `--plan`·실행이 `reconciled`가 아니면 보고를 출력한 뒤 종료 코드 1을 돌려준다.
 
 ## 승격 명세 `aas-promotion-v1`
 
@@ -884,3 +904,7 @@ state v2:
 | DV-107 | 지수 구성 편입은 계획한 쌍과 수집한 쌍의 누락·계획 밖·반복을 보고하고 journal이 manifest와 다르면 거부한다 | `tests/storage/test_legacy_import.py::test_membership_reconciles_planned_pairs` | 구현 |
 | DV-108 | SEC archive 편입은 member마다 크기·CRC·SHA-256을 색인하고 영수증이 archive와 다르면 거부한다 | `tests/storage/test_legacy_import.py::test_sec_archive_indexes_members_and_checks_receipts` | 구현 |
 | DV-109 | FRED·KR 공개·FMP·identity authority loader는 합성 원본을 독립 기대값과 같은 행으로 옮긴다 | `tests/storage/test_legacy_import.py::test_small_loaders_map_their_originals` | 구현 |
+| DV-110 | Norgate 내보내기의 재사용 시리즈는 checkpoint 단위로 편입되고, 편입되기 전에는 `missing_series`로 남으며, 계획과 다른 checkpoint나 acquisition은 거부된다 | `tests/storage/test_legacy_import.py::test_reused_series_are_units_until_imported` | 구현 |
+| DV-111 | 항목 경로 아래 어떤 단위도 덮지 않는 파일은 `uncovered`로 보고되고 `retain`·`exclude`로 기록되기 전까지 `complete`를 막으며, 보존 파일의 `raw/` 사본이 없으면 `unmatched`다 | `tests/storage/test_legacy_import.py::test_uncovered_files_keep_verify_incomplete` | 구현 |
+| DV-112 | 등록된 모든 loader에서 계획·실행·재실행·검증의 원천 ID·행 수·digest가 같고 재실행은 재사용, 검증은 `complete`다 | `tests/storage/test_legacy_import.py::test_every_loader_plans_applies_and_verifies_alike` | 구현 |
+| DV-113 | 보존한 `raw/` 사본이 주소와 다르거나 크기가 다르면 legacy 단위 읽기를 거부한다 | `tests/storage/test_legacy_import.py::test_retained_bytes_refuse_a_changed_raw_object` | 구현 |

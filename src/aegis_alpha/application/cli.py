@@ -172,5 +172,10 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912 -- explic
             diagnostic["notes"] = list(notes)
         print(json.dumps(diagnostic, ensure_ascii=False), file=sys.stderr)  # noqa: T201 -- CLI diagnostic
         return 1
+    if args.command == "import":
+        # A legacy import report is a gate: a verify that is not complete, or a plan or apply
+        # that is not reconciled, exits 1 after printing the report.
+        gate = "complete" if result.get("mode") == "verify" else "reconciled"
+        return 0 if result.get(gate) is True else 1
     code = result.get("exit_code", 0) if args.command == "collect" else 0
     return code if type(code) is int else 1

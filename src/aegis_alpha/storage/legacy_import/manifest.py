@@ -11,7 +11,9 @@ keys::
           "loader": "norgate.history_export@1",
           "path": "/absolute/path/to/an/export",
           "args": {},
-          "expect": {"records": 35833, "rows": 75636899}
+          "expect": {"records": 35833, "rows": 75636899},
+          "retain": ["*.py", "batch-*-transport.json"],
+          "exclude": ["batch-*/stderr.txt"]
         }
       ]
     }
@@ -22,6 +24,13 @@ original files form one unit and the output columns. ``args`` holds only the arg
 loader defines. ``expect`` maps the loader's reconciliation metrics to the counts the
 operator expects; the report states each observed value beside it. A path is absolute and
 names the original bytes where they lie; it is never copied into an ID or a stored value.
+
+``retain`` and ``exclude`` are optional lists of patterns over the relative POSIX path of a
+regular file below ``path`` (``fnmatch`` syntax, where ``*`` also crosses ``/``). They decide
+what happens to a file no unit covers: a ``retain`` match is kept byte for byte in ``raw/``
+beside the unit files and checked by ``--verify``; an ``exclude`` match is the operator's
+recorded acceptance that the file is not imported. Any other file below ``path`` that no unit
+covers is reported as uncovered, and an entry with uncovered files is never complete.
 """
 
 from __future__ import annotations
@@ -39,6 +48,7 @@ MANIFEST_SCHEMA: Final = "aas-legacy-import-v1"
 MAX_MANIFEST_BYTES: Final = 1024 * 1024
 _ROOT: Final = frozenset({"schema_version", "entries"})
 _ENTRY: Final = frozenset({"name", "loader", "path", "args", "expect"})
+_OPTIONAL: Final = frozenset({"retain", "exclude"})
 _NAME: Final = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 _METRIC: Final = re.compile(r"[a-z][a-z0-9_]*")
 _MAX_NAME: Final = 120
@@ -53,6 +63,8 @@ class Entry:
     path: Path
     args: dict[str, object]
     expect: dict[str, int]
+    retain: tuple[str, ...] = ()
+    exclude: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,8 +86,11 @@ def relative_name(value: object, name: str) -> PurePosixPath:
 
 def _entry(value: object, index: int) -> Entry:  # noqa: C901 -- one check per manifest field
     label = f"entry {index}"
-    if not isinstance(value, dict) or set(value) != _ENTRY:
-        raise ValueError(f"legacy manifest {label} needs exactly {sorted(_ENTRY)}")
+    if not isinstance(value, dict) or not _ENTRY <= set(value) <= _ENTRY | _OPTIONAL:
+        raise ValueError(
+            f"legacy manifest {label} needs exactly {sorted(_ENTRY)}, "
+            f"optionally with {sorted(_OPTIONAL)}"
+        )
     name = value["name"]
     if not isinstance(name, str) or len(name) > _MAX_NAME or _NAME.fullmatch(name) is None:
         raise ValueError(f"legacy manifest {label} name must be lowercase words and hyphens")
@@ -98,7 +113,33 @@ def _entry(value: object, index: int) -> Entry:  # noqa: C901 -- one check per m
             raise ValueError(f"legacy manifest {label} expect has an invalid metric name")
         if isinstance(count, bool) or not isinstance(count, int) or count < 0:
             raise ValueError(f"legacy manifest {label} expected counts are nonnegative integers")
-    return Entry(name, loader, Path(path), dict(args), dict(expect))
+    patterns = {key: _patterns(value.get(key, []), f"{label} {key}") for key in sorted(_OPTIONAL)}
+    return Entry(
+        name,
+        loader,
+        Path(path),
+        dict(args),
+        dict(expect),
+        retain=patterns["retain"],
+        exclude=patterns["exclude"],
+    )
+
+
+def _patterns(value: object, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise ValueError(f"legacy manifest {label} must be a list of patterns")
+    for pattern in value:
+        if (
+            not isinstance(pattern, str)
+            or not pattern
+            or "\x00" in pattern
+            or pattern.startswith("/")
+            or ".." in pattern.split("/")
+        ):
+            raise ValueError(f"legacy manifest {label} patterns are relative and non-empty")
+    if len(set(value)) != len(value):
+        raise ValueError(f"legacy manifest {label} repeats a pattern")
+    return tuple(value)
 
 
 def parse_manifest(raw: bytes, sha256: str) -> Manifest:

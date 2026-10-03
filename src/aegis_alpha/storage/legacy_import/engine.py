@@ -11,10 +11,18 @@
   are re-derived and match, so an interrupted import is finished by running it again.
   The first failing unit stops the apply.
 - ``verify_import`` re-derives the plan from the originals and checks that every planned
-  source is committed and complete in the installation with the same rows and digest, and
-  that its ``sl:`` link matches and every linked original is intact in ``raw/``. A unit with
-  no such source is ``unmatched``; zero unmatched sources is the precondition for deleting
-  the originals outside the store.
+  source is committed and complete in the installation with the same rows and digest, that
+  its ``sl:`` link matches and every linked original is intact in ``raw/``, and that every
+  retained index file is intact in ``raw/``. A source or retained file that fails is
+  ``unmatched``.
+
+Every regular file below an entry's root is accounted for. A unit file is covered by its
+source. An index file the loader read to discover its units (a membership plan, a batch
+result of another family, an export plan) and a file matching the entry's ``retain``
+patterns are retained in ``raw/`` as they are, without a table. A file matching ``exclude``
+is reported as excluded. Every other file is ``uncovered``: the report counts it, its bytes
+and the first paths. ``complete`` holds only with zero unmatched, ``reconciled`` and zero
+uncovered files, and it is the precondition for deleting an entry's root outside the store.
 
 Every report states, per entry, the loader's reconciliation metrics beside the manifest's
 ``expect`` counts. No provider is called and no clock value reaches a stored row.
@@ -22,7 +30,10 @@ Every report states, per entry, the loader's reconciliation metrics beside the m
 
 from __future__ import annotations
 
+import fnmatch
 import json
+import os
+import stat
 from typing import TYPE_CHECKING, Final, cast
 
 from aegis_alpha.data.descriptor_tree import DescriptorTree, DescriptorTreeError
@@ -80,6 +91,10 @@ LOADERS: Final[dict[str, Loader]] = {
 }
 
 type _Commit = Callable[[Entry, Loader, Unit, Run], list[dict[str, object]]]
+type _Retain = Callable[[Entry, dict[Path, SourceFile]], list[dict[str, str]]]
+
+# The uncovered paths a report names per entry; the counts and bytes cover all of them.
+_UNCOVERED_PATHS: Final = 20
 
 
 def read_manifest_file(path: Path, sha256: str) -> Manifest:
@@ -136,11 +151,84 @@ def _derive(entry: Entry, loader: Loader, unit: Unit, run: Run) -> list[dict[str
     return derived
 
 
+def _inventory(root: Path) -> list[tuple[Path, int]]:
+    """Every non-directory below ``root`` (``root`` itself when it is a file), unfollowed."""
+    try:
+        if not stat.S_ISDIR(os.lstat(root).st_mode):
+            return [(root, os.lstat(root).st_size)]
+        found: list[tuple[Path, int]] = []
+        pending = [root]
+        while pending:
+            directory = pending.pop()
+            with os.scandir(directory) as entries:
+                for item in entries:
+                    path = directory / item.name
+                    if item.is_dir(follow_symlinks=False):
+                        pending.append(path)
+                    else:
+                        found.append((path, item.stat(follow_symlinks=False).st_size))
+    except OSError as error:
+        raise ValueError(f"cannot list legacy entry: {error}") from None
+    return sorted(found)
+
+
+def _match(path: Path, root: Path, patterns: tuple[str, ...]) -> bool:
+    relative = path.relative_to(root).as_posix()
+    return any(fnmatch.fnmatchcase(relative, pattern) for pattern in patterns)
+
+
+def _coverage(
+    entry: Entry, units: list[Unit], discovery: OriginalBytes
+) -> tuple[dict[Path, SourceFile], dict[str, object], list[dict[str, str]]]:
+    """Classify every file below the entry root; hash the ones that are retained."""
+    covered = {path for unit in units for path in unit.files}
+    retained = {path: item for path, item in discovery.seen.items() if path not in covered}
+    refusals: list[dict[str, str]] = []
+    excluded = [0, 0]
+    uncovered: list[tuple[Path, int]] = []
+    for path, size in _inventory(entry.path):
+        if path in covered or path in retained:
+            continue
+        if _match(path, entry.path, entry.retain):
+            try:
+                with discovery.stream(path):
+                    pass
+            except (OSError, ValueError) as error:
+                refusals.append({"unit": "retain", "reason": str(error)})
+                continue
+            retained[path] = discovery.seen[path]
+        elif _match(path, entry.path, entry.exclude):
+            excluded[0] += 1
+            excluded[1] += size
+        else:
+            uncovered.append((path, size))
+    report = {
+        "retained": {
+            "files": len(retained),
+            "bytes": sum(item.size_bytes for item in retained.values()),
+        },
+        "excluded": {"files": excluded[0], "bytes": excluded[1]},
+        "uncovered": {
+            "files": len(uncovered),
+            "bytes": sum(size for _, size in uncovered),
+            "paths": [
+                path.relative_to(entry.path).as_posix() for path, _ in uncovered[:_UNCOVERED_PATHS]
+            ],
+        },
+    }
+    return retained, report, refusals
+
+
 def _report(
-    manifest: Manifest, mode: str, commit: _Commit, *, stop_on_refusal: bool
+    manifest: Manifest,
+    mode: str,
+    commit: _Commit,
+    retain: _Retain,
+    *,
+    stop_on_refusal: bool,
 ) -> dict[str, object]:
     entries = []
-    totals = {"units": 0, "sources": 0, "rows": 0, "refused_units": 0}
+    totals = {"units": 0, "sources": 0, "rows": 0, "refused_units": 0, "uncovered_files": 0}
     for entry in manifest.entries:
         loader = _loader(entry)
         run = Run()
@@ -149,6 +237,7 @@ def _report(
         discovery = OriginalBytes()
         try:
             units = loader.units(entry, discovery, run)
+            retained, coverage, coverage_refusals = _coverage(entry, units, discovery)
         except (OSError, ValueError) as error:
             if stop_on_refusal:
                 error.add_note(f"legacy entry {entry.name}")
@@ -156,6 +245,10 @@ def _report(
             entries.append(_entry(entry, [], [{"unit": "", "reason": str(error)}], run, {}))
             totals["refused_units"] += 1
             continue
+        if coverage_refusals and stop_on_refusal:
+            raise ValueError(coverage_refusals[0]["reason"])
+        refusals.extend(coverage_refusals)
+        missing = retain(entry, retained)
         files: dict[str, int] = {}
         for unit in units:
             try:
@@ -170,12 +263,16 @@ def _report(
                 files.update(cast("list[tuple[str, int]]", item.pop("_files")))
             sources.extend(produced)
         loader.finish(entry, discovery, run)
-        files_report = {"files": len(files), "bytes": sum(files.values())}
+        files_report: dict[str, object] = {"files": len(files), "bytes": sum(files.values())}
+        files_report.update(coverage)
+        if missing:
+            files_report["retained_unmatched"] = missing
         entries.append(_entry(entry, sources, refusals, run, files_report, units=len(units)))
         totals["units"] += len(units)
         totals["sources"] += len(sources)
         totals["rows"] += sum(cast("int", item["rows"]) for item in sources)
         totals["refused_units"] += len(refusals)
+        totals["uncovered_files"] += cast("dict[str, int]", coverage["uncovered"])["files"]
     reconciled = all(
         all(
             check["matched"] for check in cast("dict[str, dict[str, object]]", e["expect"]).values()
@@ -198,7 +295,7 @@ def _entry(  # noqa: PLR0913 -- one report row
     sources: list[dict[str, object]],
     refusals: list[dict[str, str]],
     run: Run,
-    files: dict[str, int],
+    files: dict[str, object],
     *,
     units: int = 0,
 ) -> dict[str, object]:
@@ -233,7 +330,12 @@ def plan_import(manifest: Manifest) -> dict[str, object]:
     for entry in manifest.entries:
         _loader(entry)
 
-    return _report(manifest, "plan", _derive, stop_on_refusal=False)
+    return _report(manifest, "plan", _derive, _no_retain, stop_on_refusal=False)
+
+
+def _no_retain(entry: Entry, retained: dict[Path, SourceFile]) -> list[dict[str, str]]:
+    del entry, retained
+    return []
 
 
 def apply_import(workspace: Workspace, manifest: Manifest) -> dict[str, object]:
@@ -283,7 +385,15 @@ def apply_import(workspace: Workspace, manifest: Manifest) -> dict[str, object]:
         _with_files(produced, files)
         return produced
 
-    return _report(manifest, "apply", commit, stop_on_refusal=True)
+    def retain(entry: Entry, retained: dict[Path, SourceFile]) -> list[dict[str, str]]:
+        for path, item in retained.items():
+            _, digest, size = put_raw_file(workspace.paths.raw, path)
+            if SourceFile(digest, size) != item:
+                message = f"legacy index file changed after it was read: {path.name}"
+                raise ValueError(message + f" (entry {entry.name})")
+        return []
+
+    return _report(manifest, "apply", commit, retain, stop_on_refusal=True)
 
 
 def _status(workspace: Workspace, item: dict[str, object]) -> str:
@@ -318,14 +428,35 @@ def verify_import(workspace: Workspace, manifest: Manifest) -> dict[str, object]
             item["status"] = _status(workspace, item)
         return derived
 
-    report = _report(manifest, "verify", commit, stop_on_refusal=False)
-    unmatched = [
+    def retain(entry: Entry, retained: dict[Path, SourceFile]) -> list[dict[str, str]]:
+        from aegis_alpha.storage.raw import verify_raw  # noqa: PLC0415
+
+        missing = []
+        for path, item in retained.items():
+            try:
+                verify_raw(workspace.paths.raw, item.relative_path, item.sha256, item.size_bytes)
+            except (OSError, ValueError, DescriptorTreeError):
+                relative = path.relative_to(entry.path) if path.is_relative_to(entry.path) else path
+                missing.append({"file": str(relative), "status": "not_retained"})
+        return missing
+
+    report = _report(manifest, "verify", commit, retain, stop_on_refusal=False)
+    entries = cast("list[dict[str, object]]", report["entries"])
+    unmatched: list[dict[str, object]] = [
         {"entry": entry["name"], "unit": source["unit"], "status": source["status"]}
-        for entry in cast("list[dict[str, object]]", report["entries"])
+        for entry in entries
         for source in cast("list[dict[str, object]]", entry["sources"])
         if source["status"] != "committed"
     ]
-    report["unmatched"] = len(unmatched) + cast("dict[str, int]", report["totals"])["refused_units"]
+    unmatched.extend(
+        {"entry": entry["name"], **item}
+        for entry in entries
+        for item in cast("list[dict[str, str]]", entry.get("retained_unmatched", []))
+    )
+    totals = cast("dict[str, int]", report["totals"])
+    report["unmatched"] = len(unmatched) + totals["refused_units"]
     report["unmatched_sources"] = unmatched
-    report["complete"] = report["unmatched"] == 0 and bool(report["reconciled"])
+    report["complete"] = (
+        report["unmatched"] == 0 and bool(report["reconciled"]) and totals["uncovered_files"] == 0
+    )
     return report
