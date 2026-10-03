@@ -1209,6 +1209,38 @@ docker compose run --rm aas doctor
 상시 앱의 소켓·예약 실행은 [0013](decisions/0013-first-install-workspace.md)에서 승인됐지만
 미구현인 설계다. 현재 명령은 소켓으로 전달되지 않으며 잠금 충돌 시 `installation_busy`로 실패한다.
 
+## KR 공시·상장 수집
+
+```bash
+aas collect dart plan [--home HOME] [--today YYYY-MM-DD]
+aas collect dart plan --legacy-root LEGACY_OPENDART_DIR [--kind-receipt KIND_DIR/response.json] [--today YYYY-MM-DD]
+aas collect dart run --key-file OPENDART_KEY_FILE [--max-calls 2000] [--daily-quota 19000] [--home HOME]
+aas collect kind run [--home HOME]
+```
+
+`dart plan`은 설치본을 읽기 전용으로 열어 오늘(Seoul) 실행이 물을 것을 보고한다. corp code 목록 갱신
+여부, 빠진 공시 목록 page와 날 수, 재무 요청의 이유별·기간별 수, 회사 수와 KIND 축소 여부, commit되지
+않은 receipt 수다. 공급자를 호출하지 않는다. `--legacy-root`는 설치본 대신 legacy OpenDART 수집 디렉터리의
+`attempts.jsonl`과 receipt를 읽어 같은 계획을 만들고 그 원장 요약(`legacy`)을 함께 보고한다.
+
+`dart run`은 설치본을 쓰기로 열고 한 번의 제한된 수집을 한다. 키 파일은 소유자만 읽을 수 있는 한 줄
+파일이며 Git checkout 밖에 둔다. 중단된 attempt 정산, commit되지 않은 receipt의 commit, corp code 목록,
+공시 목록, 재무 요청 순서로 진행하고, 호출 수는 `--max-calls`와 24시간 quota의 남은 수 중 작은 값이다.
+응답은 결과와 상관없이 `raw/`와 `opendart-receipts-<hex>` 원천에 남고, 호출마다 state의
+`collection_jobs`·`collection_attempts`·`usage_events`에 기록된다. 응답은 공급자 호출 수, 이유별 요청 수,
+결과 분포, 멈춘 이유(`budget`, `provider_refused:<상태>`, `transport_failures`), 남은 계획, commit한 원천이다.
+예산을 다 쓰면 정상 종료이고, 키·한도 거부나 전송 실패로 멈추면 받은 답을 commit한 뒤 종료 코드 1이다.
+commit에는 `pyarrow`(legacy extra)가 필요하다.
+
+`kind run`은 KIND 유가증권·코스닥 상장법인목록을 받아 각각 `kind-listings-<hex>` 원천으로 commit한다. 두
+목록이 모두 commit되면 다음 `dart` 계획은 그 단축코드의 회사로 좁혀진다. 목록 하나라도 commit되지 않으면
+종료 코드 1이다.
+
+승인된 수집기(OpenDART corp code·공시 목록·재무, KIND 목록)지만 패키지 설치나 이 명령은 예약 실행을
+만들지 않는다. `[owner]` 예약 실행은 운영 전환에서 키 파일과 호출 상한을 정해 켜고, 같은 키를 쓰는 legacy
+DART backfill unit은 그 전에 멈춘다(두 수집기는 quota를 서로 세지 않는다). 요청·cohort·원장·보존 규칙은
+[KR 공시·상장 수집](design/data-vertical.md#kr-공시상장-수집)이 소유한다.
+
 ## Qveris 원문 수집
 
 `aas collect daily --config /path/to/collection.json --state-root /path/to/private-journal`은
