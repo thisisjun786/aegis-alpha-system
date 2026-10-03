@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from aegis_alpha.storage.promotion.spec import MAX_SPEC_BYTES, parse_spec
+from tests.storage.dart_receipt_support import spec as dart_spec
 from tests.storage.promotion_support import DAY_RULE, DECIMALS, ZONE
 
 _PIN = {
@@ -109,3 +110,21 @@ def test_spec_rejects_unknown_fields_and_moving_refs() -> None:
     oversized = raw + b" " * (MAX_SPEC_BYTES + 1 - len(raw))
     with pytest.raises(ValueError, match="64 MiB"):
         parse_spec(oversized, hashlib.sha256(oversized).hexdigest())
+
+
+def test_an_optional_instrument_needs_no_identity_snapshot() -> None:
+    raw, sha = dart_spec([dict(_PIN, table="receipts")])
+    spec = parse_spec(raw, sha)
+    assert (spec.domain, spec.identity_snapshot, spec.mapper.identity({})) == (
+        "fundamentals",
+        None,
+        None,
+    )
+    pinned = json.loads(raw)
+    pinned["identity_snapshot"] = dict(_IDENTITY)
+    with pytest.raises(ValueError, match="resolves no subject pins none"):
+        _parse(pinned)
+    # A domain whose instrument is required keeps needing a mapper that resolves it.
+    unresolved = _change(lambda d: d.update(identity_snapshot=None))
+    with pytest.raises(ValueError, match="an instrument domain pins"):
+        _parse(unresolved)

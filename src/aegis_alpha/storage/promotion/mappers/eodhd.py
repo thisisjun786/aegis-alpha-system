@@ -137,6 +137,7 @@ class _Bars:
     source_prefixes: Final = ()
     domain: Final = "prices"
     partition_sql: Final = '"date"'
+    expands: Final = False
     date_column: Final = "session_date"
     time_inputs: Final[Mapping[str, InputKind]] = {"session_date": "date"}
     row_flags: Final[Mapping[str, str]] = {}
@@ -166,6 +167,9 @@ class _Bars:
     def identity(self, args: Mapping[str, object]) -> IdentityKey:
         del args
         return IdentityKey("eodhd", "eodhd_symbol")
+
+    def outcome(self, args: Mapping[str, object]) -> None:
+        del args
 
     def select(self, source: str, args: Mapping[str, object]) -> str:
         values = ("adjusted_close",) if self._adjusted else _VALUES
@@ -252,6 +256,7 @@ class _BulkQuarantine:
     time_inputs: Final[Mapping[str, InputKind]] = {"session_date": "date"}
     row_flags: Final[Mapping[str, str]] = {PARTIAL_FLAG: "_aas_f_" + PARTIAL_FLAG}
     manifest_items: Final = None
+    expands: Final = False
     name: str
     _adjusted: bool
 
@@ -271,6 +276,9 @@ class _BulkQuarantine:
     def identity(self, args: Mapping[str, object]) -> IdentityKey:
         del args
         return IdentityKey("eodhd", "eodhd_symbol")
+
+    def outcome(self, args: Mapping[str, object]) -> None:
+        del args
 
     def select(self, source: str, args: Mapping[str, object]) -> str:
         values = ("adjusted_close",) if self._adjusted else _VALUES
@@ -362,6 +370,7 @@ class EodhdBarsQuarantine:
     time_inputs: Final[Mapping[str, InputKind]] = {"session_date": "date"}
     row_flags: Final[Mapping[str, str]] = {}
     manifest_items: Final = "jobs"
+    expands: Final = False
 
     def check_args(self, args: Mapping[str, object]) -> None:
         if set(args) != {"timezone", "currencies"}:
@@ -383,6 +392,9 @@ class EodhdBarsQuarantine:
     def identity(self, args: Mapping[str, object]) -> IdentityKey:
         del args
         return IdentityKey("eodhd", "eodhd_symbol")
+
+    def outcome(self, args: Mapping[str, object]) -> None:
+        del args
 
     def select(self, source: str, args: Mapping[str, object]) -> str:
         currencies = args["currencies"]

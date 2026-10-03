@@ -98,6 +98,7 @@ class SecSubmissions:
 
     row_flags: Final[Mapping[str, str]] = {}
     manifest_items: Final = None
+    expands: Final = False
 
     # The filings table of an SEC submissions archive (``sec.submissions_filings@1``).
     source_prefixes: Final = ("sec-submissions-filings-",)
@@ -121,6 +122,9 @@ class SecSubmissions:
         return {}
 
     def identity(self, args: Mapping[str, object]) -> None:
+        del args
+
+    def outcome(self, args: Mapping[str, object]) -> None:
         del args
 
     def select(self, source: str, args: Mapping[str, object]) -> str:
@@ -168,6 +172,7 @@ class SecCompanyfacts:
     source_prefixes: Final = ()
     row_flags: Final[Mapping[str, str]] = {}
     manifest_items: Final = None
+    expands: Final = False
     time_inputs: Final[Mapping[str, InputKind]] = {"accepted_at": "utc_us", "filed": "date"}
 
     def check_args(self, args: Mapping[str, object]) -> None:
@@ -197,6 +202,9 @@ class SecCompanyfacts:
         return {"value": "VARCHAR"}
 
     def identity(self, args: Mapping[str, object]) -> None:
+        del args
+
+    def outcome(self, args: Mapping[str, object]) -> None:
         del args
 
     def select(self, source: str, args: Mapping[str, object]) -> str:

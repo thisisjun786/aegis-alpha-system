@@ -111,6 +111,7 @@ class _Norgate:
     time_inputs: Final[Mapping[str, InputKind]] = {"session_date": "date"}
     row_flags: Final[Mapping[str, str]] = {}
     manifest_items: Final = None
+    expands: Final = False
     source_prefixes: tuple[str, ...] = ()
     name: str
     major: int
@@ -122,6 +123,9 @@ class _Norgate:
     def identity(self, args: Mapping[str, object]) -> IdentityKey:
         del args
         return _IDENTITY
+
+    def outcome(self, args: Mapping[str, object]) -> None:
+        del args
 
 
 class NorgatePricesNone(_Norgate):

@@ -47,6 +47,7 @@ class NorgateFxCloses:
     partition_sql: Final = '"date"'
     row_flags: Final[Mapping[str, str]] = {}
     manifest_items: Final = None
+    expands: Final = False
     date_column: Final = "fixing_at_us"
     time_inputs: Final[Mapping[str, InputKind]] = {"fixing_date": "date"}
 
@@ -66,6 +67,9 @@ class NorgateFxCloses:
         return {"rate": "VARCHAR"}
 
     def identity(self, args: Mapping[str, object]) -> None:
+        del args
+
+    def outcome(self, args: Mapping[str, object]) -> None:
         del args
 
     def select(self, source: str, args: Mapping[str, object]) -> str:

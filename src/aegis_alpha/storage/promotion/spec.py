@@ -296,7 +296,7 @@ def _identity(
     """The snapshot pin of a mapper with an identity key; a mapper without one pins none.
 
     ``required``: every row of the domain names an instrument, so its mapper resolves one.
-    A domain whose instrument is optional (fundamentals) may go without a key.
+    An optional instrument (fundamentals, filings) may go without.
     ``resolvable``: the domain has a column an identity key can resolve into.
     """
     resolves = found.identity(args) is not None

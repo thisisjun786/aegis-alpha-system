@@ -53,12 +53,14 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   an equivalence digest and an other-device backup, and never removes `raw/` bytes.
 - `promotion/` implements that path. `spec` parses the document, `mappers` is the registry
   (one module per provider shape, `daily` holding the SQL the daily price mappers share; a
-  mapper is SQL over the staged source and declares its columns, identity key, partition date
-  SQL, time inputs and any pinned generations of other datasets it joins, which the engine
-  verifies and loads as head tables), `time_rules` and `decimal_rules` hold the versioned rules
-  with a Python reference beside each SQL form, `formats` the frozen hash formats, and `engine`
-  plans, applies, recovers and verifies. All per-row work stays in DuckDB temp tables on the
-  workspace connection; only rows SQL cannot hash exactly (escaped text, odd
+  mapper is SQL over the staged source and declares its columns, identity key, partition
+  date, time inputs, any pinned generations of other datasets it joins (which the engine
+  verifies and loads as head tables), whether one source row expands into rows numbered by
+  `_aas_item`, and the per-row outcome a response source records as coverage instead of
+  rows), `time_rules` and `decimal_rules` hold the versioned rules with a Python reference
+  beside each SQL form, `formats` the frozen hash formats, and `engine` plans, applies,
+  recovers and verifies. All per-row work stays in DuckDB temp tables on the workspace
+  connection; only rows SQL cannot hash exactly (escaped text, odd
   natural keys) are computed in Python in bounded key-ordered batches. A plan writes nothing; an
   apply retains spec, request and manifest in `raw/`, records a `promotion` intent whose payload
   is the manifest, commits marker, rows and `quality_flags` in one DuckDB transaction through

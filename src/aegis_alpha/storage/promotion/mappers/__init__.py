@@ -11,6 +11,9 @@ prefixes it reads, so a spec cannot promote one provider's rows into another's d
 ``select`` returns one SELECT over the source relation with these columns:
 
 - ``_aas_pin``, ``_aas_ordinal``, ``_aas_row_hash`` passed through unchanged;
+- ``_aas_item`` (BIGINT) when the mapper ``expands``: one source row (a provider response
+  document) holds several domain rows, numbered distinctly within that source row, and a
+  source row may yield none;
 - ``_aas_ingested_at_us`` (BIGINT, NULL when the source row has no collection time);
 - ``_aas_id_token`` (VARCHAR) and ``_aas_id_at_us`` (BIGINT) when the mapper has an
   identity key: the key's token and the instant at which it is resolved;
@@ -32,7 +35,12 @@ when it differs from the marker and completed operation, so what the mapper read
 the manifest is pinned like the rows.
 
 A domain whose ``instrument_id`` is optional (fundamentals) may be mapped without an
-identity key; the mapper then emits ``instrument_id`` itself (NULL for an issuer row).
+identity key; such a mapper emits a NULL ``instrument_id``. Filings name no instrument.
+A mapper whose source rows are responses rather than facts declares an ``outcome`` over
+a staged source row (completed, no data, failed, ...), which the promotion records as
+coverage in place of rows that a response without data cannot give. A partition stages
+such a mapper's source rows whose partition date is NULL in every partition, so each is
+counted, and refuses them for every other mapper.
 
 A mapper may join generations of other datasets that its spec arguments pin
 (``references``): SEC company facts read each filing's acceptance time from a pinned
@@ -118,8 +126,14 @@ class Mapper(Protocol):
         """SQL over the source columns giving the DATE a spec partition tests.
 
         A row with no partition date never falls in a partition, and a partitioned plan
-        refuses such rows rather than dropping them.
+        refuses such rows rather than dropping them, except for a mapper that declares an
+        ``outcome``: its undated rows are staged in every partition and counted there.
         """
+        ...
+
+    @property
+    def expands(self) -> bool:
+        """Whether one source row maps to any number of rows numbered by ``_aas_item``."""
         ...
 
     @property
@@ -161,6 +175,10 @@ class Mapper(Protocol):
 
     def identity(self, args: Mapping[str, object]) -> IdentityKey | None: ...
 
+    def outcome(self, args: Mapping[str, object]) -> str | None:
+        """SQL over a staged source row naming its outcome for coverage, or None."""
+        ...
+
     def select(self, source: str, args: Mapping[str, object]) -> str: ...
 
 
@@ -179,6 +197,10 @@ def _registry() -> dict[str, Mapper]:
         KindIndustry,
         NorgateClassification,
         SecSic,
+    )
+    from aegis_alpha.storage.promotion.mappers.dart import (  # noqa: PLC0415 -- registry
+        DartFnltt,
+        DartFnlttFilings,
     )
     from aegis_alpha.storage.promotion.mappers.eodhd import (  # noqa: PLC0415 -- registry
         EodhdBars,
@@ -208,6 +230,8 @@ def _registry() -> dict[str, Mapper]:
 
     mappers: tuple[Mapper, ...] = (
         CalendarDeclared(),
+        DartFnltt(),
+        DartFnlttFilings(),
         EodhdBars(),
         EodhdBarsAdjusted(),
         EodhdBarsQuarantine(),
