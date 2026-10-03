@@ -78,9 +78,10 @@ class Mapper(Protocol):
 
 
 def _registry() -> dict[str, Mapper]:
+    from aegis_alpha.storage.promotion.mappers.calendar import CalendarDeclared  # noqa: PLC0415
     from aegis_alpha.storage.promotion.mappers.eodhd import EodhdBars  # noqa: PLC0415 -- registry
 
-    mappers: tuple[Mapper, ...] = (EodhdBars(),)
+    mappers: tuple[Mapper, ...] = (CalendarDeclared(), EodhdBars())
     return {f"{mapper.name}@{mapper.major}": mapper for mapper in mappers}
 
 

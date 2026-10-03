@@ -63,6 +63,14 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   `publish_generation_bulk(companion=...)`, then writes the catalog. `aas db verify` sends a
   promoted chain to `engine.verify_promotion` instead of the import-document verifier, and
   `db recover` finishes a `promotion` intent only when the retained spec recomputes its manifest.
+- `calendar_declaration` owns the `aas-calendar-declaration-v1` document (regimes, closed
+  regime weekdays, sessions with other hours; one spelling per schedule) and the packaged
+  XNYS/XKRX declarations under `calendar_declarations/`, which `scripts/calendar_declarations.py`
+  regenerates. `calendar_refresh` commits a declaration's bytes as a content source (one row per
+  date, local wall times only) and promotes it with `calendar.declared@1` as the child of
+  `sessions.<mic>`'s head: both times are `source_column@1` on `public_by`, the earlier of the
+  declaration instant and the session's own end. A declaration older than the head's, or another
+  one at the same instant, is refused, so an old declaration never undoes a newer correction.
 - `bulk_generation` publishes a staged DuckDB table as one generation: plan without
   writing, then one transaction with the marker and `INSERT … SELECT`. DuckDB encodes and
   sorts `aas-rowset-v1` rows and `rowset.RowsetStream` digests them in admitted batches and
