@@ -63,6 +63,7 @@ RECORDS_SCHEMA: Final = "aas-source-retirement-records-v1"
 OPERATION_PREFIX: Final = "source-retire:"
 MAX_SPEC_BYTES: Final = 8 * 1024 * 1024
 _MAX_DOCUMENT: Final = 64 * 1024 * 1024
+_SEARCH_CHUNK: Final = 8 * 1024 * 1024
 _SIDE_KEYS: Final = frozenset({"sources", "table", "columns"})
 _GROUP_KEYS: Final = frozenset({"reason", "retire", "equivalent"})
 _DEFAULT_BUDGET: Final = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
@@ -71,6 +72,7 @@ _ROW_OBJECT_BYTES: Final = 256
 _TEXT_FRAMING: Final = 5
 _FIXED_WIDTH: Final = {"int": 9, "utc_us": 9, "float": 9, "date": 15, "decimal": 48, "bool": 2}
 _U32_MAX: Final = (1 << 32) - 1
+_ENCODED: Final = "temp.main.aas_retirement_rows"
 _SMALL_INTEGERS: Final = frozenset(
     {"TINYINT", "SMALLINT", "INTEGER", "BIGINT", "UTINYINT", "USMALLINT", "UINTEGER"}
 )
@@ -281,9 +283,7 @@ def _table(manifest: dict[str, object], name: str) -> dict[str, object] | None:
 # --- references ---------------------------------------------------------------------------
 
 
-def source_references(
-    workspace: Workspace, source_ids: set[str], *, budget: ComputeBudget | None = None
-) -> dict[str, list[str]]:
+def source_references(workspace: Workspace, source_ids: set[str]) -> dict[str, list[str]]:
     """Where each source is still referenced, outside its own ``sl:`` link.
 
     State rows that name a snapshot or source (identity assertions, universe members,
@@ -292,7 +292,6 @@ def source_references(
     retained document a committed generation is evidenced by (promotion spec, research
     transform, import document) whose JSON names the source.
     """
-    budget = budget or _DEFAULT_BUDGET
     found: dict[str, list[str]] = {source: [] for source in source_ids}
     if not source_ids:
         return found
@@ -335,17 +334,24 @@ def source_references(
             [wanted],
         ).fetchall():
             found[names[value]].append(f"market.{table}.{column}")
-    _document_references(workspace, names, found, budget)
+    _document_references(workspace, names, found)
     return {source: sorted(set(places)) for source, places in found.items()}
 
 
 def _document_references(
-    workspace: Workspace,
-    names: dict[str, str],
-    found: dict[str, list[str]],
-    budget: ComputeBudget,
+    workspace: Workspace, names: dict[str, str], found: dict[str, list[str]]
 ) -> None:
-    """Search the retained documents of committed generations for a source ID or link."""
+    """Search the retained documents of committed generations for a source ID or link.
+
+    The search is over bytes, for the JSON string of each name (quoted, in both its
+    ASCII-escaped and its UTF-8 spelling), in bounded chunks that overlap by the longest
+    pattern. A document of any size or format is searched, and any occurrence counts.
+    """
+    patterns: dict[bytes, str] = {}
+    for name, source in names.items():
+        patterns[json.dumps(name).encode()] = source
+        patterns[json.dumps(name, ensure_ascii=False).encode()] = source
+    overlap = max(len(pattern) for pattern in patterns) - 1
     rows = workspace.state.execute(
         "SELECT generation_id,transform_hash,manifest_hash FROM dataset_versions "
         "WHERE status='committed' ORDER BY generation_id"
@@ -356,33 +362,17 @@ def _document_references(
                 relative = digest[:2] + "/" + digest
                 if not tree.exists(relative):
                     continue
-                size = tree.stat(relative).st_size
-                if size > _MAX_DOCUMENT:
-                    continue
-                if 32 * size > budget.available_bytes:
-                    raise ComputeResourceError("retained document exceeds materialization budget")
-                payload = tree.read_bytes(relative, max_bytes=_MAX_DOCUMENT)
-                try:
-                    document = json.loads(payload)
-                except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
-                    continue
-                for value in _strings(document):
-                    if value in names:
-                        found[names[value]].append(f"generation {generation} document {digest}")
-
-
-def _strings(value: object) -> list[str]:
-    pending = [value]
-    strings: list[str] = []
-    while pending:
-        item = pending.pop()
-        if isinstance(item, str):
-            strings.append(item)
-        elif isinstance(item, dict):
-            pending.extend(item.values())
-        elif isinstance(item, list):
-            pending.extend(item)
-    return strings
+                hits: set[str] = set()
+                with tree.binary_reader(relative) as reader:
+                    tail = b""
+                    while chunk := reader.read(_SEARCH_CHUNK):
+                        window = tail + chunk
+                        hits.update(
+                            source for pattern, source in patterns.items() if pattern in window
+                        )
+                        tail = window[-overlap:] if overlap else b""
+                for source in hits:
+                    found[source].append(f"generation {generation} document {digest}")
 
 
 # --- equivalence --------------------------------------------------------------------------
@@ -511,7 +501,25 @@ def _side_digest(  # noqa: PLR0913 -- one side's exact hashing inputs
             raise ComputeResourceError(
                 f"one compared row ({row_bytes} encoded bytes) exceeds the materialization budget"
             )
-        digest = stream_rowset(market, rowset, cells, relation, [], count=count, batch_rows=batch)
+        # Encode into a temporary table first. DuckDB then sorts its own spillable copy;
+        # sorting straight off many persistent source tables exhausts the memory limit
+        # instead of spilling.
+        market.execute(
+            f"CREATE OR REPLACE TEMP TABLE {_ENCODED} AS "
+            f"SELECT {' || '.join(cells)} AS encoded FROM ({relation})"
+        )
+        try:
+            digest = stream_rowset(
+                market,
+                rowset,
+                ["encoded"],
+                f"SELECT encoded FROM {_ENCODED}",
+                [],
+                count=count,
+                batch_rows=batch,
+            )
+        finally:
+            market.execute(f"DROP TABLE IF EXISTS {_ENCODED}")
     except (
         duckdb.ConversionException,
         duckdb.OutOfRangeException,
@@ -707,7 +715,7 @@ def plan_retirement(  # noqa: C901, PLR0912, PLR0915 -- one ordered proof per gr
             if names - tables:
                 sources[source].reasons.append("table_not_covered")
     references = source_references(
-        workspace, {source for source in sources if source not in retired}, budget=budget
+        workspace, {source for source in sources if source not in retired}
     )
     for source, places in references.items():
         sources[source].references = places
@@ -864,7 +872,7 @@ def retire_sources(
         ).fetchall()
     ]
     for operation_id in finished:
-        finish_retirement(workspace, operation_id, budget=budget)
+        finish_retirement(workspace, operation_id)
     plan = plan_retirement(workspace, spec, backup_root=backup_root, budget=budget)
     try:
         records = _records(plan)
@@ -891,7 +899,7 @@ def retire_sources(
                 expected_parent=None,
                 payload_hash=payload_hash,
             )
-            finish_retirement(workspace, operation_id, budget=budget)
+            finish_retirement(workspace, operation_id)
         return {
             "plan": False,
             **plan.report(),
@@ -960,7 +968,7 @@ def retirement_started(workspace: Workspace, operation: dict[str, object]) -> bo
 
 
 def finish_retirement(  # noqa: C901, PLR0912 -- drop, record and complete one intent
-    workspace: Workspace, operation_id: str, *, budget: ComputeBudget | None = None
+    workspace: Workspace, operation_id: str
 ) -> bool:
     """Drop what the prepared intent still names, record it, then complete the intent.
 
@@ -994,9 +1002,7 @@ def finish_retirement(  # noqa: C901, PLR0912 -- drop, record and complete one i
             pending.add(source)
             drops.extend(present)
     referenced = {
-        source: places
-        for source, places in source_references(workspace, pending, budget=budget).items()
-        if places
+        source: places for source, places in source_references(workspace, pending).items() if places
     }
     if referenced:
         raise RetirementError(
