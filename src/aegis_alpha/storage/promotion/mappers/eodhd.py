@@ -134,6 +134,7 @@ class _Bars:
 
     major: Final = 1
     provider: Final = "eodhd"
+    source_prefixes: Final = ()
     domain: Final = "prices"
     partition_sql: Final = '"date"'
     date_column: Final = "session_date"
@@ -242,6 +243,7 @@ class _BulkQuarantine:
 
     major: Final = 1
     provider: Final = "eodhd"
+    source_prefixes: Final = ()
     domain: Final = "prices"
     partition_sql: Final = _bulk_day(
         "CASE WHEN json_valid(source_row_json) THEN source_row_json END"
@@ -350,6 +352,7 @@ class EodhdBarsQuarantine:
 
     major: Final = 1
     provider: Final = "eodhd"
+    source_prefixes: Final = ()
     domain: Final = "prices"
     name: Final = "eodhd.bars_quarantine"
     partition_sql: Final = _held_day(

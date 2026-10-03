@@ -168,7 +168,7 @@ revision을 가리키며 그 revision이 고정된 부모 generation chain에 �
 | `corporate_actions` | instrument, action_id/type, ex/record/pay/effective dates, amount/ratio/currency | 배당·분할·합병·상폐 대금 구분. 미래 action을 과거 조정에 쓰지 않음 |
 | `instrument_status` | instrument, status_event_id, effective_from/to, status, reason | 종목별 거래정지·재개·상장·상폐 이력. 거래소 calendar와 함께 체결 가능성을 판정 |
 | `fundamentals` | 자연키: issuer/instrument, concept, period_start/end, fiscal_period, unit, dimensions_hash; revision 속성: form/accession/accepted_at, value/state | accession 변경은 새 자연키가 아님. 재공시는 같은 항목의 SUPERSEDE로 연결 |
-| `macro_observations` | 자연키: series, observation_period, unit; revision 속성: source_vintage_start/end, value/state | 원본 vintage 구간은 수집 당시 응답값 그대로 보존. 지식 종료는 revision chain에서 도출 |
+| `macro_observations` | 자연키: series, observation_period, unit; revision 속성: source_vintage_start/end, value/state | vintage 시작은 열에, 원본 vintage 구간 전체는 원천 행에 보존. 지식 종료는 revision chain에서 도출 |
 | `estimates` | instrument, metric, target_period, as_of, statistic, value/state, analyst_count nullable | 전망 대상 기간과 발표 시점을 분리. 출처·자격 미확인 추정치는 실행 입력 차단 |
 | `filings` (v2) | issuer, filing_id(accession·접수번호), form, filed_date, accepted_at nullable, period_end nullable | 재무 시점의 근거. accession 조인으로 `fundamentals`의 공개 시각을 정함 |
 | `classifications` (v2) | subject/subject_kind, scheme, code, label, effective_from/to | 분류 snapshot은 snapshot 시각부터 알려짐. 과거로 소급하지 않음 |

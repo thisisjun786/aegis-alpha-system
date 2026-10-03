@@ -207,7 +207,8 @@ ID는 `promotion:<request_hash>`, dataset version은 그 generation의 chain seq
 flag → 대량 게시 계획이다. 원천 확인은 pin한 테이블마다 완료된 commit과 테이블 digest를 다시
 계산해 대조한다. `--plan`은 같은 계산을 하고 아무것도 쓰지 않는다. 읽기 전용으로 연 설치본에서
 돌며, 계산에 쓰는 것은 그 연결의 임시 테이블뿐이다. 보고는 원천 행 수, 행 상태(`ok`, `held`,
-`unresolved`, `ambiguous`, `refused_*`), 미해결 token 표본, 해석 전 매핑 행 전체의 숫자 flag 분포,
+`unresolved`, `ambiguous`, `refused_*`), 매퍼가 고르지 않은 원천 행 수(`unselected_rows`, 여러 시계열을
+담은 원천에서 한 시계열만 읽는 매퍼), 미해결 token 표본, 해석 전 매핑 행 전체의 숫자 flag 분포,
 시간 규칙별 null·상한 적용 수, 반복된 자연키, op 분포, 변하지 않은 행과 stale 행 수,
 head와 시점이 다르게 계산되는 변하지 않은 행 수(`time_drift`), delta의 flag 분포, 부분 응답 행이 있으면
 그 행 수 대조(`partition_row_count`), 계획한 marker를 담는다.
@@ -260,6 +261,13 @@ identity 해석과 무관하게 `refused_required`이므로, 모양이 잘못된
 계획 거부로 보고한다. 엔진은 목록을 넘기기 전에 원천의 request hash를 manifest의 표와 `metadata`에서
 다시 계산해 marker·완료 operation의 값과 맞춰 보고, 다르면 그 원천을 계획 거부로 보고한다. 그래서
 매퍼가 manifest에서 읽는 값도 행과 같이 pin된다.
+명세의 `partition`은 매퍼의 파티션 날짜 식으로 원천 행을 고른다. 날짜를 텍스트로 싣는 원천(FRED CSV,
+KR 공개 응답, Norgate 내보내기 편입본)은 `YYYY-MM-DD`(KR은 기간의 첫날) 텍스트만 날짜로 읽고 다른 표기는
+파티션 날짜가 없다. tombstone 범위의 날짜는 매퍼가 선언한 도메인 열이 DATE면 그 값이고, UTC
+microsecond 시각(FX의 `fixing_at_us`)이면 그 UTC 날짜다. reader가 같은 날짜로 거르므로 범위와 읽기가
+같은 날짜를 쓴다. 여러 공급자의 원천이 같은 형태를 공유하는 매퍼는 읽는 원천 ID 접두사를 선언하고, 명세
+단계에서 접두사가 다른 원천 pin을 거부한다. 그래서 한 공급자의 행이 다른 공급자의 dataset에 들어가지
+않는다. 접두사를 선언하지 않은 매퍼는 열이 맞는 원천을 모두 읽는다.
 
 `source_row_hash`는 원천 행 내용의 해시다.
 
@@ -316,7 +324,7 @@ ICU 시간대 자료로 푼 값이고, `timezone_version`은 그 자료를 가�
 예정된 매퍼 목록: `norgate.prices_none`, `norgate.prices_adjusted`,
 `norgate.dividends`, `norgate.reference_series`,
 `fmp.actions`, `sec.submissions`, `sec.companyfacts`,
-`dart.fnltt`, `dart.list`, `fred.alfred`, `fx.series`. identity 원천을 읽는 매퍼는 typed generation이
+`dart.fnltt`, `dart.list`. identity 원천을 읽는 매퍼는 typed generation이
 아니라 등록 문서를 만든다. `eodhd.kr_symbol`, `kind.listings`, `dart.corp_codes`는
 [KR 등록](#kr-등록)이, `norgate.master`, `eodhd.us_symbol`, `fmp.profile`, `sec.tickers`는
 [US 등록](#us-등록)이 소유한다. universe 원천을 읽는 `norgate.index_membership`과 `norgate.listings`도
@@ -327,6 +335,68 @@ instrument는 pin한 identity snapshot에서 매퍼의 assertion key와 token이
 구간 안이며, 아직 정정되지 않은(`known_to_us`가 null인) member로 해석한다. 해석되는 instrument가
 없거나(`unresolved`) 둘 이상인(`ambiguous`) 행은 승격하지 않고 수와 원천 token을 미해결 보고에
 남긴다. 티커·경로·날짜로 instrument ID를 만들지 않는다.
+
+### 거시와 FX 매퍼
+
+거시·FX 매퍼는 숫자를 원천 텍스트 그대로 내고 명세는 `decimal_text@1`을 쓴다. 텍스트가 일반 십진수일
+때만 `present`이고, 텍스트가 없거나 비었거나 FRED의 `.`이면 `missing`, 그 밖의 텍스트는 값 없이
+`invalid`다. 다듬거나 고치지 않는다. 시장 시각은 0 이상이므로 시간 입력 날짜가 1970-01-01보다
+이르면 1970-01-01을 시간 입력으로 낸다. 더 늦은 날짜도 그 행이 공개된 시각의 상한이므로 규칙의
+주장은 그대로 참이고, 원래 날짜는 도메인 열과 원천 행에 남는다.
+
+`fred.alfred@1`은 ALFRED 관측 테이블(`series_id`, `observation_date`, vintage의 `realtime_start`,
+`value` 텍스트, 수집 시각 `retrieved_at_utc`)을 `macro_observations`로 옮긴다.
+
+- record는 시계열 하나의 관측 하나다. 관측 행은 단위를 싣지 않고 FRED는 단위를 시계열 metadata로
+  공표하므로 `unit`은 `as_published`(그 vintage에 FRED가 공표한 단위)다. 기준 연도나 배율이 바뀐 vintage도
+  같은 record의 새 revision이다.
+- `source_vintage_start`는 `realtime_start`이고 `source_vintage_end`는 null이다. vintage는 다음 vintage가
+  시작할 때 끝나며 chain은 그것을 다음 revision으로 기록한다. 나중에 수집한 원천의 닫힌 `realtime_end`는
+  그 vintage가 현재였던 동안에는 알 수 없던 사실이므로 그 revision에 옮기지 않는다. 원천 행과 해시에는 남는다.
+- generation 하나는 record마다 revision 하나이므로 파티션 하나는 관측마다 vintage를 많아야 하나 담는다.
+  파티션 열은 `realtime_start`다. 백필은 `mappers.fred.vintage_partitions`가 원천 테이블에서 계산한
+  구간(같은 관측의 연속한 두 vintage 사이마다 경계가 있는 가장 적은 순서 있는 `[from, to)` 목록)을 순서대로
+  하나씩 승격하므로 각 vintage는 직전 vintage의 SUPERSEDE가 된다. 유지보수는 vintage 날짜 하루를
+  generation 하나로 승격한다.
+- 시간 입력은 `vintage_start`(`realtime_start`) 하나다. 명세는 두 시점 열 모두 `local_day_end@1`(근거
+  `revision`, FRED 시간대)를 쓰므로 첫 vintage와 정정 모두 자기 vintage 날짜의 끝부터 알려진다.
+
+`bok.observations@1`과 `oecd.observations@1`은 legacy `korea.public_response@1`이 편입한 관측
+테이블(`series_id`, `period`, `value`, `units`, `unit_multiplier`, `base_period` 텍스트)을 옮긴다.
+`observation_period`는 `period`의 첫날이다(`YYYY-MM-DD`는 그날, `YYYY-MM`은 그 달, `YYYY-Qn`은 그 분기,
+`YYYY`는 그해). 다른 형식은 필수 열이 비어 승격이 거부된다. `unit`은 `units` 뒤에 원천이 밝힌
+`;base=<base_period>`, `;multiplier=<unit_multiplier>`, `;regime=<regime>`을 붙인 것이다. 기준 시점이나
+배율이 다른 값, 다른 정의로 정한 값(BOK의 2008년 이전 콜금리 목표 `call_target`과 기준금리 `base_rate`)은
+같은 수치의 정정이 아니라 다른 단위다. `units`가 없는 행은 거부된다. 응답에 vintage와 공개 시각이 없으므로
+시간 입력을 선언하지 않고, 명세는 두 시점 열에 `unknown_null@1`을 쓴다. 그래서 strict 읽기는 이 행을
+고르지 않는다. 수집 시각은 원천의 `sl:` 수집 시각이다.
+
+FX 매퍼는 인자 `series`(원천의 시계열 이름), `base`·`quote`(대문자 세 글자 통화 코드, 서로 다름),
+`timezone`(IANA)을 받아 한 통화쌍을 승격한다. 같은 원천의 다른 시계열 행은 고르지 않는다. `rate`는 base
+한 단위당 quote 수량이다. `fixing_at_us`는 관측 날짜의 `timezone` 기준 마지막 microsecond이고 시간 입력은
+그 날짜인 `fixing_date`다. reader가 FX를 거르는 날짜는 `fixing_at_us`의 UTC 날짜이므로 UTC보다 서쪽
+시간대의 날짜는 다음 UTC 날짜로 읽힌다.
+
+- `timezone`의 날짜 끝은 그 날짜의 고시나 종가가 그보다 앞설 때만 고시 시각의 상한이다. 고시 자체의
+  시간대(FRED의 New York 정오 매입률은 `America/New_York`)를 쓰고, 공급자가 종가 시각을 밝히지 않으면
+  어느 시간대에서든 그 날짜로 적힌 시각보다 늦은 `Etc/GMT+12`(가장 늦은 날짜 끝)를 쓴다. 호가 통화의
+  시장 시간대는 그것만으로 상한이 아니다. 역내 USDKRW는 다음 서울 날짜 02:00까지 거래된다.
+- 고시 날짜는 공개 시각을 말하지 않는다. 명세는 공급자가 그 날짜 끝까지 고시를 공개할 때만
+  `fixing_date`에 근거 `record`의 `local_day_end@1`을 쓴다. FRED는 한 주의 고시를 다음 H.10 발표(며칠 뒤)에
+  공개하므로 `fred.fx_series@1`은 두 시점 열에 `unknown_null@1`을 쓰고 strict 읽기는 그 행을 고르지 않는다.
+  발표 지연을 싣는 규칙이나 시간 입력이 생기면 그 규칙으로 바꾼다. 수집 시각 clamp는 백필에서 상한을
+  낮추지 못하므로 지연을 대신하지 않는다.
+
+- `norgate.fx_closes@1`은 Norgate 기준 시리즈 테이블(`symbol`, `date`, binary64 `close`, 내보내기 행
+  원문 `raw_row_json`)을 읽는다. `rate`는 binary64 값이 아니라 내보내기가 쓴 `Close` 텍스트다. 원문의
+  `Date`가 행의 `date`가 아니면 `invalid`다. 그 밖에는 텍스트가 양의 십진수이고 그 double이 `close`와 같을
+  때만 `present`이고, 둘 다 없으면 `missing`, 나머지는 `invalid`다. 원천에 수집 시각이 없으므로 수집 시각은
+  `sl:` 수집 시각이다.
+- `fred.fx_series@1`(`fred-series-csv-*` 원천)은 legacy `fred.series_csv@1`이 편입한 텍스트 행
+  (`series_id`, `observation_date`, `value`)을, `norgate.fx_history@1`(`norgate-history-csv-*` 원천)은
+  legacy `norgate.history_export@1`이 편입한 `bars`의 텍스트 행(`symbol`, `date`, `close`)을 읽는다. 0
+  이하의 값은 `invalid`이고, `YYYY-MM-DD`가 아니거나 없는 날짜는 필수 열인 `fixing_at_us`를 비워 승격을
+  거부한다.
 
 ## 결정적 공통 열
 
@@ -614,9 +684,9 @@ KRX 토요일 session은 확인되지 않은 반일 마감 대신 평일 마감�
 | `filings.us.sec`, `filings.kr.dart` | `filings`(v2) | SEC submissions(`source_column@1`), DART 공시 목록(`local_day_end@1`) |
 | `fundamentals.us.sec` | `fundamentals` | companyfacts. 시점은 accession으로 조인한 `filings.accepted_at_us`, 조인 실패 시 `local_day_end(filed)` 또는 null. 재공시는 SUPERSEDE |
 | `fundamentals.kr.dart` | `fundamentals` | 재무제표 응답. 연결·별도는 dimensions. 자료 없음 응답은 행 대신 coverage 기록 |
-| `macro.us.alfred` | `macro_observations` | ALFRED vintage. known은 `local_day_end@1(realtime_start)` |
-| `macro.kr.bok`, `macro.kr.oecd` | `macro_observations` | vintage가 없어 known은 null |
-| `fx.usdkrw.norgate`, `fx.usdkrw.fred` | `fx_rates` | 우선순위는 소비자 pin |
+| `macro.us.alfred` | `macro_observations` | ALFRED vintage(`fred.alfred@1`). vintage 구간마다 generation 하나, 정정은 SUPERSEDE. 두 시점은 `local_day_end@1(realtime_start)` |
+| `macro.kr.bok`, `macro.kr.oecd` | `macro_observations` | `bok.observations@1`, `oecd.observations@1`. vintage가 없어 두 시점은 `unknown_null@1` |
+| `fx.usdkrw.norgate`, `fx.usdkrw.fred` | `fx_rates` | `norgate.fx_closes@1`(source library 기준 시리즈, 동결, 2026-09-08까지) 또는 `norgate.fx_history@1`(legacy 내보내기 편입본), 시간대 `Etc/GMT+12`. `fred.fx_series@1`(DEXKOUS), 시간대 `America/New_York`, H.10 발표 지연 때문에 두 시점은 `unknown_null@1`. 우선순위는 소비자 pin |
 | `classifications.*` | `classifications`(v2) | Norgate 분류, SEC SIC, KIND 업종. known은 snapshot 시각이며 과거로 소급하지 않음 |
 
 identity 원천(Norgate master, SEC submissions, FMP profile, DART 고유번호, KIND 목록)은 typed generation이
@@ -1237,12 +1307,21 @@ state v2:
 | DV-161 | 매핑된 이유와 날짜가 없는 보류 행만 있으면 보류 단계 없이 `held_unmapped_rows`를 보고하고 이력 단계는 계획된다 | `tests/storage/test_kr_prices.py::test_held_rows_without_a_mapped_date_plan_no_held_step` | 구현 |
 | DV-162 | 행이 있지만 날짜가 없는 이력 lineage는 거부된다 | `tests/storage/test_kr_prices.py::test_undated_history_is_refused` | 구현 |
 | DV-163 | 거래소를 말하지 않는 부분 응답 테이블은 pin되지 않고 `bulk_unclassified_tables`에 남는다 | `tests/storage/test_kr_prices.py::test_bulk_tables_naming_no_exchange_are_listed` | 구현 |
-| DV-164 | 지수 구성 쌍의 연속한 `1` 행 묶음은 member 구간 하나이고, 구간을 쌍의 날짜에 펼치면 원래 일간 값이 나온다 | `tests/storage/test_universe.py::test_interval_compression_round_trips_daily_values` | 구현 |
-| DV-165 | 지수 구성의 SQL 압축은 참조 구현과 같은 구간을 내고, 두 원천이 실은 쌍은 이어 붙이지 않고 통째로 거부한다 | `tests/storage/test_universe.py::test_index_universe_sql_matches_the_reference_and_round_trips` | 구현 |
-| DV-166 | 값·날짜·순서·지수 이름이 정규가 아닌 쌍은 이유와 함께 통째로 거부하고, 등록되지 않은 asset ID는 미해결로 보고한다 | `tests/storage/test_universe.py::test_index_pairs_with_unreadable_values_are_refused` | 구현 |
-| DV-167 | 지수 universe는 chunked 문서로 등록되고 재등록은 같은 pin이며, 읽기와 `aas db verify`를 통과한다 | `tests/storage/test_universe.py::test_index_universes_register_and_read_back` | 구현 |
-| DV-168 | 상장 universe의 member는 master 행의 `first_date`부터 `last_date` 다음 날까지이고 `last_date` 없는 상장 행은 `through`까지다 | `tests/storage/test_universe.py::test_listing_universe_spans_each_master_listing` | 구현 |
-| DV-169 | universe part는 원천별로 채우고 읽기는 member를 정규 순서로 돌려준다 | `tests/storage/test_universe.py::test_universe_parts_are_filled_source_by_source` | 구현 |
-| DV-170 | `aas universe --plan`은 쓰지 않고, 만들 수 없는 `--report` 경로는 등록 전에 거부하며, 등록한 universe를 `aas universe show`가 읽는다 | `tests/storage/test_universe.py::test_universe_cli_plans_registers_and_shows` | 구현 |
-| DV-171 | 두 원천이 실은 쌍은 한 사본이 다른 이유로 거부돼도 나머지 사본을 받지 않고 `pair_repeated`로 거부한다 | `tests/storage/test_universe.py::test_a_pair_two_sources_carry_is_refused_when_one_copy_is_refused` | 구현 |
-| DV-172 | 원천 순서가 맞아도 두 part에 걸친 같은 member key는 읽기와 verify에서 거부한다 | `tests/storage/test_universe.py::test_a_member_key_repeated_across_parts_is_refused` | 구현 |
+| DV-164 | `fred.alfred@1`은 합성 원천을 독립 기대값과 같은 도메인 열로 옮기고 vintage 끝을 싣지 않으며 1970년 이전 vintage의 시간 입력은 1970-01-01이다 | `tests/storage/test_macro_fx.py::test_fred_alfred_maps_synthetic_fixture` | 구현 |
+| DV-165 | ALFRED vintage는 vintage 구간 순서로 승격하면 SUPERSEDE가 되고, grant 아래 strict 읽기는 cutoff 당시 vintage를, grant 없이는 아무 행도 돌려주지 않는다 | `tests/storage/test_macro_fx.py::test_alfred_vintages_are_superseding_revisions` | 구현 |
+| DV-166 | vintage 구간은 관측마다 vintage를 하나만 담고 모든 vintage를 덮는 가장 적은 목록이며, vintage 시작이 없는 행은 거부한다 | `tests/storage/test_macro_fx.py::test_vintage_partitions_hold_each_observation_once` | 구현 |
+| DV-167 | FX 매퍼는 합성 원천을 독립 기대값과 같은 도메인 열로 옮기고 원문과 다른 값·날짜를 `invalid`로 둔다 | `tests/storage/test_macro_fx.py::test_fx_mappers_map_synthetic_fixtures` | 구현 |
+| DV-168 | KR 공개 관측 매퍼는 기간 형식과 단위를 정해진 규칙으로만 옮기고 나머지는 필수 열을 비운다 | `tests/storage/test_macro_fx.py::test_korea_observations_map_synthetic_fixture` | 구현 |
+| DV-169 | FX 승격은 한 통화쌍만 고르고 나머지를 `unselected_rows`로 보고하며, 전체 snapshot에서 빠진 고시는 `fixing_at_us`의 UTC 날짜로 범위를 정해 tombstone한다 | `tests/storage/test_macro_fx.py::test_fx_series_promote_one_pair_each` | 구현 |
+| DV-170 | legacy FRED CSV와 KR 공개 응답은 편입 뒤 승격되고, 텍스트 날짜 원천의 파티션은 `YYYY-MM-DD` 날짜만 고르며 FRED FX와 시점이 없는 거시 행의 두 시점은 null이고 BOK 정책금리의 두 정의는 다른 단위다 | `tests/storage/test_macro_fx.py::test_legacy_fred_and_kr_public_sources_promote` | 구현 |
+| DV-171 | legacy Norgate 내보내기는 편입 뒤 `norgate.fx_history@1`로 한 통화쌍이 승격된다 | `tests/storage/test_macro_fx.py::test_norgate_history_export_promotes_one_pair` | 구현 |
+| DV-172 | 원천 ID 접두사를 선언한 매퍼는 다른 공급자의 원천 pin을 명세 단계에서 거부한다 | `tests/storage/test_macro_fx.py::test_legacy_fred_and_kr_public_sources_promote` | 구현 |
+| DV-173 | 지수 구성 쌍의 연속한 `1` 행 묶음은 member 구간 하나이고, 구간을 쌍의 날짜에 펼치면 원래 일간 값이 나온다 | `tests/storage/test_universe.py::test_interval_compression_round_trips_daily_values` | 구현 |
+| DV-174 | 지수 구성의 SQL 압축은 참조 구현과 같은 구간을 내고, 두 원천이 실은 쌍은 이어 붙이지 않고 통째로 거부한다 | `tests/storage/test_universe.py::test_index_universe_sql_matches_the_reference_and_round_trips` | 구현 |
+| DV-175 | 값·날짜·순서·지수 이름이 정규가 아닌 쌍은 이유와 함께 통째로 거부하고, 등록되지 않은 asset ID는 미해결로 보고한다 | `tests/storage/test_universe.py::test_index_pairs_with_unreadable_values_are_refused` | 구현 |
+| DV-176 | 지수 universe는 chunked 문서로 등록되고 재등록은 같은 pin이며, 읽기와 `aas db verify`를 통과한다 | `tests/storage/test_universe.py::test_index_universes_register_and_read_back` | 구현 |
+| DV-177 | 상장 universe의 member는 master 행의 `first_date`부터 `last_date` 다음 날까지이고 `last_date` 없는 상장 행은 `through`까지다 | `tests/storage/test_universe.py::test_listing_universe_spans_each_master_listing` | 구현 |
+| DV-178 | universe part는 원천별로 채우고 읽기는 member를 정규 순서로 돌려준다 | `tests/storage/test_universe.py::test_universe_parts_are_filled_source_by_source` | 구현 |
+| DV-179 | `aas universe --plan`은 쓰지 않고, 만들 수 없는 `--report` 경로는 등록 전에 거부하며, 등록한 universe를 `aas universe show`가 읽는다 | `tests/storage/test_universe.py::test_universe_cli_plans_registers_and_shows` | 구현 |
+| DV-180 | 두 원천이 실은 쌍은 한 사본이 다른 이유로 거부돼도 나머지 사본을 받지 않고 `pair_repeated`로 거부한다 | `tests/storage/test_universe.py::test_a_pair_two_sources_carry_is_refused_when_one_copy_is_refused` | 구현 |
+| DV-181 | 원천 순서가 맞아도 두 part에 걸친 같은 member key는 읽기와 verify에서 거부한다 | `tests/storage/test_universe.py::test_a_member_key_repeated_across_parts_is_refused` | 구현 |
