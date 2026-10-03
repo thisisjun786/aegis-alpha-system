@@ -445,6 +445,11 @@ def test_strict_preparation_records_head_read_receipt(
         assert receipt["basis"] == "split_adjusted"
         assert receipt["prices"]["query"]["cutoff_us"] == slot.cutoff_us
         assert receipt["actions"]["query"]["cutoff_us"] == slot.cutoff_us
+        # The open sessions known at the cutoff are the derivation's grid, so a dividend
+        # whose prior session has no bar is never reinvested at an older close.
+        assert receipt["prices"]["query"]["grid"] == [
+            day.isoformat() for day in DAYS if day <= slot.decision_date
+        ]
         assert receipt["prices_hash"] == content_sha256(receipt["prices"])
         assert receipt["actions_hash"] == content_sha256(receipt["actions"])
     # The split is first known at its ex-date open, after the first decision's cutoff.

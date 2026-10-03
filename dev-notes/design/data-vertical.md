@@ -1642,6 +1642,8 @@ pin(`observations`) 대신 canonical 가격 binding(`prices`: `aas-head-binding-
   수집 cutoff는 요청의 `ingestion_cutoff_us`다. 신호 날짜 구간은 이력 시작부터 이력 끝과 판단일 중 이른 날까지다.
 - `heads`로 묶은 canonical 신호 선택의 basis가 조정 basis이면 신호 가격은 공급자 조정 가격이 아니라 그
   binding의 비조정 bar와 `actions` binding의 기업행동으로 판단 cutoff에서 유도한다(`aas-adjustment-v1`).
+  유도 읽기의 격자는 판단 cutoff에 알려진 달력의 개장 세션이므로, 배당 직전 개장 세션에 bar가 없으면 더 오래된
+  종가로 재투자하지 않고 그 앞의 bar를 `invalid`로 둔다.
   그래서 cutoff까지 알려지지 않은 기업행동은 앞선 bar에 닿지 않고, grant가 막았거나 시점 근거가 없는
   기업행동 앞의 bar는 값 없이 `invalid`가 되어 신호에서 빠진다. 그런 유도 선택마다 `actions` binding이
   하나씩 있고, 유도 선택은 binding 순서대로 `actions` ordinal을 받는다(첫 유도 선택이 0). 그래서 시장마다

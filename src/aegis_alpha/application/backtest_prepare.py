@@ -562,6 +562,8 @@ def _calendar(
     )
     loader.head_read(("sessions", 0), "calendar", None, read.receipt, read.receipt_hash)
     history = tuple(item.values for item in read.revisions)
+    # Every revision stays live for each decision's projection.
+    loader.hold(history)
     for row in history:
         if any(row[key] != convention[key] for key in ("calendar_id", "venue", "timezone_version")):
             raise ValueError("session calendar/venue/timezone conflicts with request")
@@ -607,6 +609,10 @@ class _Loader:
     def retain(self, name: str, value: object) -> None:
         self._charge(value)
         self.evidence.append({"name": name, "value": value})
+
+    def hold(self, value: object) -> None:
+        """Charge a history the preparation keeps live but does not seal as evidence."""
+        self._charge(value)
 
     def _charge(self, value: object) -> None:
         self.charge += len(canonical_json_bytes(value)) * 32
@@ -1000,12 +1006,19 @@ def _head_signal(
     end = min(visibility.history_end, slot.decision_date)
     if end < visibility.history_start:
         return ()
-    query = visibility.query(cutoff, heads.instruments, visibility.history_start, end)
     opened = {
         session.session_date
         for session in _sessions(calendar, visibility, cutoff)
         if session.status == "open"
     }
+    query = visibility.query(cutoff, heads.instruments, visibility.history_start, end)
+    if heads.actions is not None:
+        # The derivation needs the open sessions: a dividend whose prior session has no bar
+        # cannot be reinvested at an older close.
+        grid = tuple(sorted(day for day in opened if visibility.history_start <= day <= end))
+        if not grid:
+            return ()
+        query = replace(query, grid=grid)
     seen: set[tuple[object, date]] = set()
     selected = []
     for row in _head_bars(loader, item, ("decision", query), slot.decision_date):
