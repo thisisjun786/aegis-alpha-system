@@ -180,6 +180,13 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   are known from the source's `sl:` link; an issuer link from the latest of its evidence.
   Builds are cumulative like `kr_identity`'s, and source rows are read through Arrow so
   time-zone-aware timestamps need no time zone database.
+- `universe` builds universe documents from committed, linked sources and registers them
+  as chunked manifests: `norgate.index_membership@1` compresses each (asset ID, index)
+  pair's daily `0`/`1` values into member intervals that expand back to the same values,
+  and `norgate.listings@1` spans each master listing. A pair or listing that cannot be
+  read exactly is refused whole, members are only instruments the identity registry
+  holds, and members are known from their source's `sl:` link. Universe parts fill
+  source by source.
 - Every contract in that document has a row in its contract/test table. A change
   that implements a `예정` row adds the named test and flips the row to `구현` in
   the same change; `tests/tools/test_data_vertical_contract.py` enforces both directions.

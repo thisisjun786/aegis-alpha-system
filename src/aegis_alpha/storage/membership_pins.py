@@ -611,8 +611,9 @@ def _part_bounds(
     bounds = []
     for direction in ("ASC", "DESC"):
         row = connection.execute(
-            "SELECT instrument_id,valid_from_us,known_from_us FROM universe_members "  # noqa: S608 -- fixed sort direction
-            f"WHERE universe_id=? AND version=? ORDER BY instrument_id {direction}, "
+            "SELECT source_snapshot_id,instrument_id,valid_from_us,known_from_us "  # noqa: S608 -- fixed sort direction
+            f"FROM universe_members WHERE universe_id=? AND version=? "
+            f"ORDER BY source_snapshot_id {direction}, instrument_id {direction}, "
             f"valid_from_us {direction}, known_from_us {direction} LIMIT 1",
             (part.universe_id, part.version),
         ).fetchone()
@@ -620,6 +621,16 @@ def _part_bounds(
             return None
         bounds.append(tuple(row))
     return bounds[0], bounds[1]
+
+
+# Whether two parts of one universe manifest hold the same member key. Parameters: the
+# universe ID, then a JSON array of part versions. Parts are ordered by source first, so the
+# order check alone does not keep one member key out of two parts with different sources.
+PART_REPEAT_SQL = (
+    "SELECT EXISTS(SELECT 1 FROM universe_members WHERE universe_id=? "
+    "AND version IN (SELECT value FROM json_each(?)) "
+    "GROUP BY instrument_id,valid_from_us,known_from_us HAVING count(*)>1)"
+)
 
 
 # Whether two parts of one identity manifest hold the same (provider, namespace, key) over
@@ -646,7 +657,9 @@ def _manifest_rules(
     """Hold the parts to one canonical document: ordered, disjoint, and non-overlapping.
 
     Each part is a v1 document checked on its own; what no single part can see is the
-    member order across parts and an identity interval overlap between two parts.
+    member order across parts (canonical order for identity, source then canonical order
+    for a universe), a universe member key repeated in two parts, and an identity interval
+    overlap between two parts.
     """
     previous: tuple[object, ...] | None = None
     for part in parts:
@@ -666,6 +679,14 @@ def _manifest_rules(
         overlap = connection.execute(PART_OVERLAP_SQL, (ISSUER_LINK_NAMESPACE, names)).fetchone()[0]
         if overlap:
             raise ValueError("identity snapshot interval overlap")
+    if parts and isinstance(parts[0], UniversePin) and len(parts) > 1:
+        universe = cast("tuple[UniversePin, ...]", tuple(parts))
+        names = json.dumps([part.version for part in universe])
+        repeated = connection.execute(PART_REPEAT_SQL, (universe[0].universe_id, names)).fetchone()[
+            0
+        ]
+        if repeated:
+            raise ValueError("membership manifest parts repeat a universe member")
 
 
 @dataclass(frozen=True, slots=True)
@@ -704,7 +725,18 @@ def _evidence(connection: sqlite3.Connection, admitted: _Admitted) -> VerifiedMe
     if admitted.manifest is None:
         return documents[0]
     members = tuple(member for document in documents for member in document.members)
+    if isinstance(admitted.pin, UniversePin):
+        # Universe parts are filled source by source; the document order is canonical.
+        members = tuple(sorted(members, key=_universe_key))
     return VerifiedMembership(admitted.pin, admitted.manifest, members)
+
+
+def _universe_key(member: Mapping[str, object]) -> tuple[str, int, int]:
+    return (
+        cast("str", member["instrument_id"]),
+        cast("int", member["valid_from_us"]),
+        cast("int", member["known_from_us"]),
+    )
 
 
 def read_membership_pins(
@@ -979,10 +1011,13 @@ def _oversized(member: Record, lookups: _Lookups, *, identity: bool) -> str:
 def chunk_membership(body: Record, *, identity: bool) -> tuple[Record, ...]:
     """Split one validated whole document into canonical v1 parts, deterministically.
 
-    Members keep their canonical order and fill each part greedily up to both the
-    1 MiB byte limit and the 64 MiB materialization charge, so the same content always
-    yields the same parts. A part carries exactly the assertions, instruments and
-    sources its own members reference, and its members' ordinals restart at zero.
+    Identity members keep their canonical order; universe members are taken source by
+    source and in canonical order within a source, because a universe source can carry
+    hundreds of files and a part carries the whole inventory of every source it cites.
+    Members fill each part greedily up to both the 1 MiB byte limit and the 64 MiB
+    materialization charge, so the same content always yields the same parts. A part
+    carries exactly the assertions, instruments and sources its own members reference,
+    and its members' ordinals restart at zero.
     """
     key = "snapshot_id" if identity else "version"
     arrays = ("instruments", "members", "sources", "assertions")
@@ -1008,7 +1043,13 @@ def chunk_membership(body: Record, *, identity: bool) -> tuple[Record, ...]:
         },
     )
     filled = [_Part([], [], {}, {}, base[0], 0, base[1])]
-    for member in _records(body, "members"):
+    members = _records(body, "members")
+    if not identity:
+        members = sorted(
+            members,
+            key=lambda row: (cast("str", row["source_snapshot_id"]), *_universe_key(row)),
+        )
+    for member in members:
         row = {name: value for name, value in member.items() if name != "ordinal"}
         if _add(filled[-1], row, lookups, identity=identity):
             continue
