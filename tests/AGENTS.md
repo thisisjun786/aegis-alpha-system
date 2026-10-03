@@ -49,7 +49,8 @@ The root `conftest.py` owns network, home, data-root and disposable DB isolation
   `pytestmark = pytest.mark.xdist_group("<resource>")` under a `# Serial: <reason>` comment;
   every file of one group runs in one worker. Today the only group is
   `qveris-account-lease`: the Qveris store binds an abstract socket named by the account, and
-  the synthetic accounts are fixed. Under xdist a grouped test's reported node ID ends in
+  the synthetic accounts are fixed. A group serializes one run only: two pytest runs on one
+  host still contend for the same socket. Under xdist a grouped test's reported node ID ends in
   `@<group>`. `AAS_TEST_WORKERS=0` runs serially.
   xdist puts `tmp_path` one directory deeper (`popen-gwN/`), so bind an `AF_UNIX` socket by
   a name relative to its directory rather than by its 107-byte-limited absolute path.
