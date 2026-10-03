@@ -194,7 +194,8 @@ def dart_rows(xml: bytes, *, retrieved: str = DART_RETRIEVED) -> tuple[tuple[obj
     """A DART receipts table: one completed ``corp_codes`` receipt and one financials row."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr("CORPCODE.xml", xml)
+        # A fixed member time keeps the archive bytes, and so the source hash, identical.
+        archive.writestr(zipfile.ZipInfo("CORPCODE.xml", (2026, 9, 1, 0, 0, 0)), xml)
     raw = buffer.getvalue()
     request = json.dumps({"endpoint": "corp_codes", "parameters_json": "{}"})
     return (
