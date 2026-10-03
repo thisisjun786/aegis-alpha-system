@@ -16,7 +16,7 @@ import hashlib
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from aegis_alpha.application.backtest_cli import run_document
 from aegis_alpha.application.backtest_prepare import (
@@ -53,7 +53,13 @@ from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
 from aegis_alpha.engine.codec import decode_json
 from aegis_alpha.storage.backtest_requests import register_backtest_request
-from aegis_alpha.storage.input_pins import BUNDLE_SCHEMA, HASH_FORMAT, register_input_bundle
+from aegis_alpha.storage.input_pins import (
+    BUNDLE_SCHEMA,
+    HASH_FORMAT,
+    HEAD_BINDING_SCHEMA,
+    register_input_bundle,
+    retain_head_binding,
+)
 from aegis_alpha.storage.run_schema import require_run_schema
 from aegis_alpha.storage.runs import (
     RunIntent,
@@ -254,6 +260,14 @@ def _open(
             ).fetchone()
         ):
             raise ValueError("prior_run_id names no recorded run")
+        # A bundle names a head binding by its document hash; retaining the document is
+        # what lets a later reader of the bundle check those pins again.
+        for ref in cast("list[dict[str, object]]", projected.get("refs", [])):
+            if ref["ref_kind"] == "heads":
+                retain_head_binding(
+                    workspace,
+                    {"schema": HEAD_BINDING_SCHEMA, **cast("dict[str, object]", ref["pin"])},
+                )
         bundle = register_input_bundle(
             workspace,
             document,

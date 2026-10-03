@@ -307,7 +307,7 @@ def _member_bytes(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> bytes:
         ) from error
 
 
-def _filing_rows(arrays: dict[str, object], member: str, cik: str) -> list[tuple[object, ...]]:
+def filing_rows(arrays: dict[str, object], member: str, cik: str) -> list[tuple[object, ...]]:
     """One row per position of a submissions document's parallel filing arrays."""
     kinds = dict(FILING_ARRAYS)
     unknown = sorted(set(arrays) - set(kinds))
@@ -390,13 +390,13 @@ class SecSubmissionsFilings:
                     document = json_object(json_document(payload, name), name)
                     if filer is not None:
                         cik = filer.group(1)
-                        arrays = _filer_arrays(document, name, cik, listed)
+                        arrays = filer_arrays(document, name, cik, listed)
                         metrics["filers"] += 1
                     else:
                         cik = cast("re.Match[str]", page).group(1)
                         arrays = document
                         metrics["pages"] += 1
-                    produced = _filing_rows(arrays, name, cik)
+                    produced = filing_rows(arrays, name, cik)
                     if page is not None:
                         found[name] = len(produced)
                     metrics["filings"] += len(produced)
@@ -429,7 +429,7 @@ class SecSubmissionsFilings:
         del entry, source, run
 
 
-def _filer_arrays(
+def filer_arrays(
     document: dict[str, object], name: str, cik: str, listed: dict[str, int]
 ) -> dict[str, object]:
     """A filer document's recent filing arrays; its listed pages go into ``listed``."""

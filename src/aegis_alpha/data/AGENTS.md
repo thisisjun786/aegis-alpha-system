@@ -7,10 +7,12 @@ This directory uses flat provider prefixes. Follow root policy and decision 0012
 | Data-root configuration and safe file access | `data_root.py`, `descriptor_tree.py` |
 | Catalog validation and version-pinned prices | `catalog_access.py`, `pinned_prices.py`, `price_schema.py` |
 | FMP one-shot/backfill and daily acquisition | `fmp_collector_cli.py`, `fmp_daily_cli.py` and `fmp_*` contracts |
+| Qveris jobs, settlement, serial/parallel cohorts and pacing | `qveris_*`; import in `storage/qveris_import.py` |
 | Macro observations/vintages and raw archives | `fred_alfred_*`, `fred_raw_archive*` |
 | SEC collection, bulk archives and period identity | `sec_*`; trusted policy pin in `sec_policy.py` |
 | FinImpulse estimates | `finimpulse_*` |
 | OpenDART requests, the rolling cohort and KIND downloads | `opendart.py`, `opendart_cohort.py`, `opendart_legacy.py`, `kind.py`; the installation side is `storage/kr_collection.py` |
+| Native SEC EDGAR and FRED/ALFRED requests, answers and plans | `provider_request.py`, `sec_collect.py`, `fred_collect.py`; the installation side is `storage/sec_collection.py` and `storage/fred_collection.py` |
 | Supported historical record/schema formats | `canonical_records.py`, `canonical_json.py`, `canonical_generation_schema.py` |
 
 - Filesystem access uses admitted data roots and descriptor-relative operations:

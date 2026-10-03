@@ -18,7 +18,7 @@ AAS의 목표는 외부 앱과 에이전트가 사용하는 데이터·연구 �
 | `aas run` | 준비·요청 등록·`open_run`·잠금 없는 회계·`commit_run`을 한 명령으로 잇고 run ID로 결과 조회 (`db run-install` 필요) | 원본 자료의 PIT 인증, 알파·헷지 전략 실행, 실주문 |
 | `aas run research` / `aas run rerun` | 선언 문서 하나로 준비·선언 등록·`open_run`·회계·`commit_run`을 잇고, 봉인한 증거에서 결과와 준비를 다시 만들어 대조 (`db run-install`과 `db run-migrate` 필요) | 관측 자료의 실행 자격, 원본 동치, PIT 인증 |
 | `aas init/doctor/db/strategy/data` | `storage/`의 내장 DB 설치·등록·조회·복구, 관례·pin 문서 등록, run 추가 스키마 설치, 기록한 run을 담은 백업과 새 home 복원 | 실행 자격 부여, 기존 home 덮어쓰기 |
-| `aas providers/collect` | 기존 공급자·예산·실행 영수증 도구. `collect dart`·`collect kind`는 KR 공시·상장 수집을 내장 설치본의 원장·`raw/`·원천 자료실에 기록 | 나머지 수집기의 내장 DB 이식·스케줄러 자동 활성화 |
+| `aas providers/collect` | 기존 공급자·예산·실행 영수증 도구. `collect dart`·`collect kind`는 KR 공시·상장 수집을, `collect sec`·`collect fred`는 SEC 공시·재무와 FRED/ALFRED 거시·DEXKOUS 수집을 내장 설치본의 원장·`raw/`·원천 자료실에 기록 | 나머지 수집기의 내장 DB 이식·스케줄러 자동 활성화 |
 
 외부 도구는 현재 Python 계산 API 또는 CLI를 재사용할 수 있다. 모든 저장·수집 기능이
 하나의 안정된 외부 API로 통합됐다는 뜻은 아니다. HTTP/MCP 서버는 제공하지 않는다.
@@ -87,7 +87,11 @@ pin을 실제 저장 소유자에서 검증한 뒤 판단 슬롯마다 `engine.r
 내보내기를 소유한다. 엔진은 저장소·DuckDB·환경을 import하지 않고 application이 계산 소스
 해시와 Python·Decimal 컨텍스트 정체성을 넘긴다. 결과는 `aas backtest`가 읽는 봉투와
 `aas-prepared-backtest-v1` 출처 문서이며 `certified=false`다. 이 경로는 체결을 계산하거나
-run·요청을 등록하지 않는다. `storage/input_pins.py`·`membership_pins.py`는 관례·정의·
+run·요청을 등록하지 않는다. 가격·세션·거시 입력은 native transform generation 대신 승격한
+generation의 head binding(`heads` 참조)으로 묶을 수 있고, 그때 판단마다 그 cutoff의 `read_heads`
+읽기로 신호를 고르며 조정 신호는 비조정 bar와 cutoff까지 알려진 기업행동에서 유도한다. 출처 문서는
+그 읽기 영수증을 그대로 싣는다([데이터 수직 계약](design/data-vertical.md#strict-실행-준비의-head-binding)).
+`storage/input_pins.py`·`membership_pins.py`는 관례·정의·
 identity·universe·입력 묶음 문서를 불변으로 등록·재해시하고, `storage/run_schema.py`와
 `backtest_requests.py`는 후속 run 소비자를 위한 추가 스키마와 정규 요청 바이트 저장 API다.
 요청 형식·등록 순서·실행 조건은 [operations](operations.md#저장한-전략과-입력의-준비)가 소유한다.
@@ -282,10 +286,12 @@ FRED는 응답 페이지별 출처와 사용량 정산을, SEC는 응답 출처�
 
 Qveris는 별도의 네이티브 원문 수집 경로다. 작업 파일 해시를 확인한 뒤 명시한 도구와
 하위 공급자만 호출하고, 호출 수·크레딧·HTTP 요청 수·시간을 제한한다. 원문과 사용량
-정산을 보존하며 이 경로는 PostgreSQL 설정을 열지 않는다. `data/qveris_native.py`는
-완료 원문의 해시와 정산 기록을 확인하고 가격과 격리 사유를 나눈다. 공급자 경고,
-종목 식별 실패, 잘못된 가격은 실행 가격으로 승인하지 않는다. 원본 자료실 적재와
-시점 조건을 갖춘 시장 데이터 게시는 별도 단계다.
+정산을 보존하며 이 경로는 PostgreSQL 설정을 열지 않는다. `aas collect qveris`가 선언 달력의
+일간 요청 계획, 순차·병렬 실행과 요청 간격, 완료 job의 원본 자료실 적재를 맡는다.
+`data/qveris_native.py`는 완료 원문의 해시와 정산 기록을 확인하고 가격·기업행동·통화쌍 행과
+보류 사유를 나누며, `storage/qveris_import.py`가 job 하나를 내용 원천 하나로 commit한다.
+공급자 경고는 기록하고 수집과 적재를 막지 않지만, 경고 행·종목 식별 실패·잘못된 가격은
+실행 가격으로 승인하지 않는다. 시점 조건을 갖춘 시장 데이터 게시는 승격 단계다.
 
 `daily_collection.py`는 외부의 불변 시작·결과 영수증과 잠금으로 자동 실행을 조정한다.
 같은 service day의 불확실한 실행을 유료 재호출하지 않는다. `compute_resources.py`는

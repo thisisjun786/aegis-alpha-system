@@ -11,13 +11,17 @@ from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, cast
 
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
+from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.engine.ensemble import EnsembleMembership
 from aegis_alpha.engine.membership import MembershipRow
 from aegis_alpha.engine.models import DerivedInputBinding, DerivedSeriesSpec
 from aegis_alpha.storage import market
-from aegis_alpha.storage.market_inputs import GenerationPin
+from aegis_alpha.storage.market_inputs import GenerationPin, verify_head_binding
 from aegis_alpha.storage.membership_pins import IdentityPin, UniversePin, read_membership_pins
+from aegis_alpha.storage.raw import put_raw
+from aegis_alpha.storage.read_heads import BINDING_SCHEMA as HEAD_BINDING_SCHEMA
+from aegis_alpha.storage.read_heads import HeadBinding, head_binding
 
 if TYPE_CHECKING:
     from aegis_alpha.engine.requirements import ExecutionDefinition
@@ -180,19 +184,22 @@ REF_FORMATS = {
     "identity": ("aas-identity-snapshot-v1", HASH_FORMAT),
     "universe": ("aas-universe-version-v1", HASH_FORMAT),
     **{kind: (schema, HASH_FORMAT) for kind, schema in _DEFINITION_SCHEMAS.items()},
+    "heads": (HEAD_BINDING_SCHEMA, HASH_FORMAT),
     **{"convention:" + kind: ("aas-convention-v1", HASH_FORMAT) for kind in _KINDS},
 }
-_ROLES = {
-    "signal_prices": ("generation", False),
-    "execution_prices": ("generation", False),
-    "sessions": ("generation", True),
-    "identity": ("identity", True),
-    "universe": ("universe", True),
-    "membership": ("membership", True),
-    "macro": ("generation", False),
-    "derived": ("derived", False),
-    "proxy": ("generation", False),
-    **{kind: ("convention:" + kind, True) for kind in _KINDS},
+# Each role's accepted reference kinds and whether it is a singleton.
+_ROLES: dict[str, tuple[tuple[str, ...], bool]] = {
+    "signal_prices": (("generation", "heads"), False),
+    "execution_prices": (("generation", "heads"), False),
+    "sessions": (("generation", "heads"), True),
+    "identity": (("identity",), True),
+    "universe": (("universe",), True),
+    "membership": (("membership",), True),
+    "macro": (("generation", "heads"), False),
+    "derived": (("derived",), False),
+    "proxy": (("generation",), False),
+    "actions": (("heads",), False),
+    **{kind: (("convention:" + kind,), True) for kind in _KINDS},
 }
 
 
@@ -286,7 +293,7 @@ class InputBinding:
         _text(self.ref_id)
         _uint(self.ordinal)
         _hash(self.hash)
-        if self.role not in _ROLES or self.ref_kind != _ROLES[self.role][0]:
+        if self.role not in _ROLES or self.ref_kind not in _ROLES[self.role][0]:
             raise ValueError("unsupported binding role/reference kind")
         if self.ref_kind.startswith("convention:"):
             _version(self.ref_version)
@@ -294,6 +301,11 @@ class InputBinding:
             _exact_version(self.ref_version)
         if self.ref_kind == "identity" and self.ref_version != "aas-identity-snapshot-v1":
             raise ValueError("identity binding version must be its format discriminator")
+        if self.ref_kind == "heads" and (self.ref_version, self.ref_id) != (
+            HEAD_BINDING_SCHEMA,
+            self.hash,
+        ):
+            raise ValueError("a head binding is named by its schema and document hash")
 
 
 @dataclass(frozen=True, slots=True)
@@ -428,6 +440,8 @@ def _verify_binding(workspace: Workspace, binding: InputBinding, budget: Compute
             UniversePin(identity, version, digest) if kind == "universe" else None,
             max_materialization_bytes=budget.available_bytes,
         )
+    elif kind == "heads":
+        verify_head_binding(workspace, read_head_binding(workspace, digest), budget=budget)
     elif kind.startswith("convention:"):
         # read_convention decodes and re-canonicalizes the whole stored document,
         # so charge its bytes before reading rather than after materializing them.
@@ -443,6 +457,53 @@ def _verify_binding(workspace: Workspace, binding: InputBinding, budget: Compute
         )
     else:
         read_definition(workspace, DefinitionPin(kind, identity, version, digest), budget=budget)
+
+
+def retain_head_binding(workspace: Workspace, document: dict[str, object]) -> str:
+    """Keep one ``aas-head-binding-v1`` document in ``raw/`` under its binding hash.
+
+    An input bundle names a head binding only by that hash, so the document is what lets
+    a later reader re-verify the pins. Returns the hash.
+    """
+    binding = head_binding(document)
+    _, digest, _ = put_raw(workspace.paths.raw, canonical_json_bytes(binding.document()))
+    if digest != binding.binding_hash:
+        raise ValueError("head binding document hash mismatch")
+    return digest
+
+
+def import_head_binding(
+    workspace: Workspace, raw: bytes, *, expected_file_sha256: str, budget: ComputeBudget
+) -> str:
+    """Retain one canonical ``aas-head-binding-v1`` file whose pins match their markers.
+
+    This is how a bundle naming a head binding by hash becomes verifiable before any run
+    has kept the document. Returns the binding hash.
+    """
+    _hash(expected_file_sha256)
+    if hashlib.sha256(raw).hexdigest() != expected_file_sha256:
+        raise ValueError("head binding file hash mismatch")
+    binding = head_binding(decode_pin_document(raw))
+    if canonical_json_bytes(binding.document()) != raw:
+        raise ValueError("head binding document is not canonical")
+    verify_head_binding(workspace, binding, budget=budget)
+    return retain_head_binding(workspace, binding.document())
+
+
+def read_head_binding(workspace: Workspace, digest: str) -> HeadBinding:
+    """Read back the head binding a bundle names by its hash, refusing a changed document."""
+    _hash(digest)
+    relative = digest[:2] + "/" + digest
+    with DescriptorTree.open_path(workspace.paths.raw) as tree:
+        if not tree.exists(relative):
+            raise ValueError("head binding document is not retained")
+        raw = tree.read_bytes(relative, max_bytes=_MAX_BYTES)
+    if hashlib.sha256(raw).hexdigest() != digest:
+        raise ValueError("head binding document hash mismatch")
+    binding = head_binding(decode_pin_document(raw))
+    if binding.binding_hash != digest or canonical_json_bytes(binding.document()) != raw:
+        raise ValueError("head binding document is not canonical")
+    return binding
 
 
 def _generation_ref(value: object) -> GenerationPin:

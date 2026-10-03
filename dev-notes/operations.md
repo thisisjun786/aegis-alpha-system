@@ -698,15 +698,21 @@ run 등록, 결과 저장은 하지 않는다. 봉투 회계는 별도 `aas back
   `ref_version`, `hash`, `ref_schema`, `hash_format`이다. 필수 역할은 `signal_prices`,
   `execution_prices`, `sessions`, `identity`, `universe`, `membership`, `calendar`, `basis`,
   `cost`, `execution`이고, `macro`·`derived`·`proxy`는 전략 정의가 요구할 때만, `benchmark`·
-  `risk_free`·`fx`는 0 또는 1개다. 여러 개를 허용하는 역할은 `signal_prices`·`execution_prices`·
-  `macro`·`derived`·`proxy`뿐이며 ordinal은 역할 안에서 0부터 연속이다.
+  `risk_free`·`fx`는 0 또는 1개다. `actions`는 `heads`로 묶은 canonical 신호 선택 중 조정 basis인 것(유도 선택)마다
+  하나다. 유도 선택은 binding 순서대로 `actions` ordinal을 하나씩 받으므로(첫 유도 선택이 0, 다음이 1)
+  시장마다 다른 기업행동 원천을 묶을 수 있다. 여러 개를 허용하는 역할은 `signal_prices`·`execution_prices`·
+  `macro`·`derived`·`proxy`·`actions`뿐이며 ordinal은 역할 안에서 0부터 연속이다. `signal_prices`·
+  `execution_prices`·`sessions`·`macro`는 `generation` 또는 `heads` 참조를, `actions`는 `heads` 참조만 받는다.
 - `refs`: bindings가 가리키는 참조 서술자. `ref_kind`, `ref_id`, `ref_version`, `hash`,
   `schema`, `hash_format`, `pin`을 담고 같은 서술자를 두 번 넣으면 거부한다.
   `generation`의 pin은 `data inspect`가 돌려주는 `dataset_id`·`version`·`generation_id`·
   `chain_hash`·`manifest_hash`, `identity`는 `snapshot_id`·`content_hash`, `universe`는
   `universe_id`·`version`·`content_hash`, `derived`·`membership`·`convention:<kind>`는
-  `kind`·`id`·`version`·`hash`다. binding의 `hash`는 그 pin의 `chain_hash`, `content_hash`,
-  또는 문서 전체 해시와 같아야 한다.
+  `kind`·`id`·`version`·`hash`다. `heads`의 pin은 `aas-head-binding-v1` 문서에서 `schema`를 뺀
+  `domain`·`pins`(각 pin은 `generation` pin의 다섯 필드와 `from`·`to` 날짜 또는 null)·`granted_rules`·
+  `excluded_flags`이고, `ref_id`와 `hash`는 그 문서의 binding hash, `ref_version`은 `aas-head-binding-v1`이다.
+  binding의 `hash`는 그 pin의 `chain_hash`, `content_hash`, binding hash 또는 문서 전체 해시와 같아야 한다.
+  `heads` 참조의 읽기 규칙은 [데이터 수직 계약](design/data-vertical.md#strict-실행-준비의-head-binding)이 소유한다.
 - `price_inputs`: `signal_prices`·`execution_prices` binding마다 하나씩. `binding`(`role`·
   `ordinal`), 정렬된 `instrument_ids`, `currency`, `basis`(`unadjusted`·`split_adjusted`·
   `total_return`), `price_role`(`canonical`·`reference`), `interval=1d`. 신호 가격은 basis
@@ -743,14 +749,20 @@ run 등록, 결과 저장은 하지 않는다. 봉투 회계는 별도 `aas back
    generation(예: `split_adjusted`·`reference`), 체결 가격 generation(`unadjusted`·`canonical`),
    세션 달력 generation. 각 `data inspect --dataset ID --version VERSION` 출력이 `generation`
    pin이다. `aas data import`로 게시한 typed generation도 같은 pin 형식이지만, 신호·체결
-   가격과 세션 입력으로 고를 수 있는 generation은 `register-prices`/`register-sessions`의
-   native transform으로 게시하고 원본 `source-import`와 보존 테이블이 남아 있는 것뿐이다.
-   준비는 이 generation마다 native transform 문서와 보존 원본을 다시 대조해 admission하며,
+   가격과 세션 입력으로 `generation` 참조가 고를 수 있는 generation은 `register-prices`/
+   `register-sessions`의 native transform으로 게시하고 원본 `source-import`와 보존 테이블이 남아 있는
+   것뿐이다. 준비는 이 generation마다 native transform 문서와 보존 원본을 다시 대조해 admission하며,
    내용이 불투명한 generic 게시는 그 선행 조건을 대신하지 못한다. `macro` 입력의 generic
-   게시는 5번 항목대로 계속 지원한다.
+   게시는 5번 항목대로 계속 지원한다. 승격한 generation(`aas data promote`, `aas data kr-prices`,
+   `aas calendar refresh`)은 `heads` 참조로 묶는다. 그 pin은 `dataset_versions`의 committed 행이고, 각
+   generation의 시간 규칙 출처는 보존한 명세에서 읽으며, 규칙 시점은 binding의 `granted_rules`가 허용할 때만
+   strict 판단에 쓰인다.
 3. `aas data binding-import`: `aas-identity-snapshot-v1`, `aas-universe-version-v1`,
    `aas-ensemble-membership-v1` 문서. 문서 스키마에 따라 identity snapshot, universe version,
    정의(derived·membership) 또는 `aas-input-bundle-v1` 묶음을 등록하고 `pin`을 돌려준다.
+   정규 표기의 `aas-head-binding-v1` 문서는 pin이 marker와 catalog에 맞는지 확인한 뒤 `raw/`에 그
+   binding hash로 남기고 `pin.binding_hash`를 돌려주므로, 그 hash를 `heads` 참조로 가리키는 묶음은
+   실행 전에도 등록·검증된다.
    identity·universe 문서의 정확한 바이트 규약은 [membership pins](design/membership-pins.md),
    derived·membership·bundle 문서는 [input_pins.py](../src/aegis_alpha/storage/input_pins.py)가
    소유한다. 이 명령은 `read-prices`와 같은 명시한 compute 환경이 필요하다.
@@ -783,8 +795,8 @@ lock 파일이 설치의 저장 잠금과 같은 경로면 거부한다. 요청 
 
 `<output>.preparation.json`은 `aas-prepared-backtest-v1` 문서로 `request_hash`, 의미 투영
 전체(`request`), `envelope_sha256`, 실행 정의, 읽은 관례 문서, 실제로 읽은 저장 입력의
-증거(`stored_inputs`), `source_pins`, 판단·체결 슬롯, 각 판단의 replay 영수증, feature 값,
-`certified=false`를 담는다. 봉투 자체에는 이 출처가 들어가지 않는다.
+증거(`stored_inputs`), `heads` 참조로 한 읽기마다 reader가 돌려준 영수증(`head_reads`), `source_pins`, 판단·체결 슬롯,
+각 판단의 replay 영수증, feature 값, `certified=false`를 담는다. 봉투 자체에는 이 출처가 들어가지 않는다.
 
 실패는 stdout 없이 stderr 한 줄 `{"error": ...}`와 종료 코드 1이다. 봉투를 쓴 뒤 sidecar나
 fsync 단계에서 실패하면 이미 쓴 파일이 검사용으로 남는다. 그 파일은 성공 영수증이 아니며
@@ -837,7 +849,7 @@ compute 환경이 없으면 `None`을 yield한다. 아래 실습 5단계가 이 
 정체성이고, `engine.backtest_request`의 `request_projection`·`export_envelope`는 저장소 없이
 순수 투영·내보내기만 맡는다.
 
-계산 소스 정체성은 `backtest_prepare.CALCULATION_MODULES`에 명시된 44개 모듈의
+계산 소스 정체성은 `backtest_prepare.CALCULATION_MODULES`에 명시된 47개 모듈의
 설치된 정확한 바이트를 해시한다. 엔진과 두 데이터 직렬화 helper뿐 아니라 준비의 해석·입력
 승인을 담당하는 application·storage 모듈을 포함한다. 런타임 import 탐색이나 패키지 전체
 해시는 아니며, 선택된 파일의 주석 변경도 정체성을 바꾼다. 이전 27개 범위로 생성한 정규
@@ -1265,6 +1277,41 @@ commit에는 `pyarrow`(legacy extra)가 필요하다.
 DART backfill unit은 그 전에 멈춘다(두 수집기는 quota를 서로 세지 않는다). 요청·cohort·원장·보존 규칙은
 [KR 공시·상장 수집](design/data-vertical.md#kr-공시상장-수집)이 소유한다.
 
+## US 공시·거시 수집
+
+```bash
+aas collect sec plan [--home HOME] [--today YYYY-MM-DD] [--since YYYY-MM-DD] [--issuers registered|all]
+aas collect sec run --user-agent-file SEC_USER_AGENT_FILE [--since YYYY-MM-DD] [--issuers registered|all] [--max-calls 2000] [--home HOME]
+aas collect fred plan [--home HOME] [--today YYYY-MM-DD]
+aas collect fred run --key-file FRED_KEY_FILE [--max-calls 500] [--home HOME]
+```
+
+`plan`은 설치본을 읽기 전용으로 열어 실행이 처음 물을 것을 보고하고 공급자를 호출하지 않는다. `sec plan`은
+New York 날짜(`--today`)의 덮이지 않은 색인 날, 이미 commit된 색인에서 나온 submissions·companyfacts 요청의
+이유별 수, 원한 공시·완료·발행인 범위 밖·포기 수, 처음 날과 덮인 마지막 날이다. `fred plan`은 FRED 날짜의
+시계열별 알려진 vintage 날, 실시간 끝(어제), 요청의 이유별 수(`vintage_dates:origin`·`vintage_check`,
+`series_csv:daily`)다. 둘 다 commit되지 않은 receipt 수를 함께 보고한다.
+
+`run`은 설치본을 쓰기로 열고 한 번의 제한된 수집을 한다. `--user-agent-file`은 SEC 공정 접근 규칙의 연락처를
+담은 `User-Agent` 한 줄, `--key-file`은 FRED API 키 한 줄이며, 둘 다 소유자만 읽을 수 있는 Git checkout 밖의
+파일이다. 중단된 attempt 정산과 commit되지 않은 receipt의 commit을 먼저 한다. SEC는 색인, submissions,
+companyfacts 순으로, FRED는 CSV, 시계열별 vintage 확인과 observations 창 순으로 묻는다. 호출마다 state의
+`collection_jobs`·`collection_attempts`·`usage_events`에 기록된다. 응답은 `raw/`와 `sec-*`·`fred-*` 내용
+원천에 남는다. 출력은 공급자 호출 수, 이유별 요청 수, 결과 분포, 멈춘 이유(`budget`,
+`provider_refused:<HTTP 상태>`, `transport_failures`), commit한 원천이다. SEC는 덮인 마지막 날과 남은 계획을,
+FRED는 시계열별 알려진 vintage 날과 완결되지 않은 창을 함께 낸다. 예산을 다 쓰면 정상 종료이고, 거부나 전송
+실패로 멈추면 받은 답을 commit한 뒤 종료 코드 1이다. commit에는 `pyarrow`(legacy extra)가 필요하다.
+`--issuers registered`(기본)는 identity에 SEC 발행인으로 등록된 제출자의 문서만 묻는다. 처음 SEC 실행은
+`--since`로 legacy bulk archive 뒤의 첫 색인 날을 정한다.
+
+수집한 원천의 승격은 [원천 자료의 승격과 은퇴](#원천-자료의-승격과-은퇴)의 명세로 한다.
+`sec-submissions-filings-*`는 `sec.submissions@1`, `sec-companyfacts-facts-*`는 `sec.companyfacts@1`,
+`fred-alfred-observations-*`는 `fred.alfred@1`(원천마다 `vintage_partitions`의 구간 순서로),
+`fred-series-csv-*`는 `fred.fx_series@1`이다. 승인된 수집기(SEC 색인·submissions·companyfacts, FRED/ALFRED와
+DEXKOUS CSV)지만, 패키지 설치나 이 명령이 예약 실행을 만들지는 않는다. `[owner]` 예약 실행은 운영 전환에서
+연락처·키 파일과 호출 상한을 정해 켠다. 요청·창·선택·보존 규칙은
+[US 공시·거시 수집](design/data-vertical.md#us-공시거시-수집)이 소유한다.
+
 ## Qveris 원문 수집
 
 `aas collect daily --config /path/to/collection.json --state-root /path/to/private-journal`은
@@ -1280,10 +1327,46 @@ DART backfill unit은 그 전에 멈춘다(두 수집기는 quota를 서로 세�
 `provider_calls`와 `http_requests`는 각각 유료 실행과 전체 HTTP 시도 수다.
 
 이 명령은 원문 수집까지만 수행하며 `native_import_completed=false`를 반환한다.
-검증된 원문을 DuckDB 원본 자료실에 적재하려면 별도의 명시적 적재 작업이 필요하다.
+검증된 원문은 아래 `aas collect qveris import`가 원본 자료실에 적재한다.
 가격의 조정 기준·종목 식별·거래일·공개 시각을 확인하기 전에는 백테스트 입력이나
 `data datasets`의 시장 버전으로 자동 승격하지 않는다. 예약 실행은 운영자가 별도로
 설치하고 실제 적재 결과와 중복 호출 여부를 확인한다. 패키지 설치는 예약 작업을 만들지 않는다.
+
+### 명시한 job의 수집과 적재
+
+```bash
+aas collect qveris daily-jobs --raw-root RAW --exchange US --exchange KO --exchange KQ \
+  --dataset prices --dataset splits --dataset dividends --lookback-days 14 --output JOBS.json
+aas collect qveris plan --jobs JOBS.json --raw-root RAW
+aas collect qveris run --jobs JOBS.json --raw-root RAW --key-file KEY \
+  --max-calls 30 --max-credits 100 [--workers 4] [--request-interval 0.75]
+aas collect qveris quarantine --raw-root RAW --key-file KEY \
+  (--batch parallel-batches/ID | --page jobs/FINGERPRINT/0000) --reason TEXT
+aas collect qveris import --raw-root RAW --identity IDENTITY.json [--market KR] \
+  [--dataset price_history] [--fingerprint FP ...] [--limit N] [--plan]
+```
+
+- `daily-jobs`는 선언 달력에서 관측일(기본 UTC 오늘) 이전의 열린 세션마다 일간 내려받기 요청을 만들고,
+  raw root에 이미 완료된 요청은 빼며 완료 없이 시도만 있는 요청은 `held`로 보고한다. 새 요청이 있을
+  때만 `--output`을 새로 만들고 그 SHA-256을 출력한다. 키를 읽지 않고 요청하지 않는다.
+- `plan`은 job 문서를 검증하고 문서마다 `completed`(같은 fingerprint가 완료돼 `run`이 HTTP 없이 재사용),
+  `held`(같은 fingerprint의 시도를 `run`이 정산), `equivalent`(같은 요청이 관측일이나 job ID가 다른 job으로
+  완료·시도돼 `run`이 다시 유료 호출), `new`를 센다. 키를 읽지 않고 raw root를 만들지 않는다.
+- `run`은 유료 호출 수(`--max-calls`)와 크레딧(`--max-credits`)을 실행 하나의 상한으로 예약하고, 서버
+  잔액에서 다른 예약을 뺀 값도 확인한다. HTTP 시도 수(`--max-http-requests`, 기본 유료 호출의 16배와 32 중
+  큰 값)와 시간(`--time-limit-seconds`)은 새 page를 시작하지 않게 한다. 이미 시작한 page는 실행과 정산을
+  마치므로 `http_requests`가 한도를 조금 넘을 수 있다. 작업자 1·2·3·4·8·16 중 하나이며 모든 요청 시작은 한
+  간격을 공유한다. 종료 코드는 완료와 예산 소진이 0, 정산된 실패가 있으면 1, 불확실한 호출이나 정산되지 않은
+  page·group으로 멈추면 2다. 진행 기록은 raw root의 `cohorts/`·`parallel-cohorts/`에 남고 표준 오류로 진행
+  줄을 낸다.
+- 종료 코드 2의 page나 group은 다음 `run`이 먼저 정산한다. usage가 끝내 나타나지 않거나 intent 묶음이
+  불완전해 정산할 수 없으면 `quarantine`이 그 page(`--page`) 또는 group(`--batch`)을 운영자 사유와 함께
+  격리한다. 격리는 견적 전체의 예약을 남기고 자동 재호출하지 않으며, 그 뒤 계정의 새 실행을 다시 허용한다.
+  대상은 `run`의 표준 오류 보고와 raw root의 `jobs/`·`parallel-batches/`에서 찾는다.
+- `import`는 완료된 job을 내용 원천으로 commit하고 공급자를 호출하지 않는다. `--plan`은 읽기 전용으로
+  설치본을 열어 정규화와 행 digest만 보고한다. identity 문서는 가격·기업행동 행에 필요하고 통화쌍
+  이력에는 필요 없다. 실패한 job은 `failures`, 완료 문서가 없는 `--fingerprint`(`no_completion`)와 읽을 수
+  없는 완료 문서(`unreadable_completion`)는 `missing`으로 남고 나머지 job을 적재한 뒤 종료 코드 1이다. 단위와 원천 ID 규칙은 [데이터 수직 계약](design/data-vertical.md#qveris-수집과-원천-적재)이 소유한다.
 
 ## 전환 중인 공급자 도구
 
