@@ -11,6 +11,7 @@ import hashlib
 import math
 import re
 from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import asdict, dataclass
 from datetime import date
 from itertools import pairwise
@@ -19,6 +20,7 @@ from typing import cast
 
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
 from aegis_alpha.engine.codec import decode_json
+from aegis_alpha.engine.fx_conversion import SIGNAL_BASES, FxConversion
 from aegis_alpha.engine.models import ENGINE_CONTRACT_VERSION_V1
 from aegis_alpha.engine.requirements import ExecutionDefinition
 from aegis_alpha.engine.tolerance import long_only_sum_tolerance
@@ -59,6 +61,7 @@ _ROLE_KINDS: dict[str, tuple[str, ...]] = {
     "derived": ("derived",),
     "proxy": ("generation",),
     "actions": ("heads",),
+    "fx_conversion": ("heads",),
     **{kind: ("convention:" + kind,) for kind in _CONVENTION_KINDS},
 }
 # The market domains a ``heads`` reference may bind in each role.
@@ -68,10 +71,13 @@ _HEAD_DOMAINS = {
     "sessions": ("calendar_sessions",),
     "macro": ("macro_observations", "fx_rates"),
     "actions": ("corporate_actions",),
+    "fx_conversion": ("fx_rates",),
 }
 _HEAD_RULE = r"^[a-z][a-z0-9_]*@[1-9][0-9]*$"
 _HEAD_FLAG = r"^[a-z][a-z0-9_]*$"
-_MULTIPLE = frozenset({"signal_prices", "execution_prices", "macro", "derived", "proxy", "actions"})
+_MULTIPLE = frozenset(
+    {"signal_prices", "execution_prices", "macro", "derived", "proxy", "actions", "fx_conversion"}
+)
 _REQUIRED = frozenset(
     {
         "signal_prices",
@@ -146,9 +152,12 @@ def _object(value: object) -> Record:
     return dict(cast("Mapping[str, object]", value))
 
 
-def _fields(value: object, fields: object) -> Record:
+def _fields(
+    value: object, fields: AbstractSet[str], optional: frozenset[str] = frozenset()
+) -> Record:
+    """The object's fields: exactly ``fields``, plus any of ``optional`` it carries."""
     row = _object(value)
-    if row.keys() != fields:
+    if row.keys() - optional != fields - optional:
         raise ValueError("missing or unknown fields")
     return row
 
@@ -243,11 +252,11 @@ def _bounded_bytes(value: object, *, limit: int = _MAX_BYTES) -> bytes:
 
 # These helpers compose the two concrete machine schemas only; they are not a
 # schema validator/registry. Cross-reference and semantic admission is below.
-def _shape(properties: Mapping[str, object]) -> Record:
+def _shape(properties: Mapping[str, object], optional: frozenset[str] = frozenset()) -> Record:
     return {
         "type": "object",
         "properties": properties,
-        "required": list(properties),
+        "required": [name for name in properties if name not in optional],
         "additionalProperties": False,
     }
 
@@ -421,6 +430,20 @@ _CONTENT_PROPERTIES = {
     "macro_inputs": _items(_shape({"binding": _KEY, "series_id": _TEXT, "unit": _TEXT})),
     "derived_inputs": _items(_shape({"binding": _KEY, "series_id": _TEXT})),
     "proxy_rules": _items(_shape({"binding": _KEY, "logical_exposure_id": _TEXT})),
+    # Present only when a price selection is in a currency other than the account's: each
+    # entry grants converting that currency through one ``fx_conversion`` head binding.
+    "fx_conversions": _items(
+        _shape(
+            {
+                "binding": _KEY,
+                "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+                "series_id": {"type": "string", "pattern": "^[A-Z]{3}/[A-Z]{3}$"},
+                "max_fixing_age_days": _UINT,
+                "signal_basis": {"enum": list(SIGNAL_BASES)},
+            }
+        ),
+        minimum=1,
+    ),
     "period": _shape({"start": _DATE, "end": _DATE}),
     "history": _shape({"start": _DATE, "end": _DATE}),
     "cutoff": _shape(
@@ -454,6 +477,9 @@ _CONTENT_PROPERTIES = {
         }
     ),
 }
+# Content keys a request carries only when it uses them, so a request without one keeps the
+# bytes, and the hash, it had before the key existed.
+_OPTIONAL = frozenset({"fx_conversions"})
 _ENGINE = _shape(
     {
         "schema": _const("aas-engine-identity-v1"),
@@ -529,7 +555,7 @@ PREPARE_REQUEST_SCHEMA = cast(
     _freeze(
         {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
-            **_shape(_PREPARE_PROPERTIES),
+            **_shape(_PREPARE_PROPERTIES, _OPTIONAL),
             "allOf": [_V1_NO_FLOWS],
         }
     ),
@@ -539,7 +565,7 @@ BACKTEST_REQUEST_SCHEMA = cast(
     _freeze(
         {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
-            **_shape(_P_PROPERTIES),
+            **_shape(_P_PROPERTIES, _OPTIONAL),
             "allOf": [_V1_NO_FLOWS],
         }
     ),
@@ -802,6 +828,62 @@ def _head_roles(body: Record, bindings: dict[tuple[str, int], Record]) -> None:
         )
 
 
+def _fx_conversions(body: Record, bindings: dict[tuple[str, int], Record]) -> None:
+    """Admit each price currency the account is not in only through a granted conversion.
+
+    A price selection in the account currency needs nothing. One in another currency needs
+    exactly one ``fx_conversions`` entry for that currency, which names the
+    ``fx_conversion`` head binding its fixings come from and the terms of the conversion;
+    every such binding carries exactly one entry, and an entry no price selection uses is
+    refused rather than recorded as if it decided something. The request without any
+    conversion omits the key, so its bytes and hash stay those of a single-currency request.
+    """
+    account = _text(_object(body["account"])["currency"])
+    currencies = {_text(row["currency"]) for row in _rows(body["price_inputs"])}
+    foreign = currencies - {account}
+    if "fx_conversions" not in body:
+        if any(role == "fx_conversion" for role, _ in bindings):
+            raise ValueError("each fx_conversion binding requires exactly one FX conversion")
+        if foreign:
+            raise ValueError(
+                "prices in "
+                + ", ".join(sorted(foreign))
+                + " need an fx_conversions grant into the account currency "
+                + account
+            )
+        return
+    entries = _rows(body["fx_conversions"])
+    if not entries:
+        raise ValueError("fx_conversions is omitted, not empty, when no price is converted")
+    selected: dict[tuple[str, int], Record] = {}
+    granted: set[str] = set()
+    for row in entries:
+        _fields(row, {"binding", "currency", "series_id", "max_fixing_age_days", "signal_basis"})
+        key = _key(row["binding"])
+        if key[0] != "fx_conversion" or key not in bindings or key in selected:
+            raise ValueError("an FX conversion addresses its own unique fx_conversion binding")
+        _integer(row["max_fixing_age_days"])
+        FxConversion(
+            _text(row["currency"]),
+            account,
+            _text(row["series_id"]),
+            cast("int", row["max_fixing_age_days"]),
+            _text(row["signal_basis"]),
+        )
+        if row["currency"] in granted:
+            raise ValueError("two FX conversions convert one currency")
+        granted.add(cast("str", row["currency"]))
+        selected[key] = row
+    if selected.keys() != {key for key in bindings if key[0] == "fx_conversion"}:
+        raise ValueError("each fx_conversion binding requires exactly one FX conversion")
+    if granted != foreign:
+        raise ValueError(
+            "FX conversions must grant exactly the non-account price currencies: "
+            + ", ".join(sorted(foreign))
+        )
+    body["fx_conversions"] = [selected[key] for key in sorted(selected)]
+
+
 def _account(value: object, start: date, end: date, envelope: Record) -> Record:
     account = _fields(value, {"currency", "initial_cash", "cashflows"})
     _text(account["currency"])
@@ -858,7 +940,7 @@ def _account_and_dates(body: Record) -> None:
 
 
 def _prepare(document: object) -> Record:
-    body = _fields(document, _PREPARE_PROPERTIES.keys())
+    body = _fields(document, _PREPARE_PROPERTIES.keys(), _OPTIONAL)
     if (body["schema"], body["hash_format"]) != ("aas-prepare-request-v1", _J):
         raise ValueError("unsupported prepare request schema/hash format")
     _strategy(body["strategy"])
@@ -866,6 +948,7 @@ def _prepare(document: object) -> Record:
     _selections(body, bindings)
     _head_roles(body, bindings)
     _account_and_dates(body)
+    _fx_conversions(body, bindings)
     comparison = _fields(body["comparison"], {"benchmark", "risk_free", "fx"})
     for role, value in comparison.items():
         if value is None:
@@ -1007,11 +1090,9 @@ def _basis_prices(payload: object, body: Record, definition: ExecutionDefinition
         if requirement.basis is not None and requirement.basis != basis["price_basis"]:
             raise ValueError("basis disagrees with execution requirement")
     expected_basis = "split_adjusted" if basis["price_basis"] == "capital" else "total_return"
-    account = _object(body["account"])
+    # A price in another currency is admitted with the request's FX conversion grant.
     for selection in _rows(body["price_inputs"]):
         role, _ = _key(selection["binding"])
-        if selection["currency"] != account["currency"]:
-            raise ValueError("cross-currency prices are unsupported")
         if role == "signal_prices" and selection["basis"] != expected_basis:
             raise ValueError("signal basis disagrees with convention")
 
@@ -1116,7 +1197,7 @@ def request_projection(
     body = _object(request.document)
     _definition(body, definition)
     evidence, cost_document, rate = _conventions(body, convention_documents, definition)
-    projection = {key: body[key] for key in _CONTENT_PROPERTIES}
+    projection = _content(body)
     projection.update(
         schema="aas-backtest-request-v1",
         hash_format=_J,
@@ -1129,11 +1210,16 @@ def request_projection(
     )
 
 
+def _content(body: Record) -> Record:
+    """The request content a body carries: every content key, and each optional one it has."""
+    return {key: body[key] for key in _CONTENT_PROPERTIES if key in body}
+
+
 def _projection_request(body: Record) -> ParsedPrepareRequest:
-    _fields(body, _P_PROPERTIES.keys())
+    _fields(body, _P_PROPERTIES.keys(), _OPTIONAL)
     if (body["schema"], body["hash_format"]) != ("aas-backtest-request-v1", _J):
         raise ValueError("unsupported semantic request schema/hash format")
-    request = {key: body[key] for key in _CONTENT_PROPERTIES}
+    request = _content(body)
     request.update(
         schema="aas-prepare-request-v1", hash_format=_J, metadata={"created_at_us": None}
     )
@@ -1175,9 +1261,8 @@ class RequestProjection:
         body = _decode(self.canonical_bytes)
         request = _projection_request(body)
         normalized = _object(request.document)
-        for key in _CONTENT_PROPERTIES:
-            if canonical_json_bytes(body[key]) != canonical_json_bytes(normalized[key]):
-                raise ValueError("projection request fields are not normalized")
+        if canonical_json_bytes(_content(body)) != canonical_json_bytes(_content(normalized)):
+            raise ValueError("projection request fields are not normalized")
         for key, normalize in (
             ("engine", _engine_identity),
             ("environment", _environment_identity),
@@ -1353,10 +1438,7 @@ def export_envelope(
     )
     body = _object(request.document)
     projected = _decode(checked.canonical_bytes)
-    if any(
-        canonical_json_bytes(body[key]) != canonical_json_bytes(projected[key])
-        for key in _CONTENT_PROPERTIES
-    ):
+    if canonical_json_bytes(_content(body)) != canonical_json_bytes(_content(projected)):
         raise ValueError("projection belongs to a different request")
     _export_dates(body, inputs.dates, inputs.opens, inputs.closes)
     selected = {

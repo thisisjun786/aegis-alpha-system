@@ -7,6 +7,7 @@ a silent instrument collision, or no recorded reservation at all.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import cast
 
@@ -24,6 +25,7 @@ from aegis_alpha.application.research_run import (
     declared_provenance,
     parse_research_run_request,
 )
+from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.engine.errors import ContractParseError
 
 DIGEST_A = "a" * 64
@@ -270,6 +272,21 @@ def test_an_unknown_observation_role_is_refused() -> None:
     body["observations"] = [_pin(role="settlement")]
     with pytest.raises(ResearchRunError, match="open or close"):
         parse_research_run_request(_raw(body))
+
+
+def test_a_declaration_without_grants_keeps_its_hash_and_sealed_record() -> None:
+    """Optional grants leave a declaration they are absent from exactly as it was.
+
+    The digests are those the contract produced before macro and FX grants existed.
+    """
+    request = parse_research_run_request(_raw(_body()))
+    assert request.request_sha256 == (
+        "5e7281eac8212d08037299dbd156b6594ca188adf09f98734f2e9f638a78a615"
+    )
+    sealed = canonical_json_bytes(_provenance(request))
+    assert hashlib.sha256(sealed).hexdigest() == (
+        "2e4245d6792cd578422ec4e99dde4293bff8eb02a36e09af39a44208c5ad1f7b"
+    )
 
 
 def test_the_same_request_hashes_the_same_way_twice() -> None:

@@ -8,12 +8,12 @@ import math
 import operator
 import subprocess
 import sys
-from collections.abc import MutableMapping
+from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import asdict, replace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Final, cast
 
 import pytest
 
@@ -1376,3 +1376,170 @@ def test_zero_weight_padding_cannot_widen_the_accepted_band() -> None:
     assert long_only_sum_tolerance(len(padded)) < execution._VALUE_RELATIVE_TOLERANCE  # noqa: SLF001
     with pytest.raises(ValueError, match="sum to at most one"):
         export_envelope(parsed, projection=projection, inputs=_two_asset_inputs(padded))
+
+
+def _add_fx(body: Document, ordinal: int = 0, *, domain: str = "fx_rates") -> Document:
+    """Bind one ``fx_conversion`` head reference over a synthetic fixing generation."""
+    pin = {
+        "domain": domain,
+        "pins": [
+            {
+                "dataset_id": "fx.usdkrw.syn",
+                "version": "1",
+                "generation_id": f"fx.usdkrw.syn-g{ordinal}",
+                "chain_hash": hashlib.sha256(f"fx-{ordinal}".encode()).hexdigest(),
+                "manifest_hash": hashlib.sha256(f"fx-m-{ordinal}".encode()).hexdigest(),
+                "from": None,
+                "to": None,
+            }
+        ],
+        "granted_rules": [],
+        "excluded_flags": [],
+    }
+    digest = content_sha256({"schema": "aas-head-binding-v1", **pin})
+    ref = {
+        "ref_kind": "heads",
+        "ref_id": digest,
+        "ref_version": "aas-head-binding-v1",
+        "hash": digest,
+        "schema": "aas-head-binding-v1",
+        "hash_format": J,
+        "pin": pin,
+    }
+    body["refs"].append(ref)
+    body["bindings"].append(
+        {key: value for key, value in ref.items() if key not in ("pin", "schema")}
+        | {"role": "fx_conversion", "ordinal": ordinal, "ref_schema": ref["schema"]}
+    )
+    return {"role": "fx_conversion", "ordinal": ordinal}
+
+
+def _krw_execution(body: Document) -> Document:
+    """Price the execution selection in KRW and grant converting it into the USD account."""
+    selection = next(
+        row for row in body["price_inputs"] if row["binding"]["role"] == "execution_prices"
+    )
+    selection["currency"] = "KRW"
+    conversion = {
+        "binding": _add_fx(body),
+        "currency": "KRW",
+        "series_id": "USD/KRW",
+        "max_fixing_age_days": 3,
+        "signal_basis": "account_currency",
+    }
+    body["fx_conversions"] = [conversion]
+    return conversion
+
+
+# The request hash of each grant-free fixture, as the contract computed it before
+# conversion grants existed. An optional field must leave a request it is absent from
+# byte for byte unchanged, so these hashes never move.
+UNGRANTED_REQUEST_HASHES: Final = {
+    False: "2f22d30ad50217b4d1eb916356e7c3fff38d96383cb61a2f5840dc1a7b865f47",
+    True: "30bc572a9a139e07d49bc8a2eb85cac90477d20834984a09427756708d0eb03d",
+}
+
+
+@pytest.mark.parametrize("rich", [False, True], ids=["contract", "rich-contract"])
+def test_a_request_without_a_grant_keeps_its_hash(*, rich: bool) -> None:
+    body, definition, docs = fixture(rich=rich)
+    _, single = project(body, definition, docs)
+    assert single.request_hash == UNGRANTED_REQUEST_HASHES[rich]
+    assert hashlib.sha256(single.canonical_bytes).hexdigest() == single.request_hash
+
+
+def test_a_foreign_price_currency_is_admitted_by_its_fx_conversion_grant() -> None:
+    body, definition, docs = fixture()
+    _, single = project(body, definition, docs)
+    # A request with no conversion carries no key, so its bytes are those it always had.
+    assert b"fx_conversions" not in single.canonical_bytes
+    ungranted = json.loads(json.dumps(body))
+    ungranted["price_inputs"][1]["currency"] = "KRW"
+    with pytest.raises(ValueError, match="KRW need an fx_conversions grant"):
+        parse_prepare_request(canonical_json_bytes(ungranted))
+    conversion = _krw_execution(body)
+    parsed, granted = project(body, definition, docs)
+    assert parsed.document["fx_conversions"] == (
+        {**conversion, "binding": {"role": "fx_conversion", "ordinal": 0}},
+    )
+    assert json.loads(granted.canonical_bytes)["fx_conversions"] == [conversion]
+    assert granted.request_hash != single.request_hash
+    # The stored semantic projection reads back exactly, conversion included.
+    request, again = parse_backtest_request(
+        granted.canonical_bytes, definition=definition, convention_documents=docs
+    )
+    assert again == granted
+    assert request.document["fx_conversions"] == parsed.document["fx_conversions"]
+    for schema in (PREPARE_REQUEST_SCHEMA, BACKTEST_REQUEST_SCHEMA):
+        assert "fx_conversions" not in cast("tuple[str, ...]", schema["required"])
+        assert "fx_conversions" in cast("Mapping[str, object]", schema["properties"])
+
+
+def _empty(body: Document) -> None:
+    body["fx_conversions"] = []
+
+
+def _unused(body: Document) -> None:
+    body["fx_conversions"].append(
+        {
+            "binding": _add_fx(body, 1),
+            "currency": "EUR",
+            "series_id": "EUR/USD",
+            "max_fixing_age_days": 0,
+            "signal_basis": "account_currency",
+        }
+    )
+
+
+def _unaddressed(body: Document) -> None:
+    _add_fx(body, 1)
+
+
+def _wrong_role(body: Document) -> None:
+    body["fx_conversions"][0]["binding"] = {"role": "macro", "ordinal": 0}
+
+
+def _wrong_series(body: Document) -> None:
+    body["fx_conversions"][0]["series_id"] = "EUR/KRW"
+
+
+def _wrong_basis(body: Document) -> None:
+    body["fx_conversions"][0]["signal_basis"] = "native"
+
+
+def _repeated(body: Document) -> None:
+    body["fx_conversions"].append(
+        {**body["fx_conversions"][0], "binding": _add_fx(body, 1), "series_id": "KRW/USD"}
+    )
+
+
+def _price_domain(body: Document) -> None:
+    body["bindings"] = [item for item in body["bindings"] if item["role"] != "fx_conversion"]
+    body["refs"] = [item for item in body["refs"] if item["ref_kind"] != "heads"]
+    _add_fx(body, domain="prices")
+
+
+def _without_grant(body: Document) -> None:
+    del body["fx_conversions"]
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (_empty, "omitted, not empty"),
+        (_unused, "exactly the non-account price currencies"),
+        (_unaddressed, "requires exactly one FX conversion"),
+        (_wrong_role, "own unique fx_conversion binding"),
+        (_wrong_series, "KRW/USD or USD/KRW"),
+        (_wrong_basis, "signal_basis"),
+        (_repeated, "two FX conversions convert one currency"),
+        (_price_domain, "domain does not serve its role"),
+        (_without_grant, "requires exactly one FX conversion"),
+    ],
+)
+def test_an_fx_conversion_grant_is_exact(change: Callable[[Document], None], message: str) -> None:
+    body, _, _ = fixture()
+    _krw_execution(body)
+    change(body)
+    with pytest.raises(ValueError, match=message):
+        parse_prepare_request(canonical_json_bytes(body))

@@ -21,13 +21,15 @@ rather than defaulted.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from types import MappingProxyType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
 from aegis_alpha.engine.codec import decode_json
+from aegis_alpha.engine.fx_conversion import FxConversion
 from aegis_alpha.storage.market_inputs import GenerationPin
 from aegis_alpha.storage.read_heads import HeadBinding, HeadPin
 
@@ -39,6 +41,7 @@ __all__ = [
     "EXECUTION_MODE",
     "FILL_CONVENTION",
     "OBSERVATION_NAMESPACE",
+    "OPTIONAL_GRANTS",
     "PANEL_SOURCES",
     "PREPARED_COMPOSITION_SCHEMA",
     "PREPARED_SCHEMA",
@@ -51,6 +54,8 @@ __all__ = [
     "DeclaredConventions",
     "DeclaredSemantics",
     "ExecutionTerms",
+    "FxGrant",
+    "MacroGrant",
     "MembershipRef",
     "ObservationPinRef",
     "PreparationRecord",
@@ -139,6 +144,18 @@ _OBSERVATION = frozenset(
     {"dataset_id", "version", "generation_id", "chain_hash", "manifest_hash", "observation_role"}
 )
 _PRICES = frozenset({"pins", "excluded_flags"})
+# Grants a declaration carries only when it uses them. Absent, the declaration's bytes and
+# digest are those of a declaration written before the grant existed.
+OPTIONAL_GRANTS = ("macro", "fx_conversions")
+_MACRO = frozenset({"series_id", "unit", "binding"})
+_MACRO_BINDING = frozenset({"domain", "pins", "excluded_flags"})
+_MACRO_DOMAINS = frozenset({"macro_observations", "fx_rates"})
+_FX_SERIES = re.compile(r"[A-Z]{3}/[A-Z]{3}")
+_FX = frozenset({"currency", "series_id", "max_fixing_age_days", "signal_basis", "binding"})
+# An FX grant may also name the canonical price binding its currency's bars come from, so a
+# run over two markets reads each market's chain: the declaration's own prices binding
+# carries the account-currency bars, and each grant's binding carries its currency's.
+_FX_PRICES = "prices"
 _PRICE_PIN = frozenset(
     {"dataset_id", "version", "generation_id", "chain_hash", "manifest_hash", "from", "to"}
 )
@@ -251,6 +268,34 @@ class Composition:
 
 
 @dataclass(frozen=True, slots=True)
+class MacroGrant:
+    """One macro series a declaration grants its sleeves, and the head binding it is read from.
+
+    A sleeve whose contract reads a macro signal is fed this series and nothing else: the
+    declaration names exactly the series the sleeves require, each with the unit its rows
+    must carry. An FX fixing is a macro series named ``BASE/QUOTE`` whose unit is the quote
+    currency.
+    """
+
+    series_id: str
+    unit: str
+    binding: HeadBinding
+
+
+@dataclass(frozen=True, slots=True)
+class FxGrant:
+    """One granted conversion of canonical prices into the declared account currency.
+
+    ``binding`` holds the fixings. ``prices``, when present, is the canonical price
+    binding whose bars are in the converted currency, read beside the declaration's own.
+    """
+
+    conversion: FxConversion
+    binding: HeadBinding
+    prices: HeadBinding | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class Window:
     """An inclusive date window, start before end."""
 
@@ -286,6 +331,13 @@ class PreparationRecord:
     # The aas-head-read-v1 receipt of the canonical price read, for a price-pinned run.
     # None for an observation run, whose panels are not read through read_heads.
     head_read: Mapping[str, object] | None = None
+    # Every read of a granted macro series: its admission and each decision's read, with
+    # the receipt read_heads returned. Empty when the declaration grants no macro series.
+    macro_reads: tuple[Mapping[str, object], ...] = ()
+    # Each granted FX conversion as applied (its terms, binding and the fixing used for
+    # every converted session) and the fixing reads behind it.
+    fx_conversions: tuple[Mapping[str, object], ...] = ()
+    fx_reads: tuple[Mapping[str, object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,6 +430,10 @@ class ResearchRunRequest:
     # The canonical price binding a price-pinned declaration reads both panels from.
     # Exactly one of this and observations is present.
     prices: HeadBinding | None = None
+    # The macro series granted to the sleeves, ordered by series, and the FX conversions
+    # granted to the price panels, ordered by currency. Empty when not declared.
+    macro: tuple[MacroGrant, ...] = ()
+    fx_conversions: tuple[FxGrant, ...] = ()
 
     @property
     def panel_source(self) -> str:
@@ -405,6 +461,8 @@ def _root(value: object, allowed: frozenset[str]) -> dict[str, object]:
         if "observations" in value:
             raise ResearchRunError("request names both observations and prices")
         allowed = (allowed - {"observations"}) | {"prices"}
+    if isinstance(value, dict):
+        allowed |= frozenset(name for name in OPTIONAL_GRANTS if name in value)
     return _object(value, "request", allowed)
 
 
@@ -465,12 +523,16 @@ def _prices(value: object) -> HeadBinding:
     ignores time-rule grants there; a grant here would be recorded as if it decided
     something. Flag exclusions do decide what is read and are declared.
     """
-    block = _object(value, "prices", _PRICES)
+    return _head_binding(_object(value, "prices", _PRICES), "prices", "prices")
+
+
+def _head_binding(block: dict[str, object], field: str, domain: str) -> HeadBinding:
+    """A research head binding: ordered exact pins with contiguous cutovers, no grants."""
     if not isinstance(block["pins"], list) or not block["pins"]:
-        raise ResearchRunError("prices pins must be a non-empty array")
+        raise ResearchRunError(field + " pins must be a non-empty array")
     pins = []
     for index, entry in enumerate(block["pins"]):
-        row = _object(entry, "prices pins[" + str(index) + "]", _PRICE_PIN)
+        row = _object(entry, field + " pins[" + str(index) + "]", _PRICE_PIN)
         bounds = []
         for name in ("from", "to"):
             bound = row[name]
@@ -478,12 +540,12 @@ def _prices(value: object) -> HeadBinding:
                 bounds.append(None)
                 continue
             try:
-                bounds.append(date.fromisoformat(_text(bound, "prices pin " + name)))
+                bounds.append(date.fromisoformat(_text(bound, field + " pin " + name)))
             except ValueError as error:
-                raise ResearchRunError("prices pin " + name + " must be an ISO date") from error
+                raise ResearchRunError(field + " pin " + name + " must be an ISO date") from error
         pin = GenerationPin(
             _text(row["dataset_id"], "dataset_id"),
-            _exact_version(row["version"], "price version"),
+            _exact_version(row["version"], field + " version"),
             _text(row["generation_id"], "generation_id"),
             _digest(row["chain_hash"], "chain_hash"),
             _digest(row["manifest_hash"], "manifest_hash"),
@@ -491,18 +553,96 @@ def _prices(value: object) -> HeadBinding:
         try:
             pins.append(HeadPin(pin, bounds[0], bounds[1]))
         except ValueError as error:
-            raise ResearchRunError("prices pin " + str(error)) from error
+            raise ResearchRunError(field + " pin " + str(error)) from error
     flags = block["excluded_flags"]
     if not isinstance(flags, list):
-        raise ResearchRunError("prices excluded_flags must be an array")
+        raise ResearchRunError(field + " excluded_flags must be an array")
     try:
         return HeadBinding(
-            "prices",
+            domain,
             tuple(pins),
             excluded_flags=tuple(_text(flag, "excluded flag") for flag in flags),
         )
     except ValueError as error:
-        raise ResearchRunError("prices binding: " + str(error)) from error
+        raise ResearchRunError(field + " binding: " + str(error)) from error
+
+
+def _macro(value: object) -> tuple[MacroGrant, ...]:
+    """The macro series a declaration grants: unique, ordered by series, each bound once.
+
+    Like the price binding, a macro binding declares no time-rule grants: the research
+    read is not strict point-in-time, so a grant would be recorded as if it decided
+    something. Each decision still reads the series at its own cutoff.
+    """
+    if not isinstance(value, list) or not value:
+        raise ResearchRunError("macro is omitted, not empty, when no series is granted")
+    grants = []
+    for index, entry in enumerate(value):
+        field = "macro[" + str(index) + "]"
+        row = _object(entry, field, _MACRO)
+        block = _object(row["binding"], field + " binding", _MACRO_BINDING)
+        domain = _text(block["domain"], field + " domain")
+        if domain not in _MACRO_DOMAINS:
+            raise ResearchRunError("macro binding domain must be macro_observations or fx_rates")
+        series = _text(row["series_id"], field + " series_id")
+        if domain == "fx_rates" and _FX_SERIES.fullmatch(series) is None:
+            raise ResearchRunError("an FX macro series is named BASE/QUOTE")
+        grants.append(
+            MacroGrant(
+                series,
+                _text(row["unit"], field + " unit"),
+                _head_binding(
+                    {key: block[key] for key in ("pins", "excluded_flags")}, field, domain
+                ),
+            )
+        )
+    names = [grant.series_id for grant in grants]
+    if names != sorted(set(names)):
+        raise ResearchRunError("macro series must be unique and ordered by series_id")
+    return tuple(grants)
+
+
+def _fx_conversions(value: object, account: str, source: str) -> tuple[FxGrant, ...]:
+    """The conversions of canonical prices into the account currency a declaration grants."""
+    if source != "prices":
+        raise ResearchRunError("fx_conversions convert canonical price pins")
+    if not isinstance(value, list) or not value:
+        raise ResearchRunError("fx_conversions is omitted, not empty, when no price is converted")
+    grants = []
+    for index, entry in enumerate(value):
+        field = "fx_conversions[" + str(index) + "]"
+        optional = {_FX_PRICES} if isinstance(entry, dict) and _FX_PRICES in entry else set()
+        row = _object(entry, field, _FX | optional)
+        age = row["max_fixing_age_days"]
+        try:
+            conversion = FxConversion(
+                _text(row["currency"], field + " currency"),
+                account,
+                _text(row["series_id"], field + " series_id"),
+                cast("int", age),
+                _text(row["signal_basis"], field + " signal_basis"),
+            )
+        except ValueError as error:
+            raise ResearchRunError(field + ": " + str(error)) from error
+        grants.append(
+            FxGrant(
+                conversion,
+                _head_binding(
+                    _object(row["binding"], field + " binding", _PRICES), field, "fx_rates"
+                ),
+                _head_binding(
+                    _object(row[_FX_PRICES], field + " prices", _PRICES),
+                    field + " prices",
+                    "prices",
+                )
+                if _FX_PRICES in row
+                else None,
+            )
+        )
+    currencies = [grant.conversion.currency for grant in grants]
+    if currencies != sorted(set(currencies)):
+        raise ResearchRunError("fx_conversions must be unique and ordered by currency")
+    return tuple(grants)
 
 
 def _instrument_map(value: object, *, source: str) -> Mapping[str, str]:
@@ -808,6 +948,14 @@ def _declared(
         schema_version=schema,
         composition=composition,
         prices=_prices(body["prices"]) if source == "prices" else None,
+        macro=_macro(body["macro"]) if "macro" in body else (),
+        fx_conversions=(
+            _fx_conversions(
+                body["fx_conversions"], _text(conventions["currency"], "currency"), source
+            )
+            if "fx_conversions" in body
+            else ()
+        ),
     )
 
 
@@ -903,6 +1051,41 @@ def _sealed_panels(
     }
 
 
+def _binding_record(binding: HeadBinding) -> dict[str, object]:
+    return {"binding_hash": binding.binding_hash, "binding": binding.document()}
+
+
+def _sealed_grants(
+    request: ResearchRunRequest, prepared: PreparationRecord
+) -> Mapping[str, object]:
+    """The macro and FX grants the run used and every read made under them.
+
+    Each key is present only when the declaration grants it, so a run without grants seals
+    the bytes it sealed before grants existed. A grant is recorded with its binding, and
+    each read with the receipt read_heads returned, so a reader can hold the run against
+    the store: which series and fixings, under which pins, at which cutoffs.
+    """
+    if bool(request.macro) != bool(prepared.macro_reads) or bool(request.fx_conversions) != bool(
+        prepared.fx_conversions
+    ):
+        raise ResearchRunError("a run seals the reads of exactly the grants it declares")
+    sealed: dict[str, object] = {}
+    if request.macro:
+        sealed["macro"] = {
+            "inputs": [
+                {"series_id": grant.series_id, "unit": grant.unit, **_binding_record(grant.binding)}
+                for grant in request.macro
+            ],
+            "head_reads": [dict(read) for read in prepared.macro_reads],
+        }
+    if request.fx_conversions:
+        sealed["fx_conversions"] = {
+            "conversions": [dict(item) for item in prepared.fx_conversions],
+            "head_reads": [dict(read) for read in prepared.fx_reads],
+        }
+    return sealed
+
+
 def declared_provenance(request: ResearchRunRequest, prepared: PreparationRecord) -> bytes:
     """The sealed record of one declared run: what was asserted, and what it produced.
 
@@ -942,6 +1125,7 @@ def declared_provenance(request: ResearchRunRequest, prepared: PreparationRecord
             },
             "composition": _sealed_composition(request, prepared),
             **_sealed_panels(request, prepared),
+            **_sealed_grants(request, prepared),
             "calendar": {
                 "calendar_id": request.calendar.calendar_id,
                 "basis": request.calendar.basis,
