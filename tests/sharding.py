@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import subprocess
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -33,6 +36,7 @@ _ROOT = WEIGHTS.parents[1]
 _SHARD = re.compile(r"([1-9][0-9]{0,2})/([1-9][0-9]{0,2})\Z")
 _MILLISECONDS = 1000
 _DEFAULT_TEST_MILLISECONDS = 1000
+_LANE_SELECTION = "not database"
 _SHARD_SUMMARY = pytest.StashKey[str]()
 _EMPTY_SHARD = pytest.StashKey[bool]()
 
@@ -193,6 +197,39 @@ def pytest_report_collectionfinish(config: pytest.Config) -> str | None:
     return config.stash.get(_SHARD_SUMMARY, None)
 
 
+def lane_files(names: Iterable[str]) -> frozenset[str]:
+    """The given test files that the database-free lane still collects tests from."""
+    names = sorted(names)
+    if not names:
+        return frozenset()
+    environment = {key: value for key, value in os.environ.items() if key != "PYTEST_ADDOPTS"}
+    result = subprocess.run(  # noqa: S603 - fixed interpreter, checked-in test paths
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "--collect-only",
+            "-q",
+            "-p",
+            "no:randomly",
+            "-p",
+            "no:cacheprovider",
+            "-m",
+            _LANE_SELECTION,
+            *names,
+        ],
+        cwd=_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    # 5: every given file is deselected, which is an answer, not a failure.
+    if result.returncode not in (pytest.ExitCode.OK, pytest.ExitCode.NO_TESTS_COLLECTED):
+        raise RuntimeError(f"collecting the lane selection failed:\n{result.stdout}{result.stderr}")
+    return frozenset(file_of(line) for line in result.stdout.splitlines() if "::" in line)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m tests.sharding")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -205,16 +242,18 @@ def main(argv: list[str] | None = None) -> int:
     merged = merge(arguments.inputs)
     if arguments.out.exists():
         # A shard that wrote or uploaded nothing would silently drop measured weights;
-        # only a weighed file that no longer exists may leave the table.
-        unmeasured = sorted(
+        # only a weighed file the lane no longer runs (deleted, renamed, or now wholly
+        # database-marked) may leave the table.
+        unmeasured = lane_files(
             name
             for name in read_seconds(arguments.out)
             if name not in merged and (_ROOT / name).exists()
         )
         if unmeasured:
             parser.error(
-                f"the inputs measure none of {len(unmeasured)} weighed test files that still "
-                f"exist, such as {unmeasured[0]}; pass every shard's durations"
+                f"the inputs measure none of {len(unmeasured)} weighed test files the "
+                f'-m "{_LANE_SELECTION}" lane still runs, such as {min(unmeasured)}; '
+                "pass every shard's durations from one run"
             )
     write_seconds(arguments.out, merged)
     return 0
