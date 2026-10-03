@@ -253,7 +253,7 @@ def verify_generation_bulk(
     """
     with _budgeted(connection, budget):
         chain = generation_chain(connection, generation_id)
-        _verify_links(chain)
+        verify_chain_links(chain)
         for index in range(len(chain)) if deep else (len(chain) - 1,):
             _verify_rows(connection, chain, index, budget)
         return chain[-1]
@@ -381,7 +381,7 @@ def _new_marker_head(
         raise ValueError("dataset version already identifies another generation")
     chain = generation_chain(connection, request.parent_id) if request.parent_id else []
     if chain:
-        _verify_links(chain)
+        verify_chain_links(chain)
         if chain[-1]["dataset_id"] != request.dataset_id or chain[-1]["domain"] != request.domain:
             raise ValueError("generation parent belongs to another dataset/domain")
     _check_revisions(
@@ -847,7 +847,7 @@ SELECT
             raise ValueError(message)
 
 
-def _verify_links(chain: list[dict[str, object]]) -> None:
+def verify_chain_links(chain: list[dict[str, object]]) -> None:
     """Each marker's chain hash follows from its parent's and its own recorded fields."""
     parent_hash: object = None
     expected_dataset = chain[-1]["dataset_id"]
@@ -875,7 +875,7 @@ def _verify_links(chain: list[dict[str, object]]) -> None:
             row_count=marker["row_count"],
         )
         if link != marker["chain_hash"]:
-            raise ValueError("market generation logical hash/count mismatch")
+            raise ValueError("market generation chain link mismatch")
         parent_hash = link
 
 

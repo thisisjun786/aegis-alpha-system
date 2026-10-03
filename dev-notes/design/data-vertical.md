@@ -19,7 +19,7 @@
 | L1 원천 자료실 | `sl_*` 테이블. 원래 열·값·행 순서를 그대로 보존하는 `source_only` 자료 | `storage/source_library*.py` |
 | L2 승격 | 승격 명세 → 매퍼 → head 비교 → 품질 flag → generation 게시 | `storage/promotion/` |
 | L3 저장 | `market.duckdb`의 typed generation과 `state.sqlite3`의 카탈로그·identity·품질·수집 기록 | `storage/market.py`, `storage/state.py`, `storage/identity.py` |
-| L4 소비 | exact pin, cutoff, grant로 head를 투영하는 reader와 실행 준비 | `storage/market_inputs.py`, `application/backtest_prepare.py` |
+| L4 소비 | exact pin, cutoff, grant로 head를 투영하는 reader와 실행 준비 | `storage/read_heads.py`, `storage/market_inputs.py`, `application/backtest_prepare.py` |
 
 원천 자료실에 있다는 사실은 PIT 자격이 아니다. 시점·식별·품질 규칙을 명시한 승격만 L1 자료를
 L3 generation으로 만든다. 13F 보유 내역, 애널리스트 추정치, 연구 산출물처럼 승격 대상 도메인이
@@ -271,11 +271,24 @@ generation을 pin할 수 있다(연말 세션 연장, 임시 휴장 SUPERSEDE). 
 그 행의 시점이 어느 규칙에서 왔는지 안다.
 
 `source_column`이 아닌 규칙에서 나온 시점을 strict PIT 경로에 쓸지는 소비자가 정한다.
-입력 binding이 허용하는 규칙 `id@version` 목록(grant)을 들고, 그 목록은 bundle hash에 포함된다.
-strict reader는 grant에 없는 규칙의 시점을 알 수 없는 시점으로 취급해 그 행을 고르지 않는다.
-inspection과 연구 모드는 grant 없이도 행을 읽는다. run 영수증은 사용한 grant를 그대로 기록한다.
+입력 binding(`aas-head-binding-v1`, [reader](#대량-게시와-reader))이 허용하는 규칙 `id@version`
+목록(grant)을 들고, 그 목록은 binding hash에 포함된다. strict reader는 grant에 없는 규칙의 시점을
+알 수 없는 시점(null)으로 취급한다. 그래서 그런 `revision_known_at_us`의 행은 고르지 않고, 그런
+`available_at_us`의 정정 행은 알려진 시점부터 이전 head를 지운다. `source_column@1`(기록된 원천 시각)과
+`unknown_null@1`(항상 null)은 grant가 필요 없다. inspection과 연구 모드는 grant 없이도 행을 읽는다.
+읽기 영수증(`aas-head-read-v1`)은 binding과 grant, generation마다 두 시점 열의 규칙, 그 읽기가
+기댄 규칙(`applied_rules`)과 막은 규칙(`withheld_rules`)을 기록하고, run은 그 영수증을 그대로 남긴다.
 규칙 하나를 허용하는 일은 그 규칙의 상한을 시점 근거로 받아들인다는 기록이며, 다른 규칙이나
 알 수 없는 시점을 허용하지 않는다.
+
+reader는 generation의 규칙 출처를 호출자에게서 받지 않고 그 generation의 보존 증거에서 읽는다.
+`dataset_versions.transform_hash`의 raw 문서가 `aas-promotion-v1` 명세이면 그 `time_rules`의 `rule`이
+출처다. 그 문서가 `aas-{price,sessions,proxy,observation}-transform-v1` 변환이거나 marker
+`request_hash`의 raw 문서가 봉인된 `aas-market-import-v1`이면 시점은 원천 열이나 문서에 기록된
+값이므로 `source_column@1`이다. 어느 것도 아닌 generation은 출처가 보존되지 않았으므로 읽지 않는다.
+raw에 없는 객체, 출처 형식의 크기 한도(64 MiB)를 넘는 객체, JSON 객체가 아닌 바이트만 "문서 없음"이다.
+주소와 hash가 다른 raw 객체는 손상으로 거부하고, 해석한 문서가 호출자 할당에 들어가지 않으면
+`ComputeResourceError`로 거부한다.
 
 ### revision 시점
 
@@ -334,8 +347,10 @@ quality_flags(generation_id, record_id, revision_id, rule_id, rule_version, flag
 - 같은 generation의 flag 행은 (record, revision, 규칙 ID, 규칙 버전, flag, detail)을 `aas-rowset-v1`으로
   따로 해시해 그 generation의 승격 manifest에 기록한다. flag를 추가·삭제하면 generation 검증이
   실패한다. flag 정정은 새 generation이다.
-- reader는 flag를 행과 함께 돌려준다. 소비자는 flag를 grant와 같은 방식으로 제외 목록에 둘 수 있고,
-  그 목록도 bundle hash와 run 영수증에 들어간다.
+- reader는 flag를 행과 함께 돌려준다. 소비자는 flag를 grant와 같은 방식으로 binding의 제외 목록에 둘
+  수 있고, 그 목록도 binding hash와 읽기 영수증에 들어간다. 제외한 flag가 달린 revision은 공개되지
+  않은 것으로 취급한다. 그 값은 고르지 않고, 그 revision이 알려진 시점부터 그것이 대체한 이전 head도
+  지운다. 이미 대체된 값을 대신 내주지 않기 위해서다. 연구 모드에서도 제외는 같다.
 
 | flag | 의미 |
 | --- | --- |
@@ -361,12 +376,16 @@ dataset 이름은 `<domain>.<market>.<provider>[.ref][.r<N>]`다. 한 dataset의
 않는다. `.ref`는 `price_role='reference'` 자료(공급자 조정 가격, 기준 지수)다.
 
 여러 공급자를 잇는 일은 소비자의 binding이 한다. 한 역할이 순서 있는 pin 목록을 들고 각 pin은
-`[from, to)` 날짜 구간을 가진다.
+`[from, to)` 날짜 구간을 가진다. 첫 pin의 `from`과 마지막 pin의 `to`만 열려 있을 수 있다.
 
-- 구간은 겹치지 않고 순서대로 이어진다. 각 날짜에는 정확히 한 pin만 적용된다.
-- 구간 밖의 날짜는 다른 pin으로 대체하지 않고 coverage에서 누락으로 보고한다.
+- 구간은 겹치지 않고 빈틈 없이 순서대로 이어진다(앞 pin의 `to`가 다음 pin의 `from`). 각 날짜에는
+  정확히 한 pin만 적용되고, pin은 자기 구간 밖의 행을 돌려주지 않는다.
+- 같은 generation이 떨어진 두 구간의 pin이 될 수 있다(정규 공급자 → 공백 기간의 보충 공급자 → 정규
+  공급자). 투영은 pin 순번마다 따로 한다.
+- pin 구간 안의 날짜에 그 pin의 head가 없으면 다른 pin으로 대체하지 않고 누락(`missing_<domain>`)으로,
+  어느 pin도 덮지 않는 날짜는 `outside_cutover`로 coverage에 보고한다.
 - 같은 날짜에 두 공급자 값을 섞거나 평균내지 않는다.
-- cutover 날짜와 pin 목록은 bundle hash에 포함된다. 공급자를 바꾸려면 새 binding을 만든다.
+- cutover 날짜와 pin 목록은 binding hash에 포함된다. 공급자를 바꾸려면 새 binding을 만든다.
 
 FX처럼 여러 원천이 같은 시계열을 내는 경우에도 우선순위는 같은 방식으로 소비자 pin이 정한다.
 
@@ -520,9 +539,44 @@ identity 문서로 투영한다. 선택한 assertion마다 member 하나이고, 
   1e7행을 게시할 때는 16 GiB 할당이 필요했다(RSS 약 9.7 GiB). 따라서 수천만 행 테이블의 백필과
   유지보수 게시는 기본 할당으로 끝나지 않는다. 색인 제거(다음 core 버전) 또는 기록된 더 큰 할당 grant
   중 하나를 Linear AAS-54에서 결정하며, 대량 승격(대응표 DV-75)은 그 결정 뒤에 한다.
-- `read_heads(pins, domain, instruments?, date_range?, cutoffs, roles, granted_rules)`는
-  `QUALIFY row_number()`로 head를 투영하며 기존 `project_heads`와 결과가 같다. ordered pin과
-  cutover를 해석한다.
+- `storage/read_heads.py`의 `read_heads(connection, binding, query, time_rules, budget)`가 pin한
+  chain들의 head를 DuckDB 안에서 투영한다. 작업 공간 진입점은 `market_inputs.load_pinned_heads`이며,
+  각 generation이 marker와 같은 committed catalog 버전인지 확인하고 시간 규칙 출처를 보존 증거에서
+  읽은 뒤 `read_heads`를 부른다.
+  - binding(`HeadBinding`)은 도메인 하나, `[from, to)` cutover 구간을 가진 순서 있는 exact pin 목록,
+    grant 목록, flag 제외 목록이다. 정규 JSON 문서 `{"schema": "aas-head-binding-v1", "domain",
+    "pins": [{"dataset_id", "version", "generation_id", "chain_hash", "manifest_hash", "from", "to"}],
+    "granted_rules", "excluded_flags"}`(목록은 정렬)의 SHA-256이 binding hash다.
+  - query(`HeadQuery`)는 cutoff, 수집 cutoff, subject 목록, 날짜 구간, 가격 역할, coverage 격자다.
+    cutoff가 있으면 strict PIT, 없으면 연구 모드다. subject는 도메인의 주체 열(가격은
+    `instrument_id`, 달력은 `calendar_id`, 재무·공시는 `issuer_id`, 거시는 `series_id`, FX는
+    `base/quote`, 분류는 `subject_id`), 날짜는 도메인의 날짜 열(가격·달력은 `session_date`, 기업행동은
+    `effective_date`, 재무는 `period_end`, 공시는 `filed_date`, `*_us` 열은 UTC 날짜)이다.
+  - 투영은 `project_heads`와 같다. 행마다 `project_heads`가 head를 두거나(set) 지우거나(pop) 넘기는
+    판정을 SQL로 계산하고, `(pin, record_id)`마다 generation 순서로 마지막 판정 하나를
+    `QUALIFY row_number()`로 고른다. 자연키 열에 대한 필터와 pin 구간은 투영 전에 scan으로 내려가고,
+    자연키가 아닌 날짜(기업행동 `effective_date` 등)는 revision이 그 날짜를 옮길 수 있으므로 투영한
+    head에 적용한다.
+  - 읽기 전에 pin이 marker와 같은지, chain의 모든 link가 기록된 hash로 다시 계산되는지, generation마다
+    행 수가 marker와 같은지 확인한다. 행 값까지 다시 해시하려면 `rehash=True`(`verify_generation_bulk`
+    deep)를 쓰고, 정기 확인은 `aas db verify`가 맡는다.
+  - 결과를 fetch하기 전에 같은 투영의 행 수와 텍스트 길이를 SQL로 재어 호출자 할당의 비DuckDB 몫과
+    비교하고, 넘으면 `ComputeResourceError`다. DuckDB 몫은 연결 한도로 제한한다.
+  - 결과는 head 행(pin 번호, 도메인 값, 그 revision의 quality flag), 격자를 준 경우의 coverage, 읽기
+    영수증이다. 영수증 `aas-head-read-v1`은 `binding`, `binding_hash`, `query`, `mode`,
+    `time_rules`(`[pin, generation_id, available 규칙, known 규칙]` 목록), `applied_rules`,
+    `withheld_rules`, `rehashed`(모든 delta를 다시 해시했는지; 거짓이면 구조 확인만 한 읽기),
+    `heads`(행 수), `heads_hash`(`[pin, record_id, revision_id]` 목록의 정규 JSON SHA-256)를 가진 정규
+    JSON이고, 그 SHA-256이 영수증 hash다.
+  - coverage 이유는 `ungranted_time_rule`, `flag_excluded`, `outside_cutover`, `tombstone`,
+    `unknown_<domain>_evidence`, `<domain>_unavailable`, `reference_price`, `missing_<domain>`과
+    head의 `value_state`다(가격은 `price`, 달력은 `session`). head가 없는 record의 이유는
+    `market_inputs`의 strict reader와 같게, cutoff까지 알려진 마지막 revision이 정한다. 그 revision의
+    공개 시점이 null이면 `unknown_<domain>_evidence`, cutoff 뒤면 `<domain>_unavailable`이다. head를
+    돌려준 칸에도 grant가 막은 정정이나 제외한 revision이 있으면 `ungranted_time_rule`이나
+    `flag_excluded`를 남기고, 칸은 present로 둔다. 한 칸에 record가 여럿이면(같은 날짜의 canonical과
+    reference 가격) head를 준 record의 이유만 그 칸의 이유다. 달력 칸은 개장한 session만 present이고
+    휴장 session은 `session_closed`다. 격자의 칸은 결과 행과 함께 fetch 전 할당 검사에 포함된다.
 - 분할조정·총수익 가격은 reader가 unadjusted 가격과 cutoff 시점까지 알려진 `corporate_actions`로
   계산한다. 공급자 조정 가격은 reference로만 남는다.
 
@@ -622,13 +676,13 @@ state v2:
 | DV-18 | 시간 규칙은 수집 시각으로 null을 채우지 않고 근거가 없으면 null이다 | `tests/storage/test_time_rules.py::test_rules_never_fill_null_from_ingestion` | 구현 |
 | DV-19 | `session_close_plus_lag@1`은 pin한 세션 종료 + lag이며 세션이 없으면 null이다 | `tests/storage/test_time_rules.py::test_session_close_plus_lag` | 구현 |
 | DV-20 | `local_day_end@1`은 현지 날짜 끝이며 `time_precision_day` flag를 단다 | `tests/storage/test_time_rules.py::test_local_day_end_flags_day_precision` | 구현 |
-| DV-21 | grant에 없는 규칙의 시점은 strict에서 제외되고 영수증에 grant가 남는다 | `tests/storage/test_read_heads.py::test_ungranted_rule_rows_excluded_from_strict` | 예정 |
+| DV-21 | grant에 없는 규칙의 시점은 strict에서 제외되고 영수증에 grant가 남는다 | `tests/storage/test_read_heads.py::test_ungranted_rule_rows_excluded_from_strict` | 구현 |
 | DV-22 | `krw_tick@1`은 정확한 십진 전개를 원 단위로 HALF_EVEN 반올림하고 flag를 단다 | `tests/storage/test_decimal_rules.py::test_krw_tick_rounds_half_even_and_flags` | 구현 |
 | DV-23 | 숫자 규칙의 SQL 결과와 Python 결과가 같다 | `tests/storage/test_decimal_rules.py::test_sql_and_python_rounding_parity` | 구현 |
 | DV-24 | flag는 값을 바꾸지 않고 generation manifest에 해시로 고정된다 | `tests/storage/test_promotion_engine.py::test_quality_flags_are_hashed_with_generation` | 구현 |
 | DV-25 | 대량 게시의 delta·chain hash는 Python `aas-rowset-v1` 경로와 같다 | `tests/storage/test_bulk_generation.py::test_streaming_hash_matches_python_rowset` | 구현 |
-| DV-26 | `read_heads`는 `project_heads`와 같은 head를 돌려준다 | `tests/storage/test_read_heads.py::test_read_heads_matches_project_heads` | 예정 |
-| DV-27 | cutover 구간 밖 날짜는 다른 pin으로 채우지 않고 누락으로 보고한다 | `tests/storage/test_read_heads.py::test_cutover_gap_is_reported_not_filled` | 예정 |
+| DV-26 | `read_heads`는 `project_heads`와 같은 head를 돌려준다 | `tests/storage/test_read_heads.py::test_read_heads_matches_project_heads` | 구현 |
+| DV-27 | cutover 구간 밖 날짜는 다른 pin으로 채우지 않고 누락으로 보고한다 | `tests/storage/test_read_heads.py::test_cutover_gap_is_reported_not_filled` | 구현 |
 | DV-28 | 유도 조정 가격은 cutoff 이후 기업행동을 쓰지 않는다 | `tests/storage/test_read_heads.py::test_adjustment_ignores_actions_after_cutoff` | 예정 |
 | DV-29 | 티커로 instrument를 만들 수 없다 | `tests/storage/test_identity_mint.py::test_ticker_anchor_is_refused` | 구현 |
 | DV-30 | v1→v2 migration은 백업 없이 거부하고 중단 후 재개한다 | `tests/storage/test_migration.py::test_migration_requires_backup_and_resumes` | 구현 |
@@ -652,7 +706,7 @@ state v2:
 | DV-48 | `float_shortest@1`은 소수 12자리를 넘으면 HALF_EVEN으로 반올림하고 범위를 넘는 값은 거부한다 | `tests/storage/test_decimal_rules.py::test_float_shortest_rounds_half_even_and_rejects_overflow` | 구현 |
 | DV-49 | 매퍼는 자연키가 겹치는 원천 행을 거부한다 | `tests/storage/test_promotion_engine.py::test_mapper_rejects_overlapping_natural_keys` | 구현 |
 | DV-50 | identity로 해석하지 못한 행은 승격하지 않고 미해결 보고에 남는다 | `tests/storage/test_promotion_engine.py::test_unresolved_identity_rows_are_reported_not_promoted` | 구현 |
-| DV-51 | flag 제외 목록은 bundle hash와 run 영수증에 들어간다 | `tests/storage/test_read_heads.py::test_flag_exclusions_enter_bundle_hash_and_receipt` | 예정 |
+| DV-51 | flag 제외 목록은 binding hash와 읽기 영수증에 들어가고, 제외한 revision은 알려진 시점부터 이전 head를 지운다 | `tests/storage/test_read_heads.py::test_flag_exclusions_enter_bundle_hash_and_receipt` | 구현 |
 | DV-52 | `cross_provider_mismatch`는 명세의 허용오차를 넘을 때만 달린다 | `tests/storage/test_promotion_engine.py::test_cross_provider_mismatch_uses_spec_tolerance` | 구현 |
 | DV-53 | 같은 parent에 다른 요청이 먼저 게시되면 부모 CAS가 실패한다 | `tests/storage/test_promotion_engine.py::test_competing_request_fails_parent_cas` | 구현 |
 | DV-54 | migration-incomplete 설치본은 정상으로 열리지 않는다 | `tests/storage/test_migration.py::test_incomplete_migration_refuses_normal_open` | 구현 |
@@ -677,10 +731,18 @@ state v2:
 | DV-73 | 대량 게시의 Python 배치 과금은 가장 넓은 행으로 정해지고 행 수와 무관하다. DuckDB 몫은 포함하지 않는다 | `tests/storage/test_bulk_generation.py::test_python_batch_charge_is_independent_of_row_count` | 구현 |
 | DV-74 | DuckDB가 할당 안에서 끝내지 못한 대량 게시는 marker와 행을 남기지 않고 `ComputeResourceError`가 된다 | `tests/storage/test_bulk_generation.py::test_duckdb_exhaustion_rolls_back_as_a_budget_error` | 구현 |
 | DV-75 | 수천만 행 도메인 테이블에 유지보수 generation을 기본 할당 또는 기록된 할당 grant 안에서 게시한다 | `tests/storage/test_bulk_generation.py::test_maintenance_publication_fits_a_large_table` | 예정 |
-| DV-76 | 승격 `--plan`은 같은 계산을 보고하고 저장소에 아무것도 쓰지 않는다 | `tests/storage/test_promotion_cli.py::test_promote_plan_writes_nothing_and_apply_publishes` | 구현 |
-| DV-77 | `eodhd.bars@1`은 합성 원천 fixture를 독립 기대값과 같은 도메인 열로 옮긴다 | `tests/storage/test_promotion_mappers.py::test_eodhd_bars_maps_synthetic_fixture` | 구현 |
-| DV-78 | 같은 chain의 승격은 달력 pin을 parent 달력 generation의 후손으로 옮길 수 있고 다른 달력 dataset의 pin은 거부된다 | `tests/storage/test_promotion_engine.py::test_calendar_descendant_extends_chain` | 구현 |
-| DV-79 | `cross_provider_mismatch`는 role을 뺀 가격 키가 같은 기준 행과만 비교하고 revision마다 flag를 하나만 단다 | `tests/storage/test_promotion_engine.py::test_cross_provider_matches_one_reference_per_key` | 구현 |
-| DV-80 | `krw_tick@1`은 KRW가 아닌 행의 값을 반올림하지 않고 숫자 거부로 보고한다 | `tests/storage/test_promotion_engine.py::test_krw_tick_refuses_non_krw_rows` | 구현 |
-| DV-81 | 부재는 전체 snapshot pin의 행으로만 판단하고 범위 안의 다른 pin 행은 계획 거부로 보고된다 | `tests/storage/test_promotion_engine.py::test_absence_is_proven_by_the_full_snapshot_only` | 구현 |
-| DV-82 | watermark의 version은 시각을 앞으로 옮긴 generation만 바꾼다 | `tests/storage/test_promotion_engine.py::test_watermark_version_follows_its_time` | 구현 |
+| DV-76 | `aas-head-binding-v1` binding hash와 `aas-head-read-v1` 영수증 형식은 고정 입력과 기대 값으로 고정돼 있다 | `tests/storage/test_read_heads.py::test_head_binding_and_receipt_formats_are_frozen` | 구현 |
+| DV-77 | `read_heads`는 pin이 marker와 다르거나 chain link·행 수가 맞지 않으면 행을 읽지 않고, `rehash`는 모든 delta를 다시 해시한다 | `tests/storage/test_read_heads.py::test_pins_are_verified_before_rows_are_read` | 구현 |
+| DV-78 | generation의 시간 규칙 출처는 보존 증거(승격 명세, 연구 변환, 봉인 import 문서)에서 오고, 출처가 없거나 catalog에 없는 pin은 읽지 않는다 | `tests/storage/test_read_heads.py::test_time_rule_provenance_comes_from_retained_evidence` | 구현 |
+| DV-79 | `read_heads`는 fetch 전에 결과 크기를 SQL로 재어 할당을 넘으면 `ComputeResourceError`로 거부한다 | `tests/storage/test_read_heads.py::test_head_read_is_admitted_before_rows_are_fetched` | 구현 |
+| DV-80 | inspection·연구 읽기는 grant와 무관하고 grant 하나는 그 규칙의 시점만 strict에 허용한다 | `tests/storage/test_read_heads.py::test_rule_grant_changes_strict_reads_only` | 구현 |
+| DV-81 | strict 실행 준비는 사용한 `read_heads` 읽기 영수증을 run에 그대로 기록한다 | `tests/application/test_backtest_prepare.py::test_strict_preparation_records_head_read_receipt` | 예정 |
+| DV-82 | pin 하나의 strict 읽기는 `market_inputs` strict reader와 같은 coverage 이유를 보고한다 | `tests/storage/test_read_heads.py::test_coverage_reasons_match_market_inputs` | 구현 |
+| DV-83 | 여러 pin의 읽기는 각 pin chain의 `project_heads`를 그 pin 구간으로 거른 것과 같다 | `tests/storage/test_read_heads.py::test_multi_pin_reads_match_each_pin_projection` | 구현 |
+| DV-84 | 승격 `--plan`은 같은 계산을 보고하고 저장소에 아무것도 쓰지 않는다 | `tests/storage/test_promotion_cli.py::test_promote_plan_writes_nothing_and_apply_publishes` | 구현 |
+| DV-85 | `eodhd.bars@1`은 합성 원천 fixture를 독립 기대값과 같은 도메인 열로 옮긴다 | `tests/storage/test_promotion_mappers.py::test_eodhd_bars_maps_synthetic_fixture` | 구현 |
+| DV-86 | 같은 chain의 승격은 달력 pin을 parent 달력 generation의 후손으로 옮길 수 있고 다른 달력 dataset의 pin은 거부된다 | `tests/storage/test_promotion_engine.py::test_calendar_descendant_extends_chain` | 구현 |
+| DV-87 | `cross_provider_mismatch`는 role을 뺀 가격 키가 같은 기준 행과만 비교하고 revision마다 flag를 하나만 단다 | `tests/storage/test_promotion_engine.py::test_cross_provider_matches_one_reference_per_key` | 구현 |
+| DV-88 | `krw_tick@1`은 KRW가 아닌 행의 값을 반올림하지 않고 숫자 거부로 보고한다 | `tests/storage/test_promotion_engine.py::test_krw_tick_refuses_non_krw_rows` | 구현 |
+| DV-89 | 부재는 전체 snapshot pin의 행으로만 판단하고 범위 안의 다른 pin 행은 계획 거부로 보고된다 | `tests/storage/test_promotion_engine.py::test_absence_is_proven_by_the_full_snapshot_only` | 구현 |
+| DV-90 | watermark의 version은 시각을 앞으로 옮긴 generation만 바꾼다 | `tests/storage/test_promotion_engine.py::test_watermark_version_follows_its_time` | 구현 |
