@@ -1242,6 +1242,7 @@ state v2:
 | DV-166 | 값·날짜·순서·지수 이름이 정규가 아닌 쌍은 이유와 함께 통째로 거부하고, 등록되지 않은 asset ID는 미해결로 보고한다 | `tests/storage/test_universe.py::test_index_pairs_with_unreadable_values_are_refused` | 구현 |
 | DV-167 | 지수 universe는 chunked 문서로 등록되고 재등록은 같은 pin이며, 읽기와 `aas db verify`를 통과한다 | `tests/storage/test_universe.py::test_index_universes_register_and_read_back` | 구현 |
 | DV-168 | 상장 universe의 member는 master 행의 `first_date`부터 `last_date` 다음 날까지이고 `last_date` 없는 상장 행은 `through`까지다 | `tests/storage/test_universe.py::test_listing_universe_spans_each_master_listing` | 구현 |
-| DV-169 | universe part는 원천별로 채우고, 원천 순서가 맞아도 두 part에 걸친 같은 member key는 읽기와 verify에서 거부한다 | `tests/storage/test_universe.py::test_universe_parts_are_filled_source_by_source`, `tests/storage/test_universe.py::test_a_member_key_repeated_across_parts_is_refused` | 구현 |
+| DV-169 | universe part는 원천별로 채우고 읽기는 member를 정규 순서로 돌려준다 | `tests/storage/test_universe.py::test_universe_parts_are_filled_source_by_source` | 구현 |
 | DV-170 | `aas universe --plan`은 쓰지 않고, 만들 수 없는 `--report` 경로는 등록 전에 거부하며, 등록한 universe를 `aas universe show`가 읽는다 | `tests/storage/test_universe.py::test_universe_cli_plans_registers_and_shows` | 구현 |
 | DV-171 | 두 원천이 실은 쌍은 한 사본이 다른 이유로 거부돼도 나머지 사본을 받지 않고 `pair_repeated`로 거부한다 | `tests/storage/test_universe.py::test_a_pair_two_sources_carry_is_refused_when_one_copy_is_refused` | 구현 |
+| DV-172 | 원천 순서가 맞아도 두 part에 걸친 같은 member key는 읽기와 verify에서 거부한다 | `tests/storage/test_universe.py::test_a_member_key_repeated_across_parts_is_refused` | 구현 |
