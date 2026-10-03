@@ -76,21 +76,26 @@ def _store(path: Path) -> duckdb.DuckDBPyConnection:
 def _price(rng: random.Random, subject: str, day: date, role: str) -> Row:
     present = rng.random() < 0.85
     close = Decimal(rng.randrange(1, 10_000)) / 100 if present else None
-    return {
+    # A reference row may carry its close alone (a v2 ``fields='close'`` row).
+    alone = role == "reference" and rng.random() < 0.4
+    row: Row = {
         "instrument_id": subject,
         "session_date": day,
         "interval": "1d",
         "bar_end_us": (day - date(1970, 1, 1)).days * 86_400_000_000,
         "basis": "unadjusted",
         "currency": "USD",
-        "open": close,
-        "high": close,
-        "low": close,
+        "open": None if alone else close,
+        "high": None if alone else close,
+        "low": None if alone else close,
         "close": close,
-        "volume": Decimal(rng.randrange(1, 1000)) if present else None,
+        "volume": None if alone or not present else Decimal(rng.randrange(1, 1000)),
         "price_role": role,
         "value_state": "present" if present else "missing",
     }
+    if alone:
+        row["fields"] = "close"
+    return row
 
 
 def _session(rng: random.Random, subject: str, day: date, _role: str) -> Row:

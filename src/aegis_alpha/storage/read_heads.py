@@ -617,6 +617,19 @@ def _events(query: HeadQuery, reference: str, params: dict[str, object]) -> _Eve
     )
 
 
+def _columns(connection: duckdb.DuckDBPyConnection, domain: str) -> tuple[list[str], bool]:
+    """The columns a read selects and whether the store holds v2 quality flags.
+
+    A v2 store adds which price fields a row carries, so a close-only reference bar keeps
+    ``fields``; an OHLCV row drops it again when fetched.
+    """
+    names = [name for name, _ in COMMON + DOMAINS[domain]]
+    flags = market_version(connection) >= 2  # noqa: PLR2004 -- fields and quality_flags arrive in v2
+    if domain == "prices" and flags:
+        names.append(PRICE_FIELDS[0])
+    return names, flags
+
+
 def _projection(
     connection: duckdb.DuckDBPyConnection,
     binding: HeadBinding,
@@ -626,10 +639,7 @@ def _projection(
     held: bool = False,
 ) -> _Projection:
     domain = binding.domain
-    names = [name for name, _ in COMMON + DOMAINS[domain]]
-    flags = market_version(connection) >= 2  # noqa: PLR2004 -- fields and quality_flags arrive in v2
-    if domain == "prices" and flags:
-        names.append(PRICE_FIELDS[0])
+    names, flags = _columns(connection, domain)
     pre, post = _filters(binding, query, params)
     excluded_cte, excluded_join, excluded = _exclusion(binding, flags=flags, params=params)
     flag_cte, flag_join, flag_select = _flagged(flags=flags)
@@ -1068,7 +1078,7 @@ def read_revisions(  # noqa: PLR0913 -- binding, query and the caller-owned reso
     if DOMAIN_VERSIONS[binding.domain] > market_version(connection):
         raise ValueError(f"the {binding.domain} domain needs aas db migrate --to 2")
     domain = binding.domain
-    names = [name for name, _ in COMMON + DOMAINS[domain]]
+    names, flags = _columns(connection, domain)
     try:
         limit_duckdb(connection, budget)
         chains = _verify_pins(connection, binding, time_rules, budget=budget, rehash=rehash)
@@ -1076,7 +1086,6 @@ def read_revisions(  # noqa: PLR0913 -- binding, query and the caller-owned reso
         pre, post = _filters(binding, query, params)
         if post:
             raise ValueError("a revision read filters natural-key columns only")
-        flags = market_version(connection) >= 2  # noqa: PLR2004 -- quality_flags arrive in v2
         excluded_cte, excluded_join, excluded = _exclusion(binding, flags=flags, params=params)
         selected = ", ".join(f'"{name}"' for name in names)
         sql = f"""
