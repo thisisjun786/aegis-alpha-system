@@ -18,6 +18,10 @@ from aegis_alpha.data.qveris_store import QverisStore
 from aegis_alpha.data.serialization import canonical_json_bytes
 from tests.data.test_qveris_acquisition import PRICE, FakeQveris, eod_job, fred_job
 
+# Serial: these tests take the host-wide Qveris account lease (an abstract Unix socket named by
+# the account), so every file that takes it runs in one xdist worker.
+pytestmark = pytest.mark.xdist_group("qveris-account-lease")
+
 
 def jobs(count: int = 4) -> tuple[QverisJob, ...]:
     return tuple(

@@ -36,6 +36,10 @@ from tests.data.qveris_support import (
 )
 from tests.data.test_qveris_acquisition import fred_job
 
+# Serial: these tests take the host-wide Qveris account lease (an abstract Unix socket named by
+# the account), so every file that takes it runs in one xdist worker.
+pytestmark = pytest.mark.xdist_group("qveris-account-lease")
+
 BARS = [
     "instrument_id",
     "venue",

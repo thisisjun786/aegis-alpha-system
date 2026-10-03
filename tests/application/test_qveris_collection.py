@@ -13,6 +13,10 @@ from aegis_alpha.application.provider_config import CollectionConfig, ProviderPr
 from aegis_alpha.application.qveris_collection import run_qveris_profile
 from aegis_alpha.data.serialization import canonical_json_bytes
 
+# Serial: these tests take the host-wide Qveris account lease (an abstract Unix socket named by
+# the synthetic account), so every file that takes it runs in one xdist worker.
+pytestmark = pytest.mark.xdist_group("qveris-account-lease")
+
 
 def profile(tmp_path: Path) -> ProviderProfile:
     jobs = tmp_path / "jobs.json"

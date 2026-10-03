@@ -10,6 +10,10 @@ from test_qveris_acquisition import FakeQveris, eod_job
 from aegis_alpha.data.qveris import InvocationBudget, RequestBudgetPort
 from aegis_alpha.data.qveris_acquisition import acquire_jobs
 
+# Serial: these tests take the host-wide Qveris account lease (an abstract Unix socket named by
+# the synthetic account), so every file that takes it runs in one xdist worker.
+pytestmark = pytest.mark.xdist_group("qveris-account-lease")
+
 
 def test_credit_bound_prevents_intent_and_paid_execution(tmp_path: Path) -> None:
     client = FakeQveris()

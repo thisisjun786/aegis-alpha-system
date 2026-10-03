@@ -2,8 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from aegis_alpha.data.qveris_batch import collect_cohort
 from tests.data.test_qveris_acquisition import FakeQveris, eod_job, fred_job
+
+# Serial: these tests take the host-wide Qveris account lease (an abstract Unix socket named by
+# the account), so every file that takes it runs in one xdist worker.
+pytestmark = pytest.mark.xdist_group("qveris-account-lease")
 
 
 def test_cohort_continues_after_known_uncharged_failure_and_reuses_success(tmp_path: Path) -> None:

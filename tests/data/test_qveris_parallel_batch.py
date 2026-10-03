@@ -12,6 +12,10 @@ from aegis_alpha.data.qveris_contracts import QverisJob
 from aegis_alpha.data.serialization import canonical_json_bytes
 from tests.data.test_qveris_acquisition import FakeQveris, eod_job
 
+# Serial: these tests take the host-wide Qveris account lease (an abstract Unix socket named by
+# the account), so every file that takes it runs in one xdist worker.
+pytestmark = pytest.mark.xdist_group("qveris-account-lease")
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 

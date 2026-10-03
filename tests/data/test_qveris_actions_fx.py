@@ -25,6 +25,10 @@ from tests.data.qveris_support import (
     history_job,
 )
 
+# Serial: these tests take the host-wide Qveris account lease (an abstract Unix socket named by
+# the account), so every file that takes it runs in one xdist worker.
+pytestmark = pytest.mark.xdist_group("qveris-account-lease")
+
 IDENTITIES = {
     symbol: {k: v for k, v in entry.items() if k != "name"} for symbol, entry in KR_IDENTITY.items()
 }

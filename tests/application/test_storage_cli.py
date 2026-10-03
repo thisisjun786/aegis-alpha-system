@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -693,7 +694,10 @@ def test_strategy_show_requirements_filesystem_admission(
         elif kind == "directory":
             source.mkdir()
         elif kind == "socket":
-            listener.bind(str(source))
+            # AF_UNIX paths hold 107 bytes; binding the name relative to its directory keeps
+            # a deep tmp_path (xdist adds a per-worker level) within that limit.
+            with contextlib.chdir(source.parent):
+                listener.bind(source.name)
         elif kind == "symlink":
             source.symlink_to(regular)
         elif kind == "ancestor-symlink":

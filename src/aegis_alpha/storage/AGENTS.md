@@ -198,6 +198,26 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   read exactly is refused whole, members are only instruments the identity registry
   holds, and members are known from their source's `sl:` link. Universe parts fill
   source by source.
+- `promotion/mappers/norgate_actions.py` reads corporate actions back out of Norgate's
+  adjusted parts, whose `CAPITAL` close is the unadjusted close over the product of later
+  capital events and whose `dividend` sits, in that basis, on the last session before the
+  ex-date: `norgate.dividends@1` (cash as paid, ex-date the next session) and
+  `norgate.capital_adjustments@1` (the step of `unadjusted_close / close`, beyond one part in
+  a million). Both read neighbouring rows, so their partition date is always NULL and a spec
+  pins every part. `norgate.status@1` reads master listings and delistings, a delisting
+  known no earlier than the last session. `fmp.dividends@1` and `fmp.splits@1` share
+  `fmp.revision_runs` with the FMP prices; a key with two values at one instant is never
+  selected, because FMP lists two payments on one ex-date that way.
+- `adjusted_prices` derives `split_adjusted` and `total_return` prices from unadjusted bars and
+  the corporate actions read with the same query (`read_adjusted_prices`, workspace entry
+  `load_adjusted_prices`), so an action unknown at the cutoff never reaches an earlier price.
+  Only actions inside the bars read apply, the last bar stays as traded, and an action it
+  cannot apply leaves every earlier bar `invalid` (`unadjustable_action`) rather than skipping
+  it. The actions read uses `read_heads(held=True)`, so an action the cutoff knows but a
+  missing grant or missing evidence holds back is unadjustable too, with its reason. The
+  derivation reads bars without the query's grid, so a dividend reinvests at the session
+  before its ex-date. The receipt (`aas-adjusted-read-v1`) carries both head-read receipts
+  and the withheld rules.
 - `promotion/mappers/classifications.py` promotes snapshot classifications
   (`norgate.classification@1`, `sec.sic@1`, `kind.industry@1`). A row starts at its
   snapshot's date and is never extended into the past; a later snapshot adds rows of its

@@ -24,7 +24,7 @@ import subprocess
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -39,6 +39,9 @@ _DEFAULT_TEST_MILLISECONDS = 1000
 _LANE_SELECTION = "not database"
 _SHARD_SUMMARY = pytest.StashKey[str]()
 _EMPTY_SHARD = pytest.StashKey[bool]()
+# Keys of the values an xdist worker hands its controller (workeroutput is plain data).
+_WORKER_SHARD_SUMMARY = "aas_shard_summary"
+_WORKER_EMPTY_SHARD = "aas_empty_shard"
 
 
 def parse_shard(value: str) -> tuple[int, int]:
@@ -159,9 +162,15 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
+def _is_xdist_worker(config: pytest.Config) -> bool:
+    return hasattr(config, "workerinput")
+
+
 def pytest_configure(config: pytest.Config) -> None:
     path = config.getoption("test_durations_out")
-    if path is not None:
+    # Under pytest-xdist the controller receives every worker's reports and writes the one
+    # table; a worker would write a partial table over it.
+    if path is not None and not _is_xdist_worker(config):
         config.pluginmanager.register(DurationRecorder(path), "aas-duration-recorder")
 
 
@@ -186,11 +195,27 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    config = session.config
+    if _is_xdist_worker(config):
+        # Workers collect; the controller decides the exit status and prints the summary.
+        output = config.workeroutput  # ty: ignore[unresolved-attribute]
+        output[_WORKER_EMPTY_SHARD] = config.stash.get(_EMPTY_SHARD, False)
+        output[_WORKER_SHARD_SUMMARY] = config.stash.get(_SHARD_SUMMARY, None)
+        return
     # An empty shard of a non-empty selection is a pass; an empty selection stays exit 5.
-    if exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED and session.config.stash.get(
-        _EMPTY_SHARD, False
-    ):
+    if exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED and config.stash.get(_EMPTY_SHARD, False):
         session.exitstatus = pytest.ExitCode.OK
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node: Any, error: object) -> None:  # noqa: ANN401 -- xdist WorkerController
+    # Every worker collects the same items and computes the same shard, so any one reports it.
+    del error
+    output = getattr(node, "workeroutput", {})
+    if _WORKER_SHARD_SUMMARY in output:
+        node.config.stash[_EMPTY_SHARD] = output[_WORKER_EMPTY_SHARD]
+        if output[_WORKER_SHARD_SUMMARY] is not None:
+            node.config.stash[_SHARD_SUMMARY] = output[_WORKER_SHARD_SUMMARY]
 
 
 def pytest_report_collectionfinish(config: pytest.Config) -> str | None:
@@ -228,6 +253,12 @@ def lane_files(names: Iterable[str]) -> frozenset[str]:
     if result.returncode not in (pytest.ExitCode.OK, pytest.ExitCode.NO_TESTS_COLLECTED):
         raise RuntimeError(f"collecting the lane selection failed:\n{result.stdout}{result.stderr}")
     return frozenset(file_of(line) for line in result.stdout.splitlines() if "::" in line)
+
+
+def pytest_terminal_summary(terminalreporter: Any, config: pytest.Config) -> None:  # noqa: ANN401
+    # Under xdist the controller never collects, so the shard line arrives with the workers.
+    if config.pluginmanager.has_plugin("dsession") and _SHARD_SUMMARY in config.stash:
+        terminalreporter.write_line(config.stash[_SHARD_SUMMARY])
 
 
 def main(argv: list[str] | None = None) -> int:

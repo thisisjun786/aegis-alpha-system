@@ -575,15 +575,25 @@ def test_container_runs_get_unique_image_names(harness: Harness) -> None:
     assert builds[0][builds[0].index("--tag") + 1] != builds[1][builds[1].index("--tag") + 1]
 
 
-@pytest.mark.parametrize(("lane", "marker"), [("test", "not database"), ("database", "database")])
+@pytest.mark.parametrize(
+    ("lane", "selection"),
+    [
+        pytest.param(
+            "test",
+            ["-m", "not database", "-n", "auto", "--dist", "loadgroup"],
+            id="test-not database",
+        ),
+        pytest.param("database", ["-m", "database"], id="database-database"),
+    ],
+)
 def test_pytest_lanes_select_marker_and_isolate_database_url(
-    harness: Harness, lane: str, marker: str
+    harness: Harness, lane: str, selection: list[str]
 ) -> None:
     token = harness.prepare()
     result = harness.run(f'"$FAKE_ROOT/scripts/verify-lane-{lane}"', AAS_VERIFY_PREPARED=token)
     assert result.returncode == 0, result.stderr
     runs = [call for call in harness.calls() if call["args"][0] == "run"]
-    assert [call["args"] for call in runs] == [["run", "--no-sync", "pytest", "-m", marker]]
+    assert [call["args"] for call in runs] == [["run", "--no-sync", "pytest", *selection]]
     assert runs[0]["database_url"] == (
         harness.environment["AAS_TEST_DATABASE_URL"] if lane == "database" else ""
     )
@@ -598,7 +608,37 @@ def test_test_lane_forwards_one_shard_selector(harness: Harness) -> None:
     )
     assert result.returncode == 0, result.stderr
     runs = [call["args"] for call in harness.calls() if call["args"][0] == "run"]
-    assert runs == [["run", "--no-sync", "pytest", "-m", "not database", "--test-shard", "2/4"]]
+    assert runs == [
+        [
+            "run",
+            "--no-sync",
+            "pytest",
+            "-m",
+            "not database",
+            "-n",
+            "auto",
+            "--dist",
+            "loadgroup",
+            "--test-shard",
+            "2/4",
+        ]
+    ]
+
+
+@pytest.mark.parametrize(("workers", "expected"), [(None, "auto"), ("0", "0"), ("3", "3")])
+def test_test_lane_runs_whole_files_on_the_requested_workers(
+    harness: Harness, workers: str | None, expected: str
+) -> None:
+    token = harness.prepare()
+    environment = {"AAS_VERIFY_PREPARED": token}
+    if workers is not None:
+        environment["AAS_TEST_WORKERS"] = workers
+    result = harness.run('"$FAKE_ROOT/scripts/verify-lane-test"', **environment)
+    assert result.returncode == 0, result.stderr
+    runs = [call["args"] for call in harness.calls() if call["args"][0] == "run"]
+    assert runs == [
+        ["run", "--no-sync", "pytest", "-m", "not database", "-n", expected, "--dist", "loadgroup"]
+    ]
 
 
 def test_database_lane_propagates_pytest_failure(harness: Harness) -> None:

@@ -16,6 +16,10 @@ from aegis_alpha.data.qveris_acquisition import acquire_jobs
 from aegis_alpha.data.qveris_contracts import QverisJob, load_jobs
 from tests.data.qveris_support import ScriptedQveris, account_key, bulk_job, complete
 
+# Serial: these tests take the host-wide Qveris account lease (an abstract Unix socket named by
+# the account), so every file that takes it runs in one xdist worker.
+pytestmark = pytest.mark.xdist_group("qveris-account-lease")
+
 KO_ROW = {
     "code": "123456",
     "exchange_short_name": "KO",
