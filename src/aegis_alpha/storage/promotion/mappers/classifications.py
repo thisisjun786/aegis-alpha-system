@@ -136,6 +136,7 @@ class NorgateClassification:
     date_column: Final = "effective_from"
     row_flags: Final[Mapping[str, str]] = {}
     manifest_items: Final = None
+    expands: Final = False
     time_inputs: Final[Mapping[str, InputKind]] = {"as_of": "date"}
     schemes: Final = (SECURITY_TYPE, EXCHANGE)
 
@@ -163,6 +164,9 @@ class NorgateClassification:
         return {}
 
     def identity(self, args: Mapping[str, object]) -> None:
+        del args
+
+    def outcome(self, args: Mapping[str, object]) -> None:
         del args
 
     def select(self, source: str, args: Mapping[str, object]) -> str:
@@ -209,6 +213,7 @@ class SecSic:
     date_column: Final = "effective_from"
     row_flags: Final[Mapping[str, str]] = {}
     manifest_items: Final = None
+    expands: Final = False
     time_inputs: Final[Mapping[str, InputKind]] = {"as_of": "date"}
 
     def check_args(self, args: Mapping[str, object]) -> None:
@@ -230,6 +235,9 @@ class SecSic:
         return {}
 
     def identity(self, args: Mapping[str, object]) -> None:
+        del args
+
+    def outcome(self, args: Mapping[str, object]) -> None:
         del args
 
     def select(self, source: str, args: Mapping[str, object]) -> str:
@@ -265,6 +273,7 @@ class KindIndustry:
     date_column: Final = "effective_from"
     row_flags: Final[Mapping[str, str]] = {}
     manifest_items: Final = None
+    expands: Final = False
     time_inputs: Final[Mapping[str, InputKind]] = {"observed_at": "utc_us", "as_of": "date"}
 
     def check_args(self, args: Mapping[str, object]) -> None:
@@ -281,6 +290,9 @@ class KindIndustry:
     def identity(self, args: Mapping[str, object]) -> IdentityKey:
         del args
         return IdentityKey("kind", "krx_short_code")
+
+    def outcome(self, args: Mapping[str, object]) -> None:
+        del args
 
     def select(self, source: str, args: Mapping[str, object]) -> str:
         del args

@@ -65,6 +65,7 @@ class KoreaObservations:
     partition_sql: Final = _PERIOD
     row_flags: Final[Mapping[str, str]] = {}
     manifest_items: Final = None
+    expands: Final = False
     date_column: Final = "observation_period"
     time_inputs: Final[Mapping[str, InputKind]] = {}
 
@@ -85,6 +86,9 @@ class KoreaObservations:
         return {"value": "VARCHAR"}
 
     def identity(self, args: Mapping[str, object]) -> None:
+        del args
+
+    def outcome(self, args: Mapping[str, object]) -> None:
         del args
 
     def select(self, source: str, args: Mapping[str, object]) -> str:

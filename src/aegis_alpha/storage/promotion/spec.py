@@ -296,6 +296,7 @@ def _identity(
     """The snapshot pin of a mapper with an identity key; a mapper without one pins none.
 
     ``required``: every row of the domain names an instrument, so its mapper resolves one.
+    An optional instrument (fundamentals, filings) may go without.
     ``resolvable``: the domain has a column an identity key can resolve into.
     """
     resolves = found.identity(args) is not None
@@ -361,7 +362,7 @@ def parse_spec(raw: bytes, sha256: str) -> PromotionSpec:
         body["identity_snapshot"],
         found,
         args,
-        required="instrument_id" in kinds,
+        required=kinds.get("instrument_id") == "VARCHAR",
         resolvable=resolved_column(domain) in kinds,
     )
     return PromotionSpec(

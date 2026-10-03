@@ -53,6 +53,7 @@ class FmpEodNonSplit:
     time_inputs: Final[Mapping[str, InputKind]] = {"session_date": "date"}
     row_flags: Final[Mapping[str, str]] = {}
     manifest_items: Final = None
+    expands: Final = False
     prices: Final = _ADJUSTED
 
     def check_args(self, args: Mapping[str, object]) -> None:
@@ -79,6 +80,9 @@ class FmpEodNonSplit:
     def identity(self, args: Mapping[str, object]) -> IdentityKey:
         del args
         return IdentityKey("fmp", "fmp_symbol")
+
+    def outcome(self, args: Mapping[str, object]) -> None:
+        del args
 
     def runs_sql(self, source: str) -> str:
         """Every source row with its revision number, whether it starts it, and its bar's ties."""

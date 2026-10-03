@@ -362,10 +362,14 @@ aas data promotions
 ```
 
 `promote --plan`은 설치본을 읽기 전용으로 열어 명세가 요청하는 승격을 끝까지 계산하고 아무것도
-쓰지 않는다. 응답은 원천 행 수, 매퍼가 고르지 않은 행 수, 행 상태(승격 가능·보류·미해결·거부), 미해결 token 표본, 숫자 규칙
+쓰지 않는다. 응답은 원천 행 수, 매핑 행 수, 매퍼가 고르지 않은 행 수, 응답을 담는 원천(DART 재무제표 응답 등)의 결과 분포
+(`source_outcomes`: 완료·자료 없음·실패·읽을 수 없음·요청 불일치·결산월 미선언), 행 상태(승격 가능·보류·미해결·거부), 미해결 token 표본, 숫자 규칙
 flag 분포, 시간 규칙별 null·상한 적용 수, op 분포, stale 행, 계획한 marker, 그리고 설치본의 전제
 부족(`blocking`: core schema v2, `sl:` 연결, identity snapshot 등록)과 자료 문제(`refusals`)를 담는다.
-`--plan` 없이 실행하면 둘 중 하나라도 있을 때 아무것도 쓰지 않고 거부한다. 같은 명세를 다시 실행하면
+`--plan` 없이 실행하면 둘 중 하나라도 있을 때 아무것도 쓰지 않고 거부한다. delta가 비면 generation을
+게시하지 않으며, 결과 분포를 내는 승격이면 head의 dataset version에 `promotion_coverage@1` 품질 검사를
+남기고 그 ID를 `coverage_check`로 돌려준다. DART 명세의 매퍼 인자 `accept`는 읽을 수 없거나 요청과
+맞지 않는 응답을 빼고 승격하도록 허용하는 grant이며, 뺀 응답도 결과 분포에 기록된다. 같은 명세를 다시 실행하면
 기존 generation을 검증해 돌려주고, 중단된 승격은 같은 명령이나 `aas db recover`가 끝낸다. 승격은
 공급자를 호출하지 않으며, 설정된 공유 계산 예산이 있으면 그 예산 안에서 돈다. `promotions`는
 승격 intent마다 단계, generation, dataset version, 행 수, 명세 해시와 매퍼를 나열한다.

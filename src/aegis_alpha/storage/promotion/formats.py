@@ -10,6 +10,8 @@ A change of shape takes a new name (``-v2``); none of these is ever reinterprete
 - TOMBSTONE ``source_row_hash``: ``["aas-tombstone-v1", source_id, table, digest]``.
 - ``request_hash``: SHA-256 of the request document
   ``["aas-promotion-request-v1", spec_sha256, [table digest, ...], parent]``.
+- ``dimensions_hash`` of a mapper that declares a fact's context:
+  ``["aas-dimensions-v1", {name: text, ...}]``.
 
 Source values keep the representation of ``source_library_digest.scalar`` (float as
 ``float_hex``, bytes as ``base64``) and add one tagged form for each temporal type, so
@@ -24,7 +26,7 @@ import base64
 import hashlib
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Final
@@ -33,6 +35,7 @@ SOURCE_ROW_FORMAT: Final = "aas-source-row-v1"
 REVISION_FORMAT: Final = "aas-revision-v1"
 TOMBSTONE_FORMAT: Final = "aas-tombstone-v1"
 REQUEST_FORMAT: Final = "aas-promotion-request-v1"
+DIMENSIONS_FORMAT: Final = "aas-dimensions-v1"
 # Text that json.dumps writes verbatim between quotes: printable ASCII except '"' and '\\'.
 JSON_PLAIN: Final = r"[\x{20}\x{21}\x{23}-\x{5b}\x{5d}-\x{7e}]*"
 _PLAIN: Final = re.compile(r"[\x20\x21\x23-\x5b\x5d-\x7e]*")
@@ -129,6 +132,13 @@ def request_document(spec_sha256: str, source_digests: Sequence[str], parent: st
 
 def request_hash(spec_sha256: str, source_digests: Sequence[str], parent: str | None) -> str:
     return hashlib.sha256(request_document(spec_sha256, source_digests, parent)).hexdigest()
+
+
+def dimensions_hash(dimensions: Mapping[str, str]) -> str:
+    """``aas-dimensions-v1``: the context that tells apart facts of one concept and period."""
+    if not dimensions or not all(isinstance(value, str) for value in dimensions.values()):
+        raise ValueError("dimensions are a nonempty mapping of names to text")
+    return digest([DIMENSIONS_FORMAT, dict(dimensions)])
 
 
 def is_plain(text: str) -> bool:
@@ -275,3 +285,47 @@ def revision_id_sql(dataset_id: str, record: str, op: str, supersedes: str, row_
         f"sha256({head} || {record} || '\",\"' || {op} || '\",' || "
         f"coalesce('\"' || {supersedes} || '\"', 'null') || ',\"' || {row_hash} || '\"]')"
     )
+
+
+def json_string_sql(expression: str) -> str:
+    r"""``json.dumps`` of a VARCHAR expression, in SQL: quoted, with Python's ASCII escapes.
+
+    Plain text passes through. Otherwise each code point is written as ``json.dumps``
+    writes it: ``\"`` and ``\\``, the five short control escapes, printable ASCII as
+    itself, any other code point below U+10000 as ``\uXXXX`` (lowercase hex) and a code
+    point above it as its UTF-16 surrogate pair. NULL stays NULL.
+    """
+    short = " ".join(
+        f"WHEN c = chr({code}) THEN {sql_literal(json.dumps(chr(code))[1:-1])}"
+        for code in (0x22, 0x5C, 0x08, 0x0C, 0x0A, 0x0D, 0x09)
+    )
+    point = "unicode(c)"
+    high = f"(55296 + (({point} - 65536) >> 10))"
+    low = f"(56320 + (({point} - 65536) & 1023))"
+    escaped = (
+        f"array_to_string(list_transform(string_split({expression}, ''), lambda c: CASE {short} "
+        f"WHEN {point} BETWEEN 32 AND 126 THEN c "
+        f"WHEN {point} < 65536 THEN printf('\\u%04x', {point}) "
+        f"ELSE printf('\\u%04x\\u%04x', {high}, {low}) END), '')"
+    )
+    return (
+        f"('\"' || CASE WHEN regexp_full_match({expression}, '{JSON_PLAIN}') THEN {expression} "
+        f"ELSE {escaped} END || '\"')"
+    )
+
+
+def dimensions_hash_sql(dimensions: Sequence[tuple[str, str]]) -> str:
+    """``aas-dimensions-v1`` in SQL over (name, VARCHAR expression) pairs.
+
+    Names are fixed code-owned text; any NULL value makes the hash NULL, so a fact whose
+    context is not known has no dimensions rather than a smaller set.
+    """
+    names = [name for name, _ in dimensions]
+    if not names or names != sorted(set(names)) or not all(is_plain(name) for name in names):
+        raise ValueError("dimension names are distinct plain text in sorted order")
+    members = " || ',' || ".join(
+        sql_literal(json.dumps(name) + ":") + " || " + json_string_sql(value)
+        for name, value in dimensions
+    )
+    head = sql_literal('["' + DIMENSIONS_FORMAT + '",{')
+    return f"sha256({head} || {members} || '}}]')"
