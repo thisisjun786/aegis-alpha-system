@@ -1,11 +1,12 @@
 """``aas collect qveris import``: completed Qveris jobs as content-addressed sources.
 
-One collection job is one original unit: its ``complete.json``, the four page files it
-pins and, when its rows need an instrument identity, the identity document the rows
-were resolved with. Each unit commits under ``qveris-<shape>-<hex>`` where ``hex`` names
-exactly those bytes (``aas-source-id-v1``), so the same completed job always lands on
-the same source ID whatever the run order, batch or loader version, and a changed
-identity document is a new source.
+One collection job is one original unit: its ``complete.json`` and the four page files
+it pins. Each unit commits under ``qveris-<shape>-<hex>`` where ``hex`` names exactly
+those bytes (``aas-source-id-v1``), so the same completed job always lands on the same
+source ID whatever the run order, batch, loader version or identity document. The
+identity document a unit's rows were resolved with is commit ``lineage``
+(``identity_sha256``), so an identity document that grows with new listings never
+turns an imported job into a second source.
 
 | job | rows table (shape, table) | held rows (shape, table) |
 | --- | --- | --- |
@@ -22,7 +23,8 @@ complete. Provider warnings are recorded, never block: every row of a warned dow
 held with the reason ``provider_reported_partial`` and the import continues. The
 history and bulk tables keep the columns the ``eodhd.*`` mappers read.
 
-Nothing here calls a provider. Code and transform hashes are commit ``lineage`` only.
+Nothing here calls a provider. Code, transform and identity hashes are commit ``lineage``
+only.
 """
 
 from __future__ import annotations
@@ -281,10 +283,14 @@ class Unit:
 
     kind: Kind
     history: CompletedHistory
-    files: tuple[bytes, ...]
     rows: pa.Table
     held: pa.Table
     lineage: Mapping[str, object]
+
+    @property
+    def files(self) -> tuple[bytes, ...]:
+        """The job's evidence bytes; the identity document is lineage, not content."""
+        return self.history.evidence
 
     @property
     def content(self) -> SourceContent:
@@ -335,13 +341,6 @@ def code_lineage() -> dict[str, object]:
     return code
 
 
-def unit_files(
-    kind: Kind, history: CompletedHistory, identity: IdentityDocument | None
-) -> tuple[bytes, ...]:
-    """The unit's original bytes: the job's evidence, plus the identity its rows used."""
-    return history.evidence + ((identity.raw,) if kind.needs_identity and identity else ())
-
-
 def build_unit(
     completion: Completion,
     history: CompletedHistory,
@@ -371,7 +370,6 @@ def build_unit(
         ],
         schema=schemas[held_schema_name(kind)],
     )
-    files = unit_files(kind, history, identity)
     lineage = {
         "loader": LOADER,
         "kind": kind.name,
@@ -385,7 +383,7 @@ def build_unit(
         "source_only": True,
         "point_in_time_certified": False,
     }
-    return Unit(kind, history, files, rows, held, lineage)
+    return Unit(kind, history, rows, held, lineage)
 
 
 def _digest(table: pa.Table) -> tuple[int, str]:
@@ -479,8 +477,7 @@ def import_completions(  # noqa: PLR0913 -- one ordered, resumable import loop a
         except (ValueError, TypeError, OSError, RuntimeError) as error:
             failures.append(_failure(completion, error))
             continue
-        source_id = f"{PROVIDER}-{kind.shape}-"
-        source_id += content_of(kind, unit_files(kind, history, identity)).sha256
+        source_id = f"{PROVIDER}-{kind.shape}-{content_of(kind, history.evidence).sha256}"
         if source_id in committed:
             reused += 1
             units.append(

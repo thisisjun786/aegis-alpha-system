@@ -1,10 +1,12 @@
-"""``aas collect qveris``: plan, run, daily jobs and content-addressed import.
+"""``aas collect qveris``: plan, run, daily jobs, quarantine and content-addressed import.
 
 ``plan`` and ``daily-jobs`` read job documents and the raw collection root only; neither
 reads a key nor makes a request. ``run`` executes explicit job documents in order (one
 worker) or in fair parallel groups (several workers) under per-run paid-call, credit,
 HTTP-request and wall-time limits, pacing every request start on one shared interval.
-``import`` commits completed jobs into the source library and never calls a provider.
+``quarantine`` isolates one unresolved page or parallel group that cannot settle, keeping
+its worst-case reservation and the operator's reason. ``import`` commits completed jobs
+into the source library and never calls a provider.
 """
 
 from __future__ import annotations
@@ -65,6 +67,15 @@ def add_commands(actions: argparse._SubParsersAction) -> None:
     daily.add_argument("--declaration", type=Path, help="Calendar declaration overriding one")
     daily.add_argument("--declaration-sha256", help="SHA-256 of --declaration")
     daily.add_argument("--output", type=Path, required=True, help="New jobs document path")
+    quarantine = sub.add_parser(
+        "quarantine", help="Isolate an unresolved page or group, keeping its reservation"
+    )
+    quarantine.add_argument("--raw-root", type=Path, required=True, help="Raw collection root")
+    quarantine.add_argument("--key-file", type=Path, required=True, help="Private Qveris key file")
+    target = quarantine.add_mutually_exclusive_group(required=True)
+    target.add_argument("--batch", help="Unsettled group, parallel-batches/<id>")
+    target.add_argument("--page", help="Unresolved page, jobs/<fingerprint>/<NNNN>")
+    quarantine.add_argument("--reason", required=True, help="Operator reason, recorded")
     importer = sub.add_parser("import", help="Commit completed jobs as content-addressed sources")
     home_option(importer)
     importer.add_argument("--raw-root", type=Path, required=True)
@@ -246,6 +257,20 @@ def daily_jobs(args: argparse.Namespace) -> dict[str, object]:
     return {"provider": "qveris", **result, "exit_code": 0}
 
 
+def quarantine(args: argparse.Namespace) -> dict[str, object]:
+    """Record the operator's quarantine of one page or group; its reservation is kept."""
+    from aegis_alpha.data.qveris_acquisition import quarantine_pending
+    from aegis_alpha.data.qveris_client import QverisClient
+    from aegis_alpha.data.qveris_parallel import quarantine_parallel_batch
+
+    client = QverisClient(args.key_file)
+    if args.batch is not None:
+        result = quarantine_parallel_batch(args.raw_root, args.batch, args.reason, client)
+    else:
+        result = quarantine_pending(args.raw_root, args.page, args.reason, client)
+    return {"provider": "qveris", **result, "automatic_retry": False, "exit_code": 0}
+
+
 def import_jobs(args: argparse.Namespace) -> dict[str, object]:
     import sqlite3
 
@@ -303,6 +328,8 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             return run(args)
         case "daily-jobs":
             return daily_jobs(args)
+        case "quarantine":
+            return quarantine(args)
         case "import":
             return import_jobs(args)
         case _:

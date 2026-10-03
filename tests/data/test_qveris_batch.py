@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from aegis_alpha.data.qveris_batch import collect_cohort
+from aegis_alpha.data.qveris_acquisition import acquire_jobs
+from aegis_alpha.data.qveris_batch import budget_stop, collect_cohort
 from tests.data.test_qveris_acquisition import FakeQveris, eod_job, fred_job
 
 # Serial: these tests take the host-wide Qveris account lease (an abstract Unix socket named by
@@ -72,3 +73,17 @@ def test_a_provider_warning_completes_and_the_cohort_continues(tmp_path: Path) -
     result = collect_cohort((eod_job(),), tmp_path, client)
     assert (result["completed"], result["warned"], result["stopped"]) == (1, 1, None)
     assert result["status"] == "RAW_ACQUIRED"
+
+
+def test_a_budget_code_with_unresolved_evidence_is_not_a_clean_stop(tmp_path: Path) -> None:
+    client = FakeQveris()
+    refusal = RuntimeError("INVOCATION_CALL_LIMIT: execute was not attempted")
+    acquire_jobs((fred_job(),), tmp_path, client)
+    assert budget_stop(refusal, tmp_path, client.account_key) == "INVOCATION_CALL_LIMIT"
+    client.failure = "timeout"
+    client.usage_ready = False
+    with pytest.raises(RuntimeError):
+        acquire_jobs((eod_job(),), tmp_path, client)
+    # The pending page blocks the account, so the run must report an uncertain stop.
+    assert budget_stop(refusal, tmp_path, client.account_key) is None
+    assert budget_stop(ValueError("INVOCATION_CALL_LIMIT"), tmp_path, client.account_key) is None

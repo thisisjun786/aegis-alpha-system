@@ -198,13 +198,21 @@ group 전체를 받아들일 때만 batch manifest와 job별 intent를 남긴 �
 예산은 group 전체를 예약하거나 하나도 예약하지 않는다. 실행 중인 유료 future는 모두 기다려 기록하고,
 group 정산은 usage와 계정 ledger로 한 번 한다. 정산되지 않은 group은 정산되거나 운영자가 예약을 남긴 채
 격리할 때까지 그 계정의 새 실행을 막는다. 모든 요청은 실행 하나에 공유된 HTTP 시도 수·시간 한도를
-통과한 뒤 같은 간격으로 시작한다(`data/qveris_pacing.py`).
+통과한 뒤 같은 간격으로 시작한다(`data/qveris_pacing.py`). 두 한도는 새 page를 시작하지 않게 할 뿐이다.
+한도에 닿으면 다음 page의 첫 사전 조회 요청(`/tools/by-ids`)이 intent 전에 `INVOCATION_HTTP_LIMIT`로
+거부되고, 이미 시작한 page의 견적·실행·정산 요청은 세되 모두 통과한다. 그래서 한도는 intent를 실행되지
+않거나 정산되지 않은 채로 남기지 않으며, 실제 HTTP 시도 수는 진행 중인 page의 요청만큼 한도를 넘을 수 있다.
 
 - 정산된 실패는 기록하고 다음 job으로 간다. 공급자 경고(`RAW_ACQUIRED_WITH_WARNINGS`)는 완료이며
   `warned`로 세고 수집을 멈추지 않는다.
 - 결과가 불확실한 유료 호출은 수집을 멈추고(`stopped`, 종료 코드 2) 자동으로 다시 호출하지 않는다.
-- 예산 거부는 intent를 만들기 전에 일어나므로 시도한 것이 없다. 남은 job은 `pending`이고 상태는
-  `budget_exhausted`(종료 코드 0)다. 다음 실행은 완료된 job을 HTTP 없이 재사용한다.
+- 예산 거부(유료 호출 수·크레딧·HTTP 시도 수·시간·서버 잔액)는 intent를 만들기 전에 일어나므로 시도한
+  것이 없다. 남은 job은 `pending`이고 상태는 `budget_exhausted`(종료 코드 0)다. 다음 실행은 완료된 job을
+  HTTP 없이 재사용한다. 예산 거부가 났어도 raw root에 정산되지 않은 page나 group이 있으면 그 증거가 계정을
+  막으므로 `stopped`(종료 코드 2)로 보고한다.
+- 정산될 수 없는 page나 group(나타나지 않는 usage, 불완전한 intent 묶음)은 운영자가
+  `aas collect qveris quarantine`으로 사유와 함께 격리한다. 격리는 최악의 경우 예약을 남기고 자동 재호출하지
+  않으며, 그 뒤 계정의 새 실행이 다시 가능하다.
 
 **일간 요청.** `daily-jobs`는 거래소(`US`는 XNYS, `KO`·`KQ`는 XKRX)의 [선언 달력](#선언-달력)에서
 관측일 이전의 열린 세션마다 `prices`·`splits`·`dividends` 일간 내려받기 요청을 만든다. 요청의 정체는
@@ -213,11 +221,13 @@ group 정산은 usage와 계정 ledger로 한 번 한다. 정산되지 않은 gr
 `held`로 보고하고 계획하지 않으므로 불확실한 시도가 자동 재호출되지 않는다. 창은 366일 이하이고 선언
 기간 안이어야 한다.
 
-**적재.** 완료된 job 하나가 원본 단위 하나다. 단위의 bytes는 `complete.json`, 그것이 pin한 page 파일
-넷, 그리고 행이 instrument를 이름 붙일 때 그 행을 해석한 identity 문서(`{"identities": {"<CODE>.<EXCHANGE>":
-{instrument_id, venue, instrument_type, currency, ...}}}`)다. 원천 ID는 이 bytes의
-`aas-source-id-v1`이므로 실행 순서·묶음·적재 코드 버전이 달라도 같은 job은 같은 ID가 되고, identity 문서가
-바뀌면 새 원천이 된다. 적재 코드와 변환 해시는 commit `lineage`에만 남는다.
+**적재.** 완료된 job 하나가 원본 단위 하나다. 단위의 bytes는 `complete.json`과 그것이 pin한 page 파일
+넷이다. 원천 ID는 이 bytes와 schema major의 `aas-source-id-v1`이므로 실행 순서·묶음·적재 코드 버전·identity
+문서가 달라도 같은 job은 같은 ID가 되고, 이미 commit된 job은 다시 적재하지 않는다. 행이 instrument를
+이름 붙일 때 그 행을 해석한 identity 문서(`{"identities": {"<CODE>.<EXCHANGE>": {instrument_id, venue,
+instrument_type, currency, ...}}}`)의 SHA-256은 적재 코드·변환 해시와 함께 commit `lineage`
+(`identity_sha256`)에 남는다. 그래서 새 상장으로 identity 문서가 커져도 적재된 job이 두 번째 원천이 되지
+않고, `aas data kr-prices`가 같은 job의 행을 두 번 pin하지 않는다.
 
 | job | 행 원천(shape, 테이블) | 보류 행 원천(shape) |
 | --- | --- | --- |
@@ -2037,7 +2047,7 @@ state v2:
 | DV-290 | batch는 응답 bytes 상한에서도 끝난다 | `tests/storage/test_kr_collection.py::test_a_batch_ends_at_its_byte_budget` | 구현 |
 | DV-291 | 완료된 Qveris job 하나는 행 원천과 보류 원천으로 commit되고 둘은 원본 bytes의 `hex`를 공유하며 매퍼가 lineage 접두어와 테이블 이름으로 찾는다 | `tests/storage/test_qveris_import.py::test_one_job_commits_its_rows_and_held_rows_under_one_content_hex` | 구현 |
 | DV-292 | 같은 job을 다시 적재하면 재사용하고 적재 코드만 바뀌어도 같은 원천 ID다 | `tests/storage/test_qveris_import.py::test_reimport_reuses_and_a_code_change_keeps_the_id` | 구현 |
-| DV-293 | 다른 identity 문서로 해석한 job은 다른 원천이다 | `tests/storage/test_qveris_import.py::test_another_identity_document_is_another_source` | 구현 |
+| DV-293 | identity 문서가 커지거나 바뀌어도 적재된 job은 같은 원천으로 재사용되고 identity 해시는 lineage에 남는다 | `tests/storage/test_qveris_import.py::test_an_identity_document_that_grows_keeps_every_imported_source` | 구현 |
 | DV-294 | 경고가 붙은 내려받기는 빈 행 테이블과 `provider_reported_partial` 보류 행으로 적재되고 적재를 막지 않는다 | `tests/storage/test_qveris_import.py::test_a_warned_download_commits_an_empty_rows_table_and_its_held_rows` | 구현 |
 | DV-295 | 읽을 수 없는 job은 기록되고 나머지 job은 적재된다 | `tests/storage/test_qveris_import.py::test_unreadable_jobs_are_recorded_and_the_run_continues` | 구현 |
 | DV-296 | 일간 요청은 선언 달력의 열린 세션에서 나오고 관측일과 무관하게 완료된 요청은 빠진다 | `tests/application/test_qveris_cli.py::test_daily_jobs_follow_declared_sessions_and_skip_completed_requests` | 구현 |
@@ -2048,4 +2058,9 @@ state v2:
 | DV-301 | 공급자 경고는 완료로 세어지고 cohort를 멈추지 않는다 | `tests/data/test_qveris_batch.py::test_a_provider_warning_completes_and_the_cohort_continues` | 구현 |
 | DV-302 | 분할 비율은 공급자 텍스트로 남고 identity가 없거나 양수가 아닌 비율은 보류된다 | `tests/data/test_qveris_actions_fx.py::test_splits_keep_the_ratio_text_and_hold_unknown_identities` | 구현 |
 | DV-303 | 통화쌍 이력은 identity 없이 쌍과 두 통화를 남기고 맞지 않는 OHLC는 보류된다 | `tests/data/test_qveris_actions_fx.py::test_forex_history_keeps_the_pair_and_holds_bad_rows` | 구현 |
-| DV-304 | 요청 시작 간격과 HTTP 시도·시간 한도는 coordinator와 작업자에 공유된다 | `tests/data/test_qveris_pacing.py::test_admission_bounds_requests_and_time_across_shared_clients` | 구현 |
+| DV-304 | 요청 시작 간격과 HTTP 시도·시간 한도는 coordinator와 작업자에 공유되고 한도는 새 page의 첫 요청만 거부한다 | `tests/data/test_qveris_pacing.py::test_admission_bounds_requests_and_time_across_shared_clients` | 구현 |
+| DV-305 | HTTP 시도 수 한도가 어느 요청 위치에 걸려도 종료 코드 0인 실행은 미정산 page나 group을 남기지 않고 다음 실행이 모두 완료한다 | `tests/application/test_qveris_cli.py::test_a_request_limit_at_any_position_never_strands_a_started_page` | 구현 |
+| DV-306 | 시간 한도가 어느 요청 위치에 걸려도 종료 코드 0인 실행은 미정산 page나 group을 남기지 않는다 | `tests/application/test_qveris_cli.py::test_a_time_limit_at_any_position_never_strands_a_started_page` | 구현 |
+| DV-307 | 미정산 증거가 있는 예산 거부는 깨끗한 예산 소진이 아니다 | `tests/data/test_qveris_batch.py::test_a_budget_code_with_unresolved_evidence_is_not_a_clean_stop` | 구현 |
+| DV-308 | `aas collect qveris quarantine`은 page나 group을 예약을 남긴 채 격리하고 계정의 새 실행을 다시 허용한다 | `tests/application/test_qveris_cli.py::test_quarantine_releases_the_account_and_keeps_the_reservation` | 구현 |
+| DV-309 | 고정 합성 job의 정규화 행과 보류 행 digest는 고정값과 같다 | `tests/storage/test_qveris_import.py::test_normalized_rows_match_the_pinned_legacy_shape` | 구현 |

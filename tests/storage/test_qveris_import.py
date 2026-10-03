@@ -21,7 +21,7 @@ from aegis_alpha.storage.qveris_import import (
     import_unit,
     parse_identity,
 )
-from aegis_alpha.storage.source_library import list_sources, list_tables
+from aegis_alpha.storage.source_library import list_sources, list_tables, source_metadata
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
 from tests.data.qveris_support import (
     KR_IDENTITY,
@@ -40,6 +40,11 @@ from tests.data.test_qveris_acquisition import fred_job
 # the account), so every file that takes it runs in one xdist worker.
 pytestmark = pytest.mark.xdist_group("qveris-account-lease")
 
+# Arrow digests of one fixed synthetic KR history job (one valid bar, one held bar). A
+# normalizer or table-shape change that would write other rows under the same source ID
+# changes these, because the source ID names the job's bytes and not the reading code.
+GOLDEN_BARS = "ad6f475c573bd61f85b423f35e593999347c11b03325ce90bd823a6292451d02"
+GOLDEN_HELD = "531f27320ba7bfa186e032bad54717867e6b60b1d6078161d1efdb7647da30fa"
 BARS = [
     "instrument_id",
     "venue",
@@ -125,15 +130,44 @@ def test_reimport_reuses_and_a_code_change_keeps_the_id(ws: Workspace, raw: Path
     assert _committed(ws) == committed
 
 
-def test_another_identity_document_is_another_source(ws: Workspace, raw: Path) -> None:
-    one = import_completions(raw, _selected(raw), parse_identity(identity_bytes()), workspace=ws)
-    renamed = {**KR_IDENTITY, "123456.KO": {**KR_IDENTITY["123456.KO"], "name": "Renamed"}}
+def test_an_identity_document_that_grows_keeps_every_imported_source(
+    ws: Workspace, raw: Path
+) -> None:
+    identity = parse_identity(identity_bytes())
+    one = import_completions(raw, _selected(raw), identity, workspace=ws)
+    grown = {
+        **KR_IDENTITY,
+        "123456.KO": {**KR_IDENTITY["123456.KO"], "name": "Renamed"},
+        "654321.KO": {**KR_IDENTITY["123456.KO"], "instrument_id": "synthetic-new-listing"},
+    }
     two = import_completions(
-        raw, _selected(raw), parse_identity(identity_bytes(renamed)), workspace=ws
+        raw,
+        _selected(raw),
+        parse_identity(identity_bytes(grown)),
+        workspace=ws,
+        committed=_committed(ws),
     )
+    assert (two["built"], two["reused"]) == (0, 1)
     ids = [cast("list[dict[str, object]]", r["units"])[0]["source_id"] for r in (one, two)]
-    assert ids[0] != ids[1]
-    assert len(_committed(ws)) == 4  # noqa: PLR2004 -- bars and quarantine of each
+    assert ids[0] == ids[1]
+    assert len(_committed(ws)) == 2  # noqa: PLR2004 -- one bars and one quarantine source
+    # The KR price backfill pins the job's bars once, so its natural keys never repeat.
+    pins = kr_prices._tables(ws, "qveris-kr-history", "bars")  # noqa: SLF001 -- mapper discovery
+    assert len(pins) == 1
+    metadata = cast("dict[str, dict[str, object]]", source_metadata(ws, str(ids[0])))
+    assert metadata["lineage"]["identity_sha256"] == identity.sha256
+
+
+def test_normalized_rows_match_the_pinned_legacy_shape(tmp_path: Path) -> None:
+    """A fixed synthetic job pins the bars and quarantine digests, so drift fails here."""
+    root = tmp_path / "golden"
+    complete(root, history_job(), [bar("2026-08-03"), bar("2026-08-04", open=None)])
+    result = import_completions(
+        root, _selected(root), parse_identity(identity_bytes()), workspace=None
+    )
+    (unit,) = cast("list[dict[str, object]]", result["units"])
+    assert (unit["rows"], unit["held_rows"]) == (1, 1)
+    assert (unit["digest"], unit["held_digest"]) == (GOLDEN_BARS, GOLDEN_HELD)
 
 
 def test_a_warned_download_commits_an_empty_rows_table_and_its_held_rows(

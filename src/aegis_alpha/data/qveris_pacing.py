@@ -52,11 +52,22 @@ class RequestPacer:
             self._next = self._clock() + self.interval
 
 
-class RequestAdmission:
-    """A thread-safe bound on HTTP attempts and wall time for one invocation.
+# The first request of every page's read-only preflight. A limit refuses only here, so a
+# page whose preflight started always gets its quote, intent, execute and settlement.
+PAGE_START = "/tools/by-ids"
 
-    Paid executions are counted separately; the paid-call and credit limits are the
-    ``InvocationBudget`` reservations made before any intent exists.
+
+class RequestAdmission:
+    """A thread-safe bound on the HTTP work one invocation starts, and on its wall time.
+
+    The request and time limits refuse a new page: once either is reached, the next
+    ``/tools/by-ids`` (the first request of a page's preflight) raises
+    ``INVOCATION_HTTP_LIMIT`` before any intent exists. Every other request is counted
+    and admitted, so a page already started is quoted, executed and settled in full and
+    a limit never leaves an intent unexecuted or unsettled. ``http_requests`` can thus
+    exceed ``max_requests`` by the requests of the pages in flight. Paid executions are
+    counted separately; the paid-call and credit limits are the ``InvocationBudget``
+    reservations made before any intent exists.
     """
 
     def __init__(
@@ -78,8 +89,9 @@ class RequestAdmission:
 
     def admit(self, path: str) -> None:
         with self._lock:
-            if self.http_requests >= self.max_requests or self._clock() >= self._deadline:
-                raise RuntimeError("INVOCATION_HTTP_LIMIT: request was not attempted")
+            exhausted = self.http_requests >= self.max_requests or self._clock() >= self._deadline
+            if path == PAGE_START and exhausted:
+                raise RuntimeError("INVOCATION_HTTP_LIMIT: no new page was started")
             self.http_requests += 1
             if path == "/tools/execute":
                 self.paid_executions += 1

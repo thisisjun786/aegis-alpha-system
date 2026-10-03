@@ -86,7 +86,8 @@ def collect_parallel_cohorts(  # noqa: PLR0913, PLR0915 -- one scheduler loop an
     Single-page tools run as one parallel group; any other tool runs serially. A group
     that settles with failures is counted and scheduling continues. An uncertain group,
     a group refused by the budget, or a changed result identity stops scheduling, and
-    the unprocessed jobs are reported as pending.
+    the unprocessed jobs are reported as pending. A budget refusal counts as budget
+    exhaustion only when the store holds no unresolved page or group.
     """
     if type(workers) is not int or not 1 <= workers <= MAX_WORKERS:
         raise ValueError(f"workers must be an integer from 1 through {MAX_WORKERS}")
@@ -126,7 +127,10 @@ def collect_parallel_cohorts(  # noqa: PLR0913, PLR0915 -- one scheduler loop an
                 warned += flagged
                 processed += len(group)
         except (ValueError, TypeError, OSError, RuntimeError) as error:
-            stopped = budget_stop(error) or type(error).__name__
+            stop = None
+            if isinstance(error, RuntimeError) and str(error).split(":", 1)[0] in BUDGET_STOPS:
+                stop = budget_stop(error, root, client_factory().account_key)
+            stopped = stop or type(error).__name__
         snapshot = {
             "cohort_id": cohort_id,
             "run_id": run_id,

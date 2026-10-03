@@ -1273,6 +1273,8 @@ aas collect qveris daily-jobs --raw-root RAW --exchange US --exchange KO --excha
 aas collect qveris plan --jobs JOBS.json --raw-root RAW
 aas collect qveris run --jobs JOBS.json --raw-root RAW --key-file KEY \
   --max-calls 30 --max-credits 100 [--workers 4] [--request-interval 0.75]
+aas collect qveris quarantine --raw-root RAW --key-file KEY \
+  (--batch parallel-batches/ID | --page jobs/FINGERPRINT/0000) --reason TEXT
 aas collect qveris import --raw-root RAW --identity IDENTITY.json [--market KR] \
   [--dataset price_history] [--fingerprint FP ...] [--limit N] [--plan]
 ```
@@ -1283,9 +1285,15 @@ aas collect qveris import --raw-root RAW --identity IDENTITY.json [--market KR] 
 - `plan`은 job 문서를 검증하고 문서마다 완료·`held`·새 요청 수를 센다. 키를 읽지 않고 raw root를 만들지 않는다.
 - `run`은 유료 호출 수(`--max-calls`)와 크레딧(`--max-credits`)을 실행 하나의 상한으로 예약하고, 서버
   잔액에서 다른 예약을 뺀 값도 확인한다. HTTP 시도 수(`--max-http-requests`, 기본 유료 호출의 16배와 32 중
-  큰 값)와 시간(`--time-limit-seconds`)도 제한한다. 작업자 1·2·3·4·8·16 중 하나이며 모든 요청 시작은 한 간격을
-  공유한다. 종료 코드는 완료와 예산 소진이 0, 정산된 실패가 있으면 1, 불확실한 호출로 멈추면 2다.
-  진행 기록은 raw root의 `cohorts/`·`parallel-cohorts/`에 남고 표준 오류로 진행 줄을 낸다.
+  큰 값)와 시간(`--time-limit-seconds`)은 새 page를 시작하지 않게 한다. 이미 시작한 page는 실행과 정산을
+  마치므로 `http_requests`가 한도를 조금 넘을 수 있다. 작업자 1·2·3·4·8·16 중 하나이며 모든 요청 시작은 한
+  간격을 공유한다. 종료 코드는 완료와 예산 소진이 0, 정산된 실패가 있으면 1, 불확실한 호출이나 정산되지 않은
+  page·group으로 멈추면 2다. 진행 기록은 raw root의 `cohorts/`·`parallel-cohorts/`에 남고 표준 오류로 진행
+  줄을 낸다.
+- 종료 코드 2의 page나 group은 다음 `run`이 먼저 정산한다. usage가 끝내 나타나지 않거나 intent 묶음이
+  불완전해 정산할 수 없으면 `quarantine`이 그 page(`--page`) 또는 group(`--batch`)을 운영자 사유와 함께
+  격리한다. 격리는 견적 전체의 예약을 남기고 자동 재호출하지 않으며, 그 뒤 계정의 새 실행을 다시 허용한다.
+  대상은 `run`의 표준 오류 보고와 raw root의 `jobs/`·`parallel-batches/`에서 찾는다.
 - `import`는 완료된 job을 내용 원천으로 commit하고 공급자를 호출하지 않는다. `--plan`은 읽기 전용으로
   설치본을 열어 정규화와 행 digest만 보고한다. identity 문서는 가격·기업행동 행에 필요하고 통화쌍
   이력에는 필요 없다. 실패한 job은 `failures`, 완료 문서가 없는 `--fingerprint`는 `missing`으로 남고 종료

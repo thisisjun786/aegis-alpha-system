@@ -174,7 +174,8 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   A manifest root holds no members; a root with members is read as a v1 document.
 - `qveris_import` commits one completed Qveris job as content sources: the rows table and,
   when it has rows, the held `quarantine` table first, both under the hex of the job's
-  `complete.json`, its four page files and the identity document its rows used. A warned
+  `complete.json` and its four page files. The identity document its rows used is lineage
+  (`identity_sha256`), so a grown identity document never re-imports a job. A warned
   download is held whole with `provider_reported_partial` and never blocks the import; a
   committed rows source makes the unit `reused`. It never calls a provider.
 - `kr_identity` builds the KR registry document from three identity mappers

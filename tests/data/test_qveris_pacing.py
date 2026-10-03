@@ -69,18 +69,23 @@ def test_admission_bounds_requests_and_time_across_shared_clients() -> None:
     pacer = RequestPacer(0, clock=clock.monotonic, sleep=clock.sleep)
     admission = RequestAdmission(3, 60, clock=clock.monotonic)
     clients = [PacedQverisClient(Transport(clock, starts), pacer, admission) for _ in range(2)]
-    clients[0].request("/tools/probe")
-    clients[1].request("/tools/execute")
+    clients[0].request("/tools/by-ids")
+    clients[1].request("/tools/probe")
     clients[0].request("/tools/execute")
+    # A page already started is finished and settled past the limit.
+    clients[1].request("/auth/usage/history/v2")
+    clients[0].request("/auth/credits")
     with pytest.raises(RuntimeError, match="INVOCATION_HTTP_LIMIT"):
-        clients[1].request("/auth/credits")
-    assert (admission.http_requests, admission.paid_executions) == (3, 2)
-    assert [path for path, _ in starts] == ["/tools/probe", "/tools/execute", "/tools/execute"]
+        clients[1].request("/tools/by-ids")
+    assert (admission.http_requests, admission.paid_executions) == (5, 1)
+    assert [path for path, _ in starts][-1] == "/auth/credits"
     late = RequestAdmission(10, 5, clock=clock.monotonic)
+    late_client = PacedQverisClient(Transport(clock, starts), pacer, late)
     clock.now += 5
     with pytest.raises(RuntimeError, match="INVOCATION_HTTP_LIMIT"):
-        PacedQverisClient(Transport(clock, starts), pacer, late).request("/tools/probe")
-    assert late.http_requests == 0
+        late_client.request("/tools/by-ids")
+    late_client.request("/tools/execute")
+    assert (late.http_requests, late.paid_executions) == (1, 1)
 
 
 @pytest.mark.parametrize(("requests", "seconds"), [(0, 1), (True, 1), (1, 0), (1, float("inf"))])

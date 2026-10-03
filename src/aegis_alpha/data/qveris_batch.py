@@ -20,6 +20,9 @@ if TYPE_CHECKING:
     from aegis_alpha.data.qveris_contracts import QverisJob
 
 # Refusals raised before an intent exists: the job was not attempted, nothing is uncertain.
+# ``INVOCATION_HTTP_LIMIT`` is raised only at a page's first preflight request
+# (``qveris_pacing.PAGE_START``); a stop counts as a budget stop only when the store also
+# holds no unresolved page or group (``budget_stop``).
 BUDGET_STOPS = frozenset(
     {
         "INVOCATION_CALL_LIMIT",
@@ -32,10 +35,19 @@ BUDGET_STOPS = frozenset(
 WARNED = "RAW_ACQUIRED_WITH_WARNINGS"
 
 
-def budget_stop(error: BaseException) -> str | None:
-    """The budget code of a refusal raised before any paid request, else ``None``."""
+def budget_stop(error: BaseException, root: Path, account_key: str) -> str | None:
+    """The budget code of a refusal that left nothing unresolved, else ``None``.
+
+    A budget code with a pending page or an unsettled parallel group in the store is
+    not a clean stop: that evidence blocks the account until it settles or an operator
+    quarantines it, so the caller reports it as stopped.
+    """
     code = str(error).split(":", 1)[0]
-    return code if isinstance(error, RuntimeError) and code in BUDGET_STOPS else None
+    if not isinstance(error, RuntimeError) or code not in BUDGET_STOPS:
+        return None
+    with QverisStore(root, account_key) as store:
+        unresolved = store.pending_pages() or store.pending_batches()
+    return None if unresolved else code
 
 
 def collect_cohort(
@@ -50,7 +62,8 @@ def collect_cohort(
 
     A settled failure is recorded and the cohort continues; a provider warning is a
     completion (``warned``) and never stops it. An uncertain or failed preflight stops
-    the cohort (``stopped``), as does a budget refusal, which attempted nothing.
+    the cohort (``stopped``), as does a budget refusal, which attempted nothing; a budget
+    refusal with unresolved evidence in the store is reported as that uncertain stop.
     """
     acquisition_plan(jobs, root)
     cohort_id = content_sha256([job.document() for job in jobs])
@@ -65,7 +78,7 @@ def collect_cohort(
         try:
             result = acquire_jobs((job,), root, client, budget=budget)
         except (ValueError, RuntimeError) as error:
-            stop = budget_stop(error)
+            stop = budget_stop(error, root, client.account_key)
             if stop is not None:
                 stopped = stop
             else:

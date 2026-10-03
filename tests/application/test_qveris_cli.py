@@ -11,9 +11,10 @@ import pytest
 
 from aegis_alpha.application import qveris_daily
 from aegis_alpha.application.cli import main
-from aegis_alpha.data import qveris_client
+from aegis_alpha.data import qveris_client, qveris_pacing
 from aegis_alpha.data.qveris_acquisition import acquire_jobs
 from aegis_alpha.data.qveris_contracts import QverisJob, load_jobs
+from aegis_alpha.data.qveris_pacing import RequestAdmission
 from tests.data.qveris_support import ScriptedQveris, account_key, bulk_job, complete
 
 # Serial: these tests take the host-wide Qveris account lease (an abstract Unix socket named by
@@ -206,3 +207,146 @@ def test_run_stops_with_exit_two_when_a_paid_call_is_uncertain(
     result = json.loads(capsys.readouterr().out)
     assert result["status"] == "stopped"
     assert client.execute_count == 1
+
+
+def _unresolved(raw: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    from aegis_alpha.data.qveris_store import QverisStore  # noqa: PLC0415
+
+    with QverisStore(raw, account_key(raw)) as store:
+        return store.pending_pages(), store.pending_batches()
+
+
+def _clean_stop_then_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    workers: str,
+    limit: list[str],
+) -> dict[str, object]:
+    tmp_path.mkdir()
+    raw = tmp_path / "raw"
+    jobs = [bulk_job("KO", "prices", day) for day in ("2026-09-01", "2026-09-02")]
+    rows = {job.parameters_json: [{**KO_ROW, "date": job.parameters["date"]}] for job in jobs}
+    client = ScriptedQveris(rows, account_key(raw))
+    monkeypatch.setattr(qveris_client, "QverisClient", lambda *_a, **_k: client)
+    path = _jobs_file(tmp_path, *jobs)
+    base = [
+        *("collect", "qveris", "run", "--jobs", str(path), "--raw-root", str(raw)),
+        *("--key-file", str(tmp_path / "key"), "--max-calls", "5", "--max-credits", "10"),
+        *("--request-interval", "0", "--workers", workers),
+    ]
+    code = main([*base, *limit])
+    captured = capsys.readouterr()
+    assert captured.out, captured.err
+    first = json.loads(captured.out)
+    # A stop the run reports as success-like never leaves a page or a group unresolved.
+    assert (code, first["status"]) in {(0, "budget_exhausted"), (0, "succeeded")}
+    assert _unresolved(raw) == ((), ())
+    assert client.execute_count == first["paid_executions"]
+    assert main(base) == 0
+    second = json.loads(capsys.readouterr().out)
+    assert second["status"] == "succeeded"
+    assert client.execute_count == len(jobs)
+    return first
+
+
+@pytest.mark.parametrize("workers", ["1", "2"])
+def test_a_request_limit_at_any_position_never_strands_a_started_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    workers: str,
+) -> None:
+    position = 1
+    while True:
+        first = _clean_stop_then_resume(
+            tmp_path / f"n{position}",
+            monkeypatch,
+            capsys,
+            workers=workers,
+            limit=["--max-http-requests", str(position)],
+        )
+        if first["status"] == "succeeded":
+            break
+        assert int(str(first["http_requests"])) >= position
+        position += 1
+    assert position > 2  # noqa: PLR2004 -- the limit fell inside a job before it covered both
+
+
+def _stepping_admission(max_requests: int, seconds: float) -> RequestAdmission:
+    """``RequestAdmission`` on a clock that advances one second per reading."""
+    ticks = iter(range(10_000))
+    return RequestAdmission(max_requests, seconds, clock=lambda: float(next(ticks)))
+
+
+@pytest.mark.parametrize("workers", ["1", "2"])
+def test_a_time_limit_at_any_position_never_strands_a_started_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    workers: str,
+) -> None:
+    monkeypatch.setattr(qveris_pacing, "RequestAdmission", _stepping_admission)
+    seconds = 1
+    while True:
+        first = _clean_stop_then_resume(
+            tmp_path / f"t{seconds}",
+            monkeypatch,
+            capsys,
+            workers=workers,
+            limit=["--time-limit-seconds", str(seconds)],
+        )
+        if first["status"] == "succeeded":
+            break
+        seconds += 1
+    assert seconds > 2  # noqa: PLR2004
+
+
+@pytest.mark.parametrize("workers", ["1", "2"])
+def test_quarantine_releases_the_account_and_keeps_the_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    workers: str,
+) -> None:
+    raw = tmp_path / "raw"
+    lost = [bulk_job("KO", "prices", day) for day in ("2026-09-01", "2026-09-02")]
+    later = bulk_job("KO", "prices", "2026-09-03")
+    rows = {later.parameters_json: [{**KO_ROW, "date": "2026-09-03"}]}
+    client = ScriptedQveris(rows, account_key(raw))
+    client.failure = "timeout"
+    client.usage_ready = False
+    monkeypatch.setattr(qveris_client, "QverisClient", lambda *_a, **_k: client)
+    limits = [
+        *("--key-file", str(tmp_path / "key"), "--max-calls", "5", "--max-credits", "10"),
+        *("--request-interval", "0", "--workers", workers),
+    ]
+
+    def run(*jobs: QverisJob) -> int:
+        (tmp_path / "jobs.json").unlink(missing_ok=True)
+        path = _jobs_file(tmp_path, *jobs)
+        return main(
+            ["collect", "qveris", "run", "--jobs", str(path), "--raw-root", str(raw), *limits]
+        )
+
+    assert run(*lost) == 2  # noqa: PLR2004 -- an uncertain paid call
+    capsys.readouterr()
+    # The lost calls' usage events never appear, so their evidence can never settle.
+    client.failure, client.usage_ready, client.usage = None, True, []
+    pages, batches = _unresolved(raw)
+    target = ["--page", pages[0]] if workers == "1" else ["--batch", batches[0]]
+    assert run(later) == 2  # noqa: PLR2004 -- the unresolved evidence blocks the account
+    capsys.readouterr()
+    base = ["collect", "qveris", "quarantine", "--raw-root", str(raw), "--key-file", "k"]
+    assert main([*base, *target, "--reason", "usage event never appeared"]) == 0
+    record = json.loads(capsys.readouterr().out)
+    assert record["automatic_retry"] is False
+    assert Decimal(str(record["reserved_credits"])) == Decimal("2.81") * (
+        1 if workers == "1" else 2
+    )
+    assert _unresolved(raw) == ((), ())
+    assert run(later) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "succeeded"
+    with pytest.raises(SystemExit):
+        main([*base, "--reason", "no target"])
