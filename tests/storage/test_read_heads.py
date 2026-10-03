@@ -447,6 +447,9 @@ def test_coverage_reasons_match_market_inputs(store: duckdb.DuckDBPyConnection) 
                     expected = () if state == "present" else (state,)
                 assert cell.reasons == expected, (seed, cutoff, ingested, cell)
                 assert cell.present == (head is not None and head["value_state"] == "present")
+
+
+def test_coverage_cells_report_why_they_are_not_served() -> None:
     # A retained revision whose availability is unknown or later is not a plain data gap.
     connection = duckdb.connect()
     market.initialize_market(connection, "synthetic")
@@ -463,6 +466,62 @@ def test_coverage_reasons_match_market_inputs(store: duckdb.DuckDBPyConnection) 
     assert [cell.reasons for cell in report.cells] == [
         ("price_unavailable",),
         ("unknown_price_evidence",),
+    ]
+    # A skipped reference price beside a canonical head does not make the cell incomplete.
+    canonical, reference = _rows(
+        "prices", [("A", DAYS[2], "canon", 10, Decimal(5)), ("A", DAYS[2], "ref", 10, Decimal(6))]
+    )
+    reference["price_role"] = "reference"
+    reference["record_id"] = market.record_identity(
+        "prices", [reference[k] for k in NATURAL_KEYS["prices"]]
+    )
+    both = _publish(connection, "kr.both", [canonical, reference])
+    query = HeadQuery(cutoff_us=20, subjects=("A",), grid=(DAYS[2],))
+    report = _read(connection, HeadBinding("prices", (HeadPin(both),)), query).coverage
+    assert report is not None
+    assert report.complete
+    assert report.present_count == 1
+    # A closed session is a reason, not a covered cell, as in market_inputs.
+    sessions = []
+    for day, status in ((DAYS[0], "open"), (DAYS[1], "closed")):
+        row = {
+            **_session(random.Random(0), "XKRX", day, "canonical"),
+            "status": status,
+            "revision_id": f"session-{day}",
+            "supersedes_revision_id": None,
+            "op": "ASSERT",
+            "available_at_us": 10,
+            "revision_known_at_us": 10,
+            "ingested_at_us": 10,
+            "source_snapshot_id": "synthetic-source",
+            "source_row_hash": hashlib.sha256(str(day).encode()).hexdigest(),
+        }
+        if status == "closed":
+            row.update(open_at_us=None, close_at_us=None)
+        else:
+            row.update(open_at_us=1, close_at_us=2)
+        row["record_id"] = market.record_identity(
+            "calendar_sessions", [row[k] for k in NATURAL_KEYS["calendar_sessions"]]
+        )
+        sessions.append(row)
+    market.publish_generation(
+        connection,
+        dataset_id="calendar.kr",
+        version="1",
+        generation_id="calendar.kr-g1",
+        operation_id="op-calendar.kr-g1",
+        request_hash=hashlib.sha256(b"calendar.kr-g1").hexdigest(),
+        parent_id=None,
+        domain="calendar_sessions",
+        rows=sessions,
+    )
+    calendar = HeadBinding("calendar_sessions", (HeadPin(_pin(connection, "calendar.kr-g1")),))
+    query = HeadQuery(cutoff_us=20, subjects=("XKRX",), grid=DAYS[:2])
+    report = _read(connection, calendar, query).coverage
+    assert report is not None
+    assert [(cell.present, cell.reasons) for cell in report.cells] == [
+        (True, ()),
+        (False, ("session_closed",)),
     ]
 
 
@@ -696,6 +755,9 @@ def test_flag_exclusions_enter_bundle_hash_and_receipt() -> None:
     assert [cell.reasons for cell in after.coverage.cells] == [("flag_excluded",), ()]
     observed = _read(connection, excluding, HeadQuery())
     assert [row.values["revision_id"] for row in observed.rows] == ["s1"]
+    # An excluded initial revision creates no head in a research read either.
+    clamped = replace(excluding, excluded_flags=("time_clamped_to_ingestion",))
+    assert [row.values["revision_id"] for row in _read(connection, clamped).rows] == ["r2"]
     for result in (before, after, observed):
         assert _binding(result)["excluded_flags"] == ["provider_float_reconstructed"]
         assert result.receipt["binding_hash"] == excluding.binding_hash
@@ -821,6 +883,11 @@ def test_head_read_is_admitted_before_rows_are_fetched(
     monkeypatch.setattr(heads_module, "_fetch", fetched)
     with pytest.raises(ComputeResourceError, match="head read memory estimate"):
         _read(store, binding, budget=replace(tiny, reserved_bytes=8 * 1024 * 1024 - 70_000))
+    # A coverage grid is charged for every cell it will build, even when no row matches.
+    grid = tuple(DAY0 + timedelta(days=offset) for offset in range(1_000))
+    subjects = tuple(f"ABSENT{index:05d}" for index in range(1_000))
+    with pytest.raises(ComputeResourceError, match="head read memory estimate"):
+        _read(store, binding, HeadQuery(subjects=subjects, grid=grid), budget=tiny)
 
 
 def _spec(rules: tuple[str, str]) -> bytes:

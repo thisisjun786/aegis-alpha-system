@@ -71,6 +71,8 @@ _FETCH_ROWS: Final = 8192
 # The columns a projected row carries beside its domain values (pin, subject, day, event...).
 _BOOKKEEPING_COLUMNS: Final = 12
 _DAY_US: Final = 86_400_000_000
+# One coverage cell: the dataclass, its reasons tuple and its slot in the cell list.
+_CELL_BYTES: Final = 512
 
 
 def _day_of(column: str) -> str:
@@ -109,7 +111,7 @@ _DATES: Final = {
     "filings": ('"filed_date"', ("filed_date",)),
     "classifications": ('"effective_from"', ("effective_from",)),
 }
-_TOKENS: Final = {"prices": "price", "calendar_sessions": "session"}
+_NOUNS: Final = {"prices": "price", "calendar_sessions": "session"}
 
 
 def _pre(domain: str, columns: tuple[str, ...]) -> bool:
@@ -588,7 +590,10 @@ ORDER BY r._pin, r.record_id"""  # noqa: S608 -- code-owned schema and fragments
 
 
 def _admit(
-    connection: duckdb.DuckDBPyConnection, projection: _Projection, budget: ComputeBudget
+    connection: duckdb.DuckDBPyConnection,
+    projection: _Projection,
+    query: HeadQuery,
+    budget: ComputeBudget,
 ) -> None:
     schema = COMMON + DOMAINS[projection.domain]
     text = " + ".join(
@@ -611,11 +616,18 @@ def _admit(
     # (text_bytes). On a 21,288-row KR price read the traced Python peak was 3.1 KB per row
     # and this charges about 5.7 KB, so the bound holds with room for wider rows.
     values = count * (text_columns(schema) + 1)
+    # A coverage grid builds one cell per requested subject and date whatever the result
+    # holds, so a sparse grid is charged for its cells too.
+    days = len(query.grid or ())
+    cells = days * len(query.subjects or ())
+    cell_characters = days * sum(len(subject) for subject in query.subjects or ())
     estimated = (
         64 * 1024
         + count * (1024 + 64 * (len(projection.names) + _BOOKKEEPING_COLUMNS))
         + text_bytes(values, characters)
         + 4 * flag_bytes
+        + cells * _CELL_BYTES
+        + text_bytes(cells, cell_characters)
     )
     if estimated > budget.available_bytes:
         raise ComputeResourceError(
@@ -624,7 +636,7 @@ def _admit(
         )
 
 
-def _reasons(row: Mapping[str, object], token: str, *, strict: bool) -> tuple[str, ...]:
+def _reasons(row: Mapping[str, object], noun: str, *, strict: bool) -> tuple[str, ...]:
     """A record's coverage reasons, in ``market_inputs._absence`` terms when it has no head.
 
     A served head keeps any withheld correction or excluded revision as a reason, so a
@@ -638,6 +650,8 @@ def _reasons(row: Mapping[str, object], token: str, *, strict: bool) -> tuple[st
     if row["_event"] == "set":
         if row["op"] == "TOMBSTONE":
             first: list[str] = ["tombstone"]
+        elif noun == "session":
+            first = [] if row["status"] == "open" else ["session_closed"]
         else:
             state = row.get("value_state", "present")
             first = [] if state == "present" else [str(state)]
@@ -646,15 +660,15 @@ def _reasons(row: Mapping[str, object], token: str, *, strict: bool) -> tuple[st
     last = row["_last_state"]
     if last is not None and last != "present":
         reason = {
-            "unknown_evidence": f"unknown_{token}_evidence",
-            "unavailable": f"{token}_unavailable",
+            "unknown_evidence": f"unknown_{noun}_evidence",
+            "unavailable": f"{noun}_unavailable",
         }.get(str(last), str(last))
         return tuple(dict.fromkeys([reason, *extra]))
     if extra:
         return tuple(extra)
     if strict and row["_unknown_any"]:
-        return (f"unknown_{token}_evidence",)
-    return (f"missing_{token}",)
+        return (f"unknown_{noun}_evidence",)
+    return (f"missing_{noun}",)
 
 
 def _fetch(connection: duckdb.DuckDBPyConnection, projection: _Projection) -> list[_Record]:
@@ -663,7 +677,7 @@ def _fetch(connection: duckdb.DuckDBPyConnection, projection: _Projection) -> li
     names = projection.names
     domain = projection.domain
     strict = projection.strict
-    token = _TOKENS.get(domain, domain)
+    noun = _NOUNS.get(domain, domain)
     records = []
     while batch := cursor.fetchmany(_FETCH_ROWS):
         for fetched in batch:
@@ -685,14 +699,21 @@ def _fetch(connection: duckdb.DuckDBPyConnection, projection: _Projection) -> li
                     row["_subject"],
                     row["_day"],
                     head,
-                    _reasons(row, token, strict=strict),
+                    _reasons(row, noun, strict=strict),
                 )
             )
     return records
 
 
+def _usable(head: HeadRow, noun: str) -> bool:
+    """A head fills its cell: a present value, or an open session for a calendar."""
+    if noun == "session":
+        return head.values["status"] == "open"
+    return head.values.get("value_state", "present") == "present"
+
+
 def _coverage(binding: HeadBinding, query: HeadQuery, records: list[_Record]) -> CoverageReport:
-    token = _TOKENS.get(binding.domain, binding.domain)
+    noun = _NOUNS.get(binding.domain, binding.domain)
     cells_by_key: dict[tuple[object, object], list[_Record]] = {}
     for record in records:
         cells_by_key.setdefault((record.subject, record.day), []).append(record)
@@ -701,16 +722,19 @@ def _coverage(binding: HeadBinding, query: HeadQuery, records: list[_Record]) ->
         covered = binding.pin_for(day) is not None
         for subject in query.subjects or ():
             found = cells_by_key.get((subject, day), [])
+            heads = [record.head for record in found if record.head is not None]
+            # When a head supplies the cell, another record's absence (a skipped reference
+            # price beside a canonical one) is not a reason against the cell.
+            sources = [record for record in found if record.head is not None] or found
             if not covered:
                 reasons: tuple[str, ...] = ("outside_cutover",)
             elif not found:
-                reasons = (f"missing_{token}",)
+                reasons = (f"missing_{noun}",)
             else:
                 reasons = tuple(
-                    dict.fromkeys(reason for record in found for reason in record.reasons)
+                    dict.fromkeys(reason for record in sources for reason in record.reasons)
                 )
-            heads = [record.head for record in found if record.head is not None]
-            present = any(head.values.get("value_state", "present") == "present" for head in heads)
+            present = any(_usable(head, noun) for head in heads)
             record_id = str(heads[0].values["record_id"]) if len(heads) == 1 else None
             cells.append(CoverageCell(subject, day, present, reasons, record_id=record_id))
     report_reasons = list(dict.fromkeys(reason for cell in cells for reason in cell.reasons))
@@ -795,7 +819,7 @@ def read_heads(  # noqa: PLR0913 -- binding, query and the caller-owned resource
                 ):
                     cast("list[object]", params[key]).append(value)
         projection = _projection(connection, binding, query, params)
-        _admit(connection, projection, budget)
+        _admit(connection, projection, query, budget)
         records = _fetch(connection, projection)
     except duckdb.OutOfMemoryException as error:
         raise ComputeResourceError(
