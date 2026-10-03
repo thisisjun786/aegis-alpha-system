@@ -12,6 +12,7 @@ from aegis_alpha.application import (
     data_cli,
     etf_cli,
     identity_cli,
+    import_cli,
     prepare_cli,
     provider_cli,
     proxy_cli,
@@ -53,6 +54,7 @@ def _parser() -> argparse.ArgumentParser:
     etf_cli.add_commands(commands)
     identity_cli.add_commands(commands)
     calendar_cli.add_commands(commands)
+    import_cli.add_commands(commands)
     return parser
 
 
@@ -146,6 +148,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912 -- explic
                 result = identity_cli.execute(args)
             case "calendar":
                 result = calendar_cli.execute(args)
+            case "import":
+                result = import_cli.execute(args)
             case "providers" | "collect":
                 result = provider_cli.execute(args)
             case "legacy-db" | "legacy-data":
