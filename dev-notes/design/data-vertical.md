@@ -322,12 +322,13 @@ ICU 시간대 자료로 푼 값이고, `timezone_version`은 그 자료를 가�
 필수 열 누락으로 거부된다. 시간 입력은 `public_by` 하나다.
 
 예정된 매퍼 목록: `norgate.prices_none`, `norgate.prices_adjusted`,
-`norgate.dividends`, `norgate.index_membership`, `norgate.reference_series`,
+`norgate.dividends`, `norgate.reference_series`,
 `fmp.actions`, `sec.submissions`, `sec.companyfacts`,
 `dart.fnltt`, `dart.list`. identity 원천을 읽는 매퍼는 typed generation이
 아니라 등록 문서를 만든다. `eodhd.kr_symbol`, `kind.listings`, `dart.corp_codes`는
 [KR 등록](#kr-등록)이, `norgate.master`, `eodhd.us_symbol`, `fmp.profile`, `sec.tickers`는
-[US 등록](#us-등록)이 소유한다.
+[US 등록](#us-등록)이 소유한다. universe 원천을 읽는 `norgate.index_membership`과 `norgate.listings`도
+generation이 아니라 universe 문서를 만들며 [universe 등록](#universe-등록)이 소유한다.
 
 자연키가 겹치는 원천 행 두 개는 승격을 거부한다. 어느 쪽을 고를지 추정하지 않는다.
 instrument는 pin한 identity snapshot에서 매퍼의 assertion key와 token이 같고, 해석 시각이 유효
@@ -689,7 +690,8 @@ KRX 토요일 session은 확인되지 않은 반일 마감 대신 평일 마감�
 | `classifications.*` | `classifications`(v2) | Norgate 분류, SEC SIC, KIND 업종. known은 snapshot 시각이며 과거로 소급하지 않음 |
 
 identity 원천(Norgate master, SEC submissions, FMP profile, DART 고유번호, KIND 목록)은 typed generation이
-아니라 아래 [identity 등록](#identity-등록과-chunked-문서)으로 state에 들어간다.
+아니라 아래 [identity 등록](#identity-등록과-chunked-문서)으로 state에 들어간다. 지수 구성과 상장 universe도
+같은 방식으로 [universe 등록](#universe-등록)의 `universe_versions`·`universe_members`에 들어간다.
 
 dataset의 백필은 연도 단위 generation, 이후 유지보수는 세션 단위(재무는 일 단위) generation으로
 게시한다.
@@ -796,15 +798,19 @@ identity 문서로 투영한다. 선택한 assertion마다 member 하나이고, 
 - part는 [membership pins](membership-pins.md)의 v1 문서(`aas-identity-snapshot-v1`,
   `aas-universe-version-v1`) 그대로이고 이름은 `<root>#00000`부터 이어지는 다섯 자리 번호다.
   이 접미사는 part 전용이라 v1 단일 문서 등록은 그런 이름을 거부한다.
-- 전체 문서를 먼저 v1 규칙으로 검증하고, member를 정규 순서대로 part마다 1 MiB 정규 bytes와 64 MiB
-  materialization charge 안에서 탐욕적으로 채운다. 같은 내용은 항상 같은 part와 hash가 된다.
+- 전체 문서를 먼저 v1 규칙으로 검증하고, member를 채움 순서대로 part마다 1 MiB 정규 bytes와 64 MiB
+  materialization charge 안에서 탐욕적으로 채운다. 같은 내용은 항상 같은 part와 hash가 된다. 채움 순서는
+  identity가 정규 순서, universe가 `source_snapshot_id` 다음 정규 순서다. universe 원천 하나가 수백 개
+  파일을 싣고 part는 인용한 원천의 파일 목록 전체를 실으므로, 원천별로 채워야 part 하나가 여러 원천의
+  목록을 함께 싣지 않는다.
 - manifest는 `{"schema": "aas-identity-manifest-v1" | "aas-universe-manifest-v1", "hash_format",
   root 키, "parts": [{part 이름, "content_hash"}]}`의 정규 JSON이고 pin의 `content_hash`는 그
   SHA-256이다. root header는 기존 `identity_snapshots`·`universe_versions` 행이며 새 테이블은 없다.
 - manifest root header는 자기 member 행을 갖지 않는다. member가 있는 root는 v1 문서로 읽으므로,
   manifest root 아래에 끼워 넣은 member 행은 재구성 hash가 맞지 않아 읽기와 검증에서 거부된다.
 - 읽기는 part 전부의 charge 합을 호출자 allowance에서 받은 뒤 part마다 v1으로 재구성하고, part
-  사이의 정규 순서와 identity 구간 겹침을 확인한다. part는 64 MiB charge 가까이 채워지므로 manifest
+  사이의 채움 순서, identity 구간 겹침, 두 part에 걸친 같은 universe member key(instrument,
+  `valid_from_us`, `known_from_us`)를 확인한다. 읽은 universe member는 전체 문서의 정규 순서로 돌려준다. part는 64 MiB charge 가까이 채워지므로 manifest
   하나를 읽는 데 part 수 × 약 64 MiB의 allowance가 필요하다(US 등록 전체 129,998 member는 208 part ≈ 13 GiB).
   소비자 allowance를 이 크기에 맞추는 일은 소비자 연결(PR 27)의 몫이다. `aas db verify`는 part를
   각자 검증하고 manifest는 part header와 경계만으로 확인한다.
@@ -945,6 +951,48 @@ Norgate security master 하나에서 모두 나온다.
   `aas-norgate-assetids-v1` 해시(정규 JSON `["aas-norgate-assetids-v1", 오름차순 asset ID 정수]`의
   SHA-256, 중복과 입력 순서는 무시한다)로도 보고한다.
 
+### universe 등록
+
+지수 구성과 US 상장 목록은 universe 매퍼로 읽어 [membership pins](membership-pins.md)의
+`aas-universe-version-v1` 문서로 만들고, [chunked 문서](#identity-등록과-chunked-문서)로 등록한다.
+코드는 `storage/universe.py`, 명령은 `aas universe`다.
+
+| 매퍼 | 원천 | 만드는 universe |
+| --- | --- | --- |
+| `norgate.index_membership@1` | legacy 편입한 Norgate `index_constituent_timeseries`(원천 자료실 `norgate-index-membership-*`, 테이블 `constituents`: asset ID, 지수 이름, `date`, `index_constituent` 원문) | 지수마다 `index.us.norgate/<지수 이름>` |
+| `norgate.listings@1` | Norgate security master(`norgate.master@1`이 읽는 같은 `observations`) | `listing.us.norgate` |
+
+- 지수 구성 원천은 (asset ID, 지수) 쌍마다 그 쌍의 날짜별 `0`/`1` 값이다. 원천 행 순서로 연속한 `1`
+  행 한 묶음이 member 하나이고, 유효 구간은 첫 날짜의 New York 0시부터 마지막 날짜 다음 날의 New York
+  0시까지다. 이 구간을 쌍 자신의 날짜에 펼치면 원래 값이 그대로 나온다. 주말처럼 쌍에 행이 없는
+  날은 묶음을 끊지 않는다. 압축은 DuckDB SQL(gaps-and-islands)이고 `universe.compress`가 같은 규칙의
+  참조 구현이다.
+- 쌍은 통째로 받거나 거부하며 고쳐 쓰지 않는다: asset ID가 양의 정수가 아님(`assetid_invalid`),
+  지수 이름이 다듬어진 텍스트가 아님(`indexname_invalid`), 값이 `0`/`1`이 아님(`constituent_invalid`),
+  날짜가 `YYYY-MM-DD`가 아니거나 다음 날을 나타낼 수 없는 `9999-12-31`임(`date_invalid`), 날짜가 원천 행 순서로 엄격히 증가하지 않음
+  (`dates_not_increasing`, 같은 날짜의 반복 포함), 두 원천이 같은 쌍을 실음(`pair_repeated`, 이어 붙이지
+  않는다). 두 원천이 실은 쌍은 한 사본이 다른 이유로 거부돼도 다른 사본을 받지 않는다: 이미 거부된 사본은
+  제 이유를 유지하고 나머지 사본이 `pair_repeated`가 된다. 보고의 행 단위는 쌍이다.
+- 상장 universe의 member는 master 행마다 `first_date`의 New York 0시부터 `last_date` 다음 날의 New York
+  0시까지다. 상장 중이고 `last_date`가 없는 행은 master의 마지막 관측 세션(`through`, US 등록과 같은
+  정의)까지다. `first_date`가 없거나(`listing_start_unknown`), 상폐 행에 `last_date`가 없거나
+  (`listing_end_unknown`), 두 날짜가 거꾸로이거나(`listing_dates_reversed`), 끝 날짜가 다음 날을 나타낼
+  수 없는 `9999-12-31`이거나(`listing_end_invalid`), 같은 asset ID의 두 행(`assetid_repeated`)은 member가
+  되지 않는다. 그 밖의 master 거부 이유는 `norgate.master@1`과 같다.
+- member는 identity 등록이 이미 가진 instrument `mint('norgate_assetid', assetid)`이고 문서의 instrument
+  행은 등록된 행 그대로다. 등록되지 않은 asset ID는 문서에 넣지 않고 `unresolved`로 보고한다.
+- 원천 행에는 수집 시각이 없으므로 member는 그 원천 `sl:` 연결의 `retrieved_at_us`부터 알려지고
+  (`known_to_us`는 null), `source_snapshot_id`는 그 `sl:` ID다. 그래서 그 시각보다 이른 결정 시점의 strict
+  멤버십 판정은 이 member를 보지 않는다. 더 이른 지식 시각은 다른 날짜 단위 원천처럼 버전 붙은 시간
+  규칙과 소비자 grant의 몫이다.
+- Norgate는 동결 원천이므로 member 구간은 마지막으로 내보낸 날짜 다음 날에 끝나며 그 뒤의 구성은 말하지
+  않는다.
+- universe version은 호출자가 정한다. 같은 원천과 identity 등록에서는 같은 문서와 pin이 나오고, 같은
+  version으로 다시 등록하면 같은 pin을 재사용하고, 이미 있는 version에 다른 내용을 등록하면 아무것도
+  바꾸지 않고 거부하므로 다른 내용은 새 version으로 등록한다.
+- 보고는 universe마다 member·instrument·원천 수, 미해결 asset ID, 쌍·원천 행·한 번도 편입되지 않은 쌍의
+  수, 원천 날짜 범위, 그리고 원천이 실은 날짜마다의 member 수(`daily_members`: 최소·중앙값·최대)다.
+
 ## 대량 게시와 reader
 
 - `storage/bulk_generation.py`가 대량 게시를 소유한다. 입력은 연결에 보이는 staging 테이블이나 view
@@ -1039,6 +1087,9 @@ pin(`observations`) 대신 canonical 가격 binding(`prices`: `aas-head-binding-
   instrument·세션의 bar가 둘이면 거부한다. 읽은 행이 없는 `instrument_map` 열쇠도 거부한다.
 - 한 bar가 자기 시가와 종가를 내므로 두 패널은 basis·조정·세션이 같다. 세션 순서는 bar의 `bar_end_us`로
   정하며 이것은 지식 시점이 아니라 bar의 경제 시점이다. 일정은 관측 경로와 같은 날짜 기반 월말 판단이다.
+- 읽기는 `read_heads`의 기본값대로 구조만 확인한다(`rehash=False`): pin·chain link·행 수는 확인하고 delta
+  행 값은 다시 해시하지 않으며 영수증의 `rehashed`가 거짓으로 이를 기록한다. 관측 경로는 보존 관측 내용을
+  다시 확인하므로 두 경로의 내용 확인 범위는 다르다. 행 값 확인은 `aas db verify`의 몫이다.
 - 자산 유형은 상태 저장소의 instrument 분류에서 온다(`etf` → `ETF`). 관측 경로의 `OBSERVATION`과 다르다.
 - 봉인 준비 문서는 `observations` 대신 `prices`에 `binding_hash`, 읽기 영수증 `head_read`
   (`aas-head-read-v1` 전체)와 그 SHA-256을 싣는다. `resolved_calendar.observed_calendar_ref`는 binding
@@ -1292,9 +1343,24 @@ state v2:
 | DV-170 | legacy FRED CSV와 KR 공개 응답은 편입 뒤 승격되고, 텍스트 날짜 원천의 파티션은 `YYYY-MM-DD` 날짜만 고르며 FRED FX와 시점이 없는 거시 행의 두 시점은 null이고 BOK 정책금리의 두 정의는 다른 단위다 | `tests/storage/test_macro_fx.py::test_legacy_fred_and_kr_public_sources_promote` | 구현 |
 | DV-171 | legacy Norgate 내보내기는 편입 뒤 `norgate.fx_history@1`로 한 통화쌍이 승격된다 | `tests/storage/test_macro_fx.py::test_norgate_history_export_promotes_one_pair` | 구현 |
 | DV-172 | 원천 ID 접두사를 선언한 매퍼는 다른 공급자의 원천 pin을 명세 단계에서 거부한다 | `tests/storage/test_macro_fx.py::test_legacy_fred_and_kr_public_sources_promote` | 구현 |
-| DV-173 | 연구 모드의 지식 상한은 그보다 늦게 알려진 revision만 빼고 시점 없는 revision은 남기며, 설정했을 때만 query 문서에 들어간다 | `tests/storage/test_read_heads.py::test_research_known_ceiling_matches_snapshot_candidates` | 구현 |
-| DV-174 | canonical 가격 pin에서 유도한 연구 실행 패널은 같은 값의 관측 패널과 같은 날짜·시가·종가·판단을 낸다 | `tests/application/test_research_prices.py::test_the_price_route_matches_the_observation_route` | 구현 |
-| DV-175 | 가격 pin 연구 실행의 봉인 준비 문서는 그 읽기의 `aas-head-read-v1` 영수증과 해시를 싣는다 | `tests/application/test_research_prices.py::test_the_sealed_preparation_carries_the_head_read_receipt` | 구현 |
-| DV-176 | `krw_tick@1`로 승격한 `prices.kr.eodhd` chain의 KRW 실행은 원 단위 가격으로 같은 판단을 낸다 | `tests/application/test_research_prices.py::test_a_krw_run_over_a_promoted_chain_decides_like_the_usd_run` | 구현 |
-| DV-177 | 선언 지식 시점 뒤에 알려진 정정은 연구 패널에 들어가지 않는다 | `tests/application/test_research_prices.py::test_a_revision_received_after_the_knowledge_time_is_not_read` | 구현 |
-| DV-178 | 선언 통화와 다른 가격과 pin이 싣지 않은 instrument는 거부되고, 선언은 패널 원천을 정확히 하나만 든다 | `tests/application/test_research_prices.py::test_a_price_run_refuses_what_the_pins_do_not_carry` | 구현 |
+| DV-173 | 지수 구성 쌍의 연속한 `1` 행 묶음은 member 구간 하나이고, 구간을 쌍의 날짜에 펼치면 원래 일간 값이 나온다 | `tests/storage/test_universe.py::test_interval_compression_round_trips_daily_values` | 구현 |
+| DV-174 | 지수 구성의 SQL 압축은 참조 구현과 같은 구간을 내고, 두 원천이 실은 쌍은 이어 붙이지 않고 통째로 거부한다 | `tests/storage/test_universe.py::test_index_universe_sql_matches_the_reference_and_round_trips` | 구현 |
+| DV-175 | 값·날짜·순서·지수 이름이 정규가 아니거나 `9999-12-31`을 담은 쌍은 이유와 함께 통째로 거부하고, 등록되지 않은 asset ID는 미해결로 보고한다 | `tests/storage/test_universe.py::test_index_pairs_with_unreadable_values_are_refused` | 구현 |
+| DV-176 | 지수 universe는 chunked 문서로 등록되고 재등록은 같은 pin이며, 한 build의 universe는 모두 등록되거나 하나도 등록되지 않고, 읽기와 `aas db verify`를 통과한다 | `tests/storage/test_universe.py::test_index_universes_register_and_read_back` | 구현 |
+| DV-177 | 상장 universe의 member는 master 행의 `first_date`부터 `last_date` 다음 날까지이고 `last_date` 없는 상장 행은 `through`까지다 | `tests/storage/test_universe.py::test_listing_universe_spans_each_master_listing` | 구현 |
+| DV-178 | universe part는 원천별로 채우고 읽기는 member를 정규 순서로 돌려준다 | `tests/storage/test_universe.py::test_universe_parts_are_filled_source_by_source` | 구현 |
+| DV-179 | `aas universe --plan`은 쓰지 않고, 만들 수 없는 `--report` 경로는 등록 전에 거부하며, `--report`는 pin을 담고, 등록한 universe를 `aas universe show`가 읽는다 | `tests/storage/test_universe.py::test_universe_cli_plans_registers_and_shows` | 구현 |
+| DV-180 | 두 원천이 실은 쌍은 한 사본이 다른 이유로 거부돼도 나머지 사본을 받지 않고 `pair_repeated`로 거부한다 | `tests/storage/test_universe.py::test_a_pair_two_sources_carry_is_refused_when_one_copy_is_refused` | 구현 |
+| DV-181 | 원천 순서가 맞아도 두 part에 걸친 같은 member key는 읽기와 verify에서 거부한다 | `tests/storage/test_universe.py::test_a_member_key_repeated_across_parts_is_refused` | 구현 |
+| DV-182 | 끝 날짜가 `9999-12-31`인 상장은 `listing_end_invalid`로 거부되고 `through`를 옮기지 않는다 | `tests/storage/test_universe.py::test_a_listing_ending_on_the_last_representable_date_is_refused` | 구현 |
+| DV-183 | 연구 모드의 지식 상한은 그보다 늦게 알려진 revision만 빼고 시점 없는 revision은 남기며, 설정했을 때만 query 문서에 들어간다 | `tests/storage/test_read_heads.py::test_research_known_ceiling_matches_snapshot_candidates` | 구현 |
+| DV-184 | canonical 가격 pin에서 유도한 연구 실행 패널은 같은 값의 관측 패널과 같은 날짜·시가·종가·판단을 낸다 | `tests/application/test_research_prices.py::test_the_price_route_matches_the_observation_route` | 구현 |
+| DV-185 | 가격 pin 연구 실행의 봉인 준비 문서는 그 읽기의 `aas-head-read-v1` 영수증과 해시를 싣는다 | `tests/application/test_research_prices.py::test_the_sealed_preparation_carries_the_head_read_receipt` | 구현 |
+| DV-186 | `krw_tick@1`로 승격한 `prices.kr.eodhd` chain의 KRW 실행은 원 단위 가격으로 같은 판단을 낸다 | `tests/application/test_research_prices.py::test_a_krw_run_over_a_promoted_chain_decides_like_the_usd_run` | 구현 |
+| DV-187 | 선언 지식 시점 뒤에 알려진 정정은 연구 패널에 들어가지 않는다 | `tests/application/test_research_prices.py::test_a_revision_received_after_the_knowledge_time_is_not_read` | 구현 |
+| DV-188 | 선언 통화와 다른 가격과 pin이 싣지 않은 instrument는 거부된다 | `tests/application/test_research_prices.py::test_a_price_run_refuses_what_the_pins_do_not_carry` | 구현 |
+| DV-189 | 선언은 패널 원천을 정확히 하나만 든다: 둘 다 든 선언, 관측 열쇠의 `instrument_map`, 이어지지 않는 pin은 거부된다 | `tests/application/test_research_prices.py::test_a_declaration_names_exactly_one_panel_source` | 구현 |
+| DV-190 | 패널 원천이 없는 선언은 거부된다 | `tests/application/test_research_prices.py::test_a_declaration_with_neither_panel_source_is_refused` | 구현 |
+| DV-191 | `present`가 아닌 bar와 공개 시점이 상한보다 늦은 head는 패널에서 빠지고 그 세션은 다른 값으로 채워지지 않는다 | `tests/application/test_research_prices.py::test_a_skipped_bar_leaves_its_session_empty_and_is_not_filled` | 구현 |
+| DV-192 | canonical unadjusted가 아닌 행과 같은 instrument·세션의 두 번째 bar는 거부된다 | `tests/application/test_research_prices.py::test_a_price_panel_refuses_rows_it_cannot_read_as_one_bar_per_session` | 구현 |
+| DV-193 | 가격 pin 선언은 sleeve와 composition 모두 `aas run research`로 기록되고 `aas run rerun --declaration`이 준비와 결과를 재현한다 | `tests/application/test_research_prices.py::test_a_priced_run_is_recorded_and_reproduces_from_its_declaration` | 구현 |

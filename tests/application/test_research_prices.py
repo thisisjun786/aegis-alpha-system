@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import UTC, datetime
+from collections.abc import Callable
+from dataclasses import replace
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
+from aegis_alpha.application import backtest_prepare
 from aegis_alpha.application.backtest_cli import run_document
 from aegis_alpha.application.backtest_prepare import PreparedResearchRun, prepare_research_run
 from aegis_alpha.application.research_run import ResearchRunError, parse_research_run_request
@@ -30,9 +33,24 @@ from aegis_alpha.storage.identity import (
     snapshot_identities,
 )
 from aegis_alpha.storage.promotion.engine import promote
+from aegis_alpha.storage.read_heads import HeadRead, HeadRow
 from aegis_alpha.storage.workspace import open_workspace
 from tests.application.test_backtest_prepare import BUDGET, DAYS
-from tests.application.test_research_execution import CLOCK_NS, copy_installation
+from tests.application.test_prepare_cli import sha
+from tests.application.test_research_composition import (  # noqa: F401 -- shared fixture
+    _as_sleeve_run,
+    _composition,
+    composed,
+)
+from tests.application.test_research_execution import CLOCK_NS, KNOWLEDGE_US, copy_installation
+from tests.application.test_run_research import (
+    _execute,
+    _installed,
+    _rerun,
+    _run_id,
+    _show,
+    _write,
+)
 from tests.storage.promotion_support import (
     UNBOUNDED,
     add_source,
@@ -370,3 +388,115 @@ def test_a_declaration_names_exactly_one_panel_source(
     }
     with pytest.raises(ResearchRunError, match="ordered and contiguous"):
         _ = parse_research_run_request(canonical_json_bytes(split))
+
+
+def _rewritten(
+    monkeypatch: pytest.MonkeyPatch, rewrite: Callable[[list[HeadRow]], list[HeadRow]]
+) -> None:
+    """Hand the price panel a read whose rows ``rewrite`` changed after the store read."""
+    original = backtest_prepare.load_pinned_heads
+
+    def load(*args: Any, **kwargs: Any) -> HeadRead:  # noqa: ANN401 -- passthrough
+        read = original(*args, **kwargs)
+        return replace(read, rows=tuple(rewrite(list(read.rows))))
+
+    monkeypatch.setattr(backtest_prepare, "load_pinned_heads", load)
+
+
+def _changed(rows: list[HeadRow], subject: str, day: date, **values: object) -> list[HeadRow]:
+    return [
+        replace(row, values={**row.values, **values})
+        if (row.values["instrument_id"], row.values["session_date"]) == (subject, day)
+        else row
+        for row in rows
+    ]
+
+
+@pytest.mark.parametrize(
+    "values",
+    [{"value_state": "invalid"}, {"available_at_us": KNOWLEDGE_US + 1}],
+    ids=["not-present", "available-after-the-ceiling"],
+)
+def test_a_skipped_bar_leaves_its_session_empty_and_is_not_filled(
+    installation: tuple[Path, Document, Document],
+    monkeypatch: pytest.MonkeyPatch,
+    values: Document,
+) -> None:
+    """A bar the panel cannot admit is left out; its instrument does not take another value."""
+    home, _body, declaration = installation
+    priced = _outcomes(home, declaration)
+    full = _prepared(home, priced)
+    # The period's last session, where the full run reads every instrument.
+    _rewritten(monkeypatch, lambda rows: _changed(rows, "REF_X", DAYS[6], **values))
+    skipped = _prepared(home, priced)
+    assert "REF_X" not in skipped.inputs.closes[-1]
+    assert full.inputs.closes[-1]["REF_X"] == VALUES["REF_X"][6]
+
+
+@pytest.mark.parametrize(
+    ("rewrite", "message"),
+    [
+        (
+            lambda rows: _changed(rows, "REF_X", DAYS[6], price_role="reference"),
+            "reads only canonical unadjusted bars",
+        ),
+        (
+            lambda rows: _changed(rows, "REF_X", DAYS[6], basis="total_return"),
+            "reads only canonical unadjusted bars",
+        ),
+        (lambda rows: [*rows, rows[-1]], "price panel repeats one session"),
+    ],
+    ids=["reference-role", "adjusted-basis", "repeated-session"],
+)
+def test_a_price_panel_refuses_rows_it_cannot_read_as_one_bar_per_session(
+    installation: tuple[Path, Document, Document],
+    monkeypatch: pytest.MonkeyPatch,
+    rewrite: Callable[[list[HeadRow]], list[HeadRow]],
+    message: str,
+) -> None:
+    home, _body, declaration = installation
+    priced = _outcomes(home, declaration)
+    _rewritten(monkeypatch, rewrite)
+    with pytest.raises(ValueError, match=message):
+        _ = _prepared(home, priced)
+
+
+def test_a_declaration_with_neither_panel_source_is_refused(
+    installation: tuple[Path, Document, Document],
+) -> None:
+    _home, _body, declaration = installation
+    neither = {key: value for key, value in declaration.items() if key != "observations"}
+    with pytest.raises(ResearchRunError, match="observations"):
+        _ = parse_research_run_request(canonical_json_bytes(neither))
+
+
+@pytest.mark.parametrize("scope", ["sleeve", "composition"])
+def test_a_priced_run_is_recorded_and_reproduces_from_its_declaration(
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    scope: str,
+) -> None:
+    """`aas run research` records a price-pinned declaration and `run rerun` reproduces it."""
+    # Requested by name so the imported fixture is reused and no parameter shadows it.
+    composition = request.getfixturevalue("composed")
+    home, base, offense, defense = cast("tuple[Path, Document, Document, Document]", composition)
+    declaration = (
+        _as_sleeve_run(base, offense) if scope == "sleeve" else _composition(base, offense, defense)
+    )
+    priced = _outcomes(home, declaration)
+    _installed(home)
+    path = _write(tmp_path, scope + ".json", priced)
+    receipt = _execute(home, path, capsys)
+    assert cast("Document", receipt["run"])["status"] == "SUCCESS"
+    run_id = _run_id(receipt)
+    shown = cast("Document", _show(home, run_id, capsys)["run"])
+    assert shown["request_hash"] == receipt["request_hash"]
+
+    rerun = _rerun(
+        home, run_id, capsys, "--declaration", str(path), "--sha256", sha(path.read_bytes())
+    )
+    assert rerun["checked"] == ["preparation", "result"]
+    assert rerun["reproduced"] is True
+    preparation = cast("Document", cast("Document", rerun["checks"])["preparation"])
+    assert preparation["matches"] == {"run_id": True, "envelope": True, "preparation": True}

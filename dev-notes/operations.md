@@ -319,6 +319,27 @@ uv run --no-sync python -m scripts.us_identity_report --market MARKET.duckdb \
 해석은 같은 master로 만든 `us-build` 문서와 같다. 문서 자체는 state의 `sl:` 연결 시각이 필요하므로 싣지
 않는다. 설치본에 쓰지 않는 검토 근거다.
 
+### universe
+
+```bash
+aas universe index --source SOURCE_ID [--source SOURCE_ID] ... [--index NAME] ... \
+  --version VERSION [--report report.json] [--plan]
+aas universe listings --master SOURCE_ID --version VERSION [--report report.json] [--plan]
+aas universe show --id UNIVERSE_ID --version VERSION
+```
+
+`index`는 `aas import legacy`의 `norgate.index_membership@1` 항목이 commit한 지수 구성 원천을, `listings`는
+Norgate security master 원천을 pin과 대조해 읽고 universe 문서를 만든다. 원천마다 `sl:` 연결이 있어야 하고
+member instrument는 US identity 등록이 먼저 있어야 한다. `index`는 지수마다 universe
+`index.us.norgate/<지수 이름>` 하나를 같은 `--version`으로 등록하고, `--index`는 등록할 지수를 고른다(모든
+쌍은 여전히 읽고 검사한다). 지수 구성 원천은 legacy 편입 단위마다 하나이므로 한 번에 모두 넘긴다.
+`--plan`은 설치본을 읽기 전용으로 열어 pin과 part 수만 보고한다. 한 명령이 만든 universe는 한 transaction에서
+모두 등록되거나 하나도 등록되지 않는다. 응답은 매퍼 보고, universe별 member 수, 미해결 asset ID 표본(100개),
+날짜별 member 수 요약, pin이고, `--report`는 미해결 전체와 pin을 담은 같은 보고를 새 파일에 쓴다. 이미 있거나
+폴더가 없는 `--report` 경로는 아무것도 등록하기 전에 거부된다. 등록은 state만 쓰고 strategy 저장소를 쓰지
+않는다. `show`는 등록된 universe의 header와 part별 member 수를 읽는다. 공급자를 호출하지 않는다.
+규칙은 [universe 등록](design/data-vertical.md#universe-등록)이 소유한다.
+
 ## 원천 자료의 승격과 은퇴
 
 원천 자료실 자료를 공급자별 시장 dataset으로 승격하는 명령(`aas data promote`), 원천 ID 연결
