@@ -302,8 +302,22 @@ aas identity register --file registry.json --sha256 SHA256 --plan
 `aas db source-link --apply`로 연결한다. `--bindings`는 legacy identity bindings 원천과 발급한 asset ID
 집합을 비교해 보고에 싣는다. 입력의 누적 규칙, 출력·`--report` 파일 규칙, 응답 형태(`withdrawn` 포함)는
 `kr-build`와 같다. 응답에는 asset ID 집합의 `aas-norgate-assetids-v1` 해시(`assetids_sha256`)와 issuer가
-연결된 instrument 수가 더 실린다. 공급자를 호출하지 않는다. 해석 규칙과 미해결 이유는
-[US 등록](design/data-vertical.md#us-등록)이 소유한다.
+연결된 instrument 수, 티커 주장이 끝나는 master의 마지막 관측 세션(`through`)이 더 실린다. 공급자를
+호출하지 않는다. 해석 규칙과 미해결 이유는 [US 등록](design/data-vertical.md#us-등록)이 소유한다.
+
+```bash
+uv run --no-sync python -m scripts.us_identity_report --market MARKET.duckdb \
+  --master SOURCE_ID --bars qveris-bulk- --quarantine qveris-bulk- \
+  [--quarantine-reason REASON] [--output report.json]
+```
+
+`scripts/us_identity_report.py`(로직은 `application/us_identity_report.py`)는 market 파일만 읽기 전용으로
+열고 `--master`의 Norgate master로 US 문서를 메모리에서 만들어, `--bars` 접두사 아래 `bars` 테이블과
+`--quarantine` 접두사 아래 `quarantine` 테이블(`source_row_json`의 `code`, `date`, `exchange_short_name`)의
+`.US` 행을 `eodhd.bars@1`처럼 세션 날짜의 New York 0시에 해석한다. 표 종류마다 모든 행과 고유
+(심볼, 날짜) 키의 해석 수와 미해결 행·심볼 수를 이유별로 보고한다. EODHD 심볼 주장은 master에만 기대므로
+해석은 같은 master로 만든 `us-build` 문서와 같다. 문서 자체는 state의 `sl:` 연결 시각이 필요하므로 싣지
+않는다. 설치본에 쓰지 않는 검토 근거다.
 
 ## 원천 자료의 승격과 은퇴
 

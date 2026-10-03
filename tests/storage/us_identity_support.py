@@ -42,6 +42,7 @@ MASTER_SCHEMA: Final = pa.schema(
         ("currency", pa.string()),
         ("subtype1", pa.string()),
         ("first_date", pa.string()),
+        ("last_date", pa.string()),
         ("is_etf", pa.bool_()),
     ]
 )
@@ -91,11 +92,16 @@ def master(  # noqa: PLR0913 -- one synthetic master row spells its columns
     assetid: int,
     symbol: str,
     *,
-    delisted: bool = False,
+    delisted: bool | None = False,
     etf: bool | None = None,
     currency: str = "USD",
     name: str | None = None,
+    first_date: str | None = "2001-02-03",
+    last_date: str | None = None,
 ) -> dict[str, object]:
+    """One master row; a delisted row's ``last_date`` defaults to before ``first_date``."""
+    if delisted and last_date is None:
+        last_date = "2001-01-31"
     return {
         "assetid": assetid,
         "symbol": symbol,
@@ -104,7 +110,8 @@ def master(  # noqa: PLR0913 -- one synthetic master row spells its columns
         "exchange": "NYSE Arca" if etf else "Nasdaq",
         "currency": currency,
         "subtype1": "Exchange Traded Product" if etf else "Equity",
-        "first_date": "2001-02-03",
+        "first_date": first_date,
+        "last_date": last_date,
         "is_etf": etf,
     }
 
@@ -117,7 +124,7 @@ def profile(  # noqa: PLR0913 -- one synthetic profile row spells its columns
     isin: str | None = None,
     etf: bool = False,
     currency: str = "USD",
-    retrieved: datetime = FMP_RETRIEVED,
+    retrieved: datetime | None = FMP_RETRIEVED,
 ) -> dict[str, object]:
     return {
         "symbol": symbol,
@@ -161,10 +168,12 @@ def fmp_rows(rows: Sequence[dict[str, object]], source_id: str = "fmp-profiles")
     return rows_of(table(rows, FMP_SCHEMA), source_id)
 
 
-def commit(workspace: Workspace, shape: str, name: str, arrow: pa.Table) -> str:
+def commit(
+    workspace: Workspace, shape: str, name: str, arrow: pa.Table, *, provider: str = "synthetic"
+) -> str:
     """Commit ``arrow`` as one linked content source of its own bytes; return its ID."""
-    _, digest, size = put_raw(workspace.paths.raw, f"synthetic-{shape}-{arrow.num_rows}".encode())
-    content = SourceContent("synthetic", shape, 1, (SourceFile(digest, size),))
+    _, digest, size = put_raw(workspace.paths.raw, f"{provider}-{shape}-{arrow.num_rows}".encode())
+    content = SourceContent(provider, shape, 1, (SourceFile(digest, size),))
     source_library.import_content_arrow(workspace, content, name, arrow.to_reader())
     return content.source_id
 

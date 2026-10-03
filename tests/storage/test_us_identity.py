@@ -11,18 +11,22 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, cast
 
+import pyarrow as pa
 import pytest
 
+from aegis_alpha.application import us_identity_report
 from aegis_alpha.application.cli import main
 from aegis_alpha.storage.identity import (
     decode_registry,
     issuer_link_token,
     mint_instrument,
     mint_issuer,
+    parse_registry,
     register_identities,
     snapshot_identities,
 )
 from aegis_alpha.storage.kr_identity import UNBOUNDED
+from aegis_alpha.storage.promotion import formats
 from aegis_alpha.storage.promotion.engine import promote
 from aegis_alpha.storage.source_identity import SourceFile
 from aegis_alpha.storage.us_identity import (
@@ -32,6 +36,7 @@ from aegis_alpha.storage.us_identity import (
     build_us_registry,
     link_instant,
     map_sec_tickers,
+    session_start_us,
     us_ticker,
 )
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
@@ -141,9 +146,16 @@ def test_us_instruments_are_minted_from_norgate_asset_ids() -> None:
         ("eodhd", "eodhd_symbol", "FUND.US"),
     }
     hashes = {row_hash for _, row_hash in source.rows.records()}
+    # A listed row's ticker claims hold from its first date until the day after the
+    # master's last observed session; asset IDs and delisted symbols hold for good.
+    assert registry.through == date(2001, 2, 3)
+    listed = (session_start_us(date(2001, 2, 3)), session_start_us(date(2001, 2, 4)))
     for row in _assertions(registry):
+        always = row["namespace"] == "norgate_assetid" or row["token"].endswith("-201001")
+        assert (row["valid_from_us"], row["valid_to_us"]) == (
+            (UNBOUNDED, None) if always else listed
+        )
         # The master records no retrieval instant: claims are known from the sl: link.
-        assert (row["valid_from_us"], row["valid_to_us"]) == (UNBOUNDED, None)
         assert row["known_from_us"] == LINKED
         assert row["source_snapshot_id"] == source.rows.snapshot_id
         assert row["source_hash"] in hashes
@@ -152,6 +164,103 @@ def test_us_instruments_are_minted_from_norgate_asset_ids() -> None:
     assert registry.report()["assetids_sha256"] == assetid_set_sha256(
         ["255128", "90001", "90005", "131684", "90004"]
     )
+    # A listing state that is not a boolean is refused, not guessed.
+    unknown = build_us_registry(linked([master(1, "AAA"), master(2, "BBB", delisted=None)]))
+    assert unknown.mappers["norgate.master@1"].refused == {"listing_state_unknown": 1}
+    assert unknown.assetids() == ["1"]
+
+
+def test_the_asset_id_set_hash_is_pinned() -> None:
+    # Independent value: SHA-256 of the bytes ["aas-norgate-assetids-v1",[9,131684,255128]].
+    pinned = "3424bffc061c3ab653ccbf2f30521980364943ac27f94869341559ab74f1cba6"
+    assert assetid_set_sha256(["9", "131684", "255128"]) == pinned
+    assert assetid_set_sha256(["255128", "9", "131684", "9"]) == pinned
+    assert assetid_set_sha256({"131684", "255128", "9"}) == pinned
+
+
+def test_ticker_claims_are_bounded_by_the_master() -> None:
+    rows = [
+        # XYZ was an earlier security's ticker until 2020-01-15; the current holder lists
+        # from 2019-06-03 under another symbol history, so its claims start 2020-01-16.
+        master(1, "XYZ-202001", delisted=True, last_date="2020-01-15"),
+        master(2, "XYZ-201505", delisted=True, last_date="2015-05-20"),
+        master(3, "XYZ", first_date="2019-06-03"),
+        # A class ticker spelled with Norgate's '.' matches its delisted holder too.
+        master(4, "CLS.A-201801", delisted=True, last_date="2018-01-10"),
+        master(5, "CLS.A", first_date="2010-01-04"),
+        master(6, "PLAIN", first_date="2026-07-28"),
+        master(7, "NODATE", first_date=None),
+        master(8, "LOST-201001", delisted=True, last_date="2010-01-29"),
+        # A delisted holder with no last date leaves the reuse unbounded.
+        {**master(9, "LOST-201002", delisted=True, first_date=None), "last_date": None},
+        master(10, "LOST"),
+        master(11, "LAST-202607", delisted=True, last_date="2026-07-28"),
+        master(12, "LAST"),
+    ]
+    registry = build_us_registry(
+        linked(rows), fmp=[fmp_rows([profile("XYZ", CIK_A), profile("NODATE", CIK_A)])]
+    )
+    assert registry.through == date(2026, 7, 28)
+    end = session_start_us(date(2026, 7, 29))
+    assert registry.intervals == {
+        "XYZ.US": (session_start_us(date(2020, 1, 16)), end),
+        "CLS-A.US": (session_start_us(date(2018, 1, 11)), end),
+        "PLAIN.US": (session_start_us(date(2026, 7, 28)), end),
+    }
+    assert registry.unresolved["tickers"] == {
+        "listing_start_unknown": ["NODATE"],
+        "ticker_reuse_unbounded": ["LOST"],
+        "ticker_reused": ["LAST"],
+    }
+    assert registry.symbols["NODATE.US"] == "unresolved:listing_start_unknown"
+    claims = {
+        (row["provider"], row["namespace"], row["token"]): (
+            row["valid_from_us"],
+            row["valid_to_us"],
+        )
+        for row in _assertions(registry)
+    }
+    for key in (("eodhd", "eodhd_symbol", "XYZ.US"), ("fmp", "fmp_symbol", "XYZ")):
+        assert claims[key] == registry.intervals["XYZ.US"]
+    assert claims[("norgate", "norgate_symbol", "XYZ")] == registry.intervals["XYZ.US"]
+    assert claims[("norgate", "norgate_symbol", "XYZ-202001")] == (UNBOUNDED, None)
+    assert not {key for key in claims if key[2] in {"NODATE", "LOST", "LAST", "NODATE.US"}}
+    resolved = registry.resolve(
+        [
+            ("XYZ.US", date(2020, 1, 15), 3),
+            ("XYZ.US", date(2020, 1, 16), 2),
+            ("XYZ.US", date(2026, 7, 28), 1),
+            ("XYZ.US", date(2026, 7, 29), 4),
+            ("NODATE.US", date(2026, 7, 28), 1),
+            ("MUTUAL.US", date(2026, 7, 28), 5),
+        ]
+    )
+    assert resolved == {
+        "rows": 16,
+        "resolved_rows": 3,
+        "resolved_ratio": 0.1875,
+        "symbols": 3,
+        "resolved_symbols": 1,
+        "unresolved_rows": {
+            "after_master_through": 4,
+            "before_ticker_claim": 3,
+            "listing_start_unknown": 1,
+            "not_a_listed_norgate_ticker": 5,
+        },
+        "unresolved_symbols": {
+            "after_master_through": 1,
+            "before_ticker_claim": 1,
+            "listing_start_unknown": 1,
+            "not_a_listed_norgate_ticker": 1,
+        },
+        "unresolved": {
+            "after_master_through": ["XYZ.US"],
+            "before_ticker_claim": ["XYZ.US"],
+            "listing_start_unknown": ["NODATE.US"],
+            "not_a_listed_norgate_ticker": ["MUTUAL.US"],
+        },
+    }
+    assert registry.report()["through"] == "2026-07-28"
 
 
 def test_provider_symbols_reach_only_a_unique_active_ticker() -> None:
@@ -163,8 +272,9 @@ def test_provider_symbols_reach_only_a_unique_active_ticker() -> None:
                 # Two listings that spell one ticker: neither is chosen.
                 master(2, "XYZ.A"),
                 master(3, "XYZ-A"),
-                master(4, "GONE-200301", delisted=True),
-                master(5, "GONE"),
+                master(4, "GONE-200301", delisted=True, last_date="2003-01-31"),
+                master(5, "GONE", first_date="1999-04-01"),
+                master(6, "LATE-201006", delisted=True, last_date="2010-06-30"),
             ]
         ),
         fmp=[fmp_rows([profile("XYZ-A", CIK_A), profile("NOPE", CIK_B)])],
@@ -178,9 +288,17 @@ def test_provider_symbols_reach_only_a_unique_active_ticker() -> None:
     assert registry.unresolved["fmp"] == {"not_a_listed_norgate_ticker": ["NOPE", "XYZ-A"]}
     assert ("norgate", "norgate_symbol", "XYZ.A") in _keys(registry)
     assert not {key for key in _keys(registry) if key[2].startswith("XYZ") and key[0] != "norgate"}
-    resolved = registry.resolve(["BRK-B.US", "XYZ-A.US", "MUTUAL.US", "BRK-B.US"])
-    assert resolved["resolved"] == 1
-    assert resolved["unresolved_count"] == {"not_a_listed_norgate_ticker": 1, "ticker_ambiguous": 1}
+    day = date(2003, 1, 31)
+    resolved = registry.resolve(
+        [("BRK-B.US", day, 1), ("XYZ-A.US", day, 1), ("MUTUAL.US", day, 1), ("BRK-B.US", day, 1)]
+    )
+    assert (resolved["resolved_rows"], resolved["resolved_symbols"]) == (2, 1)
+    assert resolved["unresolved_symbols"] == {
+        "not_a_listed_norgate_ticker": 1,
+        "ticker_ambiguous": 1,
+    }
+    # GONE was the delisted holder's ticker until 2003-01-31.
+    assert registry.intervals["GONE.US"][0] == session_start_us(date(2003, 2, 1))
 
 
 def test_issuer_needs_sec_and_fmp_to_agree() -> None:
@@ -344,7 +462,7 @@ def test_fmp_disagreement_and_shared_identifiers_stay_unresolved() -> None:
     }
     # A profile states its identifiers as current when retrieved, not since when.
     assert fmp[("cusip", APPLE_LIKE)]["valid_from_us"] == FMP_US
-    assert fmp[("fmp_symbol", "AAA")]["valid_from_us"] == UNBOUNDED
+    assert fmp[("fmp_symbol", "AAA")]["valid_from_us"] == session_start_us(date(2001, 2, 3))
     assert {row["known_from_us"] for row in fmp.values()} == {FMP_US}
 
 
@@ -411,10 +529,23 @@ def test_us_sources_register_as_one_document(ws: Workspace, tmp_path: Path) -> N
         link_instant(ws.state, "market-raw-norgate-unlinked")
 
 
+def _new_york(document: tuple[bytes, str]) -> tuple[bytes, str]:
+    """A promotion spec whose ``eodhd.bars@1`` sessions start in New York."""
+    body = json.loads(document[0])
+    body["mapper"]["args"]["timezone"] = "America/New_York"
+    raw = json.dumps(body, sort_keys=True).encode()
+    return raw, hashlib.sha256(raw).hexdigest()
+
+
 def test_us_registry_resolves_eodhd_bars_in_promotion(ws: Workspace) -> None:
-    master_id = commit(
-        ws, "norgate-master", "observations", table([master(131684, "AAA")], MASTER_SCHEMA)
-    )
+    rows = [
+        master(131684, "AAA"),
+        master(5, "REUSE-202001", delisted=True, last_date="2020-01-15"),
+        master(6, "REUSE"),
+        # The master's last observed session.
+        master(7, "NEWCO", first_date="2026-09-08"),
+    ]
+    master_id = commit(ws, "norgate-master", "observations", table(rows, MASTER_SCHEMA))
     registry = build_from_workspace(ws, master=master_id)
     register_identities(
         ws.state,
@@ -432,17 +563,23 @@ def test_us_registry_resolves_eodhd_bars_in_promotion(ws: Workspace) -> None:
         [
             bar("AAA.US", date(2026, 9, 8), 12.5, retrieved=late, currency="USD"),
             bar("MUTUAL.US", date(2026, 9, 8), 10.0, retrieved=late, currency="USD"),
+            # After the master's last session nothing says who holds the ticker.
+            bar("AAA.US", date(2026, 9, 9), 12.75, retrieved=late, currency="USD"),
+            # Before the delisted holder's last session REUSE was its ticker.
+            bar("REUSE.US", date(2020, 1, 15), 3.0, retrieved=late, currency="USD"),
+            bar("REUSE.US", date(2020, 1, 16), 3.25, retrieved=late, currency="USD"),
         ],
         tag="us",
     )
     exact = dict.fromkeys(("open", "high", "low", "close", "volume"), "exact@1")
-    applied = promote(
-        ws, *spec([pin], identity, dataset="prices.us.eodhd", decimals=exact), apply=True
+    document = _new_york(spec([pin], identity, dataset="prices.us.eodhd", decimals=exact))
+    applied = promote(ws, *document, apply=True)
+    assert applied["rows"] == {"ok": 2, "unresolved": 3}
+    assert applied["unresolved_tokens"] == ["AAA.US", "MUTUAL.US", "REUSE.US"]
+    published = prices(ws, str(applied["generation_id"]))
+    assert sorted((row["instrument_id"], str(row["session_date"])) for row in published) == sorted(
+        [(_instrument(131684), "2026-09-08"), (_instrument(6), "2020-01-16")]
     )
-    assert applied["rows"] == {"ok": 1, "unresolved": 1}
-    assert applied["unresolved_tokens"] == ["MUTUAL.US"]
-    rows = prices(ws, str(applied["generation_id"]))
-    assert [row["instrument_id"] for row in rows] == [_instrument(131684)]
 
 
 def _register(ws: Workspace, registry: UsRegistry) -> dict[str, object]:
@@ -501,3 +638,168 @@ def test_us_cli_builds_and_registers(tmp_path: Path, capsys: pytest.CaptureFixtu
     register = ["identity", "register", "--home", str(home), "--file", str(output)]
     registered = run([*register, "--sha256", built["sha256"]])
     assert registered["new"] == {"issuers": 0, "instruments": 2, "assertions": 5}
+
+
+def test_an_fmp_row_without_a_retrieval_instant_refuses_its_symbol() -> None:
+    naive = fmp_rows([profile("AAA", CIK_A)])
+    (row,) = naive.rows
+    index = naive.columns.index("retrieved_at_utc")
+    naive_row = (*row[:index], datetime(2026, 8, 29), *row[index + 1 :])  # noqa: DTZ001
+    registry = build_us_registry(
+        linked([master(1, "AAA"), master(2, "BBB"), master(3, "CCC")]),
+        fmp=[
+            fmp_rows([profile("BBB", CIK_B, retrieved=None), profile("CCC", CIK_B)]),
+            type(naive)("sl:fmp-naive", naive.columns, (naive_row,)),
+        ],
+    )
+    assert registry.mappers["fmp.profile@1"].refused == {"fmp_retrieved_invalid": 2}
+    assert registry.unresolved["fmp"] == {"fmp_retrieved_invalid": ["AAA", "BBB"]}
+    assert ("fmp", "fmp_symbol", "CCC") in _keys(registry)
+
+
+def _sec_case(case: str) -> tuple[Any, SourceFile, Any, str]:
+    archive = submissions([(CIK_A, "Synthetic A Inc", ["AAA"])])
+    members = in_memory(archive)[0]
+    if case == "oversized":
+        (row,) = members.rows.rows
+        big = (row[0], row[1], 64 * 1024 * 1024 + 1, *row[3:])
+        index = type(members.rows)(members.rows.snapshot_id, members.rows.columns, (big,))
+        return type(members)(index, LINKED), *in_memory(archive)[1:], "exceeds its bound"
+    if case == "missing":
+        fuller = submissions([(CIK_A, "Synthetic A Inc", ["AAA"]), (CIK_B, "B", ["BBB"])])
+        index = in_memory(fuller)[0]
+        return index, *in_memory(archive)[1:], "lacks indexed member"
+    raw = b"not a zip archive"
+
+    @contextmanager
+    def opener() -> Iterator[io.BytesIO]:
+        yield io.BytesIO(raw)
+
+    file = SourceFile(hashlib.sha256(raw).hexdigest(), len(raw))
+    return members, file, opener, "not a zip archive"
+
+
+@pytest.mark.parametrize("case", ["oversized", "missing", "not_zip"])
+def test_sec_archives_that_do_not_match_their_index_are_refused(case: str) -> None:
+    members, archive, opener, message = _sec_case(case)
+    with pytest.raises(ValueError, match=message):
+        map_sec_tickers(members, archive, opener)
+
+
+def test_only_an_sec_submissions_zip_source_is_read(ws: Workspace) -> None:
+    master_id = commit(
+        ws, "norgate-master", "observations", table([master(1, "AAA")], MASTER_SCHEMA)
+    )
+    with pytest.raises(ValueError, match="reads an sec-submissions-zip-"):
+        build_from_workspace(ws, master=master_id, sec=[master_id])
+    # A submissions source whose retained bytes are no zip archive names none to read.
+    empty = commit(
+        ws,
+        "submissions-zip",
+        "members",
+        table([master(1, "AAA")], MASTER_SCHEMA),
+        provider="sec",
+    )
+    assert empty.startswith("sec-submissions-zip-")
+    with pytest.raises(ValueError, match="exactly one zip archive"):
+        build_from_workspace(ws, master=master_id, sec=[empty])
+
+
+def test_a_corrected_registered_claim_is_not_reported_withdrawn(ws: Workspace) -> None:
+    master_id = commit(
+        ws, "norgate-master", "observations", table([master(1, "AAA")], MASTER_SCHEMA)
+    )
+    first = commit(ws, "fmp-one", "observations", table([profile("AAA", CIK_A)], FMP_SCHEMA))
+    registry = build_from_workspace(ws, master=master_id, fmp=[first])
+    _register(ws, registry)
+    (original,) = (
+        row
+        for row in parse_registry(registry.document).assertions
+        if row["namespace"] == "fmp_symbol"
+    )
+    correction = {
+        key: original[key]
+        for key in _assertions(registry)[0]
+        if key not in {"instrument", "supersedes_assertion_id"}
+    }
+    correction |= {
+        "instrument": {"anchor_namespace": "norgate_assetid", "anchor_token": "1"},
+        "valid_to_us": session_start_us(date(2026, 7, 1)),
+        "known_from_us": max(recorded_link(ws, first), FMP_US) + 1,
+        "supersedes_assertion_id": original["assertion_id"],
+    }
+    document = {
+        "schema": registry.document["schema"],
+        "issuers": [],
+        "instruments": [],
+        "assertions": [correction],
+    }
+    raw = formats.canonical(document)
+    corrected = register_identities(
+        ws.state,
+        decode_registry(raw, expected_file_sha256=hashlib.sha256(raw).hexdigest()),
+        apply=True,
+    )
+    assert corrected["new"] == {"issuers": 0, "instruments": 0, "assertions": 1}
+    (correction_id,) = (row["assertion_id"] for row in parse_registry(document).assertions)
+    # FMP now disagrees: neither the original (already corrected) nor its correction is
+    # built, and only the correction, which nothing corrects, is reported withdrawn.
+    later = commit(ws, "fmp-two", "observations", table([profile("AAA", CIK_B)], FMP_SCHEMA))
+    cumulative = build_from_workspace(ws, master=master_id, fmp=[first, later])
+    assert [row["assertion_id"] for row in cumulative.withdrawn] == [correction_id]
+
+
+def test_the_report_script_resolves_bulk_and_quarantined_us_rows(tmp_path: Path) -> None:
+    home = tmp_path / "aas"
+    initialize(home)
+    rows = [master(131684, "AAA"), master(7, "NEWCO", first_date="2026-09-08")]
+    late = at("2026-09-10T00:00:00")
+
+    def quarantined(code: str, day: str, exchange: str = "US") -> dict[str, object]:
+        row = {"code": code, "date": day, "exchange_short_name": exchange, "close": 1.0}
+        return {"ordinal": 0, "reason": "explicit instrument identity is required"} | {
+            "source_row_json": json.dumps(row)
+        }
+
+    quarantine_schema = pa.schema(
+        [("ordinal", pa.int64()), ("reason", pa.string()), ("source_row_json", pa.string())]
+    )
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        master_id = commit(workspace, "norgate-master", "observations", table(rows, MASTER_SCHEMA))
+        bars = add_source(
+            workspace,
+            [
+                bar("AAA.US", date(2026, 9, 8), 1.0, retrieved=late, currency="USD"),
+                bar("AAA.US", date(2026, 9, 9), 1.0, retrieved=late, currency="USD"),
+                bar("AAA.KO", date(2026, 9, 8), 1.0, retrieved=late),
+            ],
+            tag="us",
+        )
+        held = [
+            quarantined("NEWCO", "2026-09-08"),
+            quarantined("NEWCO", "2026-09-08"),
+            quarantined("MUTUAL", "2026-09-08"),
+            quarantined("NEWCO", "2026-09-08", exchange="KO"),
+        ]
+        quarantine_id = commit(
+            workspace, "bulk-quarantine", "quarantine", table(held, quarantine_schema)
+        )
+        market = workspace.paths.market
+    output = tmp_path / "report.json"
+    argv = [
+        "--market", str(market), "--master", master_id, "--bars", bars["source_id"],
+        "--quarantine", quarantine_id, "--output", str(output),
+    ]  # fmt: skip
+    assert us_identity_report.main(argv) == 0
+    report = json.loads(output.read_text())
+    assert (report["through"], report["eodhd_symbols"]) == ("2026-09-08", 2)
+    assert report["bars"]["rows"]["unresolved_rows"] == {"after_master_through": 1}
+    assert report["bars"]["rows"]["resolved_rows"] == 1
+    quarantine = report["quarantine"]
+    # Two copies of one NEWCO row resolve as two rows and one distinct key.
+    assert (quarantine["tables"], quarantine["rows"]["rows"]) == (1, 3)
+    assert (quarantine["rows"]["resolved_rows"], quarantine["distinct_keys"]["resolved_rows"]) == (
+        2,
+        1,
+    )
+    assert quarantine["rows"]["unresolved"] == {"not_a_listed_norgate_ticker": ["MUTUAL.US"]}

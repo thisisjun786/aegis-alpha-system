@@ -10,8 +10,7 @@ document; ``aas identity register`` then appends it like any other registry docu
   class separator ``.``, is its US ticker; a ticker two listed rows share is ambiguous.
 - ``eodhd.us_symbol@1`` asserts the EODHD symbol ``<ticker>.US`` (namespace
   ``eodhd_symbol``, the token ``eodhd.bars@1`` resolves) of each unambiguous listed
-  ticker. EODHD publishes a US security's history under its current code, so the claim is
-  valid over the provider's whole series. Its evidence is the Norgate row.
+  ticker. Its evidence is the Norgate row.
 - ``fmp.profile@1`` reads FMP company profiles. A symbol whose rows agree with each other
   and with the Norgate listing's currency and ETF type asserts ``fmp_symbol``, and the
   ``cusip`` and ``isin`` it names from the instant they were retrieved.
@@ -23,6 +22,14 @@ document; ``aas identity register`` then appends it like any other registry docu
 Nothing is minted from a ticker, and a cross-provider ticker match needs every provider to
 agree: a ticker two listings share, two CIKs list or FMP rows disagree on stays unresolved
 with its reason (data-vertical risk 7). Delisted listings carry Norgate's claims only.
+
+A ticker names a listing only over what the master shows: its claims (Norgate's own
+listed symbol, the EODHD and FMP symbols) are valid from the New York start of the
+listing's ``first_date``, or of the day after the last ``last_date`` of a delisted row
+whose ``<ticker>-YYYYMM`` symbol shows an earlier holder, whichever is later, until the
+New York start of the day after the master's last observed session (its ``through``
+date). Extending a claim past ``through`` needs newer evidence registered as a later
+interval.
 
 Every claim cites its source as ``sl:<source_id>`` with the ``aas-source-row-v1`` hash of
 the row it came from. A Norgate or SEC claim is known from its source's ``sl:`` link
@@ -39,11 +46,12 @@ import json
 import re
 import zipfile
 from collections import defaultdict
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, BinaryIO, Final, cast
+from zoneinfo import ZoneInfo
 
 from aegis_alpha.identity.records import IdentifierType, IdentifierValueError, normalize_identifier
 from aegis_alpha.storage.identity import (
@@ -75,6 +83,9 @@ BINDINGS_TABLE: Final = "observations"
 SEC_PREFIX: Final = "sec-submissions-zip-"
 VENUE: Final = "XNYS"
 ASSETID_SET_FORMAT: Final = "aas-norgate-assetids-v1"
+NEW_YORK: Final = ZoneInfo("America/New_York")
+_DELISTED_SYMBOL: Final = re.compile(r"(.+)-[0-9]{6}")
+_DAY: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _SEC_MEMBER: Final = re.compile(r"CIK([0-9]{10})\.json")
 _MAX_MEMBER_BYTES: Final = 64 * 1024 * 1024
 _CHUNK: Final = 1024 * 1024
@@ -107,10 +118,31 @@ def us_ticker(symbol: str) -> str:
     return symbol.replace(".", "-")
 
 
-def _instant_us(value: object) -> int:
+def _instant_us(value: object) -> int | None:
+    """UTC microseconds of a time-zone-aware timestamp, or None for anything else."""
     if not isinstance(value, datetime) or value.tzinfo is None:
-        raise ValueError("a retrieval instant must be a time-zone-aware timestamp")
+        return None
     return (value - _EPOCH) // _MICROSECOND
+
+
+def _day(value: object) -> date | None:
+    """A master date column (``YYYY-MM-DD`` text or a date), or None."""
+    if isinstance(value, datetime):
+        return None
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str) and _DAY.fullmatch(value):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
+
+
+def session_start_us(day: date) -> int:
+    """UTC microseconds of ``day``'s start in New York, the instant ``eodhd.bars@1`` resolves."""
+    moment = datetime(day.year, day.month, day.day, tzinfo=NEW_YORK)
+    return (moment - _EPOCH) // _MICROSECOND
 
 
 # --- pinned source rows -------------------------------------------------------------------
@@ -209,13 +241,23 @@ class Listing:
     listed: bool
     asset_type: str
     evidence: Evidence
+    first_date: date | None = None
+    last_date: date | None = None
 
     @property
     def instrument_id(self) -> str:
         return mint_instrument("norgate_assetid", self.assetid)
 
 
-_MASTER_COLUMNS: Final = ("assetid", "symbol", "is_delisted", "currency", "is_etf")
+_MASTER_COLUMNS: Final = (
+    "assetid",
+    "symbol",
+    "is_delisted",
+    "currency",
+    "is_etf",
+    "first_date",
+    "last_date",
+)
 
 
 def map_norgate_master(source: LinkedRows) -> tuple[list[Listing], MapperReport]:
@@ -224,6 +266,7 @@ def map_norgate_master(source: LinkedRows) -> tuple[list[Listing], MapperReport]
     ``is_etf`` true is ``etf``; everything else is ``unclassified`` and the share or fund
     class is left to the classifications dataset. A row that is not USD, whose symbol is
     not trimmed printable text or whose listing state is unknown is refused, not repaired.
+    ``first_date`` and ``last_date`` are kept when they are dates; they bound ticker claims.
     """
     _require(source.rows, _MASTER_COLUMNS, MASTER_MAPPER)
     report = MapperReport()
@@ -253,6 +296,8 @@ def map_norgate_master(source: LinkedRows) -> tuple[list[Listing], MapperReport]
                     not row["is_delisted"],
                     "etf" if row["is_etf"] is True else "unclassified",
                     source.evidence(row_hash),
+                    _day(row["first_date"]),
+                    _day(row["last_date"]),
                 )
             )
     return listings, report
@@ -294,7 +339,9 @@ def map_fmp_profiles(
     """``fmp.profile@1``: profile rows grouped by symbol, and the symbols that cannot be used.
 
     A row whose CIK, CUSIP or ISIN is present but not canonical (check digits included),
-    or whose ETF flag is not a boolean, makes its symbol ``fmp_identifier_invalid``.
+    or whose ETF flag is not a boolean, makes its symbol ``fmp_identifier_invalid``; a row
+    whose ``retrieved_at_utc`` is not a time-zone-aware timestamp makes it
+    ``fmp_retrieved_invalid``.
     """
     report = MapperReport()
     profiles: dict[str, list[Profile]] = defaultdict(list)
@@ -314,8 +361,13 @@ def map_fmp_profiles(
                 report.refuse("fmp_identifier_invalid")
                 refused[symbol] = "fmp_identifier_invalid"
                 continue
+            retrieved = _instant_us(row["retrieved_at_utc"])
+            if retrieved is None:
+                report.refuse("fmp_retrieved_invalid")
+                refused[symbol] = "fmp_retrieved_invalid"
+                continue
             report.accepted += 1
-            evidence = Evidence(source.snapshot_id, row_hash, _instant_us(row["retrieved_at_utc"]))
+            evidence = Evidence(source.snapshot_id, row_hash, retrieved)
             profiles[symbol].append(
                 Profile(symbol, cik, cusip, isin, bool(row["isEtf"]), row["currency"], evidence)
             )
@@ -426,8 +478,12 @@ def _anchor(namespace: str, token: str) -> Record:
     return {"anchor_namespace": namespace, "anchor_token": token}
 
 
+type Interval = tuple[int, int | None]
+_ALWAYS: Final[Interval] = (UNBOUNDED, None)
+
+
 def _assertion(
-    assetid: str, key: tuple[str, str, str], valid_from_us: int, evidence: Evidence
+    assetid: str, key: tuple[str, str, str], valid: Interval, evidence: Evidence
 ) -> Record:
     provider, namespace, token = key
     return {
@@ -435,8 +491,8 @@ def _assertion(
         "provider": provider,
         "namespace": namespace,
         "token": token,
-        "valid_from_us": valid_from_us,
-        "valid_to_us": None,
+        "valid_from_us": valid[0],
+        "valid_to_us": valid[1],
         "known_from_us": evidence.known_from_us,
         "supersedes_assertion_id": None,
         "source_snapshot_id": evidence.source,
@@ -465,6 +521,10 @@ class UsRegistry:
     """Registered US assertions, not yet corrected, that these sources no longer give."""
     bindings: dict[str, object] | None = None
     """How the minted asset IDs compare with a legacy identity-bindings table."""
+    intervals: dict[str, tuple[int, int]] = field(default_factory=dict)
+    """The valid interval of each resolved EODHD US symbol's claim."""
+    through: date | None = None
+    """The master's last observed session; ticker claims end the day after it."""
 
     def raw(self) -> bytes:
         return formats.canonical(self.document)
@@ -476,25 +536,46 @@ class UsRegistry:
         instruments = cast("list[dict[str, object]]", self.document["instruments"])
         return [str(row["anchor_token"]) for row in instruments]
 
-    def resolve(self, symbols: Sequence[str], *, sample: int | None = None) -> dict[str, object]:
-        """Classify EODHD US symbols (for example a daily bulk's) by this registry."""
-        resolved = 0
-        reasons: dict[str, list[str]] = defaultdict(list)
-        unique = sorted(set(symbols))
-        for symbol in unique:
+    def resolve(
+        self, bars: Iterable[tuple[str, date, int]], *, sample: int | None = None
+    ) -> dict[str, object]:
+        """Classify EODHD US bar keys ``(symbol, session date, rows)`` by this registry.
+
+        A key resolves when its symbol's claim is valid at the session's New York start,
+        the instant ``eodhd.bars@1`` resolves; rows and symbols are counted by reason.
+        """
+        rows: dict[str, int] = defaultdict(int)
+        symbols: dict[str, set[str]] = defaultdict(set)
+        for symbol, day, count in bars:
             status = self.symbols.get(symbol, "unresolved:not_a_listed_norgate_ticker")
             if status.startswith("ins-"):
-                resolved += 1
+                start, end = self.intervals[symbol]
+                at = session_start_us(day)
+                reason = (
+                    "resolved"
+                    if start <= at < end
+                    else "before_ticker_claim"
+                    if at < start
+                    else "after_master_through"
+                )
             else:
-                reasons[status.removeprefix("unresolved:")].append(symbol)
+                reason = status.removeprefix("unresolved:")
+            rows[reason] += count
+            symbols[reason].add(symbol)
+        total = sum(rows.values())
+        resolved = rows.pop("resolved", 0)
+        resolved_symbols = symbols.pop("resolved", set())
         return {
-            "symbols": len(unique),
-            "resolved": resolved,
-            "resolved_ratio": None if not unique else round(resolved / len(unique), 6),
-            "unresolved_count": {reason: len(found) for reason, found in sorted(reasons.items())},
+            "rows": total,
+            "resolved_rows": resolved,
+            "resolved_ratio": None if not total else round(resolved / total, 6),
+            "symbols": len(set().union(resolved_symbols, *symbols.values())),
+            "resolved_symbols": len(resolved_symbols),
+            "unresolved_rows": dict(sorted(rows.items())),
+            "unresolved_symbols": {reason: len(found) for reason, found in sorted(symbols.items())},
             "unresolved": {
-                reason: found if sample is None else found[:sample]
-                for reason, found in sorted(reasons.items())
+                reason: sorted(found) if sample is None else sorted(found)[:sample]
+                for reason, found in sorted(symbols.items())
             },
         }
 
@@ -513,6 +594,7 @@ class UsRegistry:
             "instruments": len(instruments),
             "instruments_with_issuer": sum(row["issuer"] is not None for row in instruments),
             "assetids_sha256": assetid_set_sha256(self.assetids()),
+            "through": None if self.through is None else self.through.isoformat(),
             "assertions": dict(sorted(kinds.items())),
             "mappers": {name: report.json() for name, report in sorted(self.mappers.items())},
             "unresolved_count": {
@@ -542,6 +624,73 @@ def _tickers(listings: Sequence[Listing], unresolved: dict[str, list[str]]) -> d
         else:
             tickers[ticker] = group[0]
     return tickers
+
+
+@dataclass(frozen=True, slots=True)
+class _Bounds:
+    """What the master shows about when each listed row's ticker named it."""
+
+    through: date | None
+    intervals: dict[str, tuple[int, int]]
+    """Listed asset ID -> valid interval of its ticker claims."""
+    reasons: dict[str, str]
+    """Listed asset ID -> why its ticker claims have no interval."""
+
+
+def _bounds(accepted: Sequence[Listing]) -> _Bounds:
+    """Bound each listed row's ticker claims by the master's own dates.
+
+    A claim starts at the listing's ``first_date``, or the day after the latest
+    ``last_date`` of a delisted row whose ``<ticker>-YYYYMM`` symbol shows an earlier
+    holder, whichever is later, and ends the day after the master's last observed session.
+    """
+    days = [day for row in accepted for day in (row.first_date, row.last_date) if day]
+    through = max(days, default=None)
+    held: dict[str, date] = {}
+    unbounded: set[str] = set()
+    for listing in accepted:
+        match = None if listing.listed else _DELISTED_SYMBOL.fullmatch(listing.symbol)
+        if match is None:
+            continue
+        base = us_ticker(match[1])
+        if listing.last_date is None:
+            unbounded.add(base)
+        else:
+            held[base] = max(listing.last_date, held.get(base, listing.last_date))
+    intervals: dict[str, tuple[int, int]] = {}
+    reasons: dict[str, str] = {}
+    for listing in accepted:
+        if not listing.listed:
+            continue
+        ticker = us_ticker(listing.symbol)
+        if through is None or listing.first_date is None:
+            reasons[listing.assetid] = "listing_start_unknown"
+        elif ticker in unbounded:
+            reasons[listing.assetid] = "ticker_reuse_unbounded"
+        else:
+            start = listing.first_date
+            if ticker in held:
+                start = max(start, held[ticker] + timedelta(days=1))
+            if start > through:
+                reasons[listing.assetid] = "ticker_reused"
+            else:
+                end = session_start_us(through + timedelta(days=1))
+                intervals[listing.assetid] = (session_start_us(start), end)
+    return _Bounds(through, intervals, reasons)
+
+
+def _bounded(
+    tickers: Mapping[str, Listing], bounds: _Bounds, unresolved: dict[str, list[str]]
+) -> dict[str, Listing]:
+    """The unambiguous tickers whose claims have an interval; the rest stay unresolved."""
+    kept: dict[str, Listing] = {}
+    for ticker, listing in tickers.items():
+        reason = bounds.reasons.get(listing.assetid)
+        if reason is None:
+            kept[ticker] = listing
+        else:
+            unresolved[reason].append(ticker)
+    return kept
 
 
 def _profiles(
@@ -587,6 +736,7 @@ def _shared(claims: Mapping[str, str], unresolved: dict[str, list[str]], reason:
 def _fmp_assertions(
     agreed: Mapping[str, Profile],
     tickers: Mapping[str, Listing],
+    bounds: _Bounds,
     unresolved: dict[str, list[str]],
 ) -> list[Record]:
     cusips = {ticker: profile.cusip for ticker, profile in agreed.items() if profile.cusip}
@@ -596,9 +746,10 @@ def _fmp_assertions(
     assertions: list[Record] = []
     for ticker, profile in agreed.items():
         assetid, evidence = tickers[ticker].assetid, profile.evidence
-        assertions.append(_assertion(assetid, ("fmp", "fmp_symbol", ticker), UNBOUNDED, evidence))
+        symbol = ("fmp", "fmp_symbol", ticker)
+        assertions.append(_assertion(assetid, symbol, bounds.intervals[assetid], evidence))
         # A profile states the identifiers current when it was retrieved, not since when.
-        retrieved = evidence.known_from_us
+        retrieved: Interval = (evidence.known_from_us, None)
         if profile.cusip and profile.cusip not in shared_cusips:
             key = ("fmp", "cusip", profile.cusip)
             assertions.append(_assertion(assetid, key, retrieved, evidence))
@@ -679,39 +830,55 @@ def _accepted(
 
 
 def _listing_assertions(
-    accepted: Sequence[Listing], repeated: set[str], links: Mapping[str, tuple[str, Evidence]]
+    accepted: Sequence[Listing],
+    repeated: set[str],
+    links: Mapping[str, tuple[str, Evidence]],
+    bounds: _Bounds,
 ) -> list[Record]:
-    """Norgate's own claims and the issuer link of every accepted listing."""
+    """Norgate's own claims and the issuer link of every accepted listing.
+
+    A delisted row's suffixed symbol names it for good; a listed row's symbol is its
+    ticker and is bounded like the ticker's other claims.
+    """
     assertions: list[Record] = []
     for listing in accepted:
-        claims = [("norgate_assetid", listing.assetid)]
+        claims: list[tuple[str, str, Interval]] = [("norgate_assetid", listing.assetid, _ALWAYS)]
         if listing.symbol not in repeated:
-            claims.append(("norgate_symbol", listing.symbol))
-        for namespace, token in claims:
+            valid = bounds.intervals.get(listing.assetid) if listing.listed else _ALWAYS
+            if valid is not None:
+                claims.append(("norgate_symbol", listing.symbol, valid))
+        for namespace, token, interval in claims:
             key = ("norgate", namespace, token)
-            assertions.append(_assertion(listing.assetid, key, UNBOUNDED, listing.evidence))
+            assertions.append(_assertion(listing.assetid, key, interval, listing.evidence))
         if listing.assetid in links:
             cik, link = links[listing.assetid]
             token = issuer_link_token(mint_issuer("sec_cik", cik), listing.instrument_id)
             key = ("sec", "issuer", token)
-            assertions.append(_assertion(listing.assetid, key, UNBOUNDED, link))
+            assertions.append(_assertion(listing.assetid, key, _ALWAYS, link))
     return assertions
 
 
 def _eodhd(
-    tickers: Mapping[str, Listing], ambiguous: Sequence[str]
-) -> tuple[list[Record], dict[str, str], MapperReport]:
-    """``eodhd.us_symbol@1``: ``<ticker>.US`` of every unambiguous listed ticker."""
+    tickers: Mapping[str, Listing], bounds: _Bounds, unresolved: Mapping[str, Sequence[str]]
+) -> tuple[list[Record], dict[str, str], dict[str, tuple[int, int]], MapperReport]:
+    """``eodhd.us_symbol@1``: ``<ticker>.US`` of every unambiguous, bounded listed ticker."""
     report = MapperReport()
-    symbols = {f"{ticker}.US": "unresolved:ticker_ambiguous" for ticker in ambiguous}
+    symbols = {
+        f"{ticker}.US": f"unresolved:{reason}"
+        for reason, found in unresolved.items()
+        for ticker in found
+    }
+    intervals: dict[str, tuple[int, int]] = {}
     assertions: list[Record] = []
     for ticker, listing in tickers.items():
         report.rows += 1
         report.accepted += 1
-        symbols[f"{ticker}.US"] = listing.instrument_id
-        key = ("eodhd", "eodhd_symbol", f"{ticker}.US")
-        assertions.append(_assertion(listing.assetid, key, UNBOUNDED, listing.evidence))
-    return assertions, dict(sorted(symbols.items())), report
+        symbol = f"{ticker}.US"
+        symbols[symbol] = listing.instrument_id
+        intervals[symbol] = bounds.intervals[listing.assetid]
+        key = ("eodhd", "eodhd_symbol", symbol)
+        assertions.append(_assertion(listing.assetid, key, intervals[symbol], listing.evidence))
+    return assertions, dict(sorted(symbols.items())), intervals, report
 
 
 def _sec_filers(
@@ -744,20 +911,26 @@ def build_us_registry(
     mappers: dict[str, MapperReport] = {}
     listings, mappers[MASTER_MAPPER] = map_norgate_master(master)
     accepted, repeated = _accepted(listings, unresolved["listings"])
-    tickers = _tickers(
-        [listing for listing in accepted if listing.symbol not in repeated], unresolved["tickers"]
+    bounds = _bounds(accepted)
+    tickers = _bounded(
+        _tickers(
+            [listing for listing in accepted if listing.symbol not in repeated],
+            unresolved["tickers"],
+        ),
+        bounds,
+        unresolved["tickers"],
     )
     profiles, refused, mappers[FMP_MAPPER] = map_fmp_profiles(fmp)
     agreed = _profiles(profiles, refused, tickers, unresolved["fmp"])
     filers, mappers[SEC_MAPPER] = _sec_filers(sec)
     issuers, links = _issuers(filers, agreed, tickers, unresolved["issuers"]) if sec else ([], {})
-    eodhd, symbols, mappers[EODHD_MAPPER] = _eodhd(
-        tickers, unresolved["tickers"]["ticker_ambiguous"]
+    eodhd, symbols, intervals, mappers[EODHD_MAPPER] = _eodhd(
+        tickers, bounds, unresolved["tickers"]
     )
     assertions = [
-        *_listing_assertions(accepted, repeated, links),
+        *_listing_assertions(accepted, repeated, links, bounds),
         *eodhd,
-        *_fmp_assertions(agreed, tickers, unresolved["identifiers"]),
+        *_fmp_assertions(agreed, tickers, bounds, unresolved["identifiers"]),
     ]
     instruments = [
         {
@@ -792,6 +965,8 @@ def build_us_registry(
             [master.rows.snapshot_id, *(rows.snapshot_id for rows in fmp)]
             + [members.rows.snapshot_id for members, _, _ in sec]
         ),
+        intervals=intervals,
+        through=bounds.through,
     )
 
 
