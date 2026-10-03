@@ -249,12 +249,20 @@ def _bulk_steps(
     report["bulk_tables"] = len(kept)
     report["bulk_repeated_tables"] = len(repeated)
     report["bulk_unclassified_tables"] = unclassified
-    # Insertion order is link order, so each exchange's downloads of a day are in it too.
+    name = "eodhd.bulk_quarantine_adjusted@1" if reference else "eodhd.bulk_quarantine@1"
+    steps = _day_steps(list(kept.values()), name)
+    report["bulk_superseding_steps"] = len(steps) - len({step.start for step in steps})
+    return steps
+
+
+def _day_steps(
+    kept: list[tuple[dict[str, str], frozenset[str], list[date]]], name: str
+) -> list[Step]:
+    """Each date's downloads as successive generations; ``kept`` is in link order."""
     by_day: dict[date, dict[frozenset[str], list[dict[str, str]]]] = {}
-    for pin, covered, days in kept.values():
+    for pin, covered, days in kept:
         for session in days:
             by_day.setdefault(session, {}).setdefault(covered, []).append(pin)
-    name = "eodhd.bulk_quarantine_adjusted@1" if reference else "eodhd.bulk_quarantine@1"
     steps = []
     for session, groups in sorted(by_day.items()):
         for k in range(max(len(pins) for pins in groups.values())):
@@ -268,7 +276,6 @@ def _bulk_steps(
                     tuple(sorted(chosen, key=lambda pin: pin["source_id"])),
                 )
             )
-    report["bulk_superseding_steps"] = len(steps) - len(by_day)
     return steps
 
 
