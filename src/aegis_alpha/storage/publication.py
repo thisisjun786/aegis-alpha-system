@@ -426,11 +426,9 @@ def execute_data(workspace: Workspace, args: argparse.Namespace) -> dict[str, ob
     if args.data_command == "import":
         return publish_document(workspace, read_import(Path(args.file).absolute(), args.sha256))
     if args.data_command == "datasets":
-        rows = workspace.state.execute(
-            "SELECT dataset_id, version, generation_id, chain_hash, row_count FROM "
-            "dataset_versions WHERE status='committed' ORDER BY dataset_id, sequence"
-        ).fetchall()
-        return {"datasets": [dict(row) for row in rows]}
+        from aegis_alpha.storage.dataset_catalog import list_datasets  # noqa: PLC0415
+
+        return list_datasets(workspace.state)
     dataset = read_dataset(workspace, args.dataset, args.version)
     if args.data_command == "inspect":
         return {
