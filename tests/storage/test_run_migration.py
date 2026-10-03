@@ -267,10 +267,14 @@ def test_the_backup_happens_before_the_rebuild(tmp_path: Path) -> None:
     rebuilt = run_schema._rebuild_state  # noqa: SLF001
 
     def observe_backup(
-        workspace: Workspace, output: Path | None = None, *, budget: ComputeBudget | None = None
+        workspace: Workspace,
+        output: Path | None = None,
+        *,
+        budget: ComputeBudget | None = None,
+        deep: bool = False,
     ) -> dict[str, object]:
         phases.append("backup")
-        return backed_up(workspace, output, budget=budget)
+        return backed_up(workspace, output, budget=budget, deep=deep)
 
     def observe_rebuild(workspace: Workspace) -> None:
         phases.append("rebuild")

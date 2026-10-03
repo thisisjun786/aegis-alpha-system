@@ -76,6 +76,17 @@ hex = sha256(정규 JSON ["aas-source-id-v1", 출력 schema major, [[상대 경�
   `source_files`처럼 `raw/`에서 다시 해시한다. 완료된 내용 commit은 연결과 `raw/`의 ID 문서가 모두
   있어야 통과한다. 연결이 하나라도 있으면 보고에 `source_library.linked`가 나오고, 연결이 없는
   설치본의 보고 형태는 연결 도입 전과 같아 그 전에 만든 백업도 복원 대조를 통과한다.
+- `aas db verify`·`backup`·`restore`·`compact`는 기본으로 저장된 행을 기록된 digest와 대조하고 행 값을
+  다시 해시하지 않는다. 원천은 marker·intent·연결·은퇴 기록을 그대로 확인하고, 살아 있는 테이블마다
+  commit manifest가 기록한 열(순서 포함)과 행 수가 저장된 테이블과 같아야 한다. 승격 chain은 모든 marker
+  link와 leaf generation의 delta만 다시 해시한다. `--deep`(`verify_workspace(deep=True)`)은 원천 테이블마다
+  행을 다시 해시해 기록된 digest와 비교하고 승격 chain의 모든 delta를 다시 해시한다. 그 밖의 확인
+  (SQLite 무결성, publication 문서, `raw/`의 `source_files` bytes, 전략·run 산출물)은 두 방식이 같고 보고
+  형태도 같으므로 기본 백업을 `--deep`으로 복원해도 논리 보고 대조를 통과한다. 백업 `backup.json`은
+`logical` 밖의 `deep`에 검증 방식을 기록한다. `migrate`·`run-install`·`run-migrate`의 백업도 `--deep`을 받는다. 백업과 복원은 복사한
+  파일마다 bytes를 해시하므로 복원본의 저장소는 검증된 백업과 bytes가 같다. compact는 행을 새로 쓰므로
+  새 루트는 항상 deep으로 검증한다. 원천 import 재사용, 복구, `aas import legacy --verify`는 그대로 행을
+  다시 해시한다.
 
 ## legacy 원천 편입
 
@@ -2214,8 +2225,10 @@ state v2:
    DuckDB가 행을 부호화해 정렬하고 Python은 할당 안의 배치로 digest만 계산한다.
 3. **다른 장치 백업**: `--backup`의 백업은 모든 파일을 다시 해시해 검증되고, 같은 설치본의 것이며,
    설치본의 루트·state·market·`raw/`와 다른 장치에 있다. 백업의 market 저장소에는 원천마다 같은 commit
-   manifest와 그 manifest가 나열한 모든 테이블이 같은 행 수로 있다. `backup_id`는 백업 `backup.json`의
-   SHA-256이다.
+   manifest와 그 manifest가 나열한 모든 테이블이 같은 행 수로 있고, 그 테이블의 행은 백업 안에서 commit이
+   기록한 digest로 다시 해시된다. 백업이 `--deep` 없이 만들어졌어도 은퇴할 원천의 행은 이렇게 확인되며,
+   다르면 `backup_content_mismatch`로 거부한다. 보고의 `backup_deep`은 백업 `backup.json`의 `deep`이다.
+   `backup_id`는 백업 `backup.json`의 SHA-256이다.
 
 이미 은퇴한 원천의 동치 원천이었던 원천은 은퇴하지 않는다. 은퇴의 증명이 가리키는 원천이 사라지지
 않게 하기 위해서다. 같은 group을 다시 요청하면 `already_retired`로 보고하고 아무것도 쓰지 않는다.
@@ -2262,7 +2275,8 @@ commit이 있는지 확인하고, 은퇴가 하나라도 있으면 보고에 `so
 `COPY FROM DATABASE … (SCHEMA)`로 catalog를 만든 뒤 테이블마다 행을 외래 key의 부모 테이블부터 옮기고,
 자기 자신을 가리키는 테이블(`market_generations.parent_id`)은 chain 단계마다 한 번씩 옮긴다. `COPY FROM
 DATABASE`의 자료 복사는 외래 key 순서를 지키지 않기 때문이다. 그래서 지운 테이블이 남긴 빈 블록을 버린다. `raw/`, `runs/`, `secrets/`는 파일 단위로
-복사하고, `runtime.json`은 경로만 새 루트 기준 기본값으로 바꾼다. 새 루트를 열어 같은 논리 검증 결과가 나와야
+복사하고, `runtime.json`은 경로만 새 루트 기준 기본값으로 바꾼다. 원래 설치본은 기본 검증(`--deep`이면 deep)으로,
+새로 쓴 루트는 항상 deep으로 검증한다. 새 루트를 열어 같은 논리 검증 결과가 나와야
 설치 영수증이 `ready`가 된다. 실패하면 새 루트는 `restore-incomplete`로 남고 원래 설치본은 그대로다. 원래
 설치본은 바뀌거나 지워지지 않으며, `AAS_HOME`(또는 `--home`)을 새 루트로 바꾸는 일은 운영자가 한다. 새
 루트는 존재하지 않는 경로여야 하고 원래 설치본의 경로와 겹치지 않는다.
@@ -2761,7 +2775,7 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-414 | Qveris KR(KO, KQ) 일간 `splits`·`dividends` 원천은 `actions.kr.eodhd` generation으로 승격된다 | `tests/storage/test_qveris_actions.py::test_kr_splits_and_dividends_promote_to_actions_kr_eodhd` | 예정 |
 | DV-415 | KIND 상장법인목록 원천은 `status.kr.kind` generation으로 승격된다 | `tests/storage/test_kind_status.py::test_kind_listings_promote_to_status_kr_kind` | 예정 |
 | DV-416 | DART 공시 목록(`list.json`) 원천은 `dart.list` 매퍼로 `filings.kr.dart` generation에 승격된다 | `tests/storage/test_dart_promotion.py::test_list_json_filings_promote_to_filings_kr_dart` | 예정 |
-| DV-417 | 기본 verify·backup은 기록된 digest를 대조하고 `--deep`만 저장된 행을 다시 해시한다 | `tests/storage/test_verification.py::test_default_verify_compares_digests_and_deep_rehashes` | 예정 |
+| DV-417 | 기본 verify는 원천 행을 읽지 않고 `--deep`과 같은 보고를 내며, 원천 테이블의 행 수·열·존재가 기록과 다르면 기본에서도 실패한다 | `tests/storage/test_verification.py::test_default_verify_compares_digests_and_deep_rehashes` | 구현 |
 | DV-418 | KR 가격과 선언 달력의 승격 명세는 카탈로그 항목의 매퍼·시간·숫자·품질 규칙을 쓴다 | `tests/tools/test_dataset_catalog.py::test_kr_price_specs_use_the_catalog_rules` | 구현 |
 | DV-419 | 동치 digest는 비교 열의 정확한 형태 셀에 대한 `aas-rowset-v1`이며 독립 Python 계산과 같다 | `tests/storage/test_source_retirement.py::test_equivalence_digest_is_rowset_v1_of_typed_cells` | 구현 |
 | DV-420 | 정확한 rowset 형태가 없는 값이나 타입은 group을 거부한다 | `tests/storage/test_source_retirement.py::test_values_without_an_exact_rowset_form_refuse_the_group` | 구현 |
@@ -2776,14 +2790,21 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-429 | compact는 외래 key를 가진 generation chain과 run 결과 행을 부모부터 옮기고 같은 검증을 통과한다 | `tests/storage/test_compaction.py::test_compaction_copies_rows_that_reference_other_rows` | 구현 |
 | DV-430 | 원천 ID이면서 다른 원천의 `sl:` 링크인 이름은 두 원천 모두의 참조로 센다 | `tests/storage/test_source_retirement.py::test_a_name_that_denotes_two_sources_references_both` | 구현 |
 | DV-431 | 복구가 읽을 수 없는 64 MiB 초과 기록 문서는 intent를 만들기 전에 거부한다 | `tests/storage/test_source_retirement.py::test_records_recovery_cannot_read_are_never_prepared` | 구현 |
-| DV-432 | 두 날의 유지보수 실행은 모든 chain을 head의 자식으로 이어 붙이고, 같은 날 다시 실행하면 답한 요청을 다시 묻지 않고 아무 generation도 게시하지 않는다 | `tests/application/test_maintain.py::test_two_daily_runs_continue_every_chain_and_repeat_nothing` | 구현 |
-| DV-433 | 유료 호출 뒤나 승격 게시 뒤에 중단된 실행은 다음 실행이 공급자를 다시 부르지 않고 끝내며 원장에 증거와 어긋나는 attempt가 남지 않는다 | `tests/application/test_maintain.py::test_a_killed_run_is_recovered_without_asking_any_answered_request_again` | 구현 |
-| DV-434 | 새 KR 상장은 identity 증분과 새 유지보수 snapshot으로 등록되고 같은 실행의 KR 가격·분류 generation에서 해석된다 | `tests/application/test_maintain.py::test_new_kr_listings_advance_identity_and_every_kr_chain` | 구현 |
-| DV-435 | Qveris 요청은 묻기의 raw 증거로 정해진다: 경고 완료는 덮이고, 정산된 실패는 다음 날 새 job으로, 미정산은 보류되며 자기 job으로 먼저 끝낸다 | `tests/application/test_maintain_qveris.py::test_each_ask_state_decides_its_request` | 구현 |
-| DV-436 | 격리된 Qveris 묻기는 다음 관측일에 새 job으로 다시 묻고 같은 날에는 기다린다 | `tests/application/test_maintain_qveris.py::test_a_quarantined_ask_is_asked_again_the_next_day_and_not_the_same_day` | 구현 |
-| DV-437 | 유지보수 명세는 template에서 parent·원천·partition만 바꾸고 tombstone은 `never`이며, 끝난 원천은 `maintain_source@1`로 다시 계획되지 않는다 | `tests/storage/test_maintain_promotion.py::test_new_sources_continue_the_chain_from_the_template` | 구현 |
-| DV-438 | head나 route 매퍼의 template이 없는 dataset은 유지보수가 시작하지 않고 보고한다 | `tests/storage/test_maintain_promotion.py::test_a_route_without_a_head_or_template_reports_and_starts_nothing` | 구현 |
-| DV-439 | 유지보수 명세의 generation pin은 지금 head로 바뀌고 identity는 snapshot을 pin한 template에서만 바뀐다 | `tests/storage/test_maintain_promotion.py::test_generation_pins_advance_and_the_identity_replaces_only_a_pinned_snapshot` | 구현 |
-| DV-440 | 유지보수 설정의 알 수 없는 필드·빠진 상한·잘못된 타입은 설정 전체를 거부한다 | `tests/application/test_maintain_cli.py::test_a_typo_or_missing_cap_refuses_the_whole_configuration` | 구현 |
-| DV-441 | 설치 receipt와 다른 실행 환경은 실행 보고의 차이로 남고 실행을 막지 않는다 | `tests/application/test_maintain_cli.py::test_the_install_receipt_records_the_runtime_and_reports_its_differences` | 구현 |
-| DV-442 | 유지보수 계획은 자격 증명을 읽지 않고, `jobs.enabled` grant가 없는 실행은 공급자를 부르지 않고 나머지 단계를 끝낸다 | `tests/application/test_maintain_cli.py::test_plan_reads_no_key_and_run_without_the_jobs_grant_calls_nothing` | 구현 |
+| DV-432 | Arrow 원천·SQLite 원천·승격 조상 delta의 값 변경은 각각 기본 verify·backup·restore를 통과하고 `--deep` verify·backup·restore에서 실패하며, 백업 `backup.json`은 `deep`을 기록한다 | `tests/storage/test_verification.py::test_a_changed_value_fails_only_deep_verify_backup_and_restore` | 구현 |
+| DV-433 | 원천 은퇴는 기본 백업 안의 은퇴 원천 행을 기록된 digest로 다시 해시하고, 다르면 `backup_content_mismatch`로 거부한다 | `tests/storage/test_source_retirement.py::test_retirement_rehashes_a_default_backup` | 구현 |
+| DV-434 | 두 날의 유지보수 실행은 모든 chain을 head의 자식으로 이어 붙이고, 같은 날 다시 실행하면 답한 요청을 다시 묻지 않고 아무 generation도 게시하지 않는다 | `tests/application/test_maintain.py::test_two_daily_runs_continue_every_chain_and_repeat_nothing` | 구현 |
+| DV-435 | 유료 호출 뒤나 승격 게시 뒤에 중단된 실행은 다음 실행이 공급자를 다시 부르지 않고 끝내며 원장에 증거와 어긋나는 attempt가 남지 않는다 | `tests/application/test_maintain.py::test_a_killed_run_is_recovered_without_asking_any_answered_request_again` | 구현 |
+| DV-436 | 새 KR 상장은 identity 증분과 새 유지보수 snapshot으로 등록되고 같은 실행의 KR 가격·분류 generation에서 해석된다 | `tests/application/test_maintain.py::test_new_kr_listings_advance_identity_and_every_kr_chain` | 구현 |
+| DV-437 | Qveris 요청은 묻기의 raw 증거로 정해진다: 경고 완료는 덮이고, 정산된 실패는 다음 날 새 job으로, 미정산은 보류되며 자기 job으로 먼저 끝낸다 | `tests/application/test_maintain_qveris.py::test_each_ask_state_decides_its_request` | 구현 |
+| DV-438 | 격리된 Qveris 묻기는 다음 관측일에 새 job으로 다시 묻고 같은 날에는 기다린다 | `tests/application/test_maintain_qveris.py::test_a_quarantined_ask_is_asked_again_the_next_day_and_not_the_same_day` | 구현 |
+| DV-439 | 유지보수 명세는 template에서 parent·원천·partition만 바꾸고 tombstone은 `never`이며, 끝난 원천은 `maintain_source@1`로 다시 계획되지 않는다 | `tests/storage/test_maintain_promotion.py::test_new_sources_continue_the_chain_from_the_template` | 구현 |
+| DV-440 | head나 route 매퍼의 template이 없는 dataset은 유지보수가 시작하지 않고 보고한다 | `tests/storage/test_maintain_promotion.py::test_a_route_without_a_head_or_template_reports_and_starts_nothing` | 구현 |
+| DV-441 | 유지보수 명세의 generation pin은 지금 head로 바뀌고 identity는 snapshot을 pin한 template에서만 바뀐다 | `tests/storage/test_maintain_promotion.py::test_generation_pins_advance_and_the_identity_replaces_only_a_pinned_snapshot` | 구현 |
+| DV-442 | 유지보수 설정의 알 수 없는 필드·빠진 상한·잘못된 타입은 설정 전체를 거부한다 | `tests/application/test_maintain_cli.py::test_a_typo_or_missing_cap_refuses_the_whole_configuration` | 구현 |
+| DV-443 | 설치 receipt와 다른 실행 환경은 실행 보고의 차이로 남고 실행을 막지 않는다 | `tests/application/test_maintain_cli.py::test_the_install_receipt_records_the_runtime_and_reports_its_differences` | 구현 |
+| DV-444 | 유지보수 계획은 자격 증명을 읽지 않고, `jobs.enabled` grant가 없는 실행은 공급자를 부르지 않고 나머지 단계를 끝낸다 | `tests/application/test_maintain_cli.py::test_plan_reads_no_key_and_run_without_the_jobs_grant_calls_nothing` | 구현 |
+| DV-445 | 재개 뒤에도 정산되지 않은 유료 page는 Qveris를 `stopped`(종료 코드 2)로 남기고 attempt를 열린 채 두며, 정산이 돌아오면 다시 호출 없이 `succeeded`로 끝난다 | `tests/application/test_maintain.py::test_an_unsettled_paid_page_stops_every_run_until_its_settlement` | 구현 |
+| DV-446 | 한 단계의 데이터베이스 오류는 그 단계의 실패로 기록되고 뒤 단계와 실행 보고는 그대로 남는다 | `tests/application/test_maintain.py::test_a_database_error_in_one_stage_leaves_the_later_stages_and_the_report` | 구현 |
+| DV-447 | `identity` 단계가 실패한 실행은 snapshot을 pin하는 chain을 `identity_unavailable`로 두고, 회복한 실행이 새 상장의 행을 해석해 승격한다 | `tests/application/test_maintain.py::test_a_failed_identity_stage_holds_identity_chains_until_it_recovers` | 구현 |
+| DV-448 | 늦은 identity가 남긴 `unresolved` 원천은 같은 identity로는 다시 계획되지 않고, 그 key의 해석 행이 바뀐 snapshot에서 다시 승격된다 | `tests/application/test_maintain.py::test_rows_an_older_snapshot_left_unresolved_are_promoted_once_identity_catches_up` | 구현 |
+| DV-449 | 연속한 정산된 실패는 1, 2, 4일 간격으로 늦춰 다시 묻고 재시도는 첫 묻기 뒤에 온다 | `tests/application/test_maintain_qveris.py::test_settled_failures_back_off_and_retry_after_the_first_asks` | 구현 |

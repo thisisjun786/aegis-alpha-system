@@ -972,20 +972,20 @@ def test_honestly_rehashed_backup_does_not_certify_native_retention(
     rehash_backup_inventory(archive)
     target = tmp_path / "restored"
     if fault == "source-row":
+        # The row count still matches its record, so only a deep restore rehashes it.
         with pytest.raises(ValueError, match="source library content"):
-            restore(archive, target)
-    else:
-        # Honest ordinary integrity cannot certify a duty not recorded by generic v1.
-        assert restore(archive, target)["restored"]
-        with open_workspace(target) as workspace:
-            assert verify_workspace(workspace)["verified"]
-            with pytest.raises((ValueError, FileNotFoundError)):
-                api().admit_native_input(
-                    workspace,
-                    selected,
-                    expected_schema="aas-" + kind + "-transform-v1",
-                    budget=BUDGET,
-                )
+            restore(archive, tmp_path / "deep-restore", deep=True)
+    # Honest ordinary integrity cannot certify a duty not recorded by generic v1.
+    assert restore(archive, target)["restored"]
+    with open_workspace(target) as workspace:
+        assert verify_workspace(workspace)["verified"]
+        with pytest.raises((ValueError, FileNotFoundError)):
+            api().admit_native_input(
+                workspace,
+                selected,
+                expected_schema="aas-" + kind + "-transform-v1",
+                budget=BUDGET,
+            )
 
 
 @pytest.mark.parametrize("kind", ["price", "sessions"])

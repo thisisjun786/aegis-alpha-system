@@ -259,6 +259,37 @@ def test_unreferenced_equivalent_backed_up_source_is_retired(
         assert "equivalent_source_retired" in _group_status(target)[0][1]
 
 
+def test_retirement_rehashes_a_default_backup(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        export = commit(workspace, "export")
+        copy = commit(workspace, "copy", ROWS[::-1], path="normalized")
+        row = workspace.market.execute(
+            "SELECT manifest_json FROM source_library_commits WHERE source_id=?", [copy]
+        ).fetchone()
+        assert row is not None
+        target = json.loads(row[0])["tables"][0]["target"]
+        # An uncompared value changes in place: equivalence still holds, the digest does not.
+        workspace.market.execute(
+            f"UPDATE \"{target}\" SET path='changed' WHERE _aas_ordinal=0"  # noqa: S608
+        )
+    with pytest.raises(ValueError, match="content/count mismatch"):
+        backup(home, tmp_path / "deep", deep=True)
+    backup(home, tmp_path / "backup")
+    manifest = json.loads((tmp_path / "backup" / "backup.json").read_text())
+    assert manifest["deep"] is False
+    other_device(monkeypatch, tmp_path / "backup")
+    request = spec(group([copy], [export]))
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        planned = retire_sources(workspace, request, backup_root=tmp_path / "backup", apply=False)
+        assert planned["backup_deep"] is False
+        assert _group_status(planned) == [("refused", ["backup_content_mismatch"])]
+        applied = retire_sources(workspace, request, backup_root=tmp_path / "backup", apply=True)
+        assert applied["retired"] == []
+        assert _present(workspace, copy)
+
+
 def test_retirement_keeps_raw_bytes(
     home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

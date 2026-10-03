@@ -43,7 +43,7 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
     sub = db.add_subparsers(dest="db_command", required=True)
     maintenance = {
         "status": "Report the installation, its stores and their identifiers",
-        "verify": "Re-derive every stored publication, strategy and run",
+        "verify": "Check every stored publication, source, strategy and run against its records",
         "recover": "Finish or end interrupted operations without recalculating",
         "quarantine": "End one named prepared operation with a recorded reason",
         "backup": "Copy the quiesced stores and run artifacts, excluding secrets",
@@ -138,6 +138,12 @@ def _maintenance_options(name: str, command: argparse.ArgumentParser) -> None:
         command.add_argument("--reason", required=True)
     if name == "backup":
         command.add_argument("--output", type=Path)
+    if name in ("verify", "backup", "restore", "compact", "run-install", "run-migrate", "migrate"):
+        command.add_argument(
+            "--deep",
+            action="store_true",
+            help="Also rehash every stored source table and promoted delta",
+        )
     if name in ("run-install", "run-migrate", "migrate"):
         command.add_argument("--backup-output", type=Path)
     if name == "migrate":
@@ -315,15 +321,19 @@ def _maintenance(home: Path, args: argparse.Namespace) -> dict[str, object]:  # 
     # Acquire the compute lease before workspace admission, as other bulk readers do.
     with price_compute(excluded_locks=storage_lock_targets(home, stores)) as budget:
         if args.db_command == "backup":
-            return backup(home, args.output, budget=budget)
+            return backup(home, args.output, budget=budget, deep=args.deep)
         if args.db_command == "restore":
-            return restore(args.backup.absolute(), home, budget=budget)
+            return restore(args.backup.absolute(), home, budget=budget, deep=args.deep)
         if args.db_command == "run-install":
-            return install_run_schema(home, backup_output=args.backup_output, budget=budget)
+            return install_run_schema(
+                home, backup_output=args.backup_output, budget=budget, deep=args.deep
+            )
         if args.db_command == "run-migrate":
-            return migrate_run_schema(home, backup_output=args.backup_output, budget=budget)
+            return migrate_run_schema(
+                home, backup_output=args.backup_output, budget=budget, deep=args.deep
+            )
         if args.db_command == "compact":
-            return compact(home, args.to.absolute(), budget=budget)
+            return compact(home, args.to.absolute(), budget=budget, deep=args.deep)
         if args.db_command == "source-retire":
             return _source_retire(home, args, budget)
         if args.db_command == "migrate":
@@ -332,9 +342,10 @@ def _maintenance(home: Path, args: argparse.Namespace) -> dict[str, object]:  # 
                 to_version=args.to_version,
                 backup_output=args.backup_output,
                 budget=budget,
+                deep=args.deep,
             )
         with open_workspace(home) as workspace:
-            return verify_workspace(workspace, budget=budget)
+            return verify_workspace(workspace, budget=budget, deep=args.deep)
 
 
 def _source_retire(
@@ -455,7 +466,7 @@ def _workspace_command(workspace: object, args: argparse.Namespace) -> dict[str,
         if args.db_command == "verify":
             from aegis_alpha.storage.verification import verify_workspace
 
-            return verify_workspace(workspace)
+            return verify_workspace(workspace, deep=args.deep)
         if args.db_command == "quarantine":
             from aegis_alpha.storage.publication import quarantine
 

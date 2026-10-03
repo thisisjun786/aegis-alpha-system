@@ -434,10 +434,12 @@ def test_arrow_target_corruption_fails_verify(home: Path) -> None:
         quoted = '"' + target.replace('"', '""') + '"'
         workspace.market.execute("UPDATE " + quoted + " SET n = n + 1")  # noqa: S608
         workspace.market.execute("CHECKPOINT")
+        # The row count still matches its record, so only a deep verification sees it.
+        assert source_library.verify_sources(workspace) is not None
         with pytest.raises(ValueError, match="content/count mismatch"):
-            source_library.verify_sources(workspace)
+            source_library.verify_sources(workspace, deep=True)
         with pytest.raises(ValueError, match="content/count mismatch"):
-            verify_workspace(workspace)
+            verify_workspace(workspace, deep=True)
 
 
 def test_source_library_survives_backup_restore(tmp_path: Path, home: Path) -> None:
@@ -506,8 +508,10 @@ def test_source_verification_admits_the_largest_batch_not_the_first(
     monkeypatch.setattr(source_library, "BATCH_ROWS", 2)
     with open_workspace(home) as workspace:
         with pytest.raises(ComputeResourceError, match="source table batch"):
-            source_library.verify_sources(workspace, budget=_budget(16 * 1024 * 1024))
-        report = source_library.verify_sources(workspace, budget=_budget(256 * 1024 * 1024))
+            source_library.verify_sources(workspace, budget=_budget(16 * 1024 * 1024), deep=True)
+        report = source_library.verify_sources(
+            workspace, budget=_budget(256 * 1024 * 1024), deep=True
+        )
     assert report == {"sources": 1, "tables": 1, "rows": 3}
 
 
@@ -526,7 +530,7 @@ def test_source_verification_rejects_before_any_digest_read(
     with open_workspace(home) as workspace:
         monkeypatch.setattr(source_library, "sqlite_digest", unexpected)
         with pytest.raises(ComputeResourceError, match="source table batch"):
-            source_library.verify_sources(workspace, budget=_budget(16 * 1024 * 1024))
+            source_library.verify_sources(workspace, budget=_budget(16 * 1024 * 1024), deep=True)
 
 
 def test_admission_groups_by_the_generated_bucket_not_a_source_column(
@@ -609,3 +613,24 @@ def test_sqlite_source_verifies_without_pyarrow(
         monkeypatch.setitem(sys.modules, "pyarrow", None)
         report = source_library.verify_sources(workspace)
     assert report == {"sources": 1, "tables": 2, "rows": 4}
+
+
+def test_digest_only_verification_charges_the_store_catalog(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The table names a default verification holds are charged before they are read."""
+    source = tmp_path / "catalog.sqlite3"
+    digest = _blob_source(source, [b"x"])
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        source_library.import_sqlite(workspace, source, "catalog", digest)
+    budget = _budget(16 * 1024 * 1024)
+    # Leave one byte after the marker metadata: no store's table list fits in it.
+    monkeypatch.setattr(
+        source_library, "_admit_source_metadata", lambda _ws, allowance: allowance - 1
+    )
+    with open_workspace(home) as workspace:
+        with pytest.raises(ComputeResourceError, match="source store catalog"):
+            source_library.verify_sources(workspace, budget=budget)
+        # A deep verification holds no table list, so only its row batches are charged.
+        with pytest.raises(ComputeResourceError, match="source table batch"):
+            source_library.verify_sources(workspace, budget=budget, deep=True)

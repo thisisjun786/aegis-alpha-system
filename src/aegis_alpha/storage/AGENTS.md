@@ -25,6 +25,10 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   stays usable; writes that need a v2 table or a close-only price name the migration.
   `prices.fields` defaults to `ohlcv`, an OHLCV row reads and hashes in its v1 shape,
   and a generation holding a `close` row hashes `fields` for every row.
+- `verify_workspace`, backup, restore and compact compare stored rows with their recorded
+  digests by default: a source table's recorded columns and row count, a promoted chain's links
+  and leaf delta. `deep=True` (`--deep`) rehashes every source table and promoted delta; the
+  report is the same in both modes. Compact always verifies the rewritten root deep.
 - Backup takes SQLite snapshots and closes DuckDB after checkpoint while retaining
   installation admission. Restore targets a new root; secrets are excluded. `backup.json`
   lists every `raw/` and `runs/` file, so it is read with its own bound

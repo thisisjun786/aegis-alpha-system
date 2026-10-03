@@ -151,9 +151,15 @@ def _verify_runs(workspace: Workspace, budget: ComputeBudget) -> list[str]:
 
 
 def verify_workspace(  # noqa: C901, PLR0912, PLR0915 -- full cross-store verification boundary
-    workspace: Workspace, *, budget: ComputeBudget | None = None
+    workspace: Workspace, *, budget: ComputeBudget | None = None, deep: bool = False
 ) -> dict[str, object]:
-    """Verify under a caller-owned allocation, retaining the serial default when omitted."""
+    """Verify under a caller-owned allocation, retaining the serial default when omitted.
+
+    The default compares stored rows with their recorded digests: a source table with
+    its recorded columns and row count, a promoted chain by its links and its leaf
+    delta. ``deep`` rehashes every source table and every promoted delta. Everything
+    else is checked the same way in both modes, and the report has the same shape.
+    """
     budget = budget or ComputeBudget(Fraction(1), 512 * 1024 * 1024)
     # Every step below charges against the same non-DuckDB allowance. DuckDB's own
     # share is bounded separately by the connection limit derived from this budget.
@@ -203,7 +209,7 @@ def verify_workspace(  # noqa: C901, PLR0912, PLR0915 -- full cross-store verifi
     for generation in sorted(committed - parents):
         # A promoted chain is evidenced by its spec, manifest and flags, not an import document.
         if is_promoted(workspace, generation):
-            verify_promotion(workspace, generation, budget=held)
+            verify_promotion(workspace, generation, budget=held, deep=deep)
         else:
             verify_sealed_publication(workspace, generation, budget=held)
         covered.update(
@@ -300,7 +306,7 @@ def verify_workspace(  # noqa: C901, PLR0912, PLR0915 -- full cross-store verifi
 
     # The catalog and generation lists are still held, so source verification is
     # admitted against what is left rather than the whole allowance.
-    sources = verify_sources(workspace, budget=held)
+    sources = verify_sources(workspace, budget=held, deep=deep)
     if sources is not None:
         report["source_library"] = sources
     return report

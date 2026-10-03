@@ -5,9 +5,10 @@ import json
 import shutil
 import sqlite3
 from contextlib import closing
+from datetime import date
 from fractions import Fraction
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -1525,3 +1526,144 @@ def test_membership_verification_uses_the_caller_allowance(
         with pytest.raises(ComputeResourceError, match="synthetic membership refusal"):
             verify_workspace(workspace, budget=budget)
     assert seen == [allowance]
+
+
+def _sqlite_source(path: Path) -> str:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("CREATE TABLE notes(label TEXT, amount INTEGER)")
+        connection.executemany("INSERT INTO notes VALUES (?,?)", [("a", 1), ("b", 2)])
+        connection.commit()
+    finally:
+        connection.close()
+    path.chmod(0o600)
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _no_row_read(*_args: object) -> tuple[int, str]:
+    raise AssertionError("a default verification read a stored source row")
+
+
+def _digest_home(tmp_path: Path) -> tuple[Path, dict[str, str], dict[str, object]]:
+    """An installation with a SQLite source, two Arrow sources and a two-link promoted chain.
+
+    Returns the home, the tables a test tampers with and the deep verification report.
+    """
+    from aegis_alpha.storage import source_library  # noqa: PLC0415
+    from aegis_alpha.storage.promotion.engine import promote  # noqa: PLC0415
+    from tests.storage.promotion_support import (  # noqa: PLC0415
+        add_source,
+        at,
+        bar,
+        register_symbols,
+        spec,
+    )
+
+    home = tmp_path / "home"
+    initialize(home)
+    snapshot = tmp_path / "notes.sqlite3"
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        source_library.import_sqlite(workspace, snapshot, "notes", _sqlite_source(snapshot))
+        first_pin = add_source(
+            workspace, [bar("AAA.KO", date(2025, 1, 2), 100.0, retrieved=at("2025-01-10"))], tag="a"
+        )
+        identity = register_symbols(workspace, first_pin["source_id"])
+        first = promote(workspace, *spec([first_pin], identity), apply=True)
+        second_pin = add_source(
+            workspace, [bar("AAA.KO", date(2025, 1, 3), 101.0, retrieved=at("2025-01-11"))], tag="b"
+        )
+        promote(
+            workspace,
+            *spec([second_pin], identity, parent=str(first["generation_id"])),
+            apply=True,
+        )
+        tables = {
+            "bars": str(
+                source_library.list_tables(workspace, second_pin["source_id"])[0]["target"]
+            ),
+            "notes": str(source_library.list_tables(workspace, "notes")[0]["target"]),
+            "ancestor": str(first["generation_id"]),
+        }
+    with open_workspace(home) as workspace:
+        deep = verify_workspace(workspace, deep=True)
+    assert deep["dataset_versions"] == len((first_pin, second_pin))
+    assert deep["source_library"] == {"sources": 3, "tables": 3, "rows": 4, "linked": 2}
+    return home, tables, deep
+
+
+def _tamper(home: Path, store: str, statement: str) -> None:
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        connection = workspace.market if store == "market" else workspace.strategies
+        assert connection is not None
+        connection.execute(statement)
+        if store == "strategies":
+            cast("sqlite3.Connection", connection).commit()
+
+
+def test_default_verify_compares_digests_and_deep_rehashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aegis_alpha.storage import source_library  # noqa: PLC0415
+
+    home, tables, deep = _digest_home(tmp_path)
+    bars, notes = tables["bars"], tables["notes"]
+    with open_workspace(home) as workspace:
+        # The default reads no stored source row, yet reports exactly what deep does.
+        monkeypatch.setattr(source_library, "arrow_digest", _no_row_read)
+        monkeypatch.setattr(source_library, "sqlite_digest", _no_row_read)
+        assert verify_workspace(workspace) == deep
+        monkeypatch.undo()
+    # A missing row, an extra column or a missing table disagrees with the record itself.
+    _tamper(home, "strategies", f'DELETE FROM "{notes}" WHERE _aas_ordinal = 1')  # noqa: S608
+    with open_workspace(home) as workspace, pytest.raises(ValueError, match="row count"):
+        verify_workspace(workspace)
+    _tamper(home, "strategies", f"INSERT INTO \"{notes}\" VALUES (1, 'b', 2)")  # noqa: S608
+    _tamper(home, "market", f'ALTER TABLE "{bars}" ADD COLUMN extra INTEGER')
+    with open_workspace(home) as workspace, pytest.raises(ValueError, match="table/column"):
+        verify_workspace(workspace)
+    _tamper(home, "market", f'ALTER TABLE "{bars}" DROP COLUMN extra')
+    _tamper(home, "market", f'DROP TABLE "{bars}"')
+    with open_workspace(home) as workspace, pytest.raises(ValueError, match="table/column"):
+        verify_workspace(workspace)
+
+
+@pytest.mark.parametrize(
+    ("changed", "store", "statement", "message"),
+    [
+        ("arrow", "market", 'UPDATE "{bars}" SET close = close + 1', "content/count mismatch"),
+        (
+            "sqlite",
+            "strategies",
+            'UPDATE "{notes}" SET amount = amount + 1',
+            "content/count mismatch",
+        ),
+        (
+            "ancestor_delta",
+            "market",
+            "UPDATE prices SET currency='XXX' WHERE generation_id='{ancestor}'",
+            "hash/count mismatch",
+        ),
+    ],
+)
+def test_a_changed_value_fails_only_deep_verify_backup_and_restore(
+    tmp_path: Path, changed: str, store: str, statement: str, message: str
+) -> None:
+    """A changed value keeps every recorded count: only a deep pass rehashes it."""
+    home, tables, deep = _digest_home(tmp_path)
+    _tamper(home, store, statement.format(**tables))
+    with open_workspace(home) as workspace:
+        assert verify_workspace(workspace) == deep, changed
+        with pytest.raises(ValueError, match=message):
+            verify_workspace(workspace, deep=True)
+    archive = tmp_path / "digest-backup"
+    receipt = backup(home, archive)
+    assert receipt["deep"] is False
+    assert json.loads((archive / "backup.json").read_text())["deep"] is False
+    with pytest.raises(ValueError, match=message):
+        backup(home, tmp_path / "deep-backup", deep=True)
+    assert not (tmp_path / "deep-backup").exists()
+    restored = restore(archive, tmp_path / "restored")
+    assert (restored["verification"], restored["deep"]) == (deep, False)
+    with pytest.raises(ValueError, match=message):
+        restore(archive, tmp_path / "deep-restore", deep=True)
