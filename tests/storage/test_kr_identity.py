@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import pytest
 
+from aegis_alpha.application import kr_identity_report
 from aegis_alpha.application.cli import main
 from aegis_alpha.storage.identity import (
     decode_registry,
@@ -636,8 +637,6 @@ def test_a_build_reads_every_registered_kr_source_and_reports_withdrawn_claims(
 
 
 def test_the_report_script_builds_the_document_kr_build_builds(tmp_path: Path) -> None:
-    from scripts import kr_identity_report  # noqa: PLC0415 -- review script under test
-
     home = tmp_path / "aas"
     initialize(home)
     complete, files = eodhd_job([symbol("100010", SAMSUNG_LIKE), symbol("200010", None)])

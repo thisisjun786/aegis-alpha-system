@@ -281,7 +281,7 @@ commit한다. 두 옵션 모두 반복할 수 있고, 같은 수집물을 다시
 `aas db source-link --apply`로 연결한다. 해석 규칙과 미해결 이유는
 [KR 등록](design/data-vertical.md#kr-등록)이 소유한다.
 
-`scripts/kr_identity_report.py`는 state 파일이 없는 store도 읽도록 market 파일만 읽기 전용으로 열고,
+`scripts/kr_identity_report.py`(로직은 `application/kr_identity_report.py`)는 state 파일이 없는 store도 읽도록 market 파일만 읽기 전용으로 열고,
 수집물 파일에서 `kr-build`와 같은 bytes의 문서를 메모리에서 만들어, 일봉 원천(`--symbols-prefix`,
 `--table`)의 EODHD 심볼이 몇 개 해석되는지와 미해결 심볼을 이유별로 보고한다. 설치본에 쓰지 않는 검토
 근거다.
