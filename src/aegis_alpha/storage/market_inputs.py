@@ -40,6 +40,7 @@ from aegis_alpha.storage.research_inputs import (
 from aegis_alpha.storage.source_reader import SourcePin
 
 if TYPE_CHECKING:
+    from aegis_alpha.storage.read_heads import HeadBinding, HeadQuery, HeadRead, TimeRules
     from aegis_alpha.storage.workspace import Workspace
 
 type Row = Mapping[str, object]
@@ -1220,6 +1221,95 @@ def load_pinned_observations(
         budget=replace(budget, reserved_bytes=budget.reserved_bytes + _retained_bytes(history)),
     )
     return PinnedObservationSeries(pin, history, definition)
+
+
+# Routes whose transform maps every common revision column to a real source column, so a
+# generation's two time columns are recorded source times rather than rule outputs.
+_RECORDED_TIME_TRANSFORMS = frozenset(
+    {
+        "aas-price-transform-v1",
+        "aas-sessions-transform-v1",
+        "aas-proxy-transform-v1",
+        OBSERVATION_TRANSFORM_SCHEMA,
+    }
+)
+
+
+def _retained_document(
+    workspace: Workspace, digest: str, budget: ComputeBudget
+) -> Mapping[str, object] | None:
+    """Decode one raw object as a JSON object, or None when raw retains no such object."""
+    _digest(digest)
+    if not (workspace.paths.raw / digest[:2] / digest).is_file():
+        return None
+    try:
+        body = decode_json(_raw_payload(workspace, digest, budget))
+    except (ValueError, TypeError, RecursionError):
+        # Raw bytes that are not a JSON object are an opaque commitment, not a spec.
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def generation_time_rules(
+    workspace: Workspace, generation_id: str, *, budget: ComputeBudget
+) -> TimeRules:
+    """Derive which rules produced a committed generation's time columns from its evidence.
+
+    A promotion generation's transform is its ``aas-promotion-v1`` spec, which declares
+    the rule of each time column. A generation registered from a retained research
+    transform or a sealed ``aas-market-import-v1`` document carries recorded times
+    (``source_column@1``). Any other generation has no retained provenance and is refused
+    rather than read as if its times were recorded.
+    """
+    from aegis_alpha.storage.read_heads import (  # noqa: PLC0415 -- read_heads imports this module
+        PROMOTION_SCHEMA,
+        RECORDED_TIMES,
+        spec_time_rules,
+    )
+
+    catalog = workspace.state.execute(
+        "SELECT transform_hash, manifest_hash FROM dataset_versions "
+        "WHERE generation_id=? AND status='committed'",
+        (generation_id,),
+    ).fetchone()
+    if catalog is None:
+        raise ValueError("generation is not a committed catalog version")
+    transform = _retained_document(workspace, str(catalog[0]), budget)
+    if transform is not None and transform.get("schema_version") == PROMOTION_SCHEMA:
+        return spec_time_rules(transform)
+    if transform is not None and transform.get("schema_version") in _RECORDED_TIME_TRANSFORMS:
+        return RECORDED_TIMES
+    sealed = _retained_document(workspace, str(catalog[1]), budget)
+    if sealed is not None and sealed.get("schema_version") == "aas-market-import-v1":
+        return RECORDED_TIMES
+    raise ValueError("generation time-rule provenance is not retained")
+
+
+def load_pinned_heads(
+    workspace: Workspace,
+    binding: HeadBinding,
+    query: HeadQuery,
+    *,
+    budget: ComputeBudget,
+    rehash: bool = False,
+) -> HeadRead:
+    """Read a binding's heads with predicate pushdown under workspace admission.
+
+    Every pinned generation must be a committed catalog version equal to its marker,
+    and its time-rule provenance comes from its retained evidence, never from the
+    caller. ``read_heads`` then checks pins and chain links and projects in DuckDB.
+    """
+    from aegis_alpha.storage.read_heads import read_heads  # noqa: PLC0415 -- see above
+
+    rules = {}
+    for item in binding.pins:
+        for marker in market.generation_chain(workspace.market, item.pin.generation_id):
+            _verify_catalog(workspace, marker)
+            generation = str(marker["generation_id"])
+            rules[generation] = generation_time_rules(workspace, generation, budget=budget)
+    return read_heads(
+        workspace.market, binding, query, time_rules=rules, budget=budget, rehash=rehash
+    )
 
 
 def _retained_bytes(history: History, domain: str = "feature_values") -> int:
