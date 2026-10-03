@@ -494,7 +494,11 @@ def _quiet(workspace: Workspace, *, excluding: str) -> None:
 
 
 def install_run_schema(
-    home: Path, *, backup_output: Path | None = None, budget: ComputeBudget | None = None
+    home: Path,
+    *,
+    backup_output: Path | None = None,
+    budget: ComputeBudget | None = None,
+    deep: bool = False,
 ) -> dict[str, object]:
     from aegis_alpha.storage.backup import (  # noqa: PLC0415 -- backup verifies this schema
         backup_workspace,
@@ -508,7 +512,7 @@ def install_run_schema(
         # newer interpreter cannot finish it by installing a schema nobody prepared.
         version = status.install_version or STATE_VERSION
         if status.state == "absent":
-            backup_workspace(workspace, backup_output, budget=budget)
+            backup_workspace(workspace, backup_output, budget=budget, deep=deep)
             intent = _intent(workspace)
             prepare_operation(
                 workspace.state,
@@ -540,7 +544,11 @@ def install_run_schema(
 
 
 def migrate_run_schema(
-    home: Path, *, backup_output: Path | None = None, budget: ComputeBudget | None = None
+    home: Path,
+    *,
+    backup_output: Path | None = None,
+    budget: ComputeBudget | None = None,
+    deep: bool = False,
 ) -> dict[str, object]:
     """Migrate an installed run add-on to the version that admits every request schema.
 
@@ -568,7 +576,7 @@ def migrate_run_schema(
         if status.migration_phase is None:
             # Before the intent and before the rebuild: this backup is the operator's
             # way back to the exact add-on the migration is about to replace.
-            backup_workspace(workspace, backup_output, budget=budget)
+            backup_workspace(workspace, backup_output, budget=budget, deep=deep)
         prepare_operation(
             workspace.state,
             operation_id=MIGRATION_OPERATION,

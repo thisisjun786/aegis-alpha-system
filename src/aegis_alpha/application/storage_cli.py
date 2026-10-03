@@ -138,7 +138,7 @@ def _maintenance_options(name: str, command: argparse.ArgumentParser) -> None:
         command.add_argument("--reason", required=True)
     if name == "backup":
         command.add_argument("--output", type=Path)
-    if name in ("verify", "backup", "restore", "compact"):
+    if name in ("verify", "backup", "restore", "compact", "run-install", "run-migrate", "migrate"):
         command.add_argument(
             "--deep",
             action="store_true",
@@ -325,9 +325,13 @@ def _maintenance(home: Path, args: argparse.Namespace) -> dict[str, object]:  # 
         if args.db_command == "restore":
             return restore(args.backup.absolute(), home, budget=budget, deep=args.deep)
         if args.db_command == "run-install":
-            return install_run_schema(home, backup_output=args.backup_output, budget=budget)
+            return install_run_schema(
+                home, backup_output=args.backup_output, budget=budget, deep=args.deep
+            )
         if args.db_command == "run-migrate":
-            return migrate_run_schema(home, backup_output=args.backup_output, budget=budget)
+            return migrate_run_schema(
+                home, backup_output=args.backup_output, budget=budget, deep=args.deep
+            )
         if args.db_command == "compact":
             return compact(home, args.to.absolute(), budget=budget, deep=args.deep)
         if args.db_command == "source-retire":
@@ -338,6 +342,7 @@ def _maintenance(home: Path, args: argparse.Namespace) -> dict[str, object]:  # 
                 to_version=args.to_version,
                 backup_output=args.backup_output,
                 budget=budget,
+                deep=args.deep,
             )
         with open_workspace(home) as workspace:
             return verify_workspace(workspace, budget=budget, deep=args.deep)

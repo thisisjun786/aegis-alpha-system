@@ -409,7 +409,18 @@ def _verify_manifest(
     intentionally pass no allowance; charging them would reject a legitimate large
     sparse import. Budgeting the recovery command is a separate change.
     """
-    conn = schema.connections(workspace)[str(manifest["store"])]
+    verify_tables(schema.connections(workspace)[str(manifest["store"])], manifest, allowance)
+
+
+def verify_tables(
+    conn: sqlite3.Connection | duckdb.DuckDBPyConnection,
+    manifest: dict[str, object],
+    allowance: int | None = None,
+) -> None:
+    """Rehash one commit's tables on ``conn`` against the digests its manifest records.
+
+    ``conn`` is the store the manifest names, in this installation or in a backup of it.
+    """
     for table in cast("list[dict[str, object]]", manifest["tables"]):
         columns = cast("list[str]", table["columns"])
         if allowance is not None:

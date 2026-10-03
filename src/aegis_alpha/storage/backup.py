@@ -179,6 +179,8 @@ def backup_workspace(
         "files": files,
         "logical": verification,
         "secrets_included": False,
+        # The verification mode, kept beside the logical report it does not change.
+        "deep": deep,
     }
     write_json(target / _MANIFEST, manifest)
     _validated_manifest(target)

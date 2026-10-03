@@ -399,8 +399,10 @@ flag 분포, 시간 규칙별 null·상한 적용 수, op 분포, stale 행, 계
 `--plan`은 설치본을 읽기 전용으로 열고, `--backup` 없이도 group별 상태와 이유, 증명 범위(`compared`와
 `uncompared_columns`), 양쪽 행 수와 digest, 원천별 참조 위치, 후보·은퇴 가능 행의 합계를 보고한다. group의
 `uncompared`는 은퇴할 테이블의 비교 밖 열을 정확히 나열해야 하고, 그 열은 은퇴 뒤 백업이나 원본 bytes에서만
-다시 얻는다. 백업을 넘기면 그 백업의 모든 파일을 다시 해시하므로
-백업 크기만큼 시간이 걸린다. `--apply`는 v2 설치본에서 실행 중인 run이나 다른 PREPARED 작업이 없을 때
+다시 얻는다. 백업을 넘기면 그 백업의 모든 파일을 다시 해시하고, 은퇴할 원천마다 백업 안의 테이블 행을
+commit이 기록한 digest로 다시 해시하므로 백업 크기와 은퇴 원천 행 수만큼 시간이 걸린다. 백업 안의 행이
+기록과 다르면 그 원천은 `backup_content_mismatch`로 거부된다. 보고의 `backup_deep`은 백업이 `--deep`으로
+만들어졌는지 알려 준다(그 기록이 없는 백업이면 `null`). `--apply`는 v2 설치본에서 실행 중인 run이나 다른 PREPARED 작업이 없을 때
 증명을 통과한 group을 모두 은퇴하고 나머지를 이유와 함께 보고한다. 응답의 `retired`는 은퇴한 원천,
 `retired_rows`는 그 행 수, `operation_id`는 intent다. 같은 문서를 다시 실행하면 이미 은퇴한 group을
 `already_retired`로 보고한다. 중단된 은퇴는 같은 명령이나 `aas db recover`가 끝낸다. `raw/`의 bytes는 지우지
@@ -615,10 +617,11 @@ aas --home /path/to/new-home db restore --backup /path/to/new-backup [--deep]
 `db verify`, `db backup`, `db restore`, `db compact`는 기본으로 원천 자료실 테이블의 기록된 열과 행 수,
 승격 chain의 link와 마지막 delta를 대조하고 저장된 행을 다시 해시하지 않는다. `--deep`은 원천 테이블과
 승격 delta의 모든 행을 다시 해시해 기록된 digest와 비교한다. 두 방식의 보고 형식은 같고, 백업·복원
-응답의 `deep`이 어느 쪽으로 검증했는지 알려 준다. 기본 검증은 원천 행 값을 읽지 않으므로 수억 행
-설치본에서도 행 수 집계만큼만 걸린다. 행 값 손상까지 확인하려면 정기적으로, 그리고 백업을 삭제 근거로 쓰기 전에 `--deep`을
-실행한다. `migrate`·`run-install`·`run-migrate`가 만드는 백업은 기본 검증을 쓰고, compact는 새로 쓴 루트를
-항상 deep으로 검증한다.
+응답의 `deep`과 백업 `backup.json`의 `deep`이 어느 쪽으로 검증했는지 기록한다. 기본 검증은 원천 행 값을
+읽지 않으므로 수억 행 설치본에서도 행 수 집계만큼만 걸린다. 행 값 손상까지 확인하려면 정기적으로 `--deep`을
+실행한다. `source-retire`는 백업이 어느 쪽이든 은퇴할 원천의 백업 행을 다시 해시한다. `migrate`·`run-install`·
+`run-migrate`가 `--backup-output`으로 만드는 백업도 기본 검증을 쓰고 `--deep`이면 deep으로 검증한다.
+compact는 새로 쓴 루트를 항상 deep으로 검증한다.
 
 `db verify`, `db backup`, `db restore`, `db run-install`, `db migrate`도 설정된 공유 계산 예산을 사용한다.
 CLI는 저장소 잠금을 잡기 전에 계산 lease를 확보한다. Python 호출자는 검증·백업·복원과
