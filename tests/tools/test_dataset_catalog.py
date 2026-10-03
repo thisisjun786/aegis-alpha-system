@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 
 import pytest
 
 from aegis_alpha.data import fred_collect, sec_collect
-from aegis_alpha.storage import kr_collection, kr_prices, strategy_registry
+from aegis_alpha.storage import calendar_refresh, kr_collection, kr_prices, strategy_registry
+from aegis_alpha.storage.calendar_declaration import parse_declaration
 from aegis_alpha.storage.dataset_catalog import (
     CATALOG,
     CLAMP_FLAG,
@@ -25,6 +28,7 @@ from aegis_alpha.storage.promotion.mappers import REGISTRY
 from aegis_alpha.storage.promotion.spec import CROSS_PROVIDER
 from aegis_alpha.storage.promotion.time_rules import CLAMP_FLAG as RULE_CLAMP_FLAG
 from aegis_alpha.storage.promotion.time_rules import RULES as TIME_RULES
+from aegis_alpha.storage.source_reader import SourcePin
 
 _ROOT = Path(__file__).resolve().parents[2]
 _DESIGN = _ROOT / "dev-notes/design/data-vertical.md"
@@ -209,6 +213,92 @@ def test_declared_rule_flags_are_the_flags_rules_attach(
     found = decimal_rules.convert(decimal_rules.rule(name), value, kind, currency=currency)
     assert set(found.flags) == set(expected)
     assert set(found.flags) <= set(DECIMAL_FLAGS[name])
+
+
+def test_decimal_flags_are_the_flags_the_sql_conversion_sets() -> None:
+    for name, found in decimal_rules.RULES.items():
+        attached = {
+            flag
+            for kind in found.kinds
+            for flag, _ in decimal_rules.conversion(found, "value", kind, "p_", currency="'KRW'")[
+                1
+            ].flags
+        }
+        assert attached == set(DECIMAL_FLAGS[name]), name
+
+
+def _spec_rules(raw: bytes) -> tuple[str, list[str], list[str], list[str], list[str]]:
+    spec = json.loads(raw)
+    times = {rule["rule"] for rule in spec["time_rules"].values()}
+    target = spec["target"]["dataset_id"]
+    return (
+        target,
+        [spec["mapper"]["name"]],
+        sorted(times),
+        sorted(set(spec["decimal_rule"].values())),
+        sorted(spec["quality_rules"]),
+    )
+
+
+def _entry_rules(dataset_id: str) -> tuple[list[str], list[str], list[str], list[str]]:
+    entry = catalog_entry(dataset_id)
+    assert entry is not None, dataset_id
+    return (
+        list(entry.mappers),
+        sorted(entry.time_rules),
+        sorted(entry.decimal_rules),
+        sorted(entry.quality_rules),
+    )
+
+
+_KR_STEP_KINDS = {
+    "eodhd.bars@1": "history",
+    "eodhd.bars_adjusted@1": "history",
+    "eodhd.bars_quarantine@1": "held",
+    "eodhd.bulk_quarantine@1": "bulk",
+    "eodhd.bulk_quarantine_adjusted@1": "bulk",
+}
+
+
+def _kr_spec(dataset: str, mapper: str) -> bytes:
+    pin = {"source_id": "s", "source_sha256": "0" * 64, "table": "t", "digest": "1" * 64}
+    step = kr_prices.Step(
+        _KR_STEP_KINDS[mapper], date(2026, 1, 1), date(2027, 1, 1), mapper, (pin,)
+    )
+    return kr_prices.step_spec(
+        step,
+        dataset=dataset,
+        parent=None,
+        identity={"snapshot_id": "i", "content_hash": "2" * 64},
+        calendar={"snapshot_id": "c", "content_hash": "3" * 64},
+        lag_us=0,
+    )
+
+
+@pytest.mark.parametrize("dataset", [kr_prices.DATASET, kr_prices.REFERENCE_DATASET])
+def test_kr_price_specs_use_the_catalog_rules(dataset: str) -> None:
+    mappers, times, decimals, quality = _entry_rules(dataset)
+    used: set[str] = set()
+    for mapper in mappers:
+        target, named, spec_times, spec_decimals, spec_quality = _spec_rules(
+            _kr_spec(dataset, mapper)
+        )
+        assert (target, named) == (dataset, [mapper])
+        assert (spec_times, spec_quality) == (times, quality), mapper
+        used.update(spec_decimals)
+    # Each spec picks per column from the entry's numeric rules; together they use all.
+    assert sorted(used) == decimals
+
+
+@pytest.mark.parametrize("path", sorted(_DECLARATIONS.glob("*.json")), ids=lambda path: path.stem)
+def test_calendar_specs_use_the_catalog_rules(path: Path) -> None:
+    raw = path.read_bytes()
+    declaration = parse_declaration(raw, hashlib.sha256(raw).hexdigest())
+    pin = SourcePin("s", "0" * 64, "t", "1" * 64)
+    spec = calendar_refresh.promotion_spec(declaration, pin, None, "v")
+    target, named, times, decimals, quality = _spec_rules(spec)
+    assert catalog_entry(target) is not None, target
+    assert (named, times, decimals, quality) == _entry_rules(target)
 
 
 def test_flags_follow_the_rules_and_mappers() -> None:

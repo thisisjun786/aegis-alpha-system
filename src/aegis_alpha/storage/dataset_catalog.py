@@ -19,6 +19,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal
 
+from aegis_alpha.storage.promotion import decimal_rules
 from aegis_alpha.storage.promotion.mappers import REGISTRY
 from aegis_alpha.storage.promotion.time_rules import RULES as TIME_RULES
 
@@ -27,13 +28,19 @@ if TYPE_CHECKING:
 
 type Role = Literal["canonical", "reference"]
 
-# Flags each numeric rule may attach to a revision whose value it changed.
-DECIMAL_FLAGS: Final = {
-    "exact@1": (),
-    "krw_tick@1": ("provider_float_reconstructed", "decimal_rounding_tie"),
-    "float_shortest@1": ("provider_float_storage", "decimal_rounding_tie"),
-    "decimal_text@1": ("volume_precision_limited",),
-}
+
+def _decimal_flags(found: decimal_rules.DecimalRule) -> tuple[str, ...]:
+    """The flags the SQL conversion of ``found`` attaches over every input type it reads."""
+    names: list[str] = []
+    for kind in sorted(found.kinds):
+        _, conversion = decimal_rules.conversion(found, "value", kind, "_f", currency="'KRW'")
+        names.extend(flag for flag, _ in conversion.flags)
+    return tuple(dict.fromkeys(names))
+
+
+# Flags each numeric rule may attach to a revision whose value it changed: the flags the
+# engine's SQL conversion of that rule can set.
+DECIMAL_FLAGS: Final = {name: _decimal_flags(found) for name, found in decimal_rules.RULES.items()}
 # Flags each quality rule may attach.
 QUALITY_FLAGS: Final = {"cross_provider_mismatch@1": ("cross_provider_mismatch",)}
 # Every rule but unknown_null@1 may lower a time to the ingestion time it exceeds. That
