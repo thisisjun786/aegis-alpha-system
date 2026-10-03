@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
@@ -169,11 +169,15 @@ def publish_generation_bulk(
     *,
     budget: ComputeBudget,
     plan: BulkPlan | None = None,
+    companion: Callable[[duckdb.DuckDBPyConnection], None] | None = None,
 ) -> dict[str, object]:
     """Commit the marker and every staged row in one transaction and return the marker.
 
     The plan is recomputed inside the transaction. When ``plan`` is given, the
     recomputed marker must equal it, so what commits is what was reviewed.
+    ``companion`` runs inside the same transaction after a new generation's rows are
+    inserted, so rows that belong to the generation (its quality flags) commit or roll
+    back with its marker. It does not run when an identical generation is reused.
     """
     with _budgeted(connection, budget):
         _ = connection.execute("BEGIN TRANSACTION")
@@ -184,6 +188,8 @@ def publish_generation_bulk(
                 _insert(connection, request, current)
                 if not _is_table(connection, request.staged):
                     _check_stored(connection, request, budget)
+                if companion is not None:
+                    companion(connection)
             _ = connection.execute("COMMIT")
         except BaseException:
             _rollback(connection)
@@ -619,10 +625,10 @@ def _batch_rows(stats: _Stats, budget: ComputeBudget) -> tuple[int, int]:
 
 
 # Text that json.dumps writes verbatim between quotes: printable ASCII except '"' and '\\'.
-_JSON_PLAIN: Final = r"[\x{20}\x{21}\x{23}-\x{5b}\x{5d}-\x{7e}]*"
+JSON_PLAIN: Final = r"[\x{20}\x{21}\x{23}-\x{5b}\x{5d}-\x{7e}]*"
 
 
-def _identity_sql(domain: str) -> tuple[str, str]:
+def record_identity_sql(domain: str) -> tuple[str, str]:
     """The aas-record-v1 record ID in SQL, and the rows whose keys it covers exactly.
 
     For those rows the concatenated text is byte for byte what ``record_identity``
@@ -642,7 +648,7 @@ def _identity_sql(domain: str) -> tuple[str, str]:
         else:
             raise ValueError(f"unsupported natural key type {base}")
         if base == "VARCHAR":
-            plain.append(f"({column} IS NULL OR regexp_full_match({column}, '{_JSON_PLAIN}'))")
+            plain.append(f"({column} IS NULL OR regexp_full_match({column}, '{JSON_PLAIN}'))")
         parts.append(f"'[\"{name}\",' || coalesce({value}, 'null') || ']'")
     document = f'\'["aas-record-v1","{domain}",[\' || ' + " || ',' || ".join(parts) + " || ']]'"
     return f"sha256({document})", " AND ".join(plain) or "true"
@@ -656,7 +662,7 @@ def _check_identities(
     Keys that need no JSON escaping are checked in one SQL pass; the rest are
     recomputed with ``record_identity`` batch by batch.
     """
-    expected, plain = _identity_sql(domain)
+    expected, plain = record_identity_sql(domain)
     mismatched = connection.execute(
         f"SELECT count(*) FROM {staged} WHERE ({plain}) AND record_id <> {expected}"  # noqa: S608 -- code-owned schema and validated identifier
     ).fetchone()
@@ -675,7 +681,7 @@ def _u32(expression: str) -> str:
     return f"unhex(lpad(to_hex({expression}), 8, '0'))"
 
 
-def _float_bits(column: str) -> str:
+def float_bits_sql(column: str) -> str:
     """The IEEE-754 binary64 bits of a finite DOUBLE, with -0.0 as +0.0, as a HUGEINT."""
     magnitude = f"abs({column})"
     rough = f"CAST(floor(log2({magnitude})) AS INTEGER)"
@@ -698,7 +704,7 @@ def _float_bits(column: str) -> str:
     )
 
 
-def _encoded(name: str, rowset_type: str) -> str:
+def encoded_cell_sql(name: str, rowset_type: str) -> str:
     """One cell's aas-rowset-v1 encoding as an SQL BLOB expression (see rowset.py)."""
     column = _quote(name)
     if rowset_type == "text":
@@ -720,7 +726,7 @@ def _encoded(name: str, rowset_type: str) -> str:
             f" || unhex('fffffff4') || {_u32(f'length({digits})')} || encode({digits})"
         )
     elif rowset_type == "float":
-        body = f"unhex('06') || unhex(lpad(to_hex({_float_bits(column)}), 16, '0'))"
+        body = f"unhex('06') || unhex(lpad(to_hex({float_bits_sql(column)}), 16, '0'))"
     else:
         raise ValueError(f"unsupported rowset type {rowset_type!r}")
     return f"(CASE WHEN {column} IS NULL THEN unhex('00') ELSE {body} END)"
@@ -742,10 +748,41 @@ def _stream_delta(  # noqa: PLR0913 -- one delta's exact hashing inputs
     generation = generation_id.encode()
     constant = b"\x01" + len(generation).to_bytes(4, "big") + generation
     cells = [
-        f"unhex('{constant.hex()}')" if name == "generation_id" else _encoded(name, rowset_type)
+        f"unhex('{constant.hex()}')"
+        if name == "generation_id"
+        else encoded_cell_sql(name, rowset_type)
         for name, rowset_type in rowset_schema(columns)
     ]
-    stream = RowsetStream(rowset_schema(columns), count)
+    digest = stream_rowset(
+        connection,
+        rowset_schema(columns),
+        cells,
+        relation,
+        parameters,
+        count=count,
+        batch_rows=batch_rows,
+    )
+    return delta_digest(columns, digest)
+
+
+def stream_rowset(  # noqa: PLR0913 -- one rowset's exact hashing inputs
+    connection: duckdb.DuckDBPyConnection,
+    schema: tuple[tuple[str, str], ...],
+    cells: list[str],
+    relation: str,
+    parameters: list[object],
+    *,
+    count: int,
+    batch_rows: int,
+) -> str:
+    """The aas-rowset-v1 digest of ``relation``, each row encoded in DuckDB by ``cells``.
+
+    ``cells`` holds one SQL BLOB expression per schema field, in schema order, each
+    producing that field's aas-rowset-v1 cell encoding (see ``encoded_cell_sql``).
+    DuckDB sorts the encodings and ``RowsetStream`` digests them batch by batch, so
+    the digest equals ``rowset.rowset_hash`` over the same rows.
+    """
+    stream = RowsetStream(schema, count)
     result = connection.execute(
         f"SELECT {' || '.join(cells)} AS encoded FROM ({relation}) ORDER BY encoded",  # noqa: S608 -- code-owned encoders over a code-owned relation
         parameters,
@@ -753,7 +790,7 @@ def _stream_delta(  # noqa: PLR0913 -- one delta's exact hashing inputs
     while batch := result.fetchmany(batch_rows):
         for (encoded,) in batch:
             stream.update(encoded)
-    return delta_digest(columns, stream.hexdigest())
+    return stream.hexdigest()
 
 
 def _check_revisions(
