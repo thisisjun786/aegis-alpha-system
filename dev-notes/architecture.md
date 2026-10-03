@@ -18,7 +18,7 @@ AAS의 목표는 외부 앱과 에이전트가 사용하는 데이터·연구 �
 | `aas run` | 준비·요청 등록·`open_run`·잠금 없는 회계·`commit_run`을 한 명령으로 잇고 run ID로 결과 조회 (`db run-install` 필요) | 원본 자료의 PIT 인증, 알파·헷지 전략 실행, 실주문 |
 | `aas run research` / `aas run rerun` | 선언 문서 하나로 준비·선언 등록·`open_run`·회계·`commit_run`을 잇고, 봉인한 증거에서 결과와 준비를 다시 만들어 대조 (`db run-install`과 `db run-migrate` 필요) | 관측 자료의 실행 자격, 원본 동치, PIT 인증 |
 | `aas init/doctor/db/strategy/data` | `storage/`의 내장 DB 설치·등록·조회·복구, 관례·pin 문서 등록, run 추가 스키마 설치, 기록한 run을 담은 백업과 새 home 복원 | 실행 자격 부여, 기존 home 덮어쓰기 |
-| `aas providers/collect` | 기존 공급자·예산·실행 영수증 도구. `collect dart`·`collect kind`는 KR 공시·상장 수집을 내장 설치본의 원장·`raw/`·원천 자료실에 기록 | 나머지 수집기의 내장 DB 이식·스케줄러 자동 활성화 |
+| `aas providers/collect` | 기존 공급자·예산·실행 영수증 도구. `collect dart`·`collect kind`는 KR 공시·상장 수집을, `collect sec`·`collect fred`는 SEC 공시·재무와 FRED/ALFRED 거시·DEXKOUS 수집을 내장 설치본의 원장·`raw/`·원천 자료실에 기록 | 나머지 수집기의 내장 DB 이식·스케줄러 자동 활성화 |
 
 외부 도구는 현재 Python 계산 API 또는 CLI를 재사용할 수 있다. 모든 저장·수집 기능이
 하나의 안정된 외부 API로 통합됐다는 뜻은 아니다. HTTP/MCP 서버는 제공하지 않는다.

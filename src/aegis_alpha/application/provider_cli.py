@@ -97,9 +97,10 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
     recovery.add_argument("--provider", choices=("fmp",), required=True)
     recovery.add_argument("--limit", type=int, default=100)
     recovery.add_argument("--after-run-id", help="Continue after the previous recovery page cursor")
-    from aegis_alpha.application import kr_collection_cli
+    from aegis_alpha.application import kr_collection_cli, us_collection_cli
 
     kr_collection_cli.add_commands(actions)
+    us_collection_cli.add_commands(actions)
     for name in ("plan", "run"):
         parser = actions.add_parser(name)
         parser.add_argument("--config", type=Path, default=config_path)

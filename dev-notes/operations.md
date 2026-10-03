@@ -1245,6 +1245,41 @@ commit에는 `pyarrow`(legacy extra)가 필요하다.
 DART backfill unit은 그 전에 멈춘다(두 수집기는 quota를 서로 세지 않는다). 요청·cohort·원장·보존 규칙은
 [KR 공시·상장 수집](design/data-vertical.md#kr-공시상장-수집)이 소유한다.
 
+## US 공시·거시 수집
+
+```bash
+aas collect sec plan [--home HOME] [--today YYYY-MM-DD] [--since YYYY-MM-DD] [--issuers registered|all]
+aas collect sec run --user-agent-file SEC_USER_AGENT_FILE [--since YYYY-MM-DD] [--issuers registered|all] [--max-calls 2000] [--home HOME]
+aas collect fred plan [--home HOME] [--today YYYY-MM-DD]
+aas collect fred run --key-file FRED_KEY_FILE [--max-calls 500] [--home HOME]
+```
+
+`plan`은 설치본을 읽기 전용으로 열어 실행이 처음 물을 것을 보고하고 공급자를 호출하지 않는다. `sec plan`은
+New York 날짜(`--today`)의 덮이지 않은 색인 날, 이미 commit된 색인에서 나온 submissions·companyfacts 요청의
+이유별 수, 원한 공시·완료·발행인 범위 밖·포기 수, 처음 날과 덮인 마지막 날이다. `fred plan`은 FRED 날짜의
+시계열별 알려진 vintage 날, 실시간 끝(어제), 요청의 이유별 수(`vintage_dates:origin`·`vintage_check`,
+`series_csv:daily`)다. 둘 다 commit되지 않은 receipt 수를 함께 보고한다.
+
+`run`은 설치본을 쓰기로 열고 한 번의 제한된 수집을 한다. `--user-agent-file`은 SEC 공정 접근 규칙의 연락처를
+담은 `User-Agent` 한 줄, `--key-file`은 FRED API 키 한 줄이며, 둘 다 소유자만 읽을 수 있는 Git checkout 밖의
+파일이다. 중단된 attempt 정산과 commit되지 않은 receipt의 commit을 먼저 한다. SEC는 색인, submissions,
+companyfacts 순으로, FRED는 CSV, 시계열별 vintage 확인과 observations 창 순으로 묻는다. 호출마다 state의
+`collection_jobs`·`collection_attempts`·`usage_events`에 기록된다. 응답은 `raw/`와 `sec-*`·`fred-*` 내용
+원천에 남는다. 출력은 공급자 호출 수, 이유별 요청 수, 결과 분포, 멈춘 이유(`budget`,
+`provider_refused:<HTTP 상태>`, `transport_failures`), commit한 원천이다. SEC는 덮인 마지막 날과 남은 계획을,
+FRED는 시계열별 알려진 vintage 날과 완결되지 않은 창을 함께 낸다. 예산을 다 쓰면 정상 종료이고, 거부나 전송
+실패로 멈추면 받은 답을 commit한 뒤 종료 코드 1이다. commit에는 `pyarrow`(legacy extra)가 필요하다.
+`--issuers registered`(기본)는 identity에 SEC 발행인으로 등록된 제출자의 문서만 묻는다. 처음 SEC 실행은
+`--since`로 legacy bulk archive 뒤의 첫 색인 날을 정한다.
+
+수집한 원천의 승격은 [원천 자료의 승격과 은퇴](#원천-자료의-승격과-은퇴)의 명세로 한다.
+`sec-submissions-filings-*`는 `sec.submissions@1`, `sec-companyfacts-facts-*`는 `sec.companyfacts@1`,
+`fred-alfred-observations-*`는 `fred.alfred@1`(원천마다 `vintage_partitions`의 구간 순서로),
+`fred-series-csv-*`는 `fred.fx_series@1`이다. 승인된 수집기(SEC 색인·submissions·companyfacts, FRED/ALFRED와
+DEXKOUS CSV)지만, 패키지 설치나 이 명령이 예약 실행을 만들지는 않는다. `[owner]` 예약 실행은 운영 전환에서
+연락처·키 파일과 호출 상한을 정해 켠다. 요청·창·선택·보존 규칙은
+[US 공시·거시 수집](design/data-vertical.md#us-공시거시-수집)이 소유한다.
+
 ## Qveris 원문 수집
 
 `aas collect daily --config /path/to/collection.json --state-root /path/to/private-journal`은

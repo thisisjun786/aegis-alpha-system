@@ -1197,6 +1197,106 @@ attempt, HTTP 상태, 보존 header(`content-type`·`date`·`retry-after`), 요�
 회사를 좁힌다. 그 legacy 수집기는 요청 지문에 고정 cohort의 관측일을 넣고 모든 답(`NO_DATA` 포함)을
 종결로 다뤘으므로, 목록을 다 물은 뒤에는 새 요청을 만들지 못한다.
 
+## US 공시·거시 수집
+
+SEC EDGAR와 FRED/ALFRED 수집도 설치본에 직접 기록한다. 고정된 작업 목록은 없고, 매 실행이 commit된
+답과 공급자의 날짜(SEC는 New York, FRED는 St. Louis의 `America/Chicago`)에서 물을 것을 계산한다. 코드는
+`data/provider_request.py`(요청·답), `data/sec_collect.py`·`data/fred_collect.py`(endpoint, 답 판정, 계획),
+`storage/provider_collection.py`(원장 호출·receipt·batch), `storage/sec_collection.py`·
+`storage/fred_collection.py`(실행과 commit)이고, 명령은 `aas collect sec plan|run`과
+`aas collect fred plan|run`이다. 원장은 [KR 공시·상장 수집](#kr-공시상장-수집)의 `collection_ledger`를 같은
+규칙(호출 전 `reserved`, 직전 `started`, 답 보존 뒤 `succeeded`와 `charged`, 답이 없으면 `uncertain`,
+중단 뒤 정산)으로 쓴다.
+
+**요청.** 요청은 공급자, endpoint, 정규 parameter JSON뿐이다.
+
+```text
+fingerprint = sha256(정규 JSON ["aas-<provider>-request-v1", endpoint, parameters_json])
+```
+
+| 공급자 | endpoint | 공급자 경로 | parameter |
+| --- | --- | --- | --- |
+| `sec` | `daily_index` | `Archives/edgar/daily-index/<연>/QTR<n>/master.<YYYYMMDD>.idx` | `day` |
+| `sec` | `submissions` | `data.sec.gov/submissions/CIK##########.json` | `cik`(10자리) |
+| `sec` | `companyfacts` | `data.sec.gov/api/xbrl/companyfacts/CIK##########.json` | `cik` |
+| `fred` | `vintage_dates` | `fred/series/vintagedates` | `series_id`, `realtime_start`, `realtime_end`, `limit=10000`, `offset`, `file_type=json` |
+| `fred` | `observations` | `fred/series/observations` | `series_id`, `realtime_start`, `realtime_end`, `limit=100000`, `offset`, `file_type=json` |
+| `fred` | `series_csv` | `fredgraph.csv` | `id` |
+
+FRED 키는 `vintage_dates`·`observations`의 공급자 URL에만 실리고, SEC의 공정 접근 `User-Agent`(연락처
+포함)는 header에만 실린다. 둘 다 요청·receipt·원천에 들어가지 않으며, 답이 그 값을 되돌려 주면 그 답을
+보존하지 않는다. SEC는 HTTP 403·429, FRED는 401·403·429와 키를 거부하는 400이 실행을 멈춘다. 전송 실패가
+세 번 이어져도 멈춘다. 호출 상한은 `--max-calls`(SEC 기본 2,000, FRED 기본 500)이고, 호출 간격은 SEC
+0.125초(초당 10회 한도), FRED 0.5초(분당 120회 한도)다.
+
+**receipt와 batch.** 답마다 응답 bytes와 정규 receipt(`aas-<provider>-receipt-v1`: 요청, fingerprint, job과
+attempt, HTTP 상태, 보존 header, 요청·수집 시각, 결과, 공급자 상태, 선택, 응답의 크기·SHA-256)를 `raw/`에
+둔 뒤 attempt가 `succeeded`가 된다. 결과는 `COMPLETED`(읽을 수 있는 답), `NO_DATA`(SEC 404, FRED가 없다고
+답한 시계열), `FAILED`(그 밖의 답)이며 수집 경로만 정한다. 한 실행의 receipt를 수집 순서로 나열한 batch
+문서(`aas-<provider>-batch-v1`, 500개 또는 응답 256 MiB까지)와 그 receipt·응답이 완결 단위 하나다. 그 단위의
+모든 테이블은 같은 파일의 내용 원천이라 `hex`를 공유한다. `<provider>-collect-receipts` 원천의 `receipts`
+테이블은 receipt마다 `fingerprint`, `endpoint`, `request_json`, `outcome`, `provider_status`, `http_status`,
+`selection_json`, `receipt_json`, `receipt_sha256`, `raw_sha256`, `raw_size`, `retrieved_at_utc`의 텍스트 행이다.
+commit 전에 중단된 실행의 `charged` receipt 중 어느 commit에도 없는 것은 다음 실행이 먼저 commit한다.
+
+**SEC.** 실행은 이 수집기의 commit된 batch만 읽는다. 읽은 색인 날, 색인이 말하는 공시, submissions 답이
+나열한 공시, companyfacts 답이 사실을 준 공시다. 그 다음 세 단계로 묻는다.
+
+1. **색인.** 처음 알려진 색인 날(없으면 오늘의 30일 전, `--since`가 있으면 그 날)부터 어제까지의 평일 중
+   덮이지 않은 날의 `daily_index`를 묻는다. 날은 `COMPLETED` 답으로 덮인다. 404(주말이 아닌 EDGAR
+   휴일)는 그 다음 날이 끝난 뒤(New York 날짜로 이틀 뒤) 받은 것일 때만 덮는다. 그보다 이른 404는 아직
+   게시되지 않은 색인일 수 있다.
+2. **submissions.** 색인 공시 중 양식이 `filing_forms`(10-K·10-Q·10-KT·10-QT·8-K·20-F·40-F·6-K와 각
+   정정)에 들고 발행인 범위(`registered`: `mint_issuer('sec_cik', cik)`가 identity에 등록된 제출자, 또는
+   `all`)에 드는 공시를 원한다. 아직 나열되지 않은 공시가 있는 제출자마다 문서를 한 번 묻는다. 이유는 둘이다.
+   - `new_filing`: 그 색인을 읽은 뒤 묻지 않음.
+   - `listing_retry`: 마지막으로 물은 지 하루가 지났고, 색인을 읽은 지 `listing_days`(7일) 안.
+3. **companyfacts.** 양식이 `fact_forms`(정기 재무 보고서와 그 정정)인 원하는 공시에 사실이 아직 없는
+   제출자마다 같은 규칙으로 묻는다(재시도 이유 `fact_retry`, 기간 `fact_days` 14일). XBRL 처리가 접수보다
+   늦을 수 있기 때문이다.
+
+창이 지난 공시는 `abandoned`로 센다. 답을 보존하지 못한 attempt도 물은 것으로 보아 하루 뒤 다시 묻는다.
+문서는 그 제출자의 이전 공시를 모두 다시 싣는다. 그래서 문서 요청의 receipt는 원한 accession 목록을
+`selection`(`{"accessions": [...]}`)으로 싣고, 그 공시의 행만 테이블에 옮긴다. bytes는 `raw/`에 그대로 있다.
+
+| 원천 접두어 | 테이블 | 행 |
+| --- | --- | --- |
+| `sec-daily-index-entries-` | `entries` | 답한 색인의 header 뒤 모든 줄. `day`, 원문 `line`, 다섯 칸을 읽은 `cik`(10자리)·`company`·`form`·`date_filed`·`accession`(`edgar/data/<cik>/<accession>.txt`), `retrieved_at_utc`, `receipt_sha256`. 다섯 칸으로 읽히지 않는 줄은 읽은 칸이 null이다 |
+| `sec-submissions-filings-` | `filings` | `sec.submissions_filings@1`의 열과 같은 열로, 문서의 `filings.recent` 중 원한 공시의 위치. `sec.submissions@1`이 읽는다 |
+| `sec-companyfacts-facts-` | `facts` | 원한 공시의 사실. `cik`, `taxonomy`, `tag`, `unit`, `period_start`, `period_end`, `accession_number`, `form`, `filed`, 숫자의 JSON 원문 텍스트 `value`, `fy`, `fp`, `frame`, `retrieved_at`, `receipt_sha256`. `sec.companyfacts@1`이 읽는다 |
+
+알 수 없는 필드, 빠진 필수 필드, 십진수가 아닌 값, 다른 CIK의 문서는 그 답을 `FAILED`로 만든다. 행을
+다듬지 않고, 공급자가 쓴 미래 기간 끝도 그대로 남긴다.
+
+**FRED/ALFRED.** ALFRED는 실시간 구간을 질의 창으로 자른다. 창 시작보다 먼저 시작한 vintage는 창 시작에
+시작한 것으로, 창 끝보다 늦게 끝나는 구간은 창 끝에 끝나는 것으로 답한다. observations 창 하나는 vintage
+날짜를 2000개까지만 담을 수 있다. 그래서 시계열마다 다음처럼 묻는다.
+
+1. `vintage_dates`가 알려진 vintage 날(`known`) 다음 날부터, 알려진 날이 없으면 ALFRED 원점(1776-07-04)부터,
+   끝난 FRED 날(어제)까지의 vintage 날짜를 page마다 묻는다. 날짜가 없으면 그 시계열은 최신이다.
+2. observations 창은 `known`(또는 원점)에서 그 날까지다. 창마다 vintage 날짜를 2000개까지(원점이 아닌
+   시작일도 하나로 셈) 담고, 다음 창은 앞 창의 마지막 vintage 날짜에서 시작한다
+   (`observation_windows`). 창마다 page를 끝까지 묻는다.
+3. 원점이 아닌 창에서 창 시작일에 시작하는 행은 앞 창이나 앞선 수집이 이미 가진 구간을 다시 말한다(잘렸거나
+   그날 실제로 시작). 다른 행은 FRED가 매긴 vintage다(`split_rows`). 앞의 행은 세기만 하고 뒤의 행을 옮긴다.
+
+창은 끝난 날에서 끝나므로 반쯤 게시된 vintage 날을 수집하지 않는다. 창을 순서대로 묻고 처음 완결되지 않은
+창에서 그 시계열을 멈추므로, 알려진 가장 늦은 vintage 날까지의 모든 vintage가 수집돼 있다. `known`은
+`fred.alfred@1`이 읽을 수 있는 모든 commit된 테이블(legacy 편입분 포함)에서, 그 행을 받은 FRED 날보다
+일찍 시작한 vintage의 가장 늦은 날이다. 창은 0부터의 모든 page가 같은 count로 `COMPLETED`이고 그 수의 행을
+담을 때 완결이다. 완결되지 않은 창의 행은 옮기지 않으며 다음 실행이 같은 `known`에서 다시 묻는다.
+
+| 원천 접두어 | 테이블 | 행 |
+| --- | --- | --- |
+| `fred-alfred-observations-` | `observations` | 완결된 창의 vintage 행. `series_id`, `observation_date`, `realtime_start`, `realtime_end`(창 끝으로 잘린 값), `value` 원문, `query_realtime_start`, `query_realtime_end`, `retrieved_at_utc`, `receipt_sha256`. `fred.alfred@1`이 읽는다 |
+| `fred-series-csv-` | `observations` | `series_csv` 답 하나의 bytes만을 원본으로 한 원천. 행은 `fred.series_csv@1`과 같아 같은 bytes는 같은 원천이고, `fred.fx_series@1`이 읽는다 |
+
+`series_csv`(기본 DEXKOUS, dataset `fx.usdkrw.fred`)는 FRED 날마다 한 번 받는다. 기본 ALFRED 시계열은
+legacy 거시 목록 35개와 DEXKOUS다. 수집기 자신의 watermark는 시계열마다의 `known`이고, 수집으로만
+앞으로 간다. 승격된 dataset의 `watermarks`는 [승격 실행과 보고](#승격-실행과-보고)의 규칙대로 그 수집
+원천을 승격할 때 앞으로 간다. 유지보수 승격은 수집된 원천마다 `vintage_partitions`의 구간을 순서대로
+승격한다.
+
 ## identity 등록과 chunked 문서
 
 identity는 `storage/identity.py`가 state에 등록하고 `aas identity register|snapshot|show`가 CLI다.
@@ -1976,3 +2076,26 @@ state v2:
 | DV-288 | KIND 목록의 코드 하나라도 KRX 단축코드가 아니면 cohort를 좁히지 않는다 | `tests/storage/test_kr_collection.py::test_a_kind_list_with_a_malformed_code_never_narrows_the_cohort` | 구현 |
 | DV-289 | 응답 없는 완료 공시 목록 행은 읽히지 않은 행이고 그 날을 덮지 않는다 | `tests/storage/test_kr_collection.py::test_a_completed_list_row_without_its_page_is_unreadable` | 구현 |
 | DV-290 | batch는 응답 bytes 상한에서도 끝난다 | `tests/storage/test_kr_collection.py::test_a_batch_ends_at_its_byte_budget` | 구현 |
+| DV-291 | 요청 지문은 공급자·endpoint·parameter만 해시하고 FRED 키는 공급자 URL에만 실리며 키를 되돌리는 답은 보존되지 않는다 | `tests/data/test_fred_collect.py::test_a_request_names_its_window_and_never_its_key` | 구현 |
+| DV-292 | FRED 답은 읽히면 `COMPLETED`, 없는 시계열은 `NO_DATA`, 창 밖 행이나 다른 모양은 `FAILED`이고 키 거부와 한도는 실행을 멈춘다 | `tests/data/test_fred_collect.py::test_answers_are_classified_and_a_refused_key_stops_the_run` | 구현 |
+| DV-293 | observations 창은 vintage 날짜를 2000개까지 담고 다음 창은 앞 창의 마지막 vintage 날짜에서 시작한다 | `tests/data/test_fred_collect.py::test_windows_span_at_most_2000_vintages_and_chain_on_their_last_vintage` | 구현 |
+| DV-294 | 원점이 아닌 창의 시작일에 시작하는 행은 이미 가진 구간의 재진술로 세어지고 옮겨지지 않는다 | `tests/data/test_fred_collect.py::test_rows_starting_on_a_window_start_restate_what_is_held` | 구현 |
+| DV-295 | 계획은 알려진 vintage 날 다음 날부터 끝난 FRED 날까지 vintage를 확인하고 알려진 날이 없으면 원점부터 묻으며 CSV는 FRED 날마다 한 번이다 | `tests/data/test_fred_collect.py::test_the_plan_checks_vintages_after_the_known_day_and_csv_once_a_day` | 구현 |
+| DV-296 | 원점 수집은 잘린 재진술 없이 FRED가 매긴 구간을 한 번씩만 2000개 이하의 창으로 옮긴다 | `tests/storage/test_us_collection.py::test_an_origin_run_collects_every_vintage_once_in_windows_of_at_most_2000` | 구현 |
+| DV-297 | 날마다의 수집과 승격에서 승격 watermark와 수집기의 시계열별 vintage 날은 앞으로만 가고, 새 vintage가 없으면 그대로다 | `tests/storage/test_us_collection.py::test_the_watermark_advances_monotonically_across_daily_collections` | 구현 |
+| DV-298 | 완결되지 않은 창은 옮겨지지 않고 다음 실행이 같은 알려진 날에서 다시 묻는다 | `tests/storage/test_us_collection.py::test_an_incomplete_window_is_asked_again_from_the_same_known_day` | 구현 |
+| DV-299 | 중단된 FRED 실행의 attempt는 정산되고 보존된 receipt는 다음 실행이 먼저 commit하며 완결된 창은 알려진 것이 된다 | `tests/storage/test_us_collection.py::test_a_crashed_run_is_settled_and_its_receipts_committed_by_the_next` | 구현 |
+| DV-300 | FRED 키 거부는 실행을 멈추고 그 답을 commit한다 | `tests/storage/test_us_collection.py::test_a_refused_key_stops_the_run_and_keeps_the_answer` | 구현 |
+| DV-301 | `fred.alfred@1`이 읽는 legacy 테이블도 알려진 vintage 날을 정하고, 받은 FRED 날에 시작한 vintage는 세지 않는다 | `tests/storage/test_us_collection.py::test_a_legacy_alfred_table_sets_the_known_vintage_day` | 구현 |
+| DV-302 | CSV 내려받기는 `fred.series_csv@1` 편입과 같은 원천이고 `fred.fx_series@1`로 승격된다 | `tests/storage/test_us_collection.py::test_the_csv_download_is_the_source_the_legacy_import_makes` | 구현 |
+| DV-303 | SEC 요청은 문서를 이름 짓고 연락처 `User-Agent`는 header에만 실리며 되돌리는 답은 보존되지 않는다 | `tests/data/test_sec_collect.py::test_requests_name_the_document_and_never_the_contact` | 구현 |
+| DV-304 | 일일 색인은 모든 줄을 남기고 다섯 칸으로 읽힌 줄만 공시가 되며 404는 `NO_DATA`, 403은 실행을 멈춘다 | `tests/data/test_sec_collect.py::test_a_daily_index_keeps_every_line_and_reads_the_filings` | 구현 |
+| DV-305 | companyfacts 사실은 숫자의 JSON 원문을 그대로 남기고 다른 CIK·알 수 없는 필드·십진수가 아닌 값은 답을 거부한다 | `tests/data/test_sec_collect.py::test_company_facts_keep_each_number_as_written` | 구현 |
+| DV-306 | 색인 날은 답이나 다음 날이 끝난 뒤 받은 404로만 덮이고 빈 날은 알려진 가장 이른 날부터 채운다 | `tests/data/test_sec_collect.py::test_index_days_are_covered_by_an_answer_or_a_404_after_the_next_day` | 구현 |
+| DV-307 | 문서는 제출자마다 원한 공시로 한 번 묻고 나열되지 않은 공시는 창 안에서 하루 뒤 다시 묻으며 발행인 범위 밖은 세어진다 | `tests/data/test_sec_collect.py::test_documents_are_asked_per_filer_for_the_wanted_filings_and_retried_in_window` | 구현 |
+| DV-308 | SEC 실행은 색인 뒤 문서를 묻고 원한 공시의 행만 commit하며 `sec.submissions@1`·`sec.companyfacts@1`이 그 원천을 승격한다 | `tests/storage/test_us_collection.py::test_a_run_reads_indexes_then_documents_and_the_sec_mappers_promote_them` | 구현 |
+| DV-309 | 다음 SEC 실행은 덮이지 않은 날과 아직 없는 공시만 묻는다 | `tests/storage/test_us_collection.py::test_the_next_run_asks_only_what_is_missing` | 구현 |
+| DV-310 | `registered` 범위는 identity에 SEC 발행인이 등록된 제출자의 문서만 묻는다 | `tests/storage/test_us_collection.py::test_registered_issuers_limit_the_documents` | 구현 |
+| DV-311 | SEC의 한도 거부는 실행을 멈추고 연락처는 `raw/`의 어떤 bytes에도 남지 않는다 | `tests/storage/test_us_collection.py::test_a_refused_rate_stops_the_run_and_the_contact_is_never_retained` | 구현 |
+| DV-312 | `aas collect fred plan`과 `aas collect sec plan`은 공급자를 호출하지 않고 `run`은 호출 상한에서 정상 종료한다 | `tests/storage/test_us_collection.py::test_the_commands_plan_without_calls_and_run_through_the_cli` | 구현 |
+| DV-313 | 행으로 읽히지 않는 submissions 답은 `FAILED`이고 실행이나 commit을 막지 않는다 | `tests/storage/test_us_collection.py::test_a_submissions_answer_whose_rows_do_not_read_is_failed` | 구현 |
