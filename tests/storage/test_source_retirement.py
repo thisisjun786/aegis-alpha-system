@@ -715,3 +715,45 @@ def test_a_retired_legacy_unit_is_reused_and_verified(
     assert [source["status"] for source in _sources(verified)] == ["retired", "committed"]
     assert verified["unmatched"] == 0
     assert verified["complete"] is True
+
+
+def test_a_name_that_denotes_two_sources_references_both(writable: Workspace) -> None:
+    digest = "a" * 64
+    with writable.state:
+        writable.state.execute(
+            "INSERT INTO feature_contracts VALUES (?,?,?,?,?)",
+            ("synthetic-proxy", "1", "{}", "aas-proxy-transform-v1", digest),
+        )
+        writable.state.execute(
+            "INSERT INTO feature_inputs VALUES (?,?,?,?,?,?,?)",
+            ("synthetic-proxy", "1", 0, "donor_source:bars", "sl:x", digest, digest),
+        )
+    # ``sl:x`` is a source ID of its own and the link of source ``x``.
+    assert source_retirement.source_references(writable, {"x", "sl:x"}) == {
+        "x": ["state.feature_inputs.ref_id"],
+        "sl:x": ["state.feature_inputs.ref_id"],
+    }
+
+
+def test_records_recovery_cannot_read_are_never_prepared(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        export = commit(workspace, "export")
+        copy = commit(workspace, "copy", ROWS[::-1], path="normalized")
+    backup(home, tmp_path / "backup")
+    other_device(monkeypatch, tmp_path / "backup")
+    monkeypatch.setattr(source_retirement, "_MAX_DOCUMENT", 256)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        with pytest.raises(RetirementError, match="exceed"):
+            retire_sources(
+                workspace,
+                spec(group([copy], [export], reason="r" * 512)),
+                backup_root=tmp_path / "backup",
+                apply=True,
+            )
+        assert _present(workspace, copy)
+        row = workspace.state.execute(
+            "SELECT count(*) FROM storage_operations WHERE kind='source-retire'"
+        ).fetchone()
+        assert tuple(row) == (0,)

@@ -296,7 +296,7 @@ def _table(manifest: dict[str, object], name: str) -> dict[str, object] | None:
 # --- references ---------------------------------------------------------------------------
 
 
-def source_references(workspace: Workspace, source_ids: set[str]) -> dict[str, list[str]]:  # noqa: C901 -- one search per store
+def source_references(workspace: Workspace, source_ids: set[str]) -> dict[str, list[str]]:  # noqa: C901, PLR0912 -- one search per store
     """Where each source is still referenced, outside its own ``sl:`` link.
 
     State rows that name a snapshot or source (identity assertions, universe members,
@@ -309,8 +309,12 @@ def source_references(workspace: Workspace, source_ids: set[str]) -> dict[str, l
     found: dict[str, list[str]] = {source: [] for source in source_ids}
     if not source_ids:
         return found
-    names = {source: source for source in source_ids}
-    names.update({LINK_PREFIX + source: source for source in source_ids})
+    # A name can denote two candidates (source ``sl:x`` and the link of source ``x``); it
+    # counts as a reference to every candidate it may denote.
+    names: dict[str, set[str]] = {}
+    for source in source_ids:
+        names.setdefault(source, set()).add(source)
+        names.setdefault(LINK_PREFIX + source, set()).add(source)
     wanted = sorted(names)
     tables = [
         str(row[0])
@@ -332,7 +336,8 @@ def source_references(workspace: Workspace, source_ids: set[str]) -> dict[str, l
                 f"WHERE {schema.quoted(column)} IN (SELECT value FROM json_each(?))",
                 (json.dumps(wanted),),
             ):
-                found[names[value]].append(f"state.{table}.{column}")
+                for source in names[value]:
+                    found[source].append(f"state.{table}.{column}")
     for table, column in workspace.market.execute(
         "SELECT table_name,column_name FROM duckdb_columns() "
         "WHERE database_name=current_database() AND schema_name='main' "
@@ -347,7 +352,8 @@ def source_references(workspace: Workspace, source_ids: set[str]) -> dict[str, l
             f"WHERE list_contains(?, CAST({schema.quoted(column)} AS VARCHAR))",
             [wanted],
         ).fetchall():
-            found[names[value]].append(f"market.{table}.{column}")
+            for source in names[value]:
+                found[source].append(f"market.{table}.{column}")
     if workspace.strategies is not None:
         from aegis_alpha.storage.strategy_registry import (  # noqa: PLC0415
             registry_source_references,
@@ -360,7 +366,7 @@ def source_references(workspace: Workspace, source_ids: set[str]) -> dict[str, l
 
 
 def _document_references(
-    workspace: Workspace, names: dict[str, str], found: dict[str, list[str]]
+    workspace: Workspace, names: dict[str, set[str]], found: dict[str, list[str]]
 ) -> None:
     """Search the retained documents of committed generations for a source ID or link.
 
@@ -368,10 +374,10 @@ def _document_references(
     ASCII-escaped and its UTF-8 spelling), in bounded chunks that overlap by the longest
     pattern. A document of any size or format is searched, and any occurrence counts.
     """
-    patterns: dict[bytes, str] = {}
-    for name, source in names.items():
-        patterns[json.dumps(name).encode()] = source
-        patterns[json.dumps(name, ensure_ascii=False).encode()] = source
+    patterns: dict[bytes, set[str]] = {}
+    for name, sources in names.items():
+        patterns.setdefault(json.dumps(name).encode(), set()).update(sources)
+        patterns.setdefault(json.dumps(name, ensure_ascii=False).encode(), set()).update(sources)
     overlap = max(len(pattern) for pattern in patterns) - 1
     rows = workspace.state.execute(
         "SELECT generation_id,transform_hash,manifest_hash FROM dataset_versions "
@@ -389,7 +395,10 @@ def _document_references(
                     while chunk := reader.read(_SEARCH_CHUNK):
                         window = tail + chunk
                         hits.update(
-                            source for pattern, source in patterns.items() if pattern in window
+                            source
+                            for pattern, sources in patterns.items()
+                            if pattern in window
+                            for source in sources
                         )
                         tail = window[-overlap:] if overlap else b""
                 for source in hits:
@@ -924,6 +933,11 @@ def retire_sources(
                     "records": records,
                 }
             )
+            if len(payload) > _MAX_DOCUMENT:
+                # Recovery reads the payload under this bound; never prepare one it cannot read.
+                raise RetirementError(
+                    "retirement records exceed 64 MiB; split the document into smaller groups"
+                )
             _, payload_hash, _ = put_raw(workspace.paths.raw, payload)
             prepare_operation(
                 workspace.state,

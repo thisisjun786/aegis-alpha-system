@@ -2611,3 +2611,5 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-427 | feature 입력과 입력 binding의 `ref_id`는 원천 참조로 센다 | `tests/storage/test_source_retirement.py::test_feature_inputs_and_bindings_are_references` | 구현 |
 | DV-428 | 은퇴한 legacy unit의 재적재는 재사용이고 `--verify`는 그 unit을 `retired`로 일치시킨다 | `tests/storage/test_source_retirement.py::test_a_retired_legacy_unit_is_reused_and_verified` | 구현 |
 | DV-429 | compact는 외래 key를 가진 generation chain과 run 결과 행을 부모부터 옮기고 같은 검증을 통과한다 | `tests/storage/test_compaction.py::test_compaction_copies_rows_that_reference_other_rows` | 구현 |
+| DV-430 | 원천 ID이면서 다른 원천의 `sl:` 링크인 이름은 두 원천 모두의 참조로 센다 | `tests/storage/test_source_retirement.py::test_a_name_that_denotes_two_sources_references_both` | 구현 |
+| DV-431 | 복구가 읽을 수 없는 64 MiB 초과 기록 문서는 intent를 만들기 전에 거부한다 | `tests/storage/test_source_retirement.py::test_records_recovery_cannot_read_are_never_prepared` | 구현 |
