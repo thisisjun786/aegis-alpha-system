@@ -678,9 +678,10 @@ run 등록, 결과 저장은 하지 않는다. 봉투 회계는 별도 `aas back
   `ref_version`, `hash`, `ref_schema`, `hash_format`이다. 필수 역할은 `signal_prices`,
   `execution_prices`, `sessions`, `identity`, `universe`, `membership`, `calendar`, `basis`,
   `cost`, `execution`이고, `macro`·`derived`·`proxy`는 전략 정의가 요구할 때만, `benchmark`·
-  `risk_free`·`fx`는 0 또는 1개다. `actions`는 `heads`로 묶은 canonical 신호 선택이 조정 basis일 때만,
-  그때는 반드시 1개다. 여러 개를 허용하는 역할은 `signal_prices`·`execution_prices`·
-  `macro`·`derived`·`proxy`뿐이며 ordinal은 역할 안에서 0부터 연속이다. `signal_prices`·
+  `risk_free`·`fx`는 0 또는 1개다. `actions`는 `heads`로 묶은 canonical 신호 선택 중 조정 basis인 것(유도 선택)마다
+  하나다. 유도 선택은 binding 순서대로 `actions` ordinal을 하나씩 받으므로(첫 유도 선택이 0, 다음이 1)
+  시장마다 다른 기업행동 원천을 묶을 수 있다. 여러 개를 허용하는 역할은 `signal_prices`·`execution_prices`·
+  `macro`·`derived`·`proxy`·`actions`뿐이며 ordinal은 역할 안에서 0부터 연속이다. `signal_prices`·
   `execution_prices`·`sessions`·`macro`는 `generation` 또는 `heads` 참조를, `actions`는 `heads` 참조만 받는다.
 - `refs`: bindings가 가리키는 참조 서술자. `ref_kind`, `ref_id`, `ref_version`, `hash`,
   `schema`, `hash_format`, `pin`을 담고 같은 서술자를 두 번 넣으면 거부한다.
@@ -739,6 +740,9 @@ run 등록, 결과 저장은 하지 않는다. 봉투 회계는 별도 `aas back
 3. `aas data binding-import`: `aas-identity-snapshot-v1`, `aas-universe-version-v1`,
    `aas-ensemble-membership-v1` 문서. 문서 스키마에 따라 identity snapshot, universe version,
    정의(derived·membership) 또는 `aas-input-bundle-v1` 묶음을 등록하고 `pin`을 돌려준다.
+   정규 표기의 `aas-head-binding-v1` 문서는 pin이 marker와 catalog에 맞는지 확인한 뒤 `raw/`에 그
+   binding hash로 남기고 `pin.binding_hash`를 돌려주므로, 그 hash를 `heads` 참조로 가리키는 묶음은
+   실행 전에도 등록·검증된다.
    identity·universe 문서의 정확한 바이트 규약은 [membership pins](design/membership-pins.md),
    derived·membership·bundle 문서는 [input_pins.py](../src/aegis_alpha/storage/input_pins.py)가
    소유한다. 이 명령은 `read-prices`와 같은 명시한 compute 환경이 필요하다.

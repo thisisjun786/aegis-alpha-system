@@ -71,7 +71,7 @@ _HEAD_DOMAINS = {
 }
 _HEAD_RULE = r"^[a-z][a-z0-9_]*@[1-9][0-9]*$"
 _HEAD_FLAG = r"^[a-z][a-z0-9_]*$"
-_MULTIPLE = frozenset({"signal_prices", "execution_prices", "macro", "derived", "proxy"})
+_MULTIPLE = frozenset({"signal_prices", "execution_prices", "macro", "derived", "proxy", "actions"})
 _REQUIRED = frozenset(
     {
         "signal_prices",
@@ -773,11 +773,14 @@ def _selections(body: Record, bindings: dict[tuple[str, int], Record]) -> None:
 
 
 def _head_roles(body: Record, bindings: dict[tuple[str, int], Record]) -> None:
-    """Hold each head binding to its role's domain and bind actions exactly when used.
+    """Hold each head binding to its role's domain and give each derived series its actions.
 
     A canonical signal selection read through a head binding is an adjusted series the
-    preparation derives from unadjusted bars and the ``actions`` binding's corporate
-    actions, so that binding is required by such a selection and by nothing else.
+    preparation derives from unadjusted bars and corporate actions. The derived selections,
+    in binding order, take the ``actions`` bindings by ordinal: the first derives from
+    ``actions`` 0, the next from ``actions`` 1. So each has exactly one actions source, a
+    strategy over several markets binds one per market, and an actions binding nothing
+    derives from is refused.
     """
     refs = {_ref_key(ref): ref for ref in _rows(body["refs"])}
     for (role, _), binding in bindings.items():
@@ -786,16 +789,16 @@ def _head_roles(body: Record, bindings: dict[tuple[str, int], Record]) -> None:
         domain = _object(refs[_ref_key(binding)]["pin"])["domain"]
         if domain not in _HEAD_DOMAINS[role]:
             raise ValueError("head binding domain does not serve its role")
-    derived = any(
+    derived = sum(
         _key(row["binding"])[0] == "signal_prices"
         and bindings[_key(row["binding"])]["ref_kind"] == "heads"
         and row["price_role"] == "canonical"
         and row["basis"] != "unadjusted"
         for row in _rows(body["price_inputs"])
     )
-    if derived != (("actions", 0) in bindings):
+    if derived != sum(role == "actions" for role, _ in bindings):
         raise ValueError(
-            "an actions binding is required by, and only by, a derived canonical signal series"
+            "each derived canonical signal series requires exactly one actions binding"
         )
 
 

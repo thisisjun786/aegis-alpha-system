@@ -198,7 +198,7 @@ _ROLES: dict[str, tuple[tuple[str, ...], bool]] = {
     "macro": (("generation", "heads"), False),
     "derived": (("derived",), False),
     "proxy": (("generation",), False),
-    "actions": (("heads",), True),
+    "actions": (("heads",), False),
     **{kind: (("convention:" + kind,), True) for kind in _KINDS},
 }
 
@@ -470,6 +470,24 @@ def retain_head_binding(workspace: Workspace, document: dict[str, object]) -> st
     if digest != binding.binding_hash:
         raise ValueError("head binding document hash mismatch")
     return digest
+
+
+def import_head_binding(
+    workspace: Workspace, raw: bytes, *, expected_file_sha256: str, budget: ComputeBudget
+) -> str:
+    """Retain one canonical ``aas-head-binding-v1`` file whose pins match their markers.
+
+    This is how a bundle naming a head binding by hash becomes verifiable before any run
+    has kept the document. Returns the binding hash.
+    """
+    _hash(expected_file_sha256)
+    if hashlib.sha256(raw).hexdigest() != expected_file_sha256:
+        raise ValueError("head binding file hash mismatch")
+    binding = head_binding(decode_pin_document(raw))
+    if canonical_json_bytes(binding.document()) != raw:
+        raise ValueError("head binding document is not canonical")
+    verify_head_binding(workspace, binding, budget=budget)
+    return retain_head_binding(workspace, binding.document())
 
 
 def read_head_binding(workspace: Workspace, digest: str) -> HeadBinding:

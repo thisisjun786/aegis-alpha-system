@@ -14,12 +14,13 @@ import hashlib
 import json
 import time
 from dataclasses import replace
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Final, cast
 
 import pytest
 
+from aegis_alpha.application import backtest_prepare as preparation
 from aegis_alpha.application.backtest_cli import run_document
 from aegis_alpha.application.run_backtest import RunBacktestRequest, run_backtest
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
@@ -28,10 +29,14 @@ from aegis_alpha.engine.models import MacroSignalSpec
 from aegis_alpha.storage import market, publication
 from aegis_alpha.storage.import_document import parse_import
 from aegis_alpha.storage.input_pins import read_head_binding
-from aegis_alpha.storage.market_inputs import GenerationPin
+from aegis_alpha.storage.market_inputs import (
+    GenerationPin,
+    load_pinned_revisions,
+    verify_head_binding,
+)
 from aegis_alpha.storage.market_schema import NATURAL_KEYS
 from aegis_alpha.storage.raw import put_raw
-from aegis_alpha.storage.read_heads import HeadBinding, HeadPin, head_binding
+from aegis_alpha.storage.read_heads import HeadBinding, HeadPin, HeadQuery, head_binding
 from aegis_alpha.storage.runs import read_run
 from aegis_alpha.storage.strategy_import import register_strategy
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
@@ -45,17 +50,20 @@ from tests.application.test_backtest_prepare import (
     second_recipe,
     session_rows,
     stored_request,
+    target_membership_interval,
 )
 from tests.application.test_storage_cli import run_cli
 from tests.engine.engine_support import contract, raw_bundle
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 LAG: Final = "session_close_plus_lag@1"
 EXDATE: Final = "exdate_open@1"
 DECLARED: Final = "declared_session_end@1"
 DAY_END: Final = "local_day_end@1"
+ABSENT: Final = "absent_actions_as_none@1"
 VALUES: Final = {
     "ASSET_A": (10, 12, 15, 15, 12, 12, 12, 12),
     "ASSET_B": (10, 10, 11, 11, 20, 20, 20, 20),
@@ -278,7 +286,8 @@ def action_rows(known: int | None = None) -> list[Document]:
     return [_identity(row, "corporate_actions")]
 
 
-def calendar_rows() -> list[Document]:
+def calendar_rows(known: Callable[[Document], int] | None = None) -> list[Document]:
+    """The fixture calendar, known from the epoch unless ``known`` times each session."""
     rows = []
     for index, row in enumerate(session_rows()):
         values = {
@@ -293,8 +302,9 @@ def calendar_rows() -> list[Document]:
             )
         }
         values["session_date"] = date.fromisoformat(row["session_date"])
+        at = 1 if known is None else known(values)
         rows.append(
-            _identity({**_common("session", index, 1, ingested=1), **values}, "calendar_sessions")
+            _identity({**_common("session", index, at, ingested=at), **values}, "calendar_sessions")
         )
     return rows
 
@@ -342,22 +352,26 @@ def headed(  # noqa: PLR0913 -- what each head binding grants and how the action
     body: Document,
     *,
     price_grants: tuple[str, ...] = (LAG,),
-    action_grants: tuple[str, ...] = (EXDATE,),
+    action_grants: tuple[str, ...] = (ABSENT, EXDATE),
     session_grants: tuple[str, ...] = (DECLARED,),
     action_known: int | None = None,
     mode: str = "strict_pit",
     recorded: bool = False,
+    sessions_known: Callable[[Document], int] | None = None,
 ) -> Document:
     """Rebind signal, execution prices and sessions to head bindings.
 
     The generations are rule-timed unless ``recorded``, which publishes them as sealed
-    imports with recorded times; those need no grant.
+    imports with recorded times; those need no time-rule grant. The actions hold only
+    ASSET_A's split, so the actions binding grants reading the other instruments' absent
+    actions as none unless told otherwise.
     """
     if recorded:
         prices = sealed(workspace, "prices.syn.canonical", "prices", price_rows())
         actions = sealed(workspace, "actions.syn", "corporate_actions", action_rows(action_known))
         sessions = sealed(workspace, "sessions.syn", "calendar_sessions", calendar_rows())
-        price_grants = action_grants = session_grants = ()
+        price_grants = session_grants = ()
+        action_grants = tuple(grant for grant in action_grants if grant == ABSENT)
     else:
         prices = publish(workspace, "prices.syn.canonical", "prices", price_rows(), (LAG, LAG))
         actions = publish(
@@ -368,7 +382,11 @@ def headed(  # noqa: PLR0913 -- what each head binding grants and how the action
             (EXDATE, EXDATE),
         )
         sessions = publish(
-            workspace, "sessions.syn", "calendar_sessions", calendar_rows(), (DECLARED, DECLARED)
+            workspace,
+            "sessions.syn",
+            "calendar_sessions",
+            calendar_rows(sessions_known),
+            (DECLARED, DECLARED),
         )
     priced = heads_ref([prices], list(price_grants), "prices")
     bind(body, "signal_prices", priced)
@@ -455,6 +473,12 @@ def test_strict_preparation_records_head_read_receipt(
             assert read_head_binding(workspace, ref["hash"]).binding_hash == ref["hash"]
     verified = run_cli("db", "verify", home=home)
     assert verified.returncode == 0, verified.stderr
+    # The bundle is verified again from the retained document, so changing it is refused.
+    digest = next(ref["hash"] for ref in body["refs"] if ref["ref_kind"] == "heads")
+    stored = home / "raw" / digest[:2] / digest
+    stored.chmod(0o600)
+    stored.write_bytes(stored.read_bytes() + b"\n")
+    assert run_cli("db", "verify", home=home).returncode != 0
 
 
 def test_head_reads_record_the_rules_their_grants_apply(
@@ -717,8 +741,9 @@ def test_head_binding_hash_is_one_identity_across_request_and_reader() -> None:
         ("unsorted", "sorted and unique"),
         ("gap", "contiguous"),
         ("domain", "does not serve its role"),
-        ("unused", "required by, and only by"),
-        ("missing", "required by, and only by"),
+        ("unused", "exactly one actions binding"),
+        ("missing", "exactly one actions binding"),
+        ("extra", "exactly one actions binding"),
     ],
 )
 def test_the_request_admits_head_references_only_as_their_roles_allow(
@@ -744,6 +769,10 @@ def test_the_request_admits_head_references_only_as_their_roles_allow(
         for selection in body["price_inputs"]:
             if selection["binding"]["role"] == "signal_prices":
                 selection["price_role"] = "reference"
+    elif change == "extra":
+        # A second actions binding that no derived selection takes.
+        extra = heads_ref(actions["pin"]["pins"], [EXDATE], "corporate_actions")
+        bind(body, "actions", extra, ordinal=1)
     else:
         body["bindings"] = [item for item in body["bindings"] if item["role"] != "actions"]
         body["refs"] = [ref for ref in body["refs"] if ref is not actions]
@@ -785,3 +814,288 @@ def test_a_cutover_reads_each_interval_from_its_own_pin(
         "prices.syn.canonical-g1",
         "prices.syn.second-g1",
     ]
+
+
+def _signal_reads(prepared: object) -> list[Document]:
+    return [item for item in _reads(prepared) if item["role"] == "signal_prices"]
+
+
+def test_an_absent_action_source_is_recorded_and_strict_needs_its_grant(
+    stored_template: tuple[Path, bytes], tmp_path: Path
+) -> None:
+    """No action for an instrument is no evidence of none: strict reads it only as granted."""
+    body = copy_request(stored_template, tmp_path)
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        headed(workspace, body, action_grants=(EXDATE,))
+        # The split is not yet known at the first decision, so nothing is known of ASSET_A.
+        with pytest.raises(
+            ValueError, match=r"no corporate action evidence for ASSET_A, ASSET_B, REF_X"
+        ):
+            prepare(workspace, body)
+        research = cast("Document", json.loads(json.dumps(body)))
+        research["cutoff"]["mode"] = "observed_snapshot_research"
+        prepared = prepare(workspace, research)
+        assert dict(prepared.targets) == EXPECTED
+        assert [item["actions"] for item in _signal_reads(prepared)] == [
+            {"role": "actions", "ordinal": 0}
+        ] * 2
+        assert [item["no_action_source"] for item in _signal_reads(prepared)] == [
+            ["ASSET_A", "ASSET_B", "REF_X"],
+            ["ASSET_B", "REF_X"],
+        ]
+    granted = copy_request(stored_template, tmp_path / "granted")
+    with open_workspace(
+        tmp_path / "granted" / "home", writable=True, strategy_write=True
+    ) as workspace:
+        headed(workspace, granted)
+        prepared = prepare(workspace, granted)
+    assert dict(prepared.targets) == EXPECTED
+    assert [item["no_action_source"] for item in _signal_reads(prepared)] == [
+        ["ASSET_A", "ASSET_B", "REF_X"],
+        ["ASSET_B", "REF_X"],
+    ]
+
+
+def _dividends(workspace: Workspace) -> Document:
+    """A dividend each for ASSET_B and REF_X: evidence about them a split read ignores."""
+    rows = [
+        _identity(
+            {
+                **_common("dividend", index, micros(DAYS[1], 9), ingested=micros(DAYS[-1])),
+                "instrument_id": symbol,
+                "action_id": "dividend:" + DAYS[1].isoformat(),
+                "action_type": "dividend",
+                "ex_date": DAYS[1],
+                "record_date": None,
+                "pay_date": None,
+                "effective_date": DAYS[1],
+                "amount": Decimal("0.1"),
+                "ratio": None,
+                "currency": "USD",
+                "value_state": "present",
+            },
+            "corporate_actions",
+        )
+        for index, symbol in enumerate(("ASSET_B", "REF_X"))
+    ]
+    return publish(workspace, "actions.syn.b", "corporate_actions", rows, (EXDATE, EXDATE))
+
+
+@pytest.mark.parametrize("swapped", [False, True])
+def test_each_derived_selection_takes_its_own_actions_binding(
+    stored_template: tuple[Path, bytes], tmp_path: Path, *, swapped: bool
+) -> None:
+    """Two derived selections bind two action sources, taken by ordinal in binding order."""
+    body = copy_request(stored_template, tmp_path)
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        headed(workspace, body)
+        prices = next(ref for ref in body["refs"] if ref["pin"].get("domain") == "prices")
+        split = next(ref for ref in body["refs"] if ref["pin"].get("domain") == "corporate_actions")
+        pins = [
+            {key: value for key, value in item.items() if key not in ("from", "to")}
+            for item in prices["pin"]["pins"]
+        ]
+        # The same bars under a second binding: one selection per binding.
+        bind(body, "signal_prices", heads_ref(pins, [DAY_END, LAG], "prices"), ordinal=1)
+        first = next(
+            row for row in body["price_inputs"] if row["binding"]["role"] == "signal_prices"
+        )
+        others = [name for name in first["instrument_ids"] if name != "ASSET_A"]
+        body["price_inputs"].append(
+            {**first, "binding": {"role": "signal_prices", "ordinal": 1}, "instrument_ids": others}
+        )
+        first["instrument_ids"] = ["ASSET_A"]
+        dividends = heads_ref([_dividends(workspace)], [ABSENT, EXDATE], "corporate_actions")
+        order = (dividends, split) if swapped else (split, dividends)
+        for ordinal, ref in enumerate(order):
+            bind(body, "actions", ref, ordinal=ordinal)
+        prepared = prepare(workspace, body)
+    reads = sorted(
+        (
+            item["ordinal"],
+            item["decision_date"],
+            item["actions"]["ordinal"],
+            item["no_action_source"],
+        )
+        for item in _signal_reads(prepared)
+    )
+    first, second = DAYS[2].isoformat(), DAYS[4].isoformat()
+    if swapped:
+        # ASSET_A reads the dividends, which say nothing of it, so its split never applies.
+        assert reads == [
+            (0, first, 0, ["ASSET_A"]),
+            (0, second, 0, ["ASSET_A"]),
+            (1, first, 1, ["ASSET_B", "REF_X"]),
+            (1, second, 1, ["ASSET_B", "REF_X"]),
+        ]
+        return
+    assert dict(prepared.targets) == EXPECTED
+    # The split is first known after the first decision.
+    assert reads == [
+        (0, first, 0, ["ASSET_A"]),
+        (0, second, 0, []),
+        (1, first, 1, []),
+        (1, second, 1, []),
+    ]
+
+
+def test_a_strict_schedule_needs_the_next_session_known_at_its_cutoff(
+    stored_template: tuple[Path, bytes], tmp_path: Path
+) -> None:
+    """A calendar whose sessions are known only from their own end schedules no decision.
+
+    That is how ``declared_session_end@1`` times a declaration's earlier dates: no
+    decision before the declaration knows its next session.
+    """
+    body = copy_request(stored_template, tmp_path)
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        headed(
+            workspace,
+            body,
+            sessions_known=lambda row: (
+                cast("int", row["close_at_us"])
+                if row["close_at_us"] is not None
+                else micros(cast("date", row["session_date"]), 23)
+            ),
+        )
+        with pytest.raises(ValueError, match="incomplete decision-local calendar"):
+            prepare(workspace, body)
+
+
+def test_each_decision_projects_the_head_calendar_its_cutoff_knows(
+    stored_template: tuple[Path, bytes], tmp_path: Path
+) -> None:
+    """A session reopened between two decisions is closed at the first and open at the second."""
+    inserted = date(2026, 1, 30)
+    copy_request(stored_template, tmp_path)
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        rows = calendar_rows()
+        publish(workspace, "sessions.rev", "calendar_sessions", rows, (DECLARED, DECLARED))
+        original = next(row for row in rows if row["session_date"] == inserted)
+        assert original["status"] == "closed"
+        reopened = {
+            **original,
+            **_common("reopen", 0, micros(DAYS[3]), ingested=micros(DAYS[3])),
+            "supersedes_revision_id": original["revision_id"],
+            "op": "SUPERSEDE",
+            "status": "open",
+            "open_at_us": micros(inserted, 9),
+            "close_at_us": micros(inserted),
+        }
+        pin = publish(
+            workspace,
+            "sessions.rev",
+            "calendar_sessions",
+            [reopened],
+            (DECLARED, DECLARED),
+            sequence=2,
+        )
+        binding = HeadBinding(
+            "calendar_sessions", (HeadPin(GenerationPin(**pin)),), granted_rules=(DECLARED,)
+        )
+        read = load_pinned_revisions(
+            workspace,
+            binding,
+            HeadQuery(
+                subjects=("synthetic-calendar",),
+                from_date=DAYS[0],
+                to_date=DAYS[-1] + timedelta(days=1),
+            ),
+            strict=True,
+            budget=BUDGET,
+        )
+    calendar = preparation._Calendar(  # noqa: SLF001
+        tuple(item.values for item in read.revisions), read
+    )
+    visibility = preparation._Visibility(  # noqa: SLF001
+        "strict_pit", micros(DAYS[-1]), None, DAYS[0], DAYS[4]
+    )
+
+    def status(cutoff: int) -> str:
+        sessions = preparation._sessions(calendar, visibility, cutoff)  # noqa: SLF001
+        return next(item.status for item in sessions if item.session_date == inserted)
+
+    assert status(micros(DAYS[2])) == "closed"
+    assert status(micros(DAYS[3]) - 1) == "closed"
+    assert status(micros(DAYS[3])) == "open"
+    assert status(micros(DAYS[4])) == "open"
+
+
+@pytest.mark.parametrize("role", ["identity", "universe"])
+@pytest.mark.parametrize("change", ["known_later", "valid_to_open"])
+def test_head_signals_and_targets_are_held_by_the_membership_pins(
+    stored_template: tuple[Path, bytes], tmp_path: Path, role: str, change: str
+) -> None:
+    """A head-bound instrument the pins do not hold is neither a signal nor a target.
+
+    Known only after the decision's cutoff, ASSET_A's bars leave the signal; valid only
+    until the execution open, it cannot be the decision's target.
+    """
+    body = copy_request(stored_template, tmp_path)
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        headed(workspace, body)
+        body["explicit_decision_dates"] = [DAYS[2].isoformat()]
+        assert dict(prepare(workspace, body).targets) == {DAYS[2]: {"ASSET_A": 1.0}}
+        if change == "known_later":
+            target_membership_interval(
+                workspace, body, role, {"known_from_us": micros(DAYS[2]) + 1}
+            )
+            message = "insufficient eligible buckets"
+        else:
+            target_membership_interval(workspace, body, role, {"valid_to_us": micros(DAYS[3], 9)})
+            message = (
+                "selected target identity unavailable"
+                if role == "identity"
+                else "selected target outside pinned universe"
+            )
+        with pytest.raises(ValueError, match=message):
+            prepare(workspace, body)
+
+
+def test_a_head_binding_is_verified_again_only_from_its_retained_document(
+    heads_home: tuple[Path, Document], tmp_path: Path
+) -> None:
+    """``binding-import`` keeps a canonical binding; a missing, changed or stale one is refused."""
+    home, bodies = heads_home
+    ref = next(ref for ref in bodies["heads"]["refs"] if ref["pin"].get("domain") == "prices")
+    raw = canonical_json_bytes({"schema": "aas-head-binding-v1", **ref["pin"]})
+    with open_workspace(home) as workspace:
+        with pytest.raises(ValueError, match="not retained"):
+            read_head_binding(workspace, ref["hash"])
+        stored = workspace.paths.raw / ref["hash"][:2] / ref["hash"]
+    loose = tmp_path / "loose.json"
+    loose.write_bytes(json.dumps(json.loads(raw), indent=1).encode())
+    refused = run_cli(
+        "data",
+        "binding-import",
+        "--spec",
+        str(loose),
+        "--sha256",
+        hashlib.sha256(loose.read_bytes()).hexdigest(),
+        home=home,
+    )
+    assert refused.returncode != 0
+    assert "not canonical" in refused.stderr
+    spec = tmp_path / "binding.json"
+    spec.write_bytes(raw)
+    imported = run_cli(
+        "data", "binding-import", "--spec", str(spec), "--sha256", ref["hash"], home=home
+    )
+    assert imported.returncode == 0, imported.stderr
+    assert json.loads(imported.stdout)["pin"] == {"binding_hash": ref["hash"]}
+    with open_workspace(home) as workspace:
+        binding = read_head_binding(workspace, ref["hash"])
+        assert binding.binding_hash == ref["hash"]
+        verify_head_binding(workspace, binding, budget=BUDGET)
+        pin = binding.pins[0]
+        stale = replace(pin, pin=replace(pin.pin, manifest_hash="0" * 64))
+        for changed in (
+            replace(binding, pins=(stale,)),
+            replace(binding, domain="calendar_sessions"),
+        ):
+            with pytest.raises(ValueError, match="does not match its marker"):
+                verify_head_binding(workspace, changed, budget=BUDGET)
+    stored.chmod(0o600)
+    stored.write_bytes(raw + b"\n")
+    with open_workspace(home) as workspace, pytest.raises(ValueError, match="hash mismatch"):
+        read_head_binding(workspace, ref["hash"])

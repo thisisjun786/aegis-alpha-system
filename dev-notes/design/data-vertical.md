@@ -1643,9 +1643,15 @@ pin(`observations`) 대신 canonical 가격 binding(`prices`: `aas-head-binding-
 - `heads`로 묶은 canonical 신호 선택의 basis가 조정 basis이면 신호 가격은 공급자 조정 가격이 아니라 그
   binding의 비조정 bar와 `actions` binding의 기업행동으로 판단 cutoff에서 유도한다(`aas-adjustment-v1`).
   그래서 cutoff까지 알려지지 않은 기업행동은 앞선 bar에 닿지 않고, grant가 막았거나 시점 근거가 없는
-  기업행동 앞의 bar는 값 없이 `invalid`가 되어 신호에서 빠진다. `actions`는 그런 선택이 있을 때만,
-  그때는 반드시 하나 묶는다. `reference` 신호 선택은 그 basis의 행을 저장된 그대로 읽으며 strict 읽기는
-  reference 가격을 고르지 않는다.
+  기업행동 앞의 bar는 값 없이 `invalid`가 되어 신호에서 빠진다. 그런 유도 선택마다 `actions` binding이
+  하나씩 있고, 유도 선택은 binding 순서대로 `actions` ordinal을 받는다(첫 유도 선택이 0). 그래서 시장마다
+  다른 기업행동 원천을 묶고, 어느 유도 선택도 받지 않는 `actions` binding은 거부된다. `reference` 신호
+  선택은 그 basis의 행을 저장된 그대로 읽으며 strict 읽기는 reference 가격을 고르지 않는다.
+- 판단 cutoff의 기업행동 읽기에 bar가 있는 instrument의 기업행동이 하나도 없으면(보류된 것도 없으면) 그
+  binding이 그 instrument를 덮는지 알 수 없으므로, 그 instrument는 기업행동 근거가 없는 것이다(`no_action_source`).
+  그 instrument의 유도 가격은 비조정 bar와 같다. strict 준비는 그 `actions` binding의 `granted_rules`에
+  `absent_actions_as_none@1`이 있을 때만 그렇게 읽고, 없으면 그 instrument를 밝혀 거부한다. 연구 준비는
+  거부하지 않는다. 어느 쪽이든 그 읽기의 `head_reads` 항목이 `no_action_source`에 그 instrument를 싣는다.
 - 신호 bar는 `_eligible_prices`가 받는 칸과 같은 조건으로만 쓴다: `present`이고, 판단 cutoff에 알려진
   달력의 개장 세션이며, 판단일 이전이고 cutoff까지 끝났으며, 이력 구간 안이고, identity와 universe pin이
   그 bar의 끝 시각에 그 instrument를 cutoff 기준으로 담는다. 선택 통화와 다른 통화의 bar, `1d`가 아닌 bar,
@@ -1657,15 +1663,20 @@ pin(`observations`) 대신 canonical 가격 binding(`prices`: `aas-head-binding-
   묶을 수 없다. 일정은 판단 cutoff에 알려진 달력으로 정하므로, 그 cutoff에 다음 개장 session과 그 달의 남은
   날짜가 알려져 있어야 판단이 생긴다. [선언 달력](#선언-달력)의 `declared_session_end@1`은 선언 시각 이전
   날짜를 그 날짜가 끝난 시각부터 알리므로, 선언 시각보다 앞선 기간의 판단은 다음 session을 알지 못해
-  일정이 만들어지지 않고 준비는 미해결 월을 보고하며 거부한다.
+  일정이 만들어지지 않고 준비는 미해결 월을 보고하며 거부한다. 그런 기간의 strict 일정에 쓸 달력 사전 지식
+  규칙(버전 있는 규칙과 그 grant, run의 기록)은 owner가 정하며 아직 없다(DV-311).
 - 거시 선택의 subject는 `series_id`이고 행의 단위는 선택의 `unit`과 같아야 한다. FX 선택의 `series_id`는
   `BASE/QUOTE`이고, 경제 날짜는 고시 시각의 UTC 날짜, 값은 `rate`, 선택의 `unit`은 호가 통화다. 준비는
   지식 cutoff로 한 번 읽어 binding이 그 series의 head를 가지는지 확인하고(`admission`), 판단마다 다시 읽는다.
 - 봉인 준비 문서(`aas-prepared-backtest-v1`)의 `head_reads`는 준비가 한 읽기마다 역할·ordinal·목적
   (`calendar`, `admission`, `decision`, `outcomes`)·판단일과 reader가 돌려준 영수증(`aas-head-read-v1`,
-  `aas-adjusted-read-v1`, `aas-head-revisions-v1`) 전체와 그 SHA-256을 싣는다. `aas run execute`는 이 문서를
-  run에 그대로 봉인한다. run의 입력 bundle은 `heads` 참조를 binding hash로만 가리키므로, 실행은 그 binding
-  문서를 그 hash 주소로 `raw/`에 남기고 bundle 검증은 그 문서를 다시 읽어 pin·catalog·시간 규칙 출처를 확인한다.
+  `aas-adjusted-read-v1`, `aas-head-revisions-v1`) 전체와 그 SHA-256을 싣는다. 유도 신호 읽기의 항목은 그
+  읽기가 쓴 `actions` binding(`role`, `ordinal`)과 `no_action_source`(정렬한 instrument 목록)도 싣는다.
+  `aas run execute`는 이 문서를 run에 그대로 봉인한다. run의 입력 bundle은 `heads` 참조를 binding hash로만
+  가리키므로, 실행은 그 binding 문서를 그 hash 주소로 `raw/`에 남기고(`aas data binding-import`도 정규 표기의
+  `aas-head-binding-v1` 문서를 pin 확인 뒤 같은 자리에 남긴다), bundle 검증(`aas db verify` 포함)은 그 문서를
+  다시 읽어 hash·정규 표기·pin·catalog·시간 규칙 출처를 확인한다. 연구 run의 bundle은 membership만 묶으므로
+  `heads` 참조가 없다.
 - `heads` 입력은 envelope의 `source_pins`에 원천을 싣지 않는다. 그 출처는 읽기 영수증의 pin과 chain이다.
   proxy 규칙은 native 체결 원천에 묶이므로 `generation`으로 묶은 체결 가격에만 붙는다.
 
@@ -2046,6 +2057,13 @@ state v2:
 | DV-299 | `heads`로 묶은 거시 series는 같은 값의 native generation과 같은 신호를 내고, 단위가 다르거나 cutoff까지 head가 없으면 거부된다 | `tests/application/test_strict_head_inputs.py::test_a_head_bound_macro_series_decides_like_its_native_generation` | 구현 |
 | DV-300 | FX 고시는 `BASE/QUOTE` series로 UTC 날짜에 읽히고 그 단위는 호가 통화다 | `tests/application/test_strict_head_inputs.py::test_a_head_bound_fx_fixing_is_a_macro_series` | 구현 |
 | DV-301 | 요청의 `heads` 참조 hash와 reader의 binding hash는 같은 정체성이고 정규 표기가 아닌 문서는 거부된다 | `tests/application/test_strict_head_inputs.py::test_head_binding_hash_is_one_identity_across_request_and_reader` | 구현 |
-| DV-302 | 요청은 `heads` 참조를 역할의 도메인으로만 받고, hash 불일치·비정렬 grant·빈틈 있는 구간을 거부하며, `actions`는 유도 canonical 신호가 있을 때만 받는다 | `tests/application/test_strict_head_inputs.py::test_the_request_admits_head_references_only_as_their_roles_allow` | 구현 |
+| DV-302 | 요청은 `heads` 참조를 역할의 도메인으로만 받고, hash 불일치·비정렬 grant·빈틈 있는 구간을 거부하며, `actions` binding은 유도 canonical 신호 선택마다 정확히 하나다 | `tests/application/test_strict_head_inputs.py::test_the_request_admits_head_references_only_as_their_roles_allow` | 구현 |
 | DV-303 | cutover가 있는 체결 binding은 구간마다 자기 pin의 bar를 읽는다 | `tests/application/test_strict_head_inputs.py::test_a_cutover_reads_each_interval_from_its_own_pin` | 구현 |
 | DV-304 | 규칙 시점 binding의 읽기 영수증은 grant가 허용한 규칙을 싣고 막은 규칙이 없다 | `tests/application/test_strict_head_inputs.py::test_head_reads_record_the_rules_their_grants_apply` | 구현 |
+| DV-305 | 기업행동 근거가 없는 instrument는 `head_reads`의 `no_action_source`에 실리고, strict 준비는 `absent_actions_as_none@1` grant 없이 그것을 읽지 않는다 | `tests/application/test_strict_head_inputs.py::test_an_absent_action_source_is_recorded_and_strict_needs_its_grant` | 구현 |
+| DV-306 | 유도 신호 선택은 binding 순서대로 자기 `actions` binding을 ordinal로 받는다 | `tests/application/test_strict_head_inputs.py::test_each_derived_selection_takes_its_own_actions_binding` | 구현 |
+| DV-307 | 세션이 그 끝 시각부터 알려진 `heads` 달력에서는 판단 cutoff가 다음 session을 몰라 strict 준비가 미해결 월로 거부한다 | `tests/application/test_strict_head_inputs.py::test_a_strict_schedule_needs_the_next_session_known_at_its_cutoff` | 구현 |
+| DV-308 | `heads` 달력은 판단마다 그 cutoff에 알려진 revision으로 투영되어, 두 판단 사이에 알려진 개정은 뒤 판단에만 닿는다 | `tests/application/test_strict_head_inputs.py::test_each_decision_projects_the_head_calendar_its_cutoff_knows` | 구현 |
+| DV-309 | `heads` 신호 bar와 목표는 identity·universe pin이 cutoff 기준으로 담는 instrument만 쓴다 | `tests/application/test_strict_head_inputs.py::test_head_signals_and_targets_are_held_by_the_membership_pins` | 구현 |
+| DV-310 | bundle의 `heads` 참조는 `raw/`에 남은 정규 binding 문서로만 다시 검증되고, 없거나 바뀌었거나 marker와 맞지 않는 binding은 거부된다 | `tests/application/test_strict_head_inputs.py::test_a_head_binding_is_verified_again_only_from_its_retained_document` | 구현 |
+| DV-311 | 선언 시각 이전 기간의 strict 일정은 owner가 정한 달력 사전 지식 규칙의 grant로 만들어지고 run이 그 grant를 기록한다 | `tests/application/test_strict_head_inputs.py::test_a_granted_calendar_knowledge_rule_schedules_history` | 예정 |

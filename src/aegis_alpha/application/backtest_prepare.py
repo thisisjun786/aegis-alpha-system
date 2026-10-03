@@ -61,7 +61,7 @@ from aegis_alpha.engine.requirements import ExecutionDefinition
 from aegis_alpha.engine.schedule import DecisionSlot, ScheduleRequest, Session, decision_slots
 from aegis_alpha.engine.signals import MacroPoint
 from aegis_alpha.storage import market
-from aegis_alpha.storage.adjusted_prices import load_adjusted_prices
+from aegis_alpha.storage.adjusted_prices import AdjustedRead, load_adjusted_prices
 from aegis_alpha.storage.input_pins import (
     ConventionPin,
     DefinitionPin,
@@ -613,15 +613,20 @@ class _Loader:
         if self.charge > self.budget.available_bytes:
             raise ComputeResourceError("prepared histories exceed aggregate materialization budget")
 
-    def head_read(
+    def head_read(  # noqa: PLR0913 -- one read: where, why, when, its receipt and notes
         self,
         key: tuple[str, int],
         purpose: str,
         decision: date | None,
         receipt: Mapping[str, object],
         receipt_hash: str,
+        *,
+        notes: Mapping[str, object] | None = None,
     ) -> None:
-        """Record one head read's receipt exactly as the reader returned it."""
+        """Record one head read's receipt exactly as the reader returned it.
+
+        ``notes`` adds what the preparation concluded from the read beside its receipt.
+        """
         entry = {
             "role": key[0],
             "ordinal": key[1],
@@ -629,6 +634,7 @@ class _Loader:
             "decision_date": None if decision is None else decision.isoformat(),
             "receipt": dict(receipt),
             "receipt_sha256": receipt_hash,
+            **(notes or {}),
         }
         self._charge(entry)
         self.reads.append(entry)
@@ -739,11 +745,13 @@ class _HeadPrices:
 
     ``actions`` is set for a canonical selection whose basis is adjusted: those prices are
     derived from the binding's unadjusted bars and the corporate actions known at each
-    cutoff, never read from a provider's adjusted series.
+    cutoff, never read from a provider's adjusted series. ``actions_key`` is the request
+    binding it came from.
     """
 
     binding: HeadBinding
     actions: HeadBinding | None
+    actions_key: tuple[str, int] | None
     instruments: tuple[str, ...]
     currency: str
     basis: str
@@ -821,20 +829,26 @@ def _prices(loader: _Loader, body: Row, calendar: Row, sessions: _Calendar) -> t
         )
     )
     result = []
+    # Derived selections take the actions bindings by ordinal, in binding order.
+    derived_count = 0
     for selection in _rows(body["price_inputs"]):
         key = _row(selection["binding"])
         role, ordinal = _text(key["role"]), cast("int", key["ordinal"])
         instruments = cast("tuple[str, ...]", selection["instrument_ids"])
         if loader.bindings[role, ordinal]["ref_kind"] == "heads":
             _head_instruments(loader, instruments, calendar)
-            derived = (
+            actions = None
+            if (
                 role == "signal_prices"
                 and selection["price_role"] == "canonical"
                 and selection["basis"] != "unadjusted"
-            )
+            ):
+                actions = ("actions", derived_count)
+                derived_count += 1
             heads = _HeadPrices(
                 loader.binding((role, ordinal)),
-                loader.binding(("actions", 0)) if derived else None,
+                None if actions is None else loader.binding(actions),
+                actions,
                 instruments,
                 _text(selection["currency"]),
                 _text(selection["basis"]),
@@ -897,8 +911,21 @@ def _head_bars(
             basis=heads.basis,
             budget=loader.budget,
         )
+        absent = _no_action_source(adjusted, heads, strict=query.cutoff_us is not None)
         loader.head_read(
-            (item.role, item.ordinal), purpose, decision, adjusted.receipt, adjusted.receipt_hash
+            (item.role, item.ordinal),
+            purpose,
+            decision,
+            adjusted.receipt,
+            adjusted.receipt_hash,
+            notes={
+                "actions": dict(
+                    zip(
+                        ("role", "ordinal"), cast("tuple[str, int]", heads.actions_key), strict=True
+                    )
+                ),
+                "no_action_source": absent,
+            },
         )
         return tuple(row.values for row in adjusted.rows)
     result = load_pinned_heads(
@@ -913,6 +940,33 @@ def _head_bars(
     # A dataset may carry several bases of one bar (a provider's split-adjusted and total
     # return references); the selection names one of them.
     return tuple(row.values for row in result.rows if row.values["basis"] == heads.basis)
+
+
+NO_ACTION_GRANT = "absent_actions_as_none@1"
+
+
+def _no_action_source(adjusted: AdjustedRead, heads: _HeadPrices, *, strict: bool) -> list[str]:
+    """The instruments whose bars the actions read holds no evidence about.
+
+    An instrument with bars but no corporate action, held or not, in the actions read is
+    not known to have had none: the binding may simply not cover it. Its derived series is
+    its unadjusted bars, so a strict preparation reads it only when the actions binding
+    grants ``absent_actions_as_none@1``; every preparation records the instruments.
+    """
+    priced = {str(row.values["instrument_id"]) for row in adjusted.series.rows}
+    evidenced = {str(row.values["instrument_id"]) for row in adjusted.actions.rows}
+    evidenced |= {cell.instrument_id for cell in adjusted.actions.held}
+    absent = sorted(priced - evidenced)
+    granted = NO_ACTION_GRANT in cast("HeadBinding", heads.actions).granted_rules
+    if absent and strict and not granted:
+        raise ValueError(
+            "no corporate action evidence for "
+            + ", ".join(absent)
+            + "; the actions binding grants "
+            + NO_ACTION_GRANT
+            + " to read an absent action as none"
+        )
+    return absent
 
 
 def _admit_bar(row: Row, heads: _HeadPrices, seen: set[tuple[object, date]]) -> None:
