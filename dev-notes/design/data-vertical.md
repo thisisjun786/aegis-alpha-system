@@ -1924,8 +1924,7 @@ state v2:
 `--apply`는 다음이 모두 성립하는 원천만 처리하고, 성립하지 않는 원천은 이유와 함께 보고한다.
 
 1. **참조 없음**: committed generation 명세의 원천 pin, generation 행의 `source_snapshot_id`,
-   `dataset_sources`, 입력 binding, 전략 레지스트리 등록(`strategy_registrations.source_id`) 중 어느
-   것도 그 원천을 가리키지 않는다. 원천 자신의
+   `dataset_sources`, 입력 binding 중 어느 것도 그 원천을 가리키지 않는다. 원천 자신의
    source-link 행(`sl:` snapshot)은 참조로 세지 않는다. 그 행은 은퇴 뒤에도 계보로 남는다.
 2. **동치 증명**: `equivalence_spec`이 비교할 테이블과 열을 명시하고, 그 열들의 정규 행 multiset에
    대한 `aas-rowset-v1` digest가 은퇴할 원천과 `equivalent_to_source_id`에서 같다.
@@ -1951,7 +1950,8 @@ state v2:
 `request_json`, `normalized_json`, `exact_hash`, `rule_hash`, `family_hash`, `start_date`, `finish_date`,
 `source_data_basis`, `quality_status`), `asset_dependency`(`strategy_id`, `role`, `ordinal`,
 `raw_token_json`, `token_kind`), `macro_dependency`(`strategy_id`, `ordinal`, `raw_json`). 세 테이블은
-원천 pin(원천 ID, 원천 SHA-256, 테이블 digest)으로 검증한 뒤 읽는다. 다른 모양의 원천, 다른 SHA-256,
+원천 pin(원천 ID, 원천 SHA-256, 테이블 digest)으로 검증한 뒤 읽는다. 세 테이블은 함께 메모리에 올라가므로
+계산 예산(설정이 없으면 512 MiB 직렬 기본값)에서 차례로 누적해 승인한다. 다른 모양의 원천, 다른 SHA-256,
 같은 전략 ID가 두 번 나오는 원천은 거부한다.
 
 **정의 문서 `aas-strategy-definition-v1`.** 레코드 하나가 문서 하나다. 문서는 `strategy_id`,
@@ -1978,6 +1978,12 @@ UPDATE와 DELETE를 거부한다. 같은 정의를 다른 원천에서 다시 �
   등록된 파생 정의가 없으므로 `unmapped`(`derived_series`)다.
 - `weight_calculation_rule.constant`가 위 경로 어디에도 없는 자산을 가리키면 정의를 거부한다. 가격
   입력이 요구 행 없이 남지 않게 하기 위해서다.
+- 요청의 통화는 `/exchange`(`USD` 또는 `KRW`)다. `mapped` 가격 행 중 하나라도 다른 통화의 시장(`us`는
+  `USD`, `kr`는 `KRW`)이면 `fx` 도메인 행 하나(역할 `/exchange`, ordinal 0, 토큰은 요청 통화)가
+  `fx.usdkrw.norgate`의 `USD/KRW` series로 `mapped`된다. 같은 쌍의 `fx.usdkrw.fred`는 소비자가 대신 pin할
+  수 있는 다른 공급자다. `mapped` 가격 행이 있는데 `/exchange`가 없으면 `unmapped`(`missing_currency`,
+  빈 토큰), 다른 통화면 `unmapped`(`unrecognized_currency`)다. 모든 가격이 요청 통화의 시장이거나
+  `mapped` 가격 행이 없으면 `fx` 행은 없다.
 
 사상표를 바꾸면 새 map ID가 되고, 따라서 그 사상표를 쓰는 정의는 새 버전이 된다. 저장된 정의의 의미는
 바뀌지 않는다. 요구 행의 dataset ID는 소비자가 pin할 dataset의 후보이며 pin이나 binding이 아니다.
@@ -1993,9 +1999,13 @@ UPDATE와 DELETE를 거부한다. 같은 정의를 다른 원천에서 다시 �
 트랜잭션에서 `strategy_registrations` marker, 전략, 정의, 요구, 출처 행을 쓴 뒤 intent를 완료한다.
 intent의 payload hash는 등록 대상 `(strategy_id, version, document_sha256)` 집합의 hash다. 같은 요청을 다시
 실행하면 marker를 재사용한다. marker가 commit된 채 PREPARED로 남은 intent는 `aas db recover`가 marker가
-덮는 정의를 다시 유도해 완료하며 원천을 다시 읽지 않는다. `aas db quarantine`은 그 intent를 끝내지 않는다.
-`aas db verify`는 marker와 intent를 양방향으로 대조하고 모든 정의의 hash와 요구 행을 다시 확인해
-`strategy_registry`(등록 수, 전략 수, 정의 수)로 보고한다.
+덮는 정의를 다시 유도해 완료하며 원천을 다시 읽지 않는다. marker 없이 PREPARED로 남은 intent는 같은
+`--apply`를 다시 실행하면 같은 operation ID로 쓰고 완료한다. operation ID가 요청 hash라서 격리된 intent는
+그 원천의 모든 `--apply`를 거부하게 되므로 `aas db quarantine`은 `strategy_registry` intent를 끝내지 않는다.
+`aas db verify`는 marker와 intent를 양방향으로 대조하고(marker에 PREPARED·COMPLETED intent가 있고,
+COMPLETED intent에 marker가 있다) 모든 정의의 hash와 요구 행을 다시 확인해 `strategy_registry`(marker가 있는
+등록 수, 전략 수, 정의 수)로 보고한다. 정의 문서 hash, 요청 hash와 payload hash 형식, 그리고 확장 DDL의
+checksum은 테스트에 기록된 값으로 고정된다.
 
 **저장 확장.** 레지스트리 테이블은 원천 자료실처럼 `strategies.sqlite3` 안의 별도 확장이다.
 `strategy_registry_schema`가 버전과 DDL checksum을 한 행으로 기록하고, 다른 checksum은 거부한다. 확장은 첫
@@ -2375,12 +2385,19 @@ intent의 payload hash는 등록 대상 `(strategy_id, version, document_sha256)
 | DV-368 | 행이 읽히지 않는 CSV 답은 `FAILED`이고 그 FRED 날을 덮지 않아 다음 실행이 다시 받는다 | `tests/storage/test_us_collection.py::test_a_csv_download_whose_rows_do_not_read_is_failed_and_asked_again` | 구현 |
 | DV-369 | pyarrow가 없으면 US 수집은 원장이나 공급자 호출 전에 멈춘다 | `tests/storage/test_us_collection.py::test_a_run_without_pyarrow_stops_before_any_call` | 구현 |
 | DV-370 | `strategy promote --plan`은 원천의 모든 레코드를 세고 요구를 dataset ID별로 state 카탈로그와 대조하며 아무것도 쓰지 않는다 | `tests/storage/test_strategy_registry.py::test_plan_reports_every_record_and_reconciles_requirements_with_the_catalog` | 구현 |
-| DV-371 | 요구 사상표 v1은 가격·현금·벤치마크·거시 입력을 모두 행으로 만들고 목록에 없는 자산의 고정 비중을 거부한다 | `tests/storage/test_strategy_registry.py::test_requirement_map_derives_every_named_input` | 구현 |
+| DV-371 | 요구 사상표 v1은 가격·현금·벤치마크·거시·환율 입력을 모두 행으로 만들고 목록에 없는 자산의 고정 비중을 거부한다 | `tests/storage/test_strategy_registry.py::test_requirement_map_derives_every_named_input` | 구현 |
 | DV-372 | `--apply`는 계획과 같은 전략 집합을 등록하고 같은 원천의 재실행은 재사용이다 | `tests/storage/test_strategy_registry.py::test_apply_registers_the_planned_set_and_a_repeat_is_reused` | 구현 |
 | DV-373 | 정의 버전은 내용 hash이고, 바뀐 레코드는 새 버전이며 저장된 정의·요구·등록 행은 바뀌거나 지워지지 않는다 | `tests/storage/test_strategy_registry.py::test_definition_versions_are_immutable` | 구현 |
 | DV-374 | 원천 의존 테이블과 요청이 어긋나면 계획이 보고하고 등록은 아무것도 쓰지 않고 거부한다 | `tests/storage/test_strategy_registry.py::test_a_dependency_table_that_disagrees_is_reported_and_refused` | 구현 |
 | DV-375 | 원천 형식이 아니거나 SHA-256이 다른 원천은 거부된다 | `tests/storage/test_strategy_registry.py::test_a_source_of_another_shape_or_hash_is_refused` | 구현 |
-| DV-376 | marker가 commit된 등록 intent는 원천을 다시 읽지 않고 복구되며 격리되지 않는다 | `tests/storage/test_strategy_registry.py::test_an_interrupted_registration_is_recovered_from_its_marker` | 구현 |
+| DV-376 | marker가 commit된 등록 intent는 원천을 다시 읽지 않고 복구된다 | `tests/storage/test_strategy_registry.py::test_an_interrupted_registration_is_recovered_from_its_marker` | 구현 |
 | DV-377 | 저장된 요구 행이 정의에서 다시 유도한 행과 다르면 검증이 실패한다 | `tests/storage/test_strategy_registry.py::test_a_changed_definition_fails_verification` | 구현 |
 | DV-378 | `aas strategy promote`와 `aas strategy definitions`는 계획·등록·조회·검증을 CLI로 끝낸다 | `tests/storage/test_strategy_registry.py::test_strategy_promote_cli_plans_applies_and_lists` | 구현 |
 | DV-379 | 전략 레지스트리 등록이 가리키는 원천은 은퇴 대상에서 참조로 세어 거부된다 | `tests/storage/test_source_retirement.py::test_a_source_a_strategy_registration_names_is_referenced` | 예정 |
+| DV-380 | 요청 통화와 다른 시장의 `mapped` 가격이 있으면 `/exchange` `fx` 요구 행이 생기고, 통화가 없거나 모르는 통화면 이유와 함께 `unmapped`다 | `tests/storage/test_strategy_registry.py::test_requirement_map_records_the_conversion_a_request_currency_needs` | 구현 |
+| DV-381 | 정의 문서 hash·버전, 등록 요청 hash·operation ID, payload hash는 고정된 기대 digest를 가진다 | `tests/storage/test_strategy_registry.py::test_definition_and_registry_request_formats_are_frozen` | 구현 |
+| DV-382 | `strategy_registry_schema` v1 checksum은 기록된 값과 같다 | `tests/storage/test_strategy_registry.py::test_the_registry_schema_checksum_is_recorded` | 구현 |
+| DV-383 | 같은 전략 ID가 두 번 나오는 원천, 원천에 없는 전략의 의존 행, 문자열이 아닌 `token_kind`는 아무것도 쓰지 않고 거부된다 | `tests/storage/test_strategy_registry.py::test_a_source_whose_records_do_not_hold_together_writes_nothing` | 구현 |
+| DV-384 | 저장된 정의 문서의 bytes·hash·제목이 바뀌면 검증이 실패한다 | `tests/storage/test_strategy_registry.py::test_a_tampered_definition_document_fails_verification` | 구현 |
+| DV-385 | intent 없는 marker와 marker 없는 COMPLETED intent는 검증이 거부한다 | `tests/storage/test_strategy_registry.py::test_markers_and_intents_are_verified_in_both_directions` | 구현 |
+| DV-386 | 등록 intent는 격리되지 않고, marker 없이 남은 intent는 같은 `--apply`가 끝내며 그 전까지 등록 수에 들지 않는다 | `tests/storage/test_strategy_registry.py::test_an_intent_without_a_marker_is_finished_by_applying_again` | 구현 |

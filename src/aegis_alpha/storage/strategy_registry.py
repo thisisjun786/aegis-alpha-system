@@ -62,9 +62,9 @@ _VERSION_PREFIX: Final = "def-"
 _VERSION_HEX: Final = 16
 _MAX_DOCUMENT_BYTES: Final = 1024 * 1024
 _MAX_STRATEGIES: Final = 100_000
-# The serial default when no compute budget is configured. Table admission charges a
-# whole retained table, including the derived column registration never reads.
-_DEFAULT_BUDGET: Final = ComputeBudget(Fraction(1), 1024 * 1024 * 1024)
+# The repository's serial default when no compute budget is configured. Table admission
+# charges a whole retained table, including the derived column registration never reads.
+_DEFAULT_BUDGET: Final = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
 
 # The three retained tables a source of this format carries, each with exact columns.
 _STRATEGY_COLUMNS: Final = (
@@ -119,6 +119,12 @@ _US_PRICES: Final = "prices.us.norgate"
 # derived series with no registered definition yet.
 _ALFRED_SERIES: Final = frozenset({"T10Y2Y", "T10Y3M"})
 _US_MACRO: Final = "macro.us.alfred"
+# A request states the currency it is measured in. A mapped price of a market quoted in
+# another currency is converted through the USD/KRW fixing, an input of its own.
+_FX_PATH: Final = "/exchange"
+_MARKET_CURRENCY: Final = {"us": "USD", "kr": "KRW"}
+_USDKRW: Final = "USD/KRW"
+_USDKRW_FX: Final = "fx.usdkrw.norgate"
 
 _DDL: Final = """
 CREATE TABLE strategy_registry_schema (
@@ -167,7 +173,7 @@ CREATE TABLE strategy_definition_requirements (
     PRIMARY KEY (strategy_id, version, role, ordinal),
     FOREIGN KEY (strategy_id, version) REFERENCES strategy_definitions(strategy_id, version),
     CHECK(ordinal >= 0),
-    CHECK(domain IN ('prices', 'macro', 'cash')),
+    CHECK(domain IN ('prices', 'macro', 'cash', 'fx')),
     CHECK(mapping IN ('mapped', 'unmapped', 'not_applicable')),
     CHECK((mapping = 'mapped') = (dataset_id IS NOT NULL)),
     CHECK((mapping = 'mapped') = (reason IS NULL))
@@ -336,6 +342,23 @@ def _macro(ordinal: int, function: str) -> Requirement:
     )
 
 
+def _fx(request: Mapping[str, object], rows: Sequence[Requirement]) -> Requirement | None:
+    """The conversion a request's currency needs for the mapped prices it reads, if any."""
+    markets = {r.market for r in rows if r.domain == "prices" and r.mapping == "mapped"}
+    if not markets:
+        return None
+    currency = request.get("exchange")
+    if currency is None:
+        return Requirement(_FX_PATH, 0, "fx", "", None, None, None, "unmapped", "missing_currency")
+    currency = _text(currency, _FX_PATH)
+    if currency not in _MARKET_CURRENCY.values():
+        reason = "unrecognized_currency"
+        return Requirement(_FX_PATH, 0, "fx", currency, None, None, None, "unmapped", reason)
+    if {_MARKET_CURRENCY[cast("str", market)] for market in markets} <= {currency}:
+        return None
+    return Requirement(_FX_PATH, 0, "fx", currency, None, _USDKRW_FX, _USDKRW, "mapped", None)
+
+
 def _asset_tokens(request: Mapping[str, object]) -> Iterator[tuple[str, int, str]]:
     for role, keys in _ASSET_PATHS:
         value = _at(request, keys)
@@ -360,7 +383,8 @@ def definition_requirements(document: Mapping[str, object]) -> tuple[Requirement
 
     Pure and deterministic: the stored rows are re-derived from the stored document.
     A constant weight keyed by an asset the request lists nowhere else is refused,
-    so no priced input can go unlisted.
+    so no priced input can go unlisted, and a mapped price quoted in another currency
+    than the request's `exchange` adds the USD/KRW conversion as an `fx` row.
     """
     if document.get("requirement_map") != REQUIREMENT_MAP:
         raise ValueError("unsupported strategy requirement map")
@@ -378,7 +402,8 @@ def definition_requirements(document: Mapping[str, object]) -> tuple[Requirement
             raise ValueError("source constant weight names an unlisted asset")
     for ordinal, signal in enumerate(_macro_signals(request)):
         rows.append(_macro(ordinal, _text(signal.get("func"), _MACRO_PATH)))
-    return tuple(rows)
+    fx = _fx(request, rows)
+    return tuple(rows) if fx is None else (*rows, fx)
 
 
 def _definition(row: Mapping[str, object], source_row: int) -> Definition:
@@ -454,14 +479,16 @@ def _rows(
     tables = {str(table["name"]): table for table in list_tables(workspace, source_id)}
     digests: dict[str, str] = {}
     rows: dict[str, list[tuple[int, Mapping[str, object]]]] = {}
+    # All three tables are held at once, so each is admitted against what the earlier left.
+    remaining = budget.available_bytes
     for name, columns in _SOURCE_TABLES.items():
         table = tables.get(name)
         if table is None or tuple(cast("list[str]", table["columns"])) != columns:
             raise ValueError(f"source is not {SOURCE_FORMAT}: table {name} is missing or differs")
         if cast("int", table["rows"]) > _MAX_STRATEGIES * 64:
             raise ValueError(f"source table {name} exceeds the registry row limit")
-        admit_source_table(
-            workspace, source_id, name, max_materialization_bytes=budget.available_bytes
+        remaining -= admit_source_table(
+            workspace, source_id, name, max_materialization_bytes=remaining
         )
         digests[name] = str(table["digest"])
         pin = SourcePin(source_id, source_sha256, name, digests[name])
@@ -841,10 +868,12 @@ def verify_registry(workspace: Workspace) -> dict[str, object] | None:
         operation = operations.get(operation_id)
         if operation is None or operation["phase"] not in {"PREPARED", "COMPLETED"}:
             raise ValueError("strategy registration marker has no matching active intent")
+    registrations = 0
     for operation in operations.values():
         committed = _verify_registration(strategies, operation)
         if not committed and operation["phase"] == "COMPLETED":
             raise ValueError("completed strategy registration intent has no private marker")
+        registrations += committed
     if strategies.execute(
         "SELECT 1 FROM strategy_definitions d WHERE NOT EXISTS (SELECT 1 FROM "
         "strategy_definition_sources s WHERE s.strategy_id=d.strategy_id AND s.version=d.version)"
@@ -856,7 +885,7 @@ def verify_registry(workspace: Workspace) -> dict[str, object] | None:
     for row in definitions:
         _verify_definition(strategies, row[0], row[1])
     return {
-        "registrations": len(operations),
+        "registrations": registrations,
         "strategies": strategies.execute(
             "SELECT count(DISTINCT strategy_id) FROM strategy_definitions"
         ).fetchone()[0],

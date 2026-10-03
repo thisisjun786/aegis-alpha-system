@@ -338,7 +338,10 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   requirement map on every verification, and a source whose own dependency tables
   disagree with its requests is refused. One state intent, one private transaction
   ending in the `strategy_registrations` marker, then completion; `db recover` finishes
-  a committed marker from stored evidence alone and `quarantine` refuses it.
+  a committed marker from stored evidence alone, repeating `--apply` finishes an intent
+  with no marker, and `quarantine` refuses every registration intent because the
+  operation id is the request hash. Requirement map v1 adds a USD/KRW `fx` row when a
+  mapped price's market currency differs from the request's `exchange`.
 - `runs` owns the formal run lifecycle. `open_run` commits the intent before any
   calculation and seals the envelope and preparation; `commit_run` seals the result,
   commits the market marker, then records receipts and ends the run SUCCESS;

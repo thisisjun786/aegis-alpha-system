@@ -64,8 +64,9 @@ aas data read --dataset ID --version VERSION --cutoff-us UTC_MICROSECONDS
 거부하고, 같은 원천으로 다시 실행하면 `reused=true`로 끝나며 바뀌는 것이 없다. 내용이 바뀐 레코드는
 새 버전이 되고 이전 버전은 그대로 남는다. 정의는 실행 bundle이 아니므로 `strategy list`에 나오지 않고
 `strategy definitions`로 조회하며 모든 행이 `execution_eligible=false`다. 원천 테이블은 계산 예산
-(설정한 AAS compute 환경, 없으면 1 GiB 직렬 기본값)으로 승인한다. 등록 작업이 PREPARED로 남으면
-`aas db recover`가 저장된 정의를 다시 도출해 완료하고 원천을 다시 읽지 않는다.
+(설정한 AAS compute 환경, 없으면 512 MiB 직렬 기본값)에서 세 테이블을 누적해 승인한다. 등록 작업이 PREPARED로 남으면
+`aas db recover`가 저장된 정의를 다시 도출해 완료하고 원천을 다시 읽지 않는다. 비공개 marker 없이
+남은 작업은 같은 `--apply`를 다시 실행해 끝내며, `aas db quarantine`은 등록 작업을 격리하지 않는다.
 
 `strategy show`는 고정한 전략의 실행 정의를 JSON으로 출력하며 계산·기록을 하지 않는다.
 출력에는 자산·현금 ID, 역할별 입력 요구, 달력 규약, `required_convention_roles`,
