@@ -96,17 +96,29 @@ def copy_tree(source: Path, target: Path, files: dict[str, object], prefix: str)
 
 
 def backup(
-    home: Path, output: Path | None = None, *, budget: ComputeBudget | None = None
+    home: Path,
+    output: Path | None = None,
+    *,
+    budget: ComputeBudget | None = None,
+    deep: bool = False,
 ) -> dict[str, object]:
     with open_workspace(home, writable=True) as workspace:
-        return backup_workspace(workspace, output, budget=budget)
+        return backup_workspace(workspace, output, budget=budget, deep=deep)
 
 
 def backup_workspace(
-    workspace: Workspace, output: Path | None = None, *, budget: ComputeBudget | None = None
+    workspace: Workspace,
+    output: Path | None = None,
+    *,
+    budget: ComputeBudget | None = None,
+    deep: bool = False,
 ) -> dict[str, object]:
-    """Back up within an existing maintenance lifetime; never reacquire workspace locks."""
-    verification = verify_workspace(workspace, budget=budget)
+    """Back up within an existing maintenance lifetime; never reacquire workspace locks.
+
+    The installation is verified first, comparing stored rows with their recorded
+    digests unless ``deep`` rehashes them; every copied file is hashed as it is written.
+    """
+    verification = verify_workspace(workspace, budget=budget, deep=deep)
     if verification["pending_operations"] or verification["orphan_generations"]:
         raise ValueError("backup requires recovered operations and no orphan generations")
     if workspace.state.execute("SELECT 1 FROM runs WHERE status='RUNNING'").fetchone():
@@ -167,6 +179,8 @@ def backup_workspace(
         "files": files,
         "logical": verification,
         "secrets_included": False,
+        # The verification mode, kept beside the logical report it does not change.
+        "deep": deep,
     }
     write_json(target / _MANIFEST, manifest)
     _validated_manifest(target)
@@ -176,6 +190,7 @@ def backup_workspace(
         "secrets_included": False,
         "files": len(files),
         "runs": _run_counts(workspace),
+        "deep": deep,
     }
 
 
@@ -250,8 +265,17 @@ def _validated_manifest(root: Path) -> dict[str, object]:
 
 
 def restore(
-    backup_root: Path, new_home: Path, *, budget: ComputeBudget | None = None
+    backup_root: Path,
+    new_home: Path,
+    *,
+    budget: ComputeBudget | None = None,
+    deep: bool = False,
 ) -> dict[str, object]:
+    """Restore into a new root and verify it there like the backup was.
+
+    Every listed file is rehashed before it is copied, so the stores are byte copies of
+    the verified backup; ``deep`` also rehashes their stored rows.
+    """
     backup_root = resolve_home(backup_root)
     new_home = resolve_home(new_home)
     if new_home.exists() or new_home.is_symlink():
@@ -272,7 +296,7 @@ def restore(
         private_directory(new_home / name, create=True)
     try:
         with open_workspace(new_home, validating_restore=True) as workspace:
-            verification = verify_workspace(workspace, budget=budget)
+            verification = verify_workspace(workspace, budget=budget, deep=deep)
             if verification != manifest["logical"]:
                 raise ValueError("restored logical verification differs from backup")  # noqa: TRY301 -- persist failed restore receipt
             counts = _run_counts(workspace)
@@ -288,4 +312,5 @@ def restore(
         "verification": verification,
         "secrets_restored": False,
         "runs": counts,
+        "deep": deep,
     }

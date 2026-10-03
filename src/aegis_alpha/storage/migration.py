@@ -284,6 +284,7 @@ def migrate_core_schema(
     to_version: int,
     backup_output: Path | None,
     budget: ComputeBudget | None = None,
+    deep: bool = False,
 ) -> dict[str, object]:
     """Migrate the installation's state and market stores to ``to_version``.
 
@@ -308,7 +309,7 @@ def migrate_core_schema(
                     "core_schema_backup_required", "pass --backup-output with a new directory"
                 )
             _quiet(workspace, excluding=None)
-            backup = backup_workspace(workspace, backup_output, budget=budget)
+            backup = backup_workspace(workspace, backup_output, budget=budget, deep=deep)
             backup_root = str(backup["backup_root"])
             prepare_operation(
                 workspace.state,

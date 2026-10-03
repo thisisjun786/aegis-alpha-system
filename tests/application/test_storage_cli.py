@@ -71,6 +71,33 @@ def test_configured_budget_verifies_backs_up_restores_and_installs_large_manifes
     assert json.loads(installed.stdout)["state"] == "complete"
 
 
+def test_deep_verify_backup_and_restore_report_the_default_verification(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    assert run_cli("init", home=home).returncode == 0
+    checked = run_cli("db", "verify", home=home)
+    assert checked.returncode == 0, checked.stderr
+    deep = run_cli("db", "verify", "--deep", home=home)
+    assert deep.returncode == 0, deep.stderr
+    assert json.loads(deep.stdout) == json.loads(checked.stdout)
+    archive = tmp_path / "archive"
+    saved = run_cli("db", "backup", "--deep", "--output", str(archive), home=home)
+    assert saved.returncode == 0, saved.stderr
+    assert json.loads(saved.stdout)["deep"] is True
+    restored = run_cli(
+        "--home",
+        str(tmp_path / "restored"),
+        "db",
+        "restore",
+        "--deep",
+        "--backup",
+        str(archive),
+        home=home,
+    )
+    assert restored.returncode == 0, restored.stderr
+    report = json.loads(restored.stdout)
+    assert (report["verification"], report["deep"]) == (json.loads(checked.stdout), True)
+
+
 @pytest.mark.parametrize("command", ["verify", "backup", "restore", "run-install"])
 def test_maintenance_compute_lock_alias_rejected_before_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str

@@ -11,8 +11,9 @@ group is retired whole or not at all, and only when
 2. the ``aas-rowset-v1`` digest of the compared columns' row multiset is the same on
    both sides (``equivalence_digest``), and every retired table's columns are exactly the
    compared ones plus the declared ``uncompared`` ones, and
-3. the verified backup ``--backup`` names holds every one of its commits and lives on
-   another device than the installation.
+3. the verified backup ``--backup`` names holds every one of its commits, each of whose
+   tables rehashes there to the digest the commit records, and lives on another device
+   than the installation.
 
 ``--plan`` writes nothing. ``--apply`` retains the records in ``raw/``, prepares a
 ``source-retire`` intent whose payload they are, drops the tables in one DuckDB
@@ -55,6 +56,7 @@ from aegis_alpha.storage.source_library import (
     manifest_digest,
     retired_sources,
     table_present,
+    verify_tables,
 )
 from aegis_alpha.storage.state import atomic, complete_operation, get_operation, prepare_operation
 
@@ -178,6 +180,8 @@ class _Backup:
     backup_id: str | None
     reasons: list[str]
     market: duckdb.DuckDBPyConnection | None = None
+    # Whether ``aas db backup --deep`` made it; retirement rehashes its sources either way.
+    deep: bool | None = None
 
 
 def _canonical(value: object) -> bytes:
@@ -579,6 +583,8 @@ def _open_backup(workspace: Workspace, root: Path | None) -> _Backup:
     backup_root = resolve_home(root)
     manifest = validated_backup(backup_root)
     backup = _Backup(str(backup_root), manifest_sha256(backup_root), [])
+    deep = manifest.get("deep")
+    backup.deep = deep if isinstance(deep, bool) else None
     if manifest.get("installation_id") != workspace.installation_id:
         backup.reasons.append("backup_of_another_installation")
         return backup
@@ -624,6 +630,26 @@ def _backup_holds(backup: _Backup, source_id: str, manifest_json: str) -> bool:
     return True
 
 
+def _backup_lacks(
+    backup: _Backup, source_id: str, manifest_json: str, budget: ComputeBudget
+) -> str | None:
+    """Why the backup cannot restore this commit, or None when it holds it row for row.
+
+    Each of the commit's tables must rehash in the backup to the digest the commit
+    records. A backup verified without ``--deep`` never read those rows, so this is
+    what proves them.
+    """
+    if backup.market is None or not _backup_holds(backup, source_id, manifest_json):
+        return "backup_lacks_source"
+    try:
+        verify_tables(backup.market, json.loads(manifest_json), budget.available_bytes)
+    except ComputeResourceError:
+        raise
+    except ValueError:
+        return "backup_content_mismatch"
+    return None
+
+
 # --- plan ---------------------------------------------------------------------------------
 
 
@@ -646,6 +672,7 @@ class RetirementPlan:
             "spec_sha256": self.spec.sha256,
             "backup_root": self.backup.root,
             "backup_id": self.backup.backup_id,
+            "backup_deep": self.backup.deep,
             "candidate_sources": len(candidates),
             "candidate_rows": sum(source.rows for source in candidates),
             "retirable_sources": len(retirable),
@@ -769,8 +796,10 @@ def plan_retirement(  # noqa: C901, PLR0912, PLR0915 -- one ordered proof per gr
         if source in retired or "unknown_source" in entry.reasons:
             continue
         entry.reasons.extend(backup.reasons)
-        if not backup.reasons and not _backup_holds(backup, source, commits[source][1]):
-            entry.reasons.append("backup_lacks_source")
+        if not backup.reasons and (
+            lacking := _backup_lacks(backup, source, commits[source][1], budget)
+        ):
+            entry.reasons.append(lacking)
     for result in groups:
         if result.already_retired:
             continue

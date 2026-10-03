@@ -9,7 +9,7 @@ import subprocess
 import sys
 from datetime import date
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import pyarrow as pa
 import pytest
@@ -29,6 +29,10 @@ from tests.storage.promotion_support import spec as promotion_spec
 from tests.storage.retirement_support import ROWS, commit, group, other_device, spec
 from tests.storage.test_runs import BUDGET as RUN_BUDGET
 from tests.storage.test_runs import RESULT, intent, prepared
+
+if TYPE_CHECKING:
+    from aegis_alpha.compute_resources import ComputeBudget
+    from aegis_alpha.storage.workspace import Workspace
 
 _ROOT = Path(__file__).resolve().parents[2]
 _WIDE = pa.schema([("symbol", pa.string()), ("payload", pa.string())])
@@ -190,3 +194,23 @@ def test_compact_command_reports_the_new_root(tmp_path: Path) -> None:
         len(ROWS)
         == cast("dict[str, dict[str, int]]", report["verification"])["source_library"]["rows"]
     )
+
+
+@pytest.mark.parametrize("deep", [False, True])
+def test_compaction_rehashes_the_rewritten_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, deep: bool
+) -> None:
+    """The original is verified as asked; the rewritten root is always verified deep."""
+    home = tmp_path / "aas"
+    _installation(home)
+    modes: list[bool] = []
+
+    def recorded(
+        workspace: Workspace, *, budget: ComputeBudget | None = None, deep: bool = False
+    ) -> dict[str, object]:
+        modes.append(deep)
+        return verify_workspace(workspace, budget=budget, deep=deep)
+
+    monkeypatch.setattr(compaction, "verify_workspace", recorded)
+    assert compact(home, tmp_path / "compacted", deep=deep)["compacted"] is True
+    assert modes == [deep, True]
