@@ -247,8 +247,10 @@ dataset_id·version·generation_id·chain_hash·manifest_hash다. `decision`은 
 메모리 예산을 넘으면 명시적으로 실패한다.
 
 등록과 조회는 원본 자료의 진위, 공급자 조정 기준, 거래 가능성을 인증하지 않는다.
-`data datasets`에 보이는 generation은 검증한 변환의 결과일 뿐이며 PIT 자격이나 백테스트
-입력으로 자동 승격되지 않는다.
+`data datasets`는 committed dataset version(`datasets`), [dataset 카탈로그](design/data-vertical.md#dataset-카탈로그)
+항목마다 도메인·역할·매퍼·규칙·flag·동결 여부와 그 항목에 게시된 dataset의 version 수와 head(`catalog`),
+카탈로그 밖 이름으로 게시된 dataset(`uncataloged`)을 돌려준다. 거기 보이는 generation은 검증한 변환의
+결과일 뿐이며 PIT 자격이나 백테스트 입력으로 자동 승격되지 않는다.
 
 ## identity 등록
 
@@ -395,7 +397,7 @@ ALFRED vintage(`fred.alfred@1`)는 generation 하나에 관측마다 vintage를 
 generation을 parent로 순서대로 승격한다. 구간 없이 원천 전체를 계획하면 반복된 자연키로 거부된다.
 
 US 가격 dataset은 이 명령에 명세를 하나씩 넘겨 만든다. 매퍼와 dataset의 대응과 규칙은
-[대상 dataset](design/data-vertical.md#대상-dataset)이 소유한다. 명세는 US identity snapshot(`us-build
+[dataset 카탈로그](design/data-vertical.md#dataset-카탈로그)이 소유한다. 명세는 US identity snapshot(`us-build
 --norgate-exports`로 만든 문서를 등록한 뒤 provider·namespace별로 만든 snapshot)과 `sessions.xnys` 달력
 generation을 pin한다.
 

@@ -18,7 +18,7 @@
 | L0 raw | 공급자 응답·내보내기 원본 bytes. 해시 경로, no-clobber | `storage/raw.py` |
 | L1 원천 자료실 | `sl_*` 테이블. 원래 열·값·행 순서를 그대로 보존하는 `source_only` 자료, legacy 원본 편입, 수집 job 적재 | `storage/source_library*.py`, `storage/legacy_import/`, `storage/qveris_import.py` |
 | L2 승격 | 승격 명세 → 매퍼 → head 비교 → 품질 flag → generation 게시 | `storage/promotion/` |
-| L3 저장 | `market.duckdb`의 typed generation과 `state.sqlite3`의 카탈로그·identity·품질·수집 기록 | `storage/market.py`, `storage/state.py`, `storage/identity.py` |
+| L3 저장 | `market.duckdb`의 typed generation과 `state.sqlite3`의 카탈로그·identity·품질·수집 기록, [dataset 카탈로그](#dataset-카탈로그) | `storage/market.py`, `storage/state.py`, `storage/identity.py`, `storage/dataset_catalog.py` |
 | L4 소비 | exact pin, cutoff, grant로 head를 투영하는 reader, 조정 가격 유도와 실행 준비 | `storage/read_heads.py`, `storage/adjusted_prices.py`, `storage/market_inputs.py`, `application/backtest_prepare.py` |
 
 원천 자료실에 있다는 사실은 PIT 자격이 아니다. 시점·식별·품질 규칙을 명시한 승격만 L1 자료를
@@ -498,7 +498,9 @@ microsecond, 시간 입력은 `session_date` 하나다. 값 일부만 있는 bar
 `sec.submissions@1`과 `sec.companyfacts@1`은 [SEC 공시와 재무](#sec-공시와-재무)를 발행인 단위
 `filings`와 `fundamentals`로 옮기며, 재무 매퍼는 pin한 공시 generation을 참조로 조인한다.
 
-예정된 매퍼 목록: `dart.list`. identity 원천을 읽는 매퍼는 typed generation이
+예정된 매퍼(Linear AAS-77, 대응표 DV-413~416): `actions.us.eodhd`·`actions.kr.eodhd`를 만드는 Qveris
+일간 `splits`·`dividends` 매퍼, `status.kr.kind`를 만드는 KIND 상장 상태 매퍼, `filings.kr.dart`에
+공시 목록(`list.json`)을 더하는 `dart.list`. identity 원천을 읽는 매퍼는 typed generation이
 아니라 등록 문서를 만든다. `eodhd.kr_symbol`, `kind.listings`, `dart.corp_codes`는
 [KR 등록](#kr-등록)이, `norgate.master`, `eodhd.us_symbol`, `fmp.profile`, `sec.tickers`는
 [US 등록](#us-등록)이 소유한다. universe 원천을 읽는 `norgate.index_membership`과 `norgate.listings`도
@@ -1018,39 +1020,67 @@ dimensions_hash = sha256(정규 JSON ["aas-dimensions-v1", {이름: 텍스트, .
 누락으로 거부된다. 엔진처럼 매퍼도 이 해시를 SQL로 계산하며, SQL의 JSON 문자열 표기는 `json.dumps`의
 ASCII escape와 바이트까지 같다.
 
-## 대상 dataset
+## dataset 카탈로그
 
-| dataset | 도메인·역할 | 원천과 규칙 |
-| --- | --- | --- |
-| `prices.kr.eodhd` | `prices`, canonical unadjusted | EODHD KR 일봉 이력(`eodhd.bars@1`)과 부분 응답 일간 내려받기(`eodhd.bulk_quarantine@1`). `krw_tick@1`, `session_close_plus_lag@1`, 부분 응답 flag와 행 수 대조, 잘못된 가격은 `invalid`. [KR 가격](#kr-가격) |
-| `prices.kr.eodhd.ref` | `prices`, reference `total_return`, `fields='close'` | 같은 원천의 adjusted close(`eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1`), `float_shortest@1` |
-| `prices.us.norgate` | `prices`, canonical unadjusted | Norgate 비조정 일봉 내보내기(CSV), `norgate.prices_none@1`. 다섯 값 모두 `decimal_text@1` |
-| `prices.us.norgate.ref` | `prices`, reference `split_adjusted`·`total_return` | Norgate 조정 OHLC, `norgate.prices_adjusted@1`. float32 저장값은 `float_shortest@1` |
-| `prices.us.eodhd` | `prices`, canonical unadjusted | EODHD US 일간 수집, `eodhd.bars@1`. 다운로드 하나가 generation 하나이고 같은 날짜의 다른 다운로드는 SUPERSEDE. Norgate와 겹치는 구간에 `cross_provider_mismatch@1`(기준 `prices.us.norgate`). identity가 해석한 US 보류 행의 재처리 단계는 Linear AAS-69 |
-| `prices.us.fmp.ref` | `prices`, reference unadjusted | FMP 동결 legacy non-split 응답, `fmp.eod_non_split@1`. 정정은 revision 번호순 generation. 원천 자료실 FMP normalized lineage(eod_full, dividend_adjusted)의 매퍼는 Linear AAS-68 |
-| `prices.ref.norgate` | `prices`, reference, `fields='close'` | Norgate 기준 시리즈(`norgate.reference_closes@1`)와 지수·기타 데이터베이스 내보내기(`norgate.reference_history@1`). 음수 수준이 있는 시리즈는 `signed`로 고르지 않는다 |
-| `sessions.xnys`, `sessions.xkrx` | `calendar_sessions` | [선언 달력](#선언-달력) 문서. 관측 거래일은 대조 보고의 근거. 임시 휴장은 SUPERSEDE |
-| `actions.us.norgate` | `corporate_actions` | Norgate 조정 가격 part의 `CAPITAL` 행 전체. 배당(`norgate.dividends@1`, amount `float_shortest@1`)이 첫 generation, 자본 사건(`norgate.capital_adjustments@1`, ratio `float_shortest@1`)이 그 child다. 두 시점은 `exdate_open@1`(`sessions.xnys`). 파티션 없이 이력 전체가 한 generation이다 |
-| `actions.us.fmp.ref` | `corporate_actions` | FMP 동결 배당(`fmp.dividends@1`)과 분할(`fmp.splits@1`) 응답. 정정은 revision 번호순 generation. 두 시점은 `exdate_open@1` |
-| `actions.{us,kr}.eodhd` | `corporate_actions` | `exdate_open@1` |
-| `status.us.norgate` | `instrument_status` | Norgate master의 상장(`norgate.status@1`, `event` `listed`)이 첫 generation, 상장폐지(`delisted`)가 그 child다. 두 시점은 `local_day_end@1`(`America/New_York`, 근거 `record`) |
-| `status.kr.kind` | `instrument_status` | 상장·상폐 이력 |
-| `filings.us.sec`, `filings.kr.dart` | `filings`(v2) | SEC submissions(`sec.submissions@1`, `source_column@1`). DART는 재무제표 응답의 접수번호(`dart.fnltt_filings@1`)와 공시 목록, 둘 다 `local_day_end@1`(접수일) |
-| `fundamentals.us.sec` | `fundamentals` | companyfacts(`sec.companyfacts@1`). 공시마다 자기 record(accession은 dimensions). 시점은 pin한 `filings.us.sec` generation에서 accession으로 조인한 `accepted_at_us`(`source_column@1`)이고, 조인되지 않은 사실은 null이다. 같은 accession의 값이 다시 수집되어 바뀌면 SUPERSEDE |
-| `fundamentals.kr.dart` | `fundamentals` | 재무제표 응답(`dart.fnltt@1`). 발행인 단위, 연결·별도는 dimensions, 시점은 `local_day_end@1`(접수일). 정정 공시는 SUPERSEDE. 12월 결산으로 선언한 발행인만 기간을 적는다. 자료 없음 응답은 행 대신 결과 분포로 기록 |
-| `macro.us.alfred` | `macro_observations` | ALFRED vintage(`fred.alfred@1`). vintage 구간마다 generation 하나, 정정은 SUPERSEDE. 두 시점은 `local_day_end@1(realtime_start)` |
-| `macro.kr.bok`, `macro.kr.oecd` | `macro_observations` | `bok.observations@1`, `oecd.observations@1`. vintage가 없어 두 시점은 `unknown_null@1` |
-| `fx.usdkrw.norgate`, `fx.usdkrw.fred` | `fx_rates` | `norgate.fx_closes@1`(source library 기준 시리즈, 동결, 2026-09-08까지) 또는 `norgate.fx_history@1`(legacy 내보내기 편입본), 시간대 `Etc/GMT+12`. `fred.fx_series@1`(DEXKOUS), 시간대 `America/New_York`, H.10 발표 지연 때문에 두 시점은 `unknown_null@1`. 우선순위는 소비자 pin |
-| `classifications.us.norgate` | `classifications`(v2) | Norgate 증권 유형(`norgate.security_type`)과 상장 거래소(`norgate.exchange`). [분류](#분류) snapshot이며 과거로 소급하지 않음 |
-| `classifications.us.sec` | `classifications`(v2) | SEC SIC(`sec.sic`), issuer 주체 |
-| `classifications.kr.kind` | `classifications`(v2) | KIND 업종(`kind.industry`), 단축코드를 identity snapshot으로 해석 |
+데이터 수직이 승격하는 market dataset은 아래 표가 전부다. 표는 `storage/dataset_catalog.py`의 `CATALOG`와
+같고, `aas data datasets`는 그 항목을 `catalog`로 돌려준다(`tests/tools/test_dataset_catalog.py`가 표, 코드,
+매퍼 레지스트리, 명령 출력을 대조한다).
+
+- **도메인**은 generation이 채우는 market 테이블이고, 표의 매퍼는 모두 그 도메인을 낸다.
+- **역할**은 `reference`(dataset 이름에 `ref`가 있음: 공급자 조정 가격, 기준 시리즈, 동결 공급자의 대조
+  자료)이거나 `canonical`이다. `prices`에서는 이 역할이 행의 `price_role`이다.
+- **매퍼**는 그 dataset의 명세가 쓰는 등록 매퍼다. `없음`인 dataset은 수집 원천이 있고 그 원천을 승격하는
+  매퍼가 레지스트리에 없으므로 generation이 없다.
+- **시간 규칙**은 명세가 두 시점 열에 쓰는 규칙, **숫자 규칙**은 열마다 고르는 규칙들, **품질 규칙**은 명세의
+  `quality_rules`다. 한 chain의 시간 규칙은 바뀌지 않으므로 다른 규칙은 `.r<N>` 세대의 새 dataset이고, 그
+  dataset도 같은 항목에 속한다.
+- **flag**는 위 규칙과 매퍼의 행 flag에서 나온다(규칙이 붙이는 flag는 [숫자 규칙](#숫자-규칙),
+  [품질 flag와 품질 검사](#품질-flag와-품질-검사)). 규칙이 수집 시각으로 내린 시점의
+  `time_clamped_to_ingestion`은 `unknown_null@1`이 아닌 모든 시간 규칙에 생길 수 있어 열에 적지 않는다.
+- **동결**은 [동결 원천](#동결-원천)의 dataset이다. 새 수집이 없고 coverage가 마지막 원천 날짜에서 끝난다.
+
+| dataset | 도메인 | 역할 | 매퍼 | 시간 규칙 | 숫자 규칙 | 품질 규칙 | flag | 동결 | 원천 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `prices.kr.eodhd` | `prices` | canonical | `eodhd.bars@1`, `eodhd.bars_quarantine@1`, `eodhd.bulk_quarantine@1` | `session_close_plus_lag@1` | `krw_tick@1`, `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_reconstructed`, `provider_float_storage`, `provider_reported_partial` | 아니오 | EODHD KR 일봉 이력, 보류된 이력 행(값 없는 `invalid` bar), 부분 응답 일간 내려받기. OHLC는 원 단위 정수, 거래량은 공급자 float 그대로. 부분 응답 generation은 `partition_row_count@1` 행 수 대조를 남긴다. [KR 가격](#kr-가격) |
+| `prices.kr.eodhd.ref` | `prices` | reference | `eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1` | `session_close_plus_lag@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage`, `provider_reported_partial` | 아니오 | 같은 두 원천 모양의 공급자 adjusted close. basis `total_return`, `fields='close'` |
+| `prices.us.norgate` | `prices` | canonical | `norgate.prices_none@1` | `session_close_plus_lag@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | Norgate 비조정 일봉 내보내기(`norgate-history-csv-*`의 미국 주식 `bars`). 다섯 값 모두 CSV 원문, 연도 partition마다 generation 하나 |
+| `prices.us.norgate.ref` | `prices` | reference | `norgate.prices_adjusted@1` | `session_close_plus_lag@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 아니오 | Norgate 조정 가격 part. `CAPITAL`은 `split_adjusted`, `TOTALRETURN`은 `total_return`, float32 저장값 |
+| `prices.us.eodhd` | `prices` | canonical | `eodhd.bars@1` | `session_close_plus_lag@1` | `float_shortest@1` | `cross_provider_mismatch@1` | `cross_provider_mismatch`, `decimal_rounding_tie`, `provider_float_storage` | 아니오 | EODHD US 일간 수집. 다운로드 하나가 generation 하나이고 같은 날짜의 다른 다운로드는 SUPERSEDE. 품질 규칙의 기준은 `prices.us.norgate` generation pin. identity가 해석한 US 보류 행의 재처리는 Linear AAS-69 |
+| `prices.us.fmp.ref` | `prices` | reference | `fmp.eod_non_split@1` | `session_close_plus_lag@1` | `float_shortest@1`, `exact@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 예 | FMP 동결 legacy non-split 응답. 정정은 revision 번호순 generation. 원천 자료실 FMP normalized lineage(eod_full, dividend_adjusted)의 매퍼는 Linear AAS-68 |
+| `prices.ref.norgate` | `prices` | reference | `norgate.reference_closes@1`, `norgate.reference_history@1` | `local_day_end@1` | `decimal_text@1` | 없음 | `time_precision_day`, `volume_precision_limited` | 예 | Norgate 기준 시리즈 표와 지수·기타 데이터베이스 내보내기, `fields='close'`, 통화 `XXX`. 공급자가 종가 시각을 밝히지 않으므로 날짜 끝은 `Etc/GMT+12`. 음수 수준이 있는 시리즈는 `signed`로 고르지 않는다(Linear AAS-67) |
+| `sessions.xnys` | `calendar_sessions` | canonical | `calendar.declared@1` | `declared_session_end@1` | 없음 | 없음 | 없음 | 아니오 | XNYS [선언 달력](#선언-달력) 문서. 관측 거래일은 대조 보고의 근거, 임시 휴장은 SUPERSEDE |
+| `sessions.xkrx` | `calendar_sessions` | canonical | `calendar.declared@1` | `declared_session_end@1` | 없음 | 없음 | 없음 | 아니오 | XKRX [선언 달력](#선언-달력) 문서. 관측 거래일은 대조 보고의 근거, 임시 휴장은 SUPERSEDE |
+| `actions.us.norgate` | `corporate_actions` | canonical | `norgate.dividends@1`, `norgate.capital_adjustments@1` | `exdate_open@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 예 | Norgate 조정 가격 part의 `CAPITAL` 행 전체. 배당이 첫 generation, 자본 사건이 그 child이고 파티션 없이 이력 전체가 한 generation이다. 달력은 `sessions.xnys` |
+| `actions.us.fmp.ref` | `corporate_actions` | reference | `fmp.dividends@1`, `fmp.splits@1` | `exdate_open@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 예 | FMP 동결 배당·분할 응답. 정정은 revision 번호순 generation. 달력은 `sessions.xnys` |
+| `actions.us.eodhd` | `corporate_actions` | canonical | 없음 | `exdate_open@1` | 없음 | 없음 | 없음 | 아니오 | Qveris 거래소 일간 `splits`·`dividends` 수집 원천([Qveris 수집과 원천 적재](#qveris-수집과-원천-적재)). 매퍼는 Linear AAS-77 |
+| `actions.kr.eodhd` | `corporate_actions` | canonical | 없음 | `exdate_open@1` | 없음 | 없음 | 없음 | 아니오 | Qveris 거래소 일간 `splits`·`dividends` 수집 원천(KO, KQ). 매퍼는 Linear AAS-77 |
+| `status.us.norgate` | `instrument_status` | canonical | `norgate.status@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | Norgate master의 상장(`event` `listed`)이 첫 generation, 상장폐지(`delisted`)가 그 child. `America/New_York`, 근거 `record` |
+| `status.kr.kind` | `instrument_status` | canonical | 없음 | 없음 | 없음 | 없음 | 없음 | 아니오 | KIND 상장법인목록 수집 원천(`kind-listings-*`). 상장 이력은 [KR 등록](#kr-등록)의 identity 구간으로 들어간다. 상태 매퍼는 Linear AAS-77 |
+| `filings.us.sec` | `filings` | canonical | `sec.submissions@1` | `source_column@1` | 없음 | 없음 | 없음 | 아니오 | SEC submissions의 접수 시각 `acceptanceDateTime`. [SEC 공시와 재무](#sec-공시와-재무) |
+| `filings.kr.dart` | `filings` | canonical | `dart.fnltt_filings@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | DART 재무제표 응답의 접수번호, 접수일 기준 Asia/Seoul. 공시 목록(`list.json`) 수집 원천의 매퍼(`dart.list`)는 레지스트리에 없다(Linear AAS-77) |
+| `fundamentals.us.sec` | `fundamentals` | canonical | `sec.companyfacts@1` | `source_column@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | companyfacts. 공시마다 자기 record(accession은 dimensions). 시점은 pin한 `filings.us.sec` generation에서 accession으로 조인한 `accepted_at_us`이고 조인되지 않은 사실은 null. 같은 accession의 값이 바뀌면 SUPERSEDE |
+| `fundamentals.kr.dart` | `fundamentals` | canonical | `dart.fnltt@1` | `local_day_end@1` | `decimal_text@1` | 없음 | `time_precision_day`, `volume_precision_limited` | 아니오 | 재무제표 응답. 발행인 단위, 연결·별도는 dimensions, 접수일 기준. 정정 공시는 SUPERSEDE. 자료 없음 응답은 행 대신 결과 분포로 기록. [DART 재무제표 응답](#dart-재무제표-응답) |
+| `macro.us.alfred` | `macro_observations` | canonical | `fred.alfred@1` | `local_day_end@1` | `decimal_text@1` | 없음 | `time_precision_day`, `volume_precision_limited` | 아니오 | ALFRED vintage, `realtime_start` 기준. vintage 구간마다 generation 하나, 정정은 SUPERSEDE |
+| `macro.kr.bok` | `macro_observations` | canonical | `bok.observations@1` | `unknown_null@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | legacy BOK 공개 응답. vintage와 공개 시각이 없어 strict 읽기는 고르지 않는다 |
+| `macro.kr.oecd` | `macro_observations` | canonical | `oecd.observations@1` | `unknown_null@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | legacy OECD 공개 응답. vintage와 공개 시각이 없어 strict 읽기는 고르지 않는다 |
+| `fx.usdkrw.norgate` | `fx_rates` | canonical | `norgate.fx_closes@1`, `norgate.fx_history@1` | `local_day_end@1` | `decimal_text@1` | 없음 | `time_precision_day`, `volume_precision_limited` | 예 | 원천 자료실 Norgate 기준 시리즈(2026-09-08까지)와 legacy 내보내기 편입본, 시간대 `Etc/GMT+12`. 우선순위는 소비자 pin |
+| `fx.usdkrw.fred` | `fx_rates` | canonical | `fred.fx_series@1` | `unknown_null@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | FRED DEXKOUS(legacy CSV 편입본과 ALFRED 수집). H.10 발표 지연 때문에 strict 읽기는 고르지 않는다. 우선순위는 소비자 pin |
+| `classifications.us.norgate` | `classifications` | canonical | `norgate.classification@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | Norgate 증권 유형(`norgate.security_type`)과 상장 거래소(`norgate.exchange`) snapshot, 과거로 소급하지 않음. [분류](#분류) |
+| `classifications.us.sec` | `classifications` | canonical | `sec.sic@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | SEC SIC(`sec.sic`) snapshot, issuer 주체 |
+| `classifications.kr.kind` | `classifications` | canonical | `kind.industry@1` | `source_column@1` | 없음 | 없음 | 없음 | 아니오 | KIND 업종(`kind.industry`) snapshot, 단축코드를 identity snapshot으로 해석, 수집 시각부터 알려짐 |
 
 identity 원천(Norgate master, SEC submissions, FMP profile, DART 고유번호, KIND 목록)은 typed generation이
-아니라 아래 [identity 등록](#identity-등록과-chunked-문서)으로 state에 들어간다. 지수 구성과 상장 universe도
+아니라 [identity 등록](#identity-등록과-chunked-문서)으로 state에 들어간다. 지수 구성과 상장 universe도
 같은 방식으로 [universe 등록](#universe-등록)의 `universe_versions`·`universe_members`에 들어간다.
+13F 보유 내역, 애널리스트 추정치, 연구 산출물은 `source_only`로 원천 자료실에 남는다.
 
 dataset의 백필은 연도 단위 generation, 이후 유지보수는 세션 단위(재무는 일 단위) generation으로
 게시한다.
+
+`aas data datasets`는 committed dataset version 전체(`datasets`), 카탈로그 항목마다 위 열과 그 항목에 속한
+dataset의 version 수와 head(`published`), 그리고 어느 항목에도 속하지 않는 committed dataset(`uncataloged`)을
+돌려준다. 카탈로그는 dataset을 설명할 뿐 게시를 막지 않는다. `aas data import`나 연구 입력 등록이 다른 이름으로
+게시한 generation도 그대로 읽히고 `uncataloged`에 이름이 남는다.
 
 ### KR 가격
 
@@ -2482,3 +2512,15 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-404 | proxy의 donor·target 선택은 계좌 통화여야 한다 | `tests/application/test_strict_head_inputs.py::test_a_proxy_reads_its_donor_and_target_in_the_account_currency` | 구현 |
 | DV-405 | grant 없는 실행 요청의 `request_hash`는 FX grant 계약 전과 같다 | `tests/engine/test_backtest_request.py::test_a_request_without_a_grant_keeps_its_hash` | 구현 |
 | DV-406 | grant 없는 연구 선언의 선언 hash와 봉인 문서는 grant 계약 전과 같다 | `tests/application/test_research_run.py::test_a_declaration_without_grants_keeps_its_hash_and_sealed_record` | 구현 |
+| DV-407 | [dataset 카탈로그](#dataset-카탈로그) 표는 `storage/dataset_catalog.py`의 `CATALOG`와 열마다 같다 | `tests/tools/test_dataset_catalog.py::test_the_documented_table_is_the_code_catalog` | 구현 |
+| DV-408 | `aas data datasets`는 문서의 카탈로그 항목을 그대로 돌려준다 | `tests/tools/test_dataset_catalog.py::test_datasets_command_reports_the_documented_catalog` | 구현 |
+| DV-409 | 등록된 매퍼는 모두 카탈로그의 자기 도메인 dataset을 만든다 | `tests/tools/test_dataset_catalog.py::test_every_registered_mapper_builds_a_dataset_of_its_domain` | 구현 |
+| DV-410 | 카탈로그의 시간·숫자 규칙은 등록된 규칙이고 매퍼의 시간 입력과 숫자 열 타입에 맞는다 | `tests/tools/test_dataset_catalog.py::test_rules_are_registered_and_fit_the_mappers` | 구현 |
+| DV-411 | 코드가 쓰는 dataset 이름은 모두 카탈로그 항목에 속한다 | `tests/tools/test_dataset_catalog.py::test_dataset_names_the_code_writes_are_cataloged` | 구현 |
+| DV-412 | committed dataset은 자기 항목(`.r<N>` 세대 포함) 아래 나열되고, 카탈로그 밖 이름은 게시된 채 `uncataloged`로 남는다 | `tests/storage/test_dataset_listing.py::test_published_datasets_are_listed_under_their_entry` | 구현 |
+| DV-413 | Qveris US 일간 `splits`·`dividends` 원천은 `actions.us.eodhd` generation으로 승격된다 | `tests/storage/test_qveris_actions.py::test_us_splits_and_dividends_promote_to_actions_us_eodhd` | 예정 |
+| DV-414 | Qveris KR(KO, KQ) 일간 `splits`·`dividends` 원천은 `actions.kr.eodhd` generation으로 승격된다 | `tests/storage/test_qveris_actions.py::test_kr_splits_and_dividends_promote_to_actions_kr_eodhd` | 예정 |
+| DV-415 | KIND 상장법인목록 원천은 `status.kr.kind` generation으로 승격된다 | `tests/storage/test_kind_status.py::test_kind_listings_promote_to_status_kr_kind` | 예정 |
+| DV-416 | DART 공시 목록(`list.json`) 원천은 `dart.list` 매퍼로 `filings.kr.dart` generation에 승격된다 | `tests/storage/test_dart_promotion.py::test_list_json_filings_promote_to_filings_kr_dart` | 예정 |
+| DV-417 | 기본 verify·backup은 기록된 digest를 대조하고 `--deep`만 저장된 행을 다시 해시한다 | `tests/storage/test_verification.py::test_default_verify_compares_digests_and_deep_rehashes` | 예정 |
+| DV-418 | KR 가격과 선언 달력의 승격 명세는 카탈로그 항목의 매퍼·시간·숫자·품질 규칙을 쓴다 | `tests/tools/test_dataset_catalog.py::test_kr_price_specs_use_the_catalog_rules` | 구현 |
