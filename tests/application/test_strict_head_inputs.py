@@ -56,7 +56,7 @@ from tests.application.test_storage_cli import run_cli
 from tests.engine.engine_support import contract, raw_bundle
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
     from pathlib import Path
 
 LAG: Final = "session_close_plus_lag@1"
@@ -1132,8 +1132,15 @@ def _krw_bars() -> list[Document]:
     return rows
 
 
-def _fixings(days: tuple[date, ...] = DAYS) -> list[Document]:
-    """The USD/KRW fixing of each of ``days``, fixed and known at the session's close."""
+def _fixings(
+    days: tuple[date, ...] = DAYS, available: Mapping[date, int] | None = None
+) -> list[Document]:
+    """The USD/KRW fixing of each of ``days``, fixed and known at the session's close.
+
+    A fixing ``available`` names a later instant for is recorded as known when it was
+    fixed but published only at that instant.
+    """
+    late = available or {}
     rows = []
     for index, (day, rate) in enumerate(zip(DAYS, USD_KRW, strict=True)):
         if day not in days:
@@ -1142,6 +1149,7 @@ def _fixings(days: tuple[date, ...] = DAYS) -> list[Document]:
             _identity(
                 {
                     **_common("usdkrw", index, micros(day), ingested=micros(DAYS[-1])),
+                    "available_at_us": late.get(day, micros(day)),
                     "base_currency": "USD",
                     "quote_currency": "KRW",
                     "fixing_at_us": micros(day),
@@ -1161,6 +1169,7 @@ def mixed_currency(  # noqa: PLR0913 -- the market split and the terms of its co
     signal_basis: str = "account_currency",
     max_age: int = 0,
     fixed: tuple[date, ...] = DAYS,
+    available: Mapping[date, int] | None = None,
     grant: bool = True,
 ) -> Document:
     """Move ASSET_B to a KRW chain beside the USD one and grant converting it into USD.
@@ -1178,7 +1187,7 @@ def mixed_currency(  # noqa: PLR0913 -- the market split and the terms of its co
         [{**row, "revision_id": "krw-" + row["revision_id"]} for row in action_rows()],
     )
     fx = heads_ref(
-        [sealed(workspace, "fx.usdkrw.syn", "fx_rates", _fixings(fixed))], [], "fx_rates"
+        [sealed(workspace, "fx.usdkrw.syn", "fx_rates", _fixings(fixed, available))], [], "fx_rates"
     )
     for selection in body["price_inputs"]:
         selection["instrument_ids"] = [
@@ -1334,6 +1343,46 @@ def test_a_fixing_converts_only_within_its_granted_age(
         strict["fx_conversions"][0]["max_fixing_age_days"] = 0
         with pytest.raises(ValueError, match="next-session open"):
             prepare(workspace, strict)
+
+
+def test_a_fixing_published_after_a_decision_converts_its_fills_not_its_signals(
+    stored_template: tuple[Path, bytes], tmp_path: Path
+) -> None:
+    """A decision converts with the fixings its cutoff knows; the fills use the later one.
+
+    The first decision's own session fixing is published only at the next session, so
+    that decision converts its last KRW close with the fixing before it, inside the
+    granted age, while the period's execution prices convert with the session's own.
+    """
+    late = DAYS[2]
+    body = copy_request(stored_template, tmp_path)
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        mixed_currency(workspace, body, max_age=40, available={late: micros(DAYS[3])})
+        prepared = prepare(workspace, body)
+    assert prepared.slots[0].decision_date == late
+    assert prepared.slots[0].cutoff_us < micros(DAYS[3]) <= prepared.slots[1].cutoff_us
+    index = DAYS.index(late)
+    assert prepared.features[late]["ASSET_B"].latest_price == pytest.approx(
+        VALUES["ASSET_B"][index] * USD_KRW[index] / USD_KRW[index - 1]
+    )
+    assert prepared.features[DAYS[4]]["ASSET_B"].latest_price == VALUES["ASSET_B"][4]
+    (record,) = json.loads(prepared.provenance)["fx_conversions"]
+    assert [late.isoformat(), late.isoformat(), float(USD_KRW[index])] in record["fixings"]
+    envelope = json.loads(prepared.envelope.canonical_bytes)
+    assert (
+        envelope["opens"][envelope["dates"].index(late.isoformat())]["ASSET_B"]
+        == (VALUES["ASSET_B"][index])
+    )
+
+
+@pytest.mark.parametrize("side", ["donor", "target"])
+def test_a_proxy_reads_its_donor_and_target_in_the_account_currency(side: str) -> None:
+    """A proxy's values carry no currency, so its selections must be in the account's."""
+    transition = {"donor_id": "ASSET_A", "target_id": "ASSET_B"}
+    preparation._proxy_currency(transition, {"ASSET_A": "USD", "ASSET_B": "USD"}, "USD")  # noqa: SLF001
+    currencies = {"ASSET_A": "USD", "ASSET_B": "USD", transition[side + "_id"]: "KRW"}
+    with pytest.raises(ValueError, match="proxy " + side + " .* is selected in KRW"):
+        preparation._proxy_currency(transition, currencies, "USD")  # noqa: SLF001
 
 
 def test_a_foreign_currency_without_a_grant_is_refused_by_name(

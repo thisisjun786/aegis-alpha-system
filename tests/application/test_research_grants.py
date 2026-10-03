@@ -100,13 +100,24 @@ def _prepared(home: Path, declaration: Document) -> PreparedResearchRun:
 
 
 def _fixings(
-    workspace: Workspace, name: str, rates: dict[date, str], *, base: str = "USD"
+    workspace: Workspace,
+    name: str,
+    rates: dict[date, str],
+    *,
+    base: str = "USD",
+    available: dict[date, int] | None = None,
 ) -> Document:
-    """Publish ``BASE/KRW`` fixings, fixed and known at 16:00 UTC; return the binding block."""
+    """Publish ``BASE/KRW`` fixings, fixed and known at 16:00 UTC; return the binding block.
+
+    A fixing ``available`` names a later instant for is recorded as known when it was
+    fixed but published only at that instant.
+    """
+    late = available or {}
     rows = [
         _identity(
             {
-                **_common(name, index, micros(day), ingested=micros(day)),
+                **_common(name, index, micros(day), ingested=late.get(day, micros(day))),
+                "available_at_us": late.get(day, micros(day)),
                 "base_currency": base,
                 "quote_currency": "KRW",
                 "fixing_at_us": micros(day),
@@ -238,7 +249,15 @@ def test_a_macro_grant_names_exactly_the_series_the_sleeves_read(
             _ = parse_research_run_request(canonical_json_bytes(granted | {"macro": value}))
 
 
-def _mixed(home: Path, declaration: Document, rates: tuple[int, ...]) -> Document:
+def _mixed(  # noqa: PLR0913 -- the two chains and the terms of their conversion
+    home: Path,
+    declaration: Document,
+    rates: tuple[int, ...],
+    *,
+    available: dict[date, int] | None = None,
+    signal_basis: str = "account_currency",
+    max_age: int = 0,
+) -> Document:
     """ASSET_A and REF_X from the KRW chain, ASSET_B from the USD chain, in a KRW account."""
     record = _promote_kr(home, _bars(COLLECTED))
     usd = cast("Document", _outcomes(home, declaration)["prices"])
@@ -247,6 +266,7 @@ def _mixed(home: Path, declaration: Document, rates: tuple[int, ...]) -> Documen
             workspace,
             "fx.usdkrw.syn",
             {day: str(rate) for day, rate in zip(DAYS, rates, strict=True)},
+            available=available,
         )
         _ = workspace.market.execute("CHECKPOINT")
     priced = _outcomes(home, declaration)
@@ -261,8 +281,8 @@ def _mixed(home: Path, declaration: Document, rates: tuple[int, ...]) -> Documen
         {
             "currency": "USD",
             "series_id": "USD/KRW",
-            "max_fixing_age_days": 0,
-            "signal_basis": "account_currency",
+            "max_fixing_age_days": max_age,
+            "signal_basis": signal_basis,
             "binding": fixings,
             "prices": usd,
         }
@@ -294,8 +314,16 @@ def test_a_mixed_currency_run_converts_the_granted_chain_into_its_account(
     assert [row[0] for row in conversion["fixings"]] == [
         day.isoformat() for day in DAYS[: len(DAYS) - 1]
     ]
-    assert [item["purpose"] for item in block["head_reads"]] == ["prices", "panels"]
-    assert block["head_reads"][0]["receipt"]["query"]["subjects"] == sorted(mixed["instrument_map"])
+    reads = block["head_reads"]
+    assert [item["purpose"] for item in reads] == ["prices", "panels"] + ["decision"] * len(
+        prepared.slots
+    )
+    assert reads[0]["receipt"]["query"]["subjects"] == sorted(mixed["instrument_map"])
+    # Each decision converts its signals with the fixings known at its own cutoff.
+    for item, slot in zip(reads[2:], prepared.slots, strict=True):
+        assert item["decision_date"] == slot.decision_date.isoformat()
+        assert item["receipt"]["query"]["known_ceiling_us"] == slot.cutoff_us
+        assert item["unconverted"] == []
 
 
 def test_each_session_takes_its_own_fixing(
@@ -308,6 +336,86 @@ def test_each_session_takes_its_own_fixing(
         index = DAYS.index(day)
         assert close["ASSET_B"] == VALUES["ASSET_B"][index] * rates[index]
         assert close["ASSET_A"] == VALUES["ASSET_A"][index] * 1000
+
+
+def _signal_spy(monkeypatch: pytest.MonkeyPatch) -> dict[date, dict[date, float]]:
+    """Record the ASSET_B signal closes each decision's sleeve is handed."""
+    seen: dict[date, dict[date, float]] = {}
+    original = backtest_prepare._replay_sleeve  # noqa: SLF001 -- the decision's own inputs
+
+    def spy(sleeve: Any, points: Any, slot: Any, *args: Any) -> Any:  # noqa: ANN401
+        seen[slot.decision_date] = {point.as_of: point.close for point in points["ASSET_B"]}
+        return original(sleeve, points, slot, *args)
+
+    monkeypatch.setattr(backtest_prepare, "_replay_sleeve", spy)
+    return seen
+
+
+RATES = (1000, 1100, 1200, 1300, 1400, 1300, 1200, 1100)
+
+
+def test_a_decision_converts_its_signals_with_the_fixings_its_cutoff_knows(
+    installation: tuple[Path, Document, Document], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fixing published only after a decision converts the marks, never that decision.
+
+    The first decision's own session fixing is published days after it. That decision falls
+    back to the fixing before it inside the granted age, the later decision reads the late
+    fixing once it is known, and the marking panels convert with it throughout.
+    """
+    home, _body, declaration = installation
+    seen = _signal_spy(monkeypatch)
+    late = DAYS[2]
+    mixed = _mixed(
+        home,
+        declaration,
+        RATES,
+        available={late: micros(DAYS[3])},
+        max_age=40,
+    )
+    prepared = _prepared(home, mixed)
+    first, second = (slot.decision_date for slot in prepared.slots)
+    assert first == late
+    index = DAYS.index(late)
+    assert prepared.slots[0].cutoff_us < micros(DAYS[3]) <= prepared.slots[1].cutoff_us
+    assert seen[first][late] == VALUES["ASSET_B"][index] * RATES[index - 1]
+    assert seen[second][late] == VALUES["ASSET_B"][index] * RATES[index]
+    for day, close in zip(prepared.inputs.dates, prepared.inputs.closes, strict=True):
+        position = DAYS.index(day)
+        assert close["ASSET_B"] == VALUES["ASSET_B"][position] * RATES[position]
+    block = cast("Document", json.loads(prepared.provenance)["fx_conversions"])
+    (conversion,) = block["conversions"]
+    assert [late.isoformat(), late.isoformat(), float(RATES[index])] in conversion["fixings"]
+    # With no age to fall back on, the first decision has no converted point for that
+    # session, so its sleeve is short of the month the session would have supplied.
+    exact = json.loads(json.dumps(mixed))
+    exact["fx_conversions"][0]["max_fixing_age_days"] = 0
+    with pytest.raises(ValueError, match="insufficient eligible buckets for ASSET_B"):
+        _ = _prepared(home, exact)
+
+
+def test_a_research_conversion_states_which_currency_its_signals_read(
+    installation: tuple[Path, Document, Document], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Signals read converted closes, or the USD closes when the grant keeps them there."""
+    home, _body, declaration = installation
+    seen = _signal_spy(monkeypatch)
+    mixed = _mixed(home, declaration, RATES, signal_basis="price_currency")
+    native = _prepared(home, mixed)
+    in_usd = {decision: dict(points) for decision, points in seen.items()}
+    mixed["fx_conversions"][0]["signal_basis"] = "account_currency"
+    account = _prepared(home, mixed)
+    for decision, points in in_usd.items():
+        assert points
+        for day, close in points.items():
+            index = DAYS.index(day)
+            assert close == VALUES["ASSET_B"][index]
+            assert seen[decision][day] == VALUES["ASSET_B"][index] * RATES[index]
+    # Signals in USD read no fixing at a decision; the marks are converted either way.
+    reads = json.loads(native.provenance)["fx_conversions"]["head_reads"]
+    assert [item["purpose"] for item in reads] == ["prices", "panels"]
+    assert native.inputs.opens == account.inputs.opens
+    assert native.inputs.closes == account.inputs.closes
 
 
 @pytest.mark.parametrize(

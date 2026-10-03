@@ -13,7 +13,7 @@ from dataclasses import asdict, replace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Final, cast
 
 import pytest
 
@@ -1429,6 +1429,23 @@ def _krw_execution(body: Document) -> Document:
     }
     body["fx_conversions"] = [conversion]
     return conversion
+
+
+# The request hash of each grant-free fixture, as the contract computed it before
+# conversion grants existed. An optional field must leave a request it is absent from
+# byte for byte unchanged, so these hashes never move.
+UNGRANTED_REQUEST_HASHES: Final = {
+    False: "2f22d30ad50217b4d1eb916356e7c3fff38d96383cb61a2f5840dc1a7b865f47",
+    True: "30bc572a9a139e07d49bc8a2eb85cac90477d20834984a09427756708d0eb03d",
+}
+
+
+@pytest.mark.parametrize("rich", [False, True], ids=["contract", "rich-contract"])
+def test_a_request_without_a_grant_keeps_its_hash(*, rich: bool) -> None:
+    body, definition, docs = fixture(rich=rich)
+    _, single = project(body, definition, docs)
+    assert single.request_hash == UNGRANTED_REQUEST_HASHES[rich]
+    assert hashlib.sha256(single.canonical_bytes).hexdigest() == single.request_hash
 
 
 def test_a_foreign_price_currency_is_admitted_by_its_fx_conversion_grant() -> None:

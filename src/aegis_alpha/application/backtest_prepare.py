@@ -1614,6 +1614,12 @@ def _proxies(loader: _Loader, body: Row, prices: tuple[_Prices, ...]) -> tuple[_
         if item.role == "execution_prices"
         for instrument in item.instruments
     }
+    currencies = {
+        instrument: item.currency
+        for item in prices
+        if item.role == "execution_prices"
+        for instrument in item.instruments
+    }
     for selection in _rows(body["proxy_rules"]):
         pin = _generation(_selection_ref(selection, loader.bindings))
         stored = load_pinned_proxy(loader.workspace, pin, budget=loader.budget)
@@ -1632,6 +1638,7 @@ def _proxies(loader: _Loader, body: Row, prices: tuple[_Prices, ...]) -> tuple[_
             }:
                 raise ValueError("proxy convention reference mismatch")
         _proxy_sources(loader, transition, selected_sources)
+        _proxy_currency(transition, currencies, _text(_row(body["account"])["currency"]))
         loader.retain("proxy:" + logical, {"definition": doc, "history": stored.history})
         result.append(_Proxy(logical, stored.history, transition))
     return tuple(result)
@@ -1651,6 +1658,29 @@ def _proxy_sources(
         if required and (instrument not in selected or pin not in selected[instrument]):
             raise ValueError(
                 "proxy donor/target must match explicitly selected native execution sources"
+            )
+
+
+def _proxy_currency(transition: Row, currencies: Mapping[str, str], account: str) -> None:
+    """Hold a proxy's selected donor and target to the account currency.
+
+    A proxy's feature values carry no currency, so no conversion can state them in the
+    account currency; a donor or target selected in another currency is refused by name.
+    """
+    for side in ("donor", "target"):
+        instrument = _text(transition[side + "_id"])
+        currency = currencies.get(instrument, account)
+        if currency != account:
+            raise ValueError(
+                "proxy "
+                + side
+                + " "
+                + instrument
+                + " is selected in "
+                + currency
+                + ", not the account currency "
+                + account
+                + "; a proxy carries no currency"
             )
 
 
@@ -2351,6 +2381,9 @@ class _Observed:
     known_us: Mapping[str, Mapping[date, int]]
     series: frozenset[str]
     calendar_ref: str
+    # A signal panel's instruments whose closes each decision converts, by the series name
+    # the store carries them under and the conversion that applies.
+    converts: Mapping[str, tuple[str, _Fx]] = field(default_factory=dict)
 
 
 def _declared_pin(reference: object) -> GenerationPin:
@@ -2427,9 +2460,11 @@ def _price_panels(
 
     A bar in a currency the declaration grants a conversion for is stated in the account
     currency with the fixings known at the ceiling, read once over the same window; a bar
-    no fixing converts is left out of both panels like a bar that is not present. The
-    signal panel is the converted close, or the close in its own currency when the
-    conversion keeps signals there.
+    no fixing converts is left out of both marking panels like a bar that is not present.
+    The signal panel holds each close in its own currency. Where the conversion states
+    signals in the account currency, each decision converts the closes it reads with the
+    fixings known at its own cutoff, so a fixing fixed or known after a decision never
+    reaches that decision's signals.
     """
     binding = cast("HeadBinding", declaration.prices)
     start = min(declaration.history.start, declaration.period.start)
@@ -2451,6 +2486,7 @@ def _price_panels(
     known: dict[str, dict[date, int]] = {}
     seen: set[str] = set()
     sessions: set[tuple[str, date]] = set()
+    converts: dict[str, tuple[str, _Fx]] = {}
     converting = _OutcomeFx(loader, conversions, visibility, (start, end), "panels")
     for head, required in (
         (head, required) for source, required in sources for head in source.rows
@@ -2474,13 +2510,9 @@ def _price_panels(
         if stated["open"] is not None and stated["close"] is not None:
             for role in ("open", "close"):
                 values[role].setdefault(instrument, {})[session] = cast("float", stated[role])
-        signal = (
-            _number(row["close"])
-            if fx is not None and fx.conversion.signal_basis == "price_currency"
-            else stated["close"]
-        )
-        if signal is not None:
-            values["signal"].setdefault(instrument, {})[session] = signal
+        values["signal"].setdefault(instrument, {})[session] = _number(row["close"])
+        if fx is not None and fx.conversion.signal_basis == "account_currency":
+            converts[instrument] = (name, fx)
         observed.setdefault(instrument, {})[session] = visibility.observed(row, session)
         # The bar's own end instant orders sessions for the date-only schedule. It is the
         # economic axis of the bar, not a knowledge time, exactly as the observation
@@ -2507,7 +2539,15 @@ def _price_panels(
         },
     )
     panels = {
-        role: _Observed(role, values[role], observed, known, frozenset(seen), reference)
+        role: _Observed(
+            role,
+            values[role],
+            observed,
+            known,
+            frozenset(seen),
+            reference,
+            MappingProxyType(converts) if role == "signal" else MappingProxyType({}),
+        )
         for role in ("open", "close", "signal")
     }
     return panels, read
@@ -2744,7 +2784,9 @@ def _research_decisions(  # noqa: PLR0913 -- the sleeves, their schedule and eve
 
     Each granted macro series is read at the decision's own cutoff (never past the
     declared knowledge time), so a decision sees the vintage known when it was made where
-    the store records one, and each sleeve receives the series its contract reads.
+    the store records one, and each sleeve receives the series its contract reads. A
+    signal converted into the account currency is converted the same way: with the
+    fixings known at the decision's cutoff.
     """
     close = panels.get("signal", panels["close"])
     offense = sleeves[0]
@@ -2757,17 +2799,25 @@ def _research_decisions(  # noqa: PLR0913 -- the sleeves, their schedule and eve
             )
             for item in macro
         }
-        points = {
-            instrument: tuple(
-                PricePoint(session, value, close.observed[instrument][session])
-                for session, value in sorted(series.items())
+        readable = {
+            instrument: {
+                session: value
+                for session, value in series.items()
                 # The declared history window bounds what a signal may look back on, as
                 # it does on the executable path. It does not bound the marking panels:
                 # a period legitimately extends past the lookback window it warmed up on.
                 if visibility.history_start <= session <= visibility.history_end
                 and close.known_us[instrument][session] <= slot.cutoff_us
-            )
+            }
             for instrument, series in close.values.items()
+        }
+        _convert_signals(loader, close.converts, readable, visibility, known)
+        points = {
+            instrument: tuple(
+                PricePoint(session, value, close.observed[instrument][session])
+                for session, value in sorted(values.items())
+            )
+            for instrument, values in readable.items()
         }
         chosen, receipt = offense, _replay_sleeve(offense, points, slot, visibility, series)
         if len(sleeves) > 1 and any(receipt.master_switch.values()):
@@ -2778,6 +2828,49 @@ def _research_decisions(  # noqa: PLR0913 -- the sleeves, their schedule and eve
             receipt = _replay_sleeve(chosen, points, slot, visibility, series)
         receipts.append(ResearchDecision(receipt, chosen))
     return tuple(receipts)
+
+
+def _convert_signals(
+    loader: _Loader,
+    converts: Mapping[str, tuple[str, _Fx]],
+    readable: dict[str, dict[date, float]],
+    visibility: _Visibility,
+    slot: DecisionSlot,
+) -> None:
+    """Convert one decision's signal closes, in place, with the fixings its cutoff knows.
+
+    One fixing read per currency serves every instrument in it, over the sessions the
+    decision reads. A close no fixing known at the cutoff converts is not a signal point,
+    and the decision's read record names it.
+    """
+    by_currency: dict[str, list[tuple[str, str]]] = {}
+    for instrument, (name, fx) in sorted(converts.items()):
+        if readable.get(instrument):
+            by_currency.setdefault(fx.conversion.currency, []).append((instrument, name))
+    for _, members in sorted(by_currency.items()):
+        fx = converts[members[0][0]][1]
+        days = [day for instrument, _ in members for day in readable[instrument]]
+        rates, read = _fx_rates(loader, fx, visibility, slot.cutoff_us, (min(days), max(days)))
+        converted = 0
+        unconverted = []
+        for instrument, name in members:
+            values = readable[instrument]
+            for day, value in list(values.items()):
+                stated = rates.convert(value, day)
+                if stated is None:
+                    del values[day]
+                    unconverted.append((name, day))
+                else:
+                    values[day] = stated[0]
+                    converted += 1
+        _record_fx(
+            loader,
+            fx,
+            ("decision", slot.decision_date),
+            read,
+            converted=converted,
+            unconverted=unconverted,
+        )
 
 
 def _replay_sleeve(
