@@ -237,10 +237,15 @@ def test_plan_reads_originals_and_writes_nothing(tmp_path: Path, home: Path) -> 
     # Two batches share one CSV byte string; the file is counted once.
     assert entry["files"] == len([*root.glob("batch-*-result.json"), *root.rglob("*.csv")])
     # The plan and acquisition record the loader read are retained; nothing is left uncovered.
-    assert cast("dict", entry["retained"]) == {
+    retained = cast("dict", entry["retained"])
+    inventory = retained.pop("inventory")
+    assert retained == {
         "files": 2,
         "bytes": sum(path.stat().st_size for path in root.glob("[pa][lc]*-*.json")),
     }
+    # One row per retained file: the plan and the acquisition record.
+    assert inventory["rows"] == retained["files"]
+    assert str(inventory["source_id"]).startswith("legacy-retained-files-")
     assert cast("dict", entry["uncovered"]) == {"files": 0, "bytes": 0, "paths": []}
     sources = _sources(report)
     assert [source["rows"] for source in sources] == [2, 2]
@@ -263,9 +268,11 @@ def test_apply_commits_content_sources_and_reruns_reuse(tmp_path: Path, home: Pa
     ]
     assert [s["reused"] for s in _sources(applied)] == [False, False]
     assert [s["reused"] for s in _sources(again)] == [True, True]
-    assert commits == (2,)
+    assert cast("dict", _only(again)["retained"])["inventory"]["reused"] is True
+    # Two unit sources and the retained-file inventory.
+    assert commits == (3,)
     assert links is not None
-    assert tuple(links) == (2,)
+    assert tuple(links) == (3,)
     # Every original is retained in raw/ under its own hash, and the manifest beside them.
     for path in [*root.rglob("*.csv"), *root.glob("*.json")]:
         digest = _sha(path.read_bytes())
@@ -384,8 +391,9 @@ def test_verify_requires_committed_identical_linked_sources(tmp_path: Path, home
     with open_workspace(home) as workspace:
         before = verify_import(workspace, manifest)
     assert before["complete"] is False
-    # Every planned source and both retained index files (plan, acquisition) are unmatched.
-    assert before["unmatched"] == len(_sources(before)) + 2
+    # Every planned source, both retained index files (plan, acquisition) and the retained-file
+    # inventory are unmatched.
+    assert before["unmatched"] == len(_sources(before)) + 3
     assert {s["status"] for s in _sources(before)} == {"missing"}
     with open_workspace(home, writable=True, strategy_write=True) as workspace:
         apply_import(workspace, manifest)
@@ -552,6 +560,28 @@ def test_sec_archive_indexes_members_and_checks_receipts(tmp_path: Path, home: P
     ]
     _private(receipt_path, _json({"sha256": "0" * 64}))
     assert "disagrees on sha256" in _refusal(plan_import(manifest))
+
+
+def test_sec_archive_refuses_a_corrupt_deflate_stream(tmp_path: Path) -> None:
+    archive_path, receipt_path, _ = _archive(tmp_path)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        member = zipfile.ZipInfo("CIK0000000001.json", (2026, 9, 5, 4, 25, 4))
+        archive.writestr(member, b"{}", compress_type=zipfile.ZIP_DEFLATED)
+        archive.writestr(zipfile.ZipInfo("placeholder.txt", (2026, 9, 5, 4, 25, 4)), b"x")
+        info = archive.getinfo("CIK0000000001.json")
+    payload = buffer.getvalue()
+    # A reserved deflate block type: zlib refuses the stream before any CRC is computed.
+    start = info.header_offset + 30 + len(info.filename.encode()) + len(info.extra)
+    corrupt = payload[:start] + b"\xff" + payload[start + 1 :]
+    _private(archive_path, corrupt)
+    receipt = {"bytes": len(corrupt), "json_members": 1, "members": 2, "sha256": _sha(corrupt)}
+    _private(receipt_path, _json(receipt))
+    entry = _entry("sec", "sec.submissions_zip@1", archive_path, json_members=1, members=2)
+    entry["args"] = {"evidence": [str(receipt_path)]}
+    report = plan_import(_manifest([entry]))
+    assert "CIK0000000001.json" in _refusal(report)
+    assert report["reconciled"] is False
 
 
 def _small_originals(
@@ -887,6 +917,7 @@ def test_uncovered_files_keep_verify_incomplete(tmp_path: Path, home: Path) -> N
     manifest = _manifest([entry])
     with open_workspace(home, writable=True, strategy_write=True) as workspace:
         applied = _only(apply_import(workspace, manifest))
+    inventory = cast("dict", applied["retained"]).pop("inventory")
     assert applied["retained"] == {
         "files": 4,
         "bytes": sum(
@@ -900,13 +931,29 @@ def test_uncovered_files_keep_verify_incomplete(tmp_path: Path, home: Path) -> N
     assert (home / "raw" / digest[:2] / digest).read_bytes() == b"print('collect')\n"
     with open_workspace(home) as workspace:
         assert verify_import(workspace, manifest)["complete"] is True
+        # The inventory maps each retained path to its bytes, independent of the originals.
+        rows = _rows(workspace, inventory)
+    plan_name = next(root.glob("plan-*")).name
+    assert sorted((row["path"], row["sha256"], row["reason"]) for row in rows) == sorted(
+        [
+            (f"batch-000/history/{_sha(_BBB)}.csv", _sha(_BBB), "retain"),
+            ("collect.py", digest, "retain"),
+            (plan_name, _sha((root / plan_name).read_bytes()), "index"),
+            (
+                next(root.glob("acquisition-*")).name,
+                _sha(next(root.glob("acquisition-*")).read_bytes()),
+                "index",
+            ),
+        ]
+    )
     # A retained file whose raw copy is gone is unmatched.
     (home / "raw" / digest[:2] / digest).unlink()
     with open_workspace(home) as workspace:
         report = verify_import(workspace, manifest)
     assert report["complete"] is False
     assert report["unmatched_sources"] == [
-        {"entry": "equity", "file": "collect.py", "status": "not_retained"}
+        {"entry": "equity", "unit": "retained", "status": "link_unbacked"},
+        {"entry": "equity", "file": "collect.py", "status": "not_retained"},
     ]
 
 

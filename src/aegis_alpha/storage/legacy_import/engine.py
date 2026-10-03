@@ -13,13 +13,18 @@
 - ``verify_import`` re-derives the plan from the originals and checks that every planned
   source is committed and complete in the installation with the same rows and digest, that
   its stored table still rehashes to them, that its ``sl:`` link matches and every linked
-  original is intact in ``raw/``, and that every retained index file is intact in ``raw/``.
-  A source or retained file that fails is ``unmatched``.
+  original is intact in ``raw/``, that every retained file is intact in ``raw/``, and that the
+  entry's retained-file inventory is committed. A source or retained file that fails is
+  ``unmatched``.
 
 Every regular file below an entry's root is accounted for. A unit file is covered by its
 source. An index file the loader read to discover its units (a membership plan, a batch
 result of another family, an export plan) and a file matching the entry's ``retain``
-patterns are retained in ``raw/`` as they are, without a table. A file matching ``exclude``
+patterns are retained in ``raw/`` as they are. The entry's retained files are named by one
+inventory source, ``legacy-retained-files-<hex>`` with table ``retained_files`` (relative
+path, SHA-256, size, reason ``index`` or ``retain``), whose originals are the inventory
+document ``aas-legacy-retained-v1`` and every retained file; so after the entry's root is
+deleted the store still maps each retained path to its bytes. A file matching ``exclude``
 is reported as excluded. Every other file is ``uncovered``: the report counts it, its bytes
 and the first paths. ``complete`` holds only with zero unmatched, ``reconciled`` and zero
 uncovered files, and it is the precondition for deleting an entry's root outside the store.
@@ -31,12 +36,14 @@ Every report states, per entry, the loader's reconciliation metrics beside the m
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import os
 import stat
 from typing import TYPE_CHECKING, Final, cast
 
 from aegis_alpha.data.descriptor_tree import DescriptorTree, DescriptorTreeError
+from aegis_alpha.storage import source_library_schema as schema
 from aegis_alpha.storage.legacy_import.files import OriginalBytes, RetainedBytes
 from aegis_alpha.storage.legacy_import.loaders import (
     SCHEMA_MAJOR,
@@ -91,7 +98,20 @@ LOADERS: Final[dict[str, Loader]] = {
 }
 
 type _Commit = Callable[[Entry, Loader, Unit, Run], list[dict[str, object]]]
-type _Retain = Callable[[Entry, dict[Path, SourceFile]], list[dict[str, str]]]
+# Keeps an entry's retained files and records their inventory; returns the files that are
+# not intact in raw/ and the inventory source's report row (None when nothing is retained).
+type _Retain = Callable[
+    [Entry, dict[Path, SourceFile], dict[Path, str]],
+    tuple[list[dict[str, str]], dict[str, object] | None],
+]
+
+RETAINED_FORMAT: Final = "aas-legacy-retained-v1"
+RETAINED: Final = Table(
+    "legacy",
+    "retained-files",
+    "retained_files",
+    (("path", "string"), ("sha256", "string"), ("size_bytes", "int64"), ("reason", "string")),
+)
 
 # The uncovered paths a report names per entry; the counts and bytes cover all of them.
 _UNCOVERED_PATHS: Final = 20
@@ -179,10 +199,11 @@ def _match(path: Path, root: Path, patterns: tuple[str, ...]) -> bool:
 
 def _coverage(
     entry: Entry, units: list[Unit], discovery: OriginalBytes
-) -> tuple[dict[Path, SourceFile], dict[str, object], list[dict[str, str]]]:
+) -> tuple[dict[Path, SourceFile], dict[Path, str], dict[str, object], list[dict[str, str]]]:
     """Classify every file below the entry root; hash the ones that are retained."""
     covered = {path for unit in units for path in unit.files}
     retained = {path: item for path, item in discovery.seen.items() if path not in covered}
+    reasons = dict.fromkeys(retained, "index")
     refusals: list[dict[str, str]] = []
     excluded = [0, 0]
     uncovered: list[tuple[Path, int]] = []
@@ -197,6 +218,7 @@ def _coverage(
                 refusals.append({"unit": "retain", "reason": str(error)})
                 continue
             retained[path] = discovery.seen[path]
+            reasons[path] = "retain"
         elif _match(path, entry.path, entry.exclude):
             excluded[0] += 1
             excluded[1] += size
@@ -216,7 +238,59 @@ def _coverage(
             ],
         },
     }
-    return retained, report, refusals
+    return retained, reasons, report, refusals
+
+
+def _relative(entry: Entry, path: Path) -> str:
+    if path == entry.path or not path.is_relative_to(entry.path):
+        return path.name
+    return path.relative_to(entry.path).as_posix()
+
+
+def _inventory_document(
+    entry: Entry, retained: dict[Path, SourceFile], reasons: dict[Path, str]
+) -> bytes:
+    """The canonical retained-file inventory of one entry: path, hash, size and reason."""
+    files = sorted(
+        [_relative(entry, path), item.sha256, item.size_bytes, reasons[path]]
+        for path, item in retained.items()
+    )
+    return schema.encoded(
+        {"format": RETAINED_FORMAT, "entry": entry.name, "loader": entry.loader, "files": files}
+    ).encode()
+
+
+def _inventory_reader(document: bytes) -> pa.RecordBatchReader:
+    import pyarrow as pa  # noqa: PLC0415 -- the Arrow loaders need the legacy extra
+
+    files = cast("list[list[object]]", json.loads(document)["files"])
+    columns = list(zip(*files, strict=True)) if files else [[], [], [], []]
+    batch = pa.RecordBatch.from_arrays(
+        [
+            pa.array(list(column), type=f.type)
+            for column, f in zip(columns, RETAINED.schema(), strict=True)
+        ],
+        schema=RETAINED.schema(),
+    )
+    return pa.RecordBatchReader.from_batches(RETAINED.schema(), [batch])
+
+
+def _inventory_content(document: bytes, files: tuple[SourceFile, ...]) -> SourceContent:
+    index = SourceFile(hashlib.sha256(document).hexdigest(), len(document))
+    return SourceContent(RETAINED.provider, RETAINED.shape, SCHEMA_MAJOR, (index, *files))
+
+
+def _derive_inventory(document: bytes, files: tuple[SourceFile, ...]) -> dict[str, object]:
+    from aegis_alpha.storage.source_library_digest import arrow_digest  # noqa: PLC0415
+
+    rows, digest = arrow_digest(_inventory_reader(document))
+    return {
+        "unit": "retained",
+        "table": RETAINED.name,
+        "source_id": _inventory_content(document, files).source_id,
+        "rows": rows,
+        "digest": digest,
+    }
 
 
 def _report(
@@ -237,7 +311,7 @@ def _report(
         discovery = OriginalBytes()
         try:
             units = loader.units(entry, discovery, run)
-            retained, coverage, coverage_refusals = _coverage(entry, units, discovery)
+            retained, reasons, coverage, coverage_refusals = _coverage(entry, units, discovery)
         except (OSError, ValueError) as error:
             if stop_on_refusal:
                 error.add_note(f"legacy entry {entry.name}")
@@ -248,7 +322,8 @@ def _report(
         if coverage_refusals and stop_on_refusal:
             raise ValueError(coverage_refusals[0]["reason"])
         refusals.extend(coverage_refusals)
-        missing = retain(entry, retained)
+        missing, inventory = retain(entry, retained, reasons)
+        cast("dict[str, object]", coverage["retained"])["inventory"] = inventory
         files: dict[str, int] = {}
         for unit in units:
             try:
@@ -331,12 +406,16 @@ def plan_import(manifest: Manifest) -> dict[str, object]:
     for entry in manifest.entries:
         _loader(entry)
 
-    return _report(manifest, "plan", _derive, _no_retain, stop_on_refusal=False)
+    return _report(manifest, "plan", _derive, _plan_retain, stop_on_refusal=False)
 
 
-def _no_retain(entry: Entry, retained: dict[Path, SourceFile]) -> list[dict[str, str]]:
-    del entry, retained
-    return []
+def _plan_retain(
+    entry: Entry, retained: dict[Path, SourceFile], reasons: dict[Path, str]
+) -> tuple[list[dict[str, str]], dict[str, object] | None]:
+    if not retained:
+        return [], None
+    document = _inventory_document(entry, retained, reasons)
+    return [], _derive_inventory(document, tuple(retained.values()))
 
 
 def apply_import(workspace: Workspace, manifest: Manifest) -> dict[str, object]:
@@ -386,13 +465,41 @@ def apply_import(workspace: Workspace, manifest: Manifest) -> dict[str, object]:
         _with_files(produced, files)
         return produced
 
-    def retain(entry: Entry, retained: dict[Path, SourceFile]) -> list[dict[str, str]]:
+    def retain(
+        entry: Entry, retained: dict[Path, SourceFile], reasons: dict[Path, str]
+    ) -> tuple[list[dict[str, str]], dict[str, object] | None]:
         for path, item in retained.items():
             _, digest, size = put_raw_file(workspace.paths.raw, path)
             if SourceFile(digest, size) != item:
                 message = f"legacy index file changed after it was read: {path.name}"
                 raise ValueError(message + f" (entry {entry.name})")
-        return []
+        if not retained:
+            return [], None
+        document = _inventory_document(entry, retained, reasons)
+        put_raw(workspace.paths.raw, document)
+        content = _inventory_content(document, tuple(retained.values()))
+        result = import_content_arrow(
+            workspace,
+            content,
+            RETAINED.name,
+            _inventory_reader(document),
+            lineage={
+                "loader": entry.loader,
+                "entry": entry.name,
+                "unit": "retained",
+                "manifest_sha256": manifest.sha256,
+            },
+        )
+        committed = cast("list[dict[str, object]]", result["tables"])[0]
+        return [], {
+            "unit": "retained",
+            "table": RETAINED.name,
+            "source_id": content.source_id,
+            "rows": committed["rows"],
+            "digest": committed["digest"],
+            "reused": result["reused"],
+            "link": result.get("link"),
+        }
 
     return _report(manifest, "apply", commit, retain, stop_on_refusal=True)
 
@@ -435,7 +542,9 @@ def verify_import(workspace: Workspace, manifest: Manifest) -> dict[str, object]
             item["status"] = _status(workspace, item)
         return derived
 
-    def retain(entry: Entry, retained: dict[Path, SourceFile]) -> list[dict[str, str]]:
+    def retain(
+        entry: Entry, retained: dict[Path, SourceFile], reasons: dict[Path, str]
+    ) -> tuple[list[dict[str, str]], dict[str, object] | None]:
         from aegis_alpha.storage.raw import verify_raw  # noqa: PLC0415
 
         missing = []
@@ -445,7 +554,12 @@ def verify_import(workspace: Workspace, manifest: Manifest) -> dict[str, object]
             except (OSError, ValueError, DescriptorTreeError):
                 relative = path.relative_to(entry.path) if path.is_relative_to(entry.path) else path
                 missing.append({"file": str(relative), "status": "not_retained"})
-        return missing
+        if not retained:
+            return missing, None
+        document = _inventory_document(entry, retained, reasons)
+        derived = _derive_inventory(document, tuple(retained.values()))
+        derived["status"] = _status(workspace, derived)
+        return missing, derived
 
     report = _report(manifest, "verify", commit, retain, stop_on_refusal=False)
     entries = cast("list[dict[str, object]]", report["entries"])
@@ -455,6 +569,11 @@ def verify_import(workspace: Workspace, manifest: Manifest) -> dict[str, object]
         for source in cast("list[dict[str, object]]", entry["sources"])
         if source["status"] != "committed"
     ]
+    unmatched.extend(
+        {"entry": entry["name"], "unit": "retained", "status": item["status"]}
+        for entry in entries
+        if (item := _inventory_of(entry)) is not None and item["status"] != "committed"
+    )
     unmatched.extend(
         {"entry": entry["name"], **item}
         for entry in entries
@@ -467,3 +586,10 @@ def verify_import(workspace: Workspace, manifest: Manifest) -> dict[str, object]
         report["unmatched"] == 0 and bool(report["reconciled"]) and totals["uncovered_files"] == 0
     )
     return report
+
+
+def _inventory_of(entry: dict[str, object]) -> dict[str, object] | None:
+    retained = cast("dict[str, object] | None", entry.get("retained"))
+    if retained is None:
+        return None
+    return cast("dict[str, object] | None", retained.get("inventory"))
