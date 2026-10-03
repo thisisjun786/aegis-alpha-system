@@ -207,6 +207,9 @@ def test_norgate_capital_adjustments_step_the_price_factor() -> None:
                 _part(7, D[4], 100.0, noise),
                 _part(8, D[0], 60.0, 90.0),
                 _part(8, D[1], 61.0, 61.0),  # 3:2 split
+                _part(10, D[0], 10.0, 20.0),
+                # A step on a row that is not at midnight has no session: never an action.
+                {**_part(10, D[1], 10.0, 10.0), "date": _midnight(D[1]) + timedelta(hours=1)},
                 {**_part(9, D[0], 10.0, 40.0), "adjustment_type": "TOTALRETURN"},
                 {**_part(9, D[1], 10.0, 10.0), "adjustment_type": "TOTALRETURN"},
             ],
@@ -359,10 +362,20 @@ def _pin(ws: Workspace, source_id: str, name: str) -> dict[str, str]:
     }
 
 
-def _register(ws: Workspace, source_id: str, assets: list[int]) -> dict[str, str]:
+def _register(
+    ws: Workspace,
+    source_id: str,
+    assets: list[int],
+    *,
+    provider: str = "norgate",
+    symbols: list[str] | None = None,
+) -> dict[str, str]:
+    """Anchor each asset ID and assert it for ``provider``: its asset ID, or its FMP symbol."""
     from aegis_alpha.storage.identity import snapshot_identities  # noqa: PLC0415
 
     anchors = [{"anchor_namespace": "norgate_assetid", "anchor_token": str(a)} for a in assets]
+    namespace = "norgate_assetid" if symbols is None else "fmp_symbol"
+    tokens = symbols or [str(a) for a in assets]
     document = {
         "schema": "aas-identity-registry-v1",
         "issuers": [],
@@ -373,21 +386,21 @@ def _register(ws: Workspace, source_id: str, assets: list[int]) -> dict[str, str
         "assertions": [
             {
                 "instrument": anchor,
-                "provider": "norgate",
-                "namespace": "norgate_assetid",
-                "token": anchor["anchor_token"],
+                "provider": provider,
+                "namespace": namespace,
+                "token": token,
                 "valid_from_us": UNBOUNDED,
                 "valid_to_us": None,
                 "known_from_us": 1,
                 "supersedes_assertion_id": None,
                 "source_snapshot_id": "sl:" + source_id,
-                "source_hash": hashlib.sha256(anchor["anchor_token"].encode()).hexdigest(),
+                "source_hash": hashlib.sha256(token.encode()).hexdigest(),
             }
-            for anchor in anchors
+            for anchor, token in zip(anchors, tokens, strict=True)
         ],
     }
     register_identities(ws.state, parse_registry(document), apply=True)
-    report = snapshot_identities(ws.state, "norgate", created_at_us=5, apply=True)
+    report = snapshot_identities(ws.state, provider, created_at_us=5, apply=True)
     return {"snapshot_id": str(report["snapshot_id"]), "content_hash": str(report["content_hash"])}
 
 
@@ -400,19 +413,20 @@ def _spec(  # noqa: PLR0913 -- every spec field a test varies
     decimals: dict[str, str],
     parent: str | None = None,
     partition: dict[str, str] | None = None,
+    dataset: str = "actions.us.norgate",
+    args: dict[str, object] | None = None,
 ) -> tuple[bytes, str]:
     rule = {
         "rule": EXDATE,
         "basis": "record",
         "input": "ex_date",
-        "args": {"calendar": calendar, "calendar_id": "XKRX", "venue": "XKRX"},
+        "args": {"calendar": calendar, "calendar_id": "XNYS", "venue": "XNYS"},
     }
     document = {
         "schema_version": "aas-promotion-v1",
-        "target": {"domain": "corporate_actions", "dataset_id": "actions.us.norgate",
-                   "parent": parent},
+        "target": {"domain": "corporate_actions", "dataset_id": dataset, "parent": parent},
         "sources": sources,
-        "mapper": {"name": mapper_name, "args": {"timezone": NEW_YORK}},
+        "mapper": {"name": mapper_name, "args": args or {"timezone": NEW_YORK}},
         "partition": partition,
         "time_rules": {"available_at_us": rule, "revision_known_at_us": rule},
         "decimal_rule": decimals,
@@ -510,6 +524,7 @@ def test_norgate_actions_promote_and_adjust_canonical_prices(ws: Workspace) -> N
         ws,
         {day: (opened, opened + 6 * HOUR + 30 * 60 * 10**6) for day, opened in opens.items()},
         dataset="sessions.xnys",
+        calendar_id="XNYS",
     )
     sources = [_pin(ws, part, "observations")]
     # A partition would cut a series from its neighbour, so every row lacks a partition date.
@@ -582,6 +597,106 @@ def test_norgate_actions_promote_and_adjust_canonical_prices(ws: Workspace) -> N
     assert closes(late, "total_return") == [Decimal("124.75")]
 
 
+def test_norgate_status_and_fmp_actions_promote(ws: Workspace) -> None:
+    master = commit(
+        ws,
+        "norgate-master",
+        "assets",
+        _arrow(
+            [
+                {"assetid": 1, "is_delisted": False, "first_date": "2020-08-03",
+                 "last_date": None},
+                {"assetid": 2, "is_delisted": True, "first_date": "2020-08-03",
+                 "last_date": "2020-08-28"},
+            ],
+            STATUS_SCHEMA,
+        ),
+    )  # fmt: skip
+    identity = _register(ws, master, [1, 2])
+    rule = {
+        "rule": "local_day_end@1",
+        "basis": "record",
+        "input": "status_date",
+        "args": {"timezone": NEW_YORK},
+    }
+
+    def status(event: str, parent: str | None) -> dict[str, object]:
+        document = {
+            "schema_version": "aas-promotion-v1",
+            "target": {"domain": "instrument_status", "dataset_id": "status.us.norgate",
+                       "parent": parent},
+            "sources": [_pin(ws, master, "assets")],
+            "mapper": {"name": "norgate.status@1", "args": {"timezone": NEW_YORK, "event": event}},
+            "partition": None,
+            "time_rules": {"available_at_us": rule, "revision_known_at_us": rule},
+            "decimal_rule": {},
+            "quality_rules": [],
+            "tombstone_policy": {"mode": "never"},
+            "identity_snapshot": identity,
+        }  # fmt: skip
+        raw = json.dumps(document, sort_keys=True).encode()
+        return promote(ws, raw, hashlib.sha256(raw).hexdigest(), apply=True)
+
+    listed = status("listed", None)
+    assert listed["rows"] == {"ok": 2}
+    delisted = status("delisted", str(listed["generation_id"]))
+    assert delisted["rows"] == {"ok": 1}
+    stored = ws.market.execute(
+        "SELECT status, effective_from_us, available_at_us FROM instrument_status "
+        "ORDER BY status, effective_from_us"
+    ).fetchall()
+    # Each event is known at the end of the New York day it is read from.
+    listing = _edt_start(date(2020, 8, 3))
+    assert stored == [
+        ("delisted", _edt_start(date(2020, 8, 29)), _edt_start(date(2020, 8, 29)) - 1),
+        ("listed", listing, listing + DAY - 1),
+        ("listed", listing, listing + DAY - 1),
+    ]
+    # FMP: a frozen dividend response resolved through (fmp, fmp_symbol), ex-date open on XNYS.
+    ex = date(2020, 8, 31)
+    response = commit(
+        ws,
+        "fmp-dividends",
+        "dividends",
+        _arrow(
+            [_fmp("AAA", ex, 1, dividend=0.25, recordDate=ex, paymentDate=date(2020, 9, 15))],
+            FMP_DIVIDENDS,
+        ),
+    )
+    fmp = _register(ws, response, [1], provider="fmp", symbols=["AAA"])
+    opened = _edt_start(ex) + 9 * HOUR + 30 * 60 * 10**6
+    calendar = publish_calendar(
+        ws, {ex: (opened, opened + 6 * HOUR + 30 * 60 * 10**6)},
+        dataset="sessions.xnys", calendar_id="XNYS",
+    )  # fmt: skip
+    revision = promote(
+        ws,
+        *_spec(
+            [_pin(ws, response, "dividends")],
+            fmp,
+            calendar,
+            mapper_name="fmp.dividends@1",
+            decimals={"amount": "float_shortest@1"},
+            dataset="actions.us.fmp.ref",
+            args={"timezone": NEW_YORK, "revision": 1},
+        ),
+        apply=True,
+    )
+    assert revision["rows"] == {"ok": 1}
+    assert ws.market.execute(
+        "SELECT action_id, amount, available_at_us, revision_known_at_us, ingested_at_us "
+        "FROM corporate_actions"
+    ).fetchall() == [
+        (
+            "dividend:2020-08-31",
+            Decimal("0.25"),
+            opened,
+            opened,
+            _us(datetime(2026, 8, 1, tzinfo=UTC)),
+        )
+    ]
+
+
 def _bar(day: date, close: str) -> dict[str, object]:
     value = Decimal(close)
     return {
@@ -617,6 +732,14 @@ def test_adjustment_marks_bars_before_an_unadjustable_action() -> None:
             for values, _, reasons in adjust(bars, actions, basis)
         ]
 
+    def derived_from(
+        series: list[dict[str, object]], actions: list[dict[str, object]]
+    ) -> list[tuple[object, ...]]:
+        return [
+            (values["close"], factor, values["value_state"], reasons)
+            for values, factor, reasons in adjust(series, actions, "total_return")
+        ]
+
     # A split scales earlier prices down and volume up; the last bar stays as traded.
     assert derived([split], "split_adjusted") == [
         (Decimal(20), Decimal(200), "present", ()),
@@ -640,6 +763,23 @@ def test_adjustment_marks_bars_before_an_unadjustable_action() -> None:
     # Actions outside the bars read neither scale nor break anything.
     outside = [_event("spin_off", D[0], "0.5"), _event("split", D[4], "3")]
     assert [item[0] for item in derived(outside, "total_return")] == [40, 40, 20, 10]
+    # A dividend reinvests at the session before its ex-date only: a bar there that is not
+    # present leaves no close, even though an earlier bar has one.
+    gap = [*bars[:2], {**bars[2], "close": None, "value_state": "invalid"}, bars[3]]
+    assert [item[2] for item in derived_from(gap, [_event("dividend", D[3], "1")])] == [
+        *["invalid"] * 3,
+        "present",
+    ]
+    # A held action breaks the earlier bars under either basis and carries its reason.
+    held = adjust(bars, [], "split_adjusted", held=[(D[2], ("ungranted_time_rule",))])
+    assert [item[2] for item in held] == [
+        ("ungranted_time_rule", UNADJUSTABLE),
+        ("ungranted_time_rule", UNADJUSTABLE),
+        (),
+        (),
+    ]
+    with pytest.raises(ValueError, match="adjusted basis"):
+        adjust(bars, [], "unadjusted")
     with pytest.raises(ValueError, match="two bars"):
         adjust([*bars, _bar(D[0], "41")], [], "total_return")
     with pytest.raises(ValueError, match="unadjusted"):

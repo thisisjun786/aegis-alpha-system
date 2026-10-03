@@ -323,15 +323,18 @@ def full_snapshot(
     }
 
 
-def publish_calendar(
+def publish_calendar(  # noqa: PLR0913 -- the sessions and how a test names their generation
     workspace: Workspace,
     sessions: Mapping[date, tuple[int | None, int | None]],
     *,
     dataset: str = "sessions.xkrx",
     sequence: int = 1,
     parent: str | None = None,
+    calendar_id: str = "XKRX",
 ) -> dict[str, str]:
-    """Publish and catalog a declared XKRX session generation; return its generation pin.
+    """Publish and catalog a declared session generation; return its generation pin.
+
+    ``calendar_id`` names the calendar and its venue (XKRX unless a test says otherwise).
 
     ``sequence`` and ``parent`` extend an earlier generation of ``dataset`` with new sessions.
     """
@@ -349,8 +352,8 @@ def publish_calendar(
                 "ingested_at_us": 1,
                 "source_snapshot_id": "declared-calendar",
                 "source_row_hash": hashlib.sha256(day.isoformat().encode()).hexdigest(),
-                "calendar_id": "XKRX",
-                "venue": "XKRX",
+                "calendar_id": calendar_id,
+                "venue": calendar_id,
                 "session_date": day,
                 "open_at_us": opened,
                 "close_at_us": closed,

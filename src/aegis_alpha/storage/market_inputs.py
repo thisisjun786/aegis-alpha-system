@@ -1309,13 +1309,14 @@ def generation_time_rules(
     raise ValueError("generation time-rule provenance is not retained")
 
 
-def load_pinned_heads(
+def load_pinned_heads(  # noqa: PLR0913 -- binding, query and the caller-owned resources
     workspace: Workspace,
     binding: HeadBinding,
     query: HeadQuery,
     *,
     budget: ComputeBudget,
     rehash: bool = False,
+    held: bool = False,
 ) -> HeadRead:
     """Read a binding's heads with predicate pushdown under workspace admission.
 
@@ -1332,7 +1333,13 @@ def load_pinned_heads(
             generation = str(marker["generation_id"])
             rules[generation] = generation_time_rules(workspace, generation, budget=budget)
     return read_heads(
-        workspace.market, binding, query, time_rules=rules, budget=budget, rehash=rehash
+        workspace.market,
+        binding,
+        query,
+        time_rules=rules,
+        budget=budget,
+        rehash=rehash,
+        held=held,
     )
 
 

@@ -25,6 +25,11 @@ projection changes the other in the same change.
   generation's rule provenance, the rules the read relied on or withheld, whether every
   delta was rehashed, and a digest of the selected heads. A run records that receipt
   rather than restating it.
+- ``held=True`` also returns, as ``HeadRead.held``, every record the cutoff knows but that
+  has no head because a grant withheld its time rule (``ungranted_time_rule``) or its
+  evidence has no time (``unknown_<noun>_evidence``). A record not yet known by the cutoff is
+  never held. A derived read (``adjusted_prices``) uses it so a known action is never dropped
+  silently.
 """
 
 from __future__ import annotations
@@ -350,6 +355,7 @@ class HeadRead:
     coverage: CoverageReport | None
     receipt: Mapping[str, object]
     receipt_hash: str
+    held: tuple[CoverageCell, ...] = ()
     certified: bool = field(default=False, init=False)
 
 
@@ -358,6 +364,7 @@ class _Record:
     pin: int
     subject: object
     day: object
+    record_id: str
     head: HeadRow | None
     reasons: tuple[str, ...]
 
@@ -550,6 +557,8 @@ def _projection(
     binding: HeadBinding,
     query: HeadQuery,
     params: dict[str, object],
+    *,
+    held: bool = False,
 ) -> _Projection:
     domain = binding.domain
     names = [name for name, _ in COMMON + DOMAINS[domain]]
@@ -563,6 +572,11 @@ def _projection(
     events = _events(query, reference, params)
     selected = ", ".join(f'r."{name}"' for name in names)
     final = "" if query.grid is not None else " AND _event = 'set' AND op <> 'TOMBSTONE'"
+    if held and final:
+        final = (
+            " AND ((_event = 'set' AND op <> 'TOMBSTONE') "
+            "OR _withheld_any OR _last_state IN ('ungranted_time_rule', 'unknown_evidence'))"
+        )
     sql = f"""
 WITH gens AS (
   SELECT unnest($g::VARCHAR[]) AS generation_id, unnest($p::BIGINT[]) AS _pin,
@@ -711,6 +725,7 @@ def _fetch(connection: duckdb.DuckDBPyConnection, projection: _Projection) -> li
                     int(row["_pin"]),
                     row["_subject"],
                     row["_day"],
+                    str(row["record_id"]),
                     head,
                     _reasons(row, noun, strict=strict),
                 )
@@ -796,6 +811,7 @@ def read_heads(  # noqa: PLR0913 -- binding, query and the caller-owned resource
     time_rules: Mapping[str, TimeRules],
     budget: ComputeBudget,
     rehash: bool = False,
+    held: bool = False,
 ) -> HeadRead:
     """Project the binding's heads in DuckDB with every filter pushed into the scan.
 
@@ -831,7 +847,7 @@ def read_heads(  # noqa: PLR0913 -- binding, query and the caller-owned resource
                     ("t", item.to_date),
                 ):
                     cast("list[object]", params[key]).append(value)
-        projection = _projection(connection, binding, query, params)
+        projection = _projection(connection, binding, query, params, held=held)
         _admit(connection, projection, query, budget)
         records = _fetch(connection, projection)
     except duckdb.OutOfMemoryException as error:
@@ -841,9 +857,26 @@ def read_heads(  # noqa: PLR0913 -- binding, query and the caller-owned resource
     rows = tuple(record.head for record in records if record.head is not None)
     coverage = _coverage(binding, query, records) if query.grid is not None else None
     receipt = _receipt(binding, query, chains, time_rules, rows, rehash=rehash)
+    kept: tuple[CoverageCell, ...] = ()
+    if held:
+        noun = _NOUNS.get(binding.domain, binding.domain)
+        reasons = {"ungranted_time_rule", f"unknown_{noun}_evidence"}
+        kept = tuple(
+            CoverageCell(
+                str(record.subject),
+                cast("date", record.day),
+                present=False,
+                reasons=record.reasons,
+                record_id=record.record_id,
+            )
+            for record in records
+            if record.head is None and record.reasons and record.reasons[0] in reasons
+        )
+        receipt["held"] = [[cell.record_id, list(cell.reasons)] for cell in kept]
     return HeadRead(
         rows,
         coverage,
         MappingProxyType(receipt),
         hashlib.sha256(canonical_json_bytes(receipt)).hexdigest(),
+        kept,
     )

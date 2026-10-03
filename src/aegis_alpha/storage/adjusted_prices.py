@@ -15,27 +15,39 @@ The derivation (``aas-adjustment-v1``) works per instrument on the bars read, ol
 - A ratio action (``split``, ``stock_dividend``, ``capital_adjustment``) with ratio ``r`` new
   shares per old share multiplies every earlier price by ``1/r`` and volume by ``r``.
 - Under ``total_return`` a ``dividend`` of ``D`` per share multiplies every earlier price by
-  ``(C - D) / C``, where ``C`` is the last present unadjusted close before the ex-date: the
-  dividend is reinvested at that close.
+  ``(C - D) / C``, where ``C`` is the unadjusted close of the session before the ex-date: the
+  dividend is reinvested at that close. That session is the bar read just before the
+  ex-date, and it must be ``present``. The derivation always reads every bar in the query's
+  dates, grid or not, and returns only the grid's dates; a grid date after that bar and
+  before the ex-date is a session with no bar, so the dividend has no close.
 - An action that cannot be applied (another action type, a value that is not ``present``, a
-  dividend in another currency, no earlier close, or a dividend not below it) leaves every
-  earlier bar ``invalid`` with no values, with the reason ``unadjustable_action``. Nothing is
-  skipped silently. ``split_adjusted`` ignores dividends entirely.
+  dividend in another currency, no close on the session before it, or a dividend not below
+  that close) leaves every earlier bar ``invalid`` with no values, with the reason
+  ``unadjustable_action``. Nothing is skipped silently. ``split_adjusted`` ignores dividends
+  entirely.
+- An action the cutoff knows but the actions read holds back (``read_heads(held=True)``:
+  a time rule the binding does not grant, or evidence with no time) is unadjustable the same
+  way under either basis (a held record has no values, so not even its type is read), and
+  the earlier bars carry the held record's reason (``ungranted_time_rule`` or
+  ``unknown_corporate_actions_evidence``) beside ``unadjustable_action``. An action not yet
+  known by the cutoff never applies.
 - Factors are exact decimals multiplied under a 50-digit context; each adjusted value is
   rounded to 12 decimals half to even, the precision of the domain's ``DECIMAL(38,12)``.
 
 A result row keeps the bar's record and revision IDs and every domain value, with ``basis``
 set to the derived basis and the cumulative price factor beside it. The receipt
-(``aas-adjusted-read-v1``) records the basis, the method, both head-read receipts and a digest
-of the derived rows.
+(``aas-adjusted-read-v1``) records the basis, the method, the head-read receipts (``prices``
+is the read the query asked for, ``series`` the gridless read the derivation used; they are
+the same read without a grid), the time rules either read withheld (``withheld_rules``) and a
+digest of the derived rows with their factors and reasons.
 """
 
 from __future__ import annotations
 
 import hashlib
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, cast
@@ -85,6 +97,7 @@ class AdjustedRow:
 class AdjustedRead:
     rows: tuple[AdjustedRow, ...]
     prices: HeadRead
+    series: HeadRead
     actions: HeadRead
     receipt: Mapping[str, object]
     receipt_hash: str
@@ -93,60 +106,78 @@ class AdjustedRead:
 
 @dataclass(frozen=True, slots=True)
 class _Step:
-    """One applicable action: the bars before ``day`` take ``price`` and ``volume``."""
+    """One applicable action: the bars before ``day`` take ``price`` and ``volume``.
+
+    No ``price`` makes them invalid with ``reasons``.
+    """
 
     day: date
     price: Decimal | None
     volume: Decimal
+    reasons: tuple[str, ...] = (UNADJUSTABLE,)
 
 
 def _decimal(value: object) -> Decimal | None:
     return value if isinstance(value, Decimal) else None
 
 
+def _dividend(
+    bars: Sequence[Mapping[str, object]],
+    days: Sequence[date],
+    action: Mapping[str, object],
+    grid: Sequence[date] | None,
+) -> Decimal | None:
+    """A dividend's price factor ``(C - D) / C``, or None when it cannot be applied."""
+    day = cast("date", action["effective_date"])
+    index = bisect_left(days, day) - 1
+    bar = bars[index]
+    close = _decimal(bar.get("close")) if bar.get("value_state") == "present" else None
+    amount = _decimal(action.get("amount"))
+    if (
+        action.get("value_state") != "present"
+        or action.get("currency") != bars[-1].get("currency")
+        or close is None
+        or amount is None
+        or not 0 < amount < close
+    ):
+        return None
+    # A grid date between that bar and the ex-date is a session with no bar.
+    if grid is not None:
+        after = bisect_right(grid, days[index])
+        if after < len(grid) and grid[after] < day:
+            return None
+    return (close - amount) / close
+
+
 def _steps(
-    bars: Sequence[Mapping[str, object]], actions: Sequence[Mapping[str, object]], basis: str
+    bars: Sequence[Mapping[str, object]],
+    actions: Sequence[Mapping[str, object]],
+    basis: str,
+    held: Sequence[tuple[date, tuple[str, ...]]],
+    grid: Sequence[date] | None,
 ) -> list[_Step]:
     """The applicable actions of one instrument as price and volume factors, by ex-date."""
     days = [cast("date", bar["session_date"]) for bar in bars]
-    closes = [
-        (day, _decimal(bar.get("close")))
-        for day, bar in zip(days, bars, strict=True)
-        if bar.get("value_state") == "present" and _decimal(bar.get("close"))
+    steps = [
+        _Step(day, None, Decimal(1), (*reasons, UNADJUSTABLE))
+        for day, reasons in held
+        if days[0] < day <= days[-1]
     ]
-    close_days = [day for day, _ in closes]
-    currency = bars[-1].get("currency")
-    steps = []
     for action in sorted(actions, key=lambda item: cast("date", item["effective_date"])):
         day = cast("date", action["effective_date"])
         if not days[0] < day <= days[-1]:
             continue
         kind = action["action_type"]
-        present = action.get("value_state") == "present"
         if kind in RATIO_ACTIONS:
             ratio = _decimal(action.get("ratio"))
-            if present and ratio is not None and ratio > 0:
+            if action.get("value_state") == "present" and ratio is not None and ratio > 0:
                 steps.append(_Step(day, 1 / ratio, ratio))
             else:
                 steps.append(_Step(day, None, Decimal(1)))
             continue
         if kind in CASH_ACTIONS:
-            if basis != "total_return":
-                continue
-            amount = _decimal(action.get("amount"))
-            index = bisect_left(close_days, day) - 1
-            close = closes[index][1] if index >= 0 else None
-            usable = (
-                present
-                and action.get("currency") == currency
-                and amount is not None
-                and close is not None
-                and 0 < amount < close
-            )
-            factor = None
-            if usable and close is not None and amount is not None:
-                factor = (close - amount) / close
-            steps.append(_Step(day, factor, Decimal(1)))
+            if basis == "total_return":
+                steps.append(_Step(day, _dividend(bars, days, action, grid), Decimal(1)))
             continue
         steps.append(_Step(day, None, Decimal(1)))
     return steps
@@ -154,7 +185,7 @@ def _steps(
 
 def _scaled(
     bar: Mapping[str, object], basis: str, price: Decimal | None, volume: Decimal
-) -> tuple[Mapping[str, object], tuple[str, ...]]:
+) -> Mapping[str, object]:
     """One bar's values under the cumulative factors; no price factor makes it invalid."""
     values = dict(bar)
     values["basis"] = basis
@@ -163,23 +194,28 @@ def _scaled(
             if name in values:
                 values[name] = None
         values["value_state"] = "invalid"
-        return MappingProxyType(values), (UNADJUSTABLE,)
+        return MappingProxyType(values)
     for name, factor in (*((name, price) for name in _PRICES), ("volume", volume)):
         found = _decimal(values.get(name))
         if found is not None:
             values[name] = (found * factor).quantize(_SCALE, ROUND_HALF_EVEN)
-    return MappingProxyType(values), ()
+    return MappingProxyType(values)
 
 
 def adjust(
     bars: Sequence[Mapping[str, object]],
     actions: Sequence[Mapping[str, object]],
     basis: str,
+    *,
+    held: Sequence[tuple[date, tuple[str, ...]]] = (),
+    grid: Sequence[date] | None = None,
 ) -> list[tuple[Mapping[str, object], Decimal | None, tuple[str, ...]]]:
     """Derive ``basis`` prices for one instrument's unadjusted bars from its actions.
 
-    ``bars`` are one instrument's unadjusted bars, one per session date; ``actions`` are its
-    corporate actions. Returns, oldest first, each bar's adjusted values, the cumulative
+    ``bars`` are one instrument's unadjusted bars, one per session date, with no session
+    left out; ``actions`` are its corporate actions and ``held`` the ex-dates and reasons of
+    the actions its read held back. ``grid``, when given, is the increasing list of dates
+    the bars should cover. Returns, oldest first, each bar's adjusted values, the cumulative
     price factor (None when an unadjustable action follows the bar) and its reasons.
     """
     if basis not in BASES:
@@ -194,10 +230,11 @@ def adjust(
         raise ValueError("adjusted prices derive from unadjusted bars only")
     with localcontext() as context:
         context.prec = _PRECISION
-        steps = _steps(ordered, actions, basis)
+        steps = _steps(ordered, actions, basis, held, grid)
         derived: list[tuple[Mapping[str, object], Decimal | None, tuple[str, ...]]] = []
         price: Decimal | None = Decimal(1)
         volume = Decimal(1)
+        reasons: tuple[str, ...] = ()
         pending = sorted(steps, key=lambda step: step.day, reverse=True)
         for bar in reversed(ordered):
             day = cast("date", bar["session_date"])
@@ -205,18 +242,20 @@ def adjust(
                 step = pending.pop(0)
                 price = None if price is None or step.price is None else price * step.price
                 volume *= step.volume
-            values, reasons = _scaled(bar, basis, price, volume)
-            derived.append((values, price, reasons))
+                if step.price is None:
+                    reasons = tuple(dict.fromkeys((*reasons, *step.reasons)))
+            derived.append((_scaled(bar, basis, price, volume), price, reasons))
     derived.reverse()
     return derived
 
 
 def _derive(
-    prices: HeadRead, actions: HeadRead, basis: str, budget: ComputeBudget
-) -> dict[str, object]:
+    series: HeadRead, actions: HeadRead, query: HeadQuery, basis: str, budget: ComputeBudget
+) -> list[AdjustedRow]:
     if basis not in BASES:
         raise ValueError(f"adjusted basis must be one of {list(BASES)}")
-    estimated = 64 * 1024 + _ROW_BYTES * (len(prices.rows) + len(actions.rows))
+    count = len(series.rows) + len(actions.rows) + len(actions.held)
+    estimated = 64 * 1024 + _ROW_BYTES * count
     if estimated > budget.available_bytes:
         raise ComputeResourceError(
             f"adjusted price memory estimate {estimated} exceeds admitted "
@@ -224,46 +263,69 @@ def _derive(
         )
     # One instrument is one series across every cutover pin; each bar keeps its own pin.
     bars: dict[str, list[HeadRow]] = {}
-    for row in prices.rows:
+    for row in series.rows:
         bars.setdefault(str(row.values["instrument_id"]), []).append(row)
     events: dict[str, list[Mapping[str, object]]] = {}
     for row in actions.rows:
         events.setdefault(str(row.values["instrument_id"]), []).append(row.values)
+    held: dict[str, list[tuple[date, tuple[str, ...]]]] = {}
+    for cell in actions.held:
+        held.setdefault(cell.instrument_id, []).append(
+            (cast("date", cell.session_date), cell.reasons)
+        )
+    grid = None if query.grid is None else set(query.grid)
     rows = []
     for instrument, found in sorted(bars.items()):
         found.sort(key=lambda row: cast("date", row.values["session_date"]))
-        derived = adjust([row.values for row in found], events.get(instrument, []), basis)
+        derived = adjust(
+            [row.values for row in found],
+            events.get(instrument, []),
+            basis,
+            held=held.get(instrument, ()),
+            grid=query.grid,
+        )
         for row, (values, factor, reasons) in zip(found, derived, strict=True):
-            rows.append(AdjustedRow(row.pin, values, factor, reasons))
+            if grid is None or row.values["session_date"] in grid:
+                rows.append(AdjustedRow(row.pin, values, factor, reasons))
     rows.sort(key=lambda row: (row.pin, str(row.values["record_id"])))
+    return rows
+
+
+def _result(
+    prices: HeadRead, series: HeadRead, actions: HeadRead, basis: str, rows: list[AdjustedRow]
+) -> AdjustedRead:
     digest = [
         [
             row.pin,
             row.values["record_id"],
             row.values["revision_id"],
             None if row.factor is None else str(row.factor),
+            list(row.reasons),
         ]
         for row in rows
     ]
+    withheld = {
+        str(rule)
+        for read in (series, actions)
+        for rule in cast("list[object]", read.receipt["withheld_rules"])
+    }
     receipt = {
         "schema": RECEIPT_SCHEMA,
         "method": METHOD,
         "basis": basis,
         "prices": dict(prices.receipt),
         "prices_hash": prices.receipt_hash,
+        "series_hash": series.receipt_hash,
         "actions": dict(actions.receipt),
         "actions_hash": actions.receipt_hash,
+        "withheld_rules": sorted(withheld),
         "rows": len(rows),
         "rows_hash": hashlib.sha256(canonical_json_bytes(digest)).hexdigest(),
     }
-    return {"rows": tuple(rows), "receipt": receipt}
-
-
-def _result(prices: HeadRead, actions: HeadRead, derived: dict[str, object]) -> AdjustedRead:
-    receipt = cast("dict[str, object]", derived["receipt"])
     return AdjustedRead(
-        cast("tuple[AdjustedRow, ...]", derived["rows"]),
+        tuple(rows),
         prices,
+        series,
         actions,
         MappingProxyType(receipt),
         hashlib.sha256(canonical_json_bytes(receipt)).hexdigest(),
@@ -280,6 +342,11 @@ def actions_query(query: HeadQuery) -> HeadQuery:
         from_date=query.from_date,
         to_date=query.to_date,
     )
+
+
+def series_query(query: HeadQuery) -> HeadQuery:
+    """The price read the derivation uses: the query without its grid, so no bar is missed."""
+    return query if query.grid is None else replace(query, grid=None)
 
 
 def _check(prices: HeadBinding, actions: HeadBinding) -> None:
@@ -303,18 +370,23 @@ def read_adjusted_prices(  # noqa: PLR0913 -- two bindings, the query and caller
     ``time_rules`` covers every generation of both bindings, as for ``read_heads``.
     """
     _check(prices, actions)
-    price_read = read_heads(
-        connection, prices, query, time_rules=time_rules, budget=budget, rehash=rehash
-    )
-    action_read = read_heads(
-        connection,
-        actions,
-        actions_query(query),
-        time_rules=time_rules,
-        budget=budget,
-        rehash=rehash,
-    )
-    return _result(price_read, action_read, _derive(price_read, action_read, basis, budget))
+
+    def read(binding: HeadBinding, part: HeadQuery, *, held: bool = False) -> HeadRead:
+        return read_heads(
+            connection,
+            binding,
+            part,
+            time_rules=time_rules,
+            budget=budget,
+            rehash=rehash,
+            held=held,
+        )
+
+    series = read(prices, series_query(query))
+    price_read = series if query.grid is None else read(prices, query)
+    action_read = read(actions, actions_query(query), held=True)
+    rows = _derive(series, action_read, query, basis, budget)
+    return _result(price_read, series, action_read, basis, rows)
 
 
 def load_adjusted_prices(  # noqa: PLR0913 -- two bindings, the query and caller-owned resources
@@ -331,8 +403,12 @@ def load_adjusted_prices(  # noqa: PLR0913 -- two bindings, the query and caller
     from aegis_alpha.storage.market_inputs import load_pinned_heads  # noqa: PLC0415
 
     _check(prices, actions)
-    price_read = load_pinned_heads(workspace, prices, query, budget=budget, rehash=rehash)
-    action_read = load_pinned_heads(
-        workspace, actions, actions_query(query), budget=budget, rehash=rehash
-    )
-    return _result(price_read, action_read, _derive(price_read, action_read, basis, budget))
+
+    def read(binding: HeadBinding, part: HeadQuery, *, held: bool = False) -> HeadRead:
+        return load_pinned_heads(workspace, binding, part, budget=budget, rehash=rehash, held=held)
+
+    series = read(prices, series_query(query))
+    price_read = series if query.grid is None else read(prices, query)
+    action_read = read(actions, actions_query(query), held=True)
+    rows = _derive(series, action_read, query, basis, budget)
+    return _result(price_read, series, action_read, basis, rows)

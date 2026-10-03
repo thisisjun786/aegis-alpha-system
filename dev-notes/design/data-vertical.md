@@ -506,7 +506,8 @@ part를 함께 pin한다. `CAPITAL` close는 비조정 close를 그 뒤 모든 �
   사건(분할, 병합, 주식배당, 그 밖의 자본 분배)의 주식 비율이며 binary32로 반올림해
   `float_shortest@1`에 넘긴다. 비율이 1과 백만분의 1보다 더 다를 때만 사건이다. binary32 저장은 연속한
   두 행의 `f`를 그보다 적게 움직인다(라이브 part에서 저장만으로 생긴 가장 큰 움직임은 2e-7 미만, 가장 작은
-  실제 사건은 1e-5 초과). close나 비조정 close가 유한한 양수가 아닌 행은 계수가 없어 건너뛴다. `action_type`은
+  실제 사건은 1e-5 초과). close나 비조정 close가 유한한 양수가 아닌 행은 계수가 없어 건너뛰고, `date`가
+  0시가 아닌 행은 세션이 없어 사건이 되지 않는다. `action_type`은
   `capital_adjustment`다.
 - `fmp.dividends@1`과 `fmp.splits@1`은 FMP 동결 배당·분할 응답(`symbol`, ex-date `date`,
   `retrieved_at_utc`)을 읽는다. instrument는 (`fmp`, `fmp_symbol`, `symbol`)로 해석하고 수집 시각은
@@ -1348,6 +1349,10 @@ Norgate security master와 그보다 늦은 Norgate history 내보내기에서�
     `withheld_rules`, `rehashed`(모든 delta를 다시 해시했는지; 거짓이면 구조 확인만 한 읽기),
     `heads`(행 수), `heads_hash`(`[pin, record_id, revision_id]` 목록의 정규 JSON SHA-256)를 가진 정규
     JSON이고, 그 SHA-256이 영수증 hash다.
+  - `held=True`인 읽기는 cutoff가 아는데 head가 없는 record 가운데 grant가 시점 규칙을 막았거나
+    (`ungranted_time_rule`) 공개 시점 근거가 없는(`unknown_<domain>_evidence`) record를 `HeadRead.held`
+    (값 없는 coverage 칸: subject, 날짜, 이유, record ID)로 돌려주고, 영수증에 `held`(`[record_id, 이유]`
+    목록)를 더한다. cutoff까지 알려지지 않은 record는 held가 아니다.
   - coverage 이유는 `ungranted_time_rule`, `flag_excluded`, `outside_cutover`, `tombstone`,
     `unknown_<domain>_evidence`, `<domain>_unavailable`, `reference_price`, `missing_<domain>`과
     head의 `value_state`다(가격은 `price`, 달력은 `session`). head가 없는 record의 이유는
@@ -1362,23 +1367,32 @@ Norgate security master와 그보다 늦은 Norgate history 내보내기에서�
   `read_adjusted_prices(connection, prices, actions, query, basis, time_rules, budget)`가 가격 binding과
   기업행동 binding을 같은 query(같은 cutoff, 수집 cutoff, 지식 상한, subject, 날짜 구간)로 `read_heads`에서
   읽고 유도한다. 작업 공간 진입점 `load_adjusted_prices`는 두 읽기 모두 `market_inputs.load_pinned_heads`를
-  쓴다. 그래서 cutoff까지 알려지지 않았거나 grant가 없는 규칙의 기업행동은 앞선 가격에 닿지 않는다.
+  쓴다. 그래서 cutoff까지 알려지지 않은 기업행동은 앞선 가격에 닿지 않는다. 기업행동 읽기는 `held=True`다.
+  - 유도는 격자를 뺀 같은 query로 읽은 bar 전체(`series`)로 하고, query에 격자가 있으면 격자 날짜의 행만
+    돌려주며 그 격자 읽기(`prices`)의 coverage를 함께 준다. 격자가 없으면 두 읽기는 같은 읽기다.
   - 유도 방법 `aas-adjustment-v1`은 instrument마다 읽은 bar로 한다. 한 instrument는 cutover pin을 넘어 한
     시리즈다. ex-date(`effective_date`)가 그 instrument의 첫 bar보다 늦고 마지막 bar 이하인 행동만 쓰므로
     마지막 bar는 비조정 그대로이고 앞선 bar가 그 기준으로 표현된다.
   - 비율 행동(`split`, `stock_dividend`, `capital_adjustment`)의 비율 `r`은 앞선 가격에 `1/r`, 거래량에
-    `r`을 곱한다. `total_return`에서는 배당 `D`가 앞선 가격에 `(C - D) / C`를 곱한다. `C`는 ex-date 전
-    마지막 `present` 비조정 close이며, 배당을 그 close에 재투자한다는 뜻이다. `split_adjusted`는 배당을
+    `r`을 곱한다. `total_return`에서는 배당 `D`가 앞선 가격에 `(C - D) / C`를 곱한다. `C`는 ex-date 직전
+    세션의 비조정 close이며, 배당을 그 close에 재투자한다는 뜻이다. 그 세션은 ex-date 바로 앞에 읽은
+    bar이고 `present`여야 한다. 격자가 그 bar와 ex-date 사이의 날짜를 가지면 그 날짜는 bar가 없는 세션이므로
+    배당에 close가 없다. 격자가 없으면 세션을 빠뜨리지 않은 bar를 전제한다. `split_adjusted`는 배당을
     읽지 않는다.
-  - 쓸 수 없는 행동(다른 행동 유형, `present`가 아닌 값, bar와 다른 통화의 배당, 앞선 close가 없거나 그
-    이상인 배당)이 있으면 그보다 앞선 bar는 값 없이 `invalid`가 되고 이유 `unadjustable_action`을 단다.
+  - 쓸 수 없는 행동(다른 행동 유형, `present`가 아닌 값, bar와 다른 통화의 배당, 직전 세션 close가 없거나
+    그 이상인 배당)이 있으면 그보다 앞선 bar는 값 없이 `invalid`가 되고 이유 `unadjustable_action`을 단다.
     조용히 건너뛰지 않는다.
+  - 기업행동 읽기가 held로 돌려준 행동(grant 없는 시점 규칙, 시점 근거 없음)도 두 basis 모두에서 쓸 수 없는
+    행동이다. held record에는 값이 없어 유형도 읽지 않기 때문이다. 앞선 bar는 그 record의 이유
+    (`ungranted_time_rule`이나 `unknown_corporate_actions_evidence`)와 `unadjustable_action`을 함께 단다.
   - 계수는 50자리 문맥의 정확한 십진수로 곱하고, 조정 값은 도메인의 `DECIMAL(38,12)` 정밀도인 소수
     12자리로 ROUND_HALF_EVEN한다. bar는 `basis='unadjusted'`여야 하고 한 instrument·세션에 bar가 둘이면
     거부한다(그래서 canonical과 unadjusted reference를 함께 읽으려면 query의 가격 역할로 하나를 고른다).
   - 결과 행은 bar의 record·revision ID와 도메인 값을 그대로 두고 `basis`만 유도 basis로 바꾸며, 누적
-    가격 계수를 함께 싣는다. 영수증 `aas-adjusted-read-v1`은 basis, 방법, 두 `aas-head-read-v1` 영수증과
-    그 hash, `[pin, record_id, revision_id, 계수]` 목록의 정규 JSON SHA-256을 담는다.
+    가격 계수와 이유를 함께 싣는다. 영수증 `aas-adjusted-read-v1`은 basis, 방법, 가격 읽기(`prices`)와
+    기업행동 읽기(`actions`)의 `aas-head-read-v1` 영수증과 그 hash, 유도에 쓴 읽기의 hash(`series_hash`),
+    두 읽기가 막은 규칙의 합집합(`withheld_rules`), `[pin, record_id, revision_id, 계수, 이유]` 목록의 정규
+    JSON SHA-256(`rows_hash`)을 담는다.
 
 ### 연구 실행의 canonical 가격 패널
 
@@ -1723,4 +1737,9 @@ state v2:
 | DV-242 | `norgate.status@1`은 master 행마다 `first_date`의 상장과 `last_date` 다음 날의 상장폐지를 내고, 상장폐지는 `last_date`에서 읽는다 | `tests/storage/test_us_actions.py::test_norgate_status_reads_listing_and_delisting_from_the_master` | 구현 |
 | DV-243 | FMP 배당·분할 매퍼는 응답 revision 구간마다 첫 응답을 고르고, 한 시각에 서로 다른 값을 가진 적 있는 키는 어느 revision에서도 고르지 않는다 | `tests/storage/test_us_actions.py::test_fmp_actions_select_each_run_and_never_a_tied_key` | 구현 |
 | DV-244 | Norgate 기업행동은 파티션 없이 `exdate_open@1`로 승격되고(파티션을 둔 명세는 거부), 유도 분할조정·총수익 가격은 그 generation과 canonical 가격에서 나온다 | `tests/storage/test_us_actions.py::test_norgate_actions_promote_and_adjust_canonical_prices` | 구현 |
-| DV-245 | 쓸 수 없는 기업행동 앞의 유도 bar는 값 없이 `invalid`이고 `unadjustable_action`을 달며, 분할조정은 배당을 읽지 않고 읽은 bar 밖의 행동은 쓰지 않는다 | `tests/storage/test_us_actions.py::test_adjustment_marks_bars_before_an_unadjustable_action` | 구현 |
+| DV-245 | 쓸 수 없는 기업행동(직전 세션 bar가 `present`가 아닌 배당 포함) 앞의 유도 bar는 값 없이 `invalid`이고 `unadjustable_action`을 달며, 분할조정은 배당을 읽지 않고 읽은 bar 밖의 행동은 쓰지 않는다 | `tests/storage/test_us_actions.py::test_adjustment_marks_bars_before_an_unadjustable_action` | 구현 |
+| DV-246 | grant 없는 규칙이나 시점 근거 없음으로 held된, cutoff가 아는 기업행동 앞의 유도 bar는 `invalid`이고 그 이유를 달며, 영수증은 막은 규칙을 싣는다 | `tests/storage/test_read_heads.py::test_adjustment_marks_bars_before_a_withheld_action` | 구현 |
+| DV-247 | 격자 읽기도 배당을 격자의 앞선 날짜가 아니라 ex-date 직전 세션 close에 재투자하고, 영수증은 격자 읽기와 유도에 쓴 읽기의 hash를 따로 싣는다 | `tests/storage/test_read_heads.py::test_adjustment_reinvests_at_the_session_before_the_exdate_under_a_grid` | 구현 |
+| DV-248 | 격자가 말하는 ex-date 직전 세션에 bar가 없으면 배당을 쓸 수 없다 | `tests/storage/test_read_heads.py::test_adjustment_needs_a_close_on_the_session_before_the_exdate` | 구현 |
+| DV-249 | `aas-adjusted-read-v1` 영수증은 같은 읽기에 같은 hash이고, 행동 집합이 바뀌면 `rows_hash`가 바뀌며, 하위 읽기의 hash를 싣는다 | `tests/storage/test_read_heads.py::test_adjusted_receipt_pins_the_reads_and_the_rows` | 구현 |
+| DV-250 | `norgate.status@1`과 `fmp.dividends@1`은 승격을 거쳐 `local_day_end@1`과 XNYS `exdate_open@1` 시각으로 저장된다 | `tests/storage/test_us_actions.py::test_norgate_status_and_fmp_actions_promote` | 구현 |

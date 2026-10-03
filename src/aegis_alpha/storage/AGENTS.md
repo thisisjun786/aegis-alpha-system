@@ -207,7 +207,11 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   `load_adjusted_prices`), so an action unknown at the cutoff never reaches an earlier price.
   Only actions inside the bars read apply, the last bar stays as traded, and an action it
   cannot apply leaves every earlier bar `invalid` (`unadjustable_action`) rather than skipping
-  it. The receipt (`aas-adjusted-read-v1`) carries both head-read receipts.
+  it. The actions read uses `read_heads(held=True)`, so an action the cutoff knows but a
+  missing grant or missing evidence holds back is unadjustable too, with its reason. The
+  derivation reads bars without the query's grid, so a dividend reinvests at the session
+  before its ex-date. The receipt (`aas-adjusted-read-v1`) carries both head-read receipts
+  and the withheld rules.
 - `promotion/mappers/classifications.py` promotes snapshot classifications
   (`norgate.classification@1`, `sec.sic@1`, `kind.industry@1`). A row starts at its
   snapshot's date and is never extended into the past; a later snapshot adds rows of its

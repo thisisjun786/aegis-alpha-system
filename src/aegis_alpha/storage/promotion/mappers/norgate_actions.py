@@ -170,7 +170,7 @@ class NorgateCapitalAdjustments(_NorgateActions):
             + "CAST(NULL AS DECIMAL(38,12)) AS amount, CAST(_aas_step AS FLOAT) AS ratio, "
             "CAST(NULL AS VARCHAR) AS currency, 'present' AS value_state, "
             "_aas_day AS _aas_t_ex_date "
-            f"FROM ({steps}) WHERE abs(_aas_step - 1) > {STEP_TOLERANCE}"
+            f"FROM ({steps}) WHERE abs(_aas_step - 1) > {STEP_TOLERANCE} AND _aas_day IS NOT NULL"
         )
 
 
