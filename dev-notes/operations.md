@@ -1272,10 +1272,46 @@ DART backfill unit은 그 전에 멈춘다(두 수집기는 quota를 서로 세�
 `provider_calls`와 `http_requests`는 각각 유료 실행과 전체 HTTP 시도 수다.
 
 이 명령은 원문 수집까지만 수행하며 `native_import_completed=false`를 반환한다.
-검증된 원문을 DuckDB 원본 자료실에 적재하려면 별도의 명시적 적재 작업이 필요하다.
+검증된 원문은 아래 `aas collect qveris import`가 원본 자료실에 적재한다.
 가격의 조정 기준·종목 식별·거래일·공개 시각을 확인하기 전에는 백테스트 입력이나
 `data datasets`의 시장 버전으로 자동 승격하지 않는다. 예약 실행은 운영자가 별도로
 설치하고 실제 적재 결과와 중복 호출 여부를 확인한다. 패키지 설치는 예약 작업을 만들지 않는다.
+
+### 명시한 job의 수집과 적재
+
+```bash
+aas collect qveris daily-jobs --raw-root RAW --exchange US --exchange KO --exchange KQ \
+  --dataset prices --dataset splits --dataset dividends --lookback-days 14 --output JOBS.json
+aas collect qveris plan --jobs JOBS.json --raw-root RAW
+aas collect qveris run --jobs JOBS.json --raw-root RAW --key-file KEY \
+  --max-calls 30 --max-credits 100 [--workers 4] [--request-interval 0.75]
+aas collect qveris quarantine --raw-root RAW --key-file KEY \
+  (--batch parallel-batches/ID | --page jobs/FINGERPRINT/0000) --reason TEXT
+aas collect qveris import --raw-root RAW --identity IDENTITY.json [--market KR] \
+  [--dataset price_history] [--fingerprint FP ...] [--limit N] [--plan]
+```
+
+- `daily-jobs`는 선언 달력에서 관측일(기본 UTC 오늘) 이전의 열린 세션마다 일간 내려받기 요청을 만들고,
+  raw root에 이미 완료된 요청은 빼며 완료 없이 시도만 있는 요청은 `held`로 보고한다. 새 요청이 있을
+  때만 `--output`을 새로 만들고 그 SHA-256을 출력한다. 키를 읽지 않고 요청하지 않는다.
+- `plan`은 job 문서를 검증하고 문서마다 `completed`(같은 fingerprint가 완료돼 `run`이 HTTP 없이 재사용),
+  `held`(같은 fingerprint의 시도를 `run`이 정산), `equivalent`(같은 요청이 관측일이나 job ID가 다른 job으로
+  완료·시도돼 `run`이 다시 유료 호출), `new`를 센다. 키를 읽지 않고 raw root를 만들지 않는다.
+- `run`은 유료 호출 수(`--max-calls`)와 크레딧(`--max-credits`)을 실행 하나의 상한으로 예약하고, 서버
+  잔액에서 다른 예약을 뺀 값도 확인한다. HTTP 시도 수(`--max-http-requests`, 기본 유료 호출의 16배와 32 중
+  큰 값)와 시간(`--time-limit-seconds`)은 새 page를 시작하지 않게 한다. 이미 시작한 page는 실행과 정산을
+  마치므로 `http_requests`가 한도를 조금 넘을 수 있다. 작업자 1·2·3·4·8·16 중 하나이며 모든 요청 시작은 한
+  간격을 공유한다. 종료 코드는 완료와 예산 소진이 0, 정산된 실패가 있으면 1, 불확실한 호출이나 정산되지 않은
+  page·group으로 멈추면 2다. 진행 기록은 raw root의 `cohorts/`·`parallel-cohorts/`에 남고 표준 오류로 진행
+  줄을 낸다.
+- 종료 코드 2의 page나 group은 다음 `run`이 먼저 정산한다. usage가 끝내 나타나지 않거나 intent 묶음이
+  불완전해 정산할 수 없으면 `quarantine`이 그 page(`--page`) 또는 group(`--batch`)을 운영자 사유와 함께
+  격리한다. 격리는 견적 전체의 예약을 남기고 자동 재호출하지 않으며, 그 뒤 계정의 새 실행을 다시 허용한다.
+  대상은 `run`의 표준 오류 보고와 raw root의 `jobs/`·`parallel-batches/`에서 찾는다.
+- `import`는 완료된 job을 내용 원천으로 commit하고 공급자를 호출하지 않는다. `--plan`은 읽기 전용으로
+  설치본을 열어 정규화와 행 digest만 보고한다. identity 문서는 가격·기업행동 행에 필요하고 통화쌍
+  이력에는 필요 없다. 실패한 job은 `failures`, 완료 문서가 없는 `--fingerprint`(`no_completion`)와 읽을 수
+  없는 완료 문서(`unreadable_completion`)는 `missing`으로 남고 나머지 job을 적재한 뒤 종료 코드 1이다. 단위와 원천 ID 규칙은 [데이터 수직 계약](design/data-vertical.md#qveris-수집과-원천-적재)이 소유한다.
 
 ## 전환 중인 공급자 도구
 
