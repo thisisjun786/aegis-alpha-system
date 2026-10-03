@@ -53,8 +53,8 @@ class Mapper(Protocol):
         ...
 
     @property
-    def date_column(self) -> str:
-        """The domain DATE column that a tombstone scope's date interval tests."""
+    def date_column(self) -> str | None:
+        """The domain DATE column a tombstone scope's dates test; None takes no tombstones."""
         ...
 
     @property
@@ -80,8 +80,19 @@ class Mapper(Protocol):
 def _registry() -> dict[str, Mapper]:
     from aegis_alpha.storage.promotion.mappers.calendar import CalendarDeclared  # noqa: PLC0415
     from aegis_alpha.storage.promotion.mappers.eodhd import EodhdBars  # noqa: PLC0415 -- registry
+    from aegis_alpha.storage.promotion.mappers.fred import FredAlfred, FredFxSeries  # noqa: PLC0415
+    from aegis_alpha.storage.promotion.mappers.korea import KoreaObservations  # noqa: PLC0415
+    from aegis_alpha.storage.promotion.mappers.norgate import NorgateFxCloses  # noqa: PLC0415
 
-    mappers: tuple[Mapper, ...] = (CalendarDeclared(), EodhdBars())
+    mappers: tuple[Mapper, ...] = (
+        CalendarDeclared(),
+        EodhdBars(),
+        FredAlfred(),
+        FredFxSeries(),
+        NorgateFxCloses(),
+        KoreaObservations("bok"),
+        KoreaObservations("oecd"),
+    )
     return {f"{mapper.name}@{mapper.major}": mapper for mapper in mappers}
 
 

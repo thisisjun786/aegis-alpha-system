@@ -296,7 +296,17 @@ def _sources(workspace: Workspace, spec: PromotionSpec, plan: PromotionPlan) -> 
     for _, kind in first:
         if kind not in formats.SOURCE_ROW_TYPES:
             raise ValueError(f"source column type {kind} has no aas-source-row-v1 form")
+    _check_partition(spec, kinds)
     return found
+
+
+def _check_partition(spec: PromotionSpec, kinds: Mapping[str, str]) -> None:
+    """A partition compares source dates, so it needs the mapper's column as a DATE."""
+    if spec.partition is not None and kinds.get(spec.mapper.partition_column) != "DATE":
+        raise ValueError(
+            f"mapper {spec.mapper_name} reads its partition column "
+            f"{spec.mapper.partition_column} as text; promote it without a partition"
+        )
 
 
 def _identity(
@@ -678,6 +688,8 @@ def _scope_sql(workspace: Workspace, spec: PromotionSpec, alias: str) -> str:
     policy = spec.tombstone
     if policy.start is None or policy.end is None:
         raise ValueError("a tombstone scope needs its date interval")
+    if spec.mapper.date_column is None:
+        raise ValueError(f"mapper {spec.mapper_name} has no date column to scope absence")
     date_column = f"{alias}.{_q(spec.mapper.date_column)}"
     condition = (
         f"{date_column} >= DATE '{policy.start.isoformat()}' "
@@ -1067,6 +1079,8 @@ def _report(
     market = workspace.market
     statuses = _status_counts(market)
     plan.report["source_rows"] = _count(market, f"SELECT count(*) FROM {_t('src')}")
+    # A mapper that reads one series of a shared table leaves the other rows unselected.
+    plan.report["unselected_rows"] = int(plan.report["source_rows"]) - sum(statuses.values())
     plan.report["rows"] = statuses
     for status, count in statuses.items():
         if status.startswith("refused") and count:

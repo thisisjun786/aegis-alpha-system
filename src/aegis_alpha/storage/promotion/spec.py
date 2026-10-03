@@ -241,13 +241,15 @@ def _quality(value: object, domain: str, numeric: Mapping[str, str]) -> tuple[Qu
 
 
 def _tombstone(
-    value: object, sources: tuple[SourcePin, ...], partition: Partition | None
+    value: object, sources: tuple[SourcePin, ...], partition: Partition | None, found: Mapper
 ) -> TombstonePolicy:
     if not isinstance(value, dict) or value.get("mode") not in {"never", "absent_in_full_snapshot"}:
         raise ValueError("tombstone_policy mode is never or absent_in_full_snapshot")
     if value["mode"] == "never":
         _object(value, {"mode"}, "tombstone_policy")
         return TombstonePolicy("never")
+    if found.date_column is None:
+        raise ValueError(f"mapper {found.name}@{found.major} has no date column to scope absence")
     item = _object(value, {"mode", "source", "scope"}, "tombstone_policy")
     named = _object(item["source"], {"source_id", "table"}, "tombstone source")
     pin = next(
@@ -355,6 +357,6 @@ def parse_spec(raw: bytes, sha256: str) -> PromotionSpec:
         time_rules=time_rules,
         decimal_rules=conversions,
         quality_rules=_quality(body["quality_rules"], domain, numeric),
-        tombstone=_tombstone(body["tombstone_policy"], sources, partition),
+        tombstone=_tombstone(body["tombstone_policy"], sources, partition, found),
         identity_snapshot=pin,
     )

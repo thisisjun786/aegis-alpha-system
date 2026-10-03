@@ -17,7 +17,15 @@ def _us(moment: datetime) -> int:
 
 def test_eodhd_bars_maps_synthetic_fixture() -> None:
     bars = mapper("eodhd.bars@1")
-    assert set(REGISTRY) == {"calendar.declared@1", "eodhd.bars@1"}
+    assert set(REGISTRY) == {
+        "calendar.declared@1",
+        "eodhd.bars@1",
+        "fred.alfred@1",
+        "fred.fx_series@1",
+        "norgate.fx_closes@1",
+        "bok.observations@1",
+        "oecd.observations@1",
+    }
     args = {"timezone": "Asia/Seoul"}
     bars.check_args(args)
     assert bars.identity(args) == IdentityKey("eodhd", "eodhd_symbol")
