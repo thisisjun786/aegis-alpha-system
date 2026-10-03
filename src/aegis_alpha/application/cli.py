@@ -22,6 +22,7 @@ from aegis_alpha.application import (
     run_cli,
     storage_cli,
     universe_cli,
+    us_collection_cli,
 )
 from aegis_alpha.application.contracts import parse_request
 from aegis_alpha.application.portfolio import compose_portfolio
@@ -160,6 +161,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915 
                 result = qveris_cli.execute(args)
             case "collect" if args.collect_command in {"dart", "kind"}:
                 result = kr_collection_cli.execute(args)
+            case "collect" if args.collect_command in {"fred", "sec"}:
+                result = us_collection_cli.execute(args)
             case "providers" | "collect":
                 result = provider_cli.execute(args)
             case "legacy-db" | "legacy-data":

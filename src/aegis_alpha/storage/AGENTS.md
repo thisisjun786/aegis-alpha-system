@@ -132,6 +132,18 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   KIND answers as `kind-listings`) content sources. Receipts a crashed run retained but did
   not commit are committed first by the next run. See the KR collection section of
   `dev-notes/design/data-vertical.md`.
+- `provider_collection` holds what the native US collectors share: the ledgered, paced and
+  budgeted `Caller.ask`, canonical `aas-<provider>-receipt-v1` receipts (with the document
+  selection an ask recorded) and `aas-<provider>-batch-v1` batches whose derived tables are
+  content sources of the batch's files, committed before the receipts source that marks the
+  batch complete. `sec_collection` (`aas collect sec`) reads daily
+  indexes, then each filer's submissions and companyfacts once a run, keeping only the rows
+  of the filings it wanted; `fred_collection` (`aas collect fred`) asks ALFRED vintage dates
+  after each series' latest collected vintage day and then observations windows of at most
+  1990 vintage dates chained on their last vintage, keeping only rows that do not start on a
+  window's start (ALFRED clips periods to the window), and commits each CSV download as the
+  `fred-series-csv` source `fred.series_csv@1` would import. See the US collection section of
+  `dev-notes/design/data-vertical.md`.
 - `bulk_generation` publishes a staged DuckDB table as one generation: plan without
   writing, then one transaction with the marker and `INSERT … SELECT`. DuckDB encodes and
   sorts `aas-rowset-v1` rows and `rowset.RowsetStream` digests them in admitted batches and
