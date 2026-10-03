@@ -152,17 +152,23 @@ def vintage_partitions(
     """The fewest ordered ``[from, to)`` vintage partitions of an ALFRED table.
 
     Each partition holds at most one vintage of each observation, and together they cover
-    every ``realtime_start`` in ``relation`` (an engine-quoted table or view name). Two
+    every ``realtime_start`` in ``relation`` (an engine-quoted table or view name); a row
+    without one is refused, because no partition would hold it. Two
     consecutive vintages ``a < b`` of one observation need a boundary in ``(a, b]``; taking
     the pairs in order of ``b`` and cutting at ``b`` only when no cut lies in ``(a, b]`` yet
     is the classic optimal interval stabbing.
     """
     bounds = connection.execute(
-        f"SELECT min(realtime_start), max(realtime_start) FROM {relation}"  # noqa: S608
+        "SELECT min(realtime_start), max(realtime_start), "  # noqa: S608
+        f"count(*) FILTER (WHERE realtime_start IS NULL) FROM {relation}"
     ).fetchone()
-    if bounds is None or bounds[0] is None:
+    if bounds is None:
         return []
-    first, last = bounds
+    first, last, undated = bounds
+    if undated:
+        raise ValueError(f"{undated} ALFRED rows have no vintage start, so no partition holds them")
+    if first is None:
+        return []
     cursor = connection.execute(
         "SELECT DISTINCT previous, realtime_start FROM (SELECT realtime_start, "  # noqa: S608
         "lag(realtime_start) OVER (PARTITION BY series_id, observation_date "

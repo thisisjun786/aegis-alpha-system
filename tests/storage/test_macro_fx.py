@@ -424,6 +424,10 @@ def test_vintage_partitions_hold_each_observation_once() -> None:
         )
         assert len(cuts) == fewest
     assert vintage_partitions(_vintage_table({}), "v") == []
+    undated = _vintage_table({("A", base): [days[0]]})
+    undated.execute("INSERT INTO v VALUES ('A', DATE '2020-02-01', NULL)")
+    with pytest.raises(ValueError, match="no vintage start"):
+        vintage_partitions(undated, "v")
 
 
 # --- promotions --------------------------------------------------------------------------------
