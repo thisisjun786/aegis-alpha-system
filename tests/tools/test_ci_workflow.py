@@ -71,7 +71,7 @@ def test_body_edits_run_in_their_own_group_without_cancelling_the_push_run() -> 
     concurrency = text.split("\nconcurrency:\n", 1)[1].split("\n\n", 1)[0]
     assert re.findall(r"(?m)^  group: (.*)$", concurrency) == [
         (
-            "aas-ci-${{ github.base_ref }}-${{ github.event.pull_request.number }}"
+            "aas-ci-${{ github.event.pull_request.number }}"
             "${{ github.event.action == 'edited' && !github.event.changes.base && '-edit' || '' }}"
         )
     ]
