@@ -21,7 +21,7 @@ import pytest
 from aegis_alpha.application.cli import main
 from aegis_alpha.data.kind import KindResponse
 from aegis_alpha.data.opendart import DartRequest, DartResponse, HttpAnswer, OpenDartClient
-from aegis_alpha.data.opendart_cohort import CohortPolicy, plan_financials
+from aegis_alpha.data.opendart_cohort import CohortPolicy, Knowledge, plan_financials
 from aegis_alpha.storage import collection_ledger as ledger
 from aegis_alpha.storage import kr_collection
 from aegis_alpha.storage.promotion.engine import promote
@@ -486,3 +486,28 @@ def test_receipt_batch_and_kind_receipt_formats_are_frozen() -> None:
     assert batch.content.source_id == "opendart-receipts-" + SOURCE_SHA256
     kind = KindResponse("kind-kospi", HttpAnswer(200, (), b"synthetic listing"), at, at)
     assert hashlib.sha256(kind.receipt()).hexdigest() == KIND_SHA256
+
+
+def test_a_kind_list_with_a_malformed_code_never_narrows_the_cohort(ws: Workspace) -> None:
+    kind = _kind_provider()
+    _, malformed = kind_listing([("합성바이오", "90 9", "2011-03-04")], list_id="kind-kosdaq")
+    kind.kind["kosdaqMkt"] = (200, malformed)
+    result = kr_collection.collect_kind(ws, kind, clock=_clock())
+    lists = cast("list[dict[str, object]]", result["lists"])
+    assert [item["status"] for item in lists] == ["committed", "committed"]
+    assert kr_collection.kind_codes(ws) is None
+
+
+def test_a_completed_list_row_without_its_page_is_unreadable() -> None:
+    knowledge = Knowledge()
+    request = DartRequest.list_page(date(2026, 5, 15), 1)
+    row = ("list", "COMPLETED", json.dumps(request.document), "2026-05-16T01:00:00.000000Z")
+    assert not kr_collection.observe_row(knowledge, row, None)
+    assert knowledge.list_pages == {}
+
+
+def test_a_batch_ends_at_its_byte_budget(ws: Workspace, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(kr_collection, "MAX_BATCH_BYTES", 1)
+    result = _run(ws, _provider(), _clock())
+    sources = cast("list[dict[str, object]]", result["sources"])
+    assert [source["rows"] for source in sources] == [1] * 14

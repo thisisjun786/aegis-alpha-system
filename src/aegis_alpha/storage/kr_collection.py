@@ -32,6 +32,7 @@ import base64
 import hashlib
 import importlib.util
 import json
+import re
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
@@ -119,6 +120,9 @@ DATASETS: Final = {
 _DAY_US: Final = 86_400_000_000
 _KNOWN_COLUMNS: Final = ("endpoint", "outcome", "request_json", "retrieved_at_utc")
 _MAX_RAW_BYTES: Final = 64 * 1024 * 1024
+# A batch also ends once its responses reach this many bytes.
+MAX_BATCH_BYTES: Final = 256 * 1024 * 1024
+SHORT_CODE: Final = re.compile(r"[0-9A-Z]{6}")
 
 
 def _us(moment: datetime) -> int:
@@ -289,6 +293,12 @@ def _read_raw(workspace: Workspace, digest: str) -> bytes:
 # --- what is known --------------------------------------------------------------------------
 
 
+def _require_pyarrow(command: str) -> None:
+    """Commits need the legacy extra; check before the first provider call."""
+    if importlib.util.find_spec("pyarrow") is None:
+        raise ValueError(f"{command} needs pyarrow (the legacy extra)")
+
+
 def _receipt_tables(
     workspace: Workspace, prefix: str, table: str
 ) -> Iterator[tuple[str, dict[str, object]]]:
@@ -329,7 +339,8 @@ class Known:
 def observe_row(knowledge: Knowledge, row: Sequence[object], raw: bytes | None) -> bool:
     """Add one receipts row (endpoint, outcome, request JSON, retrieval instant).
 
-    False when the row names no request or retrieval instant it can be read by.
+    False when the row names no request or retrieval instant it can be read by, or is a
+    completed list page or corp code list without the response that says what it holds.
     """
     endpoint, outcome, request_json, retrieved = row
     at = _parse_instant(retrieved)
@@ -341,6 +352,8 @@ def observe_row(knowledge: Knowledge, row: Sequence[object], raw: bytes | None) 
     except (ValueError, TypeError):
         return False
     if request.endpoint != endpoint:
+        return False
+    if request.endpoint == LIST and outcome == COMPLETED and raw is None:
         return False
     total = None
     if request.endpoint == LIST and outcome == COMPLETED and raw is not None:
@@ -396,7 +409,11 @@ def load_known(workspace: Workspace) -> Known:
 
 
 def kind_codes(workspace: Workspace) -> frozenset[str] | None:
-    """Short codes of the newest committed KOSPI and KOSDAQ lists, None unless both exist."""
+    """Short codes of the newest committed KOSPI and KOSDAQ lists.
+
+    None unless both exist and every code of both is a KRX short code, so a malformed list
+    never narrows the cohort.
+    """
     newest: dict[str, tuple[datetime, set[str]]] = {}
     for store, entry in _receipt_tables(workspace, KIND_PREFIX, KIND_TABLE):
         rows = _select(workspace, store, entry, ("list_id", "short_code", "retrieved_at_utc"))
@@ -410,7 +427,10 @@ def kind_codes(workspace: Workspace) -> frozenset[str] | None:
                 newest[list_id] = (at, codes)
     if set(newest) != set(kind_lists.LISTS):
         return None
-    return frozenset().union(*(codes for _, codes in newest.values()))
+    codes = frozenset().union(*(codes for _, codes in newest.values()))
+    if any(SHORT_CODE.fullmatch(code) is None for code in codes):
+        return None
+    return codes
 
 
 def finish_batches(workspace: Workspace) -> int:
@@ -471,22 +491,25 @@ class Run:
     _last_call: float | None = None
 
     def flush(self, *, final: bool = False) -> None:
-        while self.pending and (final or len(self.pending) >= self.batch_size):
+        while self.pending and (
+            final
+            or len(self.pending) >= self.batch_size
+            or sum(len(item.response) for item in self.pending) >= MAX_BATCH_BYTES
+        ):
             size = self._chunk_size()
             chunk, self.pending = self.pending[:size], self.pending[size:]
             self.committed.append(commit_batch(self.workspace, Batch.of(chunk)))
 
     def _chunk_size(self) -> int:
-        """Up to ``batch_size`` receipts, ending before a second completed corp code list.
-
-        ``dart.corp_codes@1`` reads one completed corp code list per source.
+        """Up to ``batch_size`` receipts and ``MAX_BATCH_BYTES`` of responses, ending before
+        a second completed corp code list (``dart.corp_codes@1`` reads one per source).
         """
-        seen = False
+        seen, size = False, 0
         for index, item in enumerate(self.pending[: self.batch_size]):
-            if item.completed_corp_codes:
-                if seen:
-                    return index
-                seen = True
+            if index and (size >= MAX_BATCH_BYTES or (seen and item.completed_corp_codes)):
+                return index
+            seen = seen or item.completed_corp_codes
+            size += len(item.response)
         return min(self.batch_size, len(self.pending))
 
     def _now_us(self) -> int:
@@ -610,8 +633,7 @@ def collect_dart(  # noqa: PLR0913 -- every bound of one run is explicit
 ) -> dict[str, object]:
     """One bounded OpenDART collection; see the module documentation for the phases."""
     policy = policy or CohortPolicy()
-    if importlib.util.find_spec("pyarrow") is None:  # commits need the legacy extra
-        raise ValueError("aas collect dart run needs pyarrow (the legacy extra)")
+    _require_pyarrow("aas collect dart run")
     for name, value in (("max_calls", max_calls), ("daily_quota", daily_quota),
                         ("batch_size", batch_size)):  # fmt: skip
         if type(value) is not int or value < (0 if name == "max_calls" else 1):
@@ -718,6 +740,7 @@ def collect_kind(
     lists: Sequence[str] = kind_lists.LISTS,
 ) -> dict[str, object]:
     """Fetch KIND lists and commit each answer as a ``kind-listings`` content source."""
+    _require_pyarrow("aas collect kind run")
     state = workspace.state
     settled = ledger.recover(state, KIND_PROVIDER, at_us=_us(clock()))
     results: list[dict[str, object]] = []

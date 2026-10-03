@@ -143,6 +143,14 @@ def test_outcomes_route_the_collector_and_keep_the_provider_status() -> None:
     assert classify(page, _response(status("013"))) == (NO_DATA, "013")
     malformed = json.dumps({"status": "000", "list": [{"corp_code": 1}]}).encode()
     assert classify(page, _response(malformed)) == (FAILED, "000")
+    # A list answer is the requested page of the requested day, counting a bounded number
+    # of pages, and a document repeating a key is no answer at all.
+    assert classify(page, _response(list_page(filings, page=2, total=2))) == (FAILED, "000")
+    late = [filing("00000101", "분기보고서 (2026.09)", "20261115000001", "20261115")]
+    assert classify(page, _response(list_page(late))) == (FAILED, "000")
+    assert classify(page, _response(list_page(filings, total=1_001))) == (FAILED, "000")
+    repeated = b'{"status":"013","status":"000","list":[]}'
+    assert classify(statement, _response(repeated)) == (FAILED, None)
     assert stops_run(_response(status("020")))
     assert stops_run(_response(status("011")))
     assert stops_run(_response(b"", http=429))

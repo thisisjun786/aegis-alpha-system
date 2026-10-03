@@ -212,16 +212,19 @@ def _first_list_day(knowledge: Knowledge, today: date, policy: CohortPolicy) -> 
 def list_gaps(knowledge: Knowledge, today: date, policy: CohortPolicy) -> list[Planned]:
     """Pages of the days before today whose list is not fully answered after the day ended.
 
-    A page whose last ask got no answer waits ``failed_retry_days`` like a statement.
+    A page whose last ask failed or got no answer waits ``failed_retry_days`` like a
+    statement.
     """
     planned: list[Planned] = []
     day = _first_list_day(knowledge, today, policy)
     while day < today:
         for page in missing_pages(knowledge, day):
             request = DartRequest.list_page(day, page)
-            unanswered = knowledge.unanswered.get(request.fingerprint)
-            if unanswered is None or (
-                (today - seoul_day(unanswered)).days >= policy.failed_retry_days
+            seen = knowledge.seen(request)
+            if (
+                seen is None
+                or seen.outcome != FAILED
+                or ((today - seoul_day(seen.retrieved_at)).days >= policy.failed_retry_days)
             ):
                 planned.append(Planned(request, "list_page"))
         day += timedelta(days=1)

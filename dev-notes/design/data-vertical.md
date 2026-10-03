@@ -1121,13 +1121,14 @@ fingerprint = sha256(정규 JSON ["aas-opendart-request-v1", endpoint, parameter
 관측일은 요청에 들어가지 않는다. 같은 질문을 다른 날 다시 묻는 것은 같은 요청의 다음 attempt이고,
 관측일을 담은 legacy 요청 문서도 같은 요청으로 읽힌다. 응답 결과는 `COMPLETED`(내용 있는 답),
 `NO_DATA`(공급자 상태 `013`), `FAILED`(그 밖의 답)이며 수집 경로만 정한다. corp code 답은
-`CORPCODE.xml`이 읽히고 종목코드가 있는 회사를 나열할 때만 `COMPLETED`다. 응답 bytes는 결과와 상관없이
+`CORPCODE.xml`이 읽히고 종목코드가 있는 회사를 나열할 때만, 목록 답은 요청한 `page_no`이고 공시 접수일이
+요청한 날 안이며 1,000 page 이하를 셀 때만 `COMPLETED`다. key를 되풀이하는 JSON은 상태가 없는 답이다. 응답 bytes는 결과와 상관없이
 보존하고 판정은 승격 매퍼가 한다. 키·IP·만료 거부와 일일 한도(`010`·`011`·`012`·`020`·`021`·`901`,
 HTTP 401·403·429)는 실행을 멈춘다. 키는 공급자 URL에만 실리며 응답이 키를 되돌려 주면 그 응답을
 보존하지 않는다.
 
 **rolling cohort.** 계획의 입력은 가장 새로운 완료 corp code 목록에서 종목코드가 있는 회사(KIND의
-유가증권·코스닥 목록이 둘 다 commit돼 있으면 그 단축코드로 좁힘)와 유가증권·코스닥(`corp_cls`
+유가증권·코스닥 목록이 둘 다 commit돼 있고 모든 코드가 KRX 단축코드면 그 단축코드로 좁힘)와 유가증권·코스닥(`corp_cls`
 `Y`·`K`) 정기공시를 낸 회사, 원천 자료실의 모든 `opendart-*` receipts 테이블(legacy 편입분 포함), 공시
 목록 page가 말하는 정기보고서 공시, 그리고 답을 보존하지 못한 원장 attempt다. 12월 결산 기준으로
 기간이 끝난 사업연도(2015년부터)·보고서마다:
@@ -1143,11 +1144,13 @@ HTTP 401·403·429)는 실행을 멈춘다. 키는 공급자 URL에만 실리며
 별도(`OFS`) 요청은 연결 요청의 마지막 답이 `NO_DATA`인 동안 같은 규칙을 따른다. `COMPLETED`는 새 공시가
 없으면 다시 묻지 않는다. 요청 순서는 위 표의 순서(`opendart_cohort.REASONS`)이고, 같은 이유 안에서는
 최신 기간부터다. 간격은 `CohortPolicy`의
-값이며 그 해시가 원장 job의 `policy_hash`다.
+값이며 그 해시가 원장 job의 `policy_hash`(그 job을 처음 만든 실행의 정책)다.
 
 공시 목록은 하루 단위로 읽는다. 오늘 전의 Seoul 날짜는 그 날이 끝난 뒤 받은 첫 page와 첫 page가 센
 모든 page의 답이 있을 때 덮인 것이다(첫 page가 `NO_DATA`면 공시 없는 날). 처음에는 90일 전부터 읽고,
-알려진 가장 이른 날부터 빈 날을 채운다. 실행 중 첫 page가 오면 그 page가 센 page를 바로 묻는다.
+알려진 가장 이른 날부터 빈 날을 채운다. 실행 중 첫 page가 오면 그 page가 센 page를 바로 묻는다. 마지막
+답이 `FAILED`이거나 답을 보존하지 못한 page는 하루 뒤 다시 묻는다. 응답이 없는 완료 목록 행은 읽히지 않은
+행으로 세고 그 날을 덮지 않는다.
 보고서 이름 `분기보고서 (YYYY.03|09)`, `반기보고서 (YYYY.06)`, `사업보고서 (YYYY.12)`(앞의 `[기재정정]` 같은
 괄호 표시 포함)만 요청에 대응하고, 다른 결산월의 보고서는 대응하지 않은 수로 센다. corp code 목록은
 7일마다 다시 받는다.
@@ -1171,7 +1174,7 @@ HTTP 401·403·429)는 실행을 멈춘다. 키는 공급자 URL에만 실리며
 
 **보존과 commit.** 호출마다 응답 bytes와 정규 receipt(`aas-opendart-receipt-v1`: 요청, fingerprint, job과
 attempt, HTTP 상태, 보존 header(`content-type`·`date`·`retry-after`), 요청·수집 시각, 결과, 공급자 상태,
-응답의 크기·SHA-256)를 `raw/`에 둔다. 500개까지의 receipt를 수집 순서로 나열한 batch 문서
+응답의 크기·SHA-256)를 `raw/`에 둔다. 500개까지(응답 합계 256 MiB까지)의 receipt를 수집 순서로 나열한 batch 문서
 (`aas-opendart-batch-v1`)와 그 receipt·응답이 완결 단위 하나이고, `opendart-receipts-<hex>` 원천의
 `receipts` 테이블 하나로 commit된다. 행은 `fingerprint`, `endpoint`, `outcome`, `provider_status`,
 `request_json`(`endpoint`·`parameters_json`), `receipt_json`, `receipt_sha256`, `raw_base64`, `raw_sha256`,
@@ -1946,14 +1949,14 @@ state v2:
 | DV-261 | `aas-adjusted-read-v1` 영수증은 같은 읽기에 같은 hash이고, 행동 집합이 바뀌면 `rows_hash`가 바뀌며, 하위 읽기의 hash를 싣는다 | `tests/storage/test_read_heads.py::test_adjusted_receipt_pins_the_reads_and_the_rows` | 구현 |
 | DV-262 | `norgate.status@1`과 `fmp.dividends@1`은 승격을 거쳐 `local_day_end@1`과 XNYS `exdate_open@1` 시각으로 저장된다 | `tests/storage/test_us_actions.py::test_norgate_status_and_fmp_actions_promote` | 구현 |
 | DV-263 | OpenDART 요청 지문은 endpoint와 parameter만 해시하고 legacy 요청의 관측일을 무시한다 | `tests/data/test_opendart.py::test_request_fingerprint_names_the_question_without_its_observation_date` | 구현 |
-| DV-264 | 응답 결과는 수집 경로만 정하고 공급자 상태를 남기며, 키·한도 거부는 실행을 멈춘다 | `tests/data/test_opendart.py::test_outcomes_route_the_collector_and_keep_the_provider_status` | 구현 |
+| DV-264 | 응답 결과는 수집 경로만 정하고 공급자 상태를 남기며, 키·한도 거부는 실행을 멈춘다. 상장회사로 읽히지 않는 corp code 답, 요청한 page·날이 아닌 목록 page, 1,000 page를 넘게 세는 목록, key를 되풀이하는 JSON은 `FAILED`다 | `tests/data/test_opendart.py::test_outcomes_route_the_collector_and_keep_the_provider_status` | 구현 |
 | DV-265 | 보고서는 12월 결산 기간이 끝나면 cohort에 들어오고 최신 기간부터 묻는다 | `tests/data/test_opendart_cohort.py::test_a_quarter_enters_the_cohort_when_its_period_ends` | 구현 |
 | DV-266 | `NO_DATA`는 종결이 아니며 시즌 안에서는 7일, 그 뒤에는 직전 사업연도까지 90일마다 다시 묻는다 | `tests/data/test_opendart_cohort.py::test_no_data_is_asked_again_in_season_weekly_and_after_it_quarterly` | 구현 |
 | DV-267 | 마지막 수집일 이후의 공시(늦은 제출·정정)는 그 요청을 다시 묻게 한다 | `tests/data/test_opendart_cohort.py::test_a_filing_on_or_after_the_last_ask_asks_again` | 구현 |
 | DV-268 | 별도 재무제표 요청은 연결 요청의 마지막 답이 `NO_DATA`인 동안만 묻는다 | `tests/data/test_opendart_cohort.py::test_the_separate_statement_follows_a_consolidated_no_data` | 구현 |
 | DV-269 | 실패했거나 답을 보존하지 못한 요청은 하루 뒤 다시 묻는다 | `tests/data/test_opendart_cohort.py::test_failed_and_unanswered_asks_wait_a_day` | 구현 |
 | DV-270 | 회사 목록은 KIND 목록으로 좁혀지고 유가증권·코스닥 정기공시 회사로 넓혀진다 | `tests/data/test_opendart_cohort.py::test_the_universe_is_narrowed_by_kind_and_widened_by_listed_filers` | 구현 |
-| DV-271 | 공시 목록의 날은 그 날이 끝난 뒤 받은 첫 page와 그 page가 센 모든 page로만 덮인다 | `tests/data/test_opendart_cohort.py::test_list_days_are_covered_only_by_answers_after_the_day_ended` | 구현 |
+| DV-271 | 공시 목록의 날은 그 날이 끝난 뒤 받은 첫 page와 그 page가 센 모든 page로만 덮이고, 실패한 page는 하루 뒤 다시 묻는다 | `tests/data/test_opendart_cohort.py::test_list_days_are_covered_only_by_answers_after_the_day_ended` | 구현 |
 | DV-272 | legacy 원장 재생은 고정 cohort가 묻지 않은 분기와 `NO_DATA` 뒤의 별도 재무제표를 계획한다 | `tests/data/test_opendart_cohort.py::test_the_legacy_ledger_replay_plans_the_quarter_its_fixed_cohort_never_asks` | 구현 |
 | DV-273 | 호출은 `reserved` attempt와 usage event로 먼저 기록되고 답을 보존한 뒤 receipt 해시로 정산된다 | `tests/storage/test_collection_ledger.py::test_a_call_is_reserved_before_it_starts_and_settled_after` | 구현 |
 | DV-274 | 중단된 attempt는 호출 전이면 `released`, 호출 뒤면 `uncertain`이 되고 성공이나 미호출로 바뀌지 않는다 | `tests/storage/test_collection_ledger.py::test_recovery_never_turns_an_interrupted_call_into_a_success_or_a_non_call` | 구현 |
@@ -1970,3 +1973,6 @@ state v2:
 | DV-285 | marker는 commit됐지만 완료되지 않은 batch는 다음 실행이 완료하고 그 receipt를 다시 commit하지 않는다 | `tests/storage/test_kr_collection.py::test_a_commit_left_without_its_completion_is_finished_not_committed_again` | 구현 |
 | DV-286 | legacy `opendart-native` receipts 테이블의 세 형태(`raw_json`, `raw_base64`, 검증 결과)는 모두 계획에 읽힌다 | `tests/storage/test_kr_collection.py::test_legacy_receipts_tables_of_every_shape_are_read` | 구현 |
 | DV-287 | `aas-opendart-receipt-v1`, `aas-opendart-batch-v1`, `aas-kind-receipt-v1` 형식은 고정 입력과 기대 digest로 고정돼 있다 | `tests/storage/test_kr_collection.py::test_receipt_batch_and_kind_receipt_formats_are_frozen` | 구현 |
+| DV-288 | KIND 목록의 코드 하나라도 KRX 단축코드가 아니면 cohort를 좁히지 않는다 | `tests/storage/test_kr_collection.py::test_a_kind_list_with_a_malformed_code_never_narrows_the_cohort` | 구현 |
+| DV-289 | 응답 없는 완료 공시 목록 행은 읽히지 않은 행이고 그 날을 덮지 않는다 | `tests/storage/test_kr_collection.py::test_a_completed_list_row_without_its_page_is_unreadable` | 구현 |
+| DV-290 | batch는 응답 bytes 상한에서도 끝난다 | `tests/storage/test_kr_collection.py::test_a_batch_ends_at_its_byte_budget` | 구현 |

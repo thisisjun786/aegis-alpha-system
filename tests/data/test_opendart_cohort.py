@@ -164,6 +164,11 @@ def test_list_days_are_covered_only_by_answers_after_the_day_ended() -> None:
     second = DartRequest.list_page(date(2026, 10, 2), 1)
     knowledge.observe(Observation(second, NO_DATA, _at("2026-10-02T15:00:01")))
     assert [item.request for item in list_gaps(knowledge, today, policy)] == gaps[:1]
+    # A retained failed page waits a day, like an unanswered one.
+    page = gaps[0]
+    knowledge.observe(Observation(page, FAILED, _at("2026-10-02T16:00")))
+    assert list_gaps(knowledge, today, policy) == []
+    assert next(item.request for item in list_gaps(knowledge, date(2026, 10, 4), policy)) == page
 
 
 def test_the_corp_code_list_is_refreshed_weekly() -> None:

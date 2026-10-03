@@ -67,6 +67,8 @@ LIST_PAGE_COUNT: Final = "100"
 # OpenDART refuses a list query without a corp code over a window longer than three months.
 MAX_LIST_WINDOW_DAYS: Final = 92
 MAX_RESPONSE_BYTES: Final = 64 * 1024 * 1024
+# A day's periodic-report list is a few thousand filings at 100 a page; more is malformed.
+MAX_LIST_PAGES: Final = 1_000
 MAX_XML_BYTES: Final = 256 * 1024 * 1024
 _RETAINED_HEADERS: Final = frozenset({"content-type", "date", "retry-after"})
 _HTTP_OK: Final = 200
@@ -242,10 +244,18 @@ class DartResponse:
             raise ValueError("a response is retrieved after it is requested")
 
 
+def _unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    document = dict(pairs)
+    if len(document) != len(pairs):
+        raise ValueError("provider JSON repeats a key")
+    return document
+
+
 def _json_status(body: bytes) -> tuple[str | None, Mapping[str, object] | None]:
+    """The status of a provider JSON document; None for anything ambiguous (repeated keys)."""
     try:
-        value = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        value = json.loads(body.decode("utf-8"), object_pairs_hook=_unique)
+    except (UnicodeDecodeError, ValueError):
         return None, None
     if not isinstance(value, dict):
         return None, None
@@ -355,6 +365,8 @@ def parse_list(body: bytes) -> ListPage:
     items = document.get("list")
     if type(total) is not int or total < 1 or not isinstance(items, list):
         raise ValueError("list page names no page count or filing list")
+    if total > MAX_LIST_PAGES:
+        raise ValueError(f"list page counts more than {MAX_LIST_PAGES} pages")
     filings: list[Filing] = []
     unmapped = 0
     for item in cast("list[object]", items):
@@ -386,10 +398,19 @@ def _answered(request: DartRequest, body: bytes) -> bool:
     if request.endpoint == FINANCIALS:
         return bool(rows)
     try:
-        parse_list(body)
+        page = parse_list(body)
     except ValueError:
         return False
-    return True
+    return _answers_page(request, cast("Mapping[str, object]", document), page)
+
+
+def _answers_page(request: DartRequest, document: Mapping[str, object], page: ListPage) -> bool:
+    """Whether a list page is the requested page of the requested days."""
+    parameters = request.parameters
+    if str(document.get("page_no")) != parameters["page_no"]:
+        return False
+    first, last = _day(parameters["bgn_de"], "bgn_de"), _day(parameters["end_de"], "end_de")
+    return all(first <= filing.filed_on <= last for filing in page.filings)
 
 
 def classify(request: DartRequest, response: DartResponse) -> tuple[str, str | None]:
