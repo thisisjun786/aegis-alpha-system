@@ -8,10 +8,10 @@ permissions:
   contents: read
 
 concurrency:
-  # A title or body edit that keeps the base runs in its own `-edit` group, so it never
-  # cancels the run a push started; it still runs, because a skipped gate would satisfy
-  # the required check. A retarget stays in the main group and replaces obsolete runs.
-  group: aas-ci-${{ github.base_ref }}-${{ github.event.pull_request.number }}${{ github.event.action == 'edited' && !github.event.changes.base && '-edit' || '' }}
+  # One group per PR: a new head or a retarget replaces the obsolete run. A title or body
+  # edit that keeps the base runs in its own `-edit` group, so it never cancels the run a
+  # push started; it still runs, because a skipped gate would satisfy the required check.
+  group: aas-ci-${{ github.event.pull_request.number }}${{ github.event.action == 'edited' && !github.event.changes.base && '-edit' || '' }}
   cancel-in-progress: true
 
 env:
