@@ -291,6 +291,7 @@ def import_binding(
 
     from aegis_alpha.storage.input_pins import (
         decode_pin_document,
+        import_head_binding,
         register_definition,
         register_input_bundle,
     )
@@ -310,6 +311,9 @@ def import_binding(
         pin = register_definition(workspace, raw, expected_file_sha256=sha256, budget=budget)
     elif schema == "aas-input-bundle-v1":
         pin = register_input_bundle(workspace, raw, expected_file_sha256=sha256, budget=budget)
+    elif schema == "aas-head-binding-v1":
+        digest = import_head_binding(workspace, raw, expected_file_sha256=sha256, budget=budget)
+        return {"registered": True, "pin": {"binding_hash": digest}, "backtest_eligible": False}
     else:
         raise ValueError("unsupported binding import schema")
     return {"registered": True, "pin": asdict(pin), "backtest_eligible": False}
