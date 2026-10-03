@@ -663,7 +663,8 @@ run 등록, 결과 저장은 하지 않는다. 봉투 회계는 별도 `aas back
 (`aas-canonical-json-sha256-v1`), `strategy`, `bindings`, `refs`, `price_inputs`,
 `macro_inputs`, `derived_inputs`, `proxy_rules`, `period`, `history`, `cutoff`,
 `decision_latency_us`, `explicit_decision_dates`, `account`, `comparison`, `envelope`,
-`metadata`다. 모든 키가 필수이고 알 수 없는 키·중복 키·bool을 숫자로 쓴 값은 거부한다.
+`metadata`다. 계좌 통화가 아닌 가격 선택이 있으면 `fx_conversions`를 더한다. 그 밖의 키는 모두 필수이고
+알 수 없는 키·중복 키·bool을 숫자로 쓴 값은 거부한다.
 기계용 JSON Schema는 [backtest_request.py](../src/aegis_alpha/engine/backtest_request.py)의
 `PREPARE_REQUEST_SCHEMA`가 정본이다. 인라인 가격·전략·기본 관례는 받지 않는다.
 
@@ -683,6 +684,8 @@ run 등록, 결과 저장은 하지 않는다. 봉투 회계는 별도 `aas back
   시장마다 다른 기업행동 원천을 묶을 수 있다. 여러 개를 허용하는 역할은 `signal_prices`·`execution_prices`·
   `macro`·`derived`·`proxy`·`actions`뿐이며 ordinal은 역할 안에서 0부터 연속이다. `signal_prices`·
   `execution_prices`·`sessions`·`macro`는 `generation` 또는 `heads` 참조를, `actions`는 `heads` 참조만 받는다.
+  `fx_conversion`은 `fx_rates` 도메인의 `heads` 참조만 받고 `fx_conversions` 항목마다 하나이며 여러 개를
+  허용한다.
 - `refs`: bindings가 가리키는 참조 서술자. `ref_kind`, `ref_id`, `ref_version`, `hash`,
   `schema`, `hash_format`, `pin`을 담고 같은 서술자를 두 번 넣으면 거부한다.
   `generation`의 pin은 `data inspect`가 돌려주는 `dataset_id`·`version`·`generation_id`·
@@ -697,6 +700,11 @@ run 등록, 결과 저장은 하지 않는다. 봉투 회계는 별도 `aas back
   `ordinal`), 정렬된 `instrument_ids`, `currency`, `basis`(`unadjusted`·`split_adjusted`·
   `total_return`), `price_role`(`canonical`·`reference`), `interval=1d`. 신호 가격은 basis
   관례와 맞아야 하고 체결 가격은 `unadjusted`·`canonical`이어야 한다.
+- `fx_conversions`: 계좌 통화가 아닌 가격 통화마다 하나. `binding`(`fx_conversion` 역할·ordinal),
+  `currency`(세 글자 대문자), `series_id`(`<currency>/<계좌 통화>` 또는 `<계좌 통화>/<currency>`),
+  `max_fixing_age_days`(0 이상 정수), `signal_basis`(`account_currency` 또는 `price_currency`). 환산이
+  없으면 열쇠를 두지 않으며 빈 배열은 거부한다. 규칙과 기록은
+  [FX 변환 계약](design/data-vertical.md#fx-변환-계약)이 소유한다.
 - `macro_inputs`(`binding`·`series_id`·`unit`), `derived_inputs`(`binding`·`series_id`),
   `proxy_rules`(`binding`·`logical_exposure_id`): 전략 정의의 요구를 빠짐없이 채워야 하며
   요구하지 않은 입력을 조용히 무시하지 않는다.
@@ -936,8 +944,30 @@ run 이력에 남는다. 어느 쪽이든 성공 영수증은 없다. 그 run을
 `pins`는 `aas-head-binding-v1`의 순서 있는 pin과 `[from, to)` cutover 구간이고, `excluded_flags`는
 읽지 않을 quality flag다. 연구 읽기는 엄격 PIT가 아니므로 시간 규칙 grant는 선언하지 않는다.
 `instrument_map`의 열쇠는 identity가 발급한 instrument ID이고 값 자산은 상태 저장소에서 `etf`로
-분류돼 있어야 한다. 가격 통화는 `conventions.currency`와 같아야 한다. 선언한 `knowledge_time`보다
-늦게 알려진 revision은 읽지 않는다. 봉인 준비 문서의 `prices.head_read`가 그 읽기 영수증이다.
+분류돼 있어야 한다. 가격 통화는 `conventions.currency`이거나 `fx_conversions` grant가 허용한 통화다.
+선언한 `knowledge_time`보다 늦게 알려진 revision은 읽지 않는다. 봉인 준비 문서의 `prices.head_read`가
+그 읽기 영수증이다.
+
+슬리브가 거시 신호를 읽으면 선언은 그 series를 `macro`로 grant하고, 다른 통화의 가격을 쓰면
+`fx_conversions`로 grant한다. 둘 다 쓰지 않으면 열쇠를 두지 않는다.
+
+```json
+"macro": [
+  {"series_id": "T10Y3M", "unit": "percent",
+   "binding": {"domain": "macro_observations", "pins": [<pin>], "excluded_flags": []}}
+],
+"fx_conversions": [
+  {"currency": "USD", "series_id": "USD/KRW", "max_fixing_age_days": 5,
+   "signal_basis": "account_currency",
+   "binding": {"pins": [<fx_rates pin>], "excluded_flags": []},
+   "prices": {"pins": [<USD 가격 pin>], "excluded_flags": []}}
+]
+```
+
+`macro`는 슬리브들이 읽는 series와 정확히 같아야 하고 판단마다 그 cutoff로 다시 읽힌다.
+`fx_conversions`의 `prices`는 선택이며, 있으면 그 통화의 chain을 선언의 `prices`와 함께 읽는다.
+봉인 준비 문서의 `macro`와 `fx_conversions`가 grant와 그 아래의 모든 읽기를 기록한다. 계약은
+[연구 실행의 canonical 가격 패널](design/data-vertical.md#연구-실행의-canonical-가격-패널)이 소유한다.
 
 run 저장 표는 기본 설치에 없고, 선언된 계약을 담으려면 add-on이 v1보다 높아야 한다. 둘 다
 0단계에서 확인하므로 설치가 부족하면 계산 전에 실행할 명령을 알려주고 끝난다.

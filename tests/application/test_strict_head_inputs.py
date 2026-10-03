@@ -1104,3 +1104,247 @@ def test_a_head_binding_is_verified_again_only_from_its_retained_document(
     stored.write_bytes(raw + b"\n")
     with open_workspace(home) as workspace, pytest.raises(ValueError, match="hash mismatch"):
         read_head_binding(workspace, ref["hash"])
+
+
+# KRW per USD at each fixture session: the KRW bars below are ASSET_B's USD numbers at
+# these rates, so converting them back into the USD account gives the fixture's numbers.
+USD_KRW: Final = (1000, 1100, 1200, 1300, 1400, 1300, 1200, 1100)
+
+
+def _krw_bars() -> list[Document]:
+    """ASSET_B's canonical unadjusted bars in KRW at the day's USD/KRW fixing."""
+    rows = []
+    for index, (day, value, rate) in enumerate(zip(DAYS, VALUES["ASSET_B"], USD_KRW, strict=True)):
+        row = {
+            **_common("krw-bar", index, micros(day), ingested=micros(DAYS[-1])),
+            "instrument_id": "ASSET_B",
+            "session_date": day,
+            "interval": "1d",
+            "bar_end_us": micros(day),
+            "basis": "unadjusted",
+            "currency": "KRW",
+            **dict.fromkeys(("open", "high", "low", "close"), Decimal(value * rate)),
+            "volume": Decimal(1000),
+            "price_role": "canonical",
+            "value_state": "present",
+        }
+        rows.append(_identity(row, "prices"))
+    return rows
+
+
+def _fixings(days: tuple[date, ...] = DAYS) -> list[Document]:
+    """The USD/KRW fixing of each of ``days``, fixed and known at the session's close."""
+    rows = []
+    for index, (day, rate) in enumerate(zip(DAYS, USD_KRW, strict=True)):
+        if day not in days:
+            continue
+        rows.append(
+            _identity(
+                {
+                    **_common("usdkrw", index, micros(day), ingested=micros(DAYS[-1])),
+                    "base_currency": "USD",
+                    "quote_currency": "KRW",
+                    "fixing_at_us": micros(day),
+                    "rate": Decimal(rate),
+                    "value_state": "present",
+                },
+                "fx_rates",
+            )
+        )
+    return rows
+
+
+def mixed_currency(  # noqa: PLR0913 -- the market split and the terms of its conversion
+    workspace: Workspace,
+    body: Document,
+    *,
+    signal_basis: str = "account_currency",
+    max_age: int = 0,
+    fixed: tuple[date, ...] = DAYS,
+    grant: bool = True,
+) -> Document:
+    """Move ASSET_B to a KRW chain beside the USD one and grant converting it into USD.
+
+    The USD bindings keep ASSET_A and REF_X. ASSET_B's signal and execution selections bind
+    the KRW chain, its derived signal takes a second actions binding, and one
+    ``fx_conversion`` binding over the USD/KRW fixings converts KRW into the USD account.
+    """
+    headed(workspace, body, recorded=True)
+    krw = heads_ref([sealed(workspace, "prices.syn.krw", "prices", _krw_bars())], [], "prices")
+    actions = sealed(
+        workspace,
+        "actions.syn.krw",
+        "corporate_actions",
+        [{**row, "revision_id": "krw-" + row["revision_id"]} for row in action_rows()],
+    )
+    fx = heads_ref(
+        [sealed(workspace, "fx.usdkrw.syn", "fx_rates", _fixings(fixed))], [], "fx_rates"
+    )
+    for selection in body["price_inputs"]:
+        selection["instrument_ids"] = [
+            name for name in selection["instrument_ids"] if name != "ASSET_B"
+        ]
+    for role in ("signal_prices", "execution_prices"):
+        bind(body, role, krw, 1)
+        usd = next(row for row in body["price_inputs"] if row["binding"]["role"] == role)
+        body["price_inputs"].append(
+            {**usd, "binding": {"role": role, "ordinal": 1}, "instrument_ids": ["ASSET_B"]}
+            | {"currency": "KRW"}
+        )
+    bind(body, "actions", heads_ref([actions], [ABSENT], "corporate_actions"), 1)
+    bind(body, "fx_conversion", fx)
+    if grant:
+        body["fx_conversions"] = [
+            {
+                "binding": {"role": "fx_conversion", "ordinal": 0},
+                "currency": "KRW",
+                "series_id": "USD/KRW",
+                "max_fixing_age_days": max_age,
+                "signal_basis": signal_basis,
+            }
+        ]
+    _ = workspace.market.execute("CHECKPOINT")
+    return body
+
+
+def test_a_mixed_currency_strategy_runs_on_its_granted_fx_pin(
+    stored_template: tuple[Path, bytes], tmp_path: Path
+) -> None:
+    """KRW bars converted into the USD account decide and fill as the USD fixture does.
+
+    The run records the grant: the conversion, its binding, the fixing applied to each
+    execution session, and each fixing read's receipt beside the reads it converted.
+    """
+    body = copy_request(stored_template, tmp_path)
+    home = tmp_path / "home"
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        mixed_currency(workspace, body)
+    with open_workspace(home) as workspace:
+        prepared = prepare(workspace, body)
+    assert dict(prepared.targets) == EXPECTED
+    envelope = json.loads(prepared.envelope.canonical_bytes)
+    period = DAYS[2:7]
+    assert envelope["dates"] == [day.isoformat() for day in period]
+    assert [row["ASSET_B"] for row in envelope["opens"]] == [
+        VALUES["ASSET_B"][DAYS.index(day)] for day in period
+    ]
+    sealed_document = json.loads(prepared.provenance)
+    (record,) = sealed_document["fx_conversions"]
+    assert record["conversion"] == {
+        "schema": "aas-fx-conversion-v1",
+        "rule": "fx_latest_fixing_on_or_before@1",
+        "currency": "KRW",
+        "account_currency": "USD",
+        "series_id": "USD/KRW",
+        "direction": "divide",
+        "max_fixing_age_days": 0,
+        "signal_basis": "account_currency",
+    }
+    fx_ref = next(ref for ref in body["refs"] if ref["pin"].get("domain") == "fx_rates")
+    assert record["binding"] == {"role": "fx_conversion", "ordinal": 0}
+    assert record["binding_hash"] == fx_ref["hash"]
+    assert record["fixings"] == [
+        [day.isoformat(), day.isoformat(), float(USD_KRW[DAYS.index(day)])] for day in period
+    ]
+    assert record["unconverted"] == []
+    reads = [item for item in _reads(prepared) if item["role"] == "fx_conversion"]
+    assert [(item["purpose"], item["decision_date"]) for item in reads] == [
+        ("decision", DAYS[2].isoformat()),
+        ("decision", DAYS[4].isoformat()),
+        ("outcomes", None),
+    ]
+    for item, cutoff in zip(
+        reads,
+        (*(slot.cutoff_us for slot in prepared.slots), body["cutoff"]["knowledge_cutoff_us"]),
+        strict=True,
+    ):
+        assert item["receipt"]["query"]["cutoff_us"] == cutoff
+        assert item["receipt"]["query"]["subjects"] == ["USD/KRW"]
+        assert item["fx_conversion"] == record["conversion"]
+        assert item["unconverted"] == []
+    # Each decision converts the KRW signal bars it reads; the outcomes convert both
+    # prices of each period session.
+    assert [item["converted"] for item in reads] == [3, 5, 2 * len(period)]
+    # The recorded run seals the same preparation, so the grant travels with the run.
+    request = tmp_path / "request.json"
+    request.write_bytes(canonical_json_bytes(body))
+    installed = run_cli("db", "run-install", home=home)
+    assert installed.returncode == 0, installed.stderr
+    receipt = run_backtest(
+        RunBacktestRequest(
+            request=request,
+            request_sha256=hashlib.sha256(request.read_bytes()).hexdigest(),
+            home=home,
+        )
+    )
+    assert receipt["preparation"] == {"sha256": hashlib.sha256(prepared.provenance).hexdigest()}
+    with open_workspace(home) as workspace:
+        stored = read_run(workspace, str(cast("Document", receipt["run"])["run_id"]), budget=BUDGET)
+        assert stored["status"] == "SUCCESS"
+        assert read_head_binding(workspace, fx_ref["hash"]).domain == "fx_rates"
+    verified = run_cli("db", "verify", home=home)
+    assert verified.returncode == 0, verified.stderr
+
+
+def test_a_conversion_states_which_currency_its_signals_read(
+    stored_template: tuple[Path, bytes], tmp_path: Path
+) -> None:
+    """Signals read converted closes, or the KRW closes when the grant keeps them there."""
+    body = copy_request(stored_template, tmp_path)
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        mixed_currency(workspace, body, signal_basis="price_currency")
+        native = prepare(workspace, body)
+        converted = json.loads(json.dumps(body))
+        converted["fx_conversions"][0]["signal_basis"] = "account_currency"
+        account = prepare(workspace, converted)
+    decision = DAYS[4]
+    rate = USD_KRW[DAYS.index(decision)]
+    assert account.features[decision]["ASSET_B"].latest_price == VALUES["ASSET_B"][4]
+    assert native.features[decision]["ASSET_B"].latest_price == VALUES["ASSET_B"][4] * rate
+    # Signals in KRW read no fixing; the fills are still converted into the USD account.
+    assert [item["purpose"] for item in _reads(native) if item["role"] == "fx_conversion"] == [
+        "outcomes"
+    ]
+    assert (
+        json.loads(native.envelope.canonical_bytes)["opens"]
+        == json.loads(account.envelope.canonical_bytes)["opens"]
+    )
+
+
+def test_a_fixing_converts_only_within_its_granted_age(
+    stored_template: tuple[Path, bytes], tmp_path: Path
+) -> None:
+    """A session without its own fixing takes an earlier one only inside the granted age."""
+    missing = DAYS[5]
+    fixed = tuple(day for day in DAYS if day != missing)
+    body = copy_request(stored_template, tmp_path)
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        mixed_currency(workspace, body, fixed=fixed, max_age=7)
+        prepared = prepare(workspace, body)
+        (record,) = json.loads(prepared.provenance)["fx_conversions"]
+        earlier = DAYS[4]
+        assert [missing.isoformat(), earlier.isoformat(), float(USD_KRW[4])] in record["fixings"]
+        envelope = json.loads(prepared.envelope.canonical_bytes)
+        index = envelope["dates"].index(missing.isoformat())
+        assert envelope["opens"][index]["ASSET_B"] == pytest.approx(
+            VALUES["ASSET_B"][5] * USD_KRW[5] / USD_KRW[4]
+        )
+        # With no age at all, the decision's fill has no USD open, and the export refuses.
+        strict = json.loads(json.dumps(body))
+        strict["fx_conversions"][0]["max_fixing_age_days"] = 0
+        with pytest.raises(ValueError, match="next-session open"):
+            prepare(workspace, strict)
+
+
+def test_a_foreign_currency_without_a_grant_is_refused_by_name(
+    stored_template: tuple[Path, bytes], tmp_path: Path
+) -> None:
+    body = copy_request(stored_template, tmp_path)
+    with open_workspace(tmp_path / "home", writable=True, strategy_write=True) as workspace:
+        mixed_currency(workspace, body, grant=False)
+        with pytest.raises(ValueError, match="fx_conversion binding requires exactly one"):
+            prepare(workspace, body)
+        body["bindings"] = [item for item in body["bindings"] if item["role"] != "fx_conversion"]
+        body["refs"] = [ref for ref in body["refs"] if ref["pin"].get("domain") != "fx_rates"]
+        with pytest.raises(ValueError, match="KRW need an fx_conversions grant"):
+            prepare(workspace, body)

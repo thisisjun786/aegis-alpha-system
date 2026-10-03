@@ -1789,7 +1789,8 @@ pin(`observations`) 대신 canonical 가격 binding(`prices`: `aas-head-binding-
 - query는 연구 모드이고 시간 규칙 grant를 쓰지 않는다. 지식 상한은 선언의 `knowledge_time`이고 subject는
   `instrument_map`의 instrument ID, 역할은 `canonical`, 날짜는 이력·기간 시작 중 이른 날부터 둘의 끝 중
   늦은 날까지다. 그래서 패널은 pin한 chain이 그 instrument에 가진 첫 세션부터 시작한다.
-- 행은 `basis='unadjusted'`, `interval='1d'`의 canonical bar여야 하고 통화는 선언 통화와 같아야 한다. `present`가 아닌
+- 행은 `basis='unadjusted'`, `interval='1d'`의 canonical bar여야 하고 통화는 선언 통화이거나 아래 FX 변환
+  grant가 허용한 통화다. `present`가 아닌
   bar와 공개 시점이 상한보다 늦은 head는 패널에 넣지 않으며 이전 값으로 대체하지 않는다. 같은
   instrument·세션의 bar가 둘이면 거부한다. 읽은 행이 없는 `instrument_map` 열쇠도 거부한다.
 - 한 bar가 자기 시가와 종가를 내므로 두 패널은 basis·조정·세션이 같다. 세션 순서는 bar의 `bar_end_us`로
@@ -1801,6 +1802,33 @@ pin(`observations`) 대신 canonical 가격 binding(`prices`: `aas-head-binding-
 - 봉인 준비 문서는 `observations` 대신 `prices`에 `binding_hash`, 읽기 영수증 `head_read`
   (`aas-head-read-v1` 전체)와 그 SHA-256을 싣는다. `resolved_calendar.observed_calendar_ref`는 binding
   hash를 가리킨다. 실행은 `research-uncertified`이다. strict 실행 준비의 head binding은 다음 절이 다룬다.
+
+선언은 두 grant를 선택적으로 가진다. 쓰지 않으면 열쇠 자체가 없으므로, grant가 없는 선언의 바이트와
+digest는 grant가 생기기 전과 같다. 빈 배열은 거부한다.
+
+- `macro`: 슬리브가 읽는 거시 series마다 `series_id`, `unit`, `binding`(`domain`이
+  `macro_observations` 또는 `fx_rates`인 pin·cutover와 flag 제외 목록)을 `series_id` 순으로 싣는다. FX
+  고시를 series로 쓰면 이름은 `BASE/QUOTE`, 단위는 호가 통화다. grant는 정확해야 한다: 슬리브들의 실행
+  정의가 읽는 거시 series 집합과 선언한 집합이 같지 않으면 준비가 거부하므로, 슬리브가 series를 받지
+  못한 채 replay에 가거나 쓰이지 않은 series가 기록되는 일이 없다. 각 binding은 store에서 다시 검증되고
+  지식 상한까지 그 series를 그 단위로 가져야 한다(`admission`). 판단마다 그 판단의 cutoff(선언 지식
+  시각을 넘지 않는다)를 지식 상한으로 다시 읽으므로, store가 vintage를 기록한 series는 판단 당시의
+  vintage로 판단한다. 파생 series는 이 경로에 원천이 없어 그 슬리브는 여전히 거부한다. 표본 조합의 공격
+  슬리브가 거시 신호를 가지면 그 신호가 master switch에 들어가 기록이 이름 붙인 canary가 아닌 조건으로
+  방어 슬리브를 고르게 되므로 거부한다. 방어 슬리브의 거시 신호는 그 슬리브 안에서 쓰인다.
+- `fx_conversions`: 선언 통화가 아닌 가격 통화마다 `currency`, `series_id`, `max_fixing_age_days`,
+  `signal_basis`, `binding`(`fx_rates` pin·cutover와 flag 제외 목록), 선택 `prices`(그 통화 bar를 담은
+  canonical 가격 binding)를 `currency` 순으로 싣는다. 변환은 [FX 변환 계약](#fx-변환-계약)을 따른다.
+  `prices`가 있으면 선언의 `prices` binding과 같은 query로 그 binding도 읽어 패널에 더하므로, KRW
+  chain과 USD chain을 한 run에서 읽는다. 그 binding의 bar는 모두 grant의 통화여야 하고 두 binding이 같은
+  instrument·세션을 가지면 반복 세션으로 거부한다. 고시는 선언 지식 상한으로 패널 구간에 한 번 읽는다.
+  환산할 고시가 없는 bar는 시가·종가 패널 모두에서 빠진다. 신호 패널은 환산한 종가이고,
+  `signal_basis=price_currency`이면 그 통화의 종가 그대로다. 이 grant는 canonical 가격 패널에만 있고
+  관측 패널 선언에서는 거부한다.
+- 봉인 준비 문서는 grant가 있을 때만 `macro`(`inputs`: series·단위·binding hash·binding 문서,
+  `head_reads`: admission과 판단별 읽기 영수증)와 `fx_conversions`(`conversions`: 변환 문서·binding·
+  세션마다 적용한 고시 날짜와 환율·환산하지 못한 칸, `head_reads`: grant 가격 binding 읽기(`prices`)와
+  고시 읽기(`panels`) 영수증)를 싣는다. 요청 저장소도 이 두 열쇠를 가진 선언을 같은 연구 스키마로 받는다.
 
 ### strict 실행 준비의 head binding
 
@@ -1819,6 +1847,7 @@ pin(`observations`) 대신 canonical 가격 binding(`prices`: `aas-head-binding-
 | `sessions` | `generation`, `heads` | `calendar_sessions` |
 | `macro` | `generation`, `heads` | `macro_observations`, `fx_rates` |
 | `actions` | `heads` | `corporate_actions` |
+| `fx_conversion` | `heads` | `fx_rates` |
 
 - 읽기는 판단마다 그 판단의 cutoff로 한다. `strict_pit` 요청은 cutoff가 있는 strict 읽기이고 binding의
   grant가 규칙 시점을 정하며, `observed_snapshot_research` 요청은 그 cutoff를 지식 상한으로 한 연구 읽기다.
@@ -1853,6 +1882,17 @@ pin(`observations`) 대신 canonical 가격 binding(`prices`: `aas-head-binding-
 - 거시 선택의 subject는 `series_id`이고 행의 단위는 선택의 `unit`과 같아야 한다. FX 선택의 `series_id`는
   `BASE/QUOTE`이고, 경제 날짜는 고시 시각의 UTC 날짜, 값은 `rate`, 선택의 `unit`은 호가 통화다. 준비는
   지식 cutoff로 한 번 읽어 binding이 그 series의 head를 가지는지 확인하고(`admission`), 판단마다 다시 읽는다.
+- 계좌 통화가 아닌 가격 선택은 요청의 `fx_conversions` grant로만 받는다. 항목은 `binding`(`fx_conversion`
+  역할의 binding 하나), `currency`, `series_id`, `max_fixing_age_days`, `signal_basis`이고 binding 순으로
+  정렬된다. grant는 정확해야 한다: 계좌 통화가 아닌 가격 통화마다 정확히 하나, `fx_conversion` binding마다
+  정확히 하나이고, 어느 가격 선택도 쓰지 않는 통화의 grant는 거부한다. 환산이 없는 요청은 열쇠가 없으므로
+  그 바이트와 `request_hash`는 이 계약 전과 같다. 신호는 판단마다 그 cutoff로 고시를 읽어(그 cutoff까지
+  고시되고 공개된 고시만) 변환하고, 체결 가격은 기간 전체를 요청의 지식 cutoff로 한 번 읽어 변환한다.
+  환산할 고시가 없는 신호 bar는 신호 점이 아니고, 체결 가격 칸은 bar가 없는 칸과 같다(그 칸에 매수가 필요하면
+  봉투 내보내기가 거부한다). 고시 읽기마다 `head_reads`에 역할 `fx_conversion`, 그 영수증, 변환 문서,
+  환산한 수와 환산하지 못한 칸이 남는다. 봉인 준비 문서의 `fx_conversions`는 변환마다 binding과 binding
+  hash, 변환 문서, 체결 세션마다 적용한 고시(세션, 고시 날짜, 환율)와 환산하지 못한 칸을 싣고, run은 그
+  문서를 그대로 봉인한다. bundle의 `fx_conversion` binding도 다른 `heads` 참조처럼 `raw/`의 문서로 검증된다.
 - 봉인 준비 문서(`aas-prepared-backtest-v1`)의 `head_reads`는 준비가 한 읽기마다 역할·ordinal·목적
   (`calendar`, `admission`, `decision`, `outcomes`)·판단일과 reader가 돌려준 영수증(`aas-head-read-v1`,
   `aas-adjusted-read-v1`, `aas-head-revisions-v1`) 전체와 그 SHA-256을 싣는다. 유도 신호 읽기의 항목은 그
@@ -1864,6 +1904,24 @@ pin(`observations`) 대신 canonical 가격 binding(`prices`: `aas-head-binding-
   `heads` 참조가 없다.
 - `heads` 입력은 envelope의 `source_pins`에 원천을 싣지 않는다. 그 출처는 읽기 영수증의 pin과 chain이다.
   proxy 규칙은 native 체결 원천에 묶이므로 `generation`으로 묶은 체결 가격에만 붙는다.
+
+### FX 변환 계약
+
+`engine.fx_conversion`이 소유하는 순수 규칙이다. 변환은 grant이고 추론하지 않는다: 호출자가 가격 통화,
+계좌 통화, 둘을 잇는 고시 series, 고시의 최대 나이(일), 신호가 읽을 통화를 이름 붙이고, 이 모듈은 명시적으로
+받은 고시에 그 grant를 적용한다. store를 읽거나 series를 고르지 않는다.
+
+- 규칙 `fx_latest_fixing_on_or_before@1`: 날짜 `d`의 가격 통화 값은 날짜가 `d` 이하이고 `d`보다
+  `max_fixing_age_days`일을 넘게 앞서지 않은 가장 늦은 `present` 고시로 계좌 통화가 된다. 고시 날짜는
+  `fixing_at_us`의 UTC 날짜다. 그런 고시가 없으면 그 값은 계좌 통화 값이 없다. 더 늦은 고시로 채우거나
+  선언한 나이를 넘겨 이월하지 않는다.
+- series가 `PRICE/ACCOUNT`이면 환율(가격 통화 1단위의 계좌 통화 값)을 곱하고, `ACCOUNT/PRICE`이면 나눈다.
+  다른 series는 그 변환이 아니다. 통화는 세 글자 대문자이고 가격 통화와 계좌 통화는 다르다. 한 날짜에
+  고시는 하나이고 환율은 유한한 양수다.
+- `signal_basis`는 `account_currency`(신호가 환산한 가격을 읽음) 또는 `price_currency`(신호가 그 통화의
+  가격을 읽음)다. 둘 다 결과를 바꾸는 연구 선택이므로 기본값이 없다. 체결·평가 가격은 늘 계좌 통화다.
+- 변환 문서(`aas-fx-conversion-v1`)는 규칙, 두 통화, series, 방향(`multiply`·`divide`), 최대 나이,
+  `signal_basis`이고 run이 이 문서를 기록한다.
 
 ## 스키마 v2
 
@@ -2310,3 +2368,17 @@ state v2:
 | DV-367 | 답을 보존하지 못한 SEC 문서 요청은 물은 것으로 보아 같은 날 다시 묻지 않고 하루 뒤 다시 묻는다 | `tests/storage/test_us_collection.py::test_an_uncertain_document_ask_is_asked_again_the_next_day` | 구현 |
 | DV-368 | 행이 읽히지 않는 CSV 답은 `FAILED`이고 그 FRED 날을 덮지 않아 다음 실행이 다시 받는다 | `tests/storage/test_us_collection.py::test_a_csv_download_whose_rows_do_not_read_is_failed_and_asked_again` | 구현 |
 | DV-369 | pyarrow가 없으면 US 수집은 원장이나 공급자 호출 전에 멈춘다 | `tests/storage/test_us_collection.py::test_a_run_without_pyarrow_stops_before_any_call` | 구현 |
+| DV-370 | FX 변환은 날짜 이하의 가장 늦은 고시를 쓴다 | `tests/engine/test_fx_conversion.py::test_a_value_takes_the_latest_fixing_on_or_before_its_date` | 구현 |
+| DV-371 | 더 늦은 고시나 선언한 나이를 넘긴 고시는 값을 환산하지 않는다 | `tests/engine/test_fx_conversion.py::test_no_later_fixing_and_no_fixing_past_its_age_converts_a_value` | 구현 |
+| DV-372 | 계좌 통화가 아닌 가격 선택은 `fx_conversions` grant로만 받고, grant가 없는 요청은 열쇠가 없어 바이트가 그대로다 | `tests/engine/test_backtest_request.py::test_a_foreign_price_currency_is_admitted_by_its_fx_conversion_grant` | 구현 |
+| DV-373 | FX grant는 통화·binding·series·신호 통화가 정확해야 하고 빈 목록, 쓰이지 않는 통화, 짝 없는 binding을 거부한다 | `tests/engine/test_backtest_request.py::test_an_fx_conversion_grant_is_exact` | 구현 |
+| DV-374 | 혼합 통화 strict 전략은 grant한 FX pin으로 실행되고, run이 변환·binding·세션별 고시와 읽기 영수증을 기록한다 | `tests/application/test_strict_head_inputs.py::test_a_mixed_currency_strategy_runs_on_its_granted_fx_pin` | 구현 |
+| DV-375 | `signal_basis`는 신호가 환산한 종가와 그 통화의 종가 중 무엇을 읽는지 정하고 체결은 늘 환산한다 | `tests/application/test_strict_head_inputs.py::test_a_conversion_states_which_currency_its_signals_read` | 구현 |
+| DV-376 | 고시가 없는 체결 세션은 grant한 나이 안의 앞선 고시만 쓰고, 그것도 없으면 그 칸은 값이 없다 | `tests/application/test_strict_head_inputs.py::test_a_fixing_converts_only_within_its_granted_age` | 구현 |
+| DV-377 | 연구 선언의 `macro` grant는 슬리브가 읽는 series를 판단마다 그 cutoff로 읽어 공급하고 봉인 문서가 binding과 읽기를 기록한다 | `tests/application/test_research_grants.py::test_a_granted_macro_series_feeds_its_sleeve_at_each_decision` | 구현 |
+| DV-378 | `macro` grant는 슬리브들이 읽는 series 집합과 정확히 같아야 하고 단위·이름·도메인이 맞아야 한다 | `tests/application/test_research_grants.py::test_a_macro_grant_names_exactly_the_series_the_sleeves_read` | 구현 |
+| DV-379 | 연구 선언의 FX grant는 자기 통화 chain을 함께 읽어 계좌 통화로 환산하고, 같은 값의 단일 통화 run과 같은 패널과 판단을 낸다 | `tests/application/test_research_grants.py::test_a_mixed_currency_run_converts_the_granted_chain_into_its_account` | 구현 |
+| DV-380 | 연구 패널의 각 세션은 그 세션의 고시로 환산된다 | `tests/application/test_research_grants.py::test_each_session_takes_its_own_fixing` | 구현 |
+| DV-381 | 연구 패널은 grant 없는 통화의 bar와 grant chain의 다른 통화 bar를 거부한다 | `tests/application/test_research_grants.py::test_a_price_currency_is_read_only_under_its_grant` | 구현 |
+| DV-382 | grant를 가진 연구 선언은 run으로 기록되고 선언으로 다시 준비해 재현된다 | `tests/application/test_research_grants.py::test_a_granted_run_is_recorded_and_reproduces_from_its_declaration` | 구현 |
+| DV-383 | 표본 조합의 공격 슬리브는 거시 신호로 전환하지 않고, 방어 슬리브는 거시 신호를 가질 수 있다 | `tests/application/test_research_grants.py::test_a_composition_offense_switches_on_its_canary_not_a_macro_signal` | 구현 |
