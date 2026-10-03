@@ -14,6 +14,7 @@ from aegis_alpha.application import (
     identity_cli,
     import_cli,
     kr_collection_cli,
+    maintain_cli,
     prepare_cli,
     provider_cli,
     proxy_cli,
@@ -60,6 +61,7 @@ def _parser() -> argparse.ArgumentParser:
     calendar_cli.add_commands(commands)
     universe_cli.add_commands(commands)
     import_cli.add_commands(commands)
+    maintain_cli.add_commands(commands)
     return parser
 
 
@@ -157,6 +159,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915 
                 result = universe_cli.execute(args)
             case "import":
                 result = import_cli.execute(args)
+            case "maintain":
+                result = maintain_cli.execute(args)
             case "collect" if args.collect_command == "qveris":
                 result = qveris_cli.execute(args)
             case "collect" if args.collect_command in {"dart", "kind"}:
@@ -190,5 +194,5 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915 
         # that is not reconciled, exits 1 after printing the report.
         gate = "complete" if result.get("mode") == "verify" else "reconciled"
         return 0 if result.get(gate) is True else 1
-    code = result.get("exit_code", 0) if args.command == "collect" else 0
+    code = result.get("exit_code", 0) if args.command in {"collect", "maintain"} else 0
     return code if type(code) is int else 1

@@ -1,0 +1,19 @@
+[Unit]
+Description=AAS daily maintenance: collect, import, register identities and promote
+# A user unit cannot order itself after the system's network-online.target, so the
+# service waits up to five minutes for a provider host name to resolve. A run that still
+# has no network records its provider stages as failed; the next run asks the missed days.
+
+[Service]
+Type=exec
+WorkingDirectory=%h
+ExecStartPre=-/bin/sh -c 'i=0; while [ $$i -lt 60 ]; do getent hosts data.sec.gov >/dev/null && exit 0; i=$$((i + 1)); sleep 5; done; exit 1'
+ExecStart=%h/.local/bin/aas maintain run
+TimeoutStartSec=6min
+RuntimeMaxSec=22h
+TimeoutStopSec=5min
+KillSignal=SIGINT
+KillMode=mixed
+SendSIGKILL=yes
+Restart=no
+UMask=0077
