@@ -17,8 +17,10 @@ run) is refused with ``installation_busy``. The stages, in order:
 8. ``report``: dataset heads with their watermarks, kept in ``raw/`` and as
    ``<runtime>/maintain-report.json``.
 
-A failing stage is recorded and the later stages still run on what is committed; a
-provider refusal or failure never stops the other providers. Each collector settles the
+A failing stage (a database error included) is recorded and the later stages still run
+on what is committed; a provider refusal or failure never stops the other providers. When
+the identity stage fails, chains that resolve identities wait for the next run instead of
+resolving new listings against an older snapshot. Each collector settles the
 attempts an interrupted run left before it plans, so a killed run is recovered by the next
 one without asking any answered request again. ``plan`` opens the installation read-only
 and reports what each stage would do; it reads no credential and calls no provider.
@@ -126,10 +128,17 @@ class _Run:
     uncertain: list[str] = field(default_factory=list)
 
     def local(self, name: str, action: Callable[[], dict[str, object]]) -> dict[str, object] | None:
-        """A stage that reads or writes only the installation: errors keep their message."""
+        """A stage that reads or writes only the installation: errors keep their message.
+
+        Database errors (DuckDB, SQLite, out of memory among them) are local errors too.
+        """
+        import sqlite3
+
+        import duckdb
+
         try:
             result = action()
-        except _LOCAL_ERRORS as error:
+        except (*_LOCAL_ERRORS, duckdb.Error, sqlite3.Error) as error:
             self.stages[name] = {"status": "failed", "error_type": type(error).__name__,
                                  "error": str(error)}  # fmt: skip
             self.failed.append(name)
@@ -346,6 +355,7 @@ def run_maintenance(  # noqa: PLR0913 -- the run's explicit inputs
             workspace,
             apply=True,
             identity=cast("dict[str, str] | None", pin),
+            identity_failed=identity is None,
             budget=budget,
             now_us=_us(clock()),
         ),
@@ -437,6 +447,7 @@ def plan_maintenance(  # noqa: PLR0913 -- the plan's explicit inputs
             workspace,
             apply=False,
             identity=cast("dict[str, str] | None", snapshot),
+            identity_failed=identity is None,
             budget=budget,
             now_us=_us(now),
             evaluate=promotions,

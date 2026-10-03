@@ -94,8 +94,8 @@ def test_a_quarantined_ask_is_asked_again_the_next_day_and_not_the_same_day(
     _write(root, "parallel-batches/b1/manifest.json", {"intents": []})
     plan = plan_requests(root, POLICY, today=TODAY)
     assert [(item.day, item.reason) for item in plan.planned] == [
-        (MON, "uncertain_retry"),
         (WED, "new"),
+        (MON, "uncertain_retry"),
     ]
     assert plan.waiting == 1  # the group quarantined today waits for tomorrow
     assert plan.held == []
@@ -174,3 +174,27 @@ def test_a_policy_outside_the_reviewed_requests_is_refused(field: str, value: ob
     }
     with pytest.raises(ValueError, match="qveris"):
         QverisPolicy(**arguments)  # ty: ignore[invalid-argument-type]
+
+
+def test_settled_failures_back_off_and_retry_after_the_first_asks(tmp_path: Path) -> None:
+    root = tmp_path / "raw"
+    # A request the provider keeps failing: three settled failures in a row.
+    for observed in (date(2026, 9, 11), date(2026, 9, 12), date(2026, 9, 14)):
+        _ask(root, _prices(date(2026, 9, 10), observed), "failed")
+    _ask(root, _prices(MON, TUE), "failed")  # one failure: retried the next day
+    policy = QverisPolicy(exchanges=("US",), datasets=("prices",), since={"US": MON},
+                          extra_sessions={"US": (date(2026, 9, 10),)})  # fmt: skip
+    # The third failure in a row waits four days after its observation date.
+    early = plan_requests(root, policy, today=TODAY)
+    assert [(item.day, item.reason) for item in early.planned] == [
+        (TUE, "new"),
+        (WED, "new"),
+        (MON, "failed_retry"),  # retries take what the caps leave after the first asks
+    ]
+    assert early.failing == [{"job_id": "maintain-US-prices-2026-09-10", "failed_asks": 3,
+                              "retry_on": "2026-09-18"}]  # fmt: skip
+    later = plan_requests(root, policy, today=date(2026, 9, 18))
+    assert [(item.day, item.reason) for item in later.planned][-2:] == [
+        (date(2026, 9, 10), "failed_retry"),
+        (MON, "failed_retry"),
+    ]

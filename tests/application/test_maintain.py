@@ -18,6 +18,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import cast
 
+import duckdb
 import pytest
 
 from aegis_alpha.application.maintain import Policies, Ports, plan_maintenance, run_maintenance
@@ -34,7 +35,7 @@ from aegis_alpha.data import sec_collect as sec
 from aegis_alpha.data.opendart import OpenDartClient
 from aegis_alpha.data.opendart_cohort import CohortPolicy
 from aegis_alpha.data.qveris_client import QverisResponse
-from aegis_alpha.storage import maintain_promotion
+from aegis_alpha.storage import maintain_identity, maintain_promotion
 from aegis_alpha.storage.identity import mint_instrument
 from aegis_alpha.storage.promotion.engine import promote
 from aegis_alpha.storage.provider_collection import committed_tables
@@ -84,6 +85,7 @@ class DatedQveris(ScriptedQveris):
         super().__init__(rows, key)
         self.clock = clock
         self.crash_on_settlement = False
+        self.settlement_down = False
 
     def request(
         self,
@@ -95,6 +97,8 @@ class DatedQveris(ScriptedQveris):
         if path == "/auth/usage/history/v2" and self.crash_on_settlement:
             self.crash_on_settlement = False
             raise KeyboardInterrupt  # the process dies after a paid call, before settling it
+        if path == "/auth/usage/history/v2" and self.settlement_down:
+            raise RuntimeError("synthetic usage history outage")
         response = super().request(path, body=body, query=query)
         now = self.clock.now
         return replace(response, requested_at_utc=now, retrieved_at_utc=now)
@@ -254,8 +258,7 @@ def test_two_daily_runs_continue_every_chain_and_repeat_nothing(tmp_path: Path) 
     world.clock.advance(hours=1)
     again = world.run()
     assert again["exit_code"] == 0, again["failed_stages"]
-    assert world.calls()[2] == calls[2]
-    assert world.calls()[1] == calls[1]
+    assert world.calls() == calls  # SEC, FRED and Qveris alike
     with open_workspace(world.home) as ws:
         assert {name: _head(ws, name) for name in heads} == heads
         recorded = ws.state.execute(
@@ -299,7 +302,7 @@ def test_two_daily_runs_continue_every_chain_and_repeat_nothing(tmp_path: Path) 
     world.clock.advance(hours=2)
     repeat = world.run()
     assert repeat["exit_code"] == 0, repeat["failed_stages"]
-    assert world.calls()[1:] == calls[1:]
+    assert world.calls() == calls
     with open_workspace(world.home) as ws:
         assert {name: _head(ws, name) for name in heads} == advanced
 
@@ -552,3 +555,162 @@ def test_new_kr_listings_advance_identity_and_every_kr_chain(tmp_path: Path) -> 
     assert world.qveris.execute_count == executed
     with open_workspace(world.home) as ws:
         assert {name: _head(ws, name) for name in heads} == state
+
+
+def test_an_unsettled_paid_page_stops_every_run_until_its_settlement(tmp_path: Path) -> None:
+    world = World(tmp_path)
+    assert world.run()["exit_code"] == 0
+    with open_workspace(world.home, writable=True, strategy_write=True) as ws:
+        _cutover(ws)
+    _advance(world)
+    world.qveris.crash_on_settlement = True
+    with pytest.raises(KeyboardInterrupt):
+        world.run()
+    calls = world.calls()
+
+    # The usage history stays down: the resume cannot settle the paid page.
+    world.qveris.settlement_down = True
+    world.clock.advance(hours=1)
+    stopped = world.run()
+    assert stopped["exit_code"] == 2, stopped["stages"]
+    assert stopped["stopped_providers"] == ["qveris"]
+    qveris = cast("dict[str, object]", cast("dict[str, object]", stopped["stages"])["qveris"])
+    assert qveris["status"] == "stopped"
+    assert len(cast("list[object]", qveris["held"])) == 1
+    with open_workspace(world.home) as ws:
+        # The attempt stays open; nothing is settled against the evidence.
+        assert _ledger(ws, "qveris") == {"succeeded": 2, "started": 1}
+
+    world.qveris.settlement_down = False
+    world.clock.advance(hours=1)
+    settled = world.run()
+    assert settled["exit_code"] == 0, settled["failed_stages"]
+    assert world.calls() == calls  # the page was settled, never executed again
+    with open_workspace(world.home) as ws:
+        assert _ledger(ws, "qveris") == {"succeeded": 3}
+
+
+def test_a_database_error_in_one_stage_leaves_the_later_stages_and_the_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = World(tmp_path)
+    world.config = replace(world.config, jobs_enabled=False)
+
+    def out_of_memory(*args: object, **kwargs: object) -> dict[str, object]:
+        del args, kwargs
+        raise duckdb.OutOfMemoryException("synthetic: the compute budget is spent")
+
+    monkeypatch.setattr(maintain_promotion, "promote_datasets", out_of_memory)
+    report = world.run()
+    assert report["exit_code"] == 1
+    assert report["failed_stages"] == ["promote"]
+    stages = cast("dict[str, dict[str, object]]", report["stages"])
+    assert stages["promote"]["error_type"] == "OutOfMemoryException"
+    assert "datasets" in stages["heads"]
+    stored = json.loads((world.home / "runtime" / "maintain-report.json").read_text())
+    assert stored["failed_stages"] == ["promote"]
+
+
+def _kr_new_listing(world: KrWorld, *, symbol_list: bool) -> None:
+    """KIND lists a new company and both days' KO sessions trade it; EODHD lists it if asked."""
+    world.listings.append(("합성신규", "000777", "2026-09-16"))
+    world._kind()  # noqa: SLF001 -- the fake's next answers
+    if symbol_list:
+        world.codes["000777"] = "000077707"
+    world.qveris.rows = {**world.qveris.rows, **_kr_rows([WED], ["000101", "000777"]),
+                         **_symbol_lists(world.codes)}  # fmt: skip
+
+
+def _new_listing_rows(world: KrWorld) -> tuple[list[tuple[object, ...]], object]:
+    listed = mint_instrument("krx_isin", isin("000077707"))
+    with open_workspace(world.home) as ws:
+        prices = ws.market.execute(
+            "SELECT session_date FROM prices WHERE instrument_id=?", (listed,)
+        ).fetchall()
+        classified = ws.market.execute(
+            "SELECT count(*) FROM classifications WHERE subject_id=?", (listed,)
+        ).fetchone()
+    return prices, classified
+
+
+def test_a_failed_identity_stage_holds_identity_chains_until_it_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = KrWorld(tmp_path)
+    first = world.run()
+    snapshot = cast("dict[str, dict[str, object]]", first["stages"])["identity"]["snapshot"]
+    with open_workspace(world.home, writable=True, strategy_write=True) as ws:
+        _kr_cutover(ws, cast("dict[str, str]", snapshot))
+    world.clock.advance(days=1)
+    _kr_new_listing(world, symbol_list=True)
+    real = maintain_identity.advance
+
+    def broken(*args: object, **kwargs: object) -> dict[str, object]:
+        del args, kwargs
+        raise RuntimeError("synthetic identity outage")
+
+    monkeypatch.setattr(maintain_identity, "advance", broken)
+    failed = world.run()
+    assert (failed["exit_code"], failed["failed_stages"]) == (1, ["identity"])
+    statuses = _statuses(failed)
+    assert statuses["prices.kr.eodhd"] == "identity_unavailable"
+    assert statuses["classifications.kr.kind"] == "identity_unavailable"
+    assert _new_listing_rows(world) == ([], (0,))
+
+    monkeypatch.setattr(maintain_identity, "advance", real)
+    world.clock.advance(hours=1)
+    recovered = world.run()
+    assert recovered["exit_code"] == 0, recovered["failed_stages"]
+    assert _new_listing_rows(world) == ([(WED,)], (1,))
+
+
+def test_rows_an_older_snapshot_left_unresolved_are_promoted_once_identity_catches_up(
+    tmp_path: Path,
+) -> None:
+    world = KrWorld(tmp_path)
+    first = world.run()
+    snapshot = cast("dict[str, dict[str, object]]", first["stages"])["identity"]["snapshot"]
+    with open_workspace(world.home, writable=True, strategy_write=True) as ws:
+        _kr_cutover(ws, cast("dict[str, str]", snapshot))
+    # The new listing trades before the EODHD symbol list carries it: identity lags.
+    world.clock.advance(days=1)
+    _kr_new_listing(world, symbol_list=False)
+    lagging = world.run()
+    assert lagging["exit_code"] == 0, lagging["failed_stages"]
+    promote = cast("dict[str, object]", cast("dict[str, object]", lagging["stages"])["promote"])
+    assert "prices.kr.eodhd" in cast("list[str]", promote["unresolved"])
+    assert _new_listing_rows(world)[0] == []
+    with open_workspace(world.home) as ws:
+        recorded = ws.state.execute(
+            "SELECT count(*) FROM quality_checks WHERE rule_id='maintain_source' "
+            "AND result='unresolved' AND dataset_id='prices.kr.eodhd'"
+        ).fetchone()
+    assert recorded[0] >= 1
+    # The same identity again: the unresolved sources are not planned again.
+    world.clock.advance(hours=1)
+    again = world.run()
+    assert again["exit_code"] == 0, again["failed_stages"]
+    assert "prices.kr.eodhd" not in cast(
+        "list[str]",
+        cast("dict[str, object]", again["stages"])["promote"]["unresolved"],  # ty: ignore[not-subscriptable]
+    )
+
+    # The next day's symbol list carries the listing: the waiting rows are promoted.
+    world.clock.advance(days=1)
+    world.codes["000777"] = "000077707"
+    thu = WED + timedelta(days=1)
+    world.qveris.rows = {**world.qveris.rows, **_kr_rows([thu], ["000101", "000777"]),
+                         **_symbol_lists(world.codes)}  # fmt: skip
+    caught_up = world.run()
+    assert caught_up["exit_code"] == 0, caught_up["failed_stages"]
+    prices, classified = _new_listing_rows(world)
+    assert (WED,) in prices
+    with open_workspace(world.home) as ws:
+        effective = ws.market.execute(
+            "SELECT DISTINCT effective_from FROM classifications WHERE subject_id=? ORDER BY 1",
+            (mint_instrument("krx_isin", isin("000077707")),),
+        ).fetchall()
+        assert verify_workspace(ws)["verified"] is True
+    # The lagging day's KIND list is classified too, not only the next day's.
+    assert classified == (2,)
+    assert len(effective) == 2

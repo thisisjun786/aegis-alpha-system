@@ -18,9 +18,11 @@ is read from its evidence:
 
 Planning, for a request that is not covered: an ``unsettled`` ask holds it (``held``);
 otherwise the latest ask decides. An ask of an earlier observation date that ``failed``
-is asked again (``failed_retry``) and one that is ``quarantined`` likewise
-(``uncertain_retry``): the quarantined page never runs again, the request is asked as a
-new job. An ask of the current observation date waits for the next day (``waiting``).
+is asked again (``failed_retry``) 1, 2, 4, ... up to 32 days after it, doubling with each
+settled failure in a row (``failing`` lists requests with more than one), and one that
+is ``quarantined`` is asked again the next day (``uncertain_retry``): the quarantined
+page never runs again, the request is asked as a new job. An ask of the current
+observation date, or a failure still backing off, waits (``waiting``).
 A request never asked is ``new``. Symbol lists are covered for ``symbol_list_days`` after
 the observation date of their latest completion and are then asked again (``refresh``).
 
@@ -36,16 +38,21 @@ Requests, in the order a run asks them while its caps last:
 3. FX pair histories (``<PAIR>.FOREX``) from ``forex_lookback_days`` before the
    observation date.
 
+Retries (``failed_retry``, ``uncertain_retry``) come after every first ask and refresh,
+in the same order, so they spend only what the caps leave.
+
 Every ask of a run is a ledger attempt (provider ``qveris``) of the request's job
 (``qveris:<request SHA-256>``): ``reserved`` with the ask's job fingerprint as the
 reservation's receipt before the cohort runs, ``started`` immediately before its paid
 execution, then settled from the raw evidence: ``succeeded`` with a retained
 ``aas-qveris-attempt-v1`` receipt for a completion or a settled failure, ``uncertain`` for a
-page without billing, and ``failed`` with a ``released`` event for an ask the run never
-executed (its caps or the account's balance stopped it first). An interrupted run's
-attempts are settled the same way at the start of the next run, so no ask is executed
-twice: the raw root reuses a completion, refuses a settled failure's job, and the planner
-never re-plans an unsettled ask.
+quarantined page (or a ``started`` attempt without an intent), and ``failed`` with a
+``released`` event for an ask the run never executed (its caps or the account's balance
+stopped it first). An attempt whose ask is ``unsettled`` stays open until a resume or a
+quarantine decides it. An interrupted run's attempts are settled the same way at the
+start of the next run, so no ask is executed twice: the raw root reuses a completion,
+refuses a settled failure's job, and the planner never re-plans an unsettled ask. A run
+that still holds an unsettled ask after its resume reports ``stopped``.
 """
 
 from __future__ import annotations
@@ -92,6 +99,8 @@ REQUEST_SCHEMA: Final = "aas-qveris-request-v1"
 REASONS: Final = ("new", "failed_retry", "uncertain_retry", "refresh")
 _MAX_DOCUMENT: Final = 1024 * 1024
 _TERMINAL: Final = frozenset({"completed", "warned"})
+RETRY_DOUBLINGS: Final = 5
+_RETRIES: Final = frozenset({"failed_retry", "uncertain_retry"})
 
 type Request = tuple[str, str, str, str, str]
 
@@ -289,6 +298,7 @@ class QverisPlan:
     covered: int = 0
     held: list[dict[str, object]] = field(default_factory=list)
     waiting: int = 0
+    failing: list[dict[str, object]] = field(default_factory=list)
     calendars: dict[str, str] = field(default_factory=dict)
     windows: dict[str, dict[str, str] | None] = field(default_factory=dict)
     undeclared: dict[str, int] = field(default_factory=dict)
@@ -309,6 +319,7 @@ class QverisPlan:
             "covered": self.covered,
             "held": self.held,
             "waiting": self.waiting,
+            "failing": self.failing,
             "calendars": self.calendars,
             "windows": self.windows,
             "undeclared_days": self.undeclared,
@@ -330,9 +341,25 @@ def _decide(
     latest = asks[-1]
     if latest.observation_date >= today:
         return "waiting", latest
-    if latest.state in _TERMINAL:
-        return "refresh", latest
-    return ("uncertain_retry" if latest.state == "quarantined" else "failed_retry"), latest
+    if latest.state in _TERMINAL or latest.state == "quarantined":
+        return ("refresh" if latest.state in _TERMINAL else "uncertain_retry"), latest
+    due = latest.observation_date + timedelta(days=retry_after(asks))
+    return ("backoff" if today < due else "failed_retry"), latest
+
+
+def failed_streak(asks: Sequence[RawAsk]) -> int:
+    """The number of settled failures that end the request's asks."""
+    count = 0
+    for ask in reversed(asks):
+        if ask.state != "failed":
+            break
+        count += 1
+    return count
+
+
+def retry_after(asks: Sequence[RawAsk]) -> int:
+    """Days after the latest settled failure before a paid retry: 1, 2, 4, ... up to 32."""
+    return 2 ** min(max(failed_streak(asks) - 1, 0), RETRY_DOUBLINGS)
 
 
 def _ledger_dataset(job: QverisJob) -> str:
@@ -434,15 +461,24 @@ def plan_requests(
         if found and found[-1].state in {"unsettled", "failed"}:
             plan.resumable.append(found[-1].job)
         decision, ask = _decide(found, today, fresh_after=fresh_after)
+        streak = failed_streak(found)
+        if streak > 1 and decision in {"backoff", "failed_retry"}:
+            plan.failing.append({
+                "job_id": job.job_id, "failed_asks": streak,
+                "retry_on": (cast("RawAsk", ask).observation_date
+                             + timedelta(days=retry_after(found))).isoformat(),
+            })  # fmt: skip
         if decision == "covered":
             plan.covered += 1
         elif decision == "held":
             plan.held.append({"job_id": job.job_id, "unsettled_fingerprint": cast("RawAsk", ask)
                               .fingerprint})  # fmt: skip
-        elif decision == "waiting":
+        elif decision in {"waiting", "backoff"}:
             plan.waiting += 1
         else:
             plan.planned.append(Planned(job, decision, _ledger_dataset(job), day))
+    # Retries take what the caps leave after every first ask and refresh.
+    plan.planned.sort(key=lambda item: item.reason in _RETRIES)
     return plan
 
 
@@ -524,8 +560,10 @@ def settle(
                 settled["uncertain"] += 1
             continue
         request, ask = found
-        if ask.state == "unsettled" and status == "reserved":
-            continue  # the cohort was stopped before this page; the next run settles it
+        if ask.state == "unsettled":
+            # Its page may have run: it stays open until a resume or the operator's
+            # quarantine decides the ask, then it is settled from that evidence.
+            continue
         if status == "reserved":
             ledger.start(state, attempt, at_us=at_us)
         if ask.state in {"completed", "warned", "failed"}:
@@ -650,13 +688,20 @@ class _Session:
             )
 
     def finish(self) -> dict[str, int]:
-        settled = settle(self.workspace, raw_asks(self.raw_root), clock=self.clock)
+        asks = raw_asks(self.raw_root)
+        settled = settle(self.workspace, asks, clock=self.clock)
+        open_asks = {ask.fingerprint for items in asks.values() for ask in items
+                     if ask.state == "unsettled"}  # fmt: skip
         # Asks the cohort never reached hold no intent; they are released, never called.
         for row in self.workspace.state.execute(
-            "SELECT a.job_id, a.attempt FROM collection_attempts a JOIN collection_jobs j ON "
-            "j.job_id=a.job_id WHERE j.provider=? AND a.status='reserved'",
+            "SELECT a.job_id, a.attempt, u.receipt_hash FROM collection_attempts a JOIN "
+            "collection_jobs j ON j.job_id=a.job_id JOIN usage_events u ON u.job_id=a.job_id AND "
+            "u.attempt=a.attempt AND u.kind='reserved' WHERE j.provider=? "
+            "AND a.status='reserved'",
             (PROVIDER,),
         ).fetchall():
+            if str(row[2]) in open_asks:
+                continue
             attempt = ledger.Attempt(str(row[0]), int(row[1]))
             ledger.release(self.workspace.state, attempt, at_us=_us(self.clock()))
             settled["released"] += 1
@@ -718,9 +763,11 @@ def collect(  # noqa: PLR0913 -- the run's explicit inputs
         else {key: resumed[key] for key in ("requested", "completed", "failed", "stopped")},
         **plan.report(),
     }
+    # A paid page still unsettled after the resume needs settlement or quarantine.
+    unsettled = bool(plan.held) or (resumed is not None and _status(resumed) == "stopped")
     if not plan.planned or caps.max_calls == 0:
         status = "budget_exhausted" if plan.planned else "succeeded"
-        return {**report, "status": status, **session.calls()}
+        return {**report, "status": "stopped" if unsettled else status, **session.calls()}
     session.reserve(plan.planned, policy.sha256)
     budget = qveris.InvocationBudget(caps.max_calls, credit_value(caps.max_credits))
     # An interrupted process (KeyboardInterrupt, SystemExit) settles nothing here: its
@@ -735,7 +782,7 @@ def collect(  # noqa: PLR0913 -- the run's explicit inputs
     after = session.finish()
     return {
         **report,
-        "status": _status(cohort),
+        "status": "stopped" if unsettled else _status(cohort),
         "cohort": {key: cohort[key] for key in sorted(cohort) if key != "billing_authority"},
         "settled_after": after,
         **session.calls(),

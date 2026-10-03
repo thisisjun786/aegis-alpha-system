@@ -1421,8 +1421,8 @@ legacy 거시 목록 35개와 DEXKOUS다. 수집기 자신의 watermark는 시�
 **단일 writer.** 실행은 설치본을 쓰기로 한 번 열고 그 저장소 잠금을 실행 끝까지 갖는다. 그래서 실행 중에는
 유지보수가 시장 store의 유일한 writer이고, 다른 명령이나 두 번째 실행은 `installation_busy`로 거부된다.
 
-**단계.** 순서대로 실행한다. 한 단계가 실패하면 그 사실을 기록하고 다음 단계는 commit된 것으로 계속한다.
-공급자 하나의 거부나 실패가 다른 공급자를 멈추지 않는다.
+**단계.** 순서대로 실행한다. 한 단계가 실패하면(DuckDB·SQLite 오류 포함) 그 사실을 기록하고 다음 단계는
+commit된 것으로 계속한다. 공급자 하나의 거부나 실패가 다른 공급자를 멈추지 않는다.
 
 | 단계 | 하는 일 |
 | --- | --- |
@@ -1464,15 +1464,17 @@ Qveris의 유료 크레딧은 실행 하나의 호출 수·크레딧 상한과, 
 | `unsettled` | 격리되지 않은 billing 없는 page |
 
 덮이지 않은 요청에서 `unsettled` 묻기는 그 요청을 잡아 둔다(`held`). 그 밖에는 가장 늦은 묻기가 정한다. 이전
-관측일의 `failed`는 다시 묻고(`failed_retry`), `quarantined`도 다시 묻는다(`uncertain_retry`). 격리된 page는 다시
-실행되지 않고 요청이 새 job으로 물린다. 오늘 관측일의 묻기는 다음 날을 기다린다(`waiting`). 물은 적이 없으면
-`new`다. 종목 목록은 가장 늦은 완료의 관측일 뒤 `symbol_list_days` 동안 덮이고 그 뒤 다시 묻는다(`refresh`).
+관측일의 `failed`는 그 관측일 뒤 1, 2, 4, …, 최대 32일이 지나면 다시 묻는다(`failed_retry`). 간격은 연속한 정산된
+실패마다 두 배이고, 둘 이상 연속 실패한 요청은 다음 시도일과 함께 `failing`에 남는다. `quarantined`는 다음 날
+다시 묻는다(`uncertain_retry`). 격리된 page는 다시 실행되지 않고 요청이 새 job으로 물린다. 오늘 관측일의 묻기와
+간격이 남은 실패는 기다린다(`waiting`). 물은 적이 없으면 `new`다. 종목 목록은 가장 늦은 완료의 관측일 뒤 `symbol_list_days` 동안 덮이고 그 뒤 다시 묻는다(`refresh`).
 
 실행은 이 순서로 상한이 남는 동안 묻는다. (1) 거래소(`US`는 XNYS, `KO`·`KQ`는 XKRX) 선언 달력의 열린
 session마다 일간 `prices`·`splits`·`dividends` 내려받기. 거래소의 `since`부터(관측일의 366일 전보다 이르지
 않게) 관측일 전날까지와 그 거래소의 `extra_sessions`(그 이전의 명시한 공백)이고, 날짜, 거래소, dataset 순이다. 선언 범위 밖의 날은 `undeclared_days`로 보고하고 묻지
 않는다. (2) KR 거래소 종목 목록(`KO`·`KQ`, 상장·상폐). 새 KR 상장의 identity 입력이다. (3) FX 쌍
-이력(`<PAIR>.FOREX`, 관측일의 `forex_lookback_days` 전부터).
+이력(`<PAIR>.FOREX`, 관측일의 `forex_lookback_days` 전부터). 재시도(`failed_retry`, `uncertain_retry`)는 같은 순서로
+모든 첫 묻기와 `refresh` 뒤에 오므로 상한이 남긴 만큼만 쓴다.
 
 묻기 전에 실행은 앞선 실행이 남긴 `unsettled` 묻기와 완료 없이 정산된 묻기를 그 자신의 job으로 끝낸다. page를
 정산·검증만 하고 새 page는 intent 전에 거부되므로 아무것도 실행하지 않는다. 중단된 실행이 유료 호출 뒤 남긴
@@ -1482,10 +1484,11 @@ session마다 일간 `prices`·`splits`·`dividends` 내려받기. 거래소의 
 `qveris:<요청 SHA-256>`, 요청 SHA-256은 정규 JSON `["aas-qveris-request-v1", 도구, 하위 공급자, 시장, dataset,
 parameter]`). cohort 전에 `reserved`(예약의 receipt는 그 묻기의 job fingerprint), 유료 실행 직전 `started`, 그 뒤
 raw 증거로 정산한다. 완료와 정산된 실패는 그 묻기의 결정 증거(완료 문서나 billing의 SHA-256)를 나열한
-`aas-qveris-attempt-v1` receipt를 `raw/`에 두고 `succeeded`, billing 없는 page는 `uncertain`, 상한이나 잔액이
-먼저 막아 실행하지 않은 묻기는 `released` event와 함께 `failed`다. 프로세스가 중단되면(KeyboardInterrupt,
+`aas-qveris-attempt-v1` receipt를 `raw/`에 두고 `succeeded`, 운영자가 격리한 page(와 intent 없는 `started`
+attempt)는 `uncertain`, 상한이나 잔액이 먼저 막아 실행하지 않은 묻기는 `released` event와 함께 `failed`다. 묻기가
+`unsettled`인 attempt는 재개나 격리가 묻기를 정할 때까지 열린 채 남는다. 프로세스가 중단되면(KeyboardInterrupt,
 SystemExit) 정산하지 않는다. 그 `started` attempt는 다음 실행이 묻기를 끝낸 뒤 같은 규칙으로 정산하므로 증거와
-어긋나는 `uncertain`이 남지 않는다.
+어긋나는 `uncertain`이 남지 않는다. 재개 뒤에도 `held` 묻기가 남은 실행의 Qveris 상태는 `stopped`다.
 
 **적재.** 완료된 일간·FX job 중 어느 `qveris-*` 원천의 lineage에도 fingerprint가 없는 것을
 [Qveris 적재](#qveris-수집과-원천-적재)로 commit한다. 가격·기업행동 행은 설정의 identity 문서가 있을 때만
@@ -1529,7 +1532,9 @@ generation의 명세(운영자의 백필이거나 앞선 유지보수 generation
   generation 하나). 그 밖은 테이블의 매퍼 partition 날짜의 `[처음, 마지막 + 1일)`.
 - 매퍼·시간 규칙·품질 규칙 인자의 모든 generation pin: 그 dataset의 지금 committed head. 갱신된 달력, 같은
   실행에서 먼저 게시된 SEC 공시가 그렇다. 그래서 route는 `filings.us.sec` 다음에 `fundamentals.us.sec`를 승격한다.
-- `identity_snapshot`: 실행에 유지보수 snapshot이 있고 template이 snapshot을 pin하면 그 snapshot.
+- `identity_snapshot`: 실행에 유지보수 snapshot이 있고 template이 snapshot을 pin하면 그 snapshot. 실행의
+  `identity` 단계가 실패했으면 snapshot을 pin하는 template의 route는 아무것도 승격하지 않고
+  `identity_unavailable`로 보고하며 그 원천은 다음 실행을 기다린다.
 - `tombstone_policy`: `never`. 원천 하나는 전체 snapshot이 아니므로 유지보수 generation은 record를 지우지 않는다.
 
 매퍼와 그 인자, 시간·숫자·품질 규칙은 template 그대로이므로 유지보수가 chain의 규칙을 바꾸지 않는다. 더 늦은
@@ -1537,7 +1542,10 @@ generation의 명세(운영자의 백필이거나 앞선 유지보수 generation
 같으면 원천 ID 순서다. 한 원천의 모든 단계가 승격되거나 변하지 않았으면 그 원천은 그 dataset에서 끝난 것이고,
 유지보수는 dataset head version에 `maintain_source@1` 품질 검사 하나(원천 pin, 단계마다 partition·명세 SHA-256·
 generation, 결과 `promoted`·`unchanged`)를 남긴다. 검사 ID는 (dataset, 원천, 테이블)에서 나오므로 다시 쓰지
-않는다. 거부되거나 막힌 단계는 아무것도 남기지 않으므로 그 원천은 다음 실행에 다시 계획된다. 단계 사이에서
+않는다. pin한 snapshot이 행을 `unresolved`·`ambiguous`로 남긴 원천은 결과 `unresolved`로 기록하고, 그 snapshot과
+매퍼 identity key(provider, namespace)로 그 snapshot이 해석에 쓰는 행(정정되지 않은 member의 token, instrument,
+유효 구간)의 SHA-256을 함께 남긴다. 그 원천은 실행이 pin할 snapshot의 그 행이 달라지면 다시 계획되므로 뒤에 등록된 상장이 해석하는 행이
+빠지지 않는다. 검사 ID는 그 SHA-256까지에서 나온다. 결과의 `unresolved`는 그런 원천이 있는 dataset이다. 거부되거나 막힌 단계는 아무것도 남기지 않으므로 그 원천은 다음 실행에 다시 계획된다. 단계 사이에서
 멈춘 원천은 끝난 단계가 빈 delta로 다시 계획된다. 결과를 선언한 매퍼가 `promotion_coverage@1`을 남긴 원천도
 끝난 것이다. 운영자의 승격이 pin한 원천은 첫 유지보수 실행에서 한 번 더 계획되어 `unchanged`로 기록되고, head보다
 이른 내려받기는 `stale`이라 head를 대체하지 않는다.
@@ -1560,7 +1568,10 @@ lock의 SHA-256이다. receipt는 `<runtime>/install-receipt.json`에, 정확한
 interpreter·package·환경을 receipt와 나란히 기록하고 다른 필드를 `differences`로 나열한다. 차이는 보고할 뿐
 거부하지 않는다. 실행 기록이 무엇이 돌았는지의 기록이다. `config/systemd/aas-maintain.service`는
 `%h/.local/bin/aas maintain run`을 실행하고(`Type=exec`, `RuntimeMaxSec=22h`, 중지는 `SIGINT`),
-`aas-maintain.timer`는 매일 03:00 UTC에 그것을 시작하며 놓친 실행은 다음 부팅에서 따라잡는다.
+`aas-maintain.timer`는 매일 03:00 UTC에 그것을 시작하며 놓친 실행은 다음 부팅에서 따라잡는다. 사용자 unit은
+system의 `network-online.target`에 순서를 걸 수 없으므로 service는 시작 전에 공급자 host 이름이 해석될 때까지
+최대 5분 기다린다. 그래도 네트워크가 없으면 공급자 단계가 실패로 기록되고(종료 코드 1), 수집기는 빈 날짜에서
+계획하므로 다음 실행이 놓친 날을 묻는다.
 
 ## identity 등록과 chunked 문서
 

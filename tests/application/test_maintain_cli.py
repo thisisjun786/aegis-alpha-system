@@ -119,6 +119,10 @@ def test_the_maintenance_units_run_the_installed_command_once_a_day() -> None:
     assert service["ExecStart"] == "%h/.local/bin/aas maintain run"
     assert (service["KillSignal"], service["Restart"], service["UMask"]) == ("SIGINT", "no",
                                                                             "0077")  # fmt: skip
+    # A user unit cannot order on network-online.target; it waits for a resolver instead.
+    assert {"After", "Wants"}.isdisjoint(_unit("aas-maintain.service")["Unit"])
+    assert service["ExecStartPre"].startswith("-/bin/sh -c ")
+    assert service["TimeoutStartSec"] == "6min"
     timer = _unit("aas-maintain.timer")
     assert timer["Timer"]["OnCalendar"] == "*-*-* 03:00:00 UTC"
     assert timer["Timer"]["Persistent"] == "true"

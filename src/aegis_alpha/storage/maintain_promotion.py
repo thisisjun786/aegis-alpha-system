@@ -20,7 +20,9 @@ only these fields advanced:
   head of the pinned dataset now (the calendar a refresh advanced, the SEC filings a
   promotion before this one published);
 - ``identity_snapshot``: the maintenance identity snapshot when the run has one and the
-  template pins a snapshot;
+  template pins a snapshot. When the run's identity stage failed, a route whose template
+  pins a snapshot promotes nothing (``identity_unavailable``) and its sources wait for
+  the next run;
 - ``tombstone_policy``: ``never``. One collected source is no full snapshot, so a
   maintenance generation never removes a record.
 
@@ -32,7 +34,11 @@ own template.
 New sources are taken in order of their ``sl:`` link time, then source ID. A source is
 done for a dataset once all its steps were promoted or found unchanged: maintenance then
 records a ``maintain_source@1`` quality check on the dataset's head version naming the
-pin and each step's request and generation (``promoted`` or ``unchanged``). A refused or
+pin and each step's request and generation (``promoted`` or ``unchanged``). A source
+whose rows the pinned snapshot left ``unresolved`` or ``ambiguous`` is recorded
+``unresolved`` with the snapshot and the SHA-256 of the rows that snapshot resolves the
+mapper's identity key with; it is planned again once the snapshot a run would pin
+resolves that key with other rows, so a listing registered later reaches its rows. A refused or
 blocked step records nothing, so the source is planned again on the next run; a run that
 stopped between the steps of one source plans its done steps again as empty deltas.
 Sources an operator's promotion pinned are planned once more on the first maintenance
@@ -50,6 +56,9 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import TYPE_CHECKING, Final, cast
 
+import duckdb
+
+from aegis_alpha.storage.membership_pins import IdentityPin, membership_parts
 from aegis_alpha.storage.promotion import formats
 from aegis_alpha.storage.promotion.engine import dataset_head, promote
 from aegis_alpha.storage.promotion.mappers import mapper
@@ -66,6 +75,7 @@ if TYPE_CHECKING:
     from aegis_alpha.storage.workspace import Workspace
 
 CHECK_RULE: Final = ("maintain_source", "1")
+UNRESOLVED: Final = "unresolved"
 _LINK: Final = "sl:"
 _PIN_KEYS: Final = frozenset({"dataset_id", "version", "generation_id", "chain_hash",
                               "manifest_hash"})  # fmt: skip
@@ -259,18 +269,61 @@ def candidates(  # noqa: PLR0913 -- the route and the pass's lookups
     )
 
 
-def _done(workspace: Workspace, dataset_id: str) -> set[tuple[str, str]]:
-    """(source ID, table) pins a maintenance record or a coverage check already settles."""
+def _done(workspace: Workspace, dataset_id: str, key_sha256: str | None) -> set[tuple[str, str]]:
+    """(source ID, table) pins a maintenance record or a coverage check already settles.
+
+    An ``unresolved`` record settles its source only while ``key_sha256``, the identity
+    members the run would resolve with, is the one it recorded.
+    """
     done: set[tuple[str, str]] = set()
-    for rule, reason in workspace.state.execute(
-        "SELECT rule_id, reason FROM quality_checks WHERE dataset_id=? "
+    for rule, result, reason in workspace.state.execute(
+        "SELECT rule_id, result, reason FROM quality_checks WHERE dataset_id=? "
         "AND rule_id IN ('maintain_source', 'promotion_coverage')",
         (dataset_id,),
     ):
         body = json.loads(str(reason))
+        if rule == CHECK_RULE[0] and result == UNRESOLVED:
+            recorded = cast("dict[str, object]", body.get("identity") or {})
+            if key_sha256 is None or recorded.get("key_sha256") != key_sha256:
+                continue
         pins = [body["source"]] if rule == CHECK_RULE[0] else body.get("sources", [])
         done.update((str(pin["source_id"]), str(pin["table"])) for pin in pins)
     return done
+
+
+def key_members_sha256(workspace: Workspace, pin: Mapping[str, str], provider: str,
+                       namespace: str) -> str:  # fmt: skip
+    """SHA-256 of the rows a snapshot resolves one identity key with (the engine's view)."""
+    snapshot = IdentityPin(pin["snapshot_id"], pin["content_hash"])
+    parts = membership_parts(workspace.state, snapshot)
+    names = [cast("IdentityPin", part).snapshot_id for part in parts] or [snapshot.snapshot_id]
+    rows = workspace.state.execute(
+        "SELECT a.token, a.instrument_id, m.valid_from_us, m.valid_to_us "
+        "FROM identity_snapshot_members m JOIN identity_assertions a USING (assertion_id) "
+        "WHERE m.snapshot_id IN (SELECT value FROM json_each(?)) AND m.known_to_us IS NULL "
+        "AND a.provider=? AND a.namespace=? ORDER BY 1, 2, 3, 4",
+        (json.dumps(names), provider, namespace),
+    ).fetchall()
+    return hashlib.sha256(formats.canonical([list(row) for row in rows])).hexdigest()
+
+
+def _resolution(
+    workspace: Workspace,
+    template: Mapping[str, object],
+    mapper_name: str,
+    identity: Mapping[str, str] | None,
+) -> dict[str, str] | None:
+    """The snapshot a maintenance spec of ``template`` pins and its identity-key members."""
+    pinned = cast("dict[str, str] | None", template.get("identity_snapshot"))
+    if pinned is None:
+        return None
+    snapshot = dict(identity) if identity is not None else dict(pinned)
+    args = cast("dict[str, object]", cast("dict[str, object]", template["mapper"]).get("args", {}))
+    key = mapper(mapper_name).identity(args)
+    if key is None:
+        return None
+    digest = key_members_sha256(workspace, snapshot, key.provider, key.namespace)
+    return {"snapshot_id": snapshot["snapshot_id"], "key_sha256": digest}
 
 
 def _template(workspace: Workspace, dataset_id: str, mapper_name: str) -> tuple[str, dict] | None:
@@ -360,12 +413,13 @@ def maintenance_spec(  # noqa: PLR0913 -- the template and every field maintenan
     return formats.canonical(spec)
 
 
-def _record(
+def _record(  # noqa: PLR0913 -- the source, its steps and the identity it resolved with
     workspace: Workspace,
     dataset_id: str,
     pin: Mapping[str, str],
     steps: Sequence[Mapping[str, object]],
     *,
+    resolution: Mapping[str, str] | None,
     now_us: int,
 ) -> str | None:
     version = workspace.state.execute(
@@ -376,22 +430,26 @@ def _record(
     if version is None:
         return None
     published = any(step.get("published") for step in steps)
-    reason = {
+    unresolved = sum(int(cast("int", step.get("unresolved_token_count") or 0)) for step in steps)
+    reason: dict[str, object] = {
         "source": dict(pin),
         "steps": [
             {
                 key: step.get(key)
-                for key in ("partition", "spec_sha256", "generation_id", "published")
+                for key in ("partition", "spec_sha256", "generation_id", "published",
+                            "unresolved_token_count")
             }
             for step in steps
         ],
-    }
-    check_id = (
-        "qc-"
-        + hashlib.sha256(
-            f"maintain/{dataset_id}/{pin['source_id']}/{pin['table']}".encode()
-        ).hexdigest()
-    )
+    }  # fmt: skip
+    key = f"maintain/{dataset_id}/{pin['source_id']}/{pin['table']}"
+    result = "promoted" if published else "unchanged"
+    if unresolved:
+        # Planned again under other identity-key members, so each set records once.
+        reason["identity"] = None if resolution is None else dict(resolution)
+        key += "/unresolved/" + ("" if resolution is None else resolution["key_sha256"])
+        result = UNRESOLVED
+    check_id = "qc-" + hashlib.sha256(key.encode()).hexdigest()
     with atomic(workspace.state):
         workspace.state.execute(
             "INSERT INTO quality_checks(check_id, dataset_id, version, rule_id, rule_version, "
@@ -402,7 +460,7 @@ def _record(
                 dataset_id,
                 str(version[0]),
                 *CHECK_RULE,
-                "promoted" if published else "unchanged",
+                result,
                 formats.canonical(reason).decode(),
                 now_us,
             ),
@@ -418,6 +476,7 @@ def _promote_source(  # noqa: PLR0913 -- one source's steps and the run's inputs
     *,
     apply: bool,
     identity: Mapping[str, str] | None,
+    resolution: Mapping[str, str] | None,
     budget: ComputeBudget | None,
     now_us: int,
     evaluate: bool = True,
@@ -441,7 +500,9 @@ def _promote_source(  # noqa: PLR0913 -- one source's steps and the run's inputs
             continue
         try:
             result = promote(workspace, raw, sha256, apply=apply, budget=budget)
-        except ValueError as error:
+        except (ValueError, duckdb.Error) as error:
+            # A database error (out of memory under the compute budget) refuses this
+            # source; the other datasets of the pass still run.
             if apply:
                 put_raw(workspace.paths.raw, raw)
             results.append({**summary, "error": str(error)})
@@ -452,8 +513,12 @@ def _promote_source(  # noqa: PLR0913 -- one source's steps and the run's inputs
             return {**outcome, "status": "refused", "steps": results}
     published = any(step.get("published") for step in results)
     status = "promoted" if published else "unchanged" if apply else "planned"
+    if any(step.get("unresolved_token_count") for step in results):
+        status = UNRESOLVED if apply else status
+        outcome["identity"] = None if resolution is None else dict(resolution)
     if apply:
-        outcome["check_id"] = _record(workspace, run.dataset_id, item.pin, results, now_us=now_us)
+        outcome["check_id"] = _record(workspace, run.dataset_id, item.pin, results,
+                                      resolution=resolution, now_us=now_us)  # fmt: skip
     return {**outcome, "status": status, "steps": results}
 
 
@@ -462,6 +527,7 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
     *,
     apply: bool,
     identity: Mapping[str, str] | None = None,
+    identity_failed: bool = False,
     budget: ComputeBudget | None = None,
     now_us: int,
     routes: Sequence[Route] = ROUTES,
@@ -470,7 +536,8 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
     """Plan, or apply in order, every route's new sources as the next generations.
 
     A plan with ``evaluate`` false lists each new source's steps and specs without
-    planning their promotions.
+    planning their promotions. With ``identity_failed`` (the run's identity stage did not
+    complete), a route whose template pins an identity snapshot promotes nothing.
     """
     if apply and not evaluate:
         raise ValueError("an applied maintenance promotion evaluates every step")
@@ -481,20 +548,30 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
         for dataset_id in _datasets(workspace, route.dataset_id):
             run = DatasetRun(dataset_id, route.mapper)
             runs.append(run)
-            done = _done(workspace, dataset_id)
             run.skipped["done"] = 0
-            pending = candidates(workspace, route, linked, shas, run.skipped, done=done)
             run.head = dataset_head(workspace, dataset_id)
+            found = None if run.head is None else _template(workspace, dataset_id, route.mapper)
+            resolution = (
+                None if found is None else _resolution(workspace, found[1], route.mapper, identity)
+            )
+            done = _done(
+                workspace, dataset_id, None if resolution is None else resolution["key_sha256"]
+            )
+            pending = candidates(workspace, route, linked, shas, run.skipped, done=done)
             if run.head is None:
                 run.status = "no_head" if pending else "current"
                 run.skipped["no_head"] = len(pending)
                 continue
-            found = _template(workspace, dataset_id, route.mapper)
             if found is None:
                 run.status = "no_template" if pending else "current"
                 run.skipped["no_template"] = len(pending)
                 continue
             run.template, template = found
+            if identity_failed and template.get("identity_snapshot") is not None:
+                # Without this run's snapshot, new listings would resolve against an older one.
+                run.status = "identity_unavailable" if pending else "current"
+                run.skipped["identity_unavailable"] = len(pending)
+                continue
             for item in pending:
                 result = _promote_source(
                     workspace,
@@ -503,6 +580,7 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
                     item,
                     apply=apply,
                     identity=identity,
+                    resolution=resolution,
                     budget=budget,
                     now_us=now_us,
                     evaluate=evaluate,
@@ -514,10 +592,13 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
                 run.status = "advanced" if apply else "planned"
             run.head = dataset_head(workspace, dataset_id)
     refused = [run.dataset_id for run in runs if run.status == "refused"]
+    unresolved = sorted({run.dataset_id for run in runs for item in run.sources
+                         if item["status"] == UNRESOLVED})  # fmt: skip
     return {
         "mode": "apply" if apply else "plan",
         "datasets": [run.report() for run in runs],
         "refused": refused,
+        "unresolved": unresolved,
         "unmapped": unmapped(workspace),
         "provider_calls": 0,
     }

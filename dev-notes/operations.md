@@ -1479,6 +1479,10 @@ systemctl --user daemon-reload && systemctl --user enable --now aas-maintain.tim
 `receipt`는 interpreter 경로·버전, package의 저장소·태그·커밋과 `RECORD` 해시, 환경의 distribution 목록 해시,
 lock 해시를 `<runtime>/install-receipt.json`과 `raw/`에 남긴다. 실행마다 그 receipt와 실행 환경의 차이가 보고에
 남지만 실행을 막지는 않는다. timer는 매일 03:00 UTC에 `aas maintain run`을 시작하고 놓친 실행을 따라잡는다.
+사용자 unit은 system의 `network-online.target`을 기다릴 수 없으므로 service가 시작 전에 공급자 host 이름이
+해석될 때까지 최대 5분 기다린다. 그래도 네트워크가 없으면 공급자 단계가 실패로 남고(종료 코드 1) 다음 실행이
+놓친 날을 묻는다. 종료 코드 2는 Qveris에 정산되지 않은 유료 page가 남았다는 뜻이므로 보고의 `held`를 보고
+정산이나 격리를 한다.
 패키지 설치나 이 명령은 unit을 설치하거나 켜지 않는다.
 
 ## 전환 중인 공급자 도구
