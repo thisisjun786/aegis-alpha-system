@@ -16,7 +16,7 @@
 | 층 | 내용 | 소유 코드 |
 | --- | --- | --- |
 | L0 raw | 공급자 응답·내보내기 원본 bytes. 해시 경로, no-clobber | `storage/raw.py` |
-| L1 원천 자료실 | `sl_*` 테이블. 원래 열·값·행 순서를 그대로 보존하는 `source_only` 자료와 legacy 원본 편입 | `storage/source_library*.py`, `storage/legacy_import/` |
+| L1 원천 자료실 | `sl_*` 테이블. 원래 열·값·행 순서를 그대로 보존하는 `source_only` 자료, legacy 원본 편입, 수집 job 적재 | `storage/source_library*.py`, `storage/legacy_import/`, `storage/qveris_import.py` |
 | L2 승격 | 승격 명세 → 매퍼 → head 비교 → 품질 flag → generation 게시 | `storage/promotion/` |
 | L3 저장 | `market.duckdb`의 typed generation과 `state.sqlite3`의 카탈로그·identity·품질·수집 기록 | `storage/market.py`, `storage/state.py`, `storage/identity.py` |
 | L4 소비 | exact pin, cutoff, grant로 head를 투영하는 reader, 조정 가격 유도와 실행 준비 | `storage/read_heads.py`, `storage/adjusted_prices.py`, `storage/market_inputs.py`, `application/backtest_prepare.py` |
@@ -182,6 +182,78 @@ loader, 보존 파일마다 `[상대 경로, SHA-256, 크기, 이유]`(이유는
 legacy 원본은 `complete`인 manifest의 항목 경로만 지울 수 있다. 항목 경로가 아닌 디렉터리(형제 수집 디렉터리,
 내보내기 상위 디렉터리)는 그 자체를 항목으로 대조하기 전에는 지우지 않는다. CLI는 `--verify`가 `complete`가
 아니거나 `--plan`·실행이 `reconciled`가 아니면 보고를 출력한 뒤 종료 코드 1을 돌려준다.
+
+## Qveris 수집과 원천 적재
+
+`aas collect qveris`는 Qveris 게이트웨이(하위 공급자 EODHD)의 수집 job을 계획·실행하고, 완료된
+job을 원천 자료실의 내용 원천으로 적재한다. 수집 증거(`jobs/<fingerprint>/` 아래 page의 intent·raw·
+response·billing과 `complete.json`)를 쓰는 규칙은 [qveris_acquisition.py](../../src/aegis_alpha/data/qveris_acquisition.py)와
+[qveris_store.py](../../src/aegis_alpha/data/qveris_store.py)가, 명령은 [operations](../operations.md#qveris-원문-수집)가 소유한다.
+
+**수집.** job 문서 하나가 cohort 하나다. 작업자 하나면 cohort를 순서대로 job 하나씩
+수집하고(`data/qveris_batch.py`), 여럿이면 cohort들을 번갈아 섞어 단일 page 도구(EOD 일간 내려받기,
+JSON 이력, SEC facts)를 작업자 수만큼 한 group으로 묶는다(`data/qveris_parallel_batch.py`). group은
+모든 새 job의 견적을 받고, 서버 잔액에서 다른 예약을 뺀 값과 실행 예산(유료 호출 수·크레딧) 모두가
+group 전체를 받아들일 때만 batch manifest와 job별 intent를 남긴 뒤 실행한다(`data/qveris_parallel.py`).
+예산은 group 전체를 예약하거나 하나도 예약하지 않는다. 실행 중인 유료 future는 모두 기다려 기록하고
+(job의 응답 bytes 상한을 넘는 응답은 순차 수집처럼 보존하지 않고 `JobResponseTooLarge`로 남긴다),
+group 정산은 usage와 계정 ledger로 한 번 한다. 정산 중 인증·quota 응답이 있으면 정산된 group의 완료와
+유료 호출을 센 뒤 `PROVIDER_STOP`으로 멈춘다. 정산되지 않은 group은 정산되거나 운영자가 예약을 남긴 채
+격리할 때까지 그 계정의 새 실행을 막는다. 모든 요청은 실행 하나에 공유된 HTTP 시도 수·시간 한도를 통과하고
+같은 간격으로 시작한다(`data/qveris_pacing.py`). 두 한도는 새 page를 시작하지 않게 할 뿐이다. 한도는
+간격을 기다린 뒤 확인하므로 기다리는 사이 시간이 지나면 새 page는 시작하지 않는다. 한도에 닿으면 다음 page의 첫 사전 조회 요청(`/tools/by-ids`)이 intent 전에 `INVOCATION_HTTP_LIMIT`로
+거부되고, 이미 시작한 page의 견적·실행·정산 요청은 세되 모두 통과한다. 그래서 한도는 intent를 실행되지
+않거나 정산되지 않은 채로 남기지 않으며, 실제 HTTP 시도 수는 진행 중인 page의 요청만큼 한도를 넘을 수 있다.
+
+- 정산된 실패(검증할 수 없는 응답 형태 포함)는 기록하고 다음 job으로 간다. 공급자 경고(`RAW_ACQUIRED_WITH_WARNINGS`)는 완료이며
+  `warned`로 세고 수집을 멈추지 않는다.
+- 결과가 불확실한 유료 호출은 수집을 멈추고(`stopped`, 종료 코드 2) 자동으로 다시 호출하지 않는다.
+- 예산 거부(유료 호출 수·크레딧·HTTP 시도 수·시간·서버 잔액)는 intent를 만들기 전에 일어나므로 시도한
+  것이 없다. 남은 job은 `pending`이고 상태는 `budget_exhausted`(종료 코드 0)다. 다음 실행은 완료된 job을
+  HTTP 없이 재사용한다. 예산 거부가 났어도 raw root에 정산되지 않은 page나 group이 있으면 그 증거가 계정을
+  막으므로 `stopped`(종료 코드 2)로 보고한다.
+- 정산될 수 없는 page나 group(나타나지 않는 usage, 불완전한 intent 묶음)은 운영자가
+  `aas collect qveris quarantine`으로 사유와 함께 격리한다. 격리는 최악의 경우 예약을 남기고 자동 재호출하지
+  않으며, 그 뒤 계정의 새 실행이 다시 가능하다.
+
+**일간 요청.** `daily-jobs`는 거래소(`US`는 XNYS, `KO`·`KQ`는 XKRX)의 [선언 달력](#선언-달력)에서
+관측일 이전의 열린 세션마다 `prices`·`splits`·`dividends` 일간 내려받기 요청을 만든다. 요청의 정체는
+도구·하위 공급자·시장·dataset·요청 변수이고 관측일과 job ID는 아니다. raw 수집 root의 완료된 job이
+같은 요청을 가지면 상태와 관측일이 무엇이든 그 요청은 `covered`다. 완료 없이 시도만 있는 요청은
+`held`로 보고하고 계획하지 않으므로 불확실한 시도가 자동 재호출되지 않는다. 창은 366일 이하이고 선언
+기간 안이어야 한다.
+
+**적재.** 완료된 job 하나가 원본 단위 하나다. 단위의 bytes는 `complete.json`과 그것이 pin한 page 파일
+넷이다. 원천 ID는 이 bytes와 schema major의 `aas-source-id-v1`이므로 실행 순서·묶음·적재 코드 버전·identity
+문서가 달라도 같은 job은 같은 ID가 되고, 이미 commit된 job은 다시 적재하지 않는다. 행이 instrument를
+이름 붙일 때 그 행을 해석한 identity 문서(`{"identities": {"<CODE>.<EXCHANGE>": {instrument_id, venue,
+instrument_type, currency, ...}}}`)의 SHA-256은 적재 코드·변환 해시와 함께 commit `lineage`
+(`identity_sha256`)에 남는다. 그래서 새 상장으로 identity 문서가 커져도 적재된 job이 두 번째 원천이 되지
+않고, `aas data kr-prices`가 같은 job의 행을 두 번 pin하지 않는다.
+
+| job | 행 원천(shape, 테이블) | 보류 행 원천(shape) |
+| --- | --- | --- |
+| KR·US 단일 종목 `price_history` | `<m>-history-bars`, `bars` | `<m>-history-quarantine` |
+| 거래소 일간 `prices` | `bulk-bars`, `bars` | `bulk-quarantine` |
+| 거래소 일간 `splits` | `splits`, `splits` | `splits-quarantine` |
+| 거래소 일간 `dividends` | `dividends`, `dividends` | `dividends-quarantine` |
+| FX 통화쌍 `fx_history`(`<BASE><QUOTE>.FOREX`) | `fx-history-bars`, `bars` | `fx-history-quarantine` |
+
+- 원천 ID는 `qveris-<shape>-<hex>`이고 한 job의 두 원천은 `hex`를 공유한다. 보류 테이블 이름은 모두
+  `quarantine`이며 열은 `ordinal`, `reason`, `source_row_json`이고 이력은 앞에 `source_fingerprint`를
+  둔다. 가격 `bars` 열은 `eodhd.*` 매퍼가 읽는 열 그대로다.
+- 행 테이블은 비어 있어도 commit한다(분할이 없는 거래일도 사실이다). 보류 테이블은 행이 있을 때만,
+  행 테이블보다 먼저 commit하므로 행 원천이 있으면 단위가 완결이다. 다시 적재하면 행 원천이 있는 단위는
+  다시 만들지 않고 `reused`로 센다.
+- 공급자 경고는 기록만 한다. 경고가 붙은 내려받기의 모든 행은 `provider_reported_partial` 사유로 보류되고
+  적재는 계속된다. 승격은 그 행에 같은 flag를 단다([KR 가격](#kr-가격)).
+- 분할 비율, 배당 금액·통화·날짜·주기는 공급자 텍스트 그대로(숫자는 가장 짧은 십진 표기) 남긴다.
+  identity가 없는 종목, 양수 십진수가 아닌 비율·금액은 그 사유로 보류하고 고치지 않는다. 통화쌍
+  이력은 instrument가 아니므로 identity 문서 없이 쌍·기준 통화·호가 통화를 남긴다.
+- 읽거나 검증할 수 없는 job은 `failures`에 남고 다음 job을 적재한다. 완료 문서가 없는 요청 job은
+  `missing`의 `no_completion`, 읽을 수 없거나 다른 job을 가리키는 완료 문서는 `missing`의
+  `unreadable_completion`으로 남고 다른 job은 계속 적재한다. 적재기가 없는 종류(FRED, SEC, 종목 목록, 연구 이력)는 `unsupported`로 센다. 적재는
+  공급자를 호출하지 않는다.
 
 ## 승격 명세 `aas-promotion-v1`
 
@@ -2087,36 +2159,61 @@ state v2:
 | DV-288 | KIND 목록의 코드 하나라도 KRX 단축코드가 아니면 cohort를 좁히지 않는다 | `tests/storage/test_kr_collection.py::test_a_kind_list_with_a_malformed_code_never_narrows_the_cohort` | 구현 |
 | DV-289 | 응답 없는 완료 공시 목록 행은 읽히지 않은 행이고 그 날을 덮지 않는다 | `tests/storage/test_kr_collection.py::test_a_completed_list_row_without_its_page_is_unreadable` | 구현 |
 | DV-290 | batch는 응답 bytes 상한에서도 끝난다 | `tests/storage/test_kr_collection.py::test_a_batch_ends_at_its_byte_budget` | 구현 |
-| DV-291 | 요청 지문은 공급자·endpoint·parameter만 해시하고 FRED 키는 공급자 URL에만 실리며 키를 되돌리는 답은 보존되지 않는다 | `tests/data/test_fred_collect.py::test_a_request_names_its_window_and_never_its_key` | 구현 |
-| DV-292 | FRED 답은 읽히면 `COMPLETED`, 없는 시계열은 `NO_DATA`, 창 밖 행이나 다른 모양은 `FAILED`이고 키 거부와 한도는 실행을 멈춘다 | `tests/data/test_fred_collect.py::test_answers_are_classified_and_a_refused_key_stops_the_run` | 구현 |
-| DV-293 | observations 창은 vintage 날짜를 1990개까지 담고 다음 창은 앞 창의 마지막 vintage 날짜에서 시작한다 | `tests/data/test_fred_collect.py::test_windows_span_at_most_1990_vintages_and_chain_on_their_last_vintage` | 구현 |
-| DV-294 | 원점이 아닌 창의 시작일에 시작하는 행은 이미 가진 구간의 재진술로 세어지고 옮겨지지 않는다 | `tests/data/test_fred_collect.py::test_rows_starting_on_a_window_start_restate_what_is_held` | 구현 |
-| DV-295 | 계획은 알려진 vintage 날 다음 날부터 끝난 FRED 날까지 vintage를 확인하고 알려진 날이 없으면 원점부터 묻으며 CSV는 FRED 날마다 한 번이다 | `tests/data/test_fred_collect.py::test_the_plan_checks_vintages_after_the_known_day_and_csv_once_a_day` | 구현 |
-| DV-296 | 원점 수집은 잘린 재진술 없이 FRED가 매긴 구간을 한 번씩만 1990개 이하의 창으로 옮긴다 | `tests/storage/test_us_collection.py::test_an_origin_run_collects_every_vintage_once_in_windows_of_at_most_1990` | 구현 |
-| DV-297 | 날마다의 수집과 승격에서 승격 watermark와 수집기의 시계열별 vintage 날은 앞으로만 가고, 새 vintage가 없으면 그대로다 | `tests/storage/test_us_collection.py::test_the_watermark_advances_monotonically_across_daily_collections` | 구현 |
-| DV-298 | 완결되지 않은 창은 옮겨지지 않고 다음 실행이 같은 알려진 날에서 다시 묻는다 | `tests/storage/test_us_collection.py::test_an_incomplete_window_is_asked_again_from_the_same_known_day` | 구현 |
-| DV-299 | 중단된 FRED 실행의 attempt는 정산되고 보존된 receipt는 다음 실행이 먼저 commit하며 완결된 창은 알려진 것이 된다 | `tests/storage/test_us_collection.py::test_a_crashed_run_is_settled_and_its_receipts_committed_by_the_next` | 구현 |
-| DV-300 | FRED 키 거부는 실행을 멈추고 그 답을 commit한다 | `tests/storage/test_us_collection.py::test_a_refused_key_stops_the_run_and_keeps_the_answer` | 구현 |
-| DV-301 | `fred.alfred@1`이 읽는 legacy 테이블도 알려진 vintage 날을 정하고, 받은 FRED 날에 시작한 vintage는 세지 않는다 | `tests/storage/test_us_collection.py::test_a_legacy_alfred_table_sets_the_known_vintage_day` | 구현 |
-| DV-302 | CSV 내려받기는 `fred.series_csv@1` 편입과 같은 원천이고 `fred.fx_series@1`로 승격된다 | `tests/storage/test_us_collection.py::test_the_csv_download_is_the_source_the_legacy_import_makes` | 구현 |
-| DV-303 | SEC 요청은 문서를 이름 짓고 연락처 `User-Agent`는 header에만 실리며 그것이나 연락처 주소를 되돌리는 답은 보존되지 않는다 | `tests/data/test_sec_collect.py::test_requests_name_the_document_and_never_the_contact` | 구현 |
-| DV-304 | 일일 색인은 모든 줄을 남기고 다섯 칸으로 읽힌 줄만 공시가 되며 header는 열 이름(대소문자·공백 무시, `File Name`·`Filename`)으로 찾고 경로의 CIK가 다른 줄은 공시가 아니며 404는 `NO_DATA`, 403은 실행을 멈춘다 | `tests/data/test_sec_collect.py::test_a_daily_index_keeps_every_line_and_reads_the_filings` | 구현 |
-| DV-305 | companyfacts 사실은 숫자의 JSON 원문을 그대로 남기고 다른 CIK·되풀이된 key·알 수 없는 필드·십진수가 아닌 값은 답을 거부한다 | `tests/data/test_sec_collect.py::test_company_facts_keep_each_number_as_written` | 구현 |
-| DV-306 | 색인 날은 답이나 다음 날이 끝난 뒤 받은 404로만 덮이고 빈 날은 알려진 가장 이른 날부터 채운다 | `tests/data/test_sec_collect.py::test_index_days_are_covered_by_an_answer_or_a_404_after_the_next_day` | 구현 |
-| DV-307 | 문서는 제출자마다 원한 공시로 한 번 묻고 나열되지 않은 공시는 창 안에서 하루 뒤 다시 묻으며 발행인 범위 밖은 세어진다 | `tests/data/test_sec_collect.py::test_documents_are_asked_per_filer_for_the_wanted_filings_and_retried_in_window` | 구현 |
-| DV-308 | SEC 실행은 색인 뒤 문서를 묻고 원한 공시의 행만 commit하며 `sec.submissions@1`·`sec.companyfacts@1`이 그 원천을 승격한다 | `tests/storage/test_us_collection.py::test_a_run_reads_indexes_then_documents_and_the_sec_mappers_promote_them` | 구현 |
-| DV-309 | 다음 SEC 실행은 덮이지 않은 날과 아직 없는 공시만 묻는다 | `tests/storage/test_us_collection.py::test_the_next_run_asks_only_what_is_missing` | 구현 |
-| DV-310 | `registered` 범위는 identity에 SEC 발행인이 등록된 제출자의 문서만 묻는다 | `tests/storage/test_us_collection.py::test_registered_issuers_limit_the_documents` | 구현 |
-| DV-311 | SEC의 한도 거부는 실행을 멈추고 연락처는 `raw/`의 어떤 bytes에도 남지 않는다 | `tests/storage/test_us_collection.py::test_a_refused_rate_stops_the_run_and_the_contact_is_never_retained` | 구현 |
-| DV-312 | `aas collect fred plan`과 `aas collect sec plan`은 공급자를 호출하지 않고 `run`은 호출 상한에서 정상 종료한다 | `tests/storage/test_us_collection.py::test_the_commands_plan_without_calls_and_run_through_the_cli` | 구현 |
-| DV-313 | 행으로 읽히지 않는 submissions 답은 `FAILED`이고 실행이나 commit을 막지 않는다 | `tests/storage/test_us_collection.py::test_a_submissions_answer_whose_rows_do_not_read_is_failed` | 구현 |
-| DV-314 | receipts 원천을 commit하기 전에 중단된 FRED batch는 다음 실행이 통째로 다시 commit하고 이미 commit된 파생 원천을 재사용해 CSV 날과 vintage를 잃지 않는다 | `tests/storage/test_us_collection.py::test_a_batch_whose_receipts_did_not_commit_is_derived_again_whole` | 구현 |
-| DV-315 | receipts 원천을 commit하기 전에 중단된 SEC batch의 색인은 다음 실행에서 알려지고 그 색인이 말하는 모든 문서를 묻는다 | `tests/storage/test_us_collection.py::test_an_sec_batch_whose_receipts_did_not_commit_loses_no_filing` | 구현 |
-| DV-316 | 고아 receipt는 실행의 batch 한도로 나뉘어 commit된다 | `tests/storage/test_us_collection.py::test_orphans_are_committed_in_batches_of_the_run_bounds` | 구현 |
-| DV-317 | 복구 batch는 질의 사이에서만 닫혀 한 observations 질의의 page를 한 batch에 둔다 | `tests/storage/test_us_collection.py::test_a_recovered_batch_closes_only_between_queries` | 구현 |
-| DV-318 | 전송 실패가 세 번 이어지면 `transport_failures`로 멈추고 명령은 종료 코드 1이다 | `tests/storage/test_us_collection.py::test_three_transport_failures_in_a_row_stop_the_run` | 구현 |
-| DV-319 | 시계열은 처음 완결되지 않은 창에서 멈추고 앞 창까지만 commit하며 다음 실행은 그 창의 마지막 vintage에서 다시 묻는다 | `tests/storage/test_us_collection.py::test_a_series_stops_at_its_first_incomplete_window_and_resumes_there` | 구현 |
-| DV-320 | receipt·batch 문서와 receipts 원천 ID는 문서화된 정규 bytes로 고정된다 | `tests/storage/test_us_collection.py::test_receipts_and_batches_have_fixed_canonical_bytes` | 구현 |
-| DV-321 | 답을 보존하지 못한 SEC 문서 요청은 물은 것으로 보아 같은 날 다시 묻지 않고 하루 뒤 다시 묻는다 | `tests/storage/test_us_collection.py::test_an_uncertain_document_ask_is_asked_again_the_next_day` | 구현 |
-| DV-322 | 행이 읽히지 않는 CSV 답은 `FAILED`이고 그 FRED 날을 덮지 않아 다음 실행이 다시 받는다 | `tests/storage/test_us_collection.py::test_a_csv_download_whose_rows_do_not_read_is_failed_and_asked_again` | 구현 |
-| DV-323 | pyarrow가 없으면 US 수집은 원장이나 공급자 호출 전에 멈춘다 | `tests/storage/test_us_collection.py::test_a_run_without_pyarrow_stops_before_any_call` | 구현 |
+| DV-291 | 완료된 Qveris job 하나는 행 원천과 보류 원천으로 commit되고 둘은 원본 bytes의 `hex`를 공유하며 매퍼가 lineage 접두어와 테이블 이름으로 찾는다 | `tests/storage/test_qveris_import.py::test_one_job_commits_its_rows_and_held_rows_under_one_content_hex` | 구현 |
+| DV-292 | 같은 job을 다시 적재하면 재사용하고 적재 코드만 바뀌어도 같은 원천 ID다 | `tests/storage/test_qveris_import.py::test_reimport_reuses_and_a_code_change_keeps_the_id` | 구현 |
+| DV-293 | identity 문서가 커지거나 바뀌어도 적재된 job은 같은 원천으로 재사용되고 identity 해시는 lineage에 남는다 | `tests/storage/test_qveris_import.py::test_an_identity_document_that_grows_keeps_every_imported_source` | 구현 |
+| DV-294 | 경고가 붙은 내려받기는 빈 행 테이블과 `provider_reported_partial` 보류 행으로 적재되고 적재를 막지 않는다 | `tests/storage/test_qveris_import.py::test_a_warned_download_commits_an_empty_rows_table_and_its_held_rows` | 구현 |
+| DV-295 | 읽을 수 없는 job은 기록되고 나머지 job은 적재된다 | `tests/storage/test_qveris_import.py::test_unreadable_jobs_are_recorded_and_the_run_continues` | 구현 |
+| DV-296 | 일간 요청은 선언 달력의 열린 세션에서 나오고 관측일과 무관하게 완료된 요청은 빠진다 | `tests/application/test_qveris_cli.py::test_daily_jobs_follow_declared_sessions_and_skip_completed_requests` | 구현 |
+| DV-297 | 완료 없이 시도만 있는 요청은 `held`로 보고되고 계획되지 않는다 | `tests/application/test_qveris_cli.py::test_an_attempt_without_a_completion_is_held_not_planned` | 구현 |
+| DV-298 | 유료 호출 한도에 닿은 실행은 시도 없이 `budget_exhausted`로 끝나고 다음 실행은 완료된 job을 다시 호출하지 않는다 | `tests/application/test_qveris_cli.py::test_run_stops_at_the_paid_call_limit_and_resumes_without_repeating` | 구현 |
+| DV-299 | 결과가 불확실한 유료 호출은 수집을 멈추고 종료 코드 2를 낸다 | `tests/application/test_qveris_cli.py::test_run_stops_with_exit_two_when_a_paid_call_is_uncertain` | 구현 |
+| DV-300 | 병렬 group은 예산에 전부 예약되거나 하나도 예약되지 않고, 거부된 group은 실행되지 않는다 | `tests/data/test_qveris_parallel.py::test_group_is_reserved_whole_or_not_at_all` | 구현 |
+| DV-301 | 공급자 경고는 완료로 세어지고 cohort를 멈추지 않는다 | `tests/data/test_qveris_batch.py::test_a_provider_warning_completes_and_the_cohort_continues` | 구현 |
+| DV-302 | 분할 비율은 공급자 텍스트로 남고 identity가 없거나 양수가 아닌 비율은 보류된다 | `tests/data/test_qveris_actions_fx.py::test_splits_keep_the_ratio_text_and_hold_unknown_identities` | 구현 |
+| DV-303 | 통화쌍 이력은 identity 없이 쌍과 두 통화를 남기고 맞지 않는 OHLC는 보류된다 | `tests/data/test_qveris_actions_fx.py::test_forex_history_keeps_the_pair_and_holds_bad_rows` | 구현 |
+| DV-304 | 요청 시작 간격과 HTTP 시도·시간 한도는 coordinator와 작업자에 공유되고 한도는 새 page의 첫 요청만 거부한다 | `tests/data/test_qveris_pacing.py::test_admission_bounds_requests_and_time_across_shared_clients` | 구현 |
+| DV-305 | HTTP 시도 수 한도가 어느 요청 위치에 걸려도 종료 코드 0인 실행은 미정산 page나 group을 남기지 않고 다음 실행이 모두 완료한다 | `tests/application/test_qveris_cli.py::test_a_request_limit_at_any_position_never_strands_a_started_page` | 구현 |
+| DV-306 | 시간 한도가 어느 요청 위치에 걸려도 종료 코드 0인 실행은 미정산 page나 group을 남기지 않는다 | `tests/application/test_qveris_cli.py::test_a_time_limit_at_any_position_never_strands_a_started_page` | 구현 |
+| DV-307 | 미정산 증거가 있는 예산 거부는 깨끗한 예산 소진이 아니다 | `tests/data/test_qveris_batch.py::test_a_budget_code_with_unresolved_evidence_is_not_a_clean_stop` | 구현 |
+| DV-308 | `aas collect qveris quarantine`은 page나 group을 예약을 남긴 채 격리하고 계정의 새 실행을 다시 허용한다 | `tests/application/test_qveris_cli.py::test_quarantine_releases_the_account_and_keeps_the_reservation` | 구현 |
+| DV-309 | 고정 합성 job의 정규화 행과 보류 행 digest는 고정값과 같다 | `tests/storage/test_qveris_import.py::test_normalized_rows_match_the_pinned_legacy_shape` | 구현 |
+| DV-310 | 정산된 뒤 응답 형태가 맞지 않는 job은 알려진 실패로 세고 cohort는 계속된다 | `tests/data/test_qveris_batch.py::test_a_settled_malformed_payload_is_a_known_failure_and_the_cohort_continues` | 구현 |
+| DV-311 | 시간 한도는 공유 간격을 기다린 뒤 확인된다 | `tests/data/test_qveris_pacing.py::test_the_deadline_is_checked_after_waiting_for_the_shared_pacer` | 구현 |
+| DV-312 | 병렬 응답이 job의 bytes 상한을 넘으면 보존하지 않고 실패로 정산된다 | `tests/data/test_qveris_parallel.py::test_a_parallel_response_over_the_job_byte_bound_is_never_retained` | 구현 |
+| DV-313 | 인증·quota 응답으로 멈춘 병렬 group은 정산된 완료와 호출을 센 뒤 멈춘다 | `tests/data/test_qveris_parallel_batch.py::test_a_provider_stop_counts_the_settled_group_before_stopping` | 구현 |
+| DV-314 | 손상된 완료 문서는 `unreadable_completion`으로 보고되고 다른 job은 적재된다 | `tests/storage/test_qveris_import.py::test_a_damaged_completion_marker_is_reported_and_other_jobs_import` | 구현 |
+| DV-315 | `plan`은 `run`이 재사용하는 같은 fingerprint만 완료로 세고 관측일이 다른 같은 요청은 `equivalent`로 센다 | `tests/application/test_qveris_cli.py::test_plan_counts_only_jobs_run_reuses_as_completed` | 구현 |
+| DV-316 | 요청 지문은 공급자·endpoint·parameter만 해시하고 FRED 키는 공급자 URL에만 실리며 키를 되돌리는 답은 보존되지 않는다 | `tests/data/test_fred_collect.py::test_a_request_names_its_window_and_never_its_key` | 구현 |
+| DV-317 | FRED 답은 읽히면 `COMPLETED`, 없는 시계열은 `NO_DATA`, 창 밖 행이나 다른 모양은 `FAILED`이고 키 거부와 한도는 실행을 멈춘다 | `tests/data/test_fred_collect.py::test_answers_are_classified_and_a_refused_key_stops_the_run` | 구현 |
+| DV-318 | observations 창은 vintage 날짜를 1990개까지 담고 다음 창은 앞 창의 마지막 vintage 날짜에서 시작한다 | `tests/data/test_fred_collect.py::test_windows_span_at_most_1990_vintages_and_chain_on_their_last_vintage` | 구현 |
+| DV-319 | 원점이 아닌 창의 시작일에 시작하는 행은 이미 가진 구간의 재진술로 세어지고 옮겨지지 않는다 | `tests/data/test_fred_collect.py::test_rows_starting_on_a_window_start_restate_what_is_held` | 구현 |
+| DV-320 | 계획은 알려진 vintage 날 다음 날부터 끝난 FRED 날까지 vintage를 확인하고 알려진 날이 없으면 원점부터 묻으며 CSV는 FRED 날마다 한 번이다 | `tests/data/test_fred_collect.py::test_the_plan_checks_vintages_after_the_known_day_and_csv_once_a_day` | 구현 |
+| DV-321 | 원점 수집은 잘린 재진술 없이 FRED가 매긴 구간을 한 번씩만 1990개 이하의 창으로 옮긴다 | `tests/storage/test_us_collection.py::test_an_origin_run_collects_every_vintage_once_in_windows_of_at_most_1990` | 구현 |
+| DV-322 | 날마다의 수집과 승격에서 승격 watermark와 수집기의 시계열별 vintage 날은 앞으로만 가고, 새 vintage가 없으면 그대로다 | `tests/storage/test_us_collection.py::test_the_watermark_advances_monotonically_across_daily_collections` | 구현 |
+| DV-323 | 완결되지 않은 창은 옮겨지지 않고 다음 실행이 같은 알려진 날에서 다시 묻는다 | `tests/storage/test_us_collection.py::test_an_incomplete_window_is_asked_again_from_the_same_known_day` | 구현 |
+| DV-324 | 중단된 FRED 실행의 attempt는 정산되고 보존된 receipt는 다음 실행이 먼저 commit하며 완결된 창은 알려진 것이 된다 | `tests/storage/test_us_collection.py::test_a_crashed_run_is_settled_and_its_receipts_committed_by_the_next` | 구현 |
+| DV-325 | FRED 키 거부는 실행을 멈추고 그 답을 commit한다 | `tests/storage/test_us_collection.py::test_a_refused_key_stops_the_run_and_keeps_the_answer` | 구현 |
+| DV-326 | `fred.alfred@1`이 읽는 legacy 테이블도 알려진 vintage 날을 정하고, 받은 FRED 날에 시작한 vintage는 세지 않는다 | `tests/storage/test_us_collection.py::test_a_legacy_alfred_table_sets_the_known_vintage_day` | 구현 |
+| DV-327 | CSV 내려받기는 `fred.series_csv@1` 편입과 같은 원천이고 `fred.fx_series@1`로 승격된다 | `tests/storage/test_us_collection.py::test_the_csv_download_is_the_source_the_legacy_import_makes` | 구현 |
+| DV-328 | SEC 요청은 문서를 이름 짓고 연락처 `User-Agent`는 header에만 실리며 그것이나 연락처 주소를 되돌리는 답은 보존되지 않는다 | `tests/data/test_sec_collect.py::test_requests_name_the_document_and_never_the_contact` | 구현 |
+| DV-329 | 일일 색인은 모든 줄을 남기고 다섯 칸으로 읽힌 줄만 공시가 되며 header는 열 이름(대소문자·공백 무시, `File Name`·`Filename`)으로 찾고 경로의 CIK가 다른 줄은 공시가 아니며 404는 `NO_DATA`, 403은 실행을 멈춘다 | `tests/data/test_sec_collect.py::test_a_daily_index_keeps_every_line_and_reads_the_filings` | 구현 |
+| DV-330 | companyfacts 사실은 숫자의 JSON 원문을 그대로 남기고 다른 CIK·되풀이된 key·알 수 없는 필드·십진수가 아닌 값은 답을 거부한다 | `tests/data/test_sec_collect.py::test_company_facts_keep_each_number_as_written` | 구현 |
+| DV-331 | 색인 날은 답이나 다음 날이 끝난 뒤 받은 404로만 덮이고 빈 날은 알려진 가장 이른 날부터 채운다 | `tests/data/test_sec_collect.py::test_index_days_are_covered_by_an_answer_or_a_404_after_the_next_day` | 구현 |
+| DV-332 | 문서는 제출자마다 원한 공시로 한 번 묻고 나열되지 않은 공시는 창 안에서 하루 뒤 다시 묻으며 발행인 범위 밖은 세어진다 | `tests/data/test_sec_collect.py::test_documents_are_asked_per_filer_for_the_wanted_filings_and_retried_in_window` | 구현 |
+| DV-333 | SEC 실행은 색인 뒤 문서를 묻고 원한 공시의 행만 commit하며 `sec.submissions@1`·`sec.companyfacts@1`이 그 원천을 승격한다 | `tests/storage/test_us_collection.py::test_a_run_reads_indexes_then_documents_and_the_sec_mappers_promote_them` | 구현 |
+| DV-334 | 다음 SEC 실행은 덮이지 않은 날과 아직 없는 공시만 묻는다 | `tests/storage/test_us_collection.py::test_the_next_run_asks_only_what_is_missing` | 구현 |
+| DV-335 | `registered` 범위는 identity에 SEC 발행인이 등록된 제출자의 문서만 묻는다 | `tests/storage/test_us_collection.py::test_registered_issuers_limit_the_documents` | 구현 |
+| DV-336 | SEC의 한도 거부는 실행을 멈추고 연락처는 `raw/`의 어떤 bytes에도 남지 않는다 | `tests/storage/test_us_collection.py::test_a_refused_rate_stops_the_run_and_the_contact_is_never_retained` | 구현 |
+| DV-337 | `aas collect fred plan`과 `aas collect sec plan`은 공급자를 호출하지 않고 `run`은 호출 상한에서 정상 종료한다 | `tests/storage/test_us_collection.py::test_the_commands_plan_without_calls_and_run_through_the_cli` | 구현 |
+| DV-338 | 행으로 읽히지 않는 submissions 답은 `FAILED`이고 실행이나 commit을 막지 않는다 | `tests/storage/test_us_collection.py::test_a_submissions_answer_whose_rows_do_not_read_is_failed` | 구현 |
+| DV-339 | receipts 원천을 commit하기 전에 중단된 FRED batch는 다음 실행이 통째로 다시 commit하고 이미 commit된 파생 원천을 재사용해 CSV 날과 vintage를 잃지 않는다 | `tests/storage/test_us_collection.py::test_a_batch_whose_receipts_did_not_commit_is_derived_again_whole` | 구현 |
+| DV-340 | receipts 원천을 commit하기 전에 중단된 SEC batch의 색인은 다음 실행에서 알려지고 그 색인이 말하는 모든 문서를 묻는다 | `tests/storage/test_us_collection.py::test_an_sec_batch_whose_receipts_did_not_commit_loses_no_filing` | 구현 |
+| DV-341 | 고아 receipt는 실행의 batch 한도로 나뉘어 commit된다 | `tests/storage/test_us_collection.py::test_orphans_are_committed_in_batches_of_the_run_bounds` | 구현 |
+| DV-342 | 복구 batch는 질의 사이에서만 닫혀 한 observations 질의의 page를 한 batch에 둔다 | `tests/storage/test_us_collection.py::test_a_recovered_batch_closes_only_between_queries` | 구현 |
+| DV-343 | 전송 실패가 세 번 이어지면 `transport_failures`로 멈추고 명령은 종료 코드 1이다 | `tests/storage/test_us_collection.py::test_three_transport_failures_in_a_row_stop_the_run` | 구현 |
+| DV-344 | 시계열은 처음 완결되지 않은 창에서 멈추고 앞 창까지만 commit하며 다음 실행은 그 창의 마지막 vintage에서 다시 묻는다 | `tests/storage/test_us_collection.py::test_a_series_stops_at_its_first_incomplete_window_and_resumes_there` | 구현 |
+| DV-345 | receipt·batch 문서와 receipts 원천 ID는 문서화된 정규 bytes로 고정된다 | `tests/storage/test_us_collection.py::test_receipts_and_batches_have_fixed_canonical_bytes` | 구현 |
+| DV-346 | 답을 보존하지 못한 SEC 문서 요청은 물은 것으로 보아 같은 날 다시 묻지 않고 하루 뒤 다시 묻는다 | `tests/storage/test_us_collection.py::test_an_uncertain_document_ask_is_asked_again_the_next_day` | 구현 |
+| DV-347 | 행이 읽히지 않는 CSV 답은 `FAILED`이고 그 FRED 날을 덮지 않아 다음 실행이 다시 받는다 | `tests/storage/test_us_collection.py::test_a_csv_download_whose_rows_do_not_read_is_failed_and_asked_again` | 구현 |
+| DV-348 | pyarrow가 없으면 US 수집은 원장이나 공급자 호출 전에 멈춘다 | `tests/storage/test_us_collection.py::test_a_run_without_pyarrow_stops_before_any_call` | 구현 |
