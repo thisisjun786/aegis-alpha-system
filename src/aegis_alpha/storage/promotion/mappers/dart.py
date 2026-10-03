@@ -85,6 +85,7 @@ January 1 of its request's ``bsns_year``.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Mapping
 from typing import Final
 
@@ -132,54 +133,72 @@ def _param(params: str, name: str) -> str:
 
 
 def _item(name: str) -> str:
-    return f"json_extract_string(_d_j, '$.{name}')"
+    return f"_d_j.{name}"
 
 
 _BODY: Final = (
     "CASE WHEN endpoint = 'financials' AND outcome = 'COMPLETED' "
     "THEN try(decode(try(from_base64(raw_base64)))) END"
 )
+# The response fields the mappers read, parsed once per response. ``json_transform``
+# reads a value as ``json_extract_string`` would: text as is, other JSON as its text,
+# and an absent or null field as NULL.
+LINE_FIELDS: Final = (
+    "account_detail",
+    "account_id",
+    "account_nm",
+    "bsns_year",
+    "corp_code",
+    "currency",
+    "ord",
+    "rcept_no",
+    "reprt_code",
+    "sj_div",
+    "thstrm_add_amount",
+    "thstrm_amount",
+)
+_SHAPE: Final = json.dumps(
+    {"status": "VARCHAR", "list": [dict.fromkeys(LINE_FIELDS, "VARCHAR")]},
+    separators=(",", ":"),
+)
 
 
 def _document(text: str) -> str:
-    """The JSON document ``text`` holds, NULL when it is not JSON."""
-    return f"CASE WHEN json_valid({text}) THEN CAST({text} AS JSON) END"
+    """The response fields of JSON ``text`` as a struct, NULL when it is not JSON."""
+    return f"json_transform(CASE WHEN json_valid({text}) THEN {text} END, '{_SHAPE}')"
 
 
-def _outcome(body: str, params: str) -> str:
-    """A receipt row's outcome, given the SQL of its response text and request parameters."""
+def _outcome(body: str, document: str, params: str) -> str:
+    """A receipt row's outcome over its response text, parsed response and parameters.
+
+    ``body`` and ``document`` must be cheap to repeat (columns or lambda parameters).
+    """
     request = (
         f"regexp_full_match({_param(params, 'corp_code')}, '[0-9]{{8}}') "
         f"AND regexp_full_match({_param(params, 'bsns_year')}, '[0-9]{{4}}') "
         f"AND {_param(params, 'reprt_code')} IN ({_quoted(REPORTS)}) "
         f"AND {_param(params, 'fs_div')} IN ('CFS', 'OFS')"
     )
-    # DuckDB evaluates both sides of AND, so JSON is read only through a guarded document.
-    document = _document(body)
-    lines = f"json_extract({document}, '$.list[*]')"
-    number = "json_extract_string(j, '$.rcept_no')"
+    lines = f"{document}.list"
     line = (
-        f"json_extract_string(j, '$.sj_div') IN ({_quoted(STATEMENTS)}) "
-        f"AND regexp_full_match({number}, '[0-9]{{14}}') "
-        f"AND try_strptime(substr({number}, 1, 8), '%Y%m%d') IS NOT NULL "
-        "AND regexp_full_match(json_extract_string(j, '$.ord'), '[0-9]+') "
-        "AND regexp_full_match(json_extract_string(j, '$.currency'), '[A-Z]{3}') "
-        "AND json_extract_string(j, '$.account_id') IS NOT NULL "
-        "AND json_extract_string(j, '$.account_nm') IS NOT NULL "
-        "AND json_extract_string(j, '$.account_detail') IS NOT NULL"
+        f"j.sj_div IN ({_quoted(STATEMENTS)}) "
+        "AND regexp_full_match(j.rcept_no, '[0-9]{14}') "
+        "AND try_strptime(substr(j.rcept_no, 1, 8), '%Y%m%d') IS NOT NULL "
+        "AND regexp_full_match(j.ord, '[0-9]+') "
+        "AND regexp_full_match(j.currency, '[A-Z]{3}') "
+        "AND j.account_id IS NOT NULL AND j.account_nm IS NOT NULL "
+        "AND j.account_detail IS NOT NULL"
     )
     readable = (
-        f"{body} IS NOT NULL AND sha256({body}) = raw_sha256 AND {document} IS NOT NULL "
-        f"AND json_extract_string({document}, '$.status') = '000' "
-        f"AND json_type({document}, '$.list') = 'ARRAY' "
-        f"AND json_array_length({document}, '$.list') > 0 "
+        f"{body} IS NOT NULL AND sha256({body}) = raw_sha256 "
+        f"AND {document}.status = '000' AND len({lines}) > 0 "
         f"AND len(list_filter({lines}, lambda j: NOT coalesce({line}, false))) = 0"
     )
     differs = " OR ".join(
-        f"json_extract_string(j, '$.{name}') IS DISTINCT FROM {_param(params, name)}"
+        f"j.{name} IS DISTINCT FROM {_param(params, name)}"
         for name in ("corp_code", "bsns_year", "reprt_code")
     )
-    numbers = f"list_distinct(list_transform({lines}, lambda j: {number}))"
+    numbers = f"list_distinct(list_transform({lines}, lambda j: j.rcept_no))"
     agrees = f"len(list_filter({lines}, lambda j: {differs})) = 0 AND len({numbers}) = 1"
     return (
         "CASE WHEN endpoint IS DISTINCT FROM 'financials' THEN 'other_endpoint' "
@@ -214,9 +233,10 @@ def _lines(source: str, args: Mapping[str, object], *, filing_only: bool) -> str
     the promotion refuses the natural keys they repeat.
     """
     receipts = f"SELECT *, {_params()} AS _d_params, {_BODY} AS _d_body FROM {source}"  # noqa: S608 -- engine-named relation
+    parsed = f"SELECT *, {_document('_d_body')} AS _d_doc FROM ({receipts})"  # noqa: S608 -- engine-named relation
     outcomes = (
-        f"SELECT *, {_outcome('_d_body', '_d_params')} AS _d_outcome, "  # noqa: S608 -- engine-named relation
-        f"{_ingested()} AS _d_ingested FROM ({receipts})"
+        f"SELECT *, {_outcome('_d_body', '_d_doc', '_d_params')} AS _d_outcome, "  # noqa: S608 -- engine-named relation
+        f"{_ingested()} AS _d_ingested FROM ({parsed})"
     )
     keys = (
         ("corp_code", "reprt_code")
@@ -228,7 +248,7 @@ def _lines(source: str, args: Mapping[str, object], *, filing_only: bool) -> str
         filing += ", raw_sha256"
     first = (
         f"row_number() OVER (PARTITION BY _d_outcome, {filing}, "
-        f"json_extract_string({_document('_d_body')}, '$.list[0].rcept_no') "
+        "_d_doc.list[1].rcept_no "
         "ORDER BY _d_ingested NULLS LAST, _aas_pin, _aas_ordinal) = 1"
     )
     refused = REFUSED_OUTCOMES - _accepted(args)
@@ -236,11 +256,10 @@ def _lines(source: str, args: Mapping[str, object], *, filing_only: bool) -> str
     if refused:
         kept += f" OR _d_outcome IN ({_quoted(refused)})"
     return (
-        "SELECT * EXCLUDE (_d_body, _d_lines), unnest(_d_lines) AS _d_j, "  # noqa: S608 -- engine-named relation
+        "SELECT * EXCLUDE (_d_body, _d_doc, _d_lines), unnest(_d_lines) AS _d_j, "  # noqa: S608 -- engine-named relation
         "generate_subscripts(_d_lines, 1) - 1 AS _d_line FROM ("
-        "SELECT *, CASE WHEN _d_outcome = 'completed' "
-        f"THEN json_extract({_document('_d_body')}, '$.list[*]') "
-        "ELSE [CAST(NULL AS JSON)] END AS _d_lines "
+        "SELECT *, CASE WHEN _d_outcome = 'completed' THEN _d_doc.list "
+        "ELSE [NULL] END AS _d_lines "
         f"FROM ({outcomes}) QUALIFY {kept})"
     )
 
@@ -308,7 +327,12 @@ class _Receipts:
 
     def outcome(self, args: Mapping[str, object]) -> str:
         del args
-        return _outcome(_BODY, _params())
+        # Lambda parameters bind the decoded and parsed response once per row.
+        inner = _outcome("b", "d", _params())
+        return (
+            f"list_transform([{_BODY}], lambda b: "
+            f"list_transform([{_document('b')}], lambda d: {inner})[1])[1]"
+        )
 
 
 def _period(field: str) -> tuple[str, str]:
@@ -376,7 +400,7 @@ class DartFnltt(_Receipts):
         # The year to date of an income statement in a half-year or third-quarter report.
         cumulative = (
             f"{_item('sj_div')} IN ('CIS', 'IS') AND {slot} IN ('11012', '11014') "
-            "AND json_exists(_d_j, '$.thstrm_add_amount')"
+            f"AND {_item('thstrm_add_amount')} IS NOT NULL"
         )
         fields = (
             "SELECT *, "  # noqa: S608 -- engine-named relation
