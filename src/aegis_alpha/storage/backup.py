@@ -19,6 +19,10 @@ if TYPE_CHECKING:
     from aegis_alpha.compute_resources import ComputeBudget
 
 _MANIFEST = "backup.json"
+# The manifest lists every raw/ and runs/ file with its size and hash, about 200 bytes
+# each, so an installation with hundreds of thousands of raw files has a manifest of tens
+# of megabytes. Configuration files keep their own 1 MiB bound.
+MAX_MANIFEST_BYTES = 512 * 1024 * 1024
 
 
 def _run_counts(workspace: Workspace) -> dict[str, int]:
@@ -75,7 +79,8 @@ def _file_hash(path: Path) -> dict[str, object]:
     return {"size_bytes": size, "sha256": hasher.hexdigest()}
 
 
-def _copy_tree(source: Path, target: Path, files: dict[str, object], prefix: str) -> None:
+def copy_tree(source: Path, target: Path, files: dict[str, object], prefix: str) -> None:
+    """Copy a private tree file by file, refusing symlinks; ``files`` receives each hash."""
     private_directory(source)
     private_directory(target, create=True)
     with DescriptorTree.open_path(source) as tree:
@@ -85,7 +90,7 @@ def _copy_tree(source: Path, target: Path, files: dict[str, object], prefix: str
         if child.is_symlink():
             raise ValueError("backup refuses symlinks")
         if child.is_dir():
-            _copy_tree(child, target / name, files, prefix + name + "/")
+            copy_tree(child, target / name, files, prefix + name + "/")
         else:
             files[prefix + name] = _copy_file(child, target / name)
 
@@ -134,8 +139,8 @@ def backup_workspace(
         files[path.name] = _file_hash(path)
     with workspace.checkpointed_market():
         files["market.duckdb"] = _copy_file(workspace.paths.market, target / "market.duckdb")
-    _copy_tree(workspace.paths.raw, target / "raw", files, "raw/")
-    _copy_tree(workspace.paths.runs, target / "runs", files, "runs/")
+    copy_tree(workspace.paths.raw, target / "raw", files, "raw/")
+    copy_tree(workspace.paths.runs, target / "runs", files, "runs/")
     # Whitelist-only export: no provider config, credentials, or external operating paths.
     original_config = read_json(workspace.paths.root / "runtime.json")
     resources = original_config.get("resources", {"threads": 2, "memory_limit": "512MB"})
@@ -192,9 +197,20 @@ def _listed_file_hash(root: Path, path: Path, relative: str) -> dict[str, object
         raise
 
 
+def validated_backup(root: Path) -> dict[str, object]:
+    """Rehash every file a backup lists and return its manifest; refuse anything else."""
+    return _validated_manifest(resolve_home(root))
+
+
+def manifest_sha256(root: Path) -> str:
+    """The backup's identity: SHA-256 of its exact ``backup.json`` bytes."""
+    with DescriptorTree.open_path(root) as tree:
+        return hashlib.sha256(tree.read_bytes(_MANIFEST, max_bytes=MAX_MANIFEST_BYTES)).hexdigest()
+
+
 def _validated_manifest(root: Path) -> dict[str, object]:
     private_directory(root)
-    manifest = read_json(root / _MANIFEST)
+    manifest = read_json(root / _MANIFEST, max_bytes=MAX_MANIFEST_BYTES)
     if (
         type(manifest.get("format_version")) is not int
         or manifest.get("format_version") != 1

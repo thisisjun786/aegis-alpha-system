@@ -1920,22 +1920,76 @@ state v2:
 
 ## 원천 은퇴와 동치 증명
 
-`aas db source-retire --plan|--apply`는 다른 원천으로 대체된 원천 자료실 테이블을 지운다.
-`--apply`는 다음이 모두 성립하는 원천만 처리하고, 성립하지 않는 원천은 이유와 함께 보고한다.
+`aas db source-retire --spec FILE --sha256 H [--backup DIR] --plan|--apply`는 다른 원천으로 대체된 원천
+자료실 테이블을 지운다. `storage/source_retirement.py`가 이 경로를 소유한다. 요청은
+`aas-source-retirement-v1` 문서 하나이고 8 MiB 이하의 정확한 bytes를 SHA-256으로 pin한다.
 
-1. **참조 없음**: committed generation 명세의 원천 pin, generation 행의 `source_snapshot_id`,
-   `dataset_sources`, 입력 binding 중 어느 것도 그 원천을 가리키지 않는다. 원천 자신의
-   source-link 행(`sl:` snapshot)은 참조로 세지 않는다. 그 행은 은퇴 뒤에도 계보로 남는다.
-2. **동치 증명**: `equivalence_spec`이 비교할 테이블과 열을 명시하고, 그 열들의 정규 행 multiset에
-   대한 `aas-rowset-v1` digest가 은퇴할 원천과 `equivalent_to_source_id`에서 같다.
-3. **다른 장치 백업**: `backup_id`가 가리키는 검증된 백업이 그 원천을 담고 있고, 설치본과 다른 장치에 있다.
+```json
+{"schema_version": "aas-source-retirement-v1",
+ "groups": [{"reason": "Norgate normalized copy of the raw export",
+             "retire": {"sources": ["..."], "table": "observations", "columns": ["assetid", "date", "close"]},
+             "equivalent": {"sources": ["..."], "table": "observations", "columns": ["assetid", "date", "close"]}}]}
+```
 
-세 조건을 통과한 원천은 한 번의 실행에서 일괄 은퇴하고 `source_retirements`에 기록하며 결과를
-보고한다. 기록은 불변이다. 은퇴는 원천 자료실 테이블을 지울 뿐 `raw/`의 원본 bytes와 보관 archive는
-지우지 않는다. 은퇴한 원천의 내용은 동치 원천과 백업에서 다시 얻는다.
+- group 하나는 은퇴할 원천 목록과 동치 원천 목록, 양쪽의 테이블 이름 하나와 위치별로 대응하는 비교 열을
+  가진다. 원천을 나눈 경계가 양쪽에서 달라도 되므로 한 group은 여러 원천을 여러 원천과 비교한다.
+- 같은 원천 테이블은 한 group에서만 은퇴하고, 은퇴할 원천은 어느 group의 동치 원천도 될 수 없다. 은퇴할
+  원천의 모든 테이블이 어떤 group의 비교 대상이어야 한다. 알 수 없는 필드, 빈 목록, 중복, 열 수 불일치는
+  데이터를 읽기 전에 거부한다.
+- group은 통째로 은퇴하거나 통째로 거부된다. `--apply`는 다음이 모두 성립하는 group만 처리하고, 나머지
+  group은 이유와 함께 보고한다.
 
-물리 공간 회수는 `aas db compact --to NEW_ROOT`가 새 루트로 복원하듯 옮기고 deep verify를 통과한 뒤
-설정을 바꾼다. 원래 파일은 그 전까지 그대로 남는다.
+1. **참조 없음**: committed generation을 증명하는 보존 문서(승격 명세, 연구 변환, import 문서)의 JSON,
+   market 도메인 테이블의 `source_snapshot_id`, state의 `dataset_sources`·`identity_assertions`·
+   `universe_members`, 입력 binding과 feature 입력 중 어느 것도 group의 원천을 가리키지 않는다. 원천 자신의
+   source-link 행(`sl:` snapshot과 `source_files`)은 참조로 세지 않는다. 그 행은 은퇴 뒤에도 계보로 남는다.
+2. **동치 증명**: 양쪽 비교 열의 정규 행 multiset에 대한 `aas-rowset-v1` digest가 같다. 열 이름은 은퇴
+   쪽의 이름을 쓰고, 각 셀은 정확한 형태로 부호화한다. 정수는 `int`, binary64(그리고 넓힌 binary32)는
+   `float`, 날짜는 `date`, timestamp는 UTC microsecond `utc_us`, 소수 12자리 이하의 decimal은 scale 12의
+   `decimal`, 문자열은 `text`, 불리언은 `bool`이다. 정확한 형태가 없는 값(int64를 넘는 정수, NaN, 무한대)이나
+   다른 타입(binary, list 등)은 group을 거부한다. 양쪽 행 수가 다르거나 열 타입이 다르면 계산 없이 거부한다.
+   DuckDB가 행을 부호화해 정렬하고 Python은 할당 안의 배치로 digest만 계산한다.
+3. **다른 장치 백업**: `--backup`의 백업은 모든 파일을 다시 해시해 검증되고, 같은 설치본의 것이며,
+   설치본의 루트·state·market·`raw/`와 다른 장치에 있다. 백업의 market 저장소에는 원천마다 같은 commit
+   manifest와 그 manifest가 나열한 모든 테이블이 같은 행 수로 있다. `backup_id`는 백업 `backup.json`의
+   SHA-256이다.
+
+이미 은퇴한 원천의 동치 원천이었던 원천은 은퇴하지 않는다. 은퇴의 증명이 가리키는 원천이 사라지지
+않게 하기 위해서다. 같은 group을 다시 요청하면 `already_retired`로 보고하고 아무것도 쓰지 않는다.
+
+`--plan`은 설치본을 읽기 전용으로 열고 group별 상태(`retire`·`refused`·`already_retired`), 이유, 양쪽 행
+수와 digest, 원천별 참조 위치와 이유, 후보·은퇴 가능 원천과 행의 합계를 보고한다. v1 state에서는 계획만
+하고 `apply_needs_v2`를 보고한다. `--apply`는 다음 순서로 진행한다.
+
+1. 실행 중인 run이나 다른 종류의 PREPARED 작업이 있으면 거부한다. 남은 `source-retire` intent가 있으면
+   먼저 끝낸다.
+2. 계획을 다시 세우고 은퇴할 원천마다 기록을 만든다. 기록은 `source_id`, `digest`(commit manifest 텍스트의
+   SHA-256. manifest는 테이블별 행 수와 내용 digest를 담고 marker에 남는다), `rows`, group의 `reason`,
+   `equivalent_to_source_id`(동치 쪽 첫 원천), `equivalence_spec`(group의 정규 JSON), `equivalence_digest`,
+   `backup_id`다.
+3. 기록 문서(`aas-source-retirement-records-v1`, 은퇴 시각 포함)를 `raw/`에 보존하고 그 해시를 payload로
+   `source-retire` intent를 기록한다. intent ID는 `source-retire:` + request hash이고, request hash는
+   `aas-source-retirement-request-v1`(`spec_sha256`, `backup_id`, 시각을 뺀 기록 목록)의 정규 JSON SHA-256이다.
+4. 남은 테이블을 DuckDB 한 트랜잭션으로 지운다. 그 전에 테이블이 남은 원천의 참조를 다시 확인한다.
+5. `source_retirements`에 원천마다 불변 행 하나를 쓰고 intent를 완료한다.
+
+중간에 멈춘 intent는 같은 명령을 다시 실행하거나 `aas db recover`로 끝낸다. 끝내기는 보존한 기록에서
+시작하고, commit manifest가 기록의 digest와 같은지와 남은 테이블의 참조만 다시 확인한다. 테이블을 하나라도
+지운 intent는 `aas db quarantine`이 끝내지 않는다. 아무 테이블도 지우지 않은 intent는 quarantine할 수 있다.
+
+은퇴는 원천 자료실 테이블만 지운다. commit marker, `sl:` 연결, `raw/`의 원본 bytes와 보관 archive는 남는다.
+은퇴한 원천은 원천 목록과 reader에서 빠지고, 읽으려 하면 동치 원천과 백업 ID를 알려 주며 거부한다. 같은 원천
+ID의 재적재도 거부한다. 은퇴한 원천의 내용은 동치 원천과 백업에서 다시 얻는다. `aas db verify`는 은퇴한
+commit마다 기록의 digest·행 수가 manifest와 같은지, 테이블이 없는지, 은퇴 intent가 완료됐는지, 동치 원천의
+commit이 있는지 확인하고, 은퇴가 하나라도 있으면 보고에 `source_library.retired`(원천 수와 행 수)를 더한다.
+
+물리 공간 회수는 `aas db compact --to NEW_ROOT`(`storage/compaction.py`)가 한다. 설치본을 유지보수 잠금 아래
+검증한 뒤 새 루트에 저장소를 새로 쓴다. SQLite는 backup API와 `VACUUM`으로, DuckDB는 새 파일로의
+`COPY FROM DATABASE`로 옮겨 지운 테이블이 남긴 빈 블록을 버린다. `raw/`, `runs/`, `secrets/`는 파일 단위로
+복사하고, `runtime.json`은 경로만 새 루트 기준 기본값으로 바꾼다. 새 루트를 열어 같은 논리 검증 결과가 나와야
+설치 영수증이 `ready`가 된다. 실패하면 새 루트는 `restore-incomplete`로 남고 원래 설치본은 그대로다. 원래
+설치본은 바뀌거나 지워지지 않으며, `AAS_HOME`(또는 `--home`)을 새 루트로 바꾸는 일은 운영자가 한다. 새
+루트는 존재하지 않는 경로여야 하고 원래 설치본의 경로와 겹치지 않는다.
 
 ## 계약과 테스트 대응표
 
@@ -1973,15 +2027,15 @@ state v2:
 | DV-30 | v1→v2 migration은 백업 없이 거부하고 중단 후 재개한다 | `tests/storage/test_migration.py::test_migration_requires_backup_and_resumes` | 구현 |
 | DV-31 | migration 후 v1 checksum 행이 남고 알 수 없는 버전은 거부한다 | `tests/storage/test_migration.py::test_migration_keeps_v1_receipt_and_rejects_unknown` | 구현 |
 | DV-32 | `fields='close'` 가격은 reference만 될 수 있다 | `tests/storage/test_migration.py::test_close_only_prices_are_reference` | 구현 |
-| DV-33 | 참조 중이거나 동치가 아니거나 백업이 없는 원천은 은퇴하지 않는다 | `tests/storage/test_source_retirement.py::test_retirement_requires_proof` | 예정 |
-| DV-34 | 은퇴는 `raw/` 원본을 지우지 않는다 | `tests/storage/test_source_retirement.py::test_retirement_keeps_raw_bytes` | 예정 |
+| DV-33 | 참조 중이거나 동치가 아니거나 백업이 없는 원천은 은퇴하지 않는다 | `tests/storage/test_source_retirement.py::test_retirement_requires_proof` | 구현 |
+| DV-34 | 은퇴는 `raw/` 원본을 지우지 않는다 | `tests/storage/test_source_retirement.py::test_retirement_keeps_raw_bytes` | 구현 |
 | DV-35 | 대응표의 구현 행은 존재하는 테스트를, 예정 행은 아직 없는 테스트를 가리킨다 | `tests/tools/test_data_vertical_contract.py::test_contract_rows_match_tests` | 구현 |
 | DV-36 | `record` 근거 규칙의 SUPERSEDE 시점은 정정을 담은 원천의 증거 시각이다 | `tests/storage/test_promotion_engine.py::test_superseding_revision_is_not_known_before_its_source` | 구현 |
 | DV-37 | 명세 `scope` 밖의 record는 원천에서 빠져도 TOMBSTONE되지 않는다 | `tests/storage/test_promotion_engine.py::test_tombstone_stays_within_declared_scope` | 구현 |
 | DV-38 | TOMBSTONE 시점은 부재를 증명한 snapshot의 증거 시각이며 record 날짜 규칙을 쓰지 않는다 | `tests/storage/test_promotion_engine.py::test_tombstone_time_comes_from_absence_snapshot` | 구현 |
 | DV-39 | 같은 값을 다른 수집 시각에 다시 수집해도 revision이 생기지 않는다 | `tests/storage/test_promotion_engine.py::test_recollection_at_new_ingestion_time_is_not_a_revision` | 구현 |
 | DV-40 | head보다 이른 시점의 원천 행은 head를 대체하지 않고 stale로 보고된다 | `tests/storage/test_promotion_engine.py::test_older_source_row_does_not_supersede_newer_head` | 구현 |
-| DV-41 | 참조가 없고 동치이며 백업된 원천은 자기 source-link 행이 있어도 은퇴하고 그 행은 남는다 | `tests/storage/test_source_retirement.py::test_unreferenced_equivalent_backed_up_source_is_retired` | 예정 |
+| DV-41 | 참조가 없고 동치이며 백업된 원천은 자기 source-link 행이 있어도 은퇴하고 그 행은 남는다 | `tests/storage/test_source_retirement.py::test_unreferenced_equivalent_backed_up_source_is_retired` | 구현 |
 | DV-42 | `source_id` 형식은 고정 입력과 기대 값으로 고정돼 있다 | `tests/storage/test_source_identity.py::test_source_id_format_is_frozen` | 구현 |
 | DV-43 | `revision_id` 형식은 고정 입력과 기대 값으로 고정돼 있다 | `tests/storage/test_promotion_formats.py::test_revision_id_format_is_frozen` | 구현 |
 | DV-44 | `source_row_hash` 형식은 float·bytes·null을 포함한 고정 입력과 기대 값으로 고정되고 `_aas_ordinal`을 제외한다 | `tests/storage/test_promotion_formats.py::test_source_row_hash_format_is_frozen` | 구현 |
@@ -2310,3 +2364,10 @@ state v2:
 | DV-367 | 답을 보존하지 못한 SEC 문서 요청은 물은 것으로 보아 같은 날 다시 묻지 않고 하루 뒤 다시 묻는다 | `tests/storage/test_us_collection.py::test_an_uncertain_document_ask_is_asked_again_the_next_day` | 구현 |
 | DV-368 | 행이 읽히지 않는 CSV 답은 `FAILED`이고 그 FRED 날을 덮지 않아 다음 실행이 다시 받는다 | `tests/storage/test_us_collection.py::test_a_csv_download_whose_rows_do_not_read_is_failed_and_asked_again` | 구현 |
 | DV-369 | pyarrow가 없으면 US 수집은 원장이나 공급자 호출 전에 멈춘다 | `tests/storage/test_us_collection.py::test_a_run_without_pyarrow_stops_before_any_call` | 구현 |
+| DV-370 | 동치 digest는 비교 열의 정확한 형태 셀에 대한 `aas-rowset-v1`이며 독립 Python 계산과 같다 | `tests/storage/test_source_retirement.py::test_equivalence_digest_is_rowset_v1_of_typed_cells` | 구현 |
+| DV-371 | 정확한 rowset 형태가 없는 값이나 타입은 group을 거부한다 | `tests/storage/test_source_retirement.py::test_values_without_an_exact_rowset_form_refuse_the_group` | 구현 |
+| DV-372 | 승격 명세·`dataset_sources`·도메인 행은 원천 참조로 센다 | `tests/storage/test_source_retirement.py::test_promotion_pins_and_rows_are_references` | 구현 |
+| DV-373 | 은퇴 request hash 형식은 고정 입력과 기대 값으로 고정돼 있다 | `tests/storage/test_source_retirement.py::test_retirement_request_hash_format_is_frozen` | 구현 |
+| DV-374 | 테이블을 지운 뒤 멈춘 은퇴는 quarantine되지 않고 recover가 기록까지 끝낸다 | `tests/storage/test_source_retirement.py::test_interrupted_retirement_is_finished_not_quarantined` | 구현 |
+| DV-375 | compact는 새 루트에서 같은 논리 검증을 통과하고 은퇴한 테이블의 공간을 회수한다 | `tests/storage/test_compaction.py::test_compaction_reclaims_retired_space_and_verifies_the_same` | 구현 |
+| DV-376 | 중단된 compact는 원래 설치본을 바꾸지 않고 새 루트를 미완료로 남긴다 | `tests/storage/test_compaction.py::test_interrupted_compaction_preserves_original` | 구현 |

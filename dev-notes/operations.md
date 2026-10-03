@@ -348,8 +348,8 @@ member instrument는 US identity 등록이 먼저 있어야 한다. `index`는 �
 원천 자료실 자료를 공급자별 시장 dataset으로 승격하는 명령(`aas data promote`), 원천 ID 연결
 (`aas db source-link`), core schema 업그레이드(`aas db migrate`), 원천 은퇴(`aas db source-retire`)와
 compact(`aas db compact`)의 계약은 [데이터 수직 계약](design/data-vertical.md)이 소유한다. 현재 CLI에는
-`aas db migrate`, `aas data promote`·`promotions`·`kr-prices`, `aas calendar refresh`, `aas import legacy`·`sec-companies`와 위
-[원본 자료 이전과 조회](#원본-자료-이전과-조회)의 `source-link`가 있다. 은퇴와 compact는 그 계약의 대응표 행이 `구현`이 될 때 이 절에 추가된다.
+`aas db migrate`, `aas data promote`·`promotions`·`kr-prices`, `aas calendar refresh`, `aas import legacy`·`sec-companies`,
+`aas db source-retire`·`compact`와 위 [원본 자료 이전과 조회](#원본-자료-이전과-조회)의 `source-link`가 있다.
 승격된 dataset을 읽는 소비자 경로(`read_heads`)가 연결되기 전까지 원천 자료의 연구 입력은 아래
 `register-*` 경로가 맡는다.
 
@@ -359,6 +359,9 @@ aas db migrate --to 2 --backup-output /path/to/other-device/new-backup
 aas data promote --spec /path/to/promotion.json --sha256 SHA256 --plan
 aas data promote --spec /path/to/promotion.json --sha256 SHA256
 aas data promotions
+aas db source-retire --spec /path/to/retirement.json --sha256 SHA256 [--backup /path/to/other-device/backup] --plan
+aas db source-retire --spec /path/to/retirement.json --sha256 SHA256 --backup /path/to/other-device/backup --apply
+aas db compact --to /path/to/new-root
 ```
 
 `promote --plan`은 설치본을 읽기 전용으로 열어 명세가 요청하는 승격을 끝까지 계산하고 아무것도
@@ -373,6 +376,22 @@ flag 분포, 시간 규칙별 null·상한 적용 수, op 분포, stale 행, 계
 기존 generation을 검증해 돌려주고, 중단된 승격은 같은 명령이나 `aas db recover`가 끝낸다. 승격은
 공급자를 호출하지 않으며, 설정된 공유 계산 예산이 있으면 그 예산 안에서 돈다. `promotions`는
 승격 intent마다 단계, generation, dataset version, 행 수, 명세 해시와 매퍼를 나열한다.
+
+`source-retire`는 `aas-source-retirement-v1` 문서의 group마다 참조, 동치 digest, 다른 장치 백업을 확인한다.
+`--plan`은 설치본을 읽기 전용으로 열고, `--backup` 없이도 group별 상태와 이유, 양쪽 행 수와 digest,
+원천별 참조 위치, 후보·은퇴 가능 행의 합계를 보고한다. 백업을 넘기면 그 백업의 모든 파일을 다시 해시하므로
+백업 크기만큼 시간이 걸린다. `--apply`는 v2 설치본에서 실행 중인 run이나 다른 PREPARED 작업이 없을 때
+증명을 통과한 group을 모두 은퇴하고 나머지를 이유와 함께 보고한다. 응답의 `retired`는 은퇴한 원천,
+`retired_rows`는 그 행 수, `operation_id`는 intent다. 같은 문서를 다시 실행하면 이미 은퇴한 group을
+`already_retired`로 보고한다. 중단된 은퇴는 같은 명령이나 `aas db recover`가 끝낸다. `raw/`의 bytes는 지우지
+않는다.
+
+`compact`는 설치본을 검증하고 새 루트에 저장소를 다시 써서 지운 테이블의 공간을 회수한 뒤 새 루트에서 같은
+검증 결과를 확인한다. 실행 중인 run, PREPARED 작업, orphan generation이 있으면 거부한다. 응답은 새 루트,
+검증 결과, 저장소별 이전·이후 크기다. 원래 설치본은 그대로 남으며, 결과를 확인한 뒤 `AAS_HOME`(또는
+`--home`)을 새 루트로 바꾸고 원래 파일은 별도 확인 뒤에 지운다. 실패하면 새 루트는 `restore-incomplete`로
+남으므로 새 경로로 다시 실행한다. 두 명령은 설정된 공유 계산 예산 안에서 돈다. 규칙은
+[원천 은퇴와 동치 증명](design/data-vertical.md#원천-은퇴와-동치-증명)이 소유한다.
 
 ALFRED vintage(`fred.alfred@1`)는 generation 하나에 관측마다 vintage를 하나만 담으므로 백필은 계약의
 [거시와 FX 매퍼](design/data-vertical.md#거시와-fx-매퍼)가 정한 vintage 구간마다 명세 하나를 만들어, 직전
@@ -556,8 +575,9 @@ market과 state를 각각 한 트랜잭션으로 올린 다음 설치 영수증�
    `aas data promote --plan`을 확인한 뒤 실행하고 generation마다 verify한다. 실패하면
    `aas db recover`로 게시만 재개한다. 공급자를 다시 호출하지 않는다.
 5. `[owner]` 승인된 수집기를 설정의 호출 상한과 함께 예약 실행으로 켠다.
-6. `aas db source-retire --plan`으로 은퇴 후보와 거부 이유를 확인하고 `--apply`로 증명을 통과한
-   원천을 일괄 은퇴한다. `aas db compact --to NEW_ROOT`와 deep verify 뒤 설정 경로를 바꾼다.
+6. `aas db source-retire --plan`으로 은퇴 후보와 거부 이유를 확인하고 2단계의 다른 장치 백업으로
+   `--apply`해 증명을 통과한 원천을 일괄 은퇴한다. `aas db compact --to NEW_ROOT`가 새 루트에서 검증을
+   통과하면 `AAS_HOME`을 새 루트로 바꾼다.
    설치본 밖 legacy 원본은 그 manifest의 `aas import legacy --verify`가 `complete`(미대조 파일 0 포함)이고
    종료 코드가 0일 때 그 항목 경로만 지운다.
 

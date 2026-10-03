@@ -35,6 +35,7 @@ from tests.storage.test_runs import BUDGET as RUN_BUDGET
 from tests.storage.test_runs import RESULT, intent, prepared
 
 _MIN_BACKUP_FILES = 5
+_MANY_RAW_FILES = 4000
 
 
 def seed_workspace(home: Path, *, lineage: LineageSpec | None = None) -> None:
@@ -522,3 +523,25 @@ def test_a_backup_missing_a_listed_file_says_so(tmp_path: Path) -> None:
     finally:
         duplicate.unlink()
     assert not (tmp_path / "restored-three").exists()
+
+
+def test_backup_manifest_beyond_the_configuration_bound_validates_and_restores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raw/ tree with thousands of files lists more than 1 MiB in backup.json."""
+    home = tmp_path / "aas"
+    initialize(home)
+    for number in range(_MANY_RAW_FILES):
+        directory = home / "raw" / f"{number % 256:02x}"
+        directory.mkdir(mode=0o700, exist_ok=True)
+        path = directory / (f"{number:06d}-" + "x" * 200)
+        path.write_bytes(str(number).encode())
+        path.chmod(0o600)
+    # Durability is not under test here; skipping fsync keeps thousands of copies fast.
+    monkeypatch.setattr(os, "fsync", lambda _descriptor: None)
+    result = backup(home, tmp_path / "backup")
+    assert (tmp_path / "backup" / "backup.json").stat().st_size > 1024 * 1024
+    assert int(str(result["files"])) > _MANY_RAW_FILES
+    restored = restore(tmp_path / "backup", tmp_path / "restored")
+    assert restored["restored"] is True
+    assert (tmp_path / "restored" / "raw" / "00" / ("000000-" + "x" * 200)).read_bytes() == b"0"

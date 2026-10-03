@@ -727,6 +727,8 @@ def encoded_cell_sql(name: str, rowset_type: str) -> str:
         )
     elif rowset_type == "float":
         body = f"unhex('06') || unhex(lpad(to_hex({float_bits_sql(column)}), 16, '0'))"
+    elif rowset_type == "bool":
+        body = f"unhex('07') || CASE WHEN {column} THEN unhex('01') ELSE unhex('00') END"
     else:
         raise ValueError(f"unsupported rowset type {rowset_type!r}")
     return f"(CASE WHEN {column} IS NULL THEN unhex('00') ELSE {body} END)"

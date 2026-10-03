@@ -350,6 +350,7 @@ def _recover_one(  # noqa: PLR0911 -- one route per operation kind
         recover_run_schema_migration,
     )
     from aegis_alpha.storage.runs import RUN_OPERATION_KIND  # noqa: PLC0415
+    from aegis_alpha.storage.source_library import RETIREMENT_KIND  # noqa: PLC0415
 
     kind = operation["kind"]
     if kind == "strategy_import":
@@ -372,6 +373,10 @@ def _recover_one(  # noqa: PLR0911 -- one route per operation kind
         return recover_run(workspace, operation, budget=budget)
     if kind == MIGRATION_KIND:
         return recover_run_schema_migration(workspace, operation)
+    if kind == RETIREMENT_KIND:
+        from aegis_alpha.storage.source_retirement import recover_retirement  # noqa: PLC0415
+
+        return recover_retirement(workspace, dict(operation))
     return False
 
 
@@ -446,6 +451,7 @@ def quarantine(workspace: Workspace, operation_id: str, reason: str) -> dict[str
     )
     from aegis_alpha.storage.run_schema import MIGRATION_KIND  # noqa: PLC0415
     from aegis_alpha.storage.runs import RUN_OPERATION_KIND  # noqa: PLC0415
+    from aegis_alpha.storage.source_library import RETIREMENT_KIND  # noqa: PLC0415
     from aegis_alpha.storage.state import get_operation, quarantine_operation  # noqa: PLC0415
 
     intent = get_operation(workspace.state, operation_id)
@@ -462,6 +468,14 @@ def quarantine(workspace: Workspace, operation_id: str, reason: str) -> dict[str
         # The same dead end for the core stores: a half-migrated installation can only
         # be finished by the command that started it.
         raise ValueError("a core schema migration is finished by aas db migrate")
+    if intent is not None and intent["kind"] == RETIREMENT_KIND:
+        from aegis_alpha.storage.source_retirement import (  # noqa: PLC0415
+            retirement_started,
+        )
+
+        # Tables already dropped have no record yet; only finishing the intent writes it.
+        if retirement_started(workspace, intent):
+            raise ValueError("a retirement whose tables are dropped must be recovered")
     if (
         workspace.market.execute(
             "SELECT 1 FROM market_generations WHERE operation_id=?", [operation_id]

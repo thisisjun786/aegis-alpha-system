@@ -15,7 +15,6 @@ and is independent of this one.
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
@@ -279,15 +278,6 @@ def _finish(workspace: Workspace, request_hash: str) -> None:
     complete_operation(workspace.state, MIGRATION_OPERATION, request_hash)
 
 
-def _manifest_sha256(root: Path) -> str:
-    from aegis_alpha.data.descriptor_tree import DescriptorTree  # noqa: PLC0415
-
-    with DescriptorTree.open_path(root) as tree:
-        return hashlib.sha256(
-            tree.read_bytes("backup.json", max_bytes=64 * 1024 * 1024)
-        ).hexdigest()
-
-
 def migrate_core_schema(
     home: Path,
     *,
@@ -302,7 +292,7 @@ def migrate_core_schema(
     manifest's SHA-256. A migration-incomplete installation is finished from its intent
     without a second backup, so ``backup_output`` is then not used.
     """
-    from aegis_alpha.storage.backup import backup_workspace  # noqa: PLC0415
+    from aegis_alpha.storage.backup import backup_workspace, manifest_sha256  # noqa: PLC0415
     from aegis_alpha.storage.workspace import open_workspace  # noqa: PLC0415
 
     _target(to_version)
@@ -327,7 +317,7 @@ def migrate_core_schema(
                 request_hash=request_hash,
                 target_id=workspace.installation_id,
                 expected_parent=_EXPECTED_PARENT,
-                payload_hash=_manifest_sha256(Path(backup_root)),
+                payload_hash=manifest_sha256(Path(backup_root)),
             )
         else:
             _quiet(workspace, excluding=MIGRATION_OPERATION)
