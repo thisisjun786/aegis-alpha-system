@@ -519,8 +519,10 @@ def _admit_source_metadata(workspace: Workspace, max_materialization_bytes: int)
 
 def admit_source_table(
     workspace: Workspace, source_id: str, table_name: str, *, max_materialization_bytes: int
-) -> None:
+) -> int:
     """Bound the existing source reader's metadata and complete table before it fetches.
+
+    Return the admitted estimate, so a caller holding several tables can charge them together.
 
     This SELECT-only capacity check is not content authentication: resolve_source
     remains the owner of exact SourcePin/intent/marker/table digest verification.
@@ -559,6 +561,7 @@ def admit_source_table(
     estimated += count * (2048 + 512 * len(sizes)) + 32 * size
     if estimated > max_materialization_bytes:
         raise ComputeResourceError("source table exceeds materialization budget")
+    return estimated
 
 
 def read_table(

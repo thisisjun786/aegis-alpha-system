@@ -165,6 +165,21 @@ def _strategy_parsers(commands: argparse._SubParsersAction[argparse.ArgumentPars
         show.add_argument(f"--{option}", required=True)
     show.add_argument("--requirements", type=Path, help="Pinned execution-requirements JSON file")
     show.add_argument("--requirements-sha256", help="SHA-256 of exact requirements file bytes")
+    promote = sub.add_parser(
+        "promote",
+        help="Register a retained source's strategy records as versioned definitions",
+    )
+    _home(promote)
+    promote.add_argument("--source", required=True, help="Source-library ID of the records")
+    promote.add_argument("--sha256", required=True, help="SHA-256 the source was imported with")
+    mode = promote.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--plan", action="store_true", help="Report the registration; write nothing")
+    mode.add_argument("--apply", action="store_true", help="Register the definitions")
+    definitions = sub.add_parser(
+        "definitions", help="List registered strategy definitions and their requirements"
+    )
+    _home(definitions)
+    definitions.add_argument("--id", help="Only this strategy ID")
 
 
 def _source_parsers(sub: argparse._SubParsersAction) -> None:
@@ -190,7 +205,7 @@ def _source_parsers(sub: argparse._SubParsersAction) -> None:
     mode.add_argument("--apply", action="store_true", help="Record the missing links")
 
 
-def execute(args: argparse.Namespace) -> dict[str, object]:
+def execute(args: argparse.Namespace) -> dict[str, object]:  # noqa: PLR0911 -- CLI routing
     import sqlite3
 
     import duckdb
@@ -216,6 +231,8 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             "migrate",
         }:
             return _maintenance(home, args)
+        if args.command == "strategy" and args.strategy_command == "promote":
+            return _strategy_promote(home, args)
         if args.command == "data" and args.data_command == "read-prices":
             from aegis_alpha.application.compute_cli import price_compute
             from aegis_alpha.application.data_cli import read_price_input
@@ -315,6 +332,24 @@ def _promote(home: Path, args: argparse.Namespace) -> dict[str, object]:
         open_workspace(home, writable=not args.plan) as workspace,
     ):
         return promote(workspace, raw, args.sha256, apply=not args.plan, budget=budget)
+
+
+def _strategy_promote(home: Path, args: argparse.Namespace) -> dict[str, object]:
+    """Plan (read-only) or apply one strategy registration under the shared compute budget."""
+    from aegis_alpha.application.compute_cli import price_compute
+    from aegis_alpha.storage.locks import private_directory, storage_lock_targets
+    from aegis_alpha.storage.paths import load_paths
+    from aegis_alpha.storage.strategy_registry import plan_registration, register_strategies
+    from aegis_alpha.storage.workspace import open_workspace
+
+    private_directory(home)
+    targets = storage_lock_targets(home, load_paths(home).stores())
+    run = register_strategies if args.apply else plan_registration
+    with (
+        price_compute(excluded_locks=targets) as budget,
+        open_workspace(home, writable=args.apply, strategy_write=args.apply) as workspace,
+    ):
+        return run(workspace, args.source, args.sha256, budget=budget)
 
 
 def _kr_prices(home: Path, args: argparse.Namespace) -> dict[str, object]:
@@ -418,6 +453,10 @@ def _strategy_command(workspace: Workspace, args: argparse.Namespace) -> dict[st
         return {"strategies": list_strategies(workspace.strategies)}
     if args.strategy_command == "show":
         return _show_definition(workspace.strategies, workspace.state, args)
+    if args.strategy_command == "definitions":
+        from aegis_alpha.storage.strategy_registry import list_definitions
+
+        return {"definitions": list_definitions(workspace.strategies, args.id)}
     from aegis_alpha.storage.strategy_import import register_strategy
 
     return register_strategy(
