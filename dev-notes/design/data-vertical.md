@@ -145,7 +145,7 @@ run 누적 최근 날짜 캐시이므로 part 목록과 대조하지 않고 데�
 | 분류 | 파일 | 처리 |
 | --- | --- | --- |
 | 단위 | 어떤 단위의 파일 목록에 있는 파일 | 원천 ID에 들어가고 `raw/`에 보존된다 |
-| 보존 | loader가 단위를 찾으려고 읽은 색인 파일(내보내기 계획·acquisition, 지수 구성 계획, 다른 family의 batch result)과 `retain` 패턴에 맞는 파일 | 테이블 없이 bytes 그대로 `raw/`에 보존되고 `--verify`가 다시 확인한다 |
+| 보존 | loader가 단위를 찾으려고 읽은 색인 파일(내보내기 계획·acquisition, 지수 구성 계획, 다른 family의 batch result)과 `retain` 패턴에 맞는 파일 | bytes 그대로 `raw/`에 보존되고 항목의 보존 목록 원천에 경로와 함께 기록되며 `--verify`가 다시 확인한다 |
 | 제외 | `exclude` 패턴에 맞는 파일 | 편입하지 않는다는 운영자의 기록. 수와 bytes를 보고한다 |
 | 미대조 | 그 밖의 파일 | 수, bytes, 앞의 경로 20개를 `uncovered`로 보고한다 |
 
@@ -153,9 +153,16 @@ run 누적 최근 날짜 캐시이므로 part 목록과 대조하지 않고 데�
 제외 순으로 먼저 맞는 것을 따른다. 단위 밖 형제 디렉터리의 파일(재사용 CSV, SEC 영수증)은 단위가 나열한 파일만
 보존되며 그 디렉터리의 나머지 파일은 대조하지 않는다.
 
+보존 파일이 있는 항목은 보존 목록 원천 하나를 가진다. 보존 목록 문서 `aas-legacy-retained-v1`은 항목 이름,
+loader, 보존 파일마다 `[상대 경로, SHA-256, 크기, 이유]`(이유는 `index` 또는 `retain`, 경로순)를 담은 정규 JSON이며
+`raw/`에 보존된다. 이 문서와 모든 보존 파일이 원천 ID `legacy-retained-files-<hex>`의 원본이고, 테이블
+`retained_files`(`path`, `sha256`, `size_bytes`, `reason`)가 문서의 행을 그대로 싣는다. 경로가 문서에 들어가므로
+같은 bytes라도 경로가 다르면 다른 원천이다. 항목 경로를 지운 뒤에도 설치본은 보존 경로마다 bytes를 찾아 준다.
+
 `--verify`는 설치본을 읽기 전용으로 열고 계획을 원본에서 다시 계산한 뒤, 계획한 원천마다 commit이 완료됐고
 테이블 이름·행 수·digest가 같고 저장된 테이블을 다시 해시해도 그 행 수·digest이며 `sl:` 연결이 유도와 같고 연결된 원본이 `raw/`에서 다시 해시해 맞는지,
-보존 파일마다 `raw/` 사본이 다시 해시해 맞는지 확인한다. 그렇지 않은 원천·보존 파일과 거부된 단위는
+보존 파일마다 `raw/` 사본이 다시 해시해 맞는지, 보존 목록 원천이 같은 방식으로 commit·연결됐는지 확인한다.
+그렇지 않은 원천·보존 파일과 거부된 단위는
 `unmatched`로 센다. `unmatched`가 0이고 `reconciled`가 참이며 미대조 파일이 0이면 `complete`다. 설치본 밖
 legacy 원본은 `complete`인 manifest의 항목 경로만 지울 수 있다. 항목 경로가 아닌 디렉터리(형제 수집 디렉터리,
 내보내기 상위 디렉터리)는 그 자체를 항목으로 대조하기 전에는 지우지 않는다. CLI는 `--verify`가 `complete`가
@@ -1072,3 +1079,5 @@ state v2:
 | DV-140 | SEC 매퍼는 zip 하나를 보존한 `sec-submissions-zip-*` 내용 원천만 읽는다 | `tests/storage/test_us_identity.py::test_only_an_sec_submissions_zip_source_is_read` | 구현 |
 | DV-141 | 이미 정정된 등록 US 주장은 이번 원천이 내지 않아도 `withdrawn`에 들지 않는다 | `tests/storage/test_us_identity.py::test_a_corrected_registered_claim_is_not_reported_withdrawn` | 구현 |
 | DV-142 | `scripts/us_identity_report.py`는 market 파일만 읽기 전용으로 열어 bulk·격리 행의 US 해석을 이유별로 보고한다 | `tests/storage/test_us_identity.py::test_the_report_script_resolves_bulk_and_quarantined_us_rows` | 구현 |
+| DV-143 | legacy 항목의 보존 파일은 경로·SHA-256·크기·이유를 담은 보존 목록 원천으로 commit되고, 목록 원천이 없거나 연결된 보존 bytes가 없으면 `--verify`가 `unmatched`로 센다 | `tests/storage/test_legacy_import.py::test_uncovered_files_keep_verify_incomplete` | 구현 |
+| DV-144 | 압축 해제가 깨진 SEC member나 지수 구성 gzip은 그 단위를 이유와 함께 거부하고 나머지 계획은 이어진다 | `tests/storage/test_legacy_import.py::test_sec_archive_refuses_a_corrupt_deflate_stream` | 구현 |

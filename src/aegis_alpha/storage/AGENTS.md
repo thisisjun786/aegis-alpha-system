@@ -81,6 +81,8 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   `OriginalBytes` for a plan). Values stay the original text or JSON; a unit whose bytes
   contradict their own index is refused, never repaired. Every file below an entry root is a
   unit file, a retained index or `retain` file, an `exclude` file, or reported as uncovered.
+  An entry's retained files are named by one `legacy-retained-files-*` inventory source
+  (path, SHA-256, size, reason), so their paths survive deleting the entry root.
   `--plan` opens no installation and writes nothing; `--verify` re-derives the plan, and its
   `complete` (zero unmatched, reconciled, zero uncovered) is the precondition for deleting an
   entry root outside the store. A new format is a new loader with its own synthetic test.

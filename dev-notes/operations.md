@@ -367,7 +367,10 @@ authority)을 `raw/`에 보존하고 원천 자료실의 내용 원천으로 com
 다시 실행하면 commit된 원천을 재사용한다. 중단되면 같은 명령을 다시 실행한다. `--verify`는 설치본을
 읽기 전용으로 열어 계획한 원천과 보존한 색인 파일이 모두 완료·동일·연결됐고 `raw/`의 원본이 온전한지 확인한다.
 보고는 항목마다 어떤 단위도 덮지 않는 파일을 `uncovered`(수, bytes, 앞의 경로)로 싣는다. 남길 파일은 manifest
-항목의 `retain` 패턴으로 `raw/`에 보존하고, 버려도 되는 파일은 `exclude` 패턴으로 기록한다. `complete`는
+항목의 `retain` 패턴으로 `raw/`에 보존하고, 버려도 되는 파일은 `exclude` 패턴으로 기록한다. 보존 파일의 경로와
+해시는 항목의 `legacy-retained-files-*` 원천(`retained_files` 테이블)에 남으므로 항목 경로를 지운 뒤에도
+원천 자료실 테이블에서 경로로 찾을 수 있다. Norgate 내보내기 항목의 `batch-NNN/history/checkpoints/*.json`과
+최상위 수집 기록처럼 loader가 읽지 않는 파일은 `retain`이나 `exclude`로 기록하기 전까지 `uncovered`다. `complete`는
 `unmatched`가 0이고 `reconciled`가 참이며 `uncovered`가 0일 때만 참이고, 그때만 그 manifest의 항목 경로를 지울 수
 있다. 항목 경로가 아닌 디렉터리는 지우지 않는다. `--verify`가 `complete`가 아니거나 `--plan`·실행이
 `reconciled`가 아니면 보고를 출력하고 종료 코드 1로 끝나므로 스크립트는 종료 코드를 삭제 조건으로 쓴다. 원본 bytes는 `raw/`로 복사되므로 원본
@@ -418,7 +421,8 @@ market과 state를 각각 한 트랜잭션으로 올린 다음 설치 영수증�
 1. `[owner]` 예약 수집을 멈추고 새 루트 복원본에서 전 과정을 먼저 실행해 시간·메모리·verify를 기록한다.
 2. `[owner]` 다른 장치에 `aas db backup`을 만들고 백업 ID를 기록한다.
 3. `aas db migrate --to 2 --backup-output DIR`, 이어서 `aas db source-link --apply`. legacy 원본은
-   `aas import legacy --plan`의 `reconciled`를 확인한 뒤 실행하고 `--verify`로 `complete`를 확인한다.
+   `aas import legacy --plan`의 `reconciled`를 확인하고, `[owner]` 항목마다 `uncovered` 파일을 manifest의
+   `retain`·`exclude`로 기록한 뒤 실행하고 `--verify`로 `complete`를 확인한다.
 4. `aas calendar refresh --plan`을 확인하고 실행해 달력 generation을 먼저 만든다. 이어서 명세마다
    `aas data promote --plan`을 확인한 뒤 실행하고 generation마다 verify한다. 실패하면
    `aas db recover`로 게시만 재개한다. 공급자를 다시 호출하지 않는다.
