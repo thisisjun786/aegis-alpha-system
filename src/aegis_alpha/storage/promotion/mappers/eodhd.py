@@ -36,7 +36,8 @@ class EodhdBars:
     major: Final = 1
     provider: Final = "eodhd"
     domain: Final = "prices"
-    partition_column: Final = "date"
+    partition_date: Final = '"date"'
+    expands: Final = False
     date_column: Final = "session_date"
     time_inputs: Final[Mapping[str, InputKind]] = {"session_date": "date"}
 
@@ -64,6 +65,9 @@ class EodhdBars:
     def identity(self, args: Mapping[str, object]) -> IdentityKey:
         del args
         return IdentityKey("eodhd", "eodhd_symbol")
+
+    def outcome(self, args: Mapping[str, object]) -> None:
+        del args
 
     def select(self, source: str, args: Mapping[str, object]) -> str:
         zone = sql_literal(str(args["timezone"]))

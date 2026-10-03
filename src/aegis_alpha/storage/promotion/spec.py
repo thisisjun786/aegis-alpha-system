@@ -291,10 +291,21 @@ def _mapper(value: object, domain: str) -> tuple[str, Mapper, dict[str, object]]
 
 
 def _identity(
-    value: object, found: Mapper, args: Mapping[str, object], *, instruments: bool
+    value: object, found: Mapper, args: Mapping[str, object], *, instrument: str | None
 ) -> IdentityPin | None:
-    if instruments != (value is not None) or instruments != (found.identity(args) is not None):
-        raise ValueError("an instrument domain pins an identity snapshot; others pin none")
+    """The snapshot pin a mapper with an identity key needs; others pin none.
+
+    ``instrument`` is the domain's ``instrument_id`` type, if it has one. A required
+    instrument needs an identity key; an optional one (fundamentals) may go without.
+    """
+    resolves = found.identity(args) is not None
+    if resolves != (value is not None) or (instrument == "VARCHAR" and not resolves):
+        raise ValueError(
+            "a mapper that resolves instruments pins an identity snapshot; others pin none, "
+            "and a domain that requires an instrument needs a mapper that resolves one"
+        )
+    if resolves and instrument is None:
+        raise ValueError("a domain without instruments cannot resolve them")
     if value is None:
         return None
     item = _object(value, {"snapshot_id", "content_hash"}, "identity_snapshot")
@@ -340,7 +351,7 @@ def parse_spec(raw: bytes, sha256: str) -> PromotionSpec:
         conversions[column] = decimal_rules.check_column(
             _text(name, "decimal rule"), column, numeric[column], domain=domain
         )
-    pin = _identity(body["identity_snapshot"], found, args, instruments="instrument_id" in kinds)
+    pin = _identity(body["identity_snapshot"], found, args, instrument=kinds.get("instrument_id"))
     return PromotionSpec(
         raw=raw,
         sha256=sha256,

@@ -9,12 +9,21 @@ resolution, decimal and time rules, record and revision identity, head diff, fla
 ``select`` returns one SELECT over the source relation with these columns:
 
 - ``_aas_pin``, ``_aas_ordinal``, ``_aas_row_hash`` passed through unchanged;
+- ``_aas_item`` (BIGINT) when the mapper ``expands``: one source row (a provider response
+  document) holds several domain rows, numbered distinctly within that source row, and a
+  source row may yield none;
 - ``_aas_ingested_at_us`` (BIGINT, NULL when the source row has no collection time);
 - ``_aas_id_token`` (VARCHAR) and ``_aas_id_at_us`` (BIGINT) when the domain names an
   instrument: the identity key token and the instant at which it is resolved;
 - every domain column except ``instrument_id`` (and ``fields`` when the mapper emits it),
   with each numeric column left as its raw source value for the spec's decimal rule;
 - one ``_aas_t_<name>`` column per time input the mapper declares.
+
+A domain whose ``instrument_id`` is optional (fundamentals, filings) may be mapped
+without an identity key; its rows then name no instrument. A mapper whose source rows
+are responses rather than facts declares an ``outcome`` over a staged source row
+(completed, no data, failed, ...), which the promotion records as coverage in place of
+rows that a response without data cannot give.
 """
 
 from __future__ import annotations
@@ -48,8 +57,13 @@ class Mapper(Protocol):
     def domain(self) -> str: ...
 
     @property
-    def partition_column(self) -> str:
-        """The source DATE column a spec partition and the record date come from."""
+    def partition_date(self) -> str:
+        """SQL over the source columns: the DATE a spec partition selects source rows by."""
+        ...
+
+    @property
+    def expands(self) -> bool:
+        """Whether one source row maps to any number of rows numbered by ``_aas_item``."""
         ...
 
     @property
@@ -74,14 +88,27 @@ class Mapper(Protocol):
 
     def identity(self, args: Mapping[str, object]) -> IdentityKey | None: ...
 
+    def outcome(self, args: Mapping[str, object]) -> str | None:
+        """SQL over a staged source row naming its outcome for coverage, or None."""
+        ...
+
     def select(self, source: str, args: Mapping[str, object]) -> str: ...
 
 
 def _registry() -> dict[str, Mapper]:
     from aegis_alpha.storage.promotion.mappers.calendar import CalendarDeclared  # noqa: PLC0415
+    from aegis_alpha.storage.promotion.mappers.dart import (  # noqa: PLC0415 -- registry
+        DartFnltt,
+        DartFnlttFilings,
+    )
     from aegis_alpha.storage.promotion.mappers.eodhd import EodhdBars  # noqa: PLC0415 -- registry
 
-    mappers: tuple[Mapper, ...] = (CalendarDeclared(), EodhdBars())
+    mappers: tuple[Mapper, ...] = (
+        CalendarDeclared(),
+        DartFnltt(),
+        DartFnlttFilings(),
+        EodhdBars(),
+    )
     return {f"{mapper.name}@{mapper.major}": mapper for mapper in mappers}
 
 

@@ -40,7 +40,8 @@ class CalendarDeclared:
     major: Final = 1
     provider: Final = "calendar"
     domain: Final = "calendar_sessions"
-    partition_column: Final = "session_date"
+    partition_date: Final = '"session_date"'
+    expands: Final = False
     date_column: Final = "session_date"
     time_inputs: Final[Mapping[str, InputKind]] = {"public_by": "utc_us"}
 
@@ -68,6 +69,9 @@ class CalendarDeclared:
         return {}
 
     def identity(self, args: Mapping[str, object]) -> None:
+        del args
+
+    def outcome(self, args: Mapping[str, object]) -> None:
         del args
 
     def select(self, source: str, args: Mapping[str, object]) -> str:

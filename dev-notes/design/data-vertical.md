@@ -186,7 +186,7 @@ DuckDB 안에서 흐르고 Python으로 통째로 올라오지 않는다. 엄격
 | `decimal_rule` | 매퍼가 내는 숫자 열마다 `id@version` 하나 |
 | `quality_rules` | `rule`(`id@version`)과 `args`의 목록. 같은 규칙은 한 번만 쓴다 |
 | `tombstone_policy` | `{"mode": "never"}`, 또는 `absent_in_full_snapshot`과 전체 snapshot인 pin 하나(`source`: `source_id`, `table`), 그것이 빠짐없이 담는 범위(`scope`: instrument ID 목록 또는 모든 instrument인 null, `from`·`to` 날짜 구간). 범위는 `partition` 안에 있다. 부재는 그 snapshot의 행으로만 판단하고, 다른 pin의 행이 범위 안에 있으면 계획이 거부하므로 그 행은 별도 generation으로 승격한다 |
-| `identity_snapshot` | instrument를 해석한 identity snapshot pin(`snapshot_id`, `content_hash`). instrument가 없는 도메인(거시·FX·달력)은 null |
+| `identity_snapshot` | instrument를 해석한 identity snapshot pin(`snapshot_id`, `content_hash`). instrument를 해석하지 않는 매퍼(거시·FX·달력, 발행인 단위의 재무·공시)는 null |
 
 `request_hash = sha256(정규 JSON ["aas-promotion-request-v1", 명세 SHA-256, 원천 digest 목록, parent])`다.
 그 정규 JSON 요청 문서도 `raw/`에 보존한다. generation ID는 `prm-<request_hash>`, intent의 operation
@@ -207,7 +207,8 @@ ID는 `promotion:<request_hash>`, dataset version은 그 generation의 chain seq
 flag → 대량 게시 계획이다. 원천 확인은 pin한 테이블마다 완료된 commit과 테이블 digest를 다시
 계산해 대조한다. `--plan`은 같은 계산을 하고 아무것도 쓰지 않는다. 읽기 전용으로 연 설치본에서
 돌며, 계산에 쓰는 것은 그 연결의 임시 테이블뿐이다. 보고는 원천 행 수, 행 상태(`ok`, `held`,
-`unresolved`, `ambiguous`, `refused_*`), 미해결 token 표본, 해석 전 매핑 행 전체의 숫자 flag 분포,
+`unresolved`, `ambiguous`, `refused_*`), 매핑 행 수, 원천 행의 결과 분포(`source_outcomes`, 아래 매퍼 절),
+미해결 token 표본, 해석 전 매핑 행 전체의 숫자 flag 분포,
 시간 규칙별 null·상한 적용 수, 반복된 자연키, op 분포, 변하지 않은 행과 stale 행 수,
 head와 시점이 다르게 계산되는 변하지 않은 행 수(`time_drift`), delta의 flag 분포, 계획한 marker를 담는다.
 
@@ -222,13 +223,15 @@ schema v2, 원천의 `sl:` 연결, 등록되지 않은 identity snapshot). `refu
 state 카탈로그를 한 트랜잭션으로 쓰고 intent를 완료한다. 카탈로그는 `datasets`(owner `promotion`),
 `dataset_versions`(`manifest_hash`는 marker의 request hash, `transform_hash`는 명세 해시,
 `normalizer_version`은 매퍼 `name@major`, `identity_snapshot_hash`, `coverage`는 partition), 원천마다
-`dataset_sources`의 `sl:` 행, `quality_checks`의 `promotion_report@1` 행(op·행 상태·flag 수), 그리고
+`dataset_sources`의 `sl:` 행, `quality_checks`의 `promotion_report@1` 행(op·행 상태·flag 수, 결과를 선언한
+매퍼면 원천 행의 결과 분포), 그리고
 (매퍼 공급자, dataset, partition)마다 delta의 가장 늦은 `ingested_at_us`까지 앞으로만 가는 `watermarks`다.
 `committed_version`은 그 시각까지 처음 나아간 version이며, 시각을 넘지 못한 정정 generation은 바꾸지 않는다.
 
 승격 manifest(`aas-promotion-manifest-v1`, 정규 JSON)는 요청·명세 해시, marker의 dataset·version·
 generation·parent·sequence·delta hash·chain hash·행 수, op 분포, 행 상태 수, flag 행의 rowset digest와
-수, 원천 pin과 identity pin을 담는다. 중단된 승격은 같은 명령을 다시 실행하거나 `aas db recover`로
+수, 원천 pin과 identity pin을 담는다. 결과를 선언한 매퍼의 승격 manifest는 원천 행의 결과 분포
+(`source_outcomes`)도 담고, 다른 매퍼의 manifest에는 그 키가 없다. 중단된 승격은 같은 명령을 다시 실행하거나 `aas db recover`로
 끝낸다. market에 commit된 generation이 있으면 manifest와 대조해 카탈로그만 쓰고, 없으면 보존한
 명세로 다시 계산해 manifest가 intent의 payload hash와 정확히 같을 때만 게시한다. 다시 계산한 결과가
 다르면 intent는 PREPARED로 남고 `aas db quarantine`의 대상이 된다. 중단된 요청의 `--plan`은 아무것도
@@ -246,10 +249,22 @@ fixture와 독립 기대값으로 검증한다. 원천 행 해시, identity 해�
 revision 정체성, head 비교, flag는 매퍼가 아니라 승격 엔진(`storage/promotion/engine.py`)이 모든
 매퍼에 같게 적용한다.
 
-매퍼의 relation은 원천 행 위치와 해시를 그대로 넘기고, 행의 수집 시각(없으면 null), instrument
-도메인이면 identity token과 그 token을 해석할 시각, `instrument_id`를 뺀 도메인 열, 원천 값 그대로의
-숫자 열, 선언한 시간 입력 열을 낸다. 매퍼는 원천 열 이름과 허용 타입, 숫자 열의 원천 타입, identity
-assertion key(provider, namespace), 파티션 날짜 열, tombstone 범위가 쓰는 도메인 날짜 열을 선언한다.
+매퍼의 relation은 원천 행 위치와 해시를 그대로 넘기고, 행의 수집 시각(없으면 null), instrument를
+해석하는 매퍼면 identity token과 그 token을 해석할 시각, `instrument_id`를 뺀 도메인 열, 원천 값
+그대로의 숫자 열, 선언한 시간 입력 열을 낸다. 매퍼는 원천 열 이름과 허용 타입, 숫자 열의 원천 타입,
+identity assertion key(provider, namespace), 원천 열에 대한 파티션 날짜 SQL, tombstone 범위가 쓰는 도메인
+날짜 열을 선언한다.
+
+- 원천 행 하나가 공급자 응답 문서 하나이면 그 행은 도메인 행을 여럿 담거나 하나도 담지 않는다. 그런
+  매퍼는 펼침(`expands`)을 선언하고 원천 행 안에서 서로 다른 번호 `_aas_item`을 낸다. 펼치지 않는 매퍼의
+  행은 원천 행마다 많아야 하나이고 번호는 0이다. 엔진은 매핑 행을 (pin, 원천 위치, 번호)로 구별하고 한
+  원천 행 안의 번호가 겹치면 매퍼 오류로 거부한다. 펼친 행은 모두 그 원천 행의 `source_row_hash`를 가진다.
+- 원천 행이 사실이 아니라 응답인 매퍼는 원천 행의 결과(`outcome`, 예: 완료·자료 없음·실패)를 SQL로
+  선언한다. 엔진은 결과별 원천 행 수를 보고와 manifest, `promotion_report@1` 품질 검사에 남긴다. 자료가
+  없다는 응답은 행을 만들지 않고 이 결과 분포로만 기록된다.
+- `instrument_id`가 선택인 도메인(재무, 공시)은 identity key가 없는 매퍼로 승격할 수 있고 그 행의
+  instrument는 null이다. `instrument_id`가 필수인 도메인은 instrument를 해석하는 매퍼만 쓴다. 명세는
+  해석하는 매퍼에만 identity snapshot을 pin한다.
 
 `source_row_hash`는 원천 행 내용의 해시다.
 
@@ -280,10 +295,13 @@ ICU 시간대 자료로 푼 값이고, `timezone_version`은 그 자료를 가�
 시각이 그 날짜 안에서 개장이 먼저여야 하고 휴장 행은 둘 다 비어야 하며, 그 밖의 행은 `status`가 비어
 필수 열 누락으로 거부된다. 시간 입력은 `public_by` 하나다.
 
+`dart.fnltt@1`과 `dart.fnltt_filings@1`은 [DART 재무제표 응답](#dart-재무제표-응답)을 발행인 단위
+`fundamentals`와 `filings`로 옮긴다.
+
 예정된 매퍼 목록: `norgate.prices_none`, `norgate.prices_adjusted`,
 `norgate.dividends`, `norgate.index_membership`, `norgate.reference_series`,
 `fmp.actions`, `sec.submissions`, `sec.companyfacts`,
-`dart.fnltt`, `dart.list`, `fred.alfred`, `fx.series`. identity 원천을 읽는 매퍼는 typed generation이
+`dart.list`, `fred.alfred`, `fx.series`. identity 원천을 읽는 매퍼는 typed generation이
 아니라 등록 문서를 만든다. `eodhd.kr_symbol`, `kind.listings`, `dart.corp_codes`는
 [KR 등록](#kr-등록)이, `norgate.master`, `eodhd.us_symbol`, `fmp.profile`, `sec.tickers`는
 [US 등록](#us-등록)이 소유한다.
@@ -332,7 +350,7 @@ TOMBSTONE의 `source_row_hash`는 `sha256(정규 JSON ["aas-tombstone-v1", sourc
 곧 그 행이 없다는 사실을 담은 원천 테이블의 증거다. TOMBSTONE의 시점은 아래
 [revision 시점](#revision-시점)이 정한다. 같은 명세를 두 번 승격하면 두 번째 delta는 비어 있다.
 
-`revision_id`, `source_row_hash`, TOMBSTONE 해시, `request_hash`, `source_id`의 형식은 고정 입력과
+`revision_id`, `source_row_hash`, TOMBSTONE 해시, `request_hash`, `source_id`, `dimensions_hash`의 형식은 고정 입력과
 기대 16진수 값으로 각각 고정한다. 형식을 바꾸려면 새 이름(`-v2`)을 쓴다. 매퍼가 DuckDB SQL로 내는
 `source_row_hash`는 같은 행의 Python 계산과 같아야 한다.
 
@@ -569,9 +587,9 @@ KRX 토요일 session은 확인되지 않은 반일 마감 대신 평일 마감�
 | `sessions.xnys`, `sessions.xkrx` | `calendar_sessions` | [선언 달력](#선언-달력) 문서. 관측 거래일은 대조 보고의 근거. 임시 휴장은 SUPERSEDE |
 | `actions.us.norgate`, `actions.us.fmp.ref`, `actions.{us,kr}.eodhd` | `corporate_actions` | `exdate_open@1` |
 | `status.us.norgate`, `status.kr.kind` | `instrument_status` | 상장·상폐 이력 |
-| `filings.us.sec`, `filings.kr.dart` | `filings`(v2) | SEC submissions(`source_column@1`), DART 공시 목록(`local_day_end@1`) |
+| `filings.us.sec`, `filings.kr.dart` | `filings`(v2) | SEC submissions(`source_column@1`). DART는 재무제표 응답의 접수번호(`dart.fnltt_filings@1`)와 공시 목록, 둘 다 `local_day_end@1`(접수일) |
 | `fundamentals.us.sec` | `fundamentals` | companyfacts. 시점은 accession으로 조인한 `filings.accepted_at_us`, 조인 실패 시 `local_day_end(filed)` 또는 null. 재공시는 SUPERSEDE |
-| `fundamentals.kr.dart` | `fundamentals` | 재무제표 응답. 연결·별도는 dimensions. 자료 없음 응답은 행 대신 coverage 기록 |
+| `fundamentals.kr.dart` | `fundamentals` | 재무제표 응답(`dart.fnltt@1`). 발행인 단위, 연결·별도는 dimensions, 시점은 `local_day_end@1`(접수일). 자료 없음 응답은 행 대신 결과 분포로 기록 |
 | `macro.us.alfred` | `macro_observations` | ALFRED vintage. known은 `local_day_end@1(realtime_start)` |
 | `macro.kr.bok`, `macro.kr.oecd` | `macro_observations` | vintage가 없어 known은 null |
 | `fx.usdkrw.norgate`, `fx.usdkrw.fred` | `fx_rates` | 우선순위는 소비자 pin |
@@ -582,6 +600,60 @@ identity 원천(Norgate master, SEC submissions, FMP profile, DART 고유번호,
 
 dataset의 백필은 연도 단위 generation, 이후 유지보수는 세션 단위(재무는 일 단위) generation으로
 게시한다.
+
+## DART 재무제표 응답
+
+OpenDART 단일회사 전체 재무제표(`fnlttSinglAcntAll`) 응답은 원천 자료실의 DART receipt 테이블에
+요청 하나가 한 행으로 들어 있다. 행은 `endpoint`, `outcome`, `request_json`(그 `parameters_json`이
+`corp_code`, `bsns_year`, `reprt_code`, `fs_div`를 싣는다), 응답 bytes `raw_base64`와 그 `raw_sha256`,
+수집 시각 `retrieved_at_utc`를 가진다. `dart.fnltt@1`과 `dart.fnltt_filings@1`은 이 행을 같은 규칙으로 읽는다.
+
+- 행의 결과는 `completed`(완료된 `financials` 요청이고 응답 bytes가 UTF-8이며 그 SHA-256이 기록과 같고,
+  공급자 상태 `000`과 비어 있지 않은 `list`를 가진 JSON), `no_data`, `failed`, `other_endpoint`(같은 테이블의
+  고유번호 목록), `unreadable`(완료됐다는 `financials` 응답이 위 검사 중 하나라도 통과하지 못함),
+  `unknown_outcome`이다. `completed`만 행을 만든다. `unreadable`·`unknown_outcome`은 issuer가 비어 있는
+  행 하나가 되어 필수 열 누락으로 승격 전체를 거부하므로, 손상된 응답이 조용히 빠지지 않는다.
+- issuer는 요청의 8자리 `corp_code`로 발급한 `mint_issuer('dart_corp_code', corp_code)`다. 응답 줄의
+  회사·사업연도·보고서 코드가 요청과 다르면 issuer가 없어 거부된다. instrument는 해석하지 않는다.
+- 공시는 응답 줄의 14자리 접수번호 `rcept_no`다. 앞 여덟 자리가 한국 날짜의 접수일이고 그것이
+  `filed_date`이자 유일한 시간 입력이다. 두 시점 열은 `local_day_end@1`(Asia/Seoul, 근거 `revision`)이다.
+  OpenDART는 한 보고서의 가장 늦은 공시(정정 포함)의 재무제표로 답하므로, 접수번호는 그 행의 값을 실은
+  공시를 가리킨다. `form`은 OpenDART 보고서 코드(`11011` 사업, `11012` 반기, `11013` 1분기, `11014` 3분기)다.
+- 명세 파티션은 요청의 사업연도로 원천 행을 고른다. 파티션 날짜는 `bsns_year`의 1월 1일이다.
+
+`dart.fnltt@1`은 응답 줄과 그 줄이 싣는 금액 필드마다 `fundamentals` 행 하나를 낸다. 당기 금액
+`thstrm_amount`는 언제나, 당기 누적 금액 `thstrm_add_amount`는 필드가 있을 때만이다. 전기 비교 금액
+(`frmtrm_*`, `bfefrmtrm_*`)은 원천에 남는다.
+
+| 열 | 값 |
+| --- | --- |
+| `concept` | DART가 쓴 `account_id` 그대로. 표준 계정이 없는 줄은 `-표준계정코드 미사용-` |
+| `fiscal_period` | 보고서 구간 `FY`·`H1`·`Q1`·`Q3`(당기 금액), 그 뒤에 `-cumulative`(당기 누적 금액) |
+| `period_end` | `bsns_year`에서 보고서 구간의 명목 종료일(`03-31`, `06-30`, `09-30`, `12-31`) |
+| `period_start` | null |
+| `unit` | 줄의 통화 코드 |
+| `dimensions_hash` | `aas-dimensions-v1`(`fs_div`, `sj_div`, `account_nm`, `account_detail`, `ord`, `rcept_no`) |
+| `form`, `accession` | 보고서 코드, 접수번호. `accepted_at_us`는 null |
+| `value`, `value_state` | 십진수 금액은 `present`이고 `decimal_text@1`로 옮긴다. 빈 필드는 `missing`, 그 밖의 텍스트는 값 없이 `invalid` |
+
+DART 응답은 기간 날짜를 싣지 않는다. 명목 종료일은 12월 결산 발행인에게는 실제 종료일이고 그 밖의
+발행인에게는 구간의 이름표이며, 매퍼는 결산월을 추정하지 않는다. 한 재무제표 안에서도 같은 계정과
+이름이 되풀이되므로 줄 순서 `ord`가 줄의 일부이고, 공시마다 그 줄들이 따로 record다. 정정 공시는 이전
+공시의 어느 줄을 고친 것인지 추정하지 않고 자기 접수번호 아래에 record를 더하며, 이전 공시의 값은 그
+공시의 사실로 남는다.
+
+```text
+dimensions_hash = sha256(정규 JSON ["aas-dimensions-v1", {이름: 텍스트, ...}])
+```
+
+차원 이름은 정렬된 키이고 값은 텍스트다. 값 하나라도 알 수 없으면 해시가 null이 되어 행이 필수 열
+누락으로 거부된다. 엔진처럼 매퍼도 이 해시를 SQL로 계산하며, SQL의 JSON 문자열 표기는 `json.dumps`의
+ASCII escape와 바이트까지 같다.
+
+`dart.fnltt_filings@1`은 완료된 응답마다 `filings` 행 하나를 낸다. 응답의 접수번호와 `form`,
+`filed_date`이고 `accepted_at_us`와 `period_end`는 응답이 말하지 않으므로 null이다. 줄마다 접수번호가
+다른 응답은 issuer가 없어 거부된다. 한 공시의 연결·별도 응답 두 개는 자연키가 겹쳐 한 generation에서
+거부되고, 따로 승격하면 두 번째는 변하지 않은 행이다.
 
 ## identity 등록과 chunked 문서
 
@@ -1081,3 +1153,13 @@ state v2:
 | DV-142 | `scripts/us_identity_report.py`는 market 파일만 읽기 전용으로 열어 bulk·격리 행의 US 해석을 이유별로 보고한다 | `tests/storage/test_us_identity.py::test_the_report_script_resolves_bulk_and_quarantined_us_rows` | 구현 |
 | DV-143 | legacy 항목의 보존 파일은 경로·SHA-256·크기·이유를 담은 보존 목록 원천으로 commit되고, 목록 원천이 없거나 연결된 보존 bytes가 없으면 `--verify`가 `unmatched`로 센다 | `tests/storage/test_legacy_import.py::test_uncovered_files_keep_verify_incomplete` | 구현 |
 | DV-144 | 압축 해제가 깨진 SEC member나 지수 구성 gzip은 그 단위를 이유와 함께 거부하고 나머지 계획은 이어진다 | `tests/storage/test_legacy_import.py::test_sec_archive_refuses_a_corrupt_deflate_stream` | 구현 |
+| DV-145 | `dart.fnltt@1`은 합성 원천 fixture를 독립 기대값과 같은 발행인 재무 행으로 옮기고, 자료 없음·실패·다른 endpoint는 행을 만들지 않으며 손상된 응답과 요청과 다른 줄은 issuer 없이 남긴다 | `tests/storage/test_promotion_mappers.py::test_dart_fnltt_maps_synthetic_fixture` | 구현 |
+| DV-146 | `dart.fnltt_filings@1`은 완료된 응답마다 그 접수번호의 공시 하나를 내고 접수번호가 둘인 응답은 issuer 없이 남긴다 | `tests/storage/test_promotion_mappers.py::test_dart_fnltt_filings_maps_synthetic_fixture` | 구현 |
+| DV-147 | `aas-dimensions-v1` 형식은 고정 입력과 기대 값으로 고정돼 있고 SQL 계산이 Python과 같다 | `tests/storage/test_promotion_formats.py::test_dimensions_hash_format_is_frozen` | 구현 |
+| DV-148 | SQL의 JSON 문자열 표기는 모든 code point에서 `json.dumps`와 같다 | `tests/storage/test_promotion_formats.py::test_json_string_sql_matches_json_dumps` | 구현 |
+| DV-149 | instrument가 선택인 도메인은 identity snapshot 없이 승격되고, instrument가 필수인 도메인은 instrument를 해석하는 매퍼만 받는다 | `tests/storage/test_promotion_spec.py::test_an_optional_instrument_needs_no_identity_snapshot` | 구현 |
+| DV-150 | 펼치는 매퍼의 재무 행은 발행인 단위로 게시되고, 자료 없음 응답은 결과 분포로 보고·manifest·품질 검사에 남으며, 같은 응답의 재승격은 빈 delta다 | `tests/storage/test_dart_promotion.py::test_statements_promote_as_issuer_fundamentals_with_coverage` | 구현 |
+| DV-151 | 읽을 수 없는 DART 응답은 승격 전체를 거부한다 | `tests/storage/test_dart_promotion.py::test_an_unreadable_response_refuses_the_promotion` | 구현 |
+| DV-152 | 정정 공시는 자기 접수번호 아래 record를 더하고 이전 공시의 값은 남으며, 다시 수집한 같은 공시는 변하지 않는다 | `tests/storage/test_dart_promotion.py::test_an_amendment_adds_records_under_its_own_filing` | 구현 |
+| DV-153 | DART 명세 파티션은 요청의 사업연도로 원천 행을 고른다 | `tests/storage/test_dart_promotion.py::test_a_partition_selects_requests_by_business_year` | 구현 |
+| DV-154 | DART 공시는 접수번호마다 행 하나이고, 한 generation에서 겹치는 공시는 거부되며 따로 승격하면 변하지 않는다 | `tests/storage/test_dart_promotion.py::test_filings_promote_one_row_per_filing` | 구현 |

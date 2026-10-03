@@ -371,40 +371,45 @@ def _layered(base: str, layers: Sequence[Sequence[tuple[str, str]]]) -> str:
     return sql
 
 
-def _fix(
+_SOURCE_KEY: Final = ("_aas_pin", "_aas_ordinal")
+_ROW_KEY: Final = ("_aas_pin", "_aas_ordinal", "_aas_item")
+_KEY_TYPES: Final = {"_aas_pin": "INTEGER", "_aas_ordinal": "BIGINT", "_aas_item": "BIGINT"}
+_KEY_FLOORS: Final = {"_aas_pin": -(2**31), "_aas_ordinal": -(2**63), "_aas_item": -(2**63)}
+
+
+def _fix(  # noqa: PLR0913 -- the query, its key, and where the computed value goes
     market: duckdb.DuckDBPyConnection,
     query: str,
     compute: Callable[[tuple[object, ...]], str],
     table: str,
     column: str,
+    *,
+    key: tuple[str, ...] = _SOURCE_KEY,
 ) -> int:
     """Fill ``column`` in Python for the rows SQL could not compute exactly.
 
-    ``query`` selects ``_aas_pin, _aas_ordinal`` first and has a WHERE clause; rows are
-    read in key order a batch at a time, because temp tables live on this connection
-    and an open result cannot stay open across the inserts.
+    ``query`` selects the ``key`` columns first and has a WHERE clause; rows are read in
+    key order a batch at a time, because temp tables live on this connection and an open
+    result cannot stay open across the inserts. ``compute`` receives the whole row.
     """
     fix = _t("fix")
-    market.execute(
-        f"CREATE OR REPLACE TEMP TABLE {fix} (_aas_pin INTEGER, _aas_ordinal BIGINT, v VARCHAR)"
-    )
-    last: tuple[int, int] = (-(2**31), -(2**63))
+    columns = ", ".join(f"{name} {_KEY_TYPES[name]}" for name in key)
+    names = ", ".join(key)
+    marks = ", ".join("?" for _ in key)
+    market.execute(f"CREATE OR REPLACE TEMP TABLE {fix} ({columns}, v VARCHAR)")
+    last: list[object] = [_KEY_FLOORS[name] for name in key]
     while batch := market.execute(
-        f"{query} AND (_aas_pin, _aas_ordinal) > (?, ?) "
-        f"ORDER BY _aas_pin, _aas_ordinal LIMIT {_BATCH}",
-        list(last),
+        f"{query} AND ({names}) > ({marks}) ORDER BY {names} LIMIT {_BATCH}", last
     ).fetchall():
         market.executemany(
-            f"INSERT INTO {fix} VALUES (?, ?, ?)",
-            [(row[0], row[1], compute(tuple(row))) for row in batch],
+            f"INSERT INTO {fix} VALUES ({marks}, ?)",
+            [(*row[: len(key)], compute(tuple(row))) for row in batch],
         )
-        last = (int(batch[-1][0]), int(batch[-1][1]))
+        last = [int(value) for value in batch[-1][: len(key)]]
     fixed = _count(market, f"SELECT count(*) FROM {fix}")
     if fixed:
-        market.execute(
-            f"UPDATE {table} SET {column} = {fix}.v FROM {fix} WHERE {table}._aas_pin = "
-            f"{fix}._aas_pin AND {table}._aas_ordinal = {fix}._aas_ordinal"
-        )
+        joined = " AND ".join(f"{table}.{name} = {fix}.{name}" for name in key)
+        market.execute(f"UPDATE {table} SET {column} = {fix}.v FROM {fix} WHERE {joined}")
     return fixed
 
 
@@ -416,10 +421,10 @@ def _stage_sources(
     names = ", ".join(_q(name) for name, _ in columns)
     where = ""
     if spec.partition is not None:
-        column = _q(spec.mapper.partition_column)
+        day = f"({spec.mapper.partition_date})"
         where = (
-            f" WHERE {column} >= DATE '{spec.partition.start.isoformat()}' "
-            f"AND {column} < DATE '{spec.partition.end.isoformat()}'"
+            f" WHERE {day} >= DATE '{spec.partition.start.isoformat()}' "
+            f"AND {day} < DATE '{spec.partition.end.isoformat()}'"
         )
     union = " UNION ALL ".join(
         f"SELECT {index}::INTEGER AS _aas_pin, _aas_ordinal, {names} "
@@ -446,18 +451,37 @@ def _stage_sources(
     )
 
 
+def _outcomes(workspace: Workspace, spec: PromotionSpec, plan: PromotionPlan) -> None:
+    """Count the staged source rows by the mapper's outcome, the coverage rows cannot give."""
+    outcome = spec.mapper.outcome(spec.mapper_args)
+    if outcome is None:
+        return
+    plan.report["source_outcomes"] = {
+        str(name): int(count)
+        for name, count in workspace.market.execute(
+            f"SELECT coalesce(CAST(({outcome}) AS VARCHAR), 'null'), count(*) FROM {_t('src')} "
+            "GROUP BY 1 ORDER BY 1"
+        ).fetchall()
+    }
+
+
 def _map(workspace: Workspace, spec: PromotionSpec) -> bool:
-    """Materialize the mapper's relation and check its columns; return whether it has fields."""
+    """Materialize the mapper's relation and check its columns; return whether it has fields.
+
+    A mapper that does not expand gives at most one row per source row, numbered 0, so
+    every later step keys a mapped row by (pin, ordinal, item) alike.
+    """
     market = workspace.market
-    market.execute(
-        f"CREATE OR REPLACE TEMP TABLE {_t('map')} AS "
-        + spec.mapper.select(_t("src"), spec.mapper_args)
-    )
+    select = spec.mapper.select(_t("src"), spec.mapper_args)
+    if not spec.mapper.expands:
+        select = f"SELECT *, CAST(0 AS BIGINT) AS _aas_item FROM ({select})"
+    market.execute(f"CREATE OR REPLACE TEMP TABLE {_t('map')} AS {select}")
     described = _columns(market, _t("map"))
     numeric = spec.mapper.numeric_columns(spec.mapper_args)
     expected = {
         "_aas_pin": "INTEGER",
         "_aas_ordinal": "BIGINT",
+        "_aas_item": "BIGINT",
         "_aas_row_hash": "VARCHAR",
         "_aas_ingested_at_us": "BIGINT",
     }
@@ -473,6 +497,13 @@ def _map(workspace: Workspace, spec: PromotionSpec) -> bool:
         expected["fields"] = "VARCHAR"
     if described != expected:
         raise ValueError(f"mapper {spec.mapper_name} output does not match its declared columns")
+    repeated = _count(
+        market,
+        f"SELECT count(*) FROM (SELECT 1 FROM {_t('map')} GROUP BY {', '.join(_ROW_KEY)} "
+        "HAVING count(*) > 1)",
+    )
+    if repeated:
+        raise ValueError(f"mapper {spec.mapper_name} numbers {repeated} rows of a source row twice")
     return fields
 
 
@@ -480,17 +511,25 @@ def _resolved(workspace: Workspace, spec: PromotionSpec) -> str:
     """The mapped rows with the resolved instrument and how many instruments matched."""
     market = workspace.market
     if spec.mapper.identity(spec.mapper_args) is None:
-        return f"SELECT m.*, 1 AS _aas_matches FROM {_t('map')} m"
+        # A domain whose instrument is optional, mapped without an identity key, names none.
+        unnamed = (
+            ", CAST(NULL AS VARCHAR) AS instrument_id"
+            if "instrument_id" in dict(DOMAINS[spec.domain])
+            else ""
+        )
+        return f"SELECT m.*{unnamed}, 1 AS _aas_matches FROM {_t('map')} m"
     market.execute(
         f"CREATE OR REPLACE TEMP TABLE {_t('res')} AS SELECT m._aas_pin, m._aas_ordinal, "
-        "count(DISTINCT i.instrument_id) AS matches, min(i.instrument_id) AS instrument_id "
+        "m._aas_item, count(DISTINCT i.instrument_id) AS matches, "
+        "min(i.instrument_id) AS instrument_id "
         f"FROM {_t('map')} m JOIN {_t('identity')} i ON i.token = m._aas_id_token "
         "AND i.valid_from_us <= m._aas_id_at_us "
         "AND (i.valid_to_us IS NULL OR m._aas_id_at_us < i.valid_to_us) GROUP BY ALL"
     )
+    same = " AND ".join(f"r.{name} = m.{name}" for name in _ROW_KEY)
     return (
         f"SELECT m.*, r.instrument_id, coalesce(r.matches, 0) AS _aas_matches FROM {_t('map')} m "
-        f"LEFT JOIN {_t('res')} r ON r._aas_pin = m._aas_pin AND r._aas_ordinal = m._aas_ordinal"
+        f"LEFT JOIN {_t('res')} r ON {same}"
     )
 
 
@@ -554,7 +593,7 @@ def _rows(
         finals.append((f"_aas_rv{index}", f"CAST({computed.value} AS BIGINT)"))
         finals.append((f"_aas_rb{index}", f"CAST({computed.base} AS BIGINT)"))
     converted = _layered(_layered(base, layers), [finals])
-    selected = ["_aas_pin", "_aas_ordinal", "_aas_row_hash", "_aas_ingest"]
+    selected = ["_aas_pin", "_aas_ordinal", "_aas_item", "_aas_row_hash", "_aas_ingest"]
     if spec.mapper.identity(spec.mapper_args) is not None:
         selected.append("_aas_id_token AS _aas_token")
     for name, kind in DOMAINS[spec.domain]:
@@ -602,11 +641,12 @@ def _rows(
     keys = ", ".join(_q(name) for name in NATURAL_KEYS[spec.domain])
     _fix(
         market,
-        f"SELECT _aas_pin, _aas_ordinal, {keys} FROM {_t('rows')} "
+        f"SELECT {', '.join(_ROW_KEY)}, {keys} FROM {_t('rows')} "
         "WHERE _aas_status IN ('ok', 'held') AND record_id IS NULL",
-        lambda row: record_identity(spec.domain, row[2:]),
+        lambda row: record_identity(spec.domain, row[len(_ROW_KEY) :]),
         _t("rows"),
         "record_id",
+        key=_ROW_KEY,
     )
     return flags
 
@@ -1067,6 +1107,7 @@ def _report(
     market = workspace.market
     statuses = _status_counts(market)
     plan.report["source_rows"] = _count(market, f"SELECT count(*) FROM {_t('src')}")
+    plan.report["mapped_rows"] = _count(market, f"SELECT count(*) FROM {_t('rows')}")
     plan.report["rows"] = statuses
     for status, count in statuses.items():
         if status.startswith("refused") and count:
@@ -1147,6 +1188,7 @@ def plan_promotion(
     calendars = _calendars(workspace, spec, budget)
     decimal_rules.install(market)
     _stage_sources(workspace, spec, sources, plan)
+    _outcomes(workspace, spec, plan)
     fields = _map(workspace, spec)
     flags = _rows(workspace, spec, sources, calendars, fields=fields)
     _report(workspace, spec, plan, flags)
@@ -1243,6 +1285,13 @@ def _manifest(plan: PromotionPlan) -> bytes:
                 "snapshot_id": spec.identity_snapshot.snapshot_id,
                 "content_hash": spec.identity_snapshot.content_hash,
             },
+            # Only a mapper of response rows records coverage, so other manifests keep
+            # exactly the shape they were retained with.
+            **(
+                {"source_outcomes": plan.report["source_outcomes"]}
+                if "source_outcomes" in plan.report
+                else {}
+            ),
         }
     )
 
@@ -1451,7 +1500,11 @@ def _complete(
     _check_flags(workspace, spec.domain, generation_id, manifest, budget)
     state = workspace.state
     created = int(cast("int", operation["created_at_us"]))
-    report = {key: manifest[key] for key in ("operations", "rows", "unchanged", "stale", "flags")}
+    report = {
+        key: manifest[key]
+        for key in ("operations", "rows", "unchanged", "stale", "flags", "source_outcomes")
+        if key in manifest
+    }
     with atomic(state):
         existing = state.execute(
             "SELECT domain, record_schema FROM datasets WHERE dataset_id=?", (spec.dataset_id,)

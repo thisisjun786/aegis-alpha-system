@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import random
 import struct
@@ -202,3 +203,51 @@ def test_source_row_hash_sql_matches_python() -> None:
     # Both routes are exercised: plain rows in SQL and escaped text through the fallback.
     assert checked["sql"] > 300
     assert checked["python"] > 300
+
+
+FROZEN_DIMENSIONS = "1daccefc2eca40c7111f22e223a449aaad6931f2a2d64381cac70075c63aba02"
+_DIMENSIONS = {"account_nm": "매출액", "fs_div": "CFS", "note": 'a"b\\😀'}
+
+
+def test_dimensions_hash_format_is_frozen() -> None:
+    document = formats.canonical([formats.DIMENSIONS_FORMAT, _DIMENSIONS])
+    assert document == (
+        b'["aas-dimensions-v1",{"account_nm":"\\ub9e4\\ucd9c\\uc561","fs_div":"CFS",'
+        b'"note":"a\\"b\\\\\\ud83d\\ude00"}]'
+    )
+    assert formats.dimensions_hash(_DIMENSIONS) == hashlib.sha256(document).hexdigest()
+    assert formats.dimensions_hash(_DIMENSIONS) == FROZEN_DIMENSIONS
+    connection = duckdb.connect()
+    sql = formats.dimensions_hash_sql([("account_nm", "a"), ("fs_div", "f"), ("note", "n")])
+    row = connection.execute(
+        f"SELECT {sql} FROM (SELECT ? AS a, ? AS f, ? AS n)",
+        [_DIMENSIONS["account_nm"], _DIMENSIONS["fs_div"], _DIMENSIONS["note"]],
+    ).fetchone()
+    assert row == (FROZEN_DIMENSIONS,)
+    unknown = connection.execute(
+        f"SELECT {sql} FROM (SELECT 'x' AS a, CAST(NULL AS VARCHAR) AS f, 'y' AS n)"
+    ).fetchone()
+    assert unknown == (None,)
+    with pytest.raises(ValueError, match="sorted order"):
+        formats.dimensions_hash_sql([("fs_div", "f"), ("account_nm", "a")])
+
+
+def test_json_string_sql_matches_json_dumps() -> None:
+    generator = random.Random(20261003)
+    ranges = ((0, 0x80), (0x80, 0xD800), (0xE000, 0x110000))
+    texts = ["", "plain", '"', "\\", "\b\f\n\r\t\x00\x1f\x7f", "\uac00", "\U0001f600", "\u2028/"]
+    texts.extend(
+        "".join(
+            chr(generator.randrange(*generator.choice(ranges)))
+            for _ in range(generator.randrange(12))
+        )
+        for _ in range(2000)
+    )
+    connection = duckdb.connect()
+    connection.execute("CREATE TABLE t (i INTEGER, s VARCHAR)")
+    connection.executemany("INSERT INTO t VALUES (?, ?)", list(enumerate(texts)))
+    got = dict(connection.execute(f"SELECT i, {formats.json_string_sql('s')} FROM t").fetchall())
+    assert [got[index] for index in range(len(texts))] == [json.dumps(text) for text in texts]
+    assert connection.execute(
+        f"SELECT {formats.json_string_sql('CAST(NULL AS VARCHAR)')}"
+    ).fetchone() == (None,)
