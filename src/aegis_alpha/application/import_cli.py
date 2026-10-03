@@ -1,4 +1,8 @@
-"""``aas import legacy``: retain legacy originals as content-addressed source-library sources."""
+"""``aas import``: retain originals as content-addressed source-library sources.
+
+``legacy`` imports legacy originals by manifest. ``sec-companies`` commits the company
+header of each CIK document of an SEC submissions archive already retained in ``raw/``.
+"""
 
 from __future__ import annotations
 
@@ -35,6 +39,17 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Check every planned source is committed, identical and linked (read-only)",
     )
+    companies = sub.add_parser(
+        "sec-companies",
+        help="Commit the company header of each CIK document of an SEC submissions archive",
+    )
+    home_option(companies)
+    companies.add_argument(
+        "--source", required=True, help="The sec-submissions-zip-* source holding the archive"
+    )
+    companies.add_argument(
+        "--plan", action="store_true", help="Read every document and report; write nothing"
+    )
 
 
 def execute(args: argparse.Namespace) -> dict[str, object]:
@@ -49,6 +64,8 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         verify_import,
     )
 
+    if args.import_command == "sec-companies":
+        return _sec_companies(args)
     manifest = read_manifest_file(args.manifest, args.sha256)
     if args.plan:
         return plan_import(manifest)
@@ -71,5 +88,26 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             if args.verify:
                 return verify_import(workspace, manifest)
             return apply_import(workspace, manifest)
+    except (sqlite3.Error, duckdb.Error):
+        raise ValueError("local database operation failed; run aas db verify") from None
+
+
+def _sec_companies(args: argparse.Namespace) -> dict[str, object]:
+    import sqlite3
+
+    import duckdb
+
+    from aegis_alpha.storage.paths import resolve_home
+    from aegis_alpha.storage.sec_companies import import_companies, plan_companies
+    from aegis_alpha.storage.workspace import open_workspace
+
+    home = resolve_home(getattr(args, "home", None))
+    try:
+        with open_workspace(
+            home, writable=not args.plan, strategy_write=not args.plan, require_strategies=False
+        ) as workspace:
+            if args.plan:
+                return plan_companies(workspace, args.source)
+            return import_companies(workspace, args.source)
     except (sqlite3.Error, duckdb.Error):
         raise ValueError("local database operation failed; run aas db verify") from None

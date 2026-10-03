@@ -105,7 +105,7 @@ ASSETID_SET_FORMAT: Final = "aas-norgate-assetids-v1"
 NEW_YORK: Final = ZoneInfo("America/New_York")
 _DELISTED_SYMBOL: Final = re.compile(r"(.+)-[0-9]{6}")
 _DAY: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
-_SEC_MEMBER: Final = re.compile(r"CIK([0-9]{10})\.json")
+SEC_MEMBER: Final = re.compile(r"CIK([0-9]{10})\.json")
 _MAX_MEMBER_BYTES: Final = 64 * 1024 * 1024
 _CHUNK: Final = 1024 * 1024
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
@@ -484,7 +484,7 @@ def _filer(raw: bytes, cik: str) -> tuple[str, tuple[str, ...]] | str:
     return name or "", tuple(cast("list[str]", tickers))
 
 
-def _check_archive(handle: BinaryIO, archive: SourceFile) -> zipfile.ZipFile:
+def open_archive(handle: BinaryIO, archive: SourceFile) -> zipfile.ZipFile:
     """Open the archive after checking it has the size and SHA-256 its source records."""
     digest = hashlib.sha256()
     size = 0
@@ -500,7 +500,7 @@ def _check_archive(handle: BinaryIO, archive: SourceFile) -> zipfile.ZipFile:
         raise ValueError("SEC submissions source is not a zip archive") from None
 
 
-def _member(bundle: zipfile.ZipFile, row: Mapping[str, object]) -> bytes:
+def read_member(bundle: zipfile.ZipFile, row: Mapping[str, object]) -> bytes:
     """One member's bytes, which must have the size and SHA-256 its index row records."""
     name, expected = str(row["member"]), row["size"]
     if type(expected) is not int or expected > _MAX_MEMBER_BYTES:
@@ -527,14 +527,14 @@ def map_sec_tickers(
     _require(members.rows, ("member", "size", "sha256"), SEC_MAPPER)
     report = MapperReport()
     filers: list[Filer] = []
-    with opener() as handle, _check_archive(handle, archive) as bundle:
+    with opener() as handle, open_archive(handle, archive) as bundle:
         for row, row_hash in members.rows.records():
             report.rows += 1
-            match = _SEC_MEMBER.fullmatch(str(row["member"]))
+            match = SEC_MEMBER.fullmatch(str(row["member"]))
             if match is None:
                 report.skip("not_a_cik_document")
                 continue
-            stated = _filer(_member(bundle, row), match[1])
+            stated = _filer(read_member(bundle, row), match[1])
             if isinstance(stated, str):
                 report.refuse(stated)
             elif not stated[1]:
@@ -1537,14 +1537,19 @@ def check_registered(registry: UsRegistry, state: sqlite3.Connection) -> UsRegis
     return registry
 
 
-def _sec_archive(workspace: Workspace, source_id: str) -> tuple[SourceFile, ArchiveOpener]:
-    """The retained archive of an SEC submissions content source and how to open it."""
+def sec_archive(
+    workspace: Workspace, source_id: str, *, reader: str = SEC_MAPPER
+) -> tuple[SourceFile, ArchiveOpener]:
+    """The retained archive of an SEC submissions content source and how to open it.
+
+    ``reader`` names what reads the archive in the refusal of any other source.
+    """
     from aegis_alpha.data.descriptor_tree import DescriptorTree  # noqa: PLC0415
     from aegis_alpha.storage.source_identity import content_of  # noqa: PLC0415
     from aegis_alpha.storage.source_library import _marker  # noqa: PLC0415
 
     if not source_id.startswith(SEC_PREFIX):
-        raise ValueError(f"{SEC_MAPPER} reads an {SEC_PREFIX}* content source, not {source_id}")
+        raise ValueError(f"{reader} reads an {SEC_PREFIX}* content source, not {source_id}")
     marker = _marker(workspace, source_id)
     if marker is None:
         raise ValueError(f"unknown source {source_id}")
@@ -1601,7 +1606,7 @@ def build_from_workspace(  # noqa: PLR0913 -- one keyword per source kind
     )
     sec_inputs = []
     for source in sec:
-        archive, opener = _sec_archive(workspace, source)
+        archive, opener = sec_archive(workspace, source)
         members = LinkedRows(read_rows(workspace, source, SEC_TABLE), link_instant(state, source))
         sec_inputs.append((members, archive, opener))
     registry = build_us_registry(
