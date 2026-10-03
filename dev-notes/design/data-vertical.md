@@ -254,6 +254,7 @@ TOMBSTONE의 `source_row_hash`는 `sha256(정규 JSON ["aas-tombstone-v1", sourc
 | `session_close_plus_lag@1` | pin한 `calendar_sessions` generation의 해당 세션 `close_at_us` + 명세의 `lag_us`(0 이상). 세션이 없거나 종료 시각이 알려지지 않았으면 null | 세션 `close_at_us` | 일봉 가격 |
 | `local_day_end@1` | 명세의 IANA 시간대에서 그 날짜의 23:59:59.999999를 UTC로 변환. 행에 `time_precision_day` flag | 그 날짜의 현지 0시 | 날짜만 있는 공시·거시 vintage(`realtime_start`) |
 | `exdate_open@1` | pin한 달력에서 ex-date 세션의 `open_at_us`. 세션이 없으면 null | 계산 값 | 기업행동 |
+| `declared_session_end@1` | 매퍼가 넘긴 선언 상한: 선언 시각과 선언된 그 날짜 session의 끝(개장 session은 마감, 휴장일은 현지 날짜의 마지막 microsecond) 중 이른 값 | 계산 값 | [선언 달력](#선언-달력) |
 | `unknown_null@1` | 항상 null | 없음 | 근거가 없는 원천 |
 
 기록되는 시점은 그 행을 받은 시각보다 늦을 수 없다. 받은 bytes는 받은 시각에 이미 공개돼 있었기 때문이다.
@@ -264,8 +265,8 @@ TOMBSTONE의 `source_row_hash`는 `sha256(정규 JSON ["aas-tombstone-v1", sourc
 
 명세는 시점 열마다 규칙 입력의 근거(`basis`)를 선언한다. `revision`은 입력 열이 그 행 자체의 공개
 시각이나 공개일을 담는 경우다(SEC `acceptanceDateTime`, ALFRED `realtime_start`, DART 접수일).
-`record`는 입력이 record의 날짜인 경우다(세션 날짜, ex-date). `session_close_plus_lag@1`과
-`exdate_open@1`은 항상 `record`다.
+`record`는 입력이 record의 날짜인 경우다(세션 날짜, ex-date). `session_close_plus_lag@1`,
+`exdate_open@1`, `declared_session_end@1`은 항상 `record`다.
 
 규칙 ID와 버전은 명세에 있으므로 transform hash에 포함된다. 규칙의 계산을 바꾸면 새 버전이 된다.
 한 chain의 모든 generation은 열마다 같은 시간 규칙(ID·버전·근거·입력과 달력 pin을 뺀 인자)을 쓴다.
@@ -428,16 +429,23 @@ FX처럼 여러 원천이 같은 시계열을 내는 경우에도 우선순위�
 `aas calendar refresh`는 선언 bytes를 `raw/`에 두고 그 bytes를 원본 파일로 한 내용 원천
 (`calendar-declared-sessions-<hex>`, 테이블 `sessions`)을 commit한다. 테이블은 범위의 날짜마다 한 행이고
 현지 벽시계 시각만 담으므로 행은 문서만으로 정해진다. 그 원천을 `calendar.declared@1`로 head의 자식
-generation에 승격하며, 두 시점 열은 `source_column@1`(근거 `revision`, 입력 `public_by`)이다.
+generation에 승격하며, 두 시점 열은 `declared_session_end@1`(근거 `record`, 입력 `public_by`)이다.
 
 - `public_by`는 선언한 행이 처음 공개됐을 수 있는 가장 늦은 시각이다. 선언 시각과 그 날짜 자체의 끝
   (개장 session은 마감, 휴장일은 현지 날짜의 마지막 microsecond) 중 이른 값이다. 한 날짜에 venue가
   열었는지와 그 시간은 그 session이 끝나면 사실이 되므로, 오늘의 선언은 과거 날짜에 대해 그보다 늦은
-  시점을 진술하지 않고 미래 날짜에 대해서는 선언 자체가 공개한 시점만 진술한다.
+  시점을 진술하지 않고 미래 날짜에 대해서는 선언 자체가 공개한 시점만 진술한다. 이 상한은 원천이 기록한
+  시각이 아니라 record 날짜에서 계산한 값이므로, strict reader는 binding이 `declared_session_end@1`을
+  grant할 때만 쓰고 읽기 영수증에 그 grant가 남는다.
 - 같은 선언을 다시 갱신하면 원천을 재사용하고 delta가 비어 아무것도 쓰지 않는다. 바뀐 날짜(임시 휴장,
-  시간 변경)는 새 generation의 SUPERSEDE이고 새 날짜(다음 해)는 ASSERT다. 이전 generation과 그 pin은
-  그대로 검증되고 그대로 읽힌다. 새 선언으로 `public_by`만 달라지는 변하지 않은 행은 다시 쓰지 않고
-  `time_drift`로 보고한다.
+  시간 변경, 정정된 과거 일정)는 새 generation의 SUPERSEDE이고 새 날짜(다음 해)는 ASSERT다. 이전
+  generation과 그 pin은 그대로 검증되고 그대로 읽힌다. 새 선언으로 `public_by`만 달라지는 변하지 않은
+  행은 다시 쓰지 않고 `time_drift`로 보고한다.
+- 근거가 `record`이므로 SUPERSEDE의 두 시점은 [revision 시점](#revision-시점) 규칙대로 정정 선언을 담은
+  원천의 증거 시각(AAS가 그 선언을 commit한 `sl:` link 시각)이다. 정정은 그 선언이 있기 전에 알려지지
+  않고, 두 선언 사이 cutoff의 strict 읽기는 이전 선언의 일정을 돌려주며, 정정 revision의 시점은 그것이
+  대체하는 revision보다 이르지 않다. 그래도 계획에 stale 행이 남으면 갱신은 아무것도 게시하지 않고
+  거부한다.
 - head를 만든 선언보다 `declared_at`이 이른 선언, 같은 `declared_at`의 다른 내용, 다른 달력·venue·시간대,
   현재보다 늦은 `declared_at`은 거부한다. 그래서 오래된 선언이 새 선언의 정정을 되돌리지 못한다.
 - `--plan`은 아무것도 쓰지 않는다. 원천이 commit돼 있으면 승격 계획을, 아니면 head 선언과의 날짜 단위
@@ -448,6 +456,9 @@ generation에 승격하며, 두 시점 열은 `source_column@1`(근거 `revision
 휴장, KRX 휴장일 목록, 원천 자료실 일봉의 거래 흔적, 수능일 시간)을 적용해 만든다. 1998-12-07 이전
 KRX 토요일 session은 확인되지 않은 반일 마감 대신 평일 마감을 선언하며, 이 값은 실제 마감보다 늦은
 상한이다. 원천 자료실의 관측 거래일은 선언의 대조 근거이고 선언에 섞이지 않는다.
+`scripts/calendar_compare.py`는 market 파일을 읽기 전용으로 열어 패키지 선언과 일봉 원천의 거래일을
+비교한다. 거래일은 거래량이 있는 행 수가 앞뒤 30일 최대값의 5% 이상인 날짜이고, 보고는 선언 session 중
+거래가 없는 날짜(행 없음과 얇은 거래), 선언이 닫은 거래일, 거래 흔적 없이 행만 있는 휴장일 수다.
 
 ## 대상 dataset
 
@@ -799,7 +810,10 @@ state v2:
 | DV-91 | `calendar.declared@1`은 합성 원천 fixture를 독립 기대값과 같은 도메인 열과 `public_by`로 옮기고 잘못된 행의 `status`를 비운다 | `tests/storage/test_promotion_mappers.py::test_calendar_declared_maps_synthetic_fixture` | 구현 |
 | DV-92 | 임시 휴장은 새 generation의 SUPERSEDE이고 이전 pin은 그대로 검증되고 읽힌다 | `tests/storage/test_calendar_refresh.py::test_temporary_closure_is_a_new_generation` | 구현 |
 | DV-93 | head 선언보다 이른 선언, 같은 시각의 다른 선언, 미래 시각의 선언은 갱신하지 못한다 | `tests/storage/test_calendar_refresh.py::test_older_declaration_cannot_undo_a_newer_one` | 구현 |
-| DV-94 | 선언 달력의 시점은 선언 시각과 그 session의 끝 중 이른 값이다 | `tests/storage/test_calendar_refresh.py::test_session_times_are_bounded_by_the_declaration` | 구현 |
+| DV-94 | 선언 달력의 처음 선언된 날짜 시점은 `declared_session_end@1`로 선언 시각과 그 session의 끝 중 이른 값이다 | `tests/storage/test_calendar_refresh.py::test_session_times_are_bounded_by_the_declaration` | 구현 |
 | DV-95 | 선언 문서는 범위 밖·중복·구간을 반복하는 예외와 잘못된 형식을 거부한다 | `tests/storage/test_calendar_declaration.py::test_declaration_has_one_spelling` | 구현 |
 | DV-96 | 패키지 XNYS·XKRX 선언은 2027년 일정을 포함해 2027-12-31까지 덮는다 | `tests/storage/test_calendar_declaration.py::test_packaged_declarations_cover_the_next_year` | 구현 |
 | DV-97 | `calendar refresh --plan`은 아무것도 쓰지 않고 head 선언과의 날짜 변경을 보고한다 | `tests/storage/test_calendar_refresh.py::test_refresh_plan_writes_nothing` | 구현 |
+| DV-98 | 과거 날짜의 정정(휴장, 이른 마감, 재개장)은 SUPERSEDE로 게시되고 정정 선언을 받은 시각부터 알려지며, 두 선언 사이 cutoff의 strict 읽기는 grant 아래 이전 선언을, grant 없이는 아무 행도 돌려주지 않는다 | `tests/storage/test_calendar_refresh.py::test_past_corrections_are_known_from_their_declaration` | 구현 |
+| DV-99 | stale 행이 남는 선언 갱신은 게시하지 않고 거부한다 | `tests/storage/test_calendar_refresh.py::test_refresh_refuses_a_stale_plan` | 구현 |
+| DV-100 | `declared_session_end@1`은 입력 상한을 값과 물리 기준으로 쓰고 근거 `record`만 받는다 | `tests/storage/test_time_rules.py::test_declared_session_end_is_a_record_rule_on_its_bound` | 구현 |

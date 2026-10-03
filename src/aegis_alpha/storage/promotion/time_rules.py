@@ -21,6 +21,9 @@ earliest instant the bytes could exist (a session's close, a local midnight).
 - ``local_day_end@1`` (input: a date): 23:59:59.999999 local in ``timezone``, flagged
   ``time_precision_day``; base: local midnight.
 - ``exdate_open@1`` (input: a date): the pinned session's ``open_at_us``; base: the value.
+- ``declared_session_end@1`` (input: an instant): a declared calendar's bound on when a
+  session's schedule was public, the earlier of the declaration instant and the session's
+  own end, as the declaring mapper computes it; base: the value.
 - ``unknown_null@1`` (no input): NULL; no base.
 
 Local times resolve through DuckDB's ICU time zone data, which the locked DuckDB fixes.
@@ -88,10 +91,20 @@ EXDATE_OPEN = RuleKind(
     frozenset({"record"}),
     frozenset({"calendar", "calendar_id", "venue"}),
 )
+DECLARED_SESSION_END = RuleKind(
+    "declared_session_end", "1", "utc_us", frozenset({"record"}), frozenset()
+)
 UNKNOWN_NULL = RuleKind("unknown_null", "1", None, frozenset({"record", "revision"}), frozenset())
 RULES: Final = {
     kind.name: kind
-    for kind in (SOURCE_COLUMN, SESSION_CLOSE, LOCAL_DAY_END, EXDATE_OPEN, UNKNOWN_NULL)
+    for kind in (
+        SOURCE_COLUMN,
+        SESSION_CLOSE,
+        LOCAL_DAY_END,
+        EXDATE_OPEN,
+        DECLARED_SESSION_END,
+        UNKNOWN_NULL,
+    )
 }
 _PIN_KEYS: Final = frozenset(
     {"dataset_id", "version", "generation_id", "chain_hash", "manifest_hash"}
@@ -205,7 +218,7 @@ def rule_sql(rule: TimeRule, input_column: str | None, session: tuple[str, str] 
     kind = rule.kind
     if kind is UNKNOWN_NULL or input_column is None:
         return RuleSql("CAST(NULL AS BIGINT)", "CAST(NULL AS BIGINT)")
-    if kind is SOURCE_COLUMN:
+    if kind in (SOURCE_COLUMN, DECLARED_SESSION_END):
         return RuleSql(input_column, input_column)
     if kind is LOCAL_DAY_END:
         zone = sql_literal(str(rule.args["timezone"]))

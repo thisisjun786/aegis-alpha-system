@@ -10,10 +10,16 @@ For one ``aas-calendar-declaration-v1`` document the refresh
    (``calendar-declared-sessions-<hex>``, one row per date) to the source library, which
    reuses the source when the same bytes were committed before;
 3. promotes that table with ``calendar.declared@1`` as the child of the head, both time
-   columns under ``source_column@1`` on the mapper's ``public_by`` instant.
+   columns under ``declared_session_end@1`` (basis ``record``) on the mapper's
+   ``public_by`` instant.
 
-A changed date is a SUPERSEDE in a new generation (a temporary closure, an extended year)
-and every earlier generation stays exactly as pinned. Refreshing the same declaration
+A changed date is a SUPERSEDE in a new generation (a temporary closure, a corrected past
+schedule) and a new date an ASSERT (an extended year); every earlier generation stays
+exactly as pinned. Under the ``record`` basis a SUPERSEDE takes the time AAS received the
+correcting declaration (its source's ``sl:`` link), never the corrected date's own end, so
+a correction is never known before it existed and its times never run behind the
+revision it replaces. A plan whose changed dates would still be stale is refused before
+anything is written rather than published as an empty delta. Refreshing the same declaration
 again is an empty delta and writes nothing. ``--plan`` writes nothing: when the source is
 already committed it reports the engine's full plan, otherwise the date-level changes
 against the head's declaration. No provider is called and no clock reaches a stored value;
@@ -51,8 +57,8 @@ if TYPE_CHECKING:
 
 MAPPER: Final = "calendar.declared@1"
 TIME_RULE: Final = {
-    "rule": "source_column@1",
-    "basis": "revision",
+    "rule": "declared_session_end@1",
+    "basis": "record",
     "input": "public_by",
     "args": {},
 }
@@ -265,5 +271,11 @@ def refresh_calendar(  # noqa: PLR0913 -- one document, its hash and the run's i
         return {**report, "promotion": None, "changes": _changes(declaration, head)}
     spec = promotion_spec(declaration, pin, parent, timezone_version())
     spec_sha = hashlib.sha256(spec).hexdigest()
-    result = promote(workspace, spec, spec_sha, apply=apply, budget=budget)
+    planned = promote(workspace, spec, spec_sha, apply=False, budget=budget)
+    if planned.get("stale"):
+        raise ValueError(
+            f"{planned['stale']} changed dates of the declaration are older than the "
+            f"{declaration.dataset_id} head revisions they would replace"
+        )
+    result = promote(workspace, spec, spec_sha, apply=True, budget=budget) if apply else planned
     return {**report, "spec_sha256": spec_sha, "promotion": result}

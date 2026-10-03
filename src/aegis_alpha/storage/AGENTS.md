@@ -68,9 +68,11 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   XNYS/XKRX declarations under `calendar_declarations/`, which `scripts/calendar_declarations.py`
   regenerates. `calendar_refresh` commits a declaration's bytes as a content source (one row per
   date, local wall times only) and promotes it with `calendar.declared@1` as the child of
-  `sessions.<mic>`'s head: both times are `source_column@1` on `public_by`, the earlier of the
-  declaration instant and the session's own end. A declaration older than the head's, or another
-  one at the same instant, is refused, so an old declaration never undoes a newer correction.
+  `sessions.<mic>`'s head: both times are `declared_session_end@1` (basis `record`, a grantable
+  rule) on `public_by`, the earlier of the declaration instant and the session's own end, so a
+  SUPERSEDE takes the correcting source's evidence time. A declaration older than the head's,
+  another one at the same instant, or a plan with stale rows is refused, so an old declaration
+  never undoes a newer correction and a correction is never dropped silently.
 - `bulk_generation` publishes a staged DuckDB table as one generation: plan without
   writing, then one transaction with the marker and `INSERT … SELECT`. DuckDB encodes and
   sorts `aas-rowset-v1` rows and `rowset.RowsetStream` digests them in admitted batches and

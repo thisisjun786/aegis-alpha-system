@@ -17,7 +17,10 @@ calendar date with ``calendar_id``, ``venue``, the IANA ``timezone``, ``session_
   earlier (the close of an open session, the last local microsecond of a closed date).
   Whether a venue opened on a date, and its hours, are facts by the end of that session,
   so a declaration made today states nothing later than that about a past date, while
-  for a future date it states only what the declaration itself made public.
+  for a future date it states only what the declaration itself made public. The bound
+  is computed from the record's date, so ``aas calendar refresh`` gives it to
+  ``declared_session_end@1`` with basis ``record``: a strict reader uses it only under a
+  grant, and a changed date takes the time AAS received the correcting declaration.
 """
 
 from __future__ import annotations

@@ -24,7 +24,7 @@ import pytest
 from aegis_alpha.compute_resources import ComputeBudget
 from aegis_alpha.storage import market
 from aegis_alpha.storage.bulk_generation import verify_generation_bulk
-from aegis_alpha.storage.calendar_refresh import refresh_calendar
+from aegis_alpha.storage.calendar_refresh import refresh_calendar, timezone_version
 from aegis_alpha.storage.market_inputs import GenerationPin, load_pinned_heads
 from aegis_alpha.storage.promotion.engine import promote
 from aegis_alpha.storage.read_heads import HeadBinding, HeadPin, HeadQuery
@@ -52,7 +52,11 @@ def ws(tmp_path: Path) -> Iterator[Workspace]:
 
 
 def _declaration(
-    declared_at: str, closed: tuple[str, ...] = (), *, end: str = "2025-02-03"
+    declared_at: str,
+    closed: tuple[str, ...] = (),
+    *,
+    end: str = "2025-02-03",
+    sessions: tuple[tuple[str, str, str], ...] = (),
 ) -> tuple[bytes, str]:
     document = {
         "schema": "aas-calendar-declaration-v1",
@@ -71,7 +75,9 @@ def _declaration(
             }
         ],
         "closed": list(closed),
-        "sessions": [],
+        "sessions": [
+            {"date": day, "open": opened, "close": closed_at} for day, opened, closed_at in sessions
+        ],
     }
     raw = json.dumps(document, indent=1).encode()
     return raw, hashlib.sha256(raw).hexdigest()
@@ -101,11 +107,16 @@ def _pin(workspace: Workspace, generation_id: str) -> GenerationPin:
     )
 
 
-def _sessions(workspace: Workspace, pin: GenerationPin) -> dict[date, dict[str, object]]:
+def _sessions(
+    workspace: Workspace,
+    pin: GenerationPin,
+    query: HeadQuery | None = None,
+    grants: tuple[str, ...] = (),
+) -> dict[date, dict[str, object]]:
     read = load_pinned_heads(
         workspace,
-        HeadBinding("calendar_sessions", (HeadPin(pin),)),
-        HeadQuery(),
+        HeadBinding("calendar_sessions", (HeadPin(pin),), granted_rules=grants),
+        query or HeadQuery(),
         budget=BUDGET,
     )
     return {cast("date", row.values["session_date"]): dict(row.values) for row in read.rows}
@@ -134,7 +145,10 @@ def test_temporary_closure_is_a_new_generation(ws: Workspace) -> None:
     after = _sessions(ws, second_pin)
     closed = after[CLOSURE]
     assert (closed["status"], closed["open_at_us"], closed["close_at_us"]) == ("closed", None, None)
-    assert after[CLOSURE]["available_at_us"] == us(at("2025-01-20T00:00:00"))
+    # A correction is known from when AAS received the declaration that carries it.
+    received = cast("int", closed["ingested_at_us"])
+    assert received >= us(at("2025-01-20T00:00:00"))
+    assert closed["available_at_us"] == closed["revision_known_at_us"] == received
     assert {day: row for day, row in after.items() if day != CLOSURE} == {
         day: row for day, row in before.items() if day != CLOSURE
     }
@@ -158,6 +172,63 @@ def test_older_declaration_cannot_undo_a_newer_one(ws: Workspace) -> None:
         _refresh(ws, _declaration(SECOND))
     with pytest.raises(ValueError, match="later than now"):
         _refresh(ws, _declaration("2025-07-01T00:00:00Z"))
+
+
+THIRD: Final = "2025-01-25T00:00:00Z"
+GRANT: Final = ("declared_session_end@1",)
+
+
+def test_past_corrections_are_known_from_their_declaration(ws: Workspace) -> None:
+    first_pin = _pin(ws, _generation(_refresh(ws, _declaration(FIRST))))
+    before = _sessions(ws, first_pin)
+    early = date(2025, 1, 7)
+    # A later declaration closes a past session and gives another an earlier close.
+    corrected = _declaration(SECOND, ("2025-01-06",), sessions=(("2025-01-07", "09:00", "12:00"),))
+    planned = cast("dict[str, object]", _refresh(ws, corrected, apply=False)["changes"])
+    assert planned["changed"] == 2
+    second = _refresh(ws, corrected)
+    promotion = cast("dict[str, object]", second["promotion"])
+    assert (promotion["published"], promotion["operations"]) == (True, {"SUPERSEDE": 2})
+    assert promotion["stale"] == 0
+    second_pin = _pin(ws, _generation(second))
+    after = _sessions(ws, second_pin)
+    assert after[PAST]["status"] == "closed"
+    assert after[early]["close_at_us"] == _local(early, 12)
+    for day in (PAST, early):
+        received = cast("int", after[day]["ingested_at_us"])
+        assert received >= us(at("2025-01-20T00:00:00"))
+        assert after[day]["available_at_us"] == after[day]["revision_known_at_us"] == received
+        assert received > cast("int", before[day]["revision_known_at_us"])
+    # A strict read between the two declarations still sees the first one's schedule.
+    between = HeadQuery(cutoff_us=us(at("2025-01-15T00:00:00")))
+    strict = _sessions(ws, second_pin, between, GRANT)
+    assert (strict[PAST]["status"], strict[early]["close_at_us"]) == ("open", _local(early, 15, 30))
+    assert strict[PAST]["revision_known_at_us"] == _local(PAST, 15, 30)
+    # Without the grant a strict read relies on none of the declared bounds.
+    assert _sessions(ws, second_pin, between) == {}
+    # Reopening the past date in a third declaration lands as well.
+    third = cast("dict[str, object]", _refresh(ws, _declaration(THIRD))["promotion"])
+    assert (third["published"], third["operations"]) == (True, {"SUPERSEDE": 2})
+    reopened = _sessions(ws, _pin(ws, str(third["generation_id"])))
+    assert (reopened[PAST]["status"], reopened[PAST]["close_at_us"]) == (
+        "open",
+        _local(PAST, 15, 30),
+    )
+    assert cast("int", reopened[PAST]["revision_known_at_us"]) >= cast(
+        "int", after[PAST]["revision_known_at_us"]
+    )
+
+
+def test_refresh_refuses_a_stale_plan(ws: Workspace, monkeypatch: pytest.MonkeyPatch) -> None:
+    from aegis_alpha.storage import calendar_refresh  # noqa: PLC0415 -- patched module
+
+    def stale(*_args: object, apply: bool, **_kwargs: object) -> dict[str, object]:
+        assert apply is False
+        return {"mode": "plan", "stale": 2}
+
+    monkeypatch.setattr(calendar_refresh, "promote", stale)
+    with pytest.raises(ValueError, match="2 changed dates"):
+        _refresh(ws, _declaration(FIRST))
 
 
 def test_session_times_are_bounded_by_the_declaration(ws: Workspace) -> None:
@@ -290,6 +361,11 @@ def test_cli_refreshes_the_packaged_calendars(tmp_path: Path) -> None:
                 "AND session_date >= DATE '2027-01-01' GROUP BY 1"
             ).fetchall()
         )
+        versions = workspace.market.execute(
+            "SELECT DISTINCT timezone_version FROM calendar_sessions"
+        ).fetchall()
     assert opened == {"XKRX": 247, "XNYS": 251}
+    # Rows, and so generation IDs, follow the locked DuckDB's zone data label.
+    assert versions == [(timezone_version(),)]
     rerun = cast("list[dict[str, object]]", calendar("--calendar", "XNYS")["calendars"])
     assert cast("dict[str, object]", rerun[0]["promotion"])["empty_delta"] is True
