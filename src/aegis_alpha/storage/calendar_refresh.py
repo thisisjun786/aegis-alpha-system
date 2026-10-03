@@ -284,7 +284,8 @@ def refresh_calendar(  # noqa: PLR0913 -- one document, its hash and the run's i
     if planned.get("stale"):
         raise ValueError(
             f"{planned['stale']} changed dates of the declaration are older than the "
-            f"{declaration.dataset_id} head revisions they would replace"
+            f"{declaration.dataset_id} head revisions they would replace; nothing was "
+            f"promoted and the declaration's source {pin.source_id} stays committed for reuse"
         )
     result = promote(workspace, spec, spec_sha, apply=True, budget=budget) if apply else planned
     return {**report, "spec_sha256": spec_sha, "promotion": result}

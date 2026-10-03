@@ -3,7 +3,8 @@
 The comparison is review evidence for a declaration, never an input to it. It opens the
 market DuckDB file read-only, reads every committed source-library table whose source id
 starts with ``--source-prefix`` and whose table name is ``--table``, and reports, inside
-the source's observed date range::
+the source's observed date range within the declaration (dates outside it are counted
+apart, never as closed)::
 
     uv run --no-sync python -m scripts.calendar_compare --market MARKET.duckdb \\
         --calendar XKRX --source-prefix qveris-kr-history-62d23e53 --table bars
@@ -82,6 +83,11 @@ def observed(
 def compare(calendar_id: str, days: dict[date, tuple[int, int, int]]) -> dict[str, object]:
     raw = packaged_declaration(calendar_id)
     declaration = parse_declaration(raw, hashlib.sha256(raw).hexdigest())
+    covered = {
+        day: value for day, value in days.items() if declaration.start <= day < declaration.end
+    }
+    outside = len(days) - len(covered)
+    days = covered
     first, last = min(days), max(days)
     status = {item.session_date: item.status for item in declaration.days()}
     declared = {day for day, value in status.items() if value == "open" and first <= day <= last}
@@ -100,6 +106,7 @@ def compare(calendar_id: str, days: dict[date, tuple[int, int, int]]) -> dict[st
         "observed_range": [first.isoformat(), last.isoformat()],
         "declared_sessions": len(declared),
         "observed_dates": len(days),
+        "observed_dates_outside_declaration": outside,
         "traded_dates": len(traded),
         "both": len(declared & traded),
         "traded_but_declared_closed": [

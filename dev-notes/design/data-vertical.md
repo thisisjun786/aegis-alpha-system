@@ -444,8 +444,8 @@ generation에 승격하며, 두 시점 열은 `declared_session_end@1`(근거 `r
 - 근거가 `record`이므로 SUPERSEDE의 두 시점은 [revision 시점](#revision-시점) 규칙대로 정정 선언을 담은
   원천의 증거 시각(AAS가 그 선언을 commit한 `sl:` link 시각)이다. 정정은 그 선언이 있기 전에 알려지지
   않고, 두 선언 사이 cutoff의 strict 읽기는 이전 선언의 일정을 돌려주며, 정정 revision의 시점은 그것이
-  대체하는 revision보다 이르지 않다. 그래도 계획에 stale 행이 남으면 갱신은 아무것도 게시하지 않고
-  거부한다.
+  대체하는 revision보다 이르지 않다. 그래도 계획에 stale 행이 남으면 갱신은 아무것도 승격하지 않고
+  거부한다. 이미 commit한 선언 원천은 내용 원천이라 남고, 오류가 그 원천 ID를 알리며 다음 갱신이 재사용한다.
 - head를 만든 선언보다 `declared_at`이 이른 선언, 같은 `declared_at`의 다른 내용, 다른 달력·venue·시간대,
   현재보다 늦은 `declared_at`, head 선언이 진술한 날짜를 모두 덮지 않는 범위는 거부한다. 그래서 오래된
   선언이 새 선언의 정정을 되돌리지 못하고, 진술된 날짜가 새 선언 밖에 남지 않는다.
