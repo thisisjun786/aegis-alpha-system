@@ -356,6 +356,10 @@ def _recover_one(  # noqa: PLR0911 -- one route per operation kind
         from aegis_alpha.storage.strategy_import import recover_strategy_import  # noqa: PLC0415
 
         return recover_strategy_import(workspace, operation)
+    if kind == "strategy_registry":
+        from aegis_alpha.storage.strategy_registry import recover_registration  # noqa: PLC0415
+
+        return recover_registration(workspace, dict(operation))
     if kind == "source_import":
         from aegis_alpha.storage.source_library import recover_source  # noqa: PLC0415
 
@@ -478,5 +482,14 @@ def quarantine(workspace: Workspace, operation_id: str, reason: str) -> dict[str
         ).fetchone()
     ):
         raise ValueError("committed strategy must be recovered")
+    if workspace.strategies is not None:
+        from aegis_alpha.storage.strategy_registry import admit_registry  # noqa: PLC0415
+
+        if admit_registry(workspace.strategies, create=False) and (
+            workspace.strategies.execute(
+                "SELECT 1 FROM strategy_registrations WHERE operation_id=?", (operation_id,)
+            ).fetchone()
+        ):
+            raise ValueError("committed strategy registration must be recovered")
     quarantine_operation(workspace.state, operation_id, reason)
     return {"quarantined": operation_id, "reason": reason, "deleted": False}

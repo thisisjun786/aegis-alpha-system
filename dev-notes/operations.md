@@ -32,6 +32,9 @@ aas strategy list
 aas strategy show --id ID --version VERSION --sha256 SHA256
 aas strategy show --id ID --version VERSION --sha256 SHA256 \
   --requirements /path/to/requirements.json --requirements-sha256 SHA256
+aas strategy promote --source SOURCE_ID --sha256 SHA256 --plan
+aas strategy promote --source SOURCE_ID --sha256 SHA256 --apply
+aas strategy definitions [--id ID]
 aas data datasets
 aas data import /path/to/typed-data.json --sha256 SHA256
 aas data inspect --dataset ID --version VERSION
@@ -51,6 +54,18 @@ aas data read --dataset ID --version VERSION --cutoff-us UTC_MICROSECONDS
 계보 없는 v1은 그대로 지원한다. 상태를 봉인하지 않은 중간 개발 버전의 caller-only 계보 v1은
 원본을 보존하지만 조회·재봉인·검증·복구 완료·백업·ready 복원은 거부한다. 자동 변환은 없다.
 정확한 바이트 규약과 호환 한계는 [계보 프로토콜](design/strategy-lineage.md)에 있다.
+
+`strategy promote`는 `db source-import`로 보존한 전략 원본 레코드(`strategy`·`asset_dependency`·
+`macro_dependency` 테이블)를 [정의 문서](design/data-vertical.md#전략-레지스트리)로 등록한다.
+`--sha256`은 그 원천을 적재할 때의 SHA-256이다. `--plan`은 아무것도 쓰지 않고 전략 수, 새 전략·새
+버전·재사용 버전 수, 요구 행의 도메인·사상 상태별 수, dataset ID마다 요구 수·전략 수와 state
+카탈로그의 등록 여부(`in_catalog`)·committed 버전 수, 사상되지 않은 토큰과 이유, 원천 의존 테이블과
+요청이 어긋난 전략(`dependency_mismatches`)을 보고한다. `--apply`는 어긋난 전략이 하나라도 있으면
+거부하고, 같은 원천으로 다시 실행하면 `reused=true`로 끝나며 바뀌는 것이 없다. 내용이 바뀐 레코드는
+새 버전이 되고 이전 버전은 그대로 남는다. 정의는 실행 bundle이 아니므로 `strategy list`에 나오지 않고
+`strategy definitions`로 조회하며 모든 행이 `execution_eligible=false`다. 원천 테이블은 계산 예산
+(설정한 AAS compute 환경, 없으면 1 GiB 직렬 기본값)으로 승인한다. 등록 작업이 PREPARED로 남으면
+`aas db recover`가 저장된 정의를 다시 도출해 완료하고 원천을 다시 읽지 않는다.
 
 `strategy show`는 고정한 전략의 실행 정의를 JSON으로 출력하며 계산·기록을 하지 않는다.
 출력에는 자산·현금 ID, 역할별 입력 요구, 달력 규약, `required_convention_roles`,

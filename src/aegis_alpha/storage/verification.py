@@ -248,6 +248,9 @@ def verify_workspace(  # noqa: C901, PLR0912, PLR0915 -- full cross-store verifi
     # Only the count is needed from here on, so this charge is released.
     del strategies
     verify_strategy_imports(workspace)
+    from aegis_alpha.storage.strategy_registry import verify_registry  # noqa: PLC0415
+
+    registry = verify_registry(workspace)
     # read_convention decodes and re-canonicalizes one whole document at a time.
     _admit_document(
         workspace.state.execute(
@@ -290,6 +293,9 @@ def verify_workspace(  # noqa: C901, PLR0912, PLR0915 -- full cross-store verifi
     }
     if unfinished_runs:
         report["unfinished_runs"] = unfinished_runs
+    # The count appears once the registry add-on exists, so other reports keep their shape.
+    if registry is not None:
+        report["strategy_registry"] = registry
     from aegis_alpha.storage.source_library import verify_sources  # noqa: PLC0415
 
     # The catalog and generation lists are still held, so source verification is

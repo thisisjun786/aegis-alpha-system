@@ -1924,7 +1924,8 @@ state v2:
 `--apply`는 다음이 모두 성립하는 원천만 처리하고, 성립하지 않는 원천은 이유와 함께 보고한다.
 
 1. **참조 없음**: committed generation 명세의 원천 pin, generation 행의 `source_snapshot_id`,
-   `dataset_sources`, 입력 binding 중 어느 것도 그 원천을 가리키지 않는다. 원천 자신의
+   `dataset_sources`, 입력 binding, 전략 레지스트리 등록(`strategy_registrations.source_id`) 중 어느
+   것도 그 원천을 가리키지 않는다. 원천 자신의
    source-link 행(`sl:` snapshot)은 참조로 세지 않는다. 그 행은 은퇴 뒤에도 계보로 남는다.
 2. **동치 증명**: `equivalence_spec`이 비교할 테이블과 열을 명시하고, 그 열들의 정규 행 multiset에
    대한 `aas-rowset-v1` digest가 은퇴할 원천과 `equivalent_to_source_id`에서 같다.
@@ -1936,6 +1937,69 @@ state v2:
 
 물리 공간 회수는 `aas db compact --to NEW_ROOT`가 새 루트로 복원하듯 옮기고 deep verify를 통과한 뒤
 설정을 바꾼다. 원래 파일은 그 전까지 그대로 남는다.
+
+## 전략 레지스트리
+
+전략 원본 레코드는 원천 자료실에 `source_only`로 보존된 작성자의 요청이다. `aas strategy promote
+--source ID --sha256 H --plan|--apply`가 그 레코드를 비공개 전략 저장소의 불변 정의 문서로 등록한다.
+`storage/strategy_registry.py`가 이 경로를 소유한다. 정의는 엔진 bundle이 아니다. `strategy_versions`에
+들어가지 않고, 실행·연구·백테스트 자격을 주지 않으며, 원본을 bundle로 추정 변환하지 않는다. 실행에
+쓰려면 검증된 bundle을 `aas strategy import`로 같은 전략 ID에 따로 등록한다.
+
+**원천 형식 `snowball-request@1`.** 원천은 `strategies` 저장소의 원천 자료실 commit이고 정확히 이 열을
+가진 세 테이블을 담는다. `strategy`(`id`, `title`, `source_type`, `country`, `is_personal`, `report_path`,
+`request_json`, `normalized_json`, `exact_hash`, `rule_hash`, `family_hash`, `start_date`, `finish_date`,
+`source_data_basis`, `quality_status`), `asset_dependency`(`strategy_id`, `role`, `ordinal`,
+`raw_token_json`, `token_kind`), `macro_dependency`(`strategy_id`, `ordinal`, `raw_json`). 세 테이블은
+원천 pin(원천 ID, 원천 SHA-256, 테이블 digest)으로 검증한 뒤 읽는다. 다른 모양의 원천, 다른 SHA-256,
+같은 전략 ID가 두 번 나오는 원천은 거부한다.
+
+**정의 문서 `aas-strategy-definition-v1`.** 레코드 하나가 문서 하나다. 문서는 `strategy_id`,
+`source_format`, `requirement_map`, `title`, `country`, `source_type`, `is_personal`, `report_path`,
+`start_date`, `finish_date`, `data_basis`, `quality_status`, 원천이 계산한 `source_hashes`(`exact`, `rule`,
+`family`), 해독한 `request`를 원래 값 그대로 담는다. 원천이 스스로 유도한 `normalized_json`은 담지
+않는다. 저장 bytes는 정규 JSON이고 버전은 `def-` + 문서 SHA-256의 앞 16자다. 그래서 내용이 같으면 같은
+버전이고, 내용이 바뀐 레코드는 새 버전이 되며 이전 버전은 그대로 남는다. 정의·요구·출처·등록 행은
+UPDATE와 DELETE를 거부한다. 같은 정의를 다른 원천에서 다시 만나면 버전은 재사용되고 출처 행만 더해진다.
+`strategies` 행은 전략 ID와 앞뒤 공백을 뺀 제목으로 처음 한 번 만들어진다.
+
+**요구 사상표 `aas-strategy-requirement-map-v1`.** 정의의 요구 행은 저장된 문서에서만 유도되고 검증할
+때마다 다시 유도해 대조한다.
+
+- 가격 역할은 요청 경로 `/offensive`, `/defensive_rule/defensive`, `/defensive_rule/unallocated`,
+  `/canary/etf_list`, `/defensive_rule/abs_compare`, `/asset_selection_rule/abs_compare`의 원소마다
+  하나, `/benchmark` 하나다. 배열 경로의 ordinal은 원소 위치이고 값이 없는 경로는 행을 만들지 않는다.
+- 거시 역할은 `/crash_protection/crash_protector`의 원소마다 하나이고 토큰은 그 `func`다.
+- `CASH`는 `cash` 도메인의 `not_applicable`이다. 여섯 자리 숫자 코드는 `prices.kr.eodhd`, 미국 상장
+  ticker 모양은 `prices.us.norgate`에 `mapped`된다. 벤치마크의 `6040`·`SP500`·`NASDAQ`·`KOSPI`는 상장
+  종목이 아닌 합성 지표라서 `unmapped`(`composite_benchmark`)다. 어느 모양도 아닌 토큰은
+  `unmapped`(`unrecognized_token`)다.
+- 거시 `T10Y2Y`·`T10Y3M`은 같은 이름의 ALFRED series로 `macro.us.alfred`에 `mapped`된다. 다른 함수는
+  등록된 파생 정의가 없으므로 `unmapped`(`derived_series`)다.
+- `weight_calculation_rule.constant`가 위 경로 어디에도 없는 자산을 가리키면 정의를 거부한다. 가격
+  입력이 요구 행 없이 남지 않게 하기 위해서다.
+
+사상표를 바꾸면 새 map ID가 되고, 따라서 그 사상표를 쓰는 정의는 새 버전이 된다. 저장된 정의의 의미는
+바뀌지 않는다. 요구 행의 dataset ID는 소비자가 pin할 dataset의 후보이며 pin이나 binding이 아니다.
+
+**대조.** 유도한 가격·거시 요구는 원천의 `asset_dependency`·`macro_dependency`와 (역할, ordinal, 토큰)
+집합으로 같아야 한다. 어긋난 전략은 `--plan`이 `dependency_mismatches`로 보고하고 `--apply`는 등록
+전체를 거부한다. `--plan`은 쓰지 않고 dataset ID마다 요구 수·전략 수, state 카탈로그(`datasets`)에
+있는지, committed 버전 수를 보고한다. 카탈로그에 없는 dataset을 가리키는 요구도 그대로 등록된다. 등록은
+요구를 기록할 뿐 그 dataset이 있다고 주장하지 않는다.
+
+**쓰기와 복구.** 등록은 `aas-strategy-registry-request-v1` 요청 hash(원천 pin, 세 테이블 digest, 원천
+형식, 정의 schema, 사상표)로 state intent(`strategy_registry`)를 PREPARED로 남기고, 비공개 저장소의 한
+트랜잭션에서 `strategy_registrations` marker, 전략, 정의, 요구, 출처 행을 쓴 뒤 intent를 완료한다.
+intent의 payload hash는 등록 대상 `(strategy_id, version, document_sha256)` 집합의 hash다. 같은 요청을 다시
+실행하면 marker를 재사용한다. marker가 commit된 채 PREPARED로 남은 intent는 `aas db recover`가 marker가
+덮는 정의를 다시 유도해 완료하며 원천을 다시 읽지 않는다. `aas db quarantine`은 그 intent를 끝내지 않는다.
+`aas db verify`는 marker와 intent를 양방향으로 대조하고 모든 정의의 hash와 요구 행을 다시 확인해
+`strategy_registry`(등록 수, 전략 수, 정의 수)로 보고한다.
+
+**저장 확장.** 레지스트리 테이블은 원천 자료실처럼 `strategies.sqlite3` 안의 별도 확장이다.
+`strategy_registry_schema`가 버전과 DDL checksum을 한 행으로 기록하고, 다른 checksum은 거부한다. 확장은 첫
+`--apply`가 만들며 `--plan`은 만들지 않는다. strategies core schema는 v1 그대로다.
 
 ## 계약과 테스트 대응표
 
@@ -2310,3 +2374,13 @@ state v2:
 | DV-367 | 답을 보존하지 못한 SEC 문서 요청은 물은 것으로 보아 같은 날 다시 묻지 않고 하루 뒤 다시 묻는다 | `tests/storage/test_us_collection.py::test_an_uncertain_document_ask_is_asked_again_the_next_day` | 구현 |
 | DV-368 | 행이 읽히지 않는 CSV 답은 `FAILED`이고 그 FRED 날을 덮지 않아 다음 실행이 다시 받는다 | `tests/storage/test_us_collection.py::test_a_csv_download_whose_rows_do_not_read_is_failed_and_asked_again` | 구현 |
 | DV-369 | pyarrow가 없으면 US 수집은 원장이나 공급자 호출 전에 멈춘다 | `tests/storage/test_us_collection.py::test_a_run_without_pyarrow_stops_before_any_call` | 구현 |
+| DV-370 | `strategy promote --plan`은 원천의 모든 레코드를 세고 요구를 dataset ID별로 state 카탈로그와 대조하며 아무것도 쓰지 않는다 | `tests/storage/test_strategy_registry.py::test_plan_reports_every_record_and_reconciles_requirements_with_the_catalog` | 구현 |
+| DV-371 | 요구 사상표 v1은 가격·현금·벤치마크·거시 입력을 모두 행으로 만들고 목록에 없는 자산의 고정 비중을 거부한다 | `tests/storage/test_strategy_registry.py::test_requirement_map_derives_every_named_input` | 구현 |
+| DV-372 | `--apply`는 계획과 같은 전략 집합을 등록하고 같은 원천의 재실행은 재사용이다 | `tests/storage/test_strategy_registry.py::test_apply_registers_the_planned_set_and_a_repeat_is_reused` | 구현 |
+| DV-373 | 정의 버전은 내용 hash이고, 바뀐 레코드는 새 버전이며 저장된 정의·요구·등록 행은 바뀌거나 지워지지 않는다 | `tests/storage/test_strategy_registry.py::test_definition_versions_are_immutable` | 구현 |
+| DV-374 | 원천 의존 테이블과 요청이 어긋나면 계획이 보고하고 등록은 아무것도 쓰지 않고 거부한다 | `tests/storage/test_strategy_registry.py::test_a_dependency_table_that_disagrees_is_reported_and_refused` | 구현 |
+| DV-375 | 원천 형식이 아니거나 SHA-256이 다른 원천은 거부된다 | `tests/storage/test_strategy_registry.py::test_a_source_of_another_shape_or_hash_is_refused` | 구현 |
+| DV-376 | marker가 commit된 등록 intent는 원천을 다시 읽지 않고 복구되며 격리되지 않는다 | `tests/storage/test_strategy_registry.py::test_an_interrupted_registration_is_recovered_from_its_marker` | 구현 |
+| DV-377 | 저장된 요구 행이 정의에서 다시 유도한 행과 다르면 검증이 실패한다 | `tests/storage/test_strategy_registry.py::test_a_changed_definition_fails_verification` | 구현 |
+| DV-378 | `aas strategy promote`와 `aas strategy definitions`는 계획·등록·조회·검증을 CLI로 끝낸다 | `tests/storage/test_strategy_registry.py::test_strategy_promote_cli_plans_applies_and_lists` | 구현 |
+| DV-379 | 전략 레지스트리 등록이 가리키는 원천은 은퇴 대상에서 참조로 세어 거부된다 | `tests/storage/test_source_retirement.py::test_a_source_a_strategy_registration_names_is_referenced` | 예정 |

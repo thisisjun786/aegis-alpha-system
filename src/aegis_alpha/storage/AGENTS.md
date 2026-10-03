@@ -329,6 +329,16 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   differing content or lineage fails. `db recover` completes a committed import
   whose state operation was left PREPARED by verifying stored content only; it
   grants no execution eligibility.
+- `strategy_registry` registers retained source strategy records as immutable
+  `aas-strategy-definition-v1` documents in an independently versioned add-on of the
+  private store (`strategy_registry_schema`), never as `strategy_versions` rows: a
+  definition is not an engine bundle and grants no eligibility. The version is the
+  document's content hash, so changed content is a new version and the old one stays.
+  Requirement rows are re-derived from the stored document through the versioned
+  requirement map on every verification, and a source whose own dependency tables
+  disagree with its requests is refused. One state intent, one private transaction
+  ending in the `strategy_registrations` marker, then completion; `db recover` finishes
+  a committed marker from stored evidence alone and `quarantine` refuses it.
 - `runs` owns the formal run lifecycle. `open_run` commits the intent before any
   calculation and seals the envelope and preparation; `commit_run` seals the result,
   commits the market marker, then records receipts and ends the run SUCCESS;

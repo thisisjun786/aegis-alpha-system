@@ -169,6 +169,13 @@ universe·전략·시장 관례의 exact version/hash를 묶고, 각 의사결�
 기록을 대조하고 내용·행 수를 검증한다. 원본 자료는 실행 전략이나 PIT 데이터 게시물로
 자동 승격되지 않으며 `aas db sources/source-tables/source-read`로 조회한다.
 
+`storage/strategy_registry`는 원본 자료실에 보존한 전략 원본 레코드를 비공개 전략 DB의
+불변 정의 문서(`aas-strategy-definition-v1`)로 등록한다. 정의의 버전은 문서 내용의 해시이고,
+정의가 이름 붙인 입력은 버전이 붙은 요구 사상표로 dataset ID에 연결된다. 정의는 실행 bundle이
+아니어서 `strategy_versions`에 들어가지 않고 실행·연구·백테스트 자격을 주지 않는다. 같은
+저장소 안의 별도 버전·체크섬 확장이며 계약은 [데이터 수직 설계](design/data-vertical.md#전략-레지스트리)가
+소유한다.
+
 원천 자료실 자료를 PIT 조회 가능한 시장 generation으로 만드는 길은 하나로 정해져 있다.
 [데이터 수직 계약](design/data-vertical.md)과 [0017](decisions/0017-data-vertical-contract.md)에 따라
 해시로 고정한 `aas-promotion-v1` 명세가 원천 pin·매퍼·시간 규칙·숫자 규칙·품질 규칙·identity
