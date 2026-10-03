@@ -969,15 +969,16 @@ Norgate security master 하나에서 모두 나온다.
   참조 구현이다.
 - 쌍은 통째로 받거나 거부하며 고쳐 쓰지 않는다: asset ID가 양의 정수가 아님(`assetid_invalid`),
   지수 이름이 다듬어진 텍스트가 아님(`indexname_invalid`), 값이 `0`/`1`이 아님(`constituent_invalid`),
-  날짜가 `YYYY-MM-DD`가 아님(`date_invalid`), 날짜가 원천 행 순서로 엄격히 증가하지 않음
+  날짜가 `YYYY-MM-DD`가 아니거나 다음 날을 나타낼 수 없는 `9999-12-31`임(`date_invalid`), 날짜가 원천 행 순서로 엄격히 증가하지 않음
   (`dates_not_increasing`, 같은 날짜의 반복 포함), 두 원천이 같은 쌍을 실음(`pair_repeated`, 이어 붙이지
   않는다). 두 원천이 실은 쌍은 한 사본이 다른 이유로 거부돼도 다른 사본을 받지 않는다: 이미 거부된 사본은
   제 이유를 유지하고 나머지 사본이 `pair_repeated`가 된다. 보고의 행 단위는 쌍이다.
 - 상장 universe의 member는 master 행마다 `first_date`의 New York 0시부터 `last_date` 다음 날의 New York
   0시까지다. 상장 중이고 `last_date`가 없는 행은 master의 마지막 관측 세션(`through`, US 등록과 같은
   정의)까지다. `first_date`가 없거나(`listing_start_unknown`), 상폐 행에 `last_date`가 없거나
-  (`listing_end_unknown`), 두 날짜가 거꾸로이거나(`listing_dates_reversed`), 같은 asset ID의 두 행
-  (`assetid_repeated`)은 member가 되지 않는다. 그 밖의 master 거부 이유는 `norgate.master@1`과 같다.
+  (`listing_end_unknown`), 두 날짜가 거꾸로이거나(`listing_dates_reversed`), 끝 날짜가 다음 날을 나타낼
+  수 없는 `9999-12-31`이거나(`listing_end_invalid`), 같은 asset ID의 두 행(`assetid_repeated`)은 member가
+  되지 않는다. 그 밖의 master 거부 이유는 `norgate.master@1`과 같다.
 - member는 identity 등록이 이미 가진 instrument `mint('norgate_assetid', assetid)`이고 문서의 instrument
   행은 등록된 행 그대로다. 등록되지 않은 asset ID는 문서에 넣지 않고 `unresolved`로 보고한다.
 - 원천 행에는 수집 시각이 없으므로 member는 그 원천 `sl:` 연결의 `retrieved_at_us`부터 알려지고
@@ -1318,10 +1319,11 @@ state v2:
 | DV-172 | 원천 ID 접두사를 선언한 매퍼는 다른 공급자의 원천 pin을 명세 단계에서 거부한다 | `tests/storage/test_macro_fx.py::test_legacy_fred_and_kr_public_sources_promote` | 구현 |
 | DV-173 | 지수 구성 쌍의 연속한 `1` 행 묶음은 member 구간 하나이고, 구간을 쌍의 날짜에 펼치면 원래 일간 값이 나온다 | `tests/storage/test_universe.py::test_interval_compression_round_trips_daily_values` | 구현 |
 | DV-174 | 지수 구성의 SQL 압축은 참조 구현과 같은 구간을 내고, 두 원천이 실은 쌍은 이어 붙이지 않고 통째로 거부한다 | `tests/storage/test_universe.py::test_index_universe_sql_matches_the_reference_and_round_trips` | 구현 |
-| DV-175 | 값·날짜·순서·지수 이름이 정규가 아닌 쌍은 이유와 함께 통째로 거부하고, 등록되지 않은 asset ID는 미해결로 보고한다 | `tests/storage/test_universe.py::test_index_pairs_with_unreadable_values_are_refused` | 구현 |
-| DV-176 | 지수 universe는 chunked 문서로 등록되고 재등록은 같은 pin이며, 읽기와 `aas db verify`를 통과한다 | `tests/storage/test_universe.py::test_index_universes_register_and_read_back` | 구현 |
+| DV-175 | 값·날짜·순서·지수 이름이 정규가 아니거나 `9999-12-31`을 담은 쌍은 이유와 함께 통째로 거부하고, 등록되지 않은 asset ID는 미해결로 보고한다 | `tests/storage/test_universe.py::test_index_pairs_with_unreadable_values_are_refused` | 구현 |
+| DV-176 | 지수 universe는 chunked 문서로 등록되고 재등록은 같은 pin이며, 한 build의 universe는 모두 등록되거나 하나도 등록되지 않고, 읽기와 `aas db verify`를 통과한다 | `tests/storage/test_universe.py::test_index_universes_register_and_read_back` | 구현 |
 | DV-177 | 상장 universe의 member는 master 행의 `first_date`부터 `last_date` 다음 날까지이고 `last_date` 없는 상장 행은 `through`까지다 | `tests/storage/test_universe.py::test_listing_universe_spans_each_master_listing` | 구현 |
 | DV-178 | universe part는 원천별로 채우고 읽기는 member를 정규 순서로 돌려준다 | `tests/storage/test_universe.py::test_universe_parts_are_filled_source_by_source` | 구현 |
-| DV-179 | `aas universe --plan`은 쓰지 않고, 만들 수 없는 `--report` 경로는 등록 전에 거부하며, 등록한 universe를 `aas universe show`가 읽는다 | `tests/storage/test_universe.py::test_universe_cli_plans_registers_and_shows` | 구현 |
+| DV-179 | `aas universe --plan`은 쓰지 않고, 만들 수 없는 `--report` 경로는 등록 전에 거부하며, `--report`는 pin을 담고, 등록한 universe를 `aas universe show`가 읽는다 | `tests/storage/test_universe.py::test_universe_cli_plans_registers_and_shows` | 구현 |
 | DV-180 | 두 원천이 실은 쌍은 한 사본이 다른 이유로 거부돼도 나머지 사본을 받지 않고 `pair_repeated`로 거부한다 | `tests/storage/test_universe.py::test_a_pair_two_sources_carry_is_refused_when_one_copy_is_refused` | 구현 |
 | DV-181 | 원천 순서가 맞아도 두 part에 걸친 같은 member key는 읽기와 verify에서 거부한다 | `tests/storage/test_universe.py::test_a_member_key_repeated_across_parts_is_refused` | 구현 |
+| DV-182 | 끝 날짜가 `9999-12-31`인 상장은 `listing_end_invalid`로 거부되고 `through`를 옮기지 않는다 | `tests/storage/test_universe.py::test_a_listing_ending_on_the_last_representable_date_is_refused` | 구현 |

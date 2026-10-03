@@ -69,9 +69,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         ):
             # Checked before anything is registered, so a refused path never follows a write.
             raise ValueError(f"cannot create new file {report.name}: it exists or has no folder")
-        with open_workspace(
-            home, writable=writes, strategy_write=writes, require_strategies=False
-        ) as workspace:
+        with open_workspace(home, writable=writes, require_strategies=False) as workspace:
             if command == "index":
                 build = universe.build_index_universes(
                     workspace, args.source, version=args.version, indexes=args.index
@@ -83,7 +81,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             registered = universe.register_universes(workspace.state, build, apply=writes)
     except (sqlite3.Error, duckdb.Error):
         raise ValueError("local database operation failed; run aas db verify") from None
-    if args.report is not None:
-        full = json.dumps(build.summary(sample=None), ensure_ascii=False, sort_keys=True)
-        _new_files([(args.report, full.encode())])
+    if report is not None:
+        full = {**build.summary(sample=None), **registered}
+        _new_files([(report, json.dumps(full, ensure_ascii=False, sort_keys=True).encode())])
     return {**build.summary(), **registered}

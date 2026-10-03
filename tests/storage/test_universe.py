@@ -207,14 +207,16 @@ def test_index_pairs_with_unreadable_values_are_refused(ws: Workspace) -> None:
         *_rows(4, INDEX, [(days[1], "1"), (days[0], "1")]),
         *_rows(5, INDEX, [(days[0], "1"), (days[0], "1")]),
         *_rows(6, " Padded", [(days[0], "1")]),
+        # The day after 9999-12-31 is not a date, so no interval can end there.
+        *_rows(7, INDEX, [(days[0], "1"), ("9999-12-31", "1")]),
         *_rows(9, INDEX, [(days[0], "1")]),
     ]
     source = _commit_membership(ws, "bad", rows)
-    _register_master(ws, [master(assetid, f"S{assetid}") for assetid in (1, 2, 3, 4, 5, 6)])
+    _register_master(ws, [master(assetid, f"S{assetid}") for assetid in (1, 2, 3, 4, 5, 6, 7)])
     build = build_index_universes(ws, [source], version="v1")
     assert build.report.refused == {
         "constituent_invalid": 1,
-        "date_invalid": 1,
+        "date_invalid": 2,
         "dates_not_increasing": 2,
         "indexname_invalid": 1,
     }
@@ -266,6 +268,20 @@ def test_index_universes_register_and_read_back(ws: Workspace) -> None:
     applied = register_universes(ws.state, build, apply=True)
     assert plan["pins"] == applied["pins"]
     assert register_universes(ws.state, build, apply=True) == applied
+    # A build registers every universe or none: a conflict on one leaves the others out.
+    held = build_index_universes(ws, [source], version="held", indexes=[INDEX])
+    for member in held.universes[0].members:
+        member["known_from_us"] = cast("int", member["known_from_us"]) + 1
+    register_universes(ws.state, held, apply=True)
+    with pytest.raises(ValueError, match="mismatch"):
+        register_universes(
+            ws.state, build_index_universes(ws, [source], version="held"), apply=True
+        )
+    other = ws.state.execute(
+        "SELECT count(*) FROM universe_versions WHERE universe_id=? AND version LIKE 'held%'",
+        (INDEX_UNIVERSE_PREFIX + "Other",),
+    ).fetchone()[0]
+    assert other == 0
     pins = {
         cast("str", row["universe_id"]): UniversePin(
             cast("str", row["universe_id"]),
@@ -321,6 +337,21 @@ def test_listing_universe_spans_each_master_listing(ws: Workspace) -> None:
     assert {m["known_from_us"] for m in universe.members} == {recorded_link(ws, master_id)}
     applied = register_universes(ws.state, build, apply=True)
     assert cast("list[dict[str, object]]", applied["pins"])[0]["universe_id"] == LISTING_UNIVERSE
+
+
+def test_a_listing_ending_on_the_last_representable_date_is_refused(ws: Workspace) -> None:
+    """No interval can end the day after 9999-12-31, and that date does not move ``through``."""
+    rows = [
+        master(28, "FAR-201001", delisted=True, first_date="2001-01-02", last_date="9999-12-31"),
+        master(29, "OK", first_date="2001-01-02", last_date="2001-02-02"),
+    ]
+    master_id = commit(ws, "norgate-master", "observations", table(rows, MASTER_SCHEMA))
+    build = build_listing_universe(ws, master_id, version="v")
+    assert build.report.refused == {"listing_end_invalid": 1}
+    (universe,) = build.universes
+    assert universe.detail["through"] == "2001-02-02"
+    # No identity is registered here, so the one listing that has a span is unresolved.
+    assert universe.unresolved == ["29"]
 
 
 def _two_source_universe(ws: Workspace, count: int) -> tuple[dict[str, object], list[str]]:
@@ -473,6 +504,8 @@ def test_universe_cli_plans_registers_and_shows(tmp_path: Path) -> None:
     assert main([*arguments, "--report", str(report)]) == 0
     full = json.loads(report.read_text())
     assert full["universes"][0]["members"] == 1
+    assert full["mode"] == "apply"
+    assert [pin["universe_id"] for pin in full["pins"]] == [INDEX_UNIVERSE_PREFIX + INDEX]
     universe_id = INDEX_UNIVERSE_PREFIX + INDEX
     show = ["universe", "show", "--home", str(home), "--id", universe_id, "--version", "v1"]
     assert main(show) == 0

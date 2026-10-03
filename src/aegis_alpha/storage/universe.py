@@ -46,6 +46,7 @@ from aegis_alpha.storage.membership_pins import (
     register_universe_manifest,
 )
 from aegis_alpha.storage.source_identity import LINK_PREFIX
+from aegis_alpha.storage.state import atomic
 from aegis_alpha.storage.us_identity import (
     MASTER_TABLE,
     LinkedRows,
@@ -151,7 +152,9 @@ WITH r AS (
 )
 SELECT assetid, indexname, 'pair' AS kind, count(*) AS rows,
        count(*) FILTER (WHERE v IS NULL OR v NOT IN ('0', '1')) AS bad_value,
-       count(*) FILTER (WHERE day IS NULL OR strftime(day, '%Y-%m-%d') <> d) AS bad_date,
+       count(*) FILTER (
+         WHERE day IS NULL OR strftime(day, '%Y-%m-%d') <> d OR day >= DATE '9999-12-31'
+       ) AS bad_date,
        count(*) FILTER (WHERE prev IS NOT NULL AND day <= prev) AS unordered,
        min(day) AS first_day, max(day) AS last_day
 FROM c GROUP BY assetid, indexname
@@ -509,6 +512,8 @@ def _listing_span(listing: Listing, through: date | None) -> Interval | str:
         return "listing_end_unknown"
     if last < listing.first_date:
         return "listing_dates_reversed"
+    if last == date.max:
+        return "listing_end_invalid"
     return listing.first_date, last
 
 
@@ -525,7 +530,12 @@ def build_listing_universe(workspace: Workspace, master: str, *, version: str) -
     counts: dict[str, int] = defaultdict(int)
     for listing in listings:
         counts[listing.assetid] += 1
-    days = [day for row in listings for day in (row.first_date, row.last_date) if day]
+    days = [
+        day
+        for row in listings
+        for day in (row.first_date, row.last_date)
+        if day is not None and day != date.max
+    ]
     through = max(days, default=None)
     candidates = []
     for listing in listings:
@@ -555,23 +565,27 @@ def build_listing_universe(workspace: Workspace, master: str, *, version: str) -
 def register_universes(
     state: sqlite3.Connection, build: UniverseBuild, *, apply: bool
 ) -> dict[str, object]:
-    """Plan, or register, each built universe as a chunked manifest; report pins and parts."""
-    registered = []
-    for universe in build.universes:
-        plan = plan_membership_manifest(universe.document, identity=False)
-        pin = plan.pin
-        if apply:
-            pin = register_universe_manifest(state, universe.document)
-            if pin != plan.pin:
-                raise ValueError("universe changed while it was being registered")
-        registered.append(
-            {
-                "universe_id": universe.universe_id,
-                "version": cast("UniversePin", pin).version,
-                "content_hash": pin.content_hash,
-                "parts": len(plan.part_pins),
-            }
-        )
+    """Plan, or register, each built universe as a chunked manifest; report pins and parts.
+
+    Applying registers every universe of the build in one transaction, or none.
+    """
+    plans = [
+        plan_membership_manifest(universe.document, identity=False) for universe in build.universes
+    ]
+    if apply:
+        with atomic(state):
+            for universe, plan in zip(build.universes, plans, strict=True):
+                if register_universe_manifest(state, universe.document) != plan.pin:
+                    raise ValueError("universe changed while it was being registered")
+    registered = [
+        {
+            "universe_id": universe.universe_id,
+            "version": cast("UniversePin", plan.pin).version,
+            "content_hash": plan.pin.content_hash,
+            "parts": len(plan.part_pins),
+        }
+        for universe, plan in zip(build.universes, plans, strict=True)
+    ]
     return {"mode": "apply" if apply else "plan", "pins": registered}
 
 

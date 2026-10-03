@@ -333,9 +333,11 @@ Norgate security master 원천을 pin과 대조해 읽고 universe 문서를 만
 member instrument는 US identity 등록이 먼저 있어야 한다. `index`는 지수마다 universe
 `index.us.norgate/<지수 이름>` 하나를 같은 `--version`으로 등록하고, `--index`는 등록할 지수를 고른다(모든
 쌍은 여전히 읽고 검사한다). 지수 구성 원천은 legacy 편입 단위마다 하나이므로 한 번에 모두 넘긴다.
-`--plan`은 설치본을 읽기 전용으로 열어 pin과 part 수만 보고한다. 응답은 매퍼 보고, universe별 member 수,
-미해결 asset ID 표본(100개), 날짜별 member 수 요약, pin이고, `--report`는 미해결 전체를 담은 같은 보고를 새
-파일에 쓴다. 이미 있거나 폴더가 없는 `--report` 경로는 아무것도 등록하기 전에 거부된다. `show`는 등록된 universe의 header와 part별 member 수를 읽는다. 공급자를 호출하지 않는다.
+`--plan`은 설치본을 읽기 전용으로 열어 pin과 part 수만 보고한다. 한 명령이 만든 universe는 한 transaction에서
+모두 등록되거나 하나도 등록되지 않는다. 응답은 매퍼 보고, universe별 member 수, 미해결 asset ID 표본(100개),
+날짜별 member 수 요약, pin이고, `--report`는 미해결 전체와 pin을 담은 같은 보고를 새 파일에 쓴다. 이미 있거나
+폴더가 없는 `--report` 경로는 아무것도 등록하기 전에 거부된다. 등록은 state만 쓰고 strategy 저장소를 쓰지
+않는다. `show`는 등록된 universe의 header와 part별 member 수를 읽는다. 공급자를 호출하지 않는다.
 규칙은 [universe 등록](design/data-vertical.md#universe-등록)이 소유한다.
 
 ## 원천 자료의 승격과 은퇴
