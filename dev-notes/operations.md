@@ -395,6 +395,25 @@ generation을 pin한다.
   `bars`에 대한 `norgate_prices.signed_series` 결과(음수 close가 있는 시리즈의 asset ID)이고, 그 행은
   `unselected_rows`로 센다.
 
+US 기업행동과 상장 상태 dataset도 같은 명령에 명세를 하나씩 넘겨 만든다. 매퍼의 정의는
+[기업행동과 상장 상태 매퍼](design/data-vertical.md#기업행동과-상장-상태-매퍼)가 소유한다.
+
+- `actions.us.norgate`: Norgate 조정 part 중 `CAPITAL` part 전부를 한 명세에 pin하고 파티션을 두지 않는다.
+  `norgate.dividends@1`(amount `float_shortest@1`)을 첫 generation으로, `norgate.capital_adjustments@1`(ratio
+  `float_shortest@1`)을 그 child로 승격한다. 두 시점은 `sessions.xnys`를 pin한 `exdate_open@1`(근거 `record`,
+  입력 `ex_date`)이다.
+- `actions.us.fmp.ref`: FMP 배당·분할 원천을 `fmp.dividends@1`과 `fmp.splits@1`로, 각각 `revision`을 1부터 delta가
+  빌 때까지 올리며 이어 승격한다. 시점 규칙은 `actions.us.norgate`와 같다.
+- `status.us.norgate`: Norgate master 하나를 pin하고 `norgate.status@1`의 `event` `listed`를 첫 generation으로,
+  `delisted`를 그 child로 승격한다. 두 시점은 `local_day_end@1`(`America/New_York`, 근거 `record`, 입력
+  `status_date`)이다.
+
+조정 가격을 읽는 소비자는 canonical 가격 binding과 기업행동 binding(규칙 grant `exdate_open@1`)을
+`adjusted_prices.load_adjusted_prices`에 함께 넘긴다. 유도 총수익 가격과 Norgate `TOTALRETURN` part의 대조는
+market 파일을 읽기 전용으로 열어 두 매퍼의 `select`를 `CAPITAL` part 전체의 view에 돌리고, 비조정 close를
+`float_shortest@1`로 읽은 bar와 그 결과를 `adjusted_prices.adjust`에 넘겨 같은 asset·날짜의 `TOTALRETURN`
+close와 상대오차를 잰다. 아무것도 쓰지 않는다.
+
 XNYS 세션 공백 보고는 `scripts/calendar_compare.py --calendar XNYS --source-prefix norgate-history-csv-
 --table bars`이고, 날짜로 읽히지 않는 행은 `undated_rows`로 따로 센다. 08-31..09-08 Norgate↔EODHD close
 불일치율은 두 dataset을 게시한 market 파일을 읽기 전용으로 열어 다시 계산한다.

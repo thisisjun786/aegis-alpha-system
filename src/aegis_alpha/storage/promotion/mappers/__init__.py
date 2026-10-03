@@ -209,7 +209,11 @@ def _registry() -> dict[str, Mapper]:
         EodhdBulkQuarantine,
         EodhdBulkQuarantineAdjusted,
     )
-    from aegis_alpha.storage.promotion.mappers.fmp import FmpEodNonSplit  # noqa: PLC0415
+    from aegis_alpha.storage.promotion.mappers.fmp import (  # noqa: PLC0415
+        FmpDividends,
+        FmpEodNonSplit,
+        FmpSplits,
+    )
     from aegis_alpha.storage.promotion.mappers.fred import FredAlfred  # noqa: PLC0415
     from aegis_alpha.storage.promotion.mappers.fx import (  # noqa: PLC0415
         fred_fx_series,
@@ -217,6 +221,11 @@ def _registry() -> dict[str, Mapper]:
     )
     from aegis_alpha.storage.promotion.mappers.korea import KoreaObservations  # noqa: PLC0415
     from aegis_alpha.storage.promotion.mappers.norgate import NorgateFxCloses  # noqa: PLC0415
+    from aegis_alpha.storage.promotion.mappers.norgate_actions import (  # noqa: PLC0415
+        NorgateCapitalAdjustments,
+        NorgateDividends,
+        NorgateStatus,
+    )
     from aegis_alpha.storage.promotion.mappers.norgate_prices import (  # noqa: PLC0415
         NorgatePricesAdjusted,
         NorgatePricesNone,
@@ -238,6 +247,11 @@ def _registry() -> dict[str, Mapper]:
         EodhdBulkQuarantine(),
         EodhdBulkQuarantineAdjusted(),
         FmpEodNonSplit(),
+        FmpDividends(),
+        FmpSplits(),
+        NorgateDividends(),
+        NorgateCapitalAdjustments(),
+        NorgateStatus(),
         NorgatePricesAdjusted(),
         NorgatePricesNone(),
         NorgateReferenceCloses(),

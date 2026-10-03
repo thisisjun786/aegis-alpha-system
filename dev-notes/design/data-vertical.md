@@ -19,7 +19,7 @@
 | L1 원천 자료실 | `sl_*` 테이블. 원래 열·값·행 순서를 그대로 보존하는 `source_only` 자료와 legacy 원본 편입 | `storage/source_library*.py`, `storage/legacy_import/` |
 | L2 승격 | 승격 명세 → 매퍼 → head 비교 → 품질 flag → generation 게시 | `storage/promotion/` |
 | L3 저장 | `market.duckdb`의 typed generation과 `state.sqlite3`의 카탈로그·identity·품질·수집 기록 | `storage/market.py`, `storage/state.py`, `storage/identity.py` |
-| L4 소비 | exact pin, cutoff, grant로 head를 투영하는 reader와 실행 준비 | `storage/read_heads.py`, `storage/market_inputs.py`, `application/backtest_prepare.py` |
+| L4 소비 | exact pin, cutoff, grant로 head를 투영하는 reader, 조정 가격 유도와 실행 준비 | `storage/read_heads.py`, `storage/adjusted_prices.py`, `storage/market_inputs.py`, `application/backtest_prepare.py` |
 
 원천 자료실에 있다는 사실은 PIT 자격이 아니다. 시점·식별·품질 규칙을 명시한 승격만 L1 자료를
 L3 generation으로 만든다. 13F 보유 내역, 애널리스트 추정치, 연구 산출물처럼 승격 대상 도메인이
@@ -420,12 +420,13 @@ microsecond, 시간 입력은 `session_date` 하나다. 값 일부만 있는 bar
 
 분류 매퍼 `norgate.classification@1`, `sec.sic@1`, `kind.industry@1`은 [분류](#분류)가 소유한다.
 
+기업행동과 상장 상태 매퍼(`norgate.dividends@1`, `norgate.capital_adjustments@1`, `fmp.dividends@1`,
+`fmp.splits@1`, `norgate.status@1`)는 [기업행동과 상장 상태 매퍼](#기업행동과-상장-상태-매퍼)가 소유한다.
+
 `sec.submissions@1`과 `sec.companyfacts@1`은 [SEC 공시와 재무](#sec-공시와-재무)를 발행인 단위
 `filings`와 `fundamentals`로 옮기며, 재무 매퍼는 pin한 공시 generation을 참조로 조인한다.
 
-예정된 매퍼 목록: `norgate.dividends`,
-`fmp.actions`,
-`dart.list`. identity 원천을 읽는 매퍼는 typed generation이
+예정된 매퍼 목록: `dart.list`. identity 원천을 읽는 매퍼는 typed generation이
 아니라 등록 문서를 만든다. `eodhd.kr_symbol`, `kind.listings`, `dart.corp_codes`는
 [KR 등록](#kr-등록)이, `norgate.master`, `eodhd.us_symbol`, `fmp.profile`, `sec.tickers`는
 [US 등록](#us-등록)이 소유한다. universe 원천을 읽는 `norgate.index_membership`과 `norgate.listings`도
@@ -499,6 +500,61 @@ FX 매퍼는 인자 `series`(원천의 시계열 이름), `base`·`quote`(대문
   legacy `norgate.history_export@1`이 편입한 `bars`의 텍스트 행(`symbol`, `date`, `close`)을 읽는다. 0
   이하의 값은 `invalid`이고, `YYYY-MM-DD`가 아니거나 없는 날짜는 필수 열인 `fixing_at_us`를 비워 승격을
   거부한다.
+
+### 기업행동과 상장 상태 매퍼
+
+기업행동 매퍼는 `corporate_actions`를 낸다. `effective_date`는 가격 조정이 시작되는 ex-date이고
+`ex_date`와 같으며, 시간 입력은 `ex_date` 하나다. 명세는 두 시점 열에 근거 `record`의
+`exdate_open@1`(pin한 `sessions.xnys`의 ex-date 개장 시각)을 쓴다. `action_id`는
+`<action_type>:<ex-date>`다(FMP 분할은 아래처럼 `split:<ex-date>`). 비율 행동(`split`, `stock_dividend`, `capital_adjustment`)의 `ratio`는 옛
+주식 한 주당 새 주식 수이고, 현금 행동(`dividend`)의 `amount`는 그 ex-date에 지급한 주당 현금이다.
+
+Norgate는 기업행동 표를 따로 내지 않는다. 두 Norgate 기업행동 매퍼는 Norgate 조정 가격 part(`assetid`,
+0시의 nanosecond `date`, binary32 `close`·`unadjusted_close`·`dividend`, `adjustment_type`)의 `CAPITAL` 행만
+asset마다 날짜순으로 읽는다. 한 asset의 시리즈가 다음 part로 이어질 수 있으므로 명세는 모든 `CAPITAL`
+part를 함께 pin한다. `CAPITAL` close는 비조정 close를 그 뒤 모든 자본 사건의 주식 비율의 곱으로 나눈
+값이고, `dividend`는 같은 자본 기준의 현금을 ex-date 직전 세션의 행에 싣는다. 매퍼는 이웃 행을 읽으므로
+파티션 날짜가 늘 null이고, 파티션을 둔 명세는 모든 행이 파티션 날짜 없음으로 거부된다. instrument는
+(`norgate`, `norgate_assetid`)로 ex-date의 현지 0시에 해석하고, 수집 시각은 원천의 `sl:` 연결 시각이다.
+
+- `norgate.dividends@1`은 `dividend`가 0이 아닌 행을 고른다. ex-date는 그 시리즈의 다음 세션, 곧 Norgate
+  총수익 시리즈가 배당을 뺀 가격을 쓰기 시작하는 첫 세션이다. 시리즈의 마지막 행에 실린 배당은 ex-date가
+  없어 고르지 않는다(계획의 `unselected_rows`에 든다). `amount`는 지급한 그대로의 주당 현금이다. 자본
+  기준 배당에 그 행의 `unadjusted_close / close`를 곱하고, 세 입력의 정밀도인 binary32로 반올림해
+  `float_shortest@1`에 넘긴다. 통화는 `USD`다. 배당·close·비조정 close 중 하나라도 유한한 양수가 아니면
+  `invalid`이고 금액을 남기지 않는다(음수 배당도 그렇다). 다음 행의 `date`가 0시가 아니면 ex-date가 없어
+  그 행은 거부된다. 원천 자료실의 `market-canonical-market-data-6af78d02*` 배당 표는 같은
+  배당을 배당 행 자신의 날짜와 자본 기준 금액으로만 담으므로 ex-date와 지급액을 낼 수 없어 승격하지 않는다.
+- `norgate.capital_adjustments@1`은 자본 계수 `f = unadjusted_close / close`가 바뀌는 세션을 고른다.
+  `ratio`는 계수가 있는 직전 행의 `f`를 이 행의 `f`로 나눈 값, 곧 Norgate가 `CAPITAL`에 접는 그 ex-date의 모든 자본
+  사건(분할, 병합, 주식배당, 그 밖의 자본 분배)의 주식 비율이며 binary32로 반올림해
+  `float_shortest@1`에 넘긴다. 비율이 1과 백만분의 1보다 더 다를 때만 사건이다. binary32 저장은 연속한
+  두 행의 `f`를 그보다 적게 움직인다(라이브 part에서 저장만으로 생긴 가장 큰 움직임은 2e-7 미만, 가장 작은
+  실제 사건은 1e-5 초과). close나 비조정 close가 유한한 양수가 아닌 행은 계수가 없다. 두 계수 사이에
+  계수 없는 행이 끼어 있으면 사건의 세션을 알 수 없으므로, 그 변화를 보인 행에 비율 없는 `invalid` 사건을
+  낸다. `date`가 0시가 아닌 행의 사건은 ex-date가 없어 거부된다. `action_type`은 `capital_adjustment`다.
+- `fmp.dividends@1`과 `fmp.splits@1`은 FMP 동결 배당·분할 응답(`symbol`, ex-date `date`,
+  `retrieved_at_utc`)을 읽는다. instrument는 (`fmp`, `fmp_symbol`, `symbol`)로 해석하고 수집 시각은
+  `retrieved_at_utc`다. 응답의 반복과 정정은 `fmp.eod_non_split@1`과 같은 revision 구간(`revision`)으로
+  고른다. FMP는 한 회사가 같은 ex-date에 두 번 지급하면 한 응답에 서로 다른 배당 두 개를 싣는다. 뒤 응답이
+  어느 항목을 정정하는지 알 수 없으므로, 한 시각에 서로 다른 값을 가진 적이 있는 (symbol, ex-date)는 어느
+  revision도 고르지 않는다. 배당은 `dividend`(유한한 양수가 아니면 `invalid`), `recordDate`,
+  `paymentDate`를, 분할은 `numerator / denominator`(두 항이 유한한 양수가 아니면 `invalid`)를 binary64로
+  `float_shortest@1`에 넘긴다. 분할의 `action_type`은 `splitType`에서 온다: `stock-split`은 `split`,
+  `stock-dividend`는 `stock_dividend`, `spin-off`는 `spin_off`, `adr-change`는 `adr_change`, 다른 유형은
+  `-`를 `_`로 쓴 그 이름, 없거나 빈 유형은 `unspecified_split`이다. 분할의 `action_id`는 유형과 관계없이
+  `split:<ex-date>`이므로 유형을 고친 revision은 앞선 행동을 SUPERSEDE한다. FMP 배당 통화는 US registry가 해석한 US
+  상장 심볼의 거래 통화인 `USD`다.
+
+`norgate.status@1`은 Norgate security master(`assetid`, `is_delisted`, `first_date`·`last_date` 텍스트)를
+`instrument_status`로 옮긴다. 인자 `event`가 master 행마다 사건 하나를 고른다. `listed`(모든 행)는
+`first_date`의 현지 0시에 시작하며, 이 날짜는 Norgate 시리즈의 첫 세션이라 실제 상장보다 늦을 수 있다
+(`reason`은 `norgate_first_date`). `delisted`(`is_delisted` 행)는 시리즈의 마지막 세션 `last_date` 다음 날의
+현지 0시에 시작한다(`reason`은 `norgate_last_date`). 둘 다 끝이 없다. 시간 입력 `status_date`는 사건을 읽은
+날짜이므로 명세가 `local_day_end@1`을 쓰면 상장폐지는 시리즈의 마지막 세션이 끝나기 전에는 알려지지 않는다.
+instrument는 그 날짜의 현지 0시에 해석한다. `YYYY-MM-DD`가 아닌 날짜, `first_date`보다 이른 `last_date`,
+마지막 표현 가능 날짜(`9999-12-31`)의 상장폐지는 사건의 시작이 없어 거부된다.
+master는 snapshot 하나라 파티션 날짜가 없다.
 
 ## 결정적 공통 열
 
@@ -902,8 +958,11 @@ ASCII escape와 바이트까지 같다.
 | `prices.us.fmp.ref` | `prices`, reference unadjusted | FMP 동결 legacy non-split 응답, `fmp.eod_non_split@1`. 정정은 revision 번호순 generation. 원천 자료실 FMP normalized lineage(eod_full, dividend_adjusted)의 매퍼는 Linear AAS-68 |
 | `prices.ref.norgate` | `prices`, reference, `fields='close'` | Norgate 기준 시리즈(`norgate.reference_closes@1`)와 지수·기타 데이터베이스 내보내기(`norgate.reference_history@1`). 음수 수준이 있는 시리즈는 `signed`로 고르지 않는다 |
 | `sessions.xnys`, `sessions.xkrx` | `calendar_sessions` | [선언 달력](#선언-달력) 문서. 관측 거래일은 대조 보고의 근거. 임시 휴장은 SUPERSEDE |
-| `actions.us.norgate`, `actions.us.fmp.ref`, `actions.{us,kr}.eodhd` | `corporate_actions` | `exdate_open@1` |
-| `status.us.norgate`, `status.kr.kind` | `instrument_status` | 상장·상폐 이력 |
+| `actions.us.norgate` | `corporate_actions` | Norgate 조정 가격 part의 `CAPITAL` 행 전체. 배당(`norgate.dividends@1`, amount `float_shortest@1`)이 첫 generation, 자본 사건(`norgate.capital_adjustments@1`, ratio `float_shortest@1`)이 그 child다. 두 시점은 `exdate_open@1`(`sessions.xnys`). 파티션 없이 이력 전체가 한 generation이다 |
+| `actions.us.fmp.ref` | `corporate_actions` | FMP 동결 배당(`fmp.dividends@1`)과 분할(`fmp.splits@1`) 응답. 정정은 revision 번호순 generation. 두 시점은 `exdate_open@1` |
+| `actions.{us,kr}.eodhd` | `corporate_actions` | `exdate_open@1` |
+| `status.us.norgate` | `instrument_status` | Norgate master의 상장(`norgate.status@1`, `event` `listed`)이 첫 generation, 상장폐지(`delisted`)가 그 child다. 두 시점은 `local_day_end@1`(`America/New_York`, 근거 `record`) |
+| `status.kr.kind` | `instrument_status` | 상장·상폐 이력 |
 | `filings.us.sec`, `filings.kr.dart` | `filings`(v2) | SEC submissions(`sec.submissions@1`, `source_column@1`). DART는 재무제표 응답의 접수번호(`dart.fnltt_filings@1`)와 공시 목록, 둘 다 `local_day_end@1`(접수일) |
 | `fundamentals.us.sec` | `fundamentals` | companyfacts(`sec.companyfacts@1`). 공시마다 자기 record(accession은 dimensions). 시점은 pin한 `filings.us.sec` generation에서 accession으로 조인한 `accepted_at_us`(`source_column@1`)이고, 조인되지 않은 사실은 null이다. 같은 accession의 값이 다시 수집되어 바뀌면 SUPERSEDE |
 | `fundamentals.kr.dart` | `fundamentals` | 재무제표 응답(`dart.fnltt@1`). 발행인 단위, 연결·별도는 dimensions, 시점은 `local_day_end@1`(접수일). 정정 공시는 SUPERSEDE. 12월 결산으로 선언한 발행인만 기간을 적는다. 자료 없음 응답은 행 대신 결과 분포로 기록 |
@@ -1382,6 +1441,10 @@ Norgate security master와 그보다 늦은 Norgate history 내보내기에서�
     `withheld_rules`, `rehashed`(모든 delta를 다시 해시했는지; 거짓이면 구조 확인만 한 읽기),
     `heads`(행 수), `heads_hash`(`[pin, record_id, revision_id]` 목록의 정규 JSON SHA-256)를 가진 정규
     JSON이고, 그 SHA-256이 영수증 hash다.
+  - `held=True`인 읽기는 cutoff가 아는데 head가 없는 record 가운데 grant가 시점 규칙을 막았거나
+    (`ungranted_time_rule`) 공개 시점 근거가 없는(`unknown_<domain>_evidence`) record를 `HeadRead.held`
+    (값 없는 coverage 칸: subject, 날짜, 이유, record ID)로 돌려주고, 영수증에 `held`(`[record_id, 이유]`
+    목록)를 더한다. cutoff까지 알려지지 않은 record는 held가 아니다.
   - coverage 이유는 `ungranted_time_rule`, `flag_excluded`, `outside_cutover`, `tombstone`,
     `unknown_<domain>_evidence`, `<domain>_unavailable`, `reference_price`, `missing_<domain>`과
     head의 `value_state`다(가격은 `price`, 달력은 `session`). head가 없는 record의 이유는
@@ -1392,7 +1455,37 @@ Norgate security master와 그보다 늦은 Norgate history 내보내기에서�
     reference 가격) head를 준 record의 이유만 그 칸의 이유다. 달력 칸은 개장한 session만 present이고
     휴장 session은 `session_closed`다. 격자의 칸은 결과 행과 함께 fetch 전 할당 검사에 포함된다.
 - 분할조정·총수익 가격은 reader가 unadjusted 가격과 cutoff 시점까지 알려진 `corporate_actions`로
-  계산한다. 공급자 조정 가격은 reference로만 남는다.
+  계산한다. 공급자 조정 가격은 reference로만 남는다. `storage/adjusted_prices.py`의
+  `read_adjusted_prices(connection, prices, actions, query, basis, time_rules, budget)`가 가격 binding과
+  기업행동 binding을 같은 query(같은 cutoff, 수집 cutoff, 지식 상한, subject, 날짜 구간)로 `read_heads`에서
+  읽고 유도한다. 작업 공간 진입점 `load_adjusted_prices`는 두 읽기 모두 `market_inputs.load_pinned_heads`를
+  쓴다. 그래서 cutoff까지 알려지지 않은 기업행동은 앞선 가격에 닿지 않는다. 기업행동 읽기는 `held=True`다.
+  - 유도는 격자를 뺀 같은 query로 읽은 bar 전체(`series`)로 하고, query에 격자가 있으면 격자 날짜의 행만
+    돌려주며 그 격자 읽기(`prices`)의 coverage를 함께 준다. 격자가 없으면 두 읽기는 같은 읽기다. 앞선
+    읽기의 행은 호출자 예산의 `reserved_bytes`로 잡아 두고 다음 읽기와 유도를 그 나머지로 받는다.
+  - 유도 방법 `aas-adjustment-v1`은 instrument마다 읽은 bar로 한다. 한 instrument는 cutover pin을 넘어 한
+    시리즈다. ex-date(`effective_date`)가 그 instrument의 첫 bar보다 늦고 마지막 bar 이하인 행동만 쓰므로
+    마지막 bar는 비조정 그대로이고 앞선 bar가 그 기준으로 표현된다.
+  - 비율 행동(`split`, `stock_dividend`, `capital_adjustment`)의 비율 `r`은 앞선 가격에 `1/r`, 거래량에
+    `r`을 곱한다. `total_return`에서는 배당 `D`가 앞선 가격에 `(C - D) / C`를 곱한다. `C`는 ex-date 직전
+    세션의 비조정 close이며, 배당을 그 close에 재투자한다는 뜻이다. 그 세션은 ex-date 바로 앞에 읽은
+    bar이고 `present`여야 한다. 격자가 그 bar와 ex-date 사이의 날짜를 가지면 그 날짜는 bar가 없는 세션이므로
+    배당에 close가 없다. 격자가 없으면 세션을 빠뜨리지 않은 bar를 전제한다. `split_adjusted`는 배당을
+    읽지 않는다.
+  - 쓸 수 없는 행동(다른 행동 유형, `present`가 아닌 값, 재투자할 직전 세션 bar와 다른 통화의 배당, 직전
+    세션 close가 없거나 그 이상인 배당)이 있으면 그보다 앞선 bar는 값 없이 `invalid`가 되고 이유 `unadjustable_action`을 단다.
+    조용히 건너뛰지 않는다.
+  - 기업행동 읽기가 held로 돌려준 행동(grant 없는 시점 규칙, 시점 근거 없음)도 두 basis 모두에서 쓸 수 없는
+    행동이다. held record에는 값이 없어 유형도 읽지 않기 때문이다. 앞선 bar는 그 record의 이유
+    (`ungranted_time_rule`이나 `unknown_corporate_actions_evidence`)와 `unadjustable_action`을 함께 단다.
+  - 계수는 50자리 문맥의 정확한 십진수로 곱하고, 조정 값은 도메인의 `DECIMAL(38,12)` 정밀도인 소수
+    12자리로 ROUND_HALF_EVEN한다. bar는 `basis='unadjusted'`여야 하고 한 instrument·세션에 bar가 둘이면
+    거부한다(그래서 canonical과 unadjusted reference를 함께 읽으려면 query의 가격 역할로 하나를 고른다).
+  - 결과 행은 bar의 record·revision ID와 도메인 값을 그대로 두고 `basis`만 유도 basis로 바꾸며, 누적
+    가격 계수와 이유를 함께 싣는다. 영수증 `aas-adjusted-read-v1`은 basis, 방법, 가격 읽기(`prices`)와
+    기업행동 읽기(`actions`)의 `aas-head-read-v1` 영수증과 그 hash, 유도에 쓴 읽기의 hash(`series_hash`),
+    두 읽기가 막은 규칙의 합집합(`withheld_rules`), `[pin, record_id, revision_id, 계수, 이유]` 목록의 정규
+    JSON SHA-256(`rows_hash`)을 담는다.
 
 ### 연구 실행의 canonical 가격 패널
 
@@ -1520,7 +1613,7 @@ state v2:
 | DV-25 | 대량 게시의 delta·chain hash는 Python `aas-rowset-v1` 경로와 같다 | `tests/storage/test_bulk_generation.py::test_streaming_hash_matches_python_rowset` | 구현 |
 | DV-26 | `read_heads`는 `project_heads`와 같은 head를 돌려준다 | `tests/storage/test_read_heads.py::test_read_heads_matches_project_heads` | 구현 |
 | DV-27 | cutover 구간 밖 날짜는 다른 pin으로 채우지 않고 누락으로 보고한다 | `tests/storage/test_read_heads.py::test_cutover_gap_is_reported_not_filled` | 구현 |
-| DV-28 | 유도 조정 가격은 cutoff 이후 기업행동을 쓰지 않는다 | `tests/storage/test_read_heads.py::test_adjustment_ignores_actions_after_cutoff` | 예정 |
+| DV-28 | 유도 조정 가격은 cutoff 이후 기업행동을 쓰지 않는다 | `tests/storage/test_read_heads.py::test_adjustment_ignores_actions_after_cutoff` | 구현 |
 | DV-29 | 티커로 instrument를 만들 수 없다 | `tests/storage/test_identity_mint.py::test_ticker_anchor_is_refused` | 구현 |
 | DV-30 | v1→v2 migration은 백업 없이 거부하고 중단 후 재개한다 | `tests/storage/test_migration.py::test_migration_requires_backup_and_resumes` | 구현 |
 | DV-31 | migration 후 v1 checksum 행이 남고 알 수 없는 버전은 거부한다 | `tests/storage/test_migration.py::test_migration_keeps_v1_receipt_and_rejects_unknown` | 구현 |
@@ -1744,3 +1837,14 @@ state v2:
 | DV-249 | 매퍼 참조는 참조 도메인의 dataset generation만 pin할 수 있다 | `tests/storage/test_sec_promotion.py::test_a_filings_reference_must_pin_a_filings_generation` | 구현 |
 | DV-250 | SEC가 두 번 나열한 같은 공시는 한 번 읽히고, 값이 다른 같은 accession의 행은 둘 다 매핑되어 승격을 거부한다 | `tests/storage/test_sec_promotion.py::test_a_repeated_listing_is_read_once` | 구현 |
 | DV-251 | 제출자 문서가 자기 CIK의 `CIK##########-submissions-###.json`이 아닌 쪽을 나열하면 submissions 단위를 거부한다 | `tests/storage/test_legacy_import.py::test_sec_submissions_filings_refuse_a_page_of_another_filer` | 구현 |
+| DV-252 | `norgate.dividends@1`은 자본 기준 배당을 그 행의 비조정/자본 close 비율로 지급액으로 되돌리고 시리즈의 다음 세션을 ex-date로 삼으며, 마지막 행의 배당은 고르지 않고 값이 유한한 양수가 아닌(음수 포함) 배당은 `invalid`이며, 0시가 아닌 다음 행은 ex-date 없는 행으로 거부된다 | `tests/storage/test_us_actions.py::test_norgate_dividends_are_paid_cash_on_the_next_session` | 구현 |
+| DV-253 | `norgate.capital_adjustments@1`은 자본 계수가 백만분의 1보다 크게 바뀐 세션을 직전/현재 계수 비율로 내고, binary32 저장만으로 생긴 움직임은 건너뛰며, 계수 없는 행을 사이에 둔 변화는 비율 없는 `invalid` 사건이고 0시가 아닌 행의 사건은 ex-date 없이 거부된다 | `tests/storage/test_us_actions.py::test_norgate_capital_adjustments_step_the_price_factor` | 구현 |
+| DV-254 | `norgate.status@1`은 master 행마다 `first_date`의 상장과 `last_date` 다음 날의 상장폐지를 내고, 상장폐지는 `last_date`에서 읽으며, 거꾸로 된 날짜 쌍과 `9999-12-31` 상장폐지는 시작 없이 거부된다 | `tests/storage/test_us_actions.py::test_norgate_status_reads_listing_and_delisting_from_the_master` | 구현 |
+| DV-255 | FMP 배당·분할 매퍼는 응답 revision 구간마다 첫 응답을 고르고, 한 시각에 서로 다른 값을 가진 적 있는 키는 어느 revision에서도 고르지 않으며, 분할은 유형과 관계없이 `split:<ex-date>`이고 빈 유형은 `unspecified_split`이다 | `tests/storage/test_us_actions.py::test_fmp_actions_select_each_run_and_never_a_tied_key` | 구현 |
+| DV-256 | Norgate 기업행동은 파티션 없이 `exdate_open@1`로 승격되고(파티션을 둔 명세는 거부), 유도 분할조정·총수익 가격은 그 generation과 canonical 가격에서 나온다 | `tests/storage/test_us_actions.py::test_norgate_actions_promote_and_adjust_canonical_prices` | 구현 |
+| DV-257 | 쓸 수 없는 기업행동(직전 세션 bar가 `present`가 아닌 배당 포함) 앞의 유도 bar는 값 없이 `invalid`이고 `unadjustable_action`을 달며, 분할조정은 배당을 읽지 않고 읽은 bar 밖의 행동은 쓰지 않는다 | `tests/storage/test_us_actions.py::test_adjustment_marks_bars_before_an_unadjustable_action` | 구현 |
+| DV-258 | grant 없는 규칙이나 시점 근거 없음으로 held된, cutoff가 아는 기업행동 앞의 유도 bar는 `invalid`이고 그 이유를 달며, 영수증은 막은 규칙을 싣는다 | `tests/storage/test_read_heads.py::test_adjustment_marks_bars_before_a_withheld_action` | 구현 |
+| DV-259 | 격자 읽기도 배당을 격자의 앞선 날짜가 아니라 ex-date 직전 세션 close에 재투자하고, 영수증은 격자 읽기와 유도에 쓴 읽기의 hash를 따로 싣는다 | `tests/storage/test_read_heads.py::test_adjustment_reinvests_at_the_session_before_the_exdate_under_a_grid` | 구현 |
+| DV-260 | 격자가 말하는 ex-date 직전 세션에 bar가 없으면 배당을 쓸 수 없다 | `tests/storage/test_read_heads.py::test_adjustment_needs_a_close_on_the_session_before_the_exdate` | 구현 |
+| DV-261 | `aas-adjusted-read-v1` 영수증은 같은 읽기에 같은 hash이고, 행동 집합이 바뀌면 `rows_hash`가 바뀌며, 하위 읽기의 hash를 싣는다 | `tests/storage/test_read_heads.py::test_adjusted_receipt_pins_the_reads_and_the_rows` | 구현 |
+| DV-262 | `norgate.status@1`과 `fmp.dividends@1`은 승격을 거쳐 `local_day_end@1`과 XNYS `exdate_open@1` 시각으로 저장된다 | `tests/storage/test_us_actions.py::test_norgate_status_and_fmp_actions_promote` | 구현 |

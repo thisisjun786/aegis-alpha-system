@@ -18,6 +18,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Final, cast
 
 import duckdb
@@ -25,8 +26,10 @@ import pytest
 
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.serialization import canonical_json_bytes
+from aegis_alpha.storage import adjusted_prices as adjusted_module
 from aegis_alpha.storage import market, market_inputs, publication
 from aegis_alpha.storage import read_heads as heads_module
+from aegis_alpha.storage.adjusted_prices import AdjustedRead, read_adjusted_prices
 from aegis_alpha.storage.import_document import parse_import
 from aegis_alpha.storage.market_inputs import (
     GenerationPin,
@@ -1042,3 +1045,194 @@ def test_time_rule_provenance_comes_from_retained_evidence(tmp_path: Path) -> No
             load_pinned_heads(
                 workspace, HeadBinding("prices", (HeadPin(unlisted),)), strict, budget=BUDGET
             )
+
+
+def _actions(specs: list[tuple[str, str, date, Decimal, int]]) -> list[Row]:
+    """Corporate action ASSERTs: (instrument, type, ex-date, amount or ratio, known time)."""
+    rows = []
+    for instrument, kind, day, value, at in specs:
+        row: Row = {
+            "instrument_id": instrument,
+            "action_id": f"{kind}:{day.isoformat()}",
+            "action_type": kind,
+            "ex_date": day,
+            "record_date": None,
+            "pay_date": None,
+            "effective_date": day,
+            "amount": value if kind == "dividend" else None,
+            "ratio": value if kind != "dividend" else None,
+            "currency": "USD" if kind == "dividend" else None,
+            "value_state": "present",
+            "revision_id": f"{kind}-{day.isoformat()}",
+            "supersedes_revision_id": None,
+            "op": "ASSERT",
+            "available_at_us": at,
+            "revision_known_at_us": at,
+            "ingested_at_us": at,
+            "source_snapshot_id": "synthetic-source",
+            "source_row_hash": hashlib.sha256(f"{kind}{day}".encode()).hexdigest(),
+        }
+        row["record_id"] = market.record_identity(
+            "corporate_actions", [row[k] for k in NATURAL_KEYS["corporate_actions"]]
+        )
+        rows.append(row)
+    return rows
+
+
+def _adjustment_store(
+    bars: list[tuple[str, date, str, int, Decimal | None]],
+) -> tuple[duckdb.DuckDBPyConnection, GenerationPin, GenerationPin]:
+    connection = duckdb.connect()
+    market.initialize_market(connection, "synthetic")
+    prices = _publish(connection, "prices.us.synthetic", _rows("prices", bars))
+    market.publish_generation(
+        connection,
+        dataset_id="actions.us.synthetic",
+        version="1",
+        generation_id="actions-g1",
+        operation_id="op-actions-g1",
+        request_hash=hashlib.sha256(b"actions-g1").hexdigest(),
+        parent_id=None,
+        domain="corporate_actions",
+        # A 2:1 split known at 30; a dividend of 1 known only at 80.
+        rows=_actions(
+            [("A", "split", DAYS[2], Decimal(2), 30), ("A", "dividend", DAYS[3], Decimal(1), 80)]
+        ),
+    )
+    return connection, prices, _pin(connection, "actions-g1")
+
+
+EXDATE: Final = "exdate_open@1"
+SPLIT_BARS: Final[list[tuple[str, date, str, int, Decimal | None]]] = [
+    ("A", DAYS[0], "b0", 1, Decimal(100)),
+    ("A", DAYS[1], "b1", 2, Decimal(100)),
+    ("A", DAYS[2], "b2", 3, Decimal(50)),
+    ("A", DAYS[3], "b3", 4, Decimal(49)),
+]
+
+
+def _adjusted(
+    store: tuple[duckdb.DuckDBPyConnection, GenerationPin, GenerationPin],
+    cutoff: int,
+    basis: str,
+    *,
+    grants: tuple[str, ...] = (EXDATE,),
+    grid: tuple[date, ...] | None = None,
+) -> AdjustedRead:
+    connection, bars, actions = store
+    rules = {bars.generation_id: RECORDED_TIMES, actions.generation_id: TimeRules(EXDATE, EXDATE)}
+    return read_adjusted_prices(
+        connection,
+        HeadBinding("prices", (HeadPin(bars),)),
+        HeadBinding("corporate_actions", (HeadPin(actions),), grants),
+        HeadQuery(cutoff_us=cutoff, subjects=("A",), grid=grid),
+        basis=basis,
+        time_rules=rules,
+        budget=BUDGET,
+    )
+
+
+def _closes(read: AdjustedRead) -> list[object]:
+    ordered = sorted(read.rows, key=lambda row: _day(row.values["session_date"]))
+    return [row.values["close"] for row in ordered]
+
+
+def test_adjustment_ignores_actions_after_cutoff() -> None:
+    store = _adjustment_store(SPLIT_BARS)
+
+    def closes(cutoff: int, basis: str) -> list[object]:
+        return _closes(_adjusted(store, cutoff, basis))
+
+    # Before the split is known, every bar stays as traded.
+    assert closes(20, "total_return") == [Decimal(100), Decimal(100), Decimal(50), Decimal(49)]
+    # The split is known, the dividend is not: earlier bars halve and nothing more.
+    assert closes(60, "total_return") == [Decimal(50), Decimal(50), Decimal(50), Decimal(49)]
+    # Once the dividend is known it is reinvested at the close before its ex-date, 50, so
+    # earlier bars take the factor 49/50.
+    assert closes(90, "total_return") == [Decimal(49), Decimal(49), Decimal(49), Decimal(49)]
+    assert closes(90, "split_adjusted") == [Decimal(50), Decimal(50), Decimal(50), Decimal(49)]
+
+
+def test_adjustment_marks_bars_before_a_withheld_action() -> None:
+    store = _adjustment_store(SPLIT_BARS)
+    # Without a grant for the action rule, the actions the cutoff knows are held back: every
+    # earlier bar is invalid and says why, and the receipt names the withheld rule.
+    read = _adjusted(store, 90, "split_adjusted", grants=())
+    ordered = sorted(read.rows, key=lambda row: _day(row.values["session_date"]))
+    assert [row.values["close"] for row in ordered] == [None, None, None, Decimal(49)]
+    assert [row.values["value_state"] for row in ordered] == [*["invalid"] * 3, "present"]
+    assert [row.reasons for row in ordered] == [
+        *[("ungranted_time_rule", "unadjustable_action")] * 3,
+        (),
+    ]
+    assert read.receipt["withheld_rules"] == [EXDATE]
+    assert len(read.actions.held) == 2
+    # Only the split is known by 60, so only the bars before it are held back.
+    early = _adjusted(store, 60, "total_return", grants=())
+    assert _closes(early) == [None, None, Decimal(50), Decimal(49)]
+    # An action not yet known by the cutoff is not held: nothing changes at 20.
+    assert _closes(_adjusted(store, 20, "total_return", grants=())) == [
+        Decimal(100),
+        Decimal(100),
+        Decimal(50),
+        Decimal(49),
+    ]
+
+
+def test_adjustment_reinvests_at_the_session_before_the_exdate_under_a_grid() -> None:
+    store = _adjustment_store(SPLIT_BARS)
+    # A sparse grid still reinvests at the close of the session before the ex-date (50 on
+    # DAYS[2]), not at the grid's earlier close (100 on DAYS[0]).
+    read = _adjusted(store, 90, "total_return", grid=(DAYS[0], DAYS[3]))
+    assert _closes(read) == [Decimal(49), Decimal(49)]
+    assert read.prices.coverage is not None
+    assert read.series.coverage is None
+    assert read.receipt["prices_hash"] == read.prices.receipt_hash
+    assert read.receipt["series_hash"] == read.series.receipt_hash != read.prices.receipt_hash
+
+
+def test_adjustment_needs_a_close_on_the_session_before_the_exdate() -> None:
+    # No bar on DAYS[2]: the grid says it is a session, so the dividend has no close.
+    gap = _adjustment_store([bar for bar in SPLIT_BARS if bar[1] != DAYS[2]])
+    read = _adjusted(gap, 90, "total_return", grid=DAYS)
+    ordered = sorted(read.rows, key=lambda row: _day(row.values["session_date"]))
+    assert [row.values["close"] for row in ordered] == [None, None, Decimal(49)]
+    assert ordered[0].reasons == ("unadjustable_action",)
+
+
+def test_adjusted_receipt_pins_the_reads_and_the_rows() -> None:
+    store = _adjustment_store(SPLIT_BARS)
+    first = _adjusted(store, 90, "total_return")
+    again = _adjusted(store, 90, "total_return")
+    assert first.receipt_hash == again.receipt_hash
+    assert first.receipt["schema"] == "aas-adjusted-read-v1"
+    assert first.receipt["prices_hash"] == first.prices.receipt_hash
+    assert first.receipt["actions_hash"] == first.actions.receipt_hash
+    assert first.receipt["withheld_rules"] == []
+    # A later-known action changes the derived rows and so the receipt.
+    earlier = _adjusted(store, 60, "total_return")
+    assert earlier.receipt["rows_hash"] != first.receipt["rows_hash"]
+    assert earlier.receipt["prices_hash"] != first.receipt["prices_hash"]  # another cutoff
+    assert earlier.prices.receipt["heads_hash"] == first.prices.receipt["heads_hash"]
+    with pytest.raises(ComputeResourceError, match="adjusted price memory estimate"):
+        adjusted_module._derive(  # noqa: SLF001 -- the budget check after both reads
+            first.series,
+            first.actions,
+            HeadQuery(cutoff_us=90),
+            "total_return",
+            # Only the admitted bytes matter here; a real budget this small refuses earlier.
+            cast("ComputeBudget", SimpleNamespace(available_bytes=64 * 1024)),
+        )
+    with pytest.raises(ValueError, match="adjusted basis"):
+        _adjusted(store, 90, "unadjusted")
+    connection, bars, actions = store
+    with pytest.raises(ValueError, match="binds prices and corporate_actions"):
+        read_adjusted_prices(
+            connection,
+            HeadBinding("corporate_actions", (HeadPin(actions),)),
+            HeadBinding("prices", (HeadPin(bars),)),
+            HeadQuery(cutoff_us=90),
+            basis="total_return",
+            time_rules={},
+            budget=BUDGET,
+        )
