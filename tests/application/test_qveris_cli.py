@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -350,3 +351,18 @@ def test_quarantine_releases_the_account_and_keeps_the_reservation(
     assert json.loads(capsys.readouterr().out)["status"] == "succeeded"
     with pytest.raises(SystemExit):
         main([*base, "--reason", "no target"])
+
+
+def test_plan_counts_only_jobs_run_reuses_as_completed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    raw = tmp_path / "raw"
+    done = bulk_job("KO", "prices", "2026-09-01", date(2026, 9, 2))
+    complete(raw, done, [{**KO_ROW, "date": "2026-09-01"}])
+    # The same request under another observation date is another job: run pays for it again.
+    again = replace(bulk_job("KO", "prices", "2026-09-01", date(2026, 9, 3)), job_id="again")
+    jobs = _jobs_file(tmp_path, done, again)
+    code = main(["collect", "qveris", "plan", "--jobs", str(jobs), "--raw-root", str(raw)])
+    assert code == 0
+    (document,) = json.loads(capsys.readouterr().out)["documents"]
+    assert (document["completed"], document["equivalent"], document["new"]) == (1, 1, 0)

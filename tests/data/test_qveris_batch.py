@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -87,3 +88,18 @@ def test_a_budget_code_with_unresolved_evidence_is_not_a_clean_stop(tmp_path: Pa
     # The pending page blocks the account, so the run must report an uncertain stop.
     assert budget_stop(refusal, tmp_path, client.account_key) is None
     assert budget_stop(ValueError("INVOCATION_CALL_LIMIT"), tmp_path, client.account_key) is None
+
+
+def test_a_settled_malformed_payload_is_a_known_failure_and_the_cohort_continues(
+    tmp_path: Path,
+) -> None:
+    from tests.data.qveris_support import ScriptedQveris, bar, bulk_job  # noqa: PLC0415
+
+    broken, fine = bulk_job("US", "prices", "2026-08-31"), bulk_job("US", "prices", "2026-09-01")
+    row = {"code": "AAA", "exchange_short_name": "US", **bar("2026-09-01")}
+    client = ScriptedQveris({broken.parameters_json: "not an array", fine.parameters_json: [row]})
+    result = collect_cohort((broken, fine), tmp_path, client)
+    assert (result["failed"], result["completed"], result["stopped"]) == (1, 1, None)
+    (failure,) = cast("list[dict[str, object]]", result["failures"])
+    assert failure["error_class"] == "TypeError"
+    assert failure["known_settled_failure"] is True

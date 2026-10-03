@@ -43,15 +43,21 @@ def _request(job: QverisJob) -> Request:
 
 @dataclass(frozen=True, slots=True)
 class RawAttempts:
-    """The requests a raw root completed, and those it attempted without completing."""
+    """The requests a raw root completed, and those it attempted without completing.
+
+    ``fingerprints`` are the completed job directories themselves: ``run`` reuses a job
+    only under its own fingerprint, which includes the observation date.
+    """
 
     completed: frozenset[Request]
     held: Mapping[Request, tuple[str, ...]]
+    fingerprints: frozenset[str] = frozenset()
 
 
 def raw_attempts(raw_root: Path | None) -> RawAttempts:
     """Read every job directory of ``raw_root`` (absent root: nothing attempted)."""
     completed: set[Request] = set()
+    fingerprints: set[str] = set()
     held: dict[Request, list[str]] = {}
     if raw_root is None or not raw_root.exists():
         return RawAttempts(frozenset(), {})
@@ -64,6 +70,7 @@ def raw_attempts(raw_root: Path | None) -> RawAttempts:
                     body = tree.read_bytes(f"{base}/complete.json", max_bytes=_MAX_DOCUMENT)
                     document = object_value(load_json(body)).get("job")
                     completed.add(_request(QverisJob.from_document(document)))
+                    fingerprints.add(name)
                     continue
                 intents = sorted(n for n in tree.listdir(base) if n.endswith(".intent.json"))
                 if intents:
@@ -75,6 +82,7 @@ def raw_attempts(raw_root: Path | None) -> RawAttempts:
     return RawAttempts(
         frozenset(completed),
         {key: tuple(value) for key, value in held.items() if key not in completed},
+        frozenset(fingerprints),
     )
 
 

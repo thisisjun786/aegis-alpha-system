@@ -241,7 +241,9 @@ def completions(
     """Completed jobs of ``raw_root`` in fingerprint order, and the requested ones not done.
 
     With ``fingerprints`` only those jobs are read and a job without ``complete.json``
-    is reported ``no_completion``; otherwise every completed job is listed. Empty
+    is reported ``no_completion``; otherwise every completed job is listed. A marker
+    that cannot be read or names another job is reported ``unreadable_completion`` and
+    the other jobs are still listed. Empty
     ``markets``/``datasets`` select every market/dataset.
     """
     found: list[Completion] = []
@@ -260,10 +262,17 @@ def completions(
                 if not tree.exists(path):
                     missing.append({"fingerprint": name, "status": "no_completion"})
                     continue
-                body = _read(tree, path)
-                job = QverisJob.from_document(object_value(load_json(body)).get("job"))
+                try:
+                    body = _read(tree, path)
+                    job = QverisJob.from_document(object_value(load_json(body)).get("job"))
+                except (ValueError, TypeError, OSError, DescriptorTreeError) as error:
+                    # One damaged marker is reported; the other completed jobs still import.
+                    missing.append(_unreadable(name, type(error).__name__, str(error)))
+                    continue
                 if job.fingerprint != name:
-                    raise ValueError("Qveris completion is filed under another fingerprint")
+                    reason = "Qveris completion is filed under another fingerprint"
+                    missing.append(_unreadable(name, "ValueError", reason))
+                    continue
                 if (markets and job.market not in markets) or (
                     datasets and job.dataset not in datasets
                 ):
@@ -272,6 +281,15 @@ def completions(
     except (OSError, DescriptorTreeError) as error:
         raise ValueError("cannot read the Qveris raw collection root") from error
     return found, missing
+
+
+def _unreadable(fingerprint: str, error_type: str, reason: str) -> dict[str, object]:
+    return {
+        "fingerprint": fingerprint,
+        "status": "unreadable_completion",
+        "error_type": error_type,
+        "reason": reason,
+    }
 
 
 # --- units ---------------------------------------------------------------------------------

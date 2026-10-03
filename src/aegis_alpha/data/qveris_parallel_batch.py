@@ -18,7 +18,12 @@ from aegis_alpha.data.qveris_contracts import (
     QverisJob,
     object_value,
 )
-from aegis_alpha.data.qveris_parallel import DEFAULT_WORKERS, MAX_WORKERS, acquire_parallel_jobs
+from aegis_alpha.data.qveris_parallel import (
+    DEFAULT_WORKERS,
+    MAX_WORKERS,
+    ProviderStopError,
+    acquire_parallel_jobs,
+)
 from aegis_alpha.data.sec_evidence import publish_bytes
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
 
@@ -72,7 +77,7 @@ def _group(remaining: deque[QverisJob], workers: int) -> list[QverisJob]:
     return group
 
 
-def collect_parallel_cohorts(  # noqa: PLR0913, PLR0915 -- one scheduler loop and its report
+def collect_parallel_cohorts(  # noqa: C901, PLR0913, PLR0915 -- one scheduler loop and its report
     cohorts: tuple[tuple[QverisJob, ...], ...],
     root: Path,
     client_factory: Callable[[], QverisPort],
@@ -116,9 +121,13 @@ def collect_parallel_cohorts(  # noqa: PLR0913, PLR0915 -- one scheduler loop an
                 if serial["stopped"]:
                     stopped = str(serial["stopped"])
             else:
-                result = acquire_parallel_jobs(
-                    tuple(group), root, client_factory, workers=workers, budget=budget
-                )
+                try:
+                    result = acquire_parallel_jobs(
+                        tuple(group), root, client_factory, workers=workers, budget=budget
+                    )
+                except ProviderStopError as error:
+                    # The group settled: count its completions and calls, then stop.
+                    result, stopped = error.result, "PROVIDER_STOP"
                 calls += int(str(result["provider_calls_this_run"]))
                 done, errors, cached, flagged = _counts(result["jobs"], group)
                 completed += done

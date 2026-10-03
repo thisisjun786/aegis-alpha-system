@@ -121,7 +121,8 @@ class PacedQverisClient:
         body: dict[str, object] | None = None,
         query: dict[str, str | int] | None = None,
     ) -> QverisResponse:
+        # Admission follows the shared pacer, so a start delayed past the deadline is refused.
+        self._pacer.wait()
         if self._admission is not None:
             self._admission.admit(path)
-        self._pacer.wait()
         return self._client.request(path, body=body, query=query)

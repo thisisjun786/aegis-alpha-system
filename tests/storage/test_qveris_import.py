@@ -284,3 +284,19 @@ def test_cli_imports_and_verify_passes(
     assert verified["source_library"]["linked"] == 2  # noqa: PLR2004 -- bars and quarantine
     assert main([*base, "--fingerprint", "f" * 64, "--identity", str(identity)]) == 1
     assert json.loads(capsys.readouterr().out)["missing"][0]["status"] == "no_completion"
+
+
+def test_a_damaged_completion_marker_is_reported_and_other_jobs_import(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    root = tmp_path / "damaged"
+    damaged = complete(root, history_job(), [bar("2026-08-03")])
+    complete(root, history_job("AAA.US", "US"), [bar("2026-08-03")])
+    marker = root / "jobs" / damaged / "complete.json"
+    marker.chmod(0o600)
+    marker.write_bytes(b"{not json")
+    found, missing = completions(root)
+    assert [m["status"] for m in missing] == ["unreadable_completion"]
+    assert missing[0]["fingerprint"] == damaged
+    result = import_completions(root, found, parse_identity(identity_bytes()), workspace=ws)
+    assert (result["built"], result["failed"]) == (1, 0)

@@ -195,15 +195,17 @@ response·billing과 `complete.json`)를 쓰는 규칙은 [qveris_acquisition.py
 JSON 이력, SEC facts)를 작업자 수만큼 한 group으로 묶는다(`data/qveris_parallel_batch.py`). group은
 모든 새 job의 견적을 받고, 서버 잔액에서 다른 예약을 뺀 값과 실행 예산(유료 호출 수·크레딧) 모두가
 group 전체를 받아들일 때만 batch manifest와 job별 intent를 남긴 뒤 실행한다(`data/qveris_parallel.py`).
-예산은 group 전체를 예약하거나 하나도 예약하지 않는다. 실행 중인 유료 future는 모두 기다려 기록하고,
-group 정산은 usage와 계정 ledger로 한 번 한다. 정산되지 않은 group은 정산되거나 운영자가 예약을 남긴 채
-격리할 때까지 그 계정의 새 실행을 막는다. 모든 요청은 실행 하나에 공유된 HTTP 시도 수·시간 한도를
-통과한 뒤 같은 간격으로 시작한다(`data/qveris_pacing.py`). 두 한도는 새 page를 시작하지 않게 할 뿐이다.
-한도에 닿으면 다음 page의 첫 사전 조회 요청(`/tools/by-ids`)이 intent 전에 `INVOCATION_HTTP_LIMIT`로
+예산은 group 전체를 예약하거나 하나도 예약하지 않는다. 실행 중인 유료 future는 모두 기다려 기록하고
+(job의 응답 bytes 상한을 넘는 응답은 순차 수집처럼 보존하지 않고 `JobResponseTooLarge`로 남긴다),
+group 정산은 usage와 계정 ledger로 한 번 한다. 정산 중 인증·quota 응답이 있으면 정산된 group의 완료와
+유료 호출을 센 뒤 `PROVIDER_STOP`으로 멈춘다. 정산되지 않은 group은 정산되거나 운영자가 예약을 남긴 채
+격리할 때까지 그 계정의 새 실행을 막는다. 모든 요청은 실행 하나에 공유된 HTTP 시도 수·시간 한도를 통과하고
+같은 간격으로 시작한다(`data/qveris_pacing.py`). 두 한도는 새 page를 시작하지 않게 할 뿐이다. 한도는
+간격을 기다린 뒤 확인하므로 기다리는 사이 시간이 지나면 새 page는 시작하지 않는다. 한도에 닿으면 다음 page의 첫 사전 조회 요청(`/tools/by-ids`)이 intent 전에 `INVOCATION_HTTP_LIMIT`로
 거부되고, 이미 시작한 page의 견적·실행·정산 요청은 세되 모두 통과한다. 그래서 한도는 intent를 실행되지
 않거나 정산되지 않은 채로 남기지 않으며, 실제 HTTP 시도 수는 진행 중인 page의 요청만큼 한도를 넘을 수 있다.
 
-- 정산된 실패는 기록하고 다음 job으로 간다. 공급자 경고(`RAW_ACQUIRED_WITH_WARNINGS`)는 완료이며
+- 정산된 실패(검증할 수 없는 응답 형태 포함)는 기록하고 다음 job으로 간다. 공급자 경고(`RAW_ACQUIRED_WITH_WARNINGS`)는 완료이며
   `warned`로 세고 수집을 멈추지 않는다.
 - 결과가 불확실한 유료 호출은 수집을 멈추고(`stopped`, 종료 코드 2) 자동으로 다시 호출하지 않는다.
 - 예산 거부(유료 호출 수·크레딧·HTTP 시도 수·시간·서버 잔액)는 intent를 만들기 전에 일어나므로 시도한
@@ -249,7 +251,8 @@ instrument_type, currency, ...}}}`)의 SHA-256은 적재 코드·변환 해시�
   identity가 없는 종목, 양수 십진수가 아닌 비율·금액은 그 사유로 보류하고 고치지 않는다. 통화쌍
   이력은 instrument가 아니므로 identity 문서 없이 쌍·기준 통화·호가 통화를 남긴다.
 - 읽거나 검증할 수 없는 job은 `failures`에 남고 다음 job을 적재한다. 완료 문서가 없는 요청 job은
-  `missing`, 적재기가 없는 종류(FRED, SEC, 종목 목록, 연구 이력)는 `unsupported`로 센다. 적재는
+  `missing`의 `no_completion`, 읽을 수 없거나 다른 job을 가리키는 완료 문서는 `missing`의
+  `unreadable_completion`으로 남고 다른 job은 계속 적재한다. 적재기가 없는 종류(FRED, SEC, 종목 목록, 연구 이력)는 `unsupported`로 센다. 적재는
   공급자를 호출하지 않는다.
 
 ## 승격 명세 `aas-promotion-v1`
@@ -2064,3 +2067,9 @@ state v2:
 | DV-307 | 미정산 증거가 있는 예산 거부는 깨끗한 예산 소진이 아니다 | `tests/data/test_qveris_batch.py::test_a_budget_code_with_unresolved_evidence_is_not_a_clean_stop` | 구현 |
 | DV-308 | `aas collect qveris quarantine`은 page나 group을 예약을 남긴 채 격리하고 계정의 새 실행을 다시 허용한다 | `tests/application/test_qveris_cli.py::test_quarantine_releases_the_account_and_keeps_the_reservation` | 구현 |
 | DV-309 | 고정 합성 job의 정규화 행과 보류 행 digest는 고정값과 같다 | `tests/storage/test_qveris_import.py::test_normalized_rows_match_the_pinned_legacy_shape` | 구현 |
+| DV-310 | 정산된 뒤 응답 형태가 맞지 않는 job은 알려진 실패로 세고 cohort는 계속된다 | `tests/data/test_qveris_batch.py::test_a_settled_malformed_payload_is_a_known_failure_and_the_cohort_continues` | 구현 |
+| DV-311 | 시간 한도는 공유 간격을 기다린 뒤 확인된다 | `tests/data/test_qveris_pacing.py::test_the_deadline_is_checked_after_waiting_for_the_shared_pacer` | 구현 |
+| DV-312 | 병렬 응답이 job의 bytes 상한을 넘으면 보존하지 않고 실패로 정산된다 | `tests/data/test_qveris_parallel.py::test_a_parallel_response_over_the_job_byte_bound_is_never_retained` | 구현 |
+| DV-313 | 인증·quota 응답으로 멈춘 병렬 group은 정산된 완료와 호출을 센 뒤 멈춘다 | `tests/data/test_qveris_parallel_batch.py::test_a_provider_stop_counts_the_settled_group_before_stopping` | 구현 |
+| DV-314 | 손상된 완료 문서는 `unreadable_completion`으로 보고되고 다른 job은 적재된다 | `tests/storage/test_qveris_import.py::test_a_damaged_completion_marker_is_reported_and_other_jobs_import` | 구현 |
+| DV-315 | `plan`은 `run`이 재사용하는 같은 fingerprint만 완료로 세고 관측일이 다른 같은 요청은 `equivalent`로 센다 | `tests/application/test_qveris_cli.py::test_plan_counts_only_jobs_run_reuses_as_completed` | 구현 |

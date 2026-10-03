@@ -57,6 +57,18 @@ DEFAULT_WORKERS = 4
 LOCK_WAIT_SECONDS = 60
 
 
+class ProviderStopError(RuntimeError):
+    """A group settled, but a member's auth/quota answer stops new executions.
+
+    ``result`` is the settled group's result, so a scheduler counts its durable
+    completions and paid calls before it stops.
+    """
+
+    def __init__(self, message: str, result: dict[str, object]) -> None:
+        super().__init__(message)
+        self.result = result
+
+
 def _stable_account(
     client: QverisPort, store: QverisStore, day: str
 ) -> tuple[Decimal, list[dict[str, object]]]:
@@ -137,7 +149,16 @@ def _execute(
     )
 
 
-def _record_response(store: QverisStore, page: str, response: QverisResponse) -> None:
+def _record_response(
+    store: QverisStore, page: str, response: QverisResponse, maximum: object
+) -> None:
+    if type(maximum) is not int or len(response.body) > maximum:
+        # The job's own byte bound holds before anything is retained, as in serial acquisition.
+        store.publish_document(
+            f"{page}.transport-failure.json",
+            {"error_class": "JobResponseTooLarge", "outcome": "UNKNOWN", "automatic_retry": False},
+        )
+        return
     store.publish(f"{page}.raw", response.body)
     execution: object = None
     with suppress(ValueError):
@@ -480,6 +501,7 @@ def _acquire_locked(  # noqa: C901, PLR0912, PLR0913, PLR0915 -- ordered coordin
         record_failed = False
         for future in as_completed(executions):
             page = str(executions[future]["page"])
+            maximum = object_value(executions[future]["job"])["max_response_bytes"]
             try:
                 response = future.result()
             except Exception as error:  # noqa: BLE001 -- drain every in-flight paid future
@@ -496,7 +518,7 @@ def _acquire_locked(  # noqa: C901, PLR0912, PLR0913, PLR0915 -- ordered coordin
                     record_failed = True
             else:
                 try:
-                    _record_response(store, page, response)
+                    _record_response(store, page, response, maximum)
                 except (OSError, RuntimeError, ValueError):
                     record_failed = True
                     with suppress(OSError, RuntimeError, ValueError):
@@ -509,13 +531,14 @@ def _acquire_locked(  # noqa: C901, PLR0912, PLR0913, PLR0915 -- ordered coordin
     results, stop = _settle(client, store, base)
     for result in results:
         old[str(result["fingerprint"])] = result
-    if stop:
-        raise RuntimeError("PROVIDER_STOP: batch settled; auth/quota failure")
-    return {
+    result = {
         "status": "SETTLED",
         "jobs": [old[j.fingerprint] for j in jobs],
         "provider_calls_this_run": len(fresh),
     }
+    if stop:
+        raise ProviderStopError("PROVIDER_STOP: batch settled; auth/quota failure", result)
+    return result
 
 
 def acquire_parallel_jobs(

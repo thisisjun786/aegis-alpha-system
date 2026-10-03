@@ -77,7 +77,7 @@ def collect_cohort(
     for index, job in enumerate(jobs):
         try:
             result = acquire_jobs((job,), root, client, budget=budget)
-        except (ValueError, RuntimeError) as error:
+        except (ValueError, TypeError, RuntimeError) as error:
             stop = budget_stop(error, root, client.account_key)
             if stop is not None:
                 stopped = stop

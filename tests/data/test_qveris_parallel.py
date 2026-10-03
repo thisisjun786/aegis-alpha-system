@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -315,11 +316,11 @@ def test_write_failure_still_drains_and_preserves_other_paid_responses(
     original = qveris_parallel._record_response  # noqa: SLF001 -- fault injection at write boundary
     writes = []
 
-    def record(store: QverisStore, page: str, response: QverisResponse) -> None:
+    def record(store: QverisStore, page: str, response: QverisResponse, maximum: object) -> None:
         writes.append(page)
         if len(writes) == 1:
             raise OSError("synthetic write failure")
-        original(store, page, response)
+        original(store, page, response, maximum)
 
     monkeypatch.setattr(qveris_parallel, "_record_response", record)
     client = ConcurrentFake(4)
@@ -358,3 +359,25 @@ def test_group_is_reserved_whole_or_not_at_all(tmp_path: Path) -> None:
         == 0
     )
     assert replay.reserved_calls == 0
+
+
+def test_a_parallel_response_over_the_job_byte_bound_is_never_retained(tmp_path: Path) -> None:
+    (small,) = (replace(job, max_response_bytes=1024) for job in jobs(1))
+    big = [{**PRICE, "date": "2026-08-01", "name": "x" * 2048}]
+
+    class Large(ConcurrentFake):
+        def _execute(
+            self, body: dict[str, object], query: dict[str, str | int]
+        ) -> dict[str, object]:
+            document = super()._execute(body, query)
+            object_value(document["result"])["data"] = big
+            return document
+
+    client = Large()
+    result = acquire_parallel_jobs((small,), tmp_path, lambda: client)
+    (row,) = cast("list[object]", result["jobs"])
+    assert object_value(row)["status"] == "FAILED"
+    page = tmp_path / "jobs" / small.fingerprint / "0000"
+    assert not page.with_suffix(".raw").exists()
+    failure = json.loads(page.with_suffix(".transport-failure.json").read_bytes())
+    assert failure["error_class"] == "JobResponseTooLarge"

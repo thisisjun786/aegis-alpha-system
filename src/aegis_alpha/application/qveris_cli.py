@@ -119,11 +119,20 @@ def plan(args: argparse.Namespace) -> dict[str, object]:
         # Parallel scheduling interleaves the documents, so a request may appear only once.
         interleave_cohorts(tuple(cohorts))
     attempts = raw_attempts(args.raw_root)
+    attempted = {fingerprint for value in attempts.held.values() for fingerprint in value}
     for document, jobs in zip(documents, cohorts, strict=True):
-        requests = [(j.tool_id, j.upstream, j.market, j.dataset, j.parameters_json) for j in jobs]
-        document["completed"] = sum(r in attempts.completed for r in requests)
-        document["held"] = sum(r in attempts.held for r in requests)
-        document["new"] = len(jobs) - document["completed"] - document["held"]
+        counts = dict.fromkeys(("completed", "held", "equivalent", "new"), 0)
+        for job in jobs:
+            request = (job.tool_id, job.upstream, job.market, job.dataset, job.parameters_json)
+            if job.fingerprint in attempts.fingerprints:
+                counts["completed"] += 1  # reused by run without HTTP
+            elif job.fingerprint in attempted:
+                counts["held"] += 1  # run settles this attempt; no new paid call
+            elif request in attempts.completed or request in attempts.held:
+                counts["equivalent"] += 1  # same request under another job; run pays again
+            else:
+                counts["new"] += 1
+        document.update(counts)
     return {
         "provider": "qveris",
         "execute": False,

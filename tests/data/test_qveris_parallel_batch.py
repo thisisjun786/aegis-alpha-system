@@ -140,3 +140,27 @@ def test_budget_refusal_stops_scheduling_as_exhausted_not_uncertain(tmp_path: Pa
     assert result["stopped"] == "INVOCATION_CALL_LIMIT"
     assert result["status"] == "BUDGET_EXHAUSTED"
     assert client.execute_count == budget.reserved_calls == 2  # noqa: PLR2004
+
+
+def test_a_provider_stop_counts_the_settled_group_before_stopping(tmp_path: Path) -> None:
+    from aegis_alpha.data.qveris_contracts import object_value  # noqa: PLC0415
+    from tests.data.test_qveris_parallel import ConcurrentFake  # noqa: PLC0415
+
+    class ForbiddenOnce(ConcurrentFake):
+        def _execute(
+            self, body: dict[str, object], query: dict[str, str | int]
+        ) -> dict[str, object]:
+            document = super()._execute(body, query)
+            if object_value(body["parameters"])["date"] == "2026-08-01":
+                document["success"] = False
+                object_value(document["result"])["status_code"] = 403
+            return document
+
+    client = ForbiddenOnce(2)
+    result = batch.collect_parallel_cohorts(
+        ((job(1), job(2), job(3)),), tmp_path, lambda: client, workers=2
+    )
+    assert (result["processed"], result["completed"], result["failed"]) == (2, 1, 1)
+    assert (result["pending"], result["provider_calls_this_run"]) == (1, 2)
+    assert result["stopped"] == "PROVIDER_STOP"
+    assert client.execute_count == 2  # noqa: PLR2004

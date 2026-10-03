@@ -92,3 +92,15 @@ def test_admission_bounds_requests_and_time_across_shared_clients() -> None:
 def test_invalid_admission_is_rejected(requests: int, seconds: float) -> None:
     with pytest.raises(ValueError, match="limit"):
         RequestAdmission(requests, seconds)
+
+
+def test_the_deadline_is_checked_after_waiting_for_the_shared_pacer() -> None:
+    clock = Clock()
+    starts: list[tuple[str, float]] = []
+    pacer = RequestPacer(10, clock=clock.monotonic, sleep=clock.sleep)
+    admission = RequestAdmission(100, 5, clock=clock.monotonic)
+    client = PacedQverisClient(Transport(clock, starts), pacer, admission)
+    client.request("/tools/by-ids")
+    with pytest.raises(RuntimeError, match="INVOCATION_HTTP_LIMIT"):
+        client.request("/tools/by-ids")
+    assert starts == [("/tools/by-ids", 10.0)]
