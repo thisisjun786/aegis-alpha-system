@@ -146,7 +146,7 @@
   "tests/storage/test_decimal_rules.py": 14.7,
   "tests/storage/test_identity_mint.py": 0.0,
   "tests/storage/test_identity_registration.py": 4.7,
-  "tests/storage/test_identity_snapshot.py": 328.3,
+  "tests/storage/test_identity_snapshot.py": 27.1,
   "tests/storage/test_import_document.py": 0.0,
   "tests/storage/test_input_pins.py": 48.1,
   "tests/storage/test_market.py": 12.9,
