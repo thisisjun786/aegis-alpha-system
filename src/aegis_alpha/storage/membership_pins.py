@@ -622,6 +622,24 @@ def _part_bounds(
     return bounds[0], bounds[1]
 
 
+# Whether two parts of one identity manifest hold the same (provider, namespace, key) over
+# overlapping valid and known intervals. Parameters: ISSUER_LINK_NAMESPACE, then a JSON array
+# of part snapshot ids. MATERIALIZED evaluates the member join once and lets SQLite index the
+# self-join; an inlined CTE re-runs the join for every outer row and grows quadratically.
+PART_OVERLAP_SQL = (
+    "WITH m AS MATERIALIZED (SELECT s.snapshot_id AS part,a.provider,a.namespace,"
+    "CASE WHEN a.namespace=? THEN a.instrument_id ELSE a.token END AS token,"
+    "s.valid_from_us AS vf,s.valid_to_us AS vt,s.known_from_us AS kf,"
+    "s.known_to_us AS kt FROM identity_snapshot_members s "
+    "JOIN identity_assertions a ON a.assertion_id=s.assertion_id "
+    "WHERE s.snapshot_id IN (SELECT value FROM json_each(?))) "
+    "SELECT EXISTS(SELECT 1 FROM m x JOIN m y ON x.provider=y.provider "
+    "AND x.namespace=y.namespace AND x.token=y.token AND x.part<y.part "
+    "WHERE (x.vt IS NULL OR y.vf<x.vt) AND (y.vt IS NULL OR x.vf<y.vt) "
+    "AND (x.kt IS NULL OR y.kf<x.kt) AND (y.kt IS NULL OR x.kf<y.kt))"
+)
+
+
 def _manifest_rules(
     connection: sqlite3.Connection, parts: Sequence[IdentityPin | UniversePin]
 ) -> None:
@@ -645,19 +663,7 @@ def _manifest_rules(
         previous = high
     if parts and isinstance(parts[0], IdentityPin) and len(parts) > 1:
         names = json.dumps([cast("IdentityPin", part).snapshot_id for part in parts])
-        overlap = connection.execute(
-            "WITH m AS (SELECT s.snapshot_id AS part,a.provider,a.namespace,"
-            "CASE WHEN a.namespace=? THEN a.instrument_id ELSE a.token END AS token,"
-            "s.valid_from_us AS vf,s.valid_to_us AS vt,s.known_from_us AS kf,"
-            "s.known_to_us AS kt FROM identity_snapshot_members s "
-            "JOIN identity_assertions a ON a.assertion_id=s.assertion_id "
-            "WHERE s.snapshot_id IN (SELECT value FROM json_each(?))) "
-            "SELECT EXISTS(SELECT 1 FROM m x JOIN m y ON x.provider=y.provider "
-            "AND x.namespace=y.namespace AND x.token=y.token AND x.part<y.part "
-            "WHERE (x.vt IS NULL OR y.vf<x.vt) AND (y.vt IS NULL OR x.vf<y.vt) "
-            "AND (x.kt IS NULL OR y.kf<x.kt) AND (y.kt IS NULL OR x.kf<y.kt))",
-            (ISSUER_LINK_NAMESPACE, names),
-        ).fetchone()[0]
+        overlap = connection.execute(PART_OVERLAP_SQL, (ISSUER_LINK_NAMESPACE, names)).fetchone()[0]
         if overlap:
             raise ValueError("identity snapshot interval overlap")
 
