@@ -286,6 +286,25 @@ commit한다. 두 옵션 모두 반복할 수 있고, 같은 수집물을 다시
 `--table`)의 EODHD 심볼이 몇 개 해석되는지와 미해결 심볼을 이유별로 보고한다. 설치본에 쓰지 않는 검토
 근거다.
 
+### US identity
+
+```bash
+aas identity us-build --master SOURCE_ID [--fmp SOURCE_ID] ... [--sec SOURCE_ID] ... \
+  [--bindings SOURCE_ID] --output registry.json [--report report.json]
+aas identity register --file registry.json --sha256 SHA256 --plan
+```
+
+`us-build`는 설치본을 읽기 전용으로 열어 지정한 원천을 pin과 대조해 읽고, `norgate.master@1`,
+`eodhd.us_symbol@1`, `fmp.profile@1`, `sec.tickers@1` 매퍼로 `aas-identity-registry-v1` 문서를 `--output`에
+쓴다. `--master`는 Norgate security master 원천 하나, `--fmp`는 FMP company profile 원천, `--sec`는
+`aas import legacy`의 `sec.submissions_zip@1`로 편입한 SEC submissions 내용 원천이다(`raw/`의 archive를
+읽는다). `--fmp`와 `--sec`는 반복할 수 있다. 원천마다 `sl:` 연결이 있어야 하므로 명시 ID 원천은 먼저
+`aas db source-link --apply`로 연결한다. `--bindings`는 legacy identity bindings 원천과 발급한 asset ID
+집합을 비교해 보고에 싣는다. 입력의 누적 규칙, 출력·`--report` 파일 규칙, 응답 형태(`withdrawn` 포함)는
+`kr-build`와 같다. 응답에는 asset ID 집합의 `aas-norgate-assetids-v1` 해시(`assetids_sha256`)와 issuer가
+연결된 instrument 수가 더 실린다. 공급자를 호출하지 않는다. 해석 규칙과 미해결 이유는
+[US 등록](design/data-vertical.md#us-등록)이 소유한다.
+
 ## 원천 자료의 승격과 은퇴
 
 원천 자료실 자료를 공급자별 시장 dataset으로 승격하는 명령(`aas data promote`), 원천 ID 연결

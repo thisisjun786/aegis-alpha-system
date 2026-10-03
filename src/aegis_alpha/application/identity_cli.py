@@ -54,6 +54,20 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
     )
     kr_build.add_argument("--output", type=Path, required=True, help="New registry file")
     kr_build.add_argument("--report", type=Path, help="New file for the full JSON report")
+    us_build = sub.add_parser(
+        "us-build", help="Build the US aas-identity-registry-v1 document from committed sources"
+    )
+    home_option(us_build)
+    us_build.add_argument("--master", required=True, help="Norgate security master source ID")
+    us_build.add_argument("--fmp", action="append", default=[], help="FMP profile source ID")
+    us_build.add_argument(
+        "--sec", action="append", default=[], help="SEC submissions archive source ID"
+    )
+    us_build.add_argument(
+        "--bindings", help="Legacy identity-bindings source ID to compare asset IDs with"
+    )
+    us_build.add_argument("--output", type=Path, required=True, help="New registry file")
+    us_build.add_argument("--report", type=Path, help="New file for the full JSON report")
     show = sub.add_parser("show", help="Inspect one instrument, provider key or snapshot")
     home_option(show)
     target = show.add_mutually_exclusive_group(required=True)
@@ -103,6 +117,24 @@ def _new_files(files: list[tuple[Path, bytes]]) -> None:
     finally:
         for temporary, _ in staged:
             Path(temporary).unlink(missing_ok=True)
+
+
+def _us(args: argparse.Namespace, home: Path) -> dict[str, object]:
+    import json
+
+    from aegis_alpha.storage import us_identity
+    from aegis_alpha.storage.workspace import open_workspace
+
+    with open_workspace(home, writable=False, require_strategies=False) as workspace:
+        registry = us_identity.build_from_workspace(
+            workspace, master=args.master, fmp=args.fmp, sec=args.sec, bindings=args.bindings
+        )
+    files = [(args.output, registry.raw())]
+    if args.report is not None:
+        full = json.dumps(registry.report(sample=None), ensure_ascii=False, sort_keys=True)
+        files.append((args.report, full.encode()))
+    _new_files(files)
+    return {"file": str(args.output), **registry.report()}
 
 
 def _kr(args: argparse.Namespace, home: Path) -> dict[str, object]:
@@ -161,11 +193,11 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
 
     home = resolve_home(getattr(args, "home", None))
     command = args.identity_command
-    if command in {"kr-import", "kr-build"}:
+    if command in {"kr-import", "kr-build", "us-build"}:
         import duckdb
 
         try:
-            return _kr(args, home)
+            return _us(args, home) if command == "us-build" else _kr(args, home)
         except (sqlite3.Error, duckdb.Error):
             raise ValueError("local database operation failed; run aas db verify") from None
     document = None
