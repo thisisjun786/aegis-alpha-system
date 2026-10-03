@@ -1513,9 +1513,13 @@ mkdir -p -m 0700 "$BACKUPS"
 설치본의 state, strategies, market, `raw/`, `runs/` 크기만큼 공간을 쓴다.
 
 **0. 동결.** 설치본에 쓰는 legacy timer와 service를 멈추고 남은 작업을 정리한다. ETF 탐색 unit은
-설치본에 쓰지 않으므로 5단계에서 은퇴한다.
+설치본에 쓰지 않으므로 5단계에서 은퇴한다. 저장소는 Git checkout 안의 경로를 거부하므로(상위 어딘가의 빈
+`.git`도 그렇다) 먼저 전환이 쓰는 경로의 상위에 `.git`이 없는지 확인한다. 아무것도 출력되지 않아야 한다.
 
 ```bash
+for p in "$OLD_HOME" "$BACKUPS" "$REHEARSAL" "$HOME_V2" "$HOME_V3" "$QVERIS" "$SPECS"; do
+  d=$(realpath -m "$p"); while [ "$d" != / ]; do [ -e "$d/.git" ] && echo "$d/.git"; d=$(dirname "$d"); done
+done
 for unit in $LEGACY_UNITS; do systemctl --user stop "$unit.timer" "$unit.service"; done
 systemctl --user list-units --all 'aas-*'   # 위 service가 모두 active가 아님
 AAS_HOME="$OLD_HOME" aas db recover
