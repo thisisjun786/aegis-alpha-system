@@ -15,6 +15,7 @@ from alembic.config import Config
 from sqlalchemy import Engine, create_engine, inspect, make_url, text
 
 from tests.isolation import isolate, live_roots, live_state_refusal
+from tests.serial import QVERIS_LEASE_GROUP
 
 if TYPE_CHECKING:
     from sqlalchemy.engine import URL
@@ -29,6 +30,7 @@ _PYTEST_ROOT = tempfile.TemporaryDirectory(prefix="aas-pytest-")
 isolate(Path(os.path.realpath(_PYTEST_ROOT.name)), os.environ)
 
 from aegis_alpha.data import canonical_generation_schema  # noqa: E402, F401
+from aegis_alpha.data.qveris_store import QverisStore  # noqa: E402
 from aegis_alpha.metadata.schema import metadata  # noqa: E402
 
 # CI splits the database-free lane into deterministic file shards (tests/sharding.py), and
@@ -70,6 +72,27 @@ def block_network(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket, "create_connection", denied)
     monkeypatch.setattr(socket, "getaddrinfo", denied)
     monkeypatch.setattr(socket.socket, "connect", denied)
+
+
+@pytest.fixture(autouse=True)
+def qveris_lease_needs_its_serial_group(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail a test that takes the Qveris account lease outside its serial group."""
+    if any(
+        marker.args == (QVERIS_LEASE_GROUP,) for marker in request.node.iter_markers("xdist_group")
+    ):
+        return
+    enter = QverisStore.__enter__
+
+    def refused(store: QverisStore) -> QverisStore:
+        pytest.fail(
+            f"{request.node.nodeid} takes the Qveris account lease; mark its file "
+            f'pytestmark = pytest.mark.xdist_group("{QVERIS_LEASE_GROUP}") (tests/AGENTS.md)'
+        )
+        return enter(store)
+
+    monkeypatch.setattr(QverisStore, "__enter__", refused)
 
 
 @dataclass(frozen=True, slots=True)
