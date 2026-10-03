@@ -340,23 +340,23 @@ migration-incomplete로 남고 앱은 그 설치본을 열지 않는다. 재개 
 ## 전환 계획과 기존 코드
 
 같은 SQL을 모든 DB에 돌리는 호환 계층을 만들지 않는다. 기존 value model·파서·해시·시점·
-권한 검증을 재사용하고 새 저장소에 맞춘 전용 SQL과 adapter를 작성한다. 다음 경로는 제안이다.
+권한 검증을 재사용하고 새 저장소에 맞춘 전용 SQL과 adapter를 작성한다. 표는 단계마다 소유 코드와 남은 작업이다.
 
 | 단계 | 현재 상태와 소유 코드 | 남은 작업과 완료 기준 |
 | --- | --- | --- |
 | L1 저장소 기반 | 로컬 경로 구현: `storage/paths.py`, `workspace.py`, `locks.py`, `sqlite.py`, 세 schema 파일. `tests/storage/test_workspace.py`에 초기화·잠금·정체성 거부 사례 | 현재 초기화·검증 경로 유지. core schema v2 업그레이드는 `storage/migration.py`·`aas db migrate`(`tests/storage/test_migration.py`). 서비스 소유권 인계는 미구현이며 별도 실패·복구 계약 검증 필요 |
 | L2 전략·상태 | bundle 등록·로드와 영수증 구현: `strategies.py`, `strategy_import.py`, `state.py`. CLI는 등록·목록 제공; lineage·원래 성과용 schema 존재 | 원래 성과·비교 조건의 전체 입력 경로, 실행 입력 bundle·run 소비자 연결 필요. schema만으로 DB 재실행 완료를 주장하지 않음 |
-| L3 시장·publication | typed JSON import, generation·revision 조회, 중단 게시 재개 구현: `import_document.py`, `market.py`, `publication.py`; `tests/storage/test_market.py`, `test_publication.py`에 합성 사례. staging 테이블의 대량 generation 게시·증분 검증은 `bulk_generation.py`(`tests/storage/test_bulk_generation.py`) | identity 등록·불투명 ID 발급·chunked identity/universe 문서는 `storage/identity.py`·`membership_pins.py`(`tests/storage/test_identity_*.py`)에 구현. ordered pin·cutover·grant·flag 제외를 해석하는 predicate-pushdown reader는 `storage/read_heads.py`와 작업 공간 진입점 `market_inputs.load_pinned_heads`(`tests/storage/test_read_heads.py`). 원천 자료실에서의 승격(명세, 매퍼 레지스트리, 시간·숫자 규칙, head 비교, quality flag, 복구·검증)은 `storage/promotion/`과 `aas data promote`(`tests/storage/test_promotion_*.py`, `test_time_rules.py`, `test_decimal_rules.py`)에 구현. 선언 달력(XNYS·XKRX 선언 문서, `calendar.declared@1`, `aas calendar refresh`)은 `storage/calendar_declaration.py`·`calendar_refresh.py`(`tests/storage/test_calendar_*.py`)에 구현. DART 재무제표 응답의 발행인 재무·공시 매퍼(`dart.fnltt@1`, `dart.fnltt_filings@1`)는 `storage/promotion/mappers/dart.py`(`tests/storage/test_dart_promotion.py`)에 구현. SEC submissions·companyfacts의 발행인 공시·재무 매퍼(`sec.submissions@1`, `sec.companyfacts@1`)는 `storage/promotion/mappers/sec.py`(`tests/storage/test_sec_promotion.py`)에 구현. 설치본 밖 legacy 원본의 `raw/`·원천 자료실 편입(`aas import legacy`)은 `storage/legacy_import/`(`tests/storage/test_legacy_import.py`)에 구현. 실행 준비의 `read_heads` 연결, 공급자별 매퍼와 identity 매퍼는 [데이터 수직 대응표](data-vertical.md#계약과-테스트-대응표)의 `예정` 행이 남은 작업이다. 기존 `data/catalog_access.py`·`pinned_prices.py`, identity/metadata 소비자와 수집기 전환 필요 |
-| L4 수집·실행 | `collection/`, `data/`의 공급자 도구와 `application/daily_collection.py`는 전환 전 경로. KR 공시·상장 수집(`aas collect dart`·`aas collect kind`)은 `storage/kr_collection.py`가 `collection_ledger.py`의 job·attempt·usage 기록, `raw/` 보존, 내용 원천 commit으로 내장 설치본에 기록(`tests/storage/test_kr_collection.py`, `test_collection_ledger.py`). SEC·FRED/ALFRED 수집(`aas collect sec`·`aas collect fred`)은 `storage/sec_collection.py`·`fred_collection.py`가 같은 원장과 `provider_collection.py`의 receipt batch로 기록(`tests/storage/test_us_collection.py`). 저장 전략→고정 입력→계산→봉투는 `application/backtest_prepare.py`·`aas prepare`가 SELECT-only로 연결(`tests/application/test_backtest_prepare.py`, `test_prepare_cli.py`에 합성 사례); 봉투 회계는 기존 `aas backtest`. `storage/run_schema.py`의 run 추가 스키마와 `backtest_requests.py`의 정규 요청 저장 API를 `application/run_backtest.py`·`aas run`이 소비해 요청 등록·`open_run`·잠금 없는 계산·`commit_run`·run ID 조회를 잇는다(`tests/application/test_run_backtest.py`에 합성 사례). 명시적 `aas db run-install` 필요 | 나머지 수집기 내장 DB 이식, watermark 결합, 결과 복원 연결 필요. 준비·실행 출력은 `certified=false`이며 불확실 호출·부분 결과·재시작 시나리오를 검증해야 완료 |
+| L3 시장·publication | 완료. typed JSON import, generation·revision 조회, 중단 게시 재개는 `import_document.py`, `market.py`, `publication.py`(`tests/storage/test_market.py`, `test_publication.py`). staging 테이블의 대량 generation 게시와 증분 검증은 `bulk_generation.py`(`tests/storage/test_bulk_generation.py`). identity 등록·불투명 ID 발급·chunked identity/universe 문서는 `storage/identity.py`·`membership_pins.py`·`universe.py`, KR·US 등록은 `kr_identity.py`·`us_identity.py`(`tests/storage/test_identity_*.py`, `test_kr_identity.py`, `test_us_identity.py`, `test_universe.py`). ordered pin·cutover·grant·flag 제외를 해석하는 predicate-pushdown reader는 `storage/read_heads.py`와 작업 공간 진입점 `market_inputs.load_pinned_heads`(`tests/storage/test_read_heads.py`), 조정 가격 유도는 `adjusted_prices.py`(`tests/storage/test_us_actions.py`). 원천 자료실에서의 승격(명세, 매퍼 레지스트리, 시간·숫자 규칙, head 비교, quality flag, 복구·검증)은 `storage/promotion/`과 `aas data promote`(`tests/storage/test_promotion_*.py`, `test_time_rules.py`, `test_decimal_rules.py`)이고, 공급자별 매퍼가 [dataset 카탈로그](data-vertical.md#dataset-카탈로그)의 dataset을 만든다(`storage/promotion/mappers/`, `kr_prices.py`, `calendar_refresh.py`; `tests/storage/test_kr_prices.py`, `test_us_prices.py`, `test_us_actions.py`, `test_macro_fx.py`, `test_classifications.py`, `test_sec_promotion.py`, `test_dart_promotion.py`, `test_calendar_*.py`). 카탈로그는 `storage/dataset_catalog.py`이고 `aas data datasets`가 돌려준다(`tests/tools/test_dataset_catalog.py`). 설치본 밖 legacy 원본의 `raw/`·원천 자료실 편입은 `aas import legacy`(`storage/legacy_import/`, `tests/storage/test_legacy_import.py`) | 원천 은퇴와 compact(Linear AAS-47), 기본 digest 검증(AAS-48), 수천만 행 테이블의 유지보수 게시 할당(AAS-54)은 [데이터 수직 대응표](data-vertical.md#계약과-테스트-대응표)의 `예정` 행이다. 실제 store의 승격 실행은 운영 전환(AAS-51)의 일이다. 기존 `data/catalog_access.py`·`pinned_prices.py`는 L6의 구경로다 |
+| L4 수집·실행 | 완료. 공급자 수집은 모두 내장 설치본에 기록한다. Qveris 일간·이력 수집과 원천 적재(`aas collect qveris`)는 `application/qveris_*.py`·`storage/qveris_import.py`(`tests/application/test_qveris_*.py`, `tests/data/test_qveris_*.py`, `tests/storage/test_qveris_import.py`), KR 공시·상장 수집(`aas collect dart`·`aas collect kind`)은 `storage/kr_collection.py`, SEC·FRED/ALFRED 수집(`aas collect sec`·`aas collect fred`)은 `storage/sec_collection.py`·`fred_collection.py`이며, 모두 `collection_ledger.py`의 job·attempt·usage 기록, `raw/` 보존, 내용 원천 commit을 쓴다(`tests/storage/test_kr_collection.py`, `test_us_collection.py`, `test_collection_ledger.py`). 저장 전략→고정 입력→계산→봉투는 `application/backtest_prepare.py`·`aas prepare`가 SELECT-only로 연결하고, strict 경로는 `read_heads`의 exact head binding, identity·universe pin, 거시·FX 입력을 쓴다(`tests/application/test_backtest_prepare.py`, `test_prepare_cli.py`, `test_strict_head_inputs.py`). 연구 경로는 canonical 가격 pin에서 패널을 만든다(`tests/application/test_research_prices.py`). 거시 입력과 계좌 통화가 아닌 가격은 선언의 `macro`·`fx_conversions` grant로 읽고 run이 그 grant와 읽기를 기록한다(`engine/fx_conversion.py`; `tests/engine/test_fx_conversion.py`, `tests/application/test_research_grants.py`). 전략 원본은 `aas strategy promote`가 레지스트리로 등록한다(`storage/strategy_registry.py`). 봉투 회계는 `aas backtest`, run 확정은 `storage/run_schema.py`·`backtest_requests.py`를 소비하는 `application/run_backtest.py`·`aas run`(요청 등록·`open_run`·잠금 없는 계산·`commit_run`·run ID 조회, 명시적 `aas db run-install` 필요; `tests/application/test_run_backtest.py`) | 수집·승격·검사를 잇는 `aas maintain`과 watermark 결합(AAS-46), strict 과거 일정의 달력 사전 지식 규칙(AAS-76), 결과 복원 연결. `collection/`, `data/`의 FMP 도구와 `application/daily_collection.py`는 L6의 구경로다. 준비·실행 출력은 `certified=false`다 |
 | L5 설치·백업 | native CLI와 선택적 단일 이미지, `storage/backup.py`의 일관 백업·새 루트 복원 구현. `tests/storage/test_backup.py`에 합성 복원·손상 거부 사례 | 0013의 상시 앱·소켓·예약 실행, 자동 업그레이드, artifact 게시·실제 자료 이전은 미완료. 구현·게시·운영 검증을 각각 기록 |
 | L6 구경로 제거 | PostgreSQL adapter·Alembic chain·Parquet reader와 `legacy` 추가 의존성 유지 | 앞 단계에서 모든 호출자와 실패 계약을 대체한 뒤 미사용 코드·의존성·관련 테스트·CI 선택을 함께 정리. 현재 제거 완료로 표시하지 않음 |
 
-표의 구현 표시는 소스와 테스트의 존재·연결 범위다. 이 문서 변경에서 실제 DB나 공급자를
-실행한 증거는 아니다. 후속 작업은 저장 계약→수집·실행 통합→구경로 제거 순서로 진행한다.
-L1~L6를 모두 미착수로 취급하거나 모두 완료로 묶지 않는다. 임시 이중 지원은 전환 기간에만
-존재하고 최종 설치 선택지가 아니다.
+표의 완료·구현 표시는 소스와 테스트의 존재·연결 범위이며 실제 store나 공급자를 실행한 증거가
+아니다. 실제 store의 마이그레이션·승격·유지보수 전환은 운영 전환(Linear AAS-51)이 기록한다. 남은 작업은
+저장 계약→수집·실행 통합→구경로 제거 순서다. L1~L6를 모두 미착수로 취급하거나 모두 완료로 묶지 않는다.
+임시 이중 지원은 전환 기간에만 존재하고 최종 설치 선택지가 아니다.
 폐기할 코드와 그 코드만 검증하던 테스트는 새 동작 증명이 생긴 단계에서 함께 제거한다.
-옛 DB의 실제 복원·추출은 새 설치의 선행 조건이 아니며 이번 문서 작업에서 실행하지 않는다.
+옛 DB의 실제 복원·추출은 새 설치의 선행 조건이 아니다.
 필요 시 별도 import로 원본·행수·hash·누락·eligibility를 대조하고 old/new ID의 mapping을 남긴다.
 현재 Alembic revision을 수정해 새 schema인 것처럼 사용하지 않는다.
 
@@ -381,7 +381,9 @@ L1~L6를 모두 미착수로 취급하거나 모두 완료로 묶지 않는다. 
 측정 없이 처리량이나 기존 설계보다 빠르다고 주장하지 않는다. 전체 시장 도메인은 유지하며
 특정 전략만 통과하도록 가격 몇 종목으로 데이터 모델을 축소하지 않는다.
 
-현재 구현은 빈 설치·전략 원문 저장·typed market generation·시점 조회·게시 재개·
-일관된 백업과 새 루트 복원, 관례·pin 문서 등록, 저장 입력의 준비와 봉투 회계, 그리고
-그 둘을 이어 run으로 확정하고 run ID로 다시 읽는 것까지다. 공급자 수집기 이식, 결과 복원,
-상시 앱 소켓, schema 업그레이드와 실제 데이터 이전·이미지 배포는 완료되지 않았다.
+현재 구현은 빈 설치·core schema v2 업그레이드·전략 원문 저장과 전략 레지스트리·typed market
+generation·시점 조회·게시 재개·일관된 백업과 새 루트 복원, 관례·pin 문서 등록, 공급자 수집과 원천 적재,
+원천 자료실에서 [dataset 카탈로그](data-vertical.md#dataset-카탈로그)의 dataset으로의 승격, identity·universe
+등록, exact pin reader, 저장 입력의 준비와 봉투 회계, 그리고 그 둘을 이어 run으로 확정하고 run ID로 다시
+읽는 것까지다. 수집·승격의 유지보수 실행, 원천 은퇴, 결과 복원, 상시 앱 소켓, 실제 데이터 이전·이미지
+배포는 구현되지 않았다.
