@@ -288,7 +288,7 @@ def import_jobs(args: argparse.Namespace) -> dict[str, object]:
     from aegis_alpha.data.sec_evidence import read_bytes
     from aegis_alpha.storage import qveris_import
     from aegis_alpha.storage.paths import resolve_home
-    from aegis_alpha.storage.source_library import list_sources
+    from aegis_alpha.storage.source_library import committed_source_ids
     from aegis_alpha.storage.workspace import open_workspace
 
     if args.limit is not None and args.limit < 1:
@@ -308,7 +308,7 @@ def import_jobs(args: argparse.Namespace) -> dict[str, object]:
         with open_workspace(
             home, writable=not args.plan, strategy_write=not args.plan, require_strategies=False
         ) as workspace:
-            committed = frozenset(str(row["source_id"]) for row in list_sources(workspace))
+            committed = frozenset(committed_source_ids(workspace))
             result = qveris_import.import_completions(
                 args.raw_root,
                 selected,

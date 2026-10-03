@@ -171,12 +171,12 @@ def companies_source(workspace: Workspace, members_source: str) -> CompaniesSour
 
 def plan_companies(workspace: Workspace, members_source: str) -> dict[str, object]:
     """Read every CIK document as the import would and report it; write nothing."""
-    from aegis_alpha.storage.source_library import list_sources  # noqa: PLC0415
+    from aegis_alpha.storage.source_library import committed_source_ids  # noqa: PLC0415
 
     source = companies_source(workspace, members_source)
     for _ in source.rows():
         pass
-    committed = {str(row["source_id"]) for row in list_sources(workspace)}
+    committed = committed_source_ids(workspace)
     return {
         "mode": "plan",
         "members_source": members_source,

@@ -14,7 +14,9 @@
   source is committed and complete in the installation with the same rows and digest, that
   its stored table still rehashes to them, that its ``sl:`` link matches and every linked
   original is intact in ``raw/``, that every retained file is intact in ``raw/``, and that the
-  entry's retained-file inventory is committed. A source or retained file that fails is
+  entry's retained-file inventory is committed. A source whose tables were retired
+  (``source_retirement``) is ``retired`` instead of rehashed, and matches when its retirement
+  record names the commit manifest it holds. A source or retained file that fails is
   ``unmatched``.
 
 Every regular file below an entry's root is accounted for. A unit file is covered by its
@@ -117,6 +119,8 @@ RETAINED: Final = Table(
 
 # The uncovered paths a report names per entry; the counts and bytes cover all of them.
 _UNCOVERED_PATHS: Final = 20
+# A retired source is matched when its retirement record names the manifest the plan derives.
+_MATCHED: Final = frozenset({"committed", "retired"})
 
 
 def read_manifest_file(path: Path, sha256: str) -> Manifest:
@@ -508,7 +512,12 @@ def apply_import(workspace: Workspace, manifest: Manifest) -> dict[str, object]:
 
 def _status(workspace: Workspace, item: dict[str, object]) -> str:
     from aegis_alpha.storage.source_identity import link_source  # noqa: PLC0415
-    from aegis_alpha.storage.source_library import _marker, _verify_manifest  # noqa: PLC0415
+    from aegis_alpha.storage.source_library import (  # noqa: PLC0415
+        _marker,
+        _verify_manifest,
+        manifest_digest,
+        retired_sources,
+    )
     from aegis_alpha.storage.state import get_operation  # noqa: PLC0415
 
     source_id = str(item["source_id"])
@@ -524,13 +533,20 @@ def _status(workspace: Workspace, item: dict[str, object]) -> str:
         (item["table"], item["rows"], item["digest"])
     ]:
         return "mismatch"
-    try:
-        # The marker records what was committed; the stored rows are rehashed against it.
-        _verify_manifest(workspace, stored)
-    except ValueError:
-        return "table_mismatch"
+    if (record := retired_sources(workspace).get(source_id)) is not None:
+        # A retired unit's tables are gone; its record names the manifest it retired.
+        if record["digest"] != manifest_digest(str(marker[4])):
+            return "retired_mismatch"
+        status = "retired"
+    else:
+        try:
+            # The marker records what was committed; the stored rows are rehashed against it.
+            _verify_manifest(workspace, stored)
+        except ValueError:
+            return "table_mismatch"
+        status = "committed"
     link = link_source(workspace, source_id, apply=False)
-    return "committed" if link == "unchanged" else f"link_{link}"
+    return status if link == "unchanged" else f"link_{link}"
 
 
 def verify_import(workspace: Workspace, manifest: Manifest) -> dict[str, object]:
@@ -569,12 +585,12 @@ def verify_import(workspace: Workspace, manifest: Manifest) -> dict[str, object]
         {"entry": entry["name"], "unit": source["unit"], "status": source["status"]}
         for entry in entries
         for source in cast("list[dict[str, object]]", entry["sources"])
-        if source["status"] != "committed"
+        if source["status"] not in _MATCHED
     ]
     unmatched.extend(
         {"entry": entry["name"], "unit": "retained", "status": item["status"]}
         for entry in entries
-        if (item := _inventory_of(entry)) is not None and item["status"] != "committed"
+        if (item := _inventory_of(entry)) is not None and item["status"] not in _MATCHED
     )
     unmatched.extend(
         {"entry": entry["name"], **item}

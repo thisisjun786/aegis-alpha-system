@@ -152,7 +152,7 @@ def _kr(args: argparse.Namespace, home: Path) -> dict[str, object]:
     import json
 
     from aegis_alpha.storage import kr_identity
-    from aegis_alpha.storage.source_library import list_sources
+    from aegis_alpha.storage.source_library import committed_source_ids
     from aegis_alpha.storage.workspace import open_workspace
 
     if args.identity_command == "kr-build":
@@ -176,7 +176,7 @@ def _kr(args: argparse.Namespace, home: Path) -> dict[str, object]:
         home, writable=not args.plan, strategy_write=not args.plan, require_strategies=False
     ) as workspace:
         if args.plan:
-            committed = {str(row["source_id"]) for row in list_sources(workspace)}
+            committed = committed_source_ids(workspace)
             return {
                 "mode": "plan",
                 "sources": [

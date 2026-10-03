@@ -15,6 +15,7 @@ _REGISTER_COMMANDS = frozenset(
 if TYPE_CHECKING:
     import sqlite3
 
+    from aegis_alpha.compute_resources import ComputeBudget
     from aegis_alpha.storage.input_pins import ConventionPin
     from aegis_alpha.storage.strategies import LineageSpec
     from aegis_alpha.storage.workspace import Workspace
@@ -50,6 +51,8 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
         "run-install": "Install the formal run add-on schema, after a backup",
         "run-migrate": "Migrate the installed run add-on to the current version, after a backup",
         "migrate": "Migrate the state and market core schema to a version, after a backup",
+        "source-retire": "Retire superseded source tables by an equivalence proof and a backup",
+        "compact": "Rebuild the installation into a new root and verify it, to reclaim space",
     }
     for name, description in maintenance.items():
         command = sub.add_parser(name, help=description)
@@ -144,6 +147,17 @@ def _maintenance_options(name: str, command: argparse.ArgumentParser) -> None:
         )
     if name == "restore":
         command.add_argument("--backup", type=Path, required=True)
+    if name == "compact":
+        command.add_argument("--to", type=Path, required=True, help="New nonexistent root")
+    if name == "source-retire":
+        command.add_argument("--spec", type=Path, required=True)
+        command.add_argument("--sha256", required=True)
+        command.add_argument(
+            "--backup", type=Path, help="Verified backup on another device holding the sources"
+        )
+        mode = command.add_mutually_exclusive_group(required=True)
+        mode.add_argument("--plan", action="store_true", help="Report proofs; write nothing")
+        mode.add_argument("--apply", action="store_true", help="Retire every proven group")
 
 
 def _strategy_parsers(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -229,6 +243,8 @@ def execute(args: argparse.Namespace) -> dict[str, object]:  # noqa: PLR0911 -- 
             "run-install",
             "run-migrate",
             "migrate",
+            "source-retire",
+            "compact",
         }:
             return _maintenance(home, args)
         if args.command == "strategy" and args.strategy_command == "promote":
@@ -274,9 +290,10 @@ def execute(args: argparse.Namespace) -> dict[str, object]:  # noqa: PLR0911 -- 
         raise ValueError("local database operation failed; run aas db verify") from None
 
 
-def _maintenance(home: Path, args: argparse.Namespace) -> dict[str, object]:  # noqa: PLR0911 -- CLI routing
+def _maintenance(home: Path, args: argparse.Namespace) -> dict[str, object]:  # noqa: C901, PLR0911 -- CLI routing
     from aegis_alpha.application.compute_cli import price_compute
     from aegis_alpha.storage.backup import backup, restore
+    from aegis_alpha.storage.compaction import compact
     from aegis_alpha.storage.locks import private_directory, storage_lock_targets
     from aegis_alpha.storage.migration import migrate_core_schema, plan_core_migration
     from aegis_alpha.storage.paths import DEFAULT_PATHS, load_paths
@@ -305,6 +322,10 @@ def _maintenance(home: Path, args: argparse.Namespace) -> dict[str, object]:  # 
             return install_run_schema(home, backup_output=args.backup_output, budget=budget)
         if args.db_command == "run-migrate":
             return migrate_run_schema(home, backup_output=args.backup_output, budget=budget)
+        if args.db_command == "compact":
+            return compact(home, args.to.absolute(), budget=budget)
+        if args.db_command == "source-retire":
+            return _source_retire(home, args, budget)
         if args.db_command == "migrate":
             return migrate_core_schema(
                 home,
@@ -314,6 +335,21 @@ def _maintenance(home: Path, args: argparse.Namespace) -> dict[str, object]:  # 
             )
         with open_workspace(home) as workspace:
             return verify_workspace(workspace, budget=budget)
+
+
+def _source_retire(
+    home: Path, args: argparse.Namespace, budget: ComputeBudget | None
+) -> dict[str, object]:
+    """Plan (read-only) or apply one retirement document under the held compute lease."""
+    from aegis_alpha.storage.source_retirement import parse_spec, read_spec_file, retire_sources
+    from aegis_alpha.storage.workspace import open_workspace
+
+    spec = parse_spec(read_spec_file(args.spec, args.sha256), args.sha256)
+    backup_root = None if args.backup is None else args.backup.absolute()
+    with open_workspace(home, writable=args.apply) as workspace:
+        return retire_sources(
+            workspace, spec, backup_root=backup_root, apply=args.apply, budget=budget
+        )
 
 
 def _promote(home: Path, args: argparse.Namespace) -> dict[str, object]:
