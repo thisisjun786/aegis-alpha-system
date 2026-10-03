@@ -96,12 +96,14 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   may declare row flags it reads off the source row; the engine attaches
   them under the mapper's `name@major` with a NULL detail. Rows flagged
   `provider_reported_partial` are promoted, never blocked, and the generation records
-  `partition_row_count@1` (resolved rows per date against the parent chain) in its manifest
+  `partition_row_count@1` (resolved rows per date against the parent chain's complete dates,
+  those with no partial-flagged head) in its manifest
   and `quality_checks`. A row missing a required column is `refused_required` before identity
   resolution, and a partitioned plan refuses rows without a partition date, so malformed rows
   never drop out silently as unresolved. A mapper that needs what a source's commit manifest
   records (the held rows' job symbols) declares `manifest_items`; the engine stages that list
-  from the pinned commit as `MANIFEST_ITEMS`, never from outside the pin.
+  from the pinned commit as `MANIFEST_ITEMS` after recomputing the source's request hash from
+  that manifest, never from outside the pin.
 - `bulk_generation` publishes a staged DuckDB table as one generation: plan without
   writing, then one transaction with the marker and `INSERT … SELECT`. DuckDB encodes and
   sorts `aas-rowset-v1` rows and `rowset.RowsetStream` digests them in admitted batches and

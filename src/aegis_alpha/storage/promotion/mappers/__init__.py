@@ -19,9 +19,10 @@ resolution, decimal and time rules, record and revision identity, head diff, fla
 
 A mapper that declares ``manifest_items`` may also read ``MANIFEST_ITEMS``: one row
 ``(_aas_pin INTEGER, item VARCHAR)`` per element of that list in each pinned source's
-commit manifest ``metadata``, the element as canonical JSON text. The manifest is the
-committed one the pin's source SHA-256 names, so what the mapper reads from it is pinned
-like the rows.
+commit manifest ``metadata``, the element as canonical JSON text. The engine recomputes
+each source's request hash from the manifest's table and metadata and refuses the plan
+when it differs from the marker and completed operation, so what the mapper reads from
+the manifest is pinned like the rows.
 """
 
 from __future__ import annotations

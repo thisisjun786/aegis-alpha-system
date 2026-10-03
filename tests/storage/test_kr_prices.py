@@ -116,9 +116,11 @@ def test_warned_bulk_rows_are_promoted_with_flags_and_counted(ws: Workspace) -> 
         "result": "below_reference",
         "dates": [
             {"session_date": "2025-01-02", "rows": 2, "resolved": 2,
-             "reference_date": "2025-01-02", "reference_rows": 3},
+             "reference_date": "2025-01-02", "reference_rows": 3,
+             "reference_generation": first["generation_id"]},
             {"session_date": "2025-01-03", "rows": 2, "resolved": 2,
-             "reference_date": "2025-01-02", "reference_rows": 3},
+             "reference_date": "2025-01-02", "reference_rows": 3,
+             "reference_generation": first["generation_id"]},
         ],
     }  # fmt: skip
     assert applied["partition_row_count"] == expected
@@ -140,6 +142,40 @@ def test_warned_bulk_rows_are_promoted_with_flags_and_counted(ws: Workspace) -> 
         )
     ]
     verify_promotion(ws, str(generation))
+
+
+def test_partial_days_are_counted_against_complete_dates_only(ws: Workspace) -> None:
+    history = add_source(
+        ws,
+        [
+            bar("AAA.KO", D0, 99.0, retrieved=LATE),
+            bar("AAA.KO", D1, 100.0, retrieved=LATE),
+            bar("BBB.KQ", D1, 50.0, retrieved=LATE),
+            bar("CCC.KO", D1, 7.0, retrieved=LATE),
+        ],
+        tag="history",
+    )
+    identity = register_symbols(ws, history["source_id"])
+    first = _apply(ws, spec([history], identity))
+    d2 = add_bulk_source(
+        ws, [bulk_row("AAA", "KO", D2, 101), bulk_row("BBB", "KQ", D2, 52)], tag="d2", linked=LATER
+    )
+    second = _apply(ws, spec([d2], identity, parent=str(first["generation_id"]), mapper=BULK))
+    d3 = add_bulk_source(
+        ws, [bulk_row("AAA", "KO", D3, 102), bulk_row("BBB", "KQ", D3, 53)], tag="d3", linked=LATER
+    )
+    third = _apply(ws, spec([d3], identity, parent=str(second["generation_id"]), mapper=BULK))
+    # D3 matches the earlier partial day D2, but its reference is the complete D1, not
+    # D2 and not the shorter complete D0; the shortfall stays visible on every partial day.
+    assert third["partition_row_count"] == {
+        "rule": "partition_row_count@1",
+        "result": "below_reference",
+        "dates": [
+            {"session_date": "2025-01-06", "rows": 2, "resolved": 2,
+             "reference_date": "2025-01-02", "reference_rows": 3,
+             "reference_generation": first["generation_id"]},
+        ],
+    }  # fmt: skip
 
 
 def test_kr_bars_refuse_partial_negative_and_unresolved(ws: Workspace) -> None:
@@ -262,7 +298,8 @@ def test_kr_prices_backfills_years_then_partial_days(ws: Workspace) -> None:
     _calendar(ws)
     day2 = [bulk_row("AAA", "KO", D2, 101), bulk_row("BBB", "KQ", D2, 51)]
     add_bulk_source(ws, day2, tag="d2", linked=LATER)
-    add_bulk_source(ws, day2, tag="d2-again", linked=LATER)  # same table, repeated download
+    # The same table downloaded again, linked earlier: the earlier link is pinned.
+    add_bulk_source(ws, day2, tag="d2-again", linked=LATE)
     # The provider divides volumes by split factors too; no exact 12-decimal value holds it.
     held = bulk_row("AAA", "KO", D3, 102, volume=545540.77978275)
     add_bulk_source(ws, [held], tag="d3", linked=LATER)
@@ -306,6 +343,10 @@ def test_kr_prices_backfills_years_then_partial_days(ws: Workspace) -> None:
         (D2, us(at("2025-01-03T07:30:00"))),
         (D3, us(at("2025-01-06T07:30:00"))),
     ]
+    ingested = ws.market.execute(
+        "SELECT DISTINCT ingested_at_us FROM prices WHERE session_date = ?", [D2]
+    ).fetchall()
+    assert ingested == [(us(LATE),)]
     partial = ws.market.execute(
         "SELECT count(*) FROM quality_flags WHERE flag = 'provider_reported_partial'"
     ).fetchone()
@@ -400,15 +441,9 @@ def test_held_history_rows_become_invalid_bars(ws: Workspace) -> None:
 def test_held_rows_without_manifest_jobs_are_refused(ws: Workspace) -> None:
     history = add_source(ws, [bar("AAA.KO", D1, 100.0, retrieved=LATE)], tag="history")
     identity = register_symbols(ws, history["source_id"])
+    # A manifest without a jobs list: the commit names no symbols at all.
     held = add_held_source(
-        ws, [held_row("fa", D1)], [], lineage="synthetic-kr-bars", tag="held", linked=LATER
-    )
-    # A manifest whose jobs list is missing: the commit names no symbols at all.
-    ws.market.execute(
-        "UPDATE source_library_commits SET manifest_json = json_object('source_id', "
-        "source_id, 'store', 'market', 'tables', manifest_json->'tables', 'metadata', "
-        "json_object()) WHERE source_id = ?",
-        [held["source_id"]],
+        ws, [held_row("fa", D1)], None, lineage="synthetic-kr-bars", tag="held", linked=LATER
     )
     document = spec(
         [held],
@@ -425,3 +460,107 @@ def test_held_rows_without_manifest_jobs_are_refused(ws: Workspace) -> None:
         "1 rows required refused",
     ]
     assert planned["rows"] == {"refused_required": 1}
+
+
+def test_held_rows_with_an_edited_manifest_are_refused(ws: Workspace) -> None:
+    history = add_source(
+        ws,
+        [bar("AAA.KO", D1, 100.0, retrieved=LATE), bar("BBB.KQ", D1, 50.0, retrieved=LATE)],
+        tag="history",
+    )
+    identity = register_symbols(ws, history["source_id"])
+    done = "2025-01-09T09:00:00+09:00"
+    held = add_held_source(
+        ws,
+        [held_row("fa", D1)],
+        [{"fingerprint": "fa", "symbol": "AAA.KO", "completed_at_utc": done}],
+        lineage="synthetic-kr-bars",
+        tag="held",
+        linked=LATER,
+    )
+    # A well-formed jobs list that maps the held row to another instrument.
+    ws.market.execute(
+        "UPDATE source_library_commits SET manifest_json = replace(manifest_json, "
+        "'\"AAA.KO\"', '\"BBB.KQ\"') WHERE source_id = ?",
+        [held["source_id"]],
+    )
+    assert "BBB.KQ" in str(
+        ws.market.execute(
+            "SELECT manifest_json FROM source_library_commits WHERE source_id = ?",
+            [held["source_id"]],
+        ).fetchone()
+    )
+    document = spec(
+        [held],
+        identity,
+        mapper={
+            "name": "eodhd.bars_quarantine@1",
+            "args": {"timezone": ZONE, "currencies": {"KO": "KRW", "KQ": "KRW"}},
+        },
+    )
+    planned = promote(ws, document[0], document[1], apply=False)
+    assert cast("list[str]", planned["refusals"])[0] == (
+        "1 pinned sources have a manifest that does not match its request hash"
+    )
+
+
+def test_a_later_different_download_of_a_day_supersedes_the_earlier(ws: Workspace) -> None:
+    history = add_source(
+        ws,
+        [bar("AAA.KO", D1, 100.0, retrieved=LATE), bar("BBB.KQ", D1, 50.0, retrieved=LATE)],
+        tag="history",
+    )
+    register_symbols(ws, history["source_id"])
+    _calendar(ws)
+    add_bulk_source(ws, [bulk_row("AAA", "KO", D2, 101)], tag="d2-later", linked=LATER)
+    add_bulk_source(ws, [bulk_row("AAA", "KO", D2, 100)], tag="d2-first", linked=LATE)
+    add_bulk_source(ws, [bulk_row("BBB", "KQ", D2, 51)], tag="d2-kq", linked=LATE)
+    planned = _backfill(ws, apply=False)
+    steps = cast("list[dict[str, object]]", planned["steps"])
+    # Two KO downloads of D2 differ: they become two generations in link order, each
+    # with the day's one KQ download.
+    assert [(step["kind"], step["from"], step["sources"]) for step in steps] == [
+        ("history", "2025-01-01", 1),
+        ("bulk", "2025-01-03", 2),
+        ("bulk", "2025-01-03", 2),
+    ]
+    assert planned["bulk_superseding_steps"] == 1
+    applied = _backfill(ws, apply=True)
+    assert [step["published"] for step in cast("list[dict[str, object]]", applied["steps"])] == [
+        True,
+        True,
+        True,
+    ]
+    head = str(applied["head"])
+    # The later KO download supersedes the earlier with its own ingestion time; the
+    # repeated KQ table is unchanged in the second generation.
+    latest = {row["instrument_id"]: row for row in prices(ws, head)}
+    assert set(latest) == {AAA}
+    assert (latest[AAA]["op"], latest[AAA]["close"]) == ("SUPERSEDE", Decimal(101))
+    assert latest[AAA]["ingested_at_us"] == us(LATER)
+    kq = ws.market.execute(
+        "SELECT ingested_at_us FROM prices WHERE instrument_id = ? AND session_date = ?",
+        [BBB, D2],
+    ).fetchall()
+    assert kq == [(us(LATE),)]
+    verify_promotion(ws, head)
+
+
+def test_held_rows_without_a_mapped_date_plan_no_held_step(ws: Workspace) -> None:
+    history = add_source(ws, [bar("AAA.KO", D1, 100.0, retrieved=LATE)], tag="history")
+    register_symbols(ws, history["source_id"])
+    _calendar(ws)
+    jobs = [{"fingerprint": "fa", "symbol": "AAA.KO", "completed_at_utc": "2025-01-09T00:00:00Z"}]
+    add_held_source(
+        ws,
+        [held_row("fa", D1, reason="unknown_reason")],
+        jobs,
+        lineage="synthetic-kr-bars",
+        tag="held",
+        linked=LATER,
+    )
+    planned = _backfill(ws, apply=False)
+    assert [step["kind"] for step in cast("list[dict[str, object]]", planned["steps"])] == [
+        "history"
+    ]
+    assert planned["held_unmapped_rows"] == 1

@@ -115,6 +115,7 @@ _COMPARED_KEYS: Final = tuple(name for name in NATURAL_KEYS["prices"] if name !=
 PARTIAL_FLAG: Final = "provider_reported_partial"
 PARTITION_CHECK: Final = ("partition_row_count", "1")
 _REFERENCE_WINDOW_DAYS: Final = 31
+_REFERENCE_LOOKBACK_DAYS: Final = 366
 
 
 def _t(name: str) -> str:
@@ -473,8 +474,13 @@ def _stage_items(
     if name is None:
         return
     lacking = []
+    unverified = []
     for index, source in enumerate(sources):
-        metadata = source_metadata(workspace, source.pin.source_id)
+        try:
+            metadata = source_metadata(workspace, source.pin.source_id)
+        except ValueError:
+            unverified.append(source.pin.source_id)
+            continue
         items = metadata.get(name) if isinstance(metadata, dict) else None
         if not isinstance(items, list):
             lacking.append(source.pin.source_id)
@@ -484,6 +490,10 @@ def _stage_items(
             market.executemany(
                 f"INSERT INTO {MANIFEST_ITEMS} VALUES (?, ?)", rows[start : start + _BATCH]
             )
+    if unverified:
+        plan.refusals.append(
+            f"{len(unverified)} pinned sources have a manifest that does not match its request hash"
+        )
     if lacking:
         plan.refusals.append(f"{len(lacking)} pinned sources have no manifest metadata list {name}")
 
@@ -1025,14 +1035,18 @@ def flags_digest(
 def _partition_check(
     workspace: Workspace, spec: PromotionSpec, chain: list[str], flags: list[_Flag]
 ) -> dict[str, object] | None:
-    """``partition_row_count@1``: a partial response's row counts against the parent chain.
+    """``partition_row_count@1``: a partial response's row counts against complete dates.
 
     For each session date of rows the mapper flags ``provider_reported_partial``, the
-    check counts the source rows and the resolved ones (status ``ok`` or ``held``) and
-    the parent chain's live heads on the same date, or, when the chain has none there,
-    on its latest earlier date within 31 days. The result is ``below_reference`` when a
-    date resolves fewer rows than its reference, ``no_reference`` when no date has one,
-    and ``at_least_reference`` otherwise. It is recorded, never a refusal: the rows are
+    check counts the source rows and the resolved ones (status ``ok`` or ``held``). Its
+    reference comes only from the parent chain's complete dates: dates whose live heads
+    carry no ``provider_reported_partial`` flag. The latest complete date on or before
+    the session anchors a 31-day window, and the reference is the largest live-head
+    count on a complete date in that window, so an earlier partial day or one short
+    complete day does not lower it. The reference date and the generation that last
+    wrote a head on it are recorded. The result is ``below_reference`` when a date
+    resolves fewer rows than its reference, ``no_reference`` when no date has one, and
+    ``at_least_reference`` otherwise. It is recorded, never a refusal: the rows are
     promoted with their flag.
     """
     partial = [flag for flag in flags if flag.flag == PARTIAL_FLAG and not flag.detail]
@@ -1047,31 +1061,40 @@ def _partition_check(
     ).fetchall()
     if not found:
         return None
-    references: list[tuple[date, int]] = []
+    complete: list[tuple[date, int, str]] = []
     if chain:
-        references = [
-            (cast("date", row[0]), int(row[1]))
+        complete = [
+            (cast("date", row[0]), int(row[1]), str(row[2]))
             for row in market.execute(
-                f"SELECT {day}, count(*) FROM (SELECT p.record_id, p.op, p.{day}, row_number() "
-                "OVER (PARTITION BY p.record_id ORDER BY g.sequence DESC) AS _aas_rank "
-                f"FROM {_q(spec.domain)} p JOIN market_generations g "
+                f"SELECT {day}, count(*), arg_max(generation_id, sequence) FROM ("
+                f"SELECT p.record_id, p.revision_id, p.generation_id, p.op, p.{day}, g.sequence, "
+                "row_number() OVER (PARTITION BY p.record_id ORDER BY g.sequence DESC) "
+                f"AS _aas_rank FROM {_q(spec.domain)} p JOIN market_generations g "
                 "ON g.generation_id = p.generation_id "
                 "WHERE p.generation_id IN (SELECT unnest(?::VARCHAR[])) "
-                f"AND p.{day} >= ?::DATE - INTERVAL {_REFERENCE_WINDOW_DAYS} DAY "
-                f"AND p.{day} <= ?::DATE) "
-                "WHERE _aas_rank = 1 AND op <> 'TOMBSTONE' GROUP BY 1 ORDER BY 1",
-                [chain, found[0][0], found[-1][0]],
+                f"AND p.{day} >= ?::DATE - INTERVAL {_REFERENCE_LOOKBACK_DAYS} DAY "
+                f"AND p.{day} <= ?::DATE) h "
+                "WHERE _aas_rank = 1 AND op <> 'TOMBSTONE' GROUP BY 1 "
+                "HAVING NOT bool_or(EXISTS (SELECT 1 FROM quality_flags f "
+                "WHERE f.generation_id = h.generation_id AND f.record_id = h.record_id "
+                "AND f.revision_id = h.revision_id AND f.flag = ?)) ORDER BY 1",
+                [chain, found[0][0], found[-1][0], PARTIAL_FLAG],
             ).fetchall()
         ]
     dates = []
     for row in found:
         session, rows, resolved = cast("date", row[0]), row[1], row[2]
-        earlier = [
-            item
-            for item in references
-            if item[0] <= session and (session - item[0]).days <= _REFERENCE_WINDOW_DAYS
-        ]
-        reference = earlier[-1] if earlier else None
+        anchor = next((item[0] for item in reversed(complete) if item[0] <= session), None)
+        window = (
+            []
+            if anchor is None
+            else [
+                item
+                for item in complete
+                if item[0] <= anchor and (anchor - item[0]).days <= _REFERENCE_WINDOW_DAYS
+            ]
+        )
+        reference = max(window, key=lambda item: (item[1], item[0])) if window else None
         dates.append(
             {
                 "session_date": str(session),
@@ -1079,6 +1102,7 @@ def _partition_check(
                 "resolved": int(resolved),
                 "reference_date": None if reference is None else str(reference[0]),
                 "reference_rows": None if reference is None else reference[1],
+                "reference_generation": None if reference is None else reference[2],
             }
         )
     compared = [item for item in dates if item["reference_rows"] is not None]

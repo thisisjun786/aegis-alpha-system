@@ -392,7 +392,9 @@ generation으로 차례로 승격한다. `--reference`는 이력과 부분 응�
 `prices.kr.eodhd.ref`에 만든다. 전제는 core schema v2, 원천의 `sl:` 연결, 등록된 KR identity snapshot(`--identity-snapshot`),
 `sessions.xkrx`의 committed generation이다. `--lag-us`는 `session_close_plus_lag@1`이 XKRX 마감에 더하는
 상한이며 명세와 transform hash에 들어간다. 부분 응답 행은 flag `provider_reported_partial`과 함께
-승격되고 generation마다 `partition_row_count@1` 행 수 대조가 `quality_checks`에 남는다.
+승격되고 generation마다 `partition_row_count@1` 행 수 대조가 `quality_checks`에 남는다. 같은 날짜를
+다시 받은 내용이 다른 내려받기는 `sl:` 연결 순서대로 그 날짜의 다음 generation이 되어 앞의 것을
+SUPERSEDE한다.
 
 `--plan`은 설치본을 읽기 전용으로 열어 모든 단계를 현재 head의 자식으로 계획하고, 단계별 `promote
 --plan` 보고와 합계를 낸다. 실행은 단계마다 앞 단계가 남긴 head를 parent로 승격하고 첫 거부에서

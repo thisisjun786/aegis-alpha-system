@@ -25,9 +25,14 @@ for ``session_close_plus_lag@1`` and the dataset's head as parent. Prices take
 provider divides volumes by split factors too (545540.77978275 shares), which no exact
 12-decimal value holds; such a row is flagged ``provider_float_storage``.
 
-Downloads repeated with identical content (the same table digest) are pinned once, by the
-smallest source ID. Two different tables carrying the same exchange and date are both
-pinned, so the step's plan refuses the repeated natural keys instead of choosing one.
+Tables are ordered by their source's ``sl:`` link time, then source ID. Downloads
+repeated with identical content (the same table digest) are pinned once, by the earliest
+link, whose time becomes the rows' ingestion. Different tables carrying the same exchange
+and date become successive generations of that date in link order: generation ``k`` pins
+each exchange's ``k``-th download (or its last, when it has fewer), so a later download
+supersedes an earlier one with its own ingestion time and flag. A held lineage whose
+nonempty tables have no row with a mapped reason and date plans no held step and reports
+those rows as ``held_unmapped_rows``.
 
 ``--plan`` writes nothing and plans every step as the next child of the current head;
 a step after an unapplied one is therefore planned against a head that lacks it. An
@@ -61,6 +66,7 @@ CALENDAR: Final = ("sessions.xkrx", "XKRX", "XKRX")
 TIMEZONE: Final = "Asia/Seoul"
 CURRENCIES: Final = {"KO": "KRW", "KQ": "KRW"}
 _HISTORY_TABLE: Final = "bars"
+_LINK: Final = "sl:"
 _BULK_TABLE: Final = "quarantine"
 _SUMMARY: Final = (
     "generation_id",
@@ -105,8 +111,18 @@ def _pin(source: Mapping[str, object], table: Mapping[str, object]) -> dict[str,
     }
 
 
+def _linked_at(workspace: Workspace, source_id: str) -> int | None:
+    row = workspace.state.execute(
+        "SELECT retrieved_at_us FROM source_snapshots WHERE snapshot_id=?", (_LINK + source_id,)
+    ).fetchone()
+    return None if row is None else int(row[0])
+
+
 def _tables(workspace: Workspace, prefix: str, name: str) -> list[tuple[dict[str, str], str, int]]:
-    """(pin, market table, rows) of each committed table ``name`` of a lineage."""
+    """(pin, market table, rows) of each committed table ``name`` of a lineage.
+
+    The order is the source's ``sl:`` link time (unlinked sources last), then source ID.
+    """
     found = [
         (_pin(source, table), str(table["target"]), int(str(table["rows"])))
         for source in list_sources(workspace)
@@ -114,7 +130,14 @@ def _tables(workspace: Workspace, prefix: str, name: str) -> list[tuple[dict[str
         for table in list_tables(workspace, str(source["source_id"]))
         if table["name"] == name and table["format"] == "arrow"
     ]
-    return sorted(found, key=lambda item: item[0]["source_id"])
+    linked = {item[0]["source_id"]: _linked_at(workspace, item[0]["source_id"]) for item in found}
+
+    def order(item: tuple[dict[str, str], str, int]) -> tuple[bool, int, str]:
+        source_id = item[0]["source_id"]
+        at = linked[source_id]
+        return (at is None, 0 if at is None else at, source_id)
+
+    return sorted(found, key=order)
 
 
 def _history_steps(workspace: Workspace, lineage: str, *, reference: bool) -> list[Step]:
@@ -143,7 +166,7 @@ def _history_steps(workspace: Workspace, lineage: str, *, reference: bool) -> li
 def _distinct(
     tables: list[tuple[dict[str, str], str, int]], report: dict[str, object], kind: str
 ) -> list[tuple[dict[str, str], str, int]]:
-    """Nonempty tables, a repeated download (the same digest) kept once by smallest ID."""
+    """Nonempty tables, a repeated download (the same digest) kept once by earliest link."""
     kept: dict[str, tuple[dict[str, str], str, int]] = {}
     for item in tables:
         if item[2]:
@@ -168,7 +191,8 @@ def _held_steps(workspace: Workspace, lineage: str, report: dict[str, object]) -
         workspace.market.execute(f"SELECT min(a), max(b) FROM ({union}) t(a, b)").fetchone(),  # noqa: S608
     )
     if first is None or last is None:
-        raise ValueError(f"no held row of lineage {lineage} has a mapped reason and date")
+        report["held_unmapped_rows"] = sum(rows for _, _, rows in tables)
+        return []
     pins = tuple(sorted((pin for pin, _, _ in tables), key=lambda pin: pin["source_id"]))
     return [
         Step(
@@ -190,7 +214,7 @@ def _bulk_steps(
         "CASE WHEN json_valid(source_row_json) THEN "
         "json_extract_string(source_row_json, '$.exchange_short_name') END"
     )
-    kept: dict[str, tuple[dict[str, str], list[date]]] = {}
+    kept: dict[str, tuple[dict[str, str], frozenset[str], list[date]]] = {}
     repeated: list[str] = []
     for pin, target, rows in _tables(workspace, lineage, _BULK_TABLE):
         if not rows:
@@ -208,24 +232,34 @@ def _bulk_steps(
         if pin["digest"] in kept:
             repeated.append(pin["source_id"])
             continue
-        kept[pin["digest"]] = (pin, sorted({cast("date", row[0]) for row in found if row[0]}))
+        kept[pin["digest"]] = (
+            pin,
+            frozenset(exchanges),
+            sorted({cast("date", row[0]) for row in found if row[0]}),
+        )
     report["bulk_tables"] = len(kept)
     report["bulk_repeated_tables"] = len(repeated)
-    by_day: dict[date, list[dict[str, str]]] = {}
-    for pin, days in kept.values():
+    # Insertion order is link order, so each exchange's downloads of a day are in it too.
+    by_day: dict[date, dict[frozenset[str], list[dict[str, str]]]] = {}
+    for pin, covered, days in kept.values():
         for session in days:
-            by_day.setdefault(session, []).append(pin)
+            by_day.setdefault(session, {}).setdefault(covered, []).append(pin)
     name = "eodhd.bulk_quarantine_adjusted@1" if reference else "eodhd.bulk_quarantine@1"
-    return [
-        Step(
-            "bulk",
-            session,
-            session + timedelta(days=1),
-            name,
-            tuple(sorted(pins, key=lambda pin: pin["source_id"])),
-        )
-        for session, pins in sorted(by_day.items())
-    ]
+    steps = []
+    for session, groups in sorted(by_day.items()):
+        for k in range(max(len(pins) for pins in groups.values())):
+            chosen = [pins[min(k, len(pins) - 1)] for pins in groups.values()]
+            steps.append(
+                Step(
+                    "bulk",
+                    session,
+                    session + timedelta(days=1),
+                    name,
+                    tuple(sorted(chosen, key=lambda pin: pin["source_id"])),
+                )
+            )
+    report["bulk_superseding_steps"] = len(steps) - len(by_day)
+    return steps
 
 
 def _calendar_pin(workspace: Workspace) -> dict[str, str]:

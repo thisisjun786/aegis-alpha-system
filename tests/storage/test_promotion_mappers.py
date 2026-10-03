@@ -184,6 +184,7 @@ def test_eodhd_bulk_quarantine_maps_synthetic_fixture() -> None:
         (partial, _bulk(low=-1)),
         (partial, _bulk(volume="absent")),
         (partial, _bulk(volume=2**53 + 1)),
+        (partial, _bulk(volume=-(2**64) - 1)),
         (partial, _bulk(close="11")),
         (partial, _bulk(exchange_short_name="US")),
         ("invalid_price_or_volume", _bulk()),
@@ -208,8 +209,9 @@ def test_eodhd_bulk_quarantine_maps_synthetic_fixture() -> None:
         "canonical", "present", 10.0, 11.0, 100.0, None, session, True,
     )  # fmt: skip
     # Every value null is missing; negative, partial, too-wide and mistyped are invalid.
-    assert [(row[1], row[9], row[11]) for row in mapped[1:6]] == [
+    assert [(row[1], row[9], row[11]) for row in mapped[1:7]] == [
         ("035720.KQ", "missing", None),
+        ("005930.KO", "invalid", None),
         ("005930.KO", "invalid", None),
         ("005930.KO", "invalid", None),
         ("005930.KO", "invalid", None),
@@ -217,13 +219,13 @@ def test_eodhd_bulk_quarantine_maps_synthetic_fixture() -> None:
     ]
     # An exchange without a declared currency has none; another hold reason, a date in
     # another spelling and unparsable JSON have no session date.
-    assert mapped[6][7] is None
-    assert [(row[3], row[15]) for row in mapped[7:]] == [(None, False), (None, True), (None, True)]
-    assert mapped[9][1] is None
+    assert mapped[7][7] is None
+    assert [(row[3], row[15]) for row in mapped[8:]] == [(None, False), (None, True), (None, True)]
+    assert mapped[10][1] is None
     partitions = connection.execute(
         f"SELECT ({bulk.partition_sql}) FROM src ORDER BY _aas_ordinal"
     ).fetchall()
-    assert [row[0] for row in partitions] == [session] * 7 + [None] * 3
+    assert [row[0] for row in partitions] == [session] * 8 + [None] * 3
 
 
 def test_eodhd_adjusted_close_maps_close_only_reference() -> None:

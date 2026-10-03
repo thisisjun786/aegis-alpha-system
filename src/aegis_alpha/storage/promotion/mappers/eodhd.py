@@ -198,13 +198,19 @@ def _json_path(field: str) -> str:
 
 
 def _json_number(field: str) -> str:
-    """A JSON number as binary64, or NULL when it is another type or a too-wide integer."""
+    """A JSON number as binary64, or NULL when it is another type or a too-wide integer.
+
+    An integer is recognized by its text, since DuckDB types one of 2^64 or more as
+    ``DOUBLE``; any integer above 2^53 in absolute value is NULL.
+    """
     path = _json_path(field)
     kind = f"json_type({_JSON}, {path})"
     text = f"json_extract_string({_JSON}, {path})"
     return (
-        f"CASE WHEN {kind} IN ('UBIGINT', 'BIGINT') AND "
-        f"abs(TRY_CAST({text} AS HUGEINT)) <= {_EXACT_INTEGER} THEN CAST({text} AS DOUBLE) "
+        f"CASE WHEN {kind} IN ('UBIGINT', 'BIGINT', 'DOUBLE') AND "
+        f"regexp_full_match({text}, '-?[0-9]+') THEN CASE WHEN "
+        f"coalesce(abs(TRY_CAST({text} AS HUGEINT)) <= {_EXACT_INTEGER}, false) "
+        f"THEN CAST({text} AS DOUBLE) END "
         f"WHEN {kind} = 'DOUBLE' THEN CAST({text} AS DOUBLE) END"
     )
 

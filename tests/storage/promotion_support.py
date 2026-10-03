@@ -201,7 +201,7 @@ def held_row(fingerprint: str, day: date, *, reason: str = "invalid_price_or_vol
 def add_held_source(  # noqa: PLR0913 -- the explicit ID, its rows and manifest jobs
     workspace: Workspace,
     rows: list[tuple[str, str, str]],
-    jobs: list[dict[str, str]],
+    jobs: list[dict[str, str]] | None,
     *,
     lineage: str,
     tag: str,
@@ -211,6 +211,7 @@ def add_held_source(  # noqa: PLR0913 -- the explicit ID, its rows and manifest 
 
     This is the shape of the collector's history downloads: one ``quarantine`` table per
     download, the job list (fingerprint, symbol, completion instant) in the manifest.
+    ``jobs=None`` commits a manifest without the list.
     """
     stamp = us(linked) * 1000
     with patch.object(time, "time_ns", lambda: stamp):
@@ -226,7 +227,12 @@ def add_held_source(  # noqa: PLR0913 -- the explicit ID, its rows and manifest 
             schema=HELD_SCHEMA,
         )
         result = source_library.import_arrow(
-            workspace, source_id, digest, "quarantine", table.to_reader(), metadata={"jobs": jobs}
+            workspace,
+            source_id,
+            digest,
+            "quarantine",
+            table.to_reader(),
+            metadata={} if jobs is None else {"jobs": jobs},
         )
     tables = result["tables"]
     assert isinstance(tables, list)

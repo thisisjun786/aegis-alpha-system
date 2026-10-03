@@ -257,8 +257,9 @@ revision에 매퍼의 `name@major`를 규칙으로 해서 달리고 `detail`은 
 identity 해석과 무관하게 `refused_required`이므로, 모양이 잘못된 행이 미해결 행으로 조용히 빠지지 않는다.
 매퍼는 pin한 원천의 commit manifest `metadata`에서 읽을 목록 이름 하나(`manifest_items`)를 선언할 수
 있다. 엔진은 원천마다 그 목록의 원소를 정규 JSON 텍스트 한 행으로 펼쳐 넘기고, 목록이 없는 원천은
-계획 거부로 보고한다. manifest는 pin의 원천 SHA-256이 가리키는 commit의 것이므로 매퍼가 거기서 읽는
-값도 행과 같이 pin된다.
+계획 거부로 보고한다. 엔진은 목록을 넘기기 전에 원천의 request hash를 manifest의 표와 `metadata`에서
+다시 계산해 marker·완료 operation의 값과 맞춰 보고, 다르면 그 원천을 계획 거부로 보고한다. 그래서
+매퍼가 manifest에서 읽는 값도 행과 같이 pin된다.
 
 `source_row_hash`는 원천 행 내용의 해시다.
 
@@ -500,9 +501,11 @@ quality_flags(generation_id, record_id, revision_id, rule_id, rule_version, flag
 dataset version 단위의 판정(행 수 대조, coverage 종료, 교차 대조율)은 기존 state
 `quality_checks`가 맡는다. 부분 응답 행은 막지 않고 flag와 함께 승격하며, 그 generation은
 `partition_row_count@1` 검사를 남긴다. 세션 날짜마다 부분 응답 원천 행 수, 그중 해석된 행 수(`ok`·`held`),
-parent chain에서 그 날짜에 살아 있는 head 수를 센다. chain에 그 날짜가 없으면 31일 안의 가장 늦은 이전
-날짜를 기준으로 쓴다(이력과 겹치는 날은 이력 자체와, 이력 뒤의 날은 직전 거래일의 종목 수와 대조된다).
-결과는 해석된 행이 기준보다 적은 날짜가 있으면 `below_reference`, 기준이 하나도 없으면 `no_reference`,
+기준은 parent chain의 완결 날짜, 곧 살아 있는 head 가운데 `provider_reported_partial` flag가 붙은 것이
+없는 날짜에서만 나온다. 세션 날짜 이전(같은 날 포함)의 가장 늦은 완결 날짜를 끝으로 하는 31일 안에서
+살아 있는 head 수가 가장 많은 완결 날짜가 기준이므로, 앞선 부분 응답 날이나 짧은 완결 날 하나가 기준을
+낮추지 않는다(이력 뒤의 부분 응답 날은 모두 이력의 종목 수와 대조된다). 날짜마다 기준 날짜, 기준 수,
+그 날짜에 마지막으로 head를 쓴 generation(`reference_generation`)이 남는다. 결과는 해석된 행이 기준보다 적은 날짜가 있으면 `below_reference`, 기준이 하나도 없으면 `no_reference`,
 그 밖은 `at_least_reference`이고 `reason`은 날짜별 수의 정규 JSON이다. 검사는 승격 manifest에 들어가므로
 복구도 같은 행을 쓴다. delta가 비어 게시되지 않은 계획은 보고에만 남는다. 소비자는
 `provider_reported_partial`을 binding의 flag 제외 목록에 두어 그런 revision을 읽지 않을 수 있다. 잘못된
@@ -630,11 +633,18 @@ dataset의 백필은 연도 단위 generation, 이후 유지보수는 세션 단
 1. 이력: 원천 ID 접두어 하나(`--history-lineage`)의 모든 `bars` 테이블을 pin하고 달력 연도마다
    `eodhd.bars@1`로 승격한다.
 2. 보류된 이력 행: 같은 접두어의 행이 있는 `quarantine` 테이블을 pin하고, 그 행들의 연도 전체를
-   generation 하나로 `eodhd.bars_quarantine@1`로 승격한다. 행은 값 없는 `invalid` bar가 된다.
+   generation 하나로 `eodhd.bars_quarantine@1`로 승격한다. 행은 값 없는 `invalid` bar가 된다. 행이 있는
+   테이블에 매핑된 이유와 날짜를 가진 행이 하나도 없으면 단계를 만들지 않고 그 행 수를
+   `held_unmapped_rows`로 보고하므로 이력 연도는 막히지 않는다.
 3. 부분 응답 일간 내려받기: 원천 ID 접두어 하나(`--bulk-lineage`)의 `quarantine` 테이블 중 행이 KR
    거래소(`KO`, `KQ` → `KRW`)를 가리키는 것을 세션 날짜마다 `eodhd.bulk_quarantine@1`로 승격한다. KR과
-   다른 거래소를 섞은 테이블은 거부한다. 보류 행과 부분 응답 모두 테이블 digest가 같은 반복 내려받기는
-   가장 작은 원천 ID 하나만 pin한다. 내용이 다른 두 테이블이 같은 거래소·날짜를 실으면 둘 다 pin해 계획이 반복 자연키로 거부한다.
+   다른 거래소를 섞은 테이블은 거부한다.
+
+테이블은 원천의 `sl:` 연결 시각, 같으면 원천 ID 순서로 놓인다. 보류 행과 부분 응답 모두 테이블 digest가
+같은 반복 내려받기는 가장 이른 연결 하나만 pin하고, 그 연결 시각이 행의 수집 시각이 된다. 내용이 다른
+테이블이 같은 거래소·날짜를 실으면 그 날짜는 연결 순서대로 이어지는 generation이 된다. k번째
+generation은 거래소마다 k번째 내려받기(그보다 적으면 마지막 것)를 pin하므로 나중 내려받기가 자기 수집
+시각과 flag로 앞의 것을 SUPERSEDE한다. 그런 추가 단계 수는 `bulk_superseding_steps`로 보고된다.
 
 두 시점 열은 `session_close_plus_lag@1`(근거 `record`, 입력 `session_date`, `--lag-us`)이고 OHLC는
 `krw_tick@1`, 거래량은 `float_shortest@1`이다. 공급자는 거래량도 분할 계수로 나눠 다시 계산하므로
@@ -1152,10 +1162,14 @@ state v2:
 | DV-146 | 부분 OHLCV와 음수 가격은 값 없이 `invalid`로, identity가 없는 심볼은 미해결로 남고 승격되지 않는다 | `tests/storage/test_kr_prices.py::test_kr_bars_refuse_partial_negative_and_unresolved` | 구현 |
 | DV-147 | 공급자가 다시 계산한 분할 이전 가격은 `krw_tick@1`로 원 단위로 돌아오고 분할 비율과 맞는다 | `tests/storage/test_kr_prices.py::test_known_split_rounds_back_to_whole_won` | 구현 |
 | DV-148 | `partition`이 있는 명세는 파티션 날짜가 없는 원천 행을 거부하고, 필수 열이 빈 행은 identity와 무관하게 거부된다 | `tests/storage/test_kr_prices.py::test_partitioned_plan_refuses_rows_without_partition_date` | 구현 |
-| DV-149 | `aas data kr-prices`는 이력 연도와 부분 응답 날짜를 순서대로 승격하고 반복 내려받기를 한 번만 pin하며 다시 실행하면 쓰지 않는다 | `tests/storage/test_kr_prices.py::test_kr_prices_backfills_years_then_partial_days` | 구현 |
+| DV-149 | `aas data kr-prices`는 이력 연도와 부분 응답 날짜를 순서대로 승격하고 반복 내려받기를 가장 이른 연결로 한 번만 pin하며 다시 실행하면 쓰지 않는다 | `tests/storage/test_kr_prices.py::test_kr_prices_backfills_years_then_partial_days` | 구현 |
 | DV-150 | `kr-prices --plan`은 설치본에 아무것도 쓰지 않는다 | `tests/storage/test_promotion_cli.py::test_kr_prices_plan_writes_nothing_and_apply_publishes` | 구현 |
 | DV-151 | `eodhd.bulk_quarantine@1`은 합성 원천 fixture를 독립 기대값과 같은 도메인 열과 행 flag로 옮기고 다른 보류 이유·잘못된 날짜·JSON의 세션 날짜를 비운다 | `tests/storage/test_promotion_mappers.py::test_eodhd_bulk_quarantine_maps_synthetic_fixture` | 구현 |
 | DV-152 | adjusted close 매퍼는 close 전용 `total_return` reference 가격을 낸다 | `tests/storage/test_promotion_mappers.py::test_eodhd_adjusted_close_maps_close_only_reference` | 구현 |
 | DV-153 | `eodhd.bars_quarantine@1`은 manifest `jobs`로 보류 행의 심볼·완료 시각을 찾아 값 없는 `invalid` bar로 옮기고, 두 번 나오거나 없는 fingerprint·다른 보류 이유는 해석하지 않는다 | `tests/storage/test_promotion_mappers.py::test_eodhd_bars_quarantine_maps_held_history_rows` | 구현 |
 | DV-154 | `kr-prices`는 보류된 이력 행을 이력 연도 뒤 한 단계로 `invalid` bar로 승격하고 반복 내려받기는 한 번만 pin하며 reference에는 그 단계가 없다 | `tests/storage/test_kr_prices.py::test_held_history_rows_become_invalid_bars` | 구현 |
 | DV-155 | `manifest_items` 목록이 없는 원천을 pin한 계획은 거부되고 심볼 없는 보류 행은 필수 열 누락으로 거부된다 | `tests/storage/test_kr_prices.py::test_held_rows_without_manifest_jobs_are_refused` | 구현 |
+| DV-156 | manifest 목록을 모양은 맞게 고쳐 request hash와 어긋난 원천을 pin한 계획은 거부된다 | `tests/storage/test_kr_prices.py::test_held_rows_with_an_edited_manifest_are_refused` | 구현 |
+| DV-157 | `partition_row_count@1`의 기준은 부분 응답 flag가 없는 완결 날짜에서만 나와 앞선 부분 응답 날과 같은 수도 `below_reference`가 된다 | `tests/storage/test_kr_prices.py::test_partial_days_are_counted_against_complete_dates_only` | 구현 |
+| DV-158 | 같은 날짜의 내용이 다른 내려받기는 연결 순서대로 이어지는 generation이 되어 나중 것이 자기 수집 시각으로 SUPERSEDE한다 | `tests/storage/test_kr_prices.py::test_a_later_different_download_of_a_day_supersedes_the_earlier` | 구현 |
+| DV-159 | 매핑된 이유와 날짜가 없는 보류 행만 있으면 보류 단계 없이 `held_unmapped_rows`를 보고하고 이력 단계는 계획된다 | `tests/storage/test_kr_prices.py::test_held_rows_without_a_mapped_date_plan_no_held_step` | 구현 |
