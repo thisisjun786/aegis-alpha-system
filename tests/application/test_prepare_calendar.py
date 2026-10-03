@@ -32,7 +32,11 @@ def schedule(rows: list[Document], **changes: object) -> tuple[date, ...]:
     )
     return tuple(
         slot.decision_date
-        for slot in preparation._schedule(tuple(rows), visibility, request)  # noqa: SLF001
+        for slot in preparation._schedule(  # noqa: SLF001
+            preparation._Calendar(tuple(rows)),  # noqa: SLF001
+            visibility,
+            request,
+        )
     )
 
 
