@@ -50,6 +50,8 @@ class FmpEodNonSplit:
     partition_sql: Final = '"date"'
     date_column: Final = "session_date"
     time_inputs: Final[Mapping[str, InputKind]] = {"session_date": "date"}
+    row_flags: Final[Mapping[str, str]] = {}
+    manifest_items: Final = None
     prices: Final = _ADJUSTED
 
     def check_args(self, args: Mapping[str, object]) -> None:

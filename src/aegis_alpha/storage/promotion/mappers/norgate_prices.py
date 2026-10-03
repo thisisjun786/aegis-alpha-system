@@ -92,6 +92,8 @@ class _Norgate:
     domain: Final = "prices"
     date_column: Final = "session_date"
     time_inputs: Final[Mapping[str, InputKind]] = {"session_date": "date"}
+    row_flags: Final[Mapping[str, str]] = {}
+    manifest_items: Final = None
     name: str
     major: int
 
