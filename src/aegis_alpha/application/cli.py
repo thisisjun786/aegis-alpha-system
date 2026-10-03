@@ -19,6 +19,7 @@ from aegis_alpha.application import (
     research_cli,
     run_cli,
     storage_cli,
+    universe_cli,
 )
 from aegis_alpha.application.contracts import parse_request
 from aegis_alpha.application.portfolio import compose_portfolio
@@ -54,6 +55,7 @@ def _parser() -> argparse.ArgumentParser:
     etf_cli.add_commands(commands)
     identity_cli.add_commands(commands)
     calendar_cli.add_commands(commands)
+    universe_cli.add_commands(commands)
     import_cli.add_commands(commands)
     return parser
 
@@ -122,7 +124,7 @@ def _status() -> dict[str, object]:
     }
 
 
-def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912 -- explicit command dispatch
+def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915 -- explicit command dispatch
     args = _parser().parse_args(argv)
     try:
         match args.command:
@@ -148,6 +150,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912 -- explic
                 result = identity_cli.execute(args)
             case "calendar":
                 result = calendar_cli.execute(args)
+            case "universe":
+                result = universe_cli.execute(args)
             case "import":
                 result = import_cli.execute(args)
             case "providers" | "collect":

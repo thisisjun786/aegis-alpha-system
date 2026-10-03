@@ -171,9 +171,13 @@ SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
 
 A document larger than one v1 document is registered as consecutive v1 **parts**
 under one **manifest**. The whole document is first validated with every v1 rule
-except the byte limit and the materialization charge. Its members, in canonical
-order, then fill each part greedily up to both the 1 MiB canonical byte limit and
-the 64 MiB charge, so the same content always yields the same parts. A part carries
+except the byte limit and the materialization charge. Its members then fill each
+part greedily, in fill order, up to both the 1 MiB canonical byte limit and the
+64 MiB charge, so the same content always yields the same parts. Identity members
+fill in canonical order. Universe members fill by `source_snapshot_id` first and in
+canonical order within a source: a universe source can list hundreds of files and a
+part carries the inventory of every source it cites, so source-major filling keeps a
+part from carrying several inventories. A part carries
 exactly the instruments, assertions and sources its own members reference, and
 identity member ordinals restart at zero in each part.
 
@@ -212,8 +216,9 @@ UniverseManifest = {
   file count. The total number of members is otherwise unbounded.
 - Reading a manifest pin requires the root header, contiguous parts whose headers
   rebuild that manifest hash, every part valid as its own v1 document, part member
-  ranges in strictly increasing canonical order, and, for identity, no provider-key
-  overlap in both dimensions between members of different parts. In namespace
+  ranges in strictly increasing fill order, for a universe no member key
+  (`instrument_id`, `valid_from_us`, `known_from_us`) in two parts, and, for identity,
+  no provider-key overlap in both dimensions between members of different parts. In namespace
   `issuer` the overlap key is the instrument rather than the token, in a v1 document
   and across parts alike, because an issuer link names one instrument's issuer. Admission charges
   the sum of every part against the caller's allowance before materializing any.

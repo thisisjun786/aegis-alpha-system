@@ -318,6 +318,12 @@ def parse_spec(raw: bytes, sha256: str) -> PromotionSpec:
     parent = None if target["parent"] is None else _text(target["parent"], "parent")
     sources = _sources(body["sources"])
     mapper_name, found, args = _mapper(body["mapper"], domain)
+    prefixes = found.source_prefixes
+    for source in sources:
+        if prefixes and not source.source_id.startswith(prefixes):
+            raise ValueError(
+                f"mapper {mapper_name} reads only sources {list(prefixes)}, not {source.source_id}"
+            )
     partition = None
     if body["partition"] is not None:
         bounds = _object(body["partition"], {"from", "to"}, "partition")

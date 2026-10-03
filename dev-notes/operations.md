@@ -322,6 +322,27 @@ uv run --no-sync python -m scripts.us_identity_report --market MARKET.duckdb \
 해석은 같은 master로 만든 `us-build` 문서와 같다. 문서 자체는 state의 `sl:` 연결 시각이 필요하므로 싣지
 않는다. 설치본에 쓰지 않는 검토 근거다.
 
+### universe
+
+```bash
+aas universe index --source SOURCE_ID [--source SOURCE_ID] ... [--index NAME] ... \
+  --version VERSION [--report report.json] [--plan]
+aas universe listings --master SOURCE_ID --version VERSION [--report report.json] [--plan]
+aas universe show --id UNIVERSE_ID --version VERSION
+```
+
+`index`는 `aas import legacy`의 `norgate.index_membership@1` 항목이 commit한 지수 구성 원천을, `listings`는
+Norgate security master 원천을 pin과 대조해 읽고 universe 문서를 만든다. 원천마다 `sl:` 연결이 있어야 하고
+member instrument는 US identity 등록이 먼저 있어야 한다. `index`는 지수마다 universe
+`index.us.norgate/<지수 이름>` 하나를 같은 `--version`으로 등록하고, `--index`는 등록할 지수를 고른다(모든
+쌍은 여전히 읽고 검사한다). 지수 구성 원천은 legacy 편입 단위마다 하나이므로 한 번에 모두 넘긴다.
+`--plan`은 설치본을 읽기 전용으로 열어 pin과 part 수만 보고한다. 한 명령이 만든 universe는 한 transaction에서
+모두 등록되거나 하나도 등록되지 않는다. 응답은 매퍼 보고, universe별 member 수, 미해결 asset ID 표본(100개),
+날짜별 member 수 요약, pin이고, `--report`는 미해결 전체와 pin을 담은 같은 보고를 새 파일에 쓴다. 이미 있거나
+폴더가 없는 `--report` 경로는 아무것도 등록하기 전에 거부된다. 등록은 state만 쓰고 strategy 저장소를 쓰지
+않는다. `show`는 등록된 universe의 header와 part별 member 수를 읽는다. 공급자를 호출하지 않는다.
+규칙은 [universe 등록](design/data-vertical.md#universe-등록)이 소유한다.
+
 ## 원천 자료의 승격과 은퇴
 
 원천 자료실 자료를 공급자별 시장 dataset으로 승격하는 명령(`aas data promote`), 원천 ID 연결
@@ -341,13 +362,17 @@ aas data promotions
 ```
 
 `promote --plan`은 설치본을 읽기 전용으로 열어 명세가 요청하는 승격을 끝까지 계산하고 아무것도
-쓰지 않는다. 응답은 원천 행 수, 행 상태(승격 가능·보류·미해결·거부), 미해결 token 표본, 숫자 규칙
+쓰지 않는다. 응답은 원천 행 수, 매퍼가 고르지 않은 행 수, 행 상태(승격 가능·보류·미해결·거부), 미해결 token 표본, 숫자 규칙
 flag 분포, 시간 규칙별 null·상한 적용 수, op 분포, stale 행, 계획한 marker, 그리고 설치본의 전제
 부족(`blocking`: core schema v2, `sl:` 연결, identity snapshot 등록)과 자료 문제(`refusals`)를 담는다.
 `--plan` 없이 실행하면 둘 중 하나라도 있을 때 아무것도 쓰지 않고 거부한다. 같은 명세를 다시 실행하면
 기존 generation을 검증해 돌려주고, 중단된 승격은 같은 명령이나 `aas db recover`가 끝낸다. 승격은
 공급자를 호출하지 않으며, 설정된 공유 계산 예산이 있으면 그 예산 안에서 돈다. `promotions`는
 승격 intent마다 단계, generation, dataset version, 행 수, 명세 해시와 매퍼를 나열한다.
+
+ALFRED vintage(`fred.alfred@1`)는 generation 하나에 관측마다 vintage를 하나만 담으므로 백필은 계약의
+[거시와 FX 매퍼](design/data-vertical.md#거시와-fx-매퍼)가 정한 vintage 구간마다 명세 하나를 만들어, 직전
+generation을 parent로 순서대로 승격한다. 구간 없이 원천 전체를 계획하면 반복된 자연키로 거부된다.
 
 US 가격 dataset은 이 명령에 명세를 하나씩 넘겨 만든다. 매퍼와 dataset의 대응과 규칙은
 [대상 dataset](design/data-vertical.md#대상-dataset)이 소유한다. 명세는 US identity snapshot(`us-build
