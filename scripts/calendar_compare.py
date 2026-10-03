@@ -87,6 +87,8 @@ def compare(calendar_id: str, days: dict[date, tuple[int, int, int]]) -> dict[st
         day: value for day, value in days.items() if declaration.start <= day < declaration.end
     }
     outside = len(days) - len(covered)
+    if not covered:
+        raise SystemExit(f"none of the {outside} observed dates fall inside the declaration")
     days = covered
     first, last = min(days), max(days)
     status = {item.session_date: item.status for item in declaration.days()}
