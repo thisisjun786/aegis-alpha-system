@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
 
 WEIGHTS = Path(__file__).with_name("shard_weights.json")
+_ROOT = WEIGHTS.parents[1]
 _SHARD = re.compile(r"([1-9][0-9]{0,2})/([1-9][0-9]{0,2})\Z")
 _MILLISECONDS = 1000
 _DEFAULT_TEST_MILLISECONDS = 1000
@@ -201,7 +202,21 @@ def main(argv: list[str] | None = None) -> int:
         "--out", type=Path, default=WEIGHTS, help="table to write (default: the checked-in weights)"
     )
     arguments = parser.parse_args(argv)
-    write_seconds(arguments.out, merge(arguments.inputs))
+    merged = merge(arguments.inputs)
+    if arguments.out.exists():
+        # A shard that wrote or uploaded nothing would silently drop measured weights;
+        # only a weighed file that no longer exists may leave the table.
+        unmeasured = sorted(
+            name
+            for name in read_seconds(arguments.out)
+            if name not in merged and (_ROOT / name).exists()
+        )
+        if unmeasured:
+            parser.error(
+                f"the inputs measure none of {len(unmeasured)} weighed test files that still "
+                f"exist, such as {unmeasured[0]}; pass every shard's durations"
+            )
+    write_seconds(arguments.out, merged)
     return 0
 
 

@@ -229,3 +229,22 @@ def test_merge_validates_each_input(tmp_path: Path) -> None:
     bad.write_text(json.dumps({"src/a.py": 1.0}))
     with pytest.raises(ValueError, match="test file path"):
         merge([bad])
+
+
+def test_merge_refuses_to_drop_the_weight_of_a_file_that_still_exists(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A shard that wrote or uploaded nothing must not erase measured weights; a weighed file
+    # that was deleted or renamed leaves the table.
+    out, shard = tmp_path / "weights.json", tmp_path / "durations-1.json"
+    original = '{\n  "tests/engine/test_bundle.py": 3.0,\n  "tests/gone/test_removed.py": 9.0\n}\n'
+    out.write_text(original)
+    shard.write_text(json.dumps({"tests/a/test_new.py": 1.0}))
+    with pytest.raises(SystemExit) as refused:
+        main(["merge", "--out", str(out), str(shard)])
+    assert refused.value.code
+    assert "such as tests/engine/test_bundle.py" in capsys.readouterr().err
+    assert out.read_text() == original
+    shard.write_text(json.dumps({"tests/engine/test_bundle.py": 4.0, "tests/a/test_new.py": 1.0}))
+    assert main(["merge", "--out", str(out), str(shard)]) == 0
+    assert load_weights(out) == {"tests/a/test_new.py": 1000, "tests/engine/test_bundle.py": 4000}
