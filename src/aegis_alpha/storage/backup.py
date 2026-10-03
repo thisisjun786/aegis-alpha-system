@@ -19,6 +19,10 @@ if TYPE_CHECKING:
     from aegis_alpha.compute_resources import ComputeBudget
 
 _MANIFEST = "backup.json"
+# The manifest lists every raw/ and runs/ file with its size and hash, about 200 bytes
+# each, so an installation with hundreds of thousands of raw files has a manifest of tens
+# of megabytes. Configuration files keep their own 1 MiB bound.
+MAX_MANIFEST_BYTES = 512 * 1024 * 1024
 
 
 def _run_counts(workspace: Workspace) -> dict[str, int]:
@@ -201,12 +205,12 @@ def validated_backup(root: Path) -> dict[str, object]:
 def manifest_sha256(root: Path) -> str:
     """The backup's identity: SHA-256 of its exact ``backup.json`` bytes."""
     with DescriptorTree.open_path(root) as tree:
-        return hashlib.sha256(tree.read_bytes(_MANIFEST, max_bytes=64 * 1024 * 1024)).hexdigest()
+        return hashlib.sha256(tree.read_bytes(_MANIFEST, max_bytes=MAX_MANIFEST_BYTES)).hexdigest()
 
 
 def _validated_manifest(root: Path) -> dict[str, object]:
     private_directory(root)
-    manifest = read_json(root / _MANIFEST)
+    manifest = read_json(root / _MANIFEST, max_bytes=MAX_MANIFEST_BYTES)
     if (
         type(manifest.get("format_version")) is not int
         or manifest.get("format_version") != 1

@@ -26,7 +26,9 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   `prices.fields` defaults to `ohlcv`, an OHLCV row reads and hashes in its v1 shape,
   and a generation holding a `close` row hashes `fields` for every row.
 - Backup takes SQLite snapshots and closes DuckDB after checkpoint while retaining
-  installation admission. Restore targets a new root; secrets are excluded.
+  installation admission. Restore targets a new root; secrets are excluded. `backup.json`
+  lists every `raw/` and `runs/` file, so it is read with its own bound
+  (`backup.MAX_MANIFEST_BYTES`), not the 1 MiB configuration bound.
 - Promotion from the source library to typed generations follows
   `dev-notes/design/data-vertical.md` (Decision 0017). One hashed `aas-promotion-v1`
   spec pins sources, `mapper name@major`, time rules, decimal rules, quality rules

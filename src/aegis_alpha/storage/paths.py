@@ -65,11 +65,11 @@ def _unique_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
-def read_json(path: Path) -> dict[str, object]:
+def read_json(path: Path, *, max_bytes: int = 1024 * 1024) -> dict[str, object]:
     private_file(path)
     with DescriptorTree.open_path(path.parent) as tree:
         value = json.loads(
-            tree.read_bytes(path.name, max_bytes=1024 * 1024), object_pairs_hook=_unique_pairs
+            tree.read_bytes(path.name, max_bytes=max_bytes), object_pairs_hook=_unique_pairs
         )
     if not isinstance(value, dict):
         raise TypeError("configuration must be a JSON object")
