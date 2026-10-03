@@ -18,7 +18,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
 
 import duckdb
 import pytest
@@ -307,6 +307,35 @@ def test_read_heads_matches_project_heads(store: duckdb.DuckDBPyConnection) -> N
                     for row in market.project_heads(history, cutoff_us=cutoff)
                     if row["price_role"] == "reference"
                 ]
+
+
+def test_research_known_ceiling_matches_snapshot_candidates(
+    store: duckdb.DuckDBPyConnection,
+) -> None:
+    """A research read under a known ceiling drops exactly the revisions known after it.
+
+    Rows with no recorded knowledge time stay readable, as ``_Visibility.candidates`` keeps
+    them for observed-snapshot research; the ceiling enters the query document only when
+    set, so every read without one keeps its receipt bytes.
+    """
+    for seed, domain in enumerate(["prices", "calendar_sessions", "corporate_actions"]):
+        rng = random.Random(200 + seed)
+        chain = _chain(store, rng, domain=domain, dataset=f"ceiling{seed}-{domain}")
+        history = _history(store, chain[-1])
+        binding = HeadBinding(domain, (HeadPin(_pin(store, chain[-1])),))
+        for ceiling in (0, 30, 60, 90, 1_000):
+            candidates = [
+                row
+                for row in history
+                if row["revision_known_at_us"] is None
+                or cast("int", row["revision_known_at_us"]) <= ceiling
+            ]
+            read = _read(store, binding, HeadQuery(known_ceiling_us=ceiling))
+            assert _values(read) == market.project_heads(candidates), (seed, ceiling)
+            assert cast("Row", read.receipt["query"])["known_ceiling_us"] == ceiling
+    assert "known_ceiling_us" not in HeadQuery().document()
+    with pytest.raises(ValueError, match="research read only"):
+        HeadQuery(cutoff_us=1, known_ceiling_us=1)
 
 
 def _mask(history: list[Row], rules: Mapping[str, TimeRules], grants: tuple[str, ...]) -> list[Row]:

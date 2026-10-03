@@ -64,6 +64,11 @@ def add_commands(commands: argparse._SubParsersAction) -> None:
         "--sec", action="append", default=[], help="SEC submissions archive source ID"
     )
     us_build.add_argument(
+        "--norgate-exports",
+        action="store_true",
+        help="Read every committed norgate-history-csv source (norgate.export_listing@1)",
+    )
+    us_build.add_argument(
         "--bindings", help="Legacy identity-bindings source ID to compare asset IDs with"
     )
     us_build.add_argument("--output", type=Path, required=True, help="New registry file")
@@ -126,8 +131,14 @@ def _us(args: argparse.Namespace, home: Path) -> dict[str, object]:
     from aegis_alpha.storage.workspace import open_workspace
 
     with open_workspace(home, writable=False, require_strategies=False) as workspace:
+        exports = us_identity.export_sources(workspace) if args.norgate_exports else []
         registry = us_identity.build_from_workspace(
-            workspace, master=args.master, fmp=args.fmp, sec=args.sec, bindings=args.bindings
+            workspace,
+            master=args.master,
+            fmp=args.fmp,
+            sec=args.sec,
+            exports=exports,
+            bindings=args.bindings,
         )
     files = [(args.output, registry.raw())]
     if args.report is not None:

@@ -290,7 +290,7 @@ commit한다. 두 옵션 모두 반복할 수 있고, 같은 수집물을 다시
 
 ```bash
 aas identity us-build --master SOURCE_ID [--fmp SOURCE_ID] ... [--sec SOURCE_ID] ... \
-  [--bindings SOURCE_ID] --output registry.json [--report report.json]
+  [--norgate-exports] [--bindings SOURCE_ID] --output registry.json [--report report.json]
 aas identity register --file registry.json --sha256 SHA256 --plan
 ```
 
@@ -298,11 +298,14 @@ aas identity register --file registry.json --sha256 SHA256 --plan
 `eodhd.us_symbol@1`, `fmp.profile@1`, `sec.tickers@1` 매퍼로 `aas-identity-registry-v1` 문서를 `--output`에
 쓴다. `--master`는 Norgate security master 원천 하나, `--fmp`는 FMP company profile 원천, `--sec`는
 `aas import legacy`의 `sec.submissions_zip@1`로 편입한 SEC submissions 내용 원천이다(`raw/`의 archive를
-읽는다). `--fmp`와 `--sec`는 반복할 수 있다. 원천마다 `sl:` 연결이 있어야 하므로 명시 ID 원천은 먼저
+읽는다). `--fmp`와 `--sec`는 반복할 수 있다. `--norgate-exports`는 `aas import legacy`의
+`norgate.history_export@1`로 편입한 `norgate-history-csv-*` 원천을 모두 `norgate.export_listing@1`로 읽어,
+master에 없는 시리즈를 발급하고 master의 마지막 세션 뒤 내보내기 창의 티커 주장을 더한다. 원천마다 `sl:` 연결이 있어야 하므로 명시 ID 원천은 먼저
 `aas db source-link --apply`로 연결한다. `--bindings`는 legacy identity bindings 원천과 발급한 asset ID
 집합을 비교해 보고에 싣는다. 입력의 누적 규칙, 출력·`--report` 파일 규칙, 응답 형태(`withdrawn` 포함)는
 `kr-build`와 같다. 응답에는 asset ID 집합의 `aas-norgate-assetids-v1` 해시(`assetids_sha256`)와 issuer가
-연결된 instrument 수, 티커 주장이 끝나는 master의 마지막 관측 세션(`through`)이 더 실린다. 공급자를
+연결된 instrument 수, 티커 주장이 끝나는 master의 마지막 관측 세션(`through`), 내보내기의 마지막 주식
+세션(`export_through`)과 창의 EODHD 심볼 수(`export_symbols`)가 더 실린다. 공급자를
 호출하지 않는다. 해석 규칙과 미해결 이유는 [US 등록](design/data-vertical.md#us-등록)이 소유한다.
 
 ```bash
@@ -370,6 +373,44 @@ flag 분포, 시간 규칙별 null·상한 적용 수, op 분포, stale 행, 계
 ALFRED vintage(`fred.alfred@1`)는 generation 하나에 관측마다 vintage를 하나만 담으므로 백필은 계약의
 [거시와 FX 매퍼](design/data-vertical.md#거시와-fx-매퍼)가 정한 vintage 구간마다 명세 하나를 만들어, 직전
 generation을 parent로 순서대로 승격한다. 구간 없이 원천 전체를 계획하면 반복된 자연키로 거부된다.
+
+US 가격 dataset은 이 명령에 명세를 하나씩 넘겨 만든다. 매퍼와 dataset의 대응과 규칙은
+[대상 dataset](design/data-vertical.md#대상-dataset)이 소유한다. 명세는 US identity snapshot(`us-build
+--norgate-exports`로 만든 문서를 등록한 뒤 provider·namespace별로 만든 snapshot)과 `sessions.xnys` 달력
+generation을 pin한다.
+
+- `prices.us.norgate`: `norgate-history-csv-*` 중 미국 주식 내보내기의 `bars` 원천 전부, `norgate.prices_none@1`,
+  다섯 값 `decimal_text@1`, 연도 partition마다 generation 하나.
+- `prices.us.norgate.ref`: Norgate 조정 part, `norgate.prices_adjusted@1`, 다섯 값 `float_shortest@1`.
+- `prices.us.eodhd`: EODHD US 일간 다운로드 하나마다 generation 하나를 수집 순서대로, `eodhd.bars@1`과
+  `cross_provider_mismatch@1`(기준은 `prices.us.norgate`의 generation pin).
+- `prices.us.fmp.ref`: `fmp-price-eod-non-split-*` 원천 전부를 pin하고 `fmp.eod_non_split@1`의 `revision`을
+  1부터 delta가 빌 때까지 올리며 이어 승격한다.
+- `prices.ref.norgate`: 기준 시리즈 표는 `norgate.reference_closes@1`, 지수·기타 내보내기는
+  `norgate.reference_history@1`, close `decimal_text@1`. 내보내기 명세의 인자 `signed`는 그 내보내기
+  `bars`에 대한 `norgate_prices.signed_series` 결과(음수 close가 있는 시리즈의 asset ID)이고, 그 행은
+  `unselected_rows`로 센다.
+
+XNYS 세션 공백 보고는 `scripts/calendar_compare.py --calendar XNYS --source-prefix norgate-history-csv-
+--table bars`이고, 날짜로 읽히지 않는 행은 `undated_rows`로 따로 센다. 08-31..09-08 Norgate↔EODHD close
+불일치율은 두 dataset을 게시한 market 파일을 읽기 전용으로 열어 다시 계산한다.
+
+```sql
+WITH g AS (SELECT generation_id, dataset_id FROM market_generations
+           WHERE dataset_id IN ('prices.us.norgate', 'prices.us.eodhd')),
+p AS (SELECT g.dataset_id, instrument_id, session_date, close FROM prices JOIN g USING (generation_id)
+      WHERE value_state = 'present' AND session_date BETWEEN DATE '2026-08-31' AND DATE '2026-09-08'
+      QUALIFY row_number() OVER (PARTITION BY g.dataset_id, instrument_id, session_date
+                                 ORDER BY revision_known_at_us DESC) = 1),
+pair AS (SELECT n.session_date, n.close AS n, e.close AS e
+         FROM p n JOIN p e USING (instrument_id, session_date)
+         WHERE n.dataset_id = 'prices.us.norgate' AND e.dataset_id = 'prices.us.eodhd')
+SELECT session_date, count(*) AS pairs,
+       avg(CASE WHEN n <> e THEN 1 ELSE 0 END) AS any_difference,
+       avg(CASE WHEN abs(e - n) > 0.0001 * n THEN 1 ELSE 0 END) AS over_1bp,
+       avg(CASE WHEN abs(e - n) > 0.01 * n THEN 1 ELSE 0 END) AS over_1pct
+FROM pair GROUP BY ROLLUP (session_date) ORDER BY session_date NULLS LAST;
+```
 
 ### legacy 원천 편입
 
@@ -844,6 +885,24 @@ run 이력에 남는다. 어느 쪽이든 성공 영수증은 없다. 그 run을
 
 `aas-research-run-v2` 슬리브 선언과 `aas-research-composition-v1` 표본 조합 선언을 모두 받는다.
 어느 쪽인지는 문서의 `schema_version`이 말하므로 호출자가 고르지 않는다.
+
+패널 원천은 선언 최상위의 열쇠 하나로 정한다. `observations`는 보존 관측 generation pin 목록이고,
+`prices`는 canonical 가격 binding이다. 둘 다 있거나 둘 다 없으면 거부한다.
+
+```json
+"prices": {
+  "pins": [{"dataset_id": "prices.kr.eodhd", "version": "<v>", "generation_id": "<g>",
+            "chain_hash": "<sha256>", "manifest_hash": "<sha256>", "from": null, "to": null}],
+  "excluded_flags": ["provider_reported_partial"]
+},
+"instrument_map": {"<instrument_id>": "<전략의 자산 ID>"}
+```
+
+`pins`는 `aas-head-binding-v1`의 순서 있는 pin과 `[from, to)` cutover 구간이고, `excluded_flags`는
+읽지 않을 quality flag다. 연구 읽기는 엄격 PIT가 아니므로 시간 규칙 grant는 선언하지 않는다.
+`instrument_map`의 열쇠는 identity가 발급한 instrument ID이고 값 자산은 상태 저장소에서 `etf`로
+분류돼 있어야 한다. 가격 통화는 `conventions.currency`와 같아야 한다. 선언한 `knowledge_time`보다
+늦게 알려진 revision은 읽지 않는다. 봉인 준비 문서의 `prices.head_read`가 그 읽기 영수증이다.
 
 run 저장 표는 기본 설치에 없고, 선언된 계약을 담으려면 add-on이 v1보다 높아야 한다. 둘 다
 0단계에서 확인하므로 설치가 부족하면 계산 전에 실행할 명령을 알려주고 끝난다.

@@ -52,12 +52,13 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   retirement requires no references (the source's own `sl:` link is lineage, not a reference),
   an equivalence digest and an other-device backup, and never removes `raw/` bytes.
 - `promotion/` implements that path. `spec` parses the document, `mappers` is the registry
-  (one module per provider shape; a mapper is SQL over the staged source and declares its
-  columns, identity key, partition date SQL, time inputs and any pinned generations of other
-  datasets it joins, which the engine verifies and loads as head tables), `time_rules` and
-  `decimal_rules` hold the versioned rules with a Python reference beside each SQL form,
-  `formats` the frozen hash formats, and `engine` plans, applies, recovers and verifies. All
-  per-row work stays in DuckDB temp tables on the workspace connection; only rows SQL cannot hash exactly (escaped text, odd
+  (one module per provider shape, `daily` holding the SQL the daily price mappers share; a
+  mapper is SQL over the staged source and declares its columns, identity key, partition date
+  SQL, time inputs and any pinned generations of other datasets it joins, which the engine
+  verifies and loads as head tables), `time_rules` and `decimal_rules` hold the versioned rules
+  with a Python reference beside each SQL form, `formats` the frozen hash formats, and `engine`
+  plans, applies, recovers and verifies. All per-row work stays in DuckDB temp tables on the
+  workspace connection; only rows SQL cannot hash exactly (escaped text, odd
   natural keys) are computed in Python in bounded key-ordered batches. A plan writes nothing; an
   apply retains spec, request and manifest in `raw/`, records a `promotion` intent whose payload
   is the manifest, commits marker, rows and `quality_flags` in one DuckDB transaction through
@@ -167,14 +168,18 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   are known from their receipt's retrieval instant and cite the source row hash. A build
   must read every source registered KR assertions cite, and reports registered claims its
   sources no longer give (`withdrawn`) instead of closing them.
-- `us_identity` builds the US registry document from four identity mappers over committed,
-  linked sources (`norgate.master@1`, `eodhd.us_symbol@1`, `fmp.profile@1`, `sec.tickers@1`).
-  Every instrument is a Norgate asset ID (venue `XNYS`); a listed row's ticker (class `.`
+- `us_identity` builds the US registry document from five identity mappers over committed,
+  linked sources (`norgate.master@1`, `eodhd.us_symbol@1`, `fmp.profile@1`, `sec.tickers@1`,
+  `norgate.export_listing@1`). Every instrument is a Norgate asset ID (venue `XNYS`, or `XXXX`
+  for an index or other reference series an export adds); a listed row's ticker (class `.`
   spelled `-`) reaches EODHD and FMP symbols only when one listed row has it, and an issuer
   CIK links only when SEC lists the ticker under one CIK and FMP names the same CIK. Every
   disagreement stays unresolved with its reason. A ticker's claims hold only from the
   listing's first date (or the day after a delisted earlier holder's last date) until the
-  day after the master's last observed session; later intervals need newer evidence.
+  day after the master's last observed session; a later Norgate history export adds a
+  non-overlapping window up to its own last session, and FMP or SEC rows are judged against
+  the claim (master or window) holding when they were retrieved. Later intervals need newer
+  evidence.
   Claims from sources without a row instant
   are known from the source's `sl:` link; an issuer link from the latest of its evidence.
   Builds are cumulative like `kr_identity`'s, and source rows are read through Arrow so
@@ -322,7 +327,11 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   it does name. Observation panels cannot be bound, because there is no role for reference
   observations and adding one would put adjusted reference data in the namespace the
   executable price roles use; a calendar cannot be bound either, because it is a declared
-  name over the panel's own dates rather than a published generation. An
+  name over the panel's own dates rather than a published generation. A declaration that
+  reads canonical price pins (its root carries `prices` in place of `observations`; each
+  research root has exactly those two variants) binds no price either: the binding vocabulary
+  has no research price role, and the declaration hash plus the sealed `aas-head-read-v1`
+  receipt cover those pins. An
   `aas-research-run-v2` bundle is therefore required to be exactly the membership it pins.
   An `aas-research-composition-v1` pins one membership per sleeve while the vocabulary
   holds a single membership, so binding one of the two would leave `bundle_id` describing
