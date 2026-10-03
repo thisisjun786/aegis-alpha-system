@@ -14,7 +14,8 @@ resolution, decimal and time rules, record and revision identity, head diff, fla
   instrument: the identity key token and the instant at which it is resolved;
 - every domain column except ``instrument_id`` (and ``fields`` when the mapper emits it),
   with each numeric column left as its raw source value for the spec's decimal rule;
-- one ``_aas_t_<name>`` column per time input the mapper declares.
+- one ``_aas_t_<name>`` column per time input the mapper declares;
+- one BOOLEAN column per row flag the mapper declares (``row_flags``).
 """
 
 from __future__ import annotations
@@ -48,8 +49,12 @@ class Mapper(Protocol):
     def domain(self) -> str: ...
 
     @property
-    def partition_column(self) -> str:
-        """The source DATE column a spec partition and the record date come from."""
+    def partition_sql(self) -> str:
+        """SQL over the source columns giving the DATE a spec partition tests.
+
+        A row with no partition date never falls in a partition, and a partitioned plan
+        refuses such rows rather than dropping them.
+        """
         ...
 
     @property
@@ -59,6 +64,15 @@ class Mapper(Protocol):
 
     @property
     def time_inputs(self) -> Mapping[str, InputKind]: ...
+
+    @property
+    def row_flags(self) -> Mapping[str, str]:
+        """Each quality flag the source row itself carries and the BOOLEAN column saying so.
+
+        The engine attaches the flag, under the mapper's ``name@major`` as its rule, to the
+        revision a flagged row produces.
+        """
+        ...
 
     def check_args(self, args: Mapping[str, object]) -> None:
         """Refuse arguments the mapper does not define."""
@@ -79,9 +93,20 @@ class Mapper(Protocol):
 
 def _registry() -> dict[str, Mapper]:
     from aegis_alpha.storage.promotion.mappers.calendar import CalendarDeclared  # noqa: PLC0415
-    from aegis_alpha.storage.promotion.mappers.eodhd import EodhdBars  # noqa: PLC0415 -- registry
+    from aegis_alpha.storage.promotion.mappers.eodhd import (  # noqa: PLC0415 -- registry
+        EodhdBars,
+        EodhdBarsAdjusted,
+        EodhdBulkQuarantine,
+        EodhdBulkQuarantineAdjusted,
+    )
 
-    mappers: tuple[Mapper, ...] = (CalendarDeclared(), EodhdBars())
+    mappers: tuple[Mapper, ...] = (
+        CalendarDeclared(),
+        EodhdBars(),
+        EodhdBarsAdjusted(),
+        EodhdBulkQuarantine(),
+        EodhdBulkQuarantineAdjusted(),
+    )
     return {f"{mapper.name}@{mapper.major}": mapper for mapper in mappers}
 
 

@@ -12,7 +12,17 @@ from pathlib import Path
 from typing import cast
 
 from aegis_alpha.storage.workspace import initialize, open_workspace
-from tests.storage.promotion_support import add_source, at, bar, register_symbols, spec
+from tests.storage.promotion_support import (
+    add_bulk_source,
+    add_source,
+    at,
+    bar,
+    bulk_row,
+    publish_calendar,
+    register_symbols,
+    spec,
+    us,
+)
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -74,3 +84,53 @@ def test_promote_plan_writes_nothing_and_apply_publishes(tmp_path: Path) -> None
     assert listed["generation_id"] == applied["generation_id"]
     assert listed["dataset_id"] == "prices.kr.eodhd"
     assert listed["row_count"] == 1
+
+
+def test_kr_prices_plan_writes_nothing_and_apply_publishes(tmp_path: Path) -> None:
+    home = tmp_path / "aas"
+    initialize(home)
+    day, next_day = date(2025, 1, 2), date(2025, 1, 3)
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        pin = add_source(
+            workspace, [bar("AAA.KO", day, 100.0, retrieved=at("2025-01-10T00:00:00"))], tag="a"
+        )
+        register_symbols(workspace, pin["source_id"])
+        add_bulk_source(
+            workspace,
+            [bulk_row("AAA", "KO", next_day, 101)],
+            tag="b",
+            linked=at("2025-01-20T00:00:00"),
+        )
+        publish_calendar(
+            workspace,
+            {
+                session: (None, us(at(f"{session.isoformat()}T06:30:00")))
+                for session in (day, next_day)
+            },
+        )
+    command = (
+        "kr-prices",
+        "--identity-snapshot",
+        "kr",
+        "--lag-us",
+        "0",
+        "--history-lineage",
+        "synthetic-kr-bars",
+        "--bulk-lineage",
+        "synthetic-kr-bulk",
+    )
+    before = _tree(home)
+    planned = _data(*command, "--plan", home=home)
+    assert planned["mode"] == "plan"
+    assert [step["published"] for step in cast("list[dict[str, object]]", planned["steps"])] == [
+        False,
+        False,
+    ]
+    assert _tree(home) == before
+    applied = _data(*command, home=home)
+    steps = cast("list[dict[str, object]]", applied["steps"])
+    assert [(step["kind"], step["published"]) for step in steps] == [
+        ("history", True),
+        ("bulk", True),
+    ]
+    assert steps[1]["flags"] == {"provider_reported_partial": 1}

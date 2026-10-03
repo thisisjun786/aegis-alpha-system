@@ -209,12 +209,13 @@ flag → 대량 게시 계획이다. 원천 확인은 pin한 테이블마다 완
 돌며, 계산에 쓰는 것은 그 연결의 임시 테이블뿐이다. 보고는 원천 행 수, 행 상태(`ok`, `held`,
 `unresolved`, `ambiguous`, `refused_*`), 미해결 token 표본, 해석 전 매핑 행 전체의 숫자 flag 분포,
 시간 규칙별 null·상한 적용 수, 반복된 자연키, op 분포, 변하지 않은 행과 stale 행 수,
-head와 시점이 다르게 계산되는 변하지 않은 행 수(`time_drift`), delta의 flag 분포, 계획한 marker를 담는다.
+head와 시점이 다르게 계산되는 변하지 않은 행 수(`time_drift`), delta의 flag 분포, 부분 응답 행이 있으면
+그 행 수 대조(`partition_row_count`), 계획한 marker를 담는다.
 
 보고는 두 종류의 거부 이유를 따로 싣는다. `blocking`은 설치본이 아직 갖추지 않은 전제다(core
 schema v2, 원천의 `sl:` 연결, 등록되지 않은 identity snapshot). `refusals`는 자료 자체의 문제다(규칙이
 변환하지 못한 숫자, 비어 있는 필수 열, 수집 시각이 없는 행, 반복된 자연키, 부재를 증명할 수 없는
-미해결 행). 실행은 둘 중 하나라도 있으면 아무것도 쓰지 않고 거부한다. delta가 비어 있으면
+미해결 행, `partition`이 있는 명세에서 파티션 날짜가 없는 원천 행). 실행은 둘 중 하나라도 있으면 아무것도 쓰지 않고 거부한다. delta가 비어 있으면
 아무것도 쓰지 않는다.
 
 실행은 명세, 요청 문서, 승격 manifest를 `raw/`에 쓰고, 그 manifest의 SHA-256을 payload hash로 한
@@ -222,13 +223,14 @@ schema v2, 원천의 `sl:` 연결, 등록되지 않은 identity snapshot). `refu
 state 카탈로그를 한 트랜잭션으로 쓰고 intent를 완료한다. 카탈로그는 `datasets`(owner `promotion`),
 `dataset_versions`(`manifest_hash`는 marker의 request hash, `transform_hash`는 명세 해시,
 `normalizer_version`은 매퍼 `name@major`, `identity_snapshot_hash`, `coverage`는 partition), 원천마다
-`dataset_sources`의 `sl:` 행, `quality_checks`의 `promotion_report@1` 행(op·행 상태·flag 수), 그리고
+`dataset_sources`의 `sl:` 행, `quality_checks`의 `promotion_report@1` 행(op·행 상태·flag 수)과 부분 응답
+행이 있으면 `partition_row_count@1` 행([품질 검사](#품질-flag와-품질-검사)), 그리고
 (매퍼 공급자, dataset, partition)마다 delta의 가장 늦은 `ingested_at_us`까지 앞으로만 가는 `watermarks`다.
 `committed_version`은 그 시각까지 처음 나아간 version이며, 시각을 넘지 못한 정정 generation은 바꾸지 않는다.
 
 승격 manifest(`aas-promotion-manifest-v1`, 정규 JSON)는 요청·명세 해시, marker의 dataset·version·
 generation·parent·sequence·delta hash·chain hash·행 수, op 분포, 행 상태 수, flag 행의 rowset digest와
-수, 원천 pin과 identity pin을 담는다. 중단된 승격은 같은 명령을 다시 실행하거나 `aas db recover`로
+수, 원천 pin과 identity pin, 부분 응답 행이 있으면 `partition_row_count`를 담는다. 중단된 승격은 같은 명령을 다시 실행하거나 `aas db recover`로
 끝낸다. market에 commit된 generation이 있으면 manifest와 대조해 카탈로그만 쓰고, 없으면 보존한
 명세로 다시 계산해 manifest가 intent의 payload hash와 정확히 같을 때만 게시한다. 다시 계산한 결과가
 다르면 intent는 PREPARED로 남고 `aas db quarantine`의 대상이 된다. 중단된 요청의 `--plan`은 아무것도
@@ -248,8 +250,11 @@ revision 정체성, head 비교, flag는 매퍼가 아니라 승격 엔진(`stor
 
 매퍼의 relation은 원천 행 위치와 해시를 그대로 넘기고, 행의 수집 시각(없으면 null), instrument
 도메인이면 identity token과 그 token을 해석할 시각, `instrument_id`를 뺀 도메인 열, 원천 값 그대로의
-숫자 열, 선언한 시간 입력 열을 낸다. 매퍼는 원천 열 이름과 허용 타입, 숫자 열의 원천 타입, identity
-assertion key(provider, namespace), 파티션 날짜 열, tombstone 범위가 쓰는 도메인 날짜 열을 선언한다.
+숫자 열, 선언한 시간 입력 열, 원천 행 자체가 싣는 품질 flag의 불리언 열을 낸다. 매퍼는 원천 열 이름과
+허용 타입, 숫자 열의 원천 타입, identity assertion key(provider, namespace), 파티션 날짜(원천 열에서
+날짜를 내는 SQL 식), tombstone 범위가 쓰는 도메인 날짜 열, 행 flag를 선언한다. 행 flag는 그 행이 만든
+revision에 매퍼의 `name@major`를 규칙으로 해서 달리고 `detail`은 null이다. 필수 도메인 열이 빈 행은
+identity 해석과 무관하게 `refused_required`이므로, 모양이 잘못된 행이 미해결 행으로 조용히 빠지지 않는다.
 
 `source_row_hash`는 원천 행 내용의 해시다.
 
@@ -272,6 +277,20 @@ source_row_hash = sha256(정규 JSON ["aas-source-row-v1", [[열 이름, 값], .
 `bar_end_us`는 인자 `timezone`에서 그 세션 날짜의 마지막 microsecond, 수집 시각은 `retrieved_at`이다.
 다섯 값이 모두 유한하고 음수가 아니면 `present`, 모두 비었으면 `missing`, 그 밖은 값 없이
 `invalid`다. 시간 입력은 `session_date` 하나다.
+
+`eodhd.bulk_quarantine@1`은 EODHD 거래소 전체 일간 내려받기에서 수집기가 보류한 행(내려받기 하나의
+테이블, `reason`과 공급자 행의 JSON 텍스트 `source_row_json`)을 같은 canonical unadjusted `prices`로
+옮긴다. 공급자가 그 거래소 응답이 부분이라고 경고한 `provider_reported_partial` 행만 세션 날짜를
+갖고, 모든 행에 행 flag `provider_reported_partial`이 달린다. 다른 보류 이유의 행, `YYYY-MM-DD`가
+아닌 날짜, 읽을 수 없는 JSON은 세션 날짜가 없어 거부되거나 파티션 날짜 없음으로 거부된다. token은
+`<code>.<exchange_short_name>`이고, JSON에 통화가 없으므로 인자 `currencies`가 거래소 코드마다 ISO 통화를
+선언하며 선언하지 않은 거래소의 행은 통화가 없어 거부된다. 행에 수집 시각이 없으므로 수집 시각은 그
+원천의 `sl:` 연결 시각이다. JSON 숫자는 binary64로 읽고, 2^53을 넘는 정수나 숫자가 아닌 JSON 값은
+`invalid`다. 나머지(해석, `bar_end_us`, 값 상태, 시간 입력)는 `eodhd.bars@1`과 같다.
+
+`eodhd.bars_adjusted@1`과 `eodhd.bulk_quarantine_adjusted@1`은 같은 두 원천 모양에서 공급자
+`adjusted_close`를 close 전용(`fields='close'`) reference 가격(basis `total_return`)으로 옮긴다. 숫자 열은
+`close` 하나이고 값 상태 규칙은 그 한 값에 같게 적용한다.
 
 `calendar.declared@1`은 [선언 달력](#선언-달력)의 원천 테이블(날짜마다 `calendar_id`, `venue`,
 `timezone`, `session_date`, `status`, 현지 `open_local`·`close_local`, `declared_at`)을
@@ -460,15 +479,21 @@ quality_flags(generation_id, record_id, revision_id, rule_id, rule_version, flag
 | `decimal_rounding_tie` | 반올림 나머지가 정확히 0.5였음 |
 | `provider_float_storage` | 원천이 float 저장값이어서 `float_shortest@1`을 적용함 |
 | `time_clamped_to_ingestion` | 규칙 상한이 수집 시각보다 늦어 수집 시각으로 내려감 |
-| `provider_reported_partial` | 공급자가 경고와 함께 보낸 부분 응답 파티션의 행 |
+| `provider_reported_partial` | 공급자가 경고와 함께 보낸 부분 응답 파티션의 행. 규칙은 그 행을 읽은 매퍼(`eodhd.bulk_quarantine@1` 등), `detail`은 null |
 | `volume_precision_limited` | 원천 거래량의 유효숫자가 잘려 있음 |
 | `time_precision_day` | 시점이 `local_day_end@1`의 날짜 단위 상한임 |
 | `cross_provider_mismatch` | 같은 instrument·세션·interval·bar_end·basis·currency(가격 키에서 role만 뺀 키)의 다른 공급자 값과 명세 품질 규칙의 허용오차를 넘게 다름(`cross_provider_mismatch@1`: 인자 `reference` generation pin, 비교할 숫자 열 `column`, 상대 허용오차 `tolerance` 십진 문자열로 `abs(값 - 기준) > tolerance × abs(기준)`). 허용오차 안이면 flag가 없다. 한 revision에 규칙마다 flag는 많아야 하나이고, delta 안에서 flag 키가 겹치면 계획이 거부한다 |
 
 dataset version 단위의 판정(행 수 대조, coverage 종료, 교차 대조율)은 기존 state
-`quality_checks`가 맡는다. 부분 응답 파티션은 행마다 flag를 달고, 같은 파티션의 다른 원천과
-행 수를 대조한 결과를 `quality_checks`에 남긴다. 잘못된 가격은 `value_state='invalid'`로
-승격하고 값을 0이나 이웃 값으로 채우지 않는다.
+`quality_checks`가 맡는다. 부분 응답 행은 막지 않고 flag와 함께 승격하며, 그 generation은
+`partition_row_count@1` 검사를 남긴다. 세션 날짜마다 부분 응답 원천 행 수, 그중 해석된 행 수(`ok`·`held`),
+parent chain에서 그 날짜에 살아 있는 head 수를 센다. chain에 그 날짜가 없으면 31일 안의 가장 늦은 이전
+날짜를 기준으로 쓴다(이력과 겹치는 날은 이력 자체와, 이력 뒤의 날은 직전 거래일의 종목 수와 대조된다).
+결과는 해석된 행이 기준보다 적은 날짜가 있으면 `below_reference`, 기준이 하나도 없으면 `no_reference`,
+그 밖은 `at_least_reference`이고 `reason`은 날짜별 수의 정규 JSON이다. 검사는 승격 manifest에 들어가므로
+복구도 같은 행을 쓴다. delta가 비어 게시되지 않은 계획은 보고에만 남는다. 소비자는
+`provider_reported_partial`을 binding의 flag 제외 목록에 두어 그런 revision을 읽지 않을 수 있다. 잘못된
+가격은 `value_state='invalid'`로 승격하고 값을 0이나 이웃 값으로 채우지 않는다.
 
 ## 공급자별 dataset과 ordered-pin cutover
 
@@ -559,8 +584,8 @@ KRX 토요일 session은 확인되지 않은 반일 마감 대신 평일 마감�
 
 | dataset | 도메인·역할 | 원천과 규칙 |
 | --- | --- | --- |
-| `prices.kr.eodhd` | `prices`, canonical unadjusted | EODHD KR 일봉 이력과 이후 일간 수집. `krw_tick@1`, `session_close_plus_lag@1`, 부분 응답 flag, 잘못된 가격은 `invalid` |
-| `prices.kr.eodhd.ref` | `prices`, reference `total_return` | 같은 원천의 adjusted close |
+| `prices.kr.eodhd` | `prices`, canonical unadjusted | EODHD KR 일봉 이력(`eodhd.bars@1`)과 부분 응답 일간 내려받기(`eodhd.bulk_quarantine@1`). `krw_tick@1`, `session_close_plus_lag@1`, 부분 응답 flag와 행 수 대조, 잘못된 가격은 `invalid`. [KR 가격](#kr-가격) |
+| `prices.kr.eodhd.ref` | `prices`, reference `total_return`, `fields='close'` | 같은 원천의 adjusted close(`eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1`), `float_shortest@1` |
 | `prices.us.norgate` | `prices`, canonical unadjusted | Norgate 비조정 일봉 내보내기(CSV). 거래량은 `decimal_text@1` |
 | `prices.us.norgate.ref` | `prices`, reference `split_adjusted`·`total_return` | Norgate 조정 OHLC. float32 저장값은 `float_shortest@1` |
 | `prices.us.eodhd` | `prices`, canonical unadjusted | EODHD US 일간 수집. Norgate와 겹치는 구간에 교차 대조 flag |
@@ -582,6 +607,32 @@ identity 원천(Norgate master, SEC submissions, FMP profile, DART 고유번호,
 
 dataset의 백필은 연도 단위 generation, 이후 유지보수는 세션 단위(재무는 일 단위) generation으로
 게시한다.
+
+### KR 가격
+
+`aas data kr-prices`(`storage/kr_prices.py`)가 `prices.kr.eodhd`를 채우는 승격을 순서대로 만든다. 한
+단계가 generation 하나이며 각 단계의 명세는 그 단계의 파티션, pin한 테이블, 등록된 identity snapshot,
+`sessions.xkrx`의 committed head, 그리고 dataset head를 parent로 적은 정규 문서다.
+
+1. 이력: 원천 ID 접두어 하나(`--history-lineage`)의 모든 `bars` 테이블을 pin하고 달력 연도마다
+   `eodhd.bars@1`로 승격한다.
+2. 부분 응답 일간 내려받기: 원천 ID 접두어 하나(`--bulk-lineage`)의 `quarantine` 테이블 중 행이 KR
+   거래소(`KO`, `KQ` → `KRW`)를 가리키는 것을 세션 날짜마다 `eodhd.bulk_quarantine@1`로 승격한다. KR과
+   다른 거래소를 섞은 테이블은 거부한다. 테이블 digest가 같은 반복 내려받기는 가장 작은 원천 ID 하나만
+   pin한다. 내용이 다른 두 테이블이 같은 거래소·날짜를 실으면 둘 다 pin해 계획이 반복 자연키로 거부한다.
+
+두 시점 열은 `session_close_plus_lag@1`(근거 `record`, 입력 `session_date`, `--lag-us`)이고 OHLC는
+`krw_tick@1`, 거래량은 `float_shortest@1`이다. 공급자는 거래량도 분할 계수로 나눠 다시 계산하므로
+(545540.77978275주처럼) 소수 12자리로 정확히 표현되지 않는 거래량이 있고, 그 행에는
+`provider_float_storage`가 남는다. `--reference`는 같은 단계를 adjusted close 매퍼로
+`prices.kr.eodhd.ref`에 만들며 close는 `float_shortest@1`이다. 이력과 겹치는 부분 응답 날짜는 이력
+generation의 자식이므로 같은 값은 바뀌지 않고, 다른 값은 SUPERSEDE로 그 원천을 받은 시각부터 알려진다.
+
+`--plan`은 아무것도 쓰지 않고 모든 단계를 현재 head의 자식으로 계획해 단계별 보고와 합계(원천 행,
+행 상태, op, flag, 숫자 규칙 flag 행 수)를 낸다. 그래서 적용되지 않은 앞 단계가 있으면 뒤 단계는 그
+단계가 없는 head에 대해 계획된다. 실행은 단계를 순서대로 앞 단계가 남긴 head의 자식으로 승격하고 첫
+거부에서 멈춘다. delta가 빈 단계는 아무것도 게시하지 않으므로, 끝까지 실행한 뒤 다시 실행하면 아무것도
+쓰지 않는다. identity snapshot에서 해석되지 않는 심볼의 행은 미해결로 보고되고 승격되지 않는다.
 
 ## identity 등록과 chunked 문서
 
@@ -1081,3 +1132,11 @@ state v2:
 | DV-142 | `scripts/us_identity_report.py`는 market 파일만 읽기 전용으로 열어 bulk·격리 행의 US 해석을 이유별로 보고한다 | `tests/storage/test_us_identity.py::test_the_report_script_resolves_bulk_and_quarantined_us_rows` | 구현 |
 | DV-143 | legacy 항목의 보존 파일은 경로·SHA-256·크기·이유를 담은 보존 목록 원천으로 commit되고, 목록 원천이 없거나 연결된 보존 bytes가 없으면 `--verify`가 `unmatched`로 센다 | `tests/storage/test_legacy_import.py::test_uncovered_files_keep_verify_incomplete` | 구현 |
 | DV-144 | 압축 해제가 깨진 SEC member나 지수 구성 gzip은 그 단위를 이유와 함께 거부하고 나머지 계획은 이어진다 | `tests/storage/test_legacy_import.py::test_sec_archive_refuses_a_corrupt_deflate_stream` | 구현 |
+| DV-145 | 부분 응답 행은 막히지 않고 flag `provider_reported_partial`과 함께 승격되며, generation은 parent chain 대비 `partition_row_count@1` 검사를 남긴다 | `tests/storage/test_kr_prices.py::test_warned_bulk_rows_are_promoted_with_flags_and_counted` | 구현 |
+| DV-146 | 부분 OHLCV와 음수 가격은 값 없이 `invalid`로, identity가 없는 심볼은 미해결로 남고 승격되지 않는다 | `tests/storage/test_kr_prices.py::test_kr_bars_refuse_partial_negative_and_unresolved` | 구현 |
+| DV-147 | 공급자가 다시 계산한 분할 이전 가격은 `krw_tick@1`로 원 단위로 돌아오고 분할 비율과 맞는다 | `tests/storage/test_kr_prices.py::test_known_split_rounds_back_to_whole_won` | 구현 |
+| DV-148 | `partition`이 있는 명세는 파티션 날짜가 없는 원천 행을 거부하고, 필수 열이 빈 행은 identity와 무관하게 거부된다 | `tests/storage/test_kr_prices.py::test_partitioned_plan_refuses_rows_without_partition_date` | 구현 |
+| DV-149 | `aas data kr-prices`는 이력 연도와 부분 응답 날짜를 순서대로 승격하고 반복 내려받기를 한 번만 pin하며 다시 실행하면 쓰지 않는다 | `tests/storage/test_kr_prices.py::test_kr_prices_backfills_years_then_partial_days` | 구현 |
+| DV-150 | `kr-prices --plan`은 설치본에 아무것도 쓰지 않는다 | `tests/storage/test_promotion_cli.py::test_kr_prices_plan_writes_nothing_and_apply_publishes` | 구현 |
+| DV-151 | `eodhd.bulk_quarantine@1`은 합성 원천 fixture를 독립 기대값과 같은 도메인 열과 행 flag로 옮기고 다른 보류 이유·잘못된 날짜·JSON의 세션 날짜를 비운다 | `tests/storage/test_promotion_mappers.py::test_eodhd_bulk_quarantine_maps_synthetic_fixture` | 구현 |
+| DV-152 | adjusted close 매퍼는 close 전용 `total_return` reference 가격을 낸다 | `tests/storage/test_promotion_mappers.py::test_eodhd_adjusted_close_maps_close_only_reference` | 구현 |

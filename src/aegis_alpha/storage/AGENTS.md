@@ -86,6 +86,18 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   `--plan` opens no installation and writes nothing; `--verify` re-derives the plan, and its
   `complete` (zero unmatched, reconciled, zero uncovered) is the precondition for deleting an
   entry root outside the store. A new format is a new loader with its own synthetic test.
+- `kr_prices` (`aas data kr-prices`) promotes `prices.kr.eodhd` (or `.ref`) as ordered steps:
+  history bars of one lineage per calendar year with `eodhd.bars@1`, then the KR exchange-wide
+  downloads the provider warned were partial, per session date with `eodhd.bulk_quarantine@1`,
+  repeated identical downloads pinned once. Each step's spec is canonical (identity snapshot,
+  `sessions.xkrx` head for `session_close_plus_lag@1`, `krw_tick@1` OHLC) with the current head
+  as parent. A mapper may declare row flags it reads off the source row; the engine attaches
+  them under the mapper's `name@major` with a NULL detail. Rows flagged
+  `provider_reported_partial` are promoted, never blocked, and the generation records
+  `partition_row_count@1` (resolved rows per date against the parent chain) in its manifest
+  and `quality_checks`. A row missing a required column is `refused_required` before identity
+  resolution, and a partitioned plan refuses rows without a partition date, so malformed rows
+  never drop out silently as unresolved.
 - `bulk_generation` publishes a staged DuckDB table as one generation: plan without
   writing, then one transaction with the marker and `INSERT … SELECT`. DuckDB encodes and
   sorts `aas-rowset-v1` rows and `rowset.RowsetStream` digests them in admitted batches and
