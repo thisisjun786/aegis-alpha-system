@@ -98,7 +98,7 @@ def test_deep_verify_backup_and_restore_report_the_default_verification(tmp_path
     assert (report["verification"], report["deep"]) == (json.loads(checked.stdout), True)
 
 
-@pytest.mark.parametrize("command", ["verify", "backup", "restore", "run-install"])
+@pytest.mark.parametrize("command", ["verify", "recover", "backup", "restore", "run-install"])
 def test_maintenance_compute_lock_alias_rejected_before_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
 ) -> None:

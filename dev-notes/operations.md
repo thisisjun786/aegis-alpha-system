@@ -605,7 +605,7 @@ aas --home /path/to/new-home db restore --backup /path/to/new-backup [--deep]
 `run-migrate`가 `--backup-output`으로 만드는 백업도 기본 검증을 쓰고 `--deep`이면 deep으로 검증한다.
 compact는 새로 쓴 루트를 항상 deep으로 검증한다.
 
-`db verify`, `db backup`, `db restore`, `db run-install`, `db migrate`도 설정된 공유 계산 예산을 사용한다.
+`db verify`, `db recover`, `db backup`, `db restore`, `db run-install`, `db migrate`도 설정된 공유 계산 예산을 사용한다. `recover`는 중단된 승격을 그 예산으로 게시하므로 승격을 실행한 것과 같은 예산 환경에서 실행한다.
 CLI는 저장소 잠금을 잡기 전에 계산 lease를 확보한다. Python 호출자는 검증·백업·복원과
 run-schema 설치 함수의 `budget=`에 자신이 확보한 `ComputeBudget`을 넘긴다. 설정이나
 인자를 생략하면 기존 직렬 기본 예산을 유지한다. import의 파일 크기 상한과 검증의 메모리
