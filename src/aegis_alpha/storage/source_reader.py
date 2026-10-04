@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, assert_never, cast
 
-from aegis_alpha.storage.source_library import list_sources, list_tables
+from aegis_alpha.storage.source_library import list_tables, source_entry
 from aegis_alpha.storage.source_library_digest import arrow_digest, sqlite_digest
 from aegis_alpha.storage.source_library_schema import connections, quoted
 from aegis_alpha.storage.state import get_operation
@@ -72,9 +72,7 @@ def _query(target: str, columns: Sequence[str]) -> str:
 
 def resolve_source(workspace: Workspace, pin: SourcePin) -> dict[str, object]:
     """Verify exactly the requested table and return its resolved descriptor."""
-    source = next(
-        (row for row in list_sources(workspace) if row["source_id"] == pin.source_id), None
-    )
+    source = source_entry(workspace, pin.source_id)
     if source is None or source["sha256"] != pin.source_sha256:
         raise ValueError("source is missing or its SHA-256 differs from the pin")
     table = next(
@@ -214,7 +212,7 @@ def inspect_source(
     """
     if type(limit) is not int or not 1 <= limit <= 1000:  # noqa: PLR2004 -- existing read limit
         raise ValueError("source read limit must be from 1 to 1000")
-    source = next((s for s in list_sources(workspace) if s["source_id"] == source_id), None)
+    source = source_entry(workspace, source_id)
     if source is None:
         raise ValueError("unknown or incomplete source")
     table = next((t for t in list_tables(workspace, source_id) if t["name"] == table_name), None)

@@ -167,10 +167,10 @@ ORDER BY assetid, indexname, kind, first_day
 
 def _pinned_table(workspace: Workspace, source_id: str, table: str) -> str:
     """Verify one committed DuckDB source table against its marker; return its target name."""
-    from aegis_alpha.storage.source_library import list_sources, list_tables  # noqa: PLC0415
+    from aegis_alpha.storage.source_library import list_tables, source_entry  # noqa: PLC0415
     from aegis_alpha.storage.source_reader import SourcePin, resolve_source  # noqa: PLC0415
 
-    source = next((row for row in list_sources(workspace) if row["source_id"] == source_id), None)
+    source = source_entry(workspace, source_id)
     if source is None:
         raise ValueError(f"unknown or incomplete source {source_id}")
     described = next(

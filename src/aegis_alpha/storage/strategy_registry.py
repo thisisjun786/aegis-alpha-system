@@ -466,12 +466,12 @@ def _rows(
 ) -> tuple[dict[str, str], dict[str, list[tuple[int, Mapping[str, object]]]]]:
     from aegis_alpha.storage.source_library import (  # noqa: PLC0415
         admit_source_table,
-        list_sources,
         list_tables,
+        source_entry,
     )
     from aegis_alpha.storage.source_reader import SourcePin, iter_source_rows  # noqa: PLC0415
 
-    source = next((s for s in list_sources(workspace) if s["source_id"] == source_id), None)
+    source = source_entry(workspace, source_id)
     if source is None or source["sha256"] != source_sha256:
         raise ValueError("source is missing or its SHA-256 differs from the request")
     if source["store"] != "strategies":

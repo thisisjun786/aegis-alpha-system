@@ -485,10 +485,10 @@ def pinned_rows(
     ``keep`` selects rows batch by batch, so a wide table (the DART receipts that hold one
     corp-code archive among many financial statements) is never held whole.
     """
-    from aegis_alpha.storage.source_library import list_sources, list_tables  # noqa: PLC0415
+    from aegis_alpha.storage.source_library import list_tables, source_entry  # noqa: PLC0415
     from aegis_alpha.storage.source_reader import SourcePin, iter_source_rows  # noqa: PLC0415
 
-    source = next((row for row in list_sources(workspace) if row["source_id"] == source_id), None)
+    source = source_entry(workspace, source_id)
     if source is None:
         raise ValueError(f"unknown or incomplete source {source_id}")
     described = next(

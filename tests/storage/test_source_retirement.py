@@ -233,8 +233,12 @@ def test_unreferenced_equivalent_backed_up_source_is_retired(
                 ("sl:" + copy, "sl:" + first, "sl:" + second),
             ).fetchone()
         )
-        listed = {row["source_id"] for row in source_library.list_sources(workspace)}
-        assert listed == {export}
+        # The listing holds the export only, and one source's entry follows it.
+        listed = source_library.list_sources(workspace)
+        assert (
+            [row["source_id"] for row in listed],
+            [source_library.source_entry(workspace, source) for source in (copy, export)],
+        ) == ([export], [None, *listed])
         with pytest.raises(ValueError, match="is retired"):
             source_library.list_tables(workspace, copy)
         report = cast("dict[str, dict[str, object]]", verify_workspace(workspace))
