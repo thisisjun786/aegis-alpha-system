@@ -244,6 +244,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:  # noqa: PLR0911 -- 
             return run(home, args)
         if args.command == "db" and args.db_command in {
             "verify",
+            "recover",
             "backup",
             "restore",
             "run-install",
@@ -273,10 +274,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:  # noqa: PLR0911 -- 
         mutation = (
             (args.command == "strategy" and args.strategy_command == "import")
             or (args.command == "data" and args.data_command in _REGISTER_COMMANDS | {"import"})
-            or (
-                args.command == "db"
-                and args.db_command in {"recover", "quarantine", "source-import"}
-            )
+            or (args.command == "db" and args.db_command in {"quarantine", "source-import"})
             or (args.command == "db" and args.db_command == "source-link" and args.apply)
         )
         with open_workspace(
@@ -288,7 +286,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:  # noqa: PLR0911 -- 
             or (
                 args.command == "db"
                 and args.db_command
-                in {"verify", "recover", "sources", "source-tables", "source-read", "source-link"}
+                in {"verify", "sources", "source-tables", "source-read", "source-link"}
             ),
         ) as workspace:
             return _workspace_command(workspace, args)
@@ -344,8 +342,24 @@ def _maintenance(home: Path, args: argparse.Namespace) -> dict[str, object]:  # 
                 budget=budget,
                 deep=args.deep,
             )
+        if args.db_command == "recover":
+            return _recover(home, budget)
         with open_workspace(home) as workspace:
             return verify_workspace(workspace, budget=budget, deep=args.deep)
+
+
+def _recover(home: Path, budget: ComputeBudget | None) -> dict[str, object]:
+    """Finish interrupted operations under the shared compute budget, as their writers ran."""
+    from aegis_alpha.storage.publication import recover_operations
+    from aegis_alpha.storage.run_schema import inspect_run_schema, require_run_schema
+    from aegis_alpha.storage.source_identity import link_content_sources
+    from aegis_alpha.storage.workspace import open_workspace
+
+    with open_workspace(home, writable=True, strategy_write=True) as workspace:
+        if inspect_run_schema(workspace).state == "partial":
+            require_run_schema(workspace)
+        recovered = recover_operations(workspace, budget=budget)
+        return {**recovered, **link_content_sources(workspace)}
 
 
 def _source_retire(
@@ -449,7 +463,7 @@ def _pin_import(home: Path, args: argparse.Namespace) -> dict[str, object]:
             return import_binding(workspace, raw, args.sha256, budget=budget)
 
 
-def _workspace_command(workspace: object, args: argparse.Namespace) -> dict[str, object]:  # noqa: C901, PLR0911 -- CLI routing
+def _workspace_command(workspace: object, args: argparse.Namespace) -> dict[str, object]:  # noqa: PLR0911 -- CLI routing
     from aegis_alpha.storage.workspace import Workspace
 
     if not isinstance(workspace, Workspace):
@@ -471,15 +485,7 @@ def _workspace_command(workspace: object, args: argparse.Namespace) -> dict[str,
             from aegis_alpha.storage.publication import quarantine
 
             return quarantine(workspace, args.operation, args.reason)
-        from aegis_alpha.storage.publication import recover_operations
-        from aegis_alpha.storage.run_schema import inspect_run_schema, require_run_schema
-
-        if inspect_run_schema(workspace).state == "partial":
-            require_run_schema(workspace)
-        from aegis_alpha.storage.source_identity import link_content_sources
-
-        recovered = recover_operations(workspace)
-        return {**recovered, **link_content_sources(workspace)}
+        raise ValueError(f"unknown db command {args.db_command}")
     if args.command == "strategy":
         return _strategy_command(workspace, args)
     if args.data_command == "promotions":
