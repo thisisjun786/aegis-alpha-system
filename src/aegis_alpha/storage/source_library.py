@@ -551,10 +551,34 @@ def list_sources(workspace: Workspace) -> list[dict[str, object]]:
     return sorted(result, key=lambda value: str(value["source_id"]))
 
 
+def source_entry(workspace: Workspace, source_id: str) -> dict[str, object] | None:
+    """The ``list_sources`` entry of one source, or None when that listing would omit it.
+
+    Reads only that source's commit rows and their operations, so resolving the pins of a
+    many-table promotion does not list every source once per pin.
+    """
+    if not schema.ensure(workspace) or source_id in retired_sources(workspace):
+        return None
+    for kind, conn in schema.connections(workspace).items():
+        for row in conn.execute(
+            "SELECT source_id,operation_id,request_hash,source_sha256 "
+            "FROM source_library_commits WHERE source_id=?",
+            [source_id],
+        ).fetchall():
+            operation = get_operation(workspace.state, row[1])
+            if (
+                operation
+                and operation["phase"] == "COMPLETED"
+                and operation["request_hash"] == row[2]
+            ):
+                return {"source_id": row[0], "store": kind, "sha256": row[3], "source_only": True}
+    return None
+
+
 def _visible(workspace: Workspace, source_id: str) -> dict[str, object]:
     if (record := retired_sources(workspace).get(source_id)) is not None:
         raise ValueError(_retired_message(source_id, record))
-    if source_id not in {row["source_id"] for row in list_sources(workspace)}:
+    if source_entry(workspace, source_id) is None:
         raise ValueError("unknown or incomplete source")
     marker = _marker(workspace, source_id)
     if marker is None:

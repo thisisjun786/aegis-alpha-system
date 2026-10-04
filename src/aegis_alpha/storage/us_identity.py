@@ -189,11 +189,11 @@ def read_rows(
     Arrow keeps a timestamp column's instant without a time zone database, so tables
     with ``TIMESTAMP WITH TIME ZONE`` columns read like any other.
     """
-    from aegis_alpha.storage.source_library import list_sources, list_tables  # noqa: PLC0415
+    from aegis_alpha.storage.source_library import list_tables, source_entry  # noqa: PLC0415
     from aegis_alpha.storage.source_library_schema import connections, quoted  # noqa: PLC0415
     from aegis_alpha.storage.source_reader import SourcePin, resolve_source  # noqa: PLC0415
 
-    source = next((row for row in list_sources(workspace) if row["source_id"] == source_id), None)
+    source = source_entry(workspace, source_id)
     if source is None:
         raise ValueError(f"unknown or incomplete source {source_id}")
     described = next(
@@ -235,14 +235,14 @@ def read_export_rows(workspace: Workspace, source_id: str) -> ExportRows:
     The table is verified against its marker like ``read_rows``; the grouping runs in
     DuckDB, so only one row per series reaches Python.
     """
-    from aegis_alpha.storage.source_library import list_sources, list_tables  # noqa: PLC0415
+    from aegis_alpha.storage.source_library import list_tables, source_entry  # noqa: PLC0415
     from aegis_alpha.storage.source_library_schema import connections, quoted  # noqa: PLC0415
     from aegis_alpha.storage.source_reader import SourcePin, resolve_source  # noqa: PLC0415
 
     if not source_id.startswith(EXPORT_PREFIX):
         raise ValueError(f"{EXPORT_MAPPER} reads {EXPORT_PREFIX}* sources, not {source_id}")
     linked = link_instant(workspace.state, source_id)
-    source = next((row for row in list_sources(workspace) if row["source_id"] == source_id), None)
+    source = source_entry(workspace, source_id)
     described = next(
         (row for row in list_tables(workspace, source_id) if row["name"] == EXPORT_TABLE), None
     )

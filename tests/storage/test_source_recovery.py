@@ -35,6 +35,8 @@ def test_target_commit_recovers_after_state_failure(
         with pytest.raises(RuntimeError, match="completion failure"):
             source_library.import_sqlite(workspace, path, "source", digest)
         assert source_library.list_sources(workspace) == []
+        # An incomplete commit is no entry either, without listing every source.
+        assert source_library.source_entry(workspace, "source") is None
     with pytest.raises(ValueError, match="recovered operations"):
         backup(home)
     monkeypatch.setattr(source_library, "complete_operation", complete)
@@ -43,6 +45,9 @@ def test_target_commit_recovers_after_state_failure(
         assert len(cast("list[str]", recovered["recovered"])) == 1
         result = source_library.import_sqlite(workspace, path, "source", digest)
         assert result["reused"] is True
+        assert [source_library.source_entry(workspace, "source")] == (
+            source_library.list_sources(workspace)
+        )
         assert source_library.read_table(workspace, "source", "source")["rows"] == [
             {"value": "preserved"}
         ]
