@@ -1922,9 +1922,11 @@ Norgate security master와 그보다 늦은 Norgate history 내보내기에서�
   행 수와 무관하다. 한 행도 들어가지 않으면 `ComputeResourceError`다. 정렬·spill·색인 유지는 같은
   할당에서 유도한 DuckDB 몫이 맡는다. 한도를 넘으면 트랜잭션 전체가 취소되고 `ComputeResourceError`가
   되며, 원래 DuckDB 오류는 그 cause로 남는다. 삽입은 들어갔는데 COMMIT이 색인 block을 할당하거나 pin하지
-  못하면 DuckDB는 OOM이 아니라 `TransactionException`(`could not allocate`·`failed to allocate`·
-  `failed to pin block`)으로 보고하므로 이것도 같은 오류다. 그 밖의 COMMIT 실패(제약 위반, 쓰기 충돌)는
-  용량 오류가 아니므로 원래 오류 그대로 나간다. COMMIT이 실패하면 DuckDB가 이미 트랜잭션을 끝내므로,
+  못하면 DuckDB는 OOM이 아니라 `TransactionException`으로 보고하고, 고정 접두어 `Failed to commit: `
+  바로 뒤의 원인이 `could not allocate`·`failed to allocate`·`failed to pin block`이면 이것도 같은
+  오류다. 그 밖의 COMMIT 실패(제약 위반, 쓰기 충돌)는 용량 오류가 아니므로 원래 오류 그대로 나간다.
+  제약 위반이 인용한 key에 같은 문구가 들어 있어도 마찬가지다. 연결이 이미 쥔 메모리보다 낮은 한도로
+  내리는 것을 DuckDB가 거절한 OOM도 이 경계 안에서 `ComputeResourceError`가 된다. COMMIT이 실패하면 DuckDB가 이미 트랜잭션을 끝내므로,
   뒤따르는 ROLLBACK의 "no transaction is active" 거절이 원래 오류를 덮지 않는다(`market.rollback`). 이
   경계(`market.budgeted`)는 `aas db migrate`의 market 단계와 `aas db compact`의 market 복사에도 쓰이며,
   둘 다 설치본 자체의 한도가 아니라 compute lease의 DuckDB 몫으로 낮춘 연결에서 실행한다.
@@ -2864,6 +2866,6 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-463 | core schema가 현재 버전이 아닌 설치본은 schema 확인이 `outdated`로 실패한다 | `tests/application/test_cutover.py::test_an_outdated_core_schema_fails_the_schema_check` | 구현 |
 | DV-464 | runbook 리허설은 설치본 밖 삭제·systemd·receipt를 실행하지 않고 그 모든 출력 경로를 리허설 정리가 지운다 | `tests/application/test_cutover.py::test_the_rehearsal_writes_only_paths_its_cleanup_removes` | 구현 |
 | DV-465 | 삽입 뒤 COMMIT에서 메모리가 고갈된 대량 게시도 marker와 행을 남기지 않고 `ComputeResourceError`가 된다 | `tests/storage/test_bulk_generation.py::test_commit_exhaustion_rolls_back_as_a_budget_error` | 구현 |
-| DV-466 | 용량과 무관한 COMMIT 실패는 `ComputeResourceError`로 바뀌지 않고, 뒤따르는 ROLLBACK이 그 오류를 덮지 않는다 | `tests/storage/test_bulk_generation.py::test_a_failed_commit_is_not_replaced_by_its_rollback` | 구현 |
+| DV-466 | 용량과 무관한 COMMIT 실패는 인용한 key가 용량 문구를 담아도 `ComputeResourceError`로 바뀌지 않고, 뒤따르는 ROLLBACK이 그 오류를 덮지 않는다 | `tests/storage/test_bulk_generation.py::test_a_failed_commit_is_not_replaced_by_its_rollback` | 구현 |
 | DV-467 | core migration의 market 단계는 compute lease의 DuckDB 몫에서 실행하고, 그 COMMIT의 고갈은 intent를 남긴 채 `ComputeResourceError`가 된다 | `tests/storage/test_migration.py::test_an_exhausted_market_step_is_a_budget_error_under_the_lease` | 구현 |
 | DV-468 | compact의 market 복사는 compute lease의 DuckDB 몫에서 실행하고, 고갈은 원본을 바꾸지 않은 채 `ComputeResourceError`가 된다 | `tests/storage/test_compaction.py::test_compaction_copies_under_the_lease_and_names_exhaustion` | 구현 |

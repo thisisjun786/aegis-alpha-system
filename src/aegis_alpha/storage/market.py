@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
@@ -56,7 +57,13 @@ _CLOSE_ONLY_NULLS = ("open", "high", "low", "volume")
 # COMMIT, which reports the same exhaustion as a TransactionException naming the
 # allocation or block pin that failed. Any other failed COMMIT (a constraint violation,
 # a write conflict) is not a capacity error and keeps its own type.
-_COMMIT_CAPACITY = ("allocate", "failed to pin block")
+# DuckDB reports a COMMIT that ran out of memory as this fixed prefix and the buffer
+# manager's own message. Only that leading cause counts: a constraint violation quotes
+# its key after the prefix, and the key may contain any of these phrases.
+_COMMIT_CAPACITY = re.compile(
+    r"TransactionContext Error: Failed to commit: "
+    r"(?:could not allocate|failed to allocate|failed to pin block) "
+)
 _NO_TRANSACTION = "no transaction is active"
 
 
@@ -763,7 +770,7 @@ def capacity_error(error: BaseException) -> bool:
 
     return isinstance(error, duckdb.OutOfMemoryException) or (
         isinstance(error, duckdb.TransactionException)
-        and any(phrase in str(error) for phrase in _COMMIT_CAPACITY)
+        and _COMMIT_CAPACITY.match(str(error)) is not None
     )
 
 
@@ -775,11 +782,12 @@ def budgeted(
 
     Without a budget the connection keeps its configured limits and only the error is
     reported. A ``ComputeResourceError`` keeps the DuckDB error as its cause; every other
-    error passes unchanged.
+    error passes unchanged. Lowering the limit is inside the boundary: DuckDB refuses a
+    limit below what the connection already holds with an ``OutOfMemoryException``.
     """
-    if budget is not None:
-        limit_duckdb(connection, budget)
     try:
+        if budget is not None:
+            limit_duckdb(connection, budget)
         yield
     except Exception as error:
         if capacity_error(error):

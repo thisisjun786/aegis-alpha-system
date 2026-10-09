@@ -13,6 +13,7 @@ import random
 import struct
 import tracemalloc
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
 from fractions import Fraction
@@ -785,6 +786,12 @@ def test_commit_capacity_messages_are_budget_errors(message: str) -> None:
             'violation: duplicate key "5"'
         ),
         duckdb.TransactionException("TransactionContext Error: Failed to commit"),
+        # The quoted key is the caller's text, never DuckDB's diagnosis of the COMMIT.
+        duckdb.TransactionException(
+            "TransactionContext Error: Failed to commit: PRIMARY KEY or UNIQUE constraint "
+            'violation: duplicate key "failed to pin block of size 256.0 KiB"'
+        ),
+        duckdb.TransactionException("Failed to commit: could not allocate block of size 1"),
         duckdb.IOException("IO Error: No space left on device"),
         ValueError("allocate"),
     ],
@@ -798,17 +805,38 @@ def test_other_failures_keep_their_own_error(error: Exception) -> None:
     connection.close()
 
 
-def test_a_failed_commit_is_not_replaced_by_its_rollback(tmp_path: Path) -> None:
+def test_lowering_below_held_memory_is_a_budget_error() -> None:
+    """DuckDB refuses a limit below what the connection holds; the boundary names that too."""
+    connection = duckdb.connect(config={"threads": 1, "temp_directory": ""})
+    connection.execute("CREATE TABLE held(k VARCHAR PRIMARY KEY)")
+    connection.execute("INSERT INTO held SELECT 'key-' || i FROM range(400000) r(i)")
+    small = ComputeBudget(Fraction(1), 16 * 1024 * 1024)
+    with (
+        pytest.raises(ComputeResourceError, match="within admitted memory") as caught,
+        market.budgeted(connection, small, "work"),
+    ):
+        pytest.fail("the boundary admitted work below the memory the connection holds")
+    assert isinstance(caught.value.__cause__, duckdb.OutOfMemoryException)
+    connection.close()
+
+
+@pytest.mark.parametrize(
+    "generation_id", ["g1", "failed to pin block", "could not allocate", "failed to allocate"]
+)
+def test_a_failed_commit_is_not_replaced_by_its_rollback(
+    tmp_path: Path, generation_id: str
+) -> None:
     """A real COMMIT refused for a non-capacity reason surfaces as itself, not as a budget error.
 
     A second connection commits the same marker first, so this one's COMMIT fails on the
     marker key after DuckDB has already ended its transaction. Its own ROLLBACK must
-    not replace that error with "no transaction is active".
+    not replace that error with "no transaction is active". The violation quotes the
+    generation ID, so an ID that reads like a capacity message must not make it one.
     """
     rows = _first(random.Random(41), "prices", 3)
     connection = _store(tmp_path / "market.duckdb")
     _stage(connection, "prices", rows)
-    request = _request("1", parent=None, domain="prices")
+    request = replace(_request("1", parent=None, domain="prices"), generation_id=generation_id)
     plan = plan_generation_bulk(connection, request, budget=BUDGET)
     rival = connection.cursor()
 
@@ -823,9 +851,10 @@ def test_a_failed_commit_is_not_replaced_by_its_rollback(tmp_path: Path) -> None
             list(marker.values()),
         )
 
-    with pytest.raises(duckdb.TransactionException, match="Failed to commit") as caught:
+    with pytest.raises(duckdb.TransactionException, match="constraint violation") as caught:
         publish_generation_bulk(connection, request, budget=BUDGET, companion=commit_rival)
     assert not isinstance(caught.value, ComputeResourceError)
+    assert f'"{generation_id}"' in str(caught.value)
     assert "no transaction is active" not in str(caught.value)
     # Only the rival's marker committed; none of this publication's rows did.
     assert connection.execute("SELECT count(*) FROM market_generations").fetchone() == (1,)
