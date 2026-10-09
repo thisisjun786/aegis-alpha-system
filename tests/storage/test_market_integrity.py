@@ -58,6 +58,7 @@ from aegis_alpha.storage.market_schema import (
     domain_ddl,
 )
 from aegis_alpha.storage.promotion import engine
+from aegis_alpha.storage.rowset import rowset_hash
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace, store_info
 from tests.storage.test_bulk_generation import _first, _request, _stage, inside_publication
@@ -874,6 +875,17 @@ def test_flag_batches_are_sized_from_the_widest_encoded_row(
     with pytest.raises(ComputeResourceError, match="one quality flag row"):
         bulk_generation.flags_digest(connection, relation, [], _tight(2 * row_bytes))
     assert batches == []
+    connection.close()
+
+
+def test_an_empty_flag_relation_needs_no_row_allowance(tmp_path: Path) -> None:
+    """No flag row is fetched, so even an allowance below one row digests the empty rowset."""
+    connection = _store(tmp_path / "market.duckdb", keys=False)
+    _wide_flags(connection)
+    relation = "SELECT * FROM staged_flags WHERE false"
+    expected = (rowset_hash(bulk_generation.FLAG_SCHEMA, []), 0)
+    assert bulk_generation.flags_digest(connection, relation, [], BUDGET) == expected
+    assert bulk_generation.flags_digest(connection, relation, [], _tight(1)) == expected
     connection.close()
 
 

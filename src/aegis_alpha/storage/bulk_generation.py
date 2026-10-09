@@ -294,7 +294,9 @@ def flags_digest(
 
     The widest row's encoding is measured in DuckDB before any fetch, and each batch is
     sized from it against the remaining allowance, so no fetched row exceeds what the
-    budget admits; when not even one row fits, it refuses before fetching any.
+    budget admits; when not even one row fits, it refuses before fetching any. An empty
+    relation fetches nothing, so it needs no row's allowance: its digest is the empty
+    rowset's.
     """
     cells = [encoded_cell_sql(name, kind) for name, kind in FLAG_SCHEMA]
     columns = ", ".join(_quote(name) for name, _ in FLAG_SCHEMA)
@@ -306,6 +308,8 @@ def flags_digest(
     if found is None:
         raise ValueError("integrity query returned no row")
     count, row_bytes = int(found[0]), int(found[1])
+    if count == 0:
+        return RowsetStream(FLAG_SCHEMA, 0).hexdigest(), 0
     batch = _hash_batch_rows(row_bytes, budget)
     if batch < 1:
         raise ComputeResourceError(
