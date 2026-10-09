@@ -37,6 +37,19 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   rechecks the names it is given and every other backup refuses every pending operation.
   The v1 DDL bytes are a recorded fact, so v1 is built from the v1 domains alone. A v1 store
   stays usable; writes that need a v2 table or a close-only price name the migration.
+  The current version is v3: v2 without the eleven domain tables' `PRIMARY KEY` and
+  `UNIQUE(record_id, revision_id)` and `quality_flags`' key, whose indexes DuckDB holds in
+  memory whole; every other column, NOT NULL, CHECK, default and `FOREIGN KEY(generation_id)`
+  stays. `market_schema.V3_DDL` is built separately from the fixed v3 domain list, so the v1
+  and v2 texts and checksums never move. Its step renames each of the twelve tables aside,
+  creates the v3 table, copies by explicit column list (never CREATE TABLE AS, which drops
+  constraints), compares every copied value by position and refuses the transaction on any
+  difference (and a connection without `preserve_insertion_order` before touching a table),
+  then drops the old table, all in one DuckDB transaction. A step completes only after the
+  landed catalog equals an empty store of its version and every committed generation
+  rehashes deep with the duplicate audit; until then it stays prepared. State v3 changes no
+  table. A v2 store stays usable, but its key indexes grow with every stored row, so large
+  publications belong on v3. No hash takes the DDL, an index or the core version.
   `prices.fields` defaults to `ohlcv`, an OHLCV row reads and hashes in its v1 shape,
   and a generation holding a `close` row hashes `fields` for every row.
 - `verify_workspace`, backup, restore and compact compare stored rows with their recorded
@@ -248,9 +261,12 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   no longer matches is `PlanChangedError`, and an existing marker is reused only for identical
   content. `verify_generation_bulk` checks every chain link from recorded hashes and rehashes
   the requested generation; `deep=True` rehashes every delta. Its Python batches fit the
-  allocation at any row count; DuckDB's share grows with the domain table's constraint
-  indexes and is refused as `ComputeResourceError` after a full rollback (see the bulk
-  publication section of `dev-notes/design/data-vertical.md`).
+  allocation at any row count. On v3 DuckDB's share follows the delta's sort and join
+  working set, which may spill, not the table's stored rows (on v2 the key indexes grow with
+  them); the domain-wide duplicate check scans the domain, so its time grows with it. A
+  publication that does not fit is refused as `ComputeResourceError` after a full rollback;
+  `memory_limit` bounds DuckDB's allocator, not the process RSS (see the bulk publication
+  section of `dev-notes/design/data-vertical.md`).
 - `market.budgeted(connection, budget, work)` is the DuckDB capacity boundary of bulk
   publication, the core migration's market step and compaction's market copy: it lowers the
   connection to the lease's share and reports an `OutOfMemoryException` (lowering the limit

@@ -372,8 +372,8 @@ compact(`aas db compact`)의 계약은 [데이터 수직 계약](design/data-ver
 `register-*` 경로가 맡는다.
 
 ```bash
-aas db migrate --to 2 --plan
-aas db migrate --to 2 --backup-output /path/to/other-device/new-backup
+aas db migrate --to 3 --plan
+aas db migrate --to 3 --backup-output /path/to/other-device/new-backup
 aas data promote --spec /path/to/promotion.json --sha256 SHA256 --plan
 aas data promote --spec /path/to/promotion.json --sha256 SHA256
 aas data promotions
@@ -399,7 +399,7 @@ catalog가 없고, 보존 증거가 intent의 것이며, 보존 명세를 다시
 것)만 PREPARED인 채로 단계를 지나고, 그 단계의 백업에 그대로 담긴다. `--plan`은 그런 승격마다 다시 계획해
 증명했다고 적는다. 그 재계획이 compute lease 안에서 돌 수 없으면 `ComputeResourceError`로 멈춘다. 그 백업은 migration의
 rollback snapshot이며 복구를 마친 백업으로 쓰지 않는다. migration 뒤 `aas db recover`가 그 승격을
-게시한다. 규칙은 [데이터 수직 계약의 스키마 v2](design/data-vertical.md#스키마-v2)가 소유한다.
+게시한다. 규칙은 [데이터 수직 계약의 core schema 버전](design/data-vertical.md#core-schema-버전)이 소유한다.
 
 실제 설치본에서 이 명령들을 실행하는 순서와 정확한 명령은 [운영 전환](#운영-전환)이 정한다.
 
@@ -550,8 +550,8 @@ SUPERSEDE한다.
 `--plan`은 설치본을 읽기 전용으로 열어 모든 단계를 현재 head의 자식으로 계획하고, 단계별 `promote
 --plan` 보고와 합계를 낸다. 실행은 단계마다 앞 단계가 남긴 head를 parent로 승격하고 첫 거부에서
 멈추며, 같은 명령을 다시 실행하면 이미 게시된 단계는 빈 delta라 아무것도 쓰지 않는다. 연도 단위 대량
-게시의 DuckDB 메모리는 [대량 게시](design/data-vertical.md#대량-게시와-reader)의 할당 결정(AAS-54)을
-따른다. 단계 순서와 규칙은 [데이터 수직 계약](design/data-vertical.md#kr-가격)이 소유한다.
+게시의 DuckDB 메모리는 [대량 게시](design/data-vertical.md#대량-게시와-reader)가 정한다. key 색인이 있는 v2
+이하 설치본에서는 그 몫이 테이블의 행 수만큼 커지므로 대량 승격은 core schema v3에서 한다. 단계 순서와 규칙은 [데이터 수직 계약](design/data-vertical.md#kr-가격)이 소유한다.
 
 ### SEC 회사 header 편입
 
@@ -1507,8 +1507,8 @@ TS=20261004T000000Z                   # 전환을 시작한 UTC 시각; 전환 �
 OLD_HOME=~/.aas                       # 지금의 설치본(runtime.json이 market·raw를 다른 장치에 둘 수 있음)
 BACKUPS=~/aas-backups                 # 새 설치본의 모든 경로와 다른 장치
 REHEARSAL=/path/to/store-device/rehearsal-$TS
-HOME_V2=/path/to/store-device/aas-v2  # 복원한 새 설치본
-HOME_V3=/path/to/store-device/aas-v3  # 은퇴 뒤 compact한 최종 설치본
+HOME_NEW=/path/to/store-device/aas-new  # 복원한 새 설치본(이름은 core schema 버전과 무관)
+HOME_FINAL=/path/to/store-device/aas-final # 은퇴 뒤 compact한 최종 설치본
 LEGACY=~/.local/share/aegis-alpha     # legacy 런타임 루트
 QVERIS=/path/to/store-device/qveris   # 유지보수의 Qveris raw root와 identity 문서
 SPECS=/path/to/private/specs          # 승격 명세, 은퇴 문서, legacy manifest(비공개, 읽기만 함)
@@ -1530,7 +1530,7 @@ mkdir -m 0700 "$REPORTS"
 `.git`도 그렇다) 먼저 전환이 쓰는 경로의 상위에 `.git`이 없는지 확인한다. 아무것도 출력되지 않아야 한다.
 
 ```bash
-for p in "$OLD_HOME" "$BACKUPS" "$REHEARSAL" "$HOME_V2" "$HOME_V3" "$QVERIS" "$SPECS"; do
+for p in "$OLD_HOME" "$BACKUPS" "$REHEARSAL" "$HOME_NEW" "$HOME_FINAL" "$QVERIS" "$SPECS"; do
   d=$(realpath -m "$p"); while [ "$d" != / ]; do [ -e "$d/.git" ] && echo "$d/.git"; d=$(dirname "$d"); done
 done
 for unit in $LEGACY_UNITS; do systemctl --user stop "$unit.timer" "$unit.service"; done
@@ -1550,43 +1550,78 @@ sha "$BACKUPS/$TS-v1/backup.json"
 **2. 리허설.** 같은 백업을 새 루트로 복원해 설치본 안에 쓰는 단계만 먼저 끝까지 실행한다. 3단계의
 migrate·연결, 4단계 전체, 6단계의 은퇴 백업·`source-retire`·`compact`이고, 단계마다 시간과 최대
 메모리(`/usr/bin/time -v`)와 `aas db verify` 결과를 기록한다. 리허설의 모든 출력은 리허설 이름을 단
-경로(`$REHEARSAL`, `$REHEARSAL-v3`, `$RB`)에 쓰므로 실제 3·6단계의 백업과 compact 대상과 겹치지 않는다. 복원한
+경로(`$REHEARSAL`, `$REHEARSAL-compact`, `$RB`)에 쓰므로 실제 3·6단계의 백업과 compact 대상과 겹치지 않는다. 복원한
 `runtime.json`은 공급자가 없고 `jobs.enabled`가 `false`라 리허설은 공급자를 부르지 않는다. 설치본 밖을 지우는
 6단계의 legacy 정리, systemd 편집과 timer, 설치 receipt는 리허설에서 실행하지 않는다. 리허설은 legacy 원본을
-읽기만 하므로 실제 4단계가 같은 원본을 다시 읽는다.
+읽기만 하므로 실제 4단계가 같은 원본을 다시 읽는다. 마지막 `rm -rf` 줄은 끝까지 마친 리허설을 버리는 정리
+예제다. 4단계 도중 멈춘 리허설을 설치본으로 쓸 때는 그 줄을 실행하지 않고 아래 [리허설 채택](#리허설-채택)으로 간다.
 
 ```bash
 RB="$BACKUPS/rehearsal-$TS"; mkdir -m 0700 "$RB" "$RB/reports"
 aas --home "$REHEARSAL" db restore --backup "$BACKUPS/$TS-v1"
 (
   export AAS_HOME="$REHEARSAL" REPORTS="$RB/reports"
-  aas db migrate --to 2 --backup-output "$RB/migrate"
+  aas db migrate --to 3 --backup-output "$RB/migrate"
   aas db source-link --apply
   # 여기서 4단계 1–7의 명령을 그대로 실행한다(설치본과 $REPORTS에만 쓴다)
   retire="$SPECS/retirement.json"
   aas db backup --output "$RB/retire" --deep > "$RB/retire.json"
   aas db source-retire --spec "$retire" --sha256 "$(sha "$retire")" --backup "$RB/retire" --plan > "$RB/retire.plan.json"
   aas db source-retire --spec "$retire" --sha256 "$(sha "$retire")" --backup "$RB/retire" --apply > "$RB/retire.apply.json"
-  aas db compact --to "$REHEARSAL-v3" > "$RB/compact.json"
-  AAS_HOME="$REHEARSAL-v3" aas db verify --deep > "$RB/verify.json"
+  aas db compact --to "$REHEARSAL-compact" > "$RB/compact.json"
+  AAS_HOME="$REHEARSAL-compact" aas db verify --deep > "$RB/verify.json"
 )
-rm -rf -- "$REHEARSAL" "$REHEARSAL-v3" "$RB"
+rm -rf -- "$REHEARSAL" "$REHEARSAL-compact" "$RB"
 ```
 
-**3. 설치본 이동, 마이그레이션, 연결.** 1단계 백업을 새 설치본으로 복원하고 그 설치본에서 core schema를 v2로
-올린 뒤 원천 자료실 commit을 모두 `sl:` 연결한다. 이후 모든 명령은 `AAS_HOME="$HOME_V2"`로 실행한다.
+**3. 설치본 이동, 마이그레이션, 연결.** 1단계 백업을 새 설치본으로 복원하고 그 설치본에서 core schema를 현재
+버전 v3로 올린 뒤 원천 자료실 commit을 모두 `sl:` 연결한다. 이후 모든 명령은 `AAS_HOME="$HOME_NEW"`로 실행한다.
 
 ```bash
-aas --home "$HOME_V2" db restore --backup "$BACKUPS/$TS-v1"
-export AAS_HOME="$HOME_V2"
-aas db migrate --to 2 --plan
-aas db migrate --to 2 --backup-output "$BACKUPS/$TS-migrate"
+aas --home "$HOME_NEW" db restore --backup "$BACKUPS/$TS-v1"
+export AAS_HOME="$HOME_NEW"
+aas db migrate --to 3 --plan
+aas db migrate --to 3 --backup-output "$BACKUPS/$TS-migrate"
 aas db source-link --plan
 aas db source-link --apply
 ```
 
-`migrate`는 백업을 만든 뒤에만 intent를 기록하고, 멈추면 같은 명령이 백업 없이 남은 단계를 끝낸다.
-`source-link --plan`의 `unbacked`·`corrupt`·`incomplete`·`invalid`가 비어 있어야 다음 단계로 간다.
+`migrate --to 3`은 v1 설치본을 v2와 v3 두 단계로 올리고, 단계마다 `$BACKUPS/$TS-migrate/core-schema-migrate-v2`와
+`.../core-schema-migrate-v3`에 검증된 백업을 만든 뒤에만 그 단계의 intent를 기록한다. 단계의 intent 뒤에 멈추면 같은
+명령이 그 단계를 백업 없이 끝내고, 한 단계를 끝내고 다음 단계의 intent 전에 멈추면 새 `--backup-output`으로
+다시 실행한다. v3 단계는 market의 도메인 테이블과 `quality_flags`를 한 트랜잭션에서 다시 쓰므로 market 장치에
+그 테이블을 한 벌 더 담을 여유와 DuckDB 임시 디렉터리의 spill 여유가 필요하고, 단계를 끝내기 전 모든 generation을
+다시 해시한다. `--plan`의 `blocking_operations`가 비어 있어야 실행한다. `source-link --plan`의 `unbacked`·`corrupt`·`incomplete`·`invalid`가 비어 있어야 다음 단계로 간다.
+
+### 리허설 채택
+
+4단계 도중 멈춘 리허설은 1단계 백업에서 복원해 같은 명령을 실행한 설치본이므로 3단계와 앞선 4단계를 다시 하지
+않고 그 루트를 새 설치본으로 채택할 수 있다. 예를 들어 v3 이전 코드로 v2까지 올린 리허설에서 대량 승격의
+COMMIT이 DuckDB 할당을 넘어 그 승격 intent만 PREPARED로 남은 경우다. 채택하면 `$REHEARSAL`이 `$HOME_NEW`의
+자리를 맡고 리허설의 보고(`$RB/reports`)가 `$REPORTS`다. v3를 담은 검증된 태그를 설치하고 그 리허설을 쓰는
+프로세스가 없을 때 실행한다. 리허설의 기존 출력과 멈춘 intent는 지우거나 `quarantine`하지 않는다.
+
+```bash
+HOME_NEW="$REHEARSAL"; RB="$BACKUPS/rehearsal-$TS"; REPORTS="$RB/reports"
+export AAS_HOME="$HOME_NEW"
+aas db status
+aas db migrate --to 3 --plan > "$RB/migrate-v3.plan.json"
+aas db migrate --to 3 --backup-output "$RB/migrate-v3" > "$RB/migrate-v3.json"
+aas db verify --deep > "$RB/migrate-v3.verify.json"
+aas db recover
+aas db verify
+```
+
+`--plan`은 남은 단계가 v3 하나이고(`migrations`), `blocking_operations`가 비어 있으며, `carried_operations`가 멈춘
+승격 intent 하나를 `proof`와 함께 적어야 한다. 아니면 실행하지 않는다. `$RB/migrate-v3`는 그 intent를 PREPARED로
+담은 migration의 rollback snapshot이며 복구를 마친 백업으로 쓰지 않는다. migration 뒤 `verify --deep`은 모든
+generation의 hash와 v3 감사를 통과하고 `pending_operations`가 1이다. `recover`는 보존 명세를 다시 계획해 intent의
+manifest가 그대로 나올 때만 게시하므로 게시한 generation의 hash는 멈추기 전 계획과 같다. `recover`가 그 intent를
+`pending`으로 남기면 멈추고 보존 증거를 그대로 둔다. 게시가 끝나면 멈춘 명세부터 4단계 6을 이어 간다. 멈춘
+명세의 `--plan`과 실행은 게시된 generation을 검증해 `reused`로 돌려주고 새 generation을 만들지 않으며, 그
+다음 명세부터 새 generation이 생긴다. 앞선 명세와 앞선 dataset은 다시 승격하지 않는다. 이어서 4단계 7과
+5–7단계를 `AAS_HOME="$HOME_NEW"`로 실행한다. `$RB`의 migration 백업(`$RB/migrate`, `$RB/migrate-v3`)은 7단계의
+`$TS-migrate`에 해당하고, `$RB/reports`는 7단계가 읽으므로 그때까지 둔다.
 
 **4. 승격.** 아래 순서로 dataset의 첫 generation을 만든다. 명세와 문서는 모두 `$SPECS`의 비공개 파일이고,
 `[owner]`는 각 `--plan` 보고(원천·매핑 행 수, `blocking`, `refusals`, 미해결 표본)를 보고 실행한다. 실행은
@@ -1700,9 +1735,9 @@ aas db backup --output "$BACKUPS/$TS-retire" --deep > "$BACKUPS/$TS-retire.json"
 retire="$SPECS/retirement.json"
 aas db source-retire --spec "$retire" --sha256 "$(sha "$retire")" --backup "$BACKUPS/$TS-retire" --plan > "$REPORTS/retire.plan.json"
 aas db source-retire --spec "$retire" --sha256 "$(sha "$retire")" --backup "$BACKUPS/$TS-retire" --apply > "$REPORTS/retire.apply.json"
-aas db compact --to "$HOME_V3" > "$BACKUPS/$TS-compact.json"
-sed -i "s|^Environment=AAS_HOME=.*|Environment=AAS_HOME=$HOME_V3|" ~/.config/systemd/user/aas-maintain.service.d/home.conf
-export AAS_HOME="$HOME_V3"
+aas db compact --to "$HOME_FINAL" > "$BACKUPS/$TS-compact.json"
+sed -i "s|^Environment=AAS_HOME=.*|Environment=AAS_HOME=$HOME_FINAL|" ~/.config/systemd/user/aas-maintain.service.d/home.conf
+export AAS_HOME="$HOME_FINAL"
 aas maintain receipt --lock /path/to/<tag>/uv.lock
 systemctl --user daemon-reload && systemctl --user start aas-maintain.timer
 ```
@@ -1715,13 +1750,13 @@ systemctl --user daemon-reload && systemctl --user start aas-maintain.timer
 설치 receipt를 다시 남긴다. 은퇴 백업(`$TS-retire`)은 `source_retirements`의 `backup_id`가 가리키므로 지우지
 않는다.
 
-설치본 밖 legacy 원본은 증명된 것만 지우고, 최종 설치본(`AAS_HOME`이 `$HOME_V3`)에서만 지운다. manifest의
+설치본 밖 legacy 원본은 증명된 것만 지우고, 최종 설치본(`AAS_HOME`이 `$HOME_FINAL`)에서만 지운다. manifest의
 `--verify`가 `complete`이고 종료 코드가 0이면 그 항목 경로만 지운다. 그 보고는 7단계가 다시 읽는다. manifest 항목이 아닌 legacy 경로(코드 snapshot, 릴리스, DB dump, 준비 snapshot)는 `$BACKUPS`에
 tar로 보관해 원본과 대조한 뒤 지운다. legacy worktree는 커밋되지 않은 변경과 push되지 않은 커밋이 없을 때만
 지운다.
 
 ```bash
-if [ "$AAS_HOME" = "$HOME_V3" ]; then
+if [ "$AAS_HOME" = "$HOME_FINAL" ]; then
   for manifest in "$SPECS"/legacy-*.json; do
     name=$(basename "$manifest" .json)
     aas import legacy --manifest "$manifest" --sha256 "$(sha "$manifest")" --verify > "$REPORTS/$name.final-verify.json" &&
@@ -1743,9 +1778,9 @@ if [ "$AAS_HOME" = "$HOME_V3" ]; then
 fi
 ```
 
-원래 설치본(`$OLD_HOME`과 그 `runtime.json`이 가리키는 market·`raw/`)과 `$HOME_V2`는 7일 동안 두고, 그동안
+원래 설치본(`$OLD_HOME`과 그 `runtime.json`이 가리키는 market·`raw/`)과 `$HOME_NEW`는 7일 동안 두고, 그동안
 유지보수 실행이 성공하고 7단계가 통과하면 지운다. 기본 설치 위치를 쓰지 않으므로 대화형 셸도
-`AAS_HOME="$HOME_V3"`를 설정한다.
+`AAS_HOME="$HOME_FINAL"`를 설정한다.
 
 **7. 사후 확인과 은퇴 기록.** 새 설치본에서 유지보수를 한 번 실행하고, deep 백업을 다른 장치에 만든 뒤
 전환 확인을 기록한다. 백업과 확인 사이에 예약 실행이 시작되지 않도록 `list-timers`의 다음 실행 시각이 확인을

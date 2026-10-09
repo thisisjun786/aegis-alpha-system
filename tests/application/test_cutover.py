@@ -548,8 +548,8 @@ def test_the_rehearsal_writes_only_paths_its_cleanup_removes() -> None:
     step = text[text.index("**2. 리허설.**") : text.index("**3. ")]
     (block,) = re.findall(r"```bash\n(.*?)```", step, re.DOTALL)
     # Nothing outside the rehearsal's own installation and outputs is touched.
-    for forbidden in ("systemctl", "sed -i", "receipt", "import legacy", "$LEGACY", "$HOME_V2",
-                      "$HOME_V3", "$OLD_HOME", "jq ", "tar "):  # fmt: skip
+    for forbidden in ("systemctl", "sed -i", "receipt", "import legacy", "$LEGACY", "$HOME_NEW",
+                      "$HOME_FINAL", "$OLD_HOME", "jq ", "tar "):  # fmt: skip
         assert forbidden not in block, forbidden
     *body, cleanup = block.strip().splitlines()
     assert cleanup.startswith("rm -rf -- ")
