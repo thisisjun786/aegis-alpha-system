@@ -388,13 +388,14 @@ aas db compact --to /path/to/new-root
 보고하고 아무것도 쓰지 않는다. 실행은 한 버전씩 올리며, 단계마다 실행 중인 run이나 PREPARED 작업이
 없을 때만 시작해 검증된 백업을 만든 뒤 그 단계의 intent를 기록하고 market과 state를 각각 한
 트랜잭션으로 올린 다음 설치 영수증을 바꾸고 intent를 완료한다. 백업이 필요한 단계가 여럿이면
-`--backup-output`은 새 디렉터리여야 하고 그 아래 단계의 operation ID마다 백업이 생긴다. 응답은 두
+`--backup-output`은 새 디렉터리여야 하고 그 아래 단계의 operation ID마다 백업이 생긴다. 목적지는 어느
+단계도 쓰기 전에 확인한다. 응답은 두
 저장소의 버전과 영수증 행, 이번에 끝낸 단계마다 백업 경로와 manifest SHA-256, 남은 PREPARED 작업을
 담는다. 목표 이상인 설치본에는 아무것도 하지 않는다. 중간에 멈춘 설치본은 다른 명령으로 열리지 않으며,
 같은 명령을 다시 실행하면 그 단계의 백업 없이 남은 부분부터 끝낸다. 한 단계를 끝내고 다음 단계의 백업
 도중 멈췄으면 다음 단계는 새 `--backup-output`을 요구한다. `aas db recover`와 `aas db quarantine`은 이
-작업을 다루지 않는다. COMMIT 전에 멈춘 승격 intent(marker·행·flag·catalog가 없고 보존 증거가 intent와
-맞는 것)만 PREPARED인 채로 단계를 지나고, 그 단계의 백업에 그대로 담긴다. 그 백업은 migration의
+작업을 다루지 않는다. COMMIT 전에 멈춘 승격 intent(marker·행·flag·catalog가 없고 보존 요청·명세와
+빠짐없는 manifest가 intent·parent와 맞는 것)만 PREPARED인 채로 단계를 지나고, 그 단계의 백업에 그대로 담긴다. 그 백업은 migration의
 rollback snapshot이며 복구를 마친 백업으로 쓰지 않는다. migration 뒤 `aas db recover`가 그 승격을
 게시한다. 규칙은 [데이터 수직 계약의 스키마 v2](design/data-vertical.md#스키마-v2)가 소유한다.
 

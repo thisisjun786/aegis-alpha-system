@@ -20,6 +20,7 @@ from __future__ import annotations
 # ruff: noqa: S608 -- every dynamic identifier is engine-owned and quoted; values are bound.
 import hashlib
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -40,6 +41,7 @@ from aegis_alpha.storage.bulk_generation import (
 )
 from aegis_alpha.storage.market import (
     RECORD_SCHEMA,
+    chain_digest,
     generation_chain,
     limit_duckdb,
     marker_for,
@@ -1978,6 +1980,156 @@ def recover_promotion(
     return True
 
 
+_MANIFEST_KEYS: Final = frozenset(
+    {
+        "schema",
+        "request_hash",
+        "spec_sha256",
+        "dataset_id",
+        "domain",
+        "version",
+        "generation_id",
+        "operation_id",
+        "parent",
+        "sequence",
+        "delta_hash",
+        "chain_hash",
+        "row_count",
+        "operations",
+        "flags",
+        "rows",
+        "unchanged",
+        "stale",
+        "ingested_through_us",
+        "sources",
+        "identity_snapshot",
+    }
+)
+_PARTITION_RESULTS: Final = frozenset({"no_reference", "below_reference", "at_least_reference"})
+_SHA256: Final = re.compile(r"[0-9a-f]{64}")
+
+
+def _count_value(value: object, *, low: int = 0) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= low
+
+
+def _counts(value: object) -> bool:
+    return isinstance(value, dict) and all(
+        isinstance(key, str) and _count_value(count) for key, count in value.items()
+    )
+
+
+def _digest_value(value: object) -> bool:
+    return isinstance(value, str) and _SHA256.fullmatch(value) is not None
+
+
+def _manifest_refusal(  # noqa: C901, PLR0911 -- one reason per manifest field group
+    workspace: Workspace,
+    operation: Mapping[str, object],
+    spec: PromotionSpec,
+    manifest: Mapping[str, object],
+) -> str | None:
+    """Why a retained manifest is not one this intent's spec could have planned, or None.
+
+    Only what holds without planning again is checked: the manifest has exactly the
+    ``aas-promotion-manifest-v1`` fields with their types, names this intent and its
+    spec, follows the spec's parent (still the dataset's head) in sequence and chain
+    hash, and counts as many delta rows as its operations. Recovery still publishes only
+    a plan that recomputes the manifest exactly; this keeps an incomplete or contradictory
+    one from being carried as if it would.
+    """
+    # Only a mapper of response rows records coverage; a partition check is optional.
+    required = set(_MANIFEST_KEYS)
+    if spec.mapper.outcome(spec.mapper_args) is not None:
+        required.add("source_outcomes")
+    keys = set(manifest)
+    if not required <= keys or keys - required - {"partition_row_count"}:
+        return "retained promotion manifest lacks or adds fields"
+    expected = {
+        "spec_sha256": spec.sha256,
+        "dataset_id": spec.dataset_id,
+        "domain": spec.domain,
+        "operation_id": operation["operation_id"],
+        "parent": spec.parent,
+        "sources": [
+            {"source_id": pin.source_id, "table": pin.table, "digest": pin.table_digest}
+            for pin in spec.sources
+        ],
+        "identity_snapshot": None
+        if spec.identity_snapshot is None
+        else {
+            "snapshot_id": spec.identity_snapshot.snapshot_id,
+            "content_hash": spec.identity_snapshot.content_hash,
+        },
+    }
+    if any(manifest[key] != value for key, value in expected.items()):
+        return "retained promotion manifest does not match its spec"
+    if operation["expected_parent"] != spec.parent:
+        return "retained promotion manifest does not match its intent"
+    flags = manifest["flags"]
+    operations = manifest["operations"]
+    if (
+        not _digest_value(manifest["delta_hash"])
+        or not _digest_value(manifest["chain_hash"])
+        or not _count_value(manifest["row_count"], low=1)
+        or not _counts(operations)
+        or sum(cast("dict[str, int]", operations).values()) != manifest["row_count"]
+        or not isinstance(flags, dict)
+        or flags.keys() != {"rowset", "rows"}
+        or not _digest_value(flags["rowset"])
+        or not _count_value(flags["rows"])
+        or not _counts(manifest["rows"])
+        or not _count_value(manifest["unchanged"])
+        or not _count_value(manifest["stale"])
+        or not (
+            manifest["ingested_through_us"] is None or _count_value(manifest["ingested_through_us"])
+        )
+        or ("source_outcomes" in manifest and not _counts(manifest["source_outcomes"]))
+    ):
+        return "retained promotion manifest has malformed counts or hashes"
+    check = manifest.get("partition_row_count")
+    if "partition_row_count" in manifest and (
+        not isinstance(check, dict)
+        or check.keys() != {"rule", "result", "dates"}
+        or check["rule"] != "@".join(PARTITION_CHECK)
+        or check["result"] not in _PARTITION_RESULTS
+        or not isinstance(check["dates"], list)
+        or not check["dates"]
+    ):
+        return "retained promotion manifest has a malformed partition check"
+    try:
+        head = dataset_head(workspace, spec.dataset_id)
+        parent = None if spec.parent is None else marker_for(workspace.market, spec.parent)
+    except ValueError as error:
+        return str(error)
+    if head != spec.parent:
+        # Recovery would find the parent moved and leave the intent pending.
+        return "its spec parent is no longer the dataset head"
+    sequence = 1 if parent is None else cast("int", parent["sequence"]) + 1
+    if parent is not None and (parent["dataset_id"], parent["domain"]) != (
+        spec.dataset_id,
+        spec.domain,
+    ):
+        return "its parent generation belongs to another dataset"
+    if (manifest["sequence"], manifest["version"]) != (sequence, str(sequence)):
+        return "retained promotion manifest does not follow its parent"
+    link = chain_digest(
+        parent_chain_hash=None if parent is None else parent["chain_hash"],
+        dataset_id=spec.dataset_id,
+        version=manifest["version"],
+        generation_id=operation["target_id"],
+        domain=spec.domain,
+        delta_hash=str(manifest["delta_hash"]),
+        parent_id=spec.parent,
+        operation_id=operation["operation_id"],
+        request_hash=operation["request_hash"],
+        row_count=manifest["row_count"],
+    )
+    if link != manifest["chain_hash"]:
+        return "retained promotion manifest chain hash does not follow its parent"
+    return None
+
+
 def untouched_promotion_refusal(  # noqa: PLR0911 -- one reason per piece of evidence
     workspace: Workspace, operation: Mapping[str, object]
 ) -> str | None:
@@ -2019,16 +2171,10 @@ def untouched_promotion_refusal(  # noqa: PLR0911 -- one reason per piece of evi
         return "its generation is cataloged"
     try:
         spec, manifest = _evidence(workspace, operation)
-    except (KeyError, TypeError, ValueError) as error:
+        return _manifest_refusal(workspace, operation, spec, manifest)
+    except (KeyError, TypeError, ValueError, OSError, RecursionError) as error:
         # Unreadable evidence is a refusal to carry, never a reason to drop the check.
         return str(error) or type(error).__name__
-    if (
-        manifest.get("operation_id") != operation_id
-        or manifest.get("parent") != spec.parent
-        or operation["expected_parent"] != spec.parent
-    ):
-        return "retained promotion manifest does not match its intent"
-    return None
 
 
 def verify_promotion(

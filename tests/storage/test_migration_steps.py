@@ -34,9 +34,10 @@ from aegis_alpha.storage.migration import (
     plan_core_migration,
     step_operation,
 )
-from aegis_alpha.storage.promotion import engine
+from aegis_alpha.storage.promotion import engine, formats
 from aegis_alpha.storage.promotion.engine import promote
 from aegis_alpha.storage.publication import recover_operations
+from aegis_alpha.storage.raw import put_raw
 from aegis_alpha.storage.state import get_operation, prepare_operation
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace
@@ -145,12 +146,15 @@ def snapshot_operation(root: Path, operation_id: str) -> dict[str, object]:
         connection.close()
 
 
-def pending_promotion(root: Path, *, crash: str = "commit") -> tuple[Path, dict[str, object]]:
+def pending_promotion(
+    root: Path, *, crash: str = "commit", parented: bool = False
+) -> tuple[Path, dict[str, object]]:
     """A v2 installation whose one promotion stopped where the rehearsal's did.
 
     ``commit`` fails the promotion's COMMIT with the rehearsal's pin-block error, so the
     intent and its retained evidence stay with no marker, rows or flags. ``catalog``
     stops after the market commit instead, leaving a committed generation uncataloged.
+    ``parented`` first publishes a generation the failed one names as its parent.
     Returns the home and the plan computed before the failure.
     """
     home = root / "home"
@@ -178,7 +182,15 @@ def pending_promotion(root: Path, *, crash: str = "commit") -> tuple[Path, dict[
         pin = add_source(
             admitted, [bar("AAA.KO", _DAY, 100.0, retrieved=at("2025-01-10T00:00:00"))], tag="a"
         )
-        document = spec([pin], register_symbols(admitted, pin["source_id"]))
+        identity = register_symbols(admitted, pin["source_id"])
+        parent = None
+        if parented:
+            first = promote(admitted, *spec([pin], identity), apply=True)
+            parent = str(first["generation_id"])
+            pin = add_source(
+                admitted, [bar("AAA.KO", _DAY, 101.0, retrieved=at("2025-01-11T00:00:00"))], tag="b"
+            )
+        document = spec([pin], identity, parent=parent)
         planned = promote(admitted, *document, apply=False)
         with pytest.MonkeyPatch.context() as patch:
             if crash == "commit":
@@ -332,6 +344,34 @@ def test_a_kill_between_steps_needs_the_next_steps_own_backup(
     assert recorded_hashes(home) == V1_MARKERS
 
 
+@pytest.mark.parametrize("step", ["_upgrade_state", "_write_receipt", "complete_operation"])
+def test_a_step_whose_market_landed_resumes_into_the_next_step(
+    tmp_path: Path, synthetic: int, step: str
+) -> None:
+    home = v1_installation(tmp_path)
+    # The v2 step died after its market COMMIT, before the receipt named v2.
+    assert kill_at(home, step, tmp_path / "v2", synthetic) == _KILLED
+    plan = plan_core_migration(home, to_version=synthetic)
+    assert (plan["state"], plan["market_version"]) == ("incomplete", synthetic - 1)
+    assert set(intents(home)) == {MIGRATION_OPERATION}
+    taken = tmp_path / "taken"
+    taken.mkdir()
+    # The v3 step's destination is checked before the v2 step is finished.
+    with pytest.raises(ValueError, match="new directory"):
+        migrate_core_schema(home, to_version=synthetic, backup_output=taken)
+    assert intents(home)[MIGRATION_OPERATION]["phase"] == "PREPARED"
+    report = migrate_core_schema(home, to_version=synthetic, backup_output=tmp_path / "v3")
+    assert (report["state"], report["market_version"], report["state_version"]) == ("current", 3, 3)
+    assert [
+        (entry["operation_id"], entry["resumed"])
+        for entry in cast("list[dict[str, object]]", report["migrations"])
+    ] == [(step_operation(2), True), (step_operation(3), False)]
+    # The v3 step's backup is of the finished v2 installation.
+    stores = json.loads((tmp_path / "v3" / "installation.json").read_text())
+    assert stores["stores"]["market"]["schema_version"] == synthetic - 1
+    assert recorded_hashes(home) == V1_MARKERS
+
+
 def test_an_unknown_step_intent_is_refused(tmp_path: Path) -> None:
     home = tmp_path / "home"
     initialize(home)
@@ -349,10 +389,11 @@ def test_an_unknown_step_intent_is_refused(tmp_path: Path) -> None:
         plan_core_migration(home, to_version=2)
 
 
+@pytest.mark.parametrize("parented", [False, True])
 def test_an_untouched_promotion_is_carried_through_a_step_and_then_recovered(
-    tmp_path: Path, synthetic: int
+    tmp_path: Path, synthetic: int, *, parented: bool
 ) -> None:
-    home, planned = pending_promotion(tmp_path)
+    home, planned = pending_promotion(tmp_path, parented=parented)
     operation_id, generation_id = str(planned["operation_id"]), str(planned["generation_id"])
     with open_workspace(home) as admitted:
         intent = get_operation(admitted.state, operation_id)
@@ -447,12 +488,74 @@ def intents_any(home: Path, operation_id: str) -> dict[str, object]:
         return cast("dict[str, object]", get_operation(admitted.state, operation_id))
 
 
+def _manifest_rewritten(
+    change: Callable[[dict[str, object]], dict[str, object]],
+) -> Callable[[Path, str], None]:
+    """Retain a changed manifest and point a fresh intent of the same request at it.
+
+    The manifest is content-addressed and the intent names it, so only evidence that
+    is itself contradictory or incomplete is left for the carry check to refuse.
+    """
+
+    def alter(home: Path, operation_id: str) -> None:
+        with open_workspace(home, writable=True) as admitted:
+            intent = cast("dict[str, object]", get_operation(admitted.state, operation_id))
+            body = json.loads(engine._read_raw(admitted, str(intent["payload_hash"])))  # noqa: SLF001
+            _, digest, _ = put_raw(admitted.paths.raw, formats.canonical(change(body)))
+            admitted.state.execute(
+                "DELETE FROM storage_operations WHERE operation_id=?", (operation_id,)
+            )
+            admitted.state.commit()
+            prepare_operation(
+                admitted.state,
+                operation_id=operation_id,
+                kind=str(intent["kind"]),
+                request_hash=str(intent["request_hash"]),
+                target_id=str(intent["target_id"]),
+                expected_parent=cast("str | None", intent["expected_parent"]),
+                payload_hash=digest,
+            )
+
+    return alter
+
+
+def _identity_only(body: dict[str, object]) -> dict[str, object]:
+    kept = ("schema", "request_hash", "spec_sha256", "generation_id", "operation_id", "parent")
+    return {key: body[key] for key in kept}
+
+
+def _other_dataset(body: dict[str, object]) -> dict[str, object]:
+    return body | {"domain": "filings", "dataset_id": "wrong.dataset"}
+
+
+def _uncounted(body: dict[str, object]) -> dict[str, object]:
+    return body | {"row_count": cast("int", body["row_count"]) + 1}
+
+
+def _unlinked(body: dict[str, object]) -> dict[str, object]:
+    return body | {"chain_hash": "0" * 64}
+
+
+def _out_of_sequence(body: dict[str, object]) -> dict[str, object]:
+    return body | {"sequence": 2, "version": "2"}
+
+
+def _unflagged(body: dict[str, object]) -> dict[str, object]:
+    return body | {"flags": {"rows": 0}}
+
+
 @pytest.mark.parametrize(
     ("crash", "alter", "reason"),
     [
         ("catalog", _committed, "committed"),
         ("commit", _manifest_gone, "absent from raw"),
         ("commit", _request_altered, "does not match its address"),
+        ("commit", _manifest_rewritten(_identity_only), "lacks or adds fields"),
+        ("commit", _manifest_rewritten(_other_dataset), "does not match its spec"),
+        ("commit", _manifest_rewritten(_uncounted), "malformed counts"),
+        ("commit", _manifest_rewritten(_unflagged), "malformed counts"),
+        ("commit", _manifest_rewritten(_unlinked), "chain hash"),
+        ("commit", _manifest_rewritten(_out_of_sequence), "does not follow its parent"),
     ],
 )
 def test_only_an_untouched_promotion_is_carried(
@@ -498,3 +601,20 @@ def test_a_promotion_intent_of_another_request_blocks(tmp_path: Path, synthetic:
     with pytest.raises(CoreSchemaError, match="promotion:d"):
         migrate_core_schema(home, to_version=synthetic, backup_output=tmp_path / "snapshot")
     assert not (tmp_path / "snapshot").exists()
+
+
+def test_an_evidence_read_error_refuses_the_carry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, planned = pending_promotion(tmp_path)
+
+    def failing(*_: object) -> bytes:
+        raise OSError("synthetic read error")
+
+    with open_workspace(home) as admitted:
+        intent = cast(
+            "dict[str, object]", get_operation(admitted.state, str(planned["operation_id"]))
+        )
+        assert engine.untouched_promotion_refusal(admitted, intent) is None
+        monkeypatch.setattr(engine, "_read_raw", failing)
+        assert engine.untouched_promotion_refusal(admitted, intent) == "synthetic read error"

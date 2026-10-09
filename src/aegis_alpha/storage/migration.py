@@ -402,14 +402,31 @@ def _quiet(workspace: Workspace, *, excluding: str | None) -> list[str]:
 
 
 def _upgrade_market(workspace: Workspace, budget: ComputeBudget | None, step: int) -> None:
-    from aegis_alpha.storage.workspace import store_info  # noqa: PLC0415
-
     # Admission, and the backup's reopen after its checkpoint, use the installation's
     # own limits; the lease's lower share is applied here, right before the transaction.
     with budgeted(workspace.market, budget, "the core schema migration"):
         upgrade_market(workspace.market, workspace.installation_id, step)
-    # The admitted identity is unchanged; only the version it records moved on.
-    workspace._market_info = store_info(workspace.market)  # noqa: SLF001 -- same admission
+
+
+def _readmit_market(workspace: Workspace, step: int) -> None:
+    """Let the admission name the market's version once its step has landed.
+
+    Admission recorded the receipt's market, which lags the store when a run died after
+    the market's COMMIT. Only the version may move, and only to this step's: the store
+    and installation identity stay the admitted ones, so a later step's backup still
+    refuses any other market.
+    """
+    from aegis_alpha.storage.workspace import store_info  # noqa: PLC0415
+
+    observed = store_info(workspace.market)
+    admitted = workspace._market_info  # noqa: SLF001 -- same admission
+    if observed.keys() != admitted.keys() or any(
+        observed[key] != admitted[key] for key in observed if key != "schema_version"
+    ):
+        raise ValueError("market identity changed during admitted maintenance")
+    if observed["schema_version"] != step:
+        raise CoreSchemaError("core_schema_migration_incomplete", "a step did not land")
+    workspace._market_info = observed  # noqa: SLF001 -- same admission
 
 
 def _upgrade_state(workspace: Workspace, step: int) -> None:
@@ -434,6 +451,9 @@ def _finish(workspace: Workspace, step: int, budget: ComputeBudget | None) -> No
         raise CoreSchemaError("core_schema_migration_incomplete", "the step has no prepared intent")
     if status.market_version < step:
         _upgrade_market(workspace, budget, step)
+    # Also when an earlier run's COMMIT already moved the market: the next step's backup
+    # compares the market with what admission recorded.
+    _readmit_market(workspace, step)
     if status.state_version < step:
         _upgrade_state(workspace, step)
     if (status.receipt_state_version, status.receipt_market_version) != (step, step):
@@ -448,7 +468,8 @@ def _backup_targets(output: Path | None, steps: list[int]) -> dict[int, Path]:
     """Where each step that needs one writes its backup.
 
     One backup goes to ``output`` itself. Several go to ``output/<operation ID>``, so
-    each step keeps its own verified rollback snapshot; ``output`` must then be new.
+    each step keeps its own verified rollback snapshot. Either way ``output`` must be
+    new, checked here so a resumed step is not finished before a later one refuses it.
     """
     if not steps:
         return {}
@@ -456,11 +477,11 @@ def _backup_targets(output: Path | None, steps: list[int]) -> dict[int, Path]:
         raise CoreSchemaError(
             "core_schema_backup_required", "pass --backup-output with a new directory"
         )
-    if len(steps) == 1:
-        return {steps[0]: output}
     root = resolve_home(output)
     if root.exists() or root.is_symlink():
         raise ValueError("backup destination must be a new directory")
+    if len(steps) == 1:
+        return {steps[0]: output}
     return {step: root / step_operation(step) for step in steps}
 
 
