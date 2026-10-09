@@ -224,6 +224,9 @@ def verify_workspace(  # noqa: C901 -- full cross-store verification boundary
     Both modes audit every market row's generation, domain and count and every quality
     flag's reference; ``deep`` also refuses a revision or flag key stored twice.
     """
+    # Before anything else, the SQLite and membership checks included: every core market
+    # name resolves to the stored table.
+    check_core_names(workspace.market)
     budget = budget or ComputeBudget(Fraction(1), 512 * 1024 * 1024)
     # Every step below charges against the same non-DuckDB allowance. DuckDB's own
     # share is bounded separately by the connection limit derived from this budget.

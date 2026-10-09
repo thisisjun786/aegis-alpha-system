@@ -29,7 +29,13 @@ import pytest
 
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.serialization import canonical_json_bytes
-from aegis_alpha.storage import bulk_generation, market, market_integrity, publication
+from aegis_alpha.storage import (
+    bulk_generation,
+    market,
+    market_integrity,
+    publication,
+    verification,
+)
 from aegis_alpha.storage.backup import backup, restore
 from aegis_alpha.storage.bulk_generation import (
     BulkFlags,
@@ -1236,6 +1242,22 @@ def test_verify_checks_the_core_catalog(tmp_path: Path) -> None:
         workspace.market.execute('ALTER TABLE filings ADD COLUMN "extra" VARCHAR')
     with open_workspace(home) as workspace, pytest.raises(ValueError, match="core table filings"):
         verify_workspace(workspace)
+
+
+def test_verify_checks_core_names_before_any_other_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A shadowed core name is refused before the SQLite and membership checks run."""
+    home = _chain_home(tmp_path)
+
+    def unreachable(*_: object) -> None:
+        pytest.fail("membership was verified before the core names")
+
+    monkeypatch.setattr(verification, "_verify_membership", unreachable)
+    with open_workspace(home) as workspace:
+        workspace.market.execute("CREATE TEMP TABLE prices AS SELECT * FROM main.prices")
+        with pytest.raises(ValueError, match=_SHADOWED):
+            verify_workspace(workspace)
 
 
 def test_only_deep_verify_audits_duplicates(
