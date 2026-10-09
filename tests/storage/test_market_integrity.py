@@ -804,6 +804,102 @@ def test_flag_gate_refuses_repeats_orphans_and_unreviewed_flags(tmp_path: Path) 
     connection.close()
 
 
+_WIDE_REVISION: Final = 256 * 1024
+_WIDE_DETAIL: Final = 1024 * 1024
+
+
+def _wide_flags(connection: duckdb.DuckDBPyConnection) -> None:
+    """Two staged prices with wide revision IDs, and one flag each with a wide detail."""
+    _stage(connection, "prices", _first(random.Random(23), "prices", 2))
+    connection.execute(
+        f"UPDATE staged SET revision_id = revision_id || repeat('v', {_WIDE_REVISION})"
+    )
+    connection.execute(
+        "CREATE TEMP TABLE staged_flags AS SELECT record_id, revision_id, 'rule' AS rule_id, "
+        f"'1' AS rule_version, 'f' AS flag, repeat('d', {_WIDE_DETAIL}) AS detail FROM staged"
+    )
+
+
+def _tight(available: int) -> ComputeBudget:
+    """``BUDGET`` with all but ``available`` materialization bytes already held live."""
+    return replace(BUDGET, reserved_bytes=BUDGET.available_bytes - available)
+
+
+def test_flag_batches_are_sized_from_the_widest_encoded_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The flag digest measures its widest row before fetching, never a fixed width."""
+    connection = _store(tmp_path / "market.duckdb", keys=False)
+    _wide_flags(connection)
+    actual = bulk_generation.stream_rowset
+    batches: list[int] = []
+
+    def recorded(  # noqa: PLR0913 -- stream_rowset's signature
+        connection: duckdb.DuckDBPyConnection,
+        schema: tuple[tuple[str, str], ...],
+        cells: list[str],
+        relation: str,
+        parameters: list[object],
+        *,
+        count: int,
+        batch_rows: int,
+    ) -> str:
+        batches.append(batch_rows)
+        return actual(
+            connection, schema, cells, relation, parameters, count=count, batch_rows=batch_rows
+        )
+
+    monkeypatch.setattr(bulk_generation, "stream_rowset", recorded)
+    relation = "SELECT * FROM staged_flags"
+    expected = bulk_generation.flags_digest(connection, relation, [], BUDGET)
+    found = connection.execute(
+        "SELECT max(strlen(record_id) + strlen(revision_id) + strlen(rule_id)"
+        " + strlen(rule_version) + strlen(flag) + strlen(detail)) "
+        "FROM staged_flags"
+    ).fetchone()
+    assert found is not None
+    row_bytes = int(found[0]) + 6 * 5  # six text cells, each tagged and length-framed
+    for available in (BUDGET.available_bytes, 8 * row_bytes):
+        batches.clear()
+        budget = _tight(available)
+        assert bulk_generation.flags_digest(connection, relation, [], budget) == expected
+        (batch,) = batches
+        charge = batch * (2 * row_bytes + bulk_generation._ROW_OBJECT_BYTES) + row_bytes
+        assert batch >= 1
+        assert charge <= budget.available_bytes
+    # A fixed 4096-byte row would admit 2048 rows here; one wide row fits only a few times.
+    assert batches == [3]
+    # Not even one row fits: refused before any row is fetched.
+    batches.clear()
+    with pytest.raises(ComputeResourceError, match="one quality flag row"):
+        bulk_generation.flags_digest(connection, relation, [], _tight(2 * row_bytes))
+    assert batches == []
+    connection.close()
+
+
+def test_a_flag_row_wider_than_the_allowance_rolls_the_publication_back(
+    tmp_path: Path,
+) -> None:
+    """A flag row that cannot be fetched refuses the whole publication, rows and marker."""
+    connection = _store(tmp_path / "market.duckdb", keys=False)
+    _wide_flags(connection)
+    flags = BulkFlags(
+        "staged_flags",
+        *bulk_generation.flags_digest(connection, "SELECT * FROM staged_flags", [], BUDGET),
+    )
+    request = _request("1", parent=None, domain="prices")
+    # The prices fit this allowance; a flag row, four times wider, does not.
+    with pytest.raises(ComputeResourceError, match="one quality flag row"):
+        publish_generation_bulk(connection, request, budget=_tight(2 * 1024 * 1024), flags=flags)
+    assert _count(connection, "SELECT count(*) FROM market_generations") == 0
+    assert _count(connection, "SELECT count(*) FROM prices") == 0
+    assert _count(connection, "SELECT count(*) FROM quality_flags") == 0
+    # Nothing was left open: the same publication commits once the allowance admits a row.
+    publish_generation_bulk(connection, request, budget=BUDGET, flags=flags)
+    assert _count(connection, "SELECT count(*) FROM quality_flags") == 2
+    connection.close()
+
+
 @pytest.mark.parametrize("staged", ["quality_flags", "prices", "market_generations"])
 def test_flags_are_never_copied_from_a_market_table(tmp_path: Path, staged: str) -> None:
     """The writer's flag INSERT reads a staged relation only, never another generation's rows."""

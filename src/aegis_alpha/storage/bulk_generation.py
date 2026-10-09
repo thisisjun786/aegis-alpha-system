@@ -105,7 +105,6 @@ FLAG_SCHEMA: Final = (
     ("flag", "text"),
     ("detail", "text"),
 )
-_FLAG_ROW_BYTES: Final = 4096
 _COLUMN_TYPES: Final = ("VARCHAR", "BIGINT", "DATE", "DOUBLE", "DECIMAL(38,12)")
 # Every code point str.strip() removes. A text cell made only of these is empty to
 # normalize_rows, so the SQL check uses exactly this class rather than trim()'s spaces.
@@ -291,17 +290,28 @@ def flags_digest(
     parameters: list[object],
     budget: ComputeBudget,
 ) -> tuple[str, int]:
-    """The ``aas-rowset-v1`` digest and count of quality flag rows (generation excluded)."""
+    """The ``aas-rowset-v1`` digest and count of quality flag rows (generation excluded).
+
+    The widest row's encoding is measured in DuckDB before any fetch, and each batch is
+    sized from it against the remaining allowance, so no fetched row exceeds what the
+    budget admits; when not even one row fits, it refuses before fetching any.
+    """
+    cells = [encoded_cell_sql(name, kind) for name, kind in FLAG_SCHEMA]
+    columns = ", ".join(_quote(name) for name, _ in FLAG_SCHEMA)
     found = connection.execute(
-        f"SELECT count(*) FROM ({relation})",  # noqa: S608 -- code-owned relation
+        f"SELECT count(*), coalesce(max(octet_length({' || '.join(cells)})), 0) "  # noqa: S608 -- code-owned encoders over a code-owned relation
+        f"FROM ({relation})",
         parameters,
     ).fetchone()
     if found is None:
         raise ValueError("integrity query returned no row")
-    count = int(found[0])
-    batch = max(1, min(BATCH_ROWS, budget.available_bytes // _FLAG_ROW_BYTES))
-    cells = [encoded_cell_sql(name, kind) for name, kind in FLAG_SCHEMA]
-    columns = ", ".join(_quote(name) for name, _ in FLAG_SCHEMA)
+    count, row_bytes = int(found[0]), int(found[1])
+    batch = _hash_batch_rows(row_bytes, budget)
+    if batch < 1:
+        raise ComputeResourceError(
+            f"one quality flag row ({row_bytes} encoded bytes) exceeds the admitted "
+            f"materialization budget {budget.available_bytes} bytes"
+        )
     digest = stream_rowset(
         connection,
         FLAG_SCHEMA,
@@ -683,8 +693,6 @@ def _stats(
 
 def _batch_rows(stats: _Stats, budget: ComputeBudget) -> tuple[int, int]:
     """Admit the hash and identity batches against the allocation before any fetch."""
-    available = budget.available_bytes - stats.row_bytes
-    hash_row = 2 * stats.row_bytes + _ROW_OBJECT_BYTES
     identity_values = 1 + max(len(keys) for keys in NATURAL_KEYS.values())
     identity_row = (
         _IDENTITY_ROW_BYTES
@@ -692,7 +700,7 @@ def _batch_rows(stats: _Stats, budget: ComputeBudget) -> tuple[int, int]:
         + text_bytes(identity_values, stats.identity_characters)
         + (_IDENTITY_CHARACTER_BYTES - TEXT_CHARACTER_BYTES) * stats.identity_characters
     )
-    hash_rows = min(BATCH_ROWS, max(available, 0) // hash_row)
+    hash_rows = _hash_batch_rows(stats.row_bytes, budget)
     identity_rows = min(BATCH_ROWS, budget.available_bytes // identity_row)
     if hash_rows < 1 or identity_rows < 1:
         raise ComputeResourceError(
@@ -700,6 +708,16 @@ def _batch_rows(stats: _Stats, budget: ComputeBudget) -> tuple[int, int]:
             f"materialization budget {budget.available_bytes} bytes"
         )
     return hash_rows, identity_rows
+
+
+def _hash_batch_rows(row_bytes: int, budget: ComputeBudget) -> int:
+    """Rows per hash batch of rows at most ``row_bytes`` wide; below one, none fits.
+
+    The stream keeps the previous row (the hash workspace), and each fetched row is
+    held twice over plus its objects' headers.
+    """
+    available = budget.available_bytes - row_bytes
+    return min(BATCH_ROWS, max(available, 0) // (2 * row_bytes + _ROW_OBJECT_BYTES))
 
 
 # Text that json.dumps writes verbatim between quotes: printable ASCII except '"' and '\\'.
