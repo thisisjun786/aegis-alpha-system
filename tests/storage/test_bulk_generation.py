@@ -784,6 +784,21 @@ def test_commit_exhaustion_rolls_back_as_a_budget_error(tmp_path: Path) -> None:
         PIN_BLOCK,
         "TransactionContext Error: Failed to commit: could not allocate block of size 256.0 KiB",
         "TransactionContext Error: Failed to commit: failed to allocate data of size 512.0 KiB",
+        # The allocator's own message, capitalised.
+        (
+            "TransactionContext Error: Failed to commit: Failed to allocate block of 262144 bytes "
+            "(bad allocation)"
+        ),
+        (
+            "TransactionContext Error: Failed to commit: Failed to re-allocate block of 262144 "
+            "bytes (bad allocation)"
+        ),
+        # Spilling past max_temp_directory_size while memory is full.
+        (
+            "TransactionContext Error: Failed to commit: failed to offload data block of size "
+            "256.0 KiB (1.0 MiB/1.0 MiB used).\nThis limit was set by the "
+            "'max_temp_directory_size' setting."
+        ),
     ],
 )
 def test_commit_capacity_messages_are_budget_errors(message: str) -> None:
@@ -812,6 +827,14 @@ def test_commit_capacity_messages_are_budget_errors(message: str) -> None:
         duckdb.TransactionException(
             "TransactionContext Error: Failed to commit: PRIMARY KEY or UNIQUE constraint "
             'violation: duplicate key "failed to pin block of size 256.0 KiB"'
+        ),
+        duckdb.TransactionException(
+            "TransactionContext Error: Failed to commit: PRIMARY KEY or UNIQUE constraint "
+            'violation: duplicate key "Failed to allocate block of 1 bytes (bad allocation)"'
+        ),
+        # The prefix stays exact; only the cause after it is matched without case.
+        duckdb.TransactionException(
+            "transactioncontext error: failed to commit: failed to pin block of size 1"
         ),
         duckdb.TransactionException("Failed to commit: could not allocate block of size 1"),
         duckdb.IOException("IO Error: No space left on device"),

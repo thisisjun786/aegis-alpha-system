@@ -58,11 +58,19 @@ _CLOSE_ONLY_NULLS = ("open", "high", "low", "volume")
 # allocation or block pin that failed. Any other failed COMMIT (a constraint violation,
 # a write conflict) is not a capacity error and keeps its own type.
 # DuckDB reports a COMMIT that ran out of memory as this fixed prefix and the buffer
-# manager's own message. Only that leading cause counts: a constraint violation quotes
-# its key after the prefix, and the key may contain any of these phrases.
+# manager's or allocator's own message: "could not allocate block", "failed to allocate
+# data", "failed to pin block", or the allocator's "Failed to allocate block of N bytes
+# (bad allocation)" (and "Failed to re-allocate"), whose case differs, so the cause alone
+# is matched without case. Exhausting max_temp_directory_size ("failed to offload data
+# block ... set by the 'max_temp_directory_size' setting") is DuckDB's OutOfMemoryException
+# outside COMMIT, so it is capacity there by type and, after this prefix, by its leading
+# cause here: spilling more than the cap allows is the memory limit's exhaustion, not a
+# disk fault. Only that leading cause counts: a constraint violation quotes its key after
+# the prefix, and the key may contain any of these phrases.
 _COMMIT_CAPACITY = re.compile(
     r"TransactionContext Error: Failed to commit: "
-    r"(?:could not allocate|failed to allocate|failed to pin block) "
+    r"(?i:could not allocate|failed to allocate|failed to re-allocate|failed to pin block"
+    r"|failed to offload data block) "
 )
 _NO_TRANSACTION = "no transaction is active"
 
