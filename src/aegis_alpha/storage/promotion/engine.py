@@ -23,6 +23,7 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import date
 from fractions import Fraction
 from typing import TYPE_CHECKING, Final, cast
 
@@ -75,7 +76,6 @@ from aegis_alpha.storage.state import atomic, complete_operation, get_operation,
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
-    from datetime import date
     from pathlib import Path
 
     import duckdb
@@ -2005,7 +2005,19 @@ _MANIFEST_KEYS: Final = frozenset(
         "identity_snapshot",
     }
 )
-_PARTITION_RESULTS: Final = frozenset({"no_reference", "below_reference", "at_least_reference"})
+_PARTITION_DATE_KEYS: Final = frozenset(
+    {
+        "session_date",
+        "rows",
+        "resolved",
+        "reference_date",
+        "reference_rows",
+        "reference_generation",
+    }
+)
+_DELTA_OPS: Final = frozenset({"ASSERT", "SUPERSEDE", "TOMBSTONE"})
+# A prepared plan has no refusals, so no ``refused_*`` status ever reaches its manifest.
+_PREPARED_STATUSES: Final = frozenset({"ok", "held", "unresolved", "ambiguous"})
 _SHA256: Final = re.compile(r"[0-9a-f]{64}")
 
 
@@ -2013,10 +2025,77 @@ def _count_value(value: object, *, low: int = 0) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= low
 
 
-def _counts(value: object) -> bool:
+def _counts(value: object, names: frozenset[str] | None = None, *, low: int = 0) -> bool:
+    """A mapping of names (any, or only ``names``) to counts of at least ``low``."""
     return isinstance(value, dict) and all(
-        isinstance(key, str) and _count_value(count) for key, count in value.items()
+        isinstance(key, str) and (names is None or key in names) and _count_value(count, low=low)
+        for key, count in value.items()
     )
+
+
+def _iso_date(value: object) -> date | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.isoformat() == value else None
+
+
+def _partition_refusal(check: object, chain: set[str]) -> str | None:
+    """Why a recorded ``partition_row_count`` check is not one planning could write, or None.
+
+    Each date record holds exactly the planned fields: a session date counted once in
+    ascending order, its source and resolved rows, and either no reference or one taken
+    on or before it from a generation of the parent chain. The result is the one those
+    records imply.
+    """
+    malformed = "retained promotion manifest has a malformed partition check"
+    if (
+        not isinstance(check, dict)
+        or check.keys() != {"rule", "result", "dates"}
+        or check["rule"] != "@".join(PARTITION_CHECK)
+        or not isinstance(check["dates"], list)
+        or not check["dates"]
+    ):
+        return malformed
+    previous: date | None = None
+    compared = []
+    for item in cast("list[object]", check["dates"]):
+        if not isinstance(item, dict) or item.keys() != _PARTITION_DATE_KEYS:
+            return malformed
+        session = _iso_date(item["session_date"])
+        rows, resolved = item["rows"], item["resolved"]
+        if (
+            session is None
+            or (previous is not None and session <= previous)
+            or not _count_value(rows, low=1)
+            or not _count_value(resolved)
+            or cast("int", resolved) > cast("int", rows)
+        ):
+            return malformed
+        previous = session
+        reference = (item["reference_date"], item["reference_rows"], item["reference_generation"])
+        if reference == (None, None, None):
+            continue
+        day = _iso_date(reference[0])
+        if (
+            day is None
+            or day > session
+            or not _count_value(reference[1], low=1)
+            or reference[2] not in chain
+        ):
+            return malformed
+        compared.append(cast("int", resolved) < cast("int", reference[1]))
+    result = (
+        "no_reference"
+        if not compared
+        else "below_reference"
+        if any(compared)
+        else "at_least_reference"
+    )
+    return None if check["result"] == result else malformed
 
 
 def _digest_value(value: object) -> bool:
@@ -2072,13 +2151,15 @@ def _manifest_refusal(  # noqa: C901, PLR0911 -- one reason per manifest field g
         not _digest_value(manifest["delta_hash"])
         or not _digest_value(manifest["chain_hash"])
         or not _count_value(manifest["row_count"], low=1)
-        or not _counts(operations)
+        or not _counts(operations, _DELTA_OPS, low=1)
         or sum(cast("dict[str, int]", operations).values()) != manifest["row_count"]
         or not isinstance(flags, dict)
         or flags.keys() != {"rowset", "rows"}
         or not _digest_value(flags["rowset"])
         or not _count_value(flags["rows"])
-        or not _counts(manifest["rows"])
+        or not _counts(manifest["rows"], _PREPARED_STATUSES, low=1)
+        or not _count_value(manifest["sequence"], low=1)
+        or not isinstance(manifest["version"], str)
         or not _count_value(manifest["unchanged"])
         or not _count_value(manifest["stale"])
         or not (
@@ -2087,24 +2168,21 @@ def _manifest_refusal(  # noqa: C901, PLR0911 -- one reason per manifest field g
         or ("source_outcomes" in manifest and not _counts(manifest["source_outcomes"]))
     ):
         return "retained promotion manifest has malformed counts or hashes"
-    check = manifest.get("partition_row_count")
-    if "partition_row_count" in manifest and (
-        not isinstance(check, dict)
-        or check.keys() != {"rule", "result", "dates"}
-        or check["rule"] != "@".join(PARTITION_CHECK)
-        or check["result"] not in _PARTITION_RESULTS
-        or not isinstance(check["dates"], list)
-        or not check["dates"]
-    ):
-        return "retained promotion manifest has a malformed partition check"
     try:
         head = dataset_head(workspace, spec.dataset_id)
-        parent = None if spec.parent is None else marker_for(workspace.market, spec.parent)
+        chain = [] if spec.parent is None else generation_chain(workspace.market, spec.parent)
     except ValueError as error:
         return str(error)
     if head != spec.parent:
         # Recovery would find the parent moved and leave the intent pending.
         return "its spec parent is no longer the dataset head"
+    if "partition_row_count" in manifest:
+        refusal = _partition_refusal(
+            manifest["partition_row_count"], {str(item["generation_id"]) for item in chain}
+        )
+        if refusal is not None:
+            return refusal
+    parent = chain[-1] if chain else None
     sequence = 1 if parent is None else cast("int", parent["sequence"]) + 1
     if parent is not None and (parent["dataset_id"], parent["domain"]) != (
         spec.dataset_id,
@@ -2162,11 +2240,15 @@ def untouched_promotion_refusal(  # noqa: PLR0911 -- one reason per piece of evi
             [generation_id],
         ).fetchone():
             return "its generation has stored rows"
-    check_id = "qc-" + hashlib.sha256(f"{generation_id}/promotion".encode()).hexdigest()
+    # Every quality check a catalog completion writes for this generation.
+    check_ids = [
+        "qc-" + hashlib.sha256(f"{generation_id}/{rule}".encode()).hexdigest()
+        for rule in ("promotion", PARTITION_CHECK[0])
+    ]
     if workspace.state.execute(
         "SELECT 1 FROM dataset_versions WHERE generation_id=? "
-        "UNION ALL SELECT 1 FROM quality_checks WHERE check_id=?",
-        (generation_id, check_id),
+        "UNION ALL SELECT 1 FROM quality_checks WHERE check_id IN (?, ?)",
+        (generation_id, *check_ids),
     ).fetchone():
         return "its generation is cataloged"
     try:

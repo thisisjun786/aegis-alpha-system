@@ -2198,7 +2198,7 @@ state와 market 저장소는 core schema 버전을 가진다. `aas init`은 새 
 만든다. 그래서 한 단계를 완료하고 다음 단계의 intent 전에 멈춘 설치본은 앞 단계 버전의 완전한
 설치본이고, 새 `DIR`로 다시 실행해야 한다. 재개한 단계의 market COMMIT이 이미 끝났어도 그 단계를 마친
 뒤 같은 호출의 다음 단계 백업은 같은 store·설치 정체성의 그 단계 버전 market만 받는다. 백업 목적지는
-어느 단계도 쓰기 전에 모두 새 디렉터리인지 확인한다. 목표 이상인 설치본에는 아무것도 하지 않는다. `aas db
+어느 단계도 쓰기 전에 백업이 받는 조건 그대로(새 디렉터리, `raw`·`runs`·`secrets` 밖, Git checkout 밖) 확인한다. 목표 이상인 설치본에는 아무것도 하지 않는다. `aas db
 quarantine`은 이 intent를 끝내지 않는다. `--plan`은 저장소를 읽기 전용으로 열어 현재 버전, 인식한
 checksum, 다음 단계의 남은 부분(`steps`), 목표까지의 단계별 목록(`migrations`), 백업 필요 여부,
 가지고 갈 승격(`carried_operations`)과 막는 작업(`blocking_operations`)을 보고하고 아무것도 쓰지 않는다.
@@ -2208,9 +2208,15 @@ ID가 요청 hash에서 나오며, 그 operation이나 generation의 marker, 행
 요청·명세·manifest가 intent와 정확히 맞아야 한다. 다시 계획하지 않고 확인할 수 있는 것은 모두 확인한다.
 manifest는 `aas-promotion-manifest-v1`의 필드를 빠짐·추가 없이 정해진 형식으로 담고(`source_outcomes`는
 mapper가 결과를 셀 때만, `partition_row_count`는 선택), dataset·domain·명세 hash·원천 pin·identity
-snapshot·parent는 명세와, operation ID는 intent와 같으며, 연산별 행 수의 합이 `row_count`다. 명세의
+snapshot·parent는 명세와, operation ID는 intent와 같으며, 연산별 행 수의 합이 `row_count`다. 준비된
+계획에서 늘 성립하는 것도 확인한다. 연산 이름은 `ASSERT`·`SUPERSEDE`·`TOMBSTONE`, 행 상태는 `ok`·`held`·
+`unresolved`·`ambiguous`뿐이며(거부된 행이 있는 계획은 준비되지 않는다) 각 수는 1 이상이고, sequence는
+bool이 아닌 양의 정수다. `partition_row_count`의 날짜 기록은 정해진 필드만 담고 날짜 순으로 한 번씩
+나오며, 해결 행 수가 원천 행 수를 넘지 않고, 기준은 없거나 그 날짜 이전의 parent chain generation에서
+온 것이며, `result`는 그 기록이 뜻하는 값이다. 명세의
 parent는 아직 dataset의 head이고 sequence·version은 parent 다음이며, `chain_hash`는 parent의 chain hash와
-manifest 필드로 다시 계산한 값과 같다. 증거를 읽다 난 오류도 가지고 가지 않는 이유가 된다. 그 밖의 PREPARED 작업, marker가 commit된 승격,
+manifest 필드로 다시 계산한 값과 같다. catalog 기록에는 그 generation의 `promotion_report`와
+`partition_row_count` 품질 검사가 모두 포함된다. 증거를 읽다 난 오류도 가지고 가지 않는 이유가 된다. 그 밖의 PREPARED 작업, marker가 commit된 승격,
 실행 중인 run은 계속 막는다. 이 예외는 단계의 백업에만 넘겨지고 백업이 스스로 다시 확인한다. 일반
 `aas db backup`과 다른 명령의 백업은 여전히 모든 PREPARED 작업을 거부한다. 그 백업은 intent와 `raw/`
 증거를 그대로 담고, `logical.pending_operations`는 실제 수를 세며, manifest의 `carried_operations`가 그
@@ -2902,6 +2908,6 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-474 | migration snapshot은 v2만 아는 코드로 복원·검증되고 다시 migration한 뒤 같은 승격을 게시한다 | `tests/storage/test_migration_steps.py::test_the_snapshot_restores_for_v2_code_and_migrates_again` | 구현 |
 | DV-475 | `--to 2`는 나중 버전을 아는 코드에서도 v2에서 멈추고, 다음 단계는 거기서 시작하며, 목표 이상인 설치본은 그대로 둔다 | `tests/storage/test_migration_steps.py::test_to_2_stops_there_and_a_later_step_starts_from_it` | 구현 |
 | DV-476 | 나중 단계 어디서 멈춰도 같은 목표로 다시 실행하면 백업 없이 끝나고, 앞선 목표는 거부된다 | `tests/storage/test_migration_steps.py::test_a_kill_in_a_later_step_is_finished_by_repeating_it` | 구현 |
-| DV-477 | market COMMIT 뒤 멈춘 단계를 재개하는 호출은 다음 단계 백업까지 이어 가고, 그 전에 모든 백업 목적지를 확인한다 | `tests/storage/test_migration_steps.py::test_a_step_whose_market_landed_resumes_into_the_next_step` | 구현 |
-| DV-478 | 필드가 빠졌거나 명세·parent·chain과 모순되는 manifest의 승격은 migration을 막고, 이름을 넘겨도 백업이 다시 거부한다 | `tests/storage/test_migration_steps.py::test_only_an_untouched_promotion_is_carried` | 구현 |
+| DV-477 | market COMMIT 뒤 멈춘 단계를 재개하는 호출은 다음 단계 백업까지 이어 가고, 그 전에 모든 백업 목적지를 백업의 조건대로 확인한다 | `tests/storage/test_migration_steps.py::test_a_step_whose_market_landed_resumes_into_the_next_step` | 구현 |
+| DV-478 | 필드가 빠졌거나 명세·parent·chain, 준비된 계획의 연산·행 상태·sequence·partition 기록 불변식과 모순되는 manifest의 승격은 migration을 막고, 이름을 넘겨도 백업이 다시 거부한다 | `tests/storage/test_migration_steps.py::test_only_an_untouched_promotion_is_carried` | 구현 |
 | DV-479 | 승격 증거를 읽다 난 I/O 오류는 가지고 가지 않는 이유가 되며 migration 밖으로 새지 않는다 | `tests/storage/test_migration_steps.py::test_an_evidence_read_error_refuses_the_carry` | 구현 |

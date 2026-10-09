@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from aegis_alpha.data.descriptor_tree import DescriptorTree, DescriptorTreeError
-from aegis_alpha.storage.locks import private_directory, private_file
+from aegis_alpha.storage.locks import private_directory, private_file, require_outside_checkout
 from aegis_alpha.storage.paths import DEFAULT_PATHS, load_paths, read_json, resolve_home
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import Workspace, open_workspace, write_json
@@ -131,6 +131,22 @@ def _carried(workspace: Workspace, carry: Collection[str]) -> list[str]:
     return [str(row["operation_id"]) for row in pending]
 
 
+def backup_destination(workspace: Workspace, output: Path | None) -> Path:
+    """The new directory a backup of ``workspace`` writes, refused before anything is."""
+    target = (
+        resolve_home(output) if output is not None else workspace.paths.backups / uuid.uuid4().hex
+    )
+    if target.exists() or target.is_symlink():
+        raise ValueError("backup destination must be a new directory")
+    if any(
+        target.is_relative_to(path)
+        for path in (workspace.paths.raw, workspace.paths.runs, workspace.paths.secrets)
+    ):
+        raise ValueError("backup destination cannot be inside raw, runs, or secrets")
+    require_outside_checkout(target)
+    return target
+
+
 def backup_workspace(
     workspace: Workspace,
     output: Path | None = None,
@@ -158,16 +174,7 @@ def backup_workspace(
         raise ValueError("backup requires recovered operations and no orphan generations")
     if workspace.state.execute("SELECT 1 FROM runs WHERE status='RUNNING'").fetchone():
         raise ValueError("backup requires all running analyses to stop")
-    target = (
-        resolve_home(output) if output is not None else workspace.paths.backups / uuid.uuid4().hex
-    )
-    if target.exists() or target.is_symlink():
-        raise ValueError("backup destination must be a new directory")
-    if any(
-        target.is_relative_to(path)
-        for path in (workspace.paths.raw, workspace.paths.runs, workspace.paths.secrets)
-    ):
-        raise ValueError("backup destination cannot be inside raw, runs, or secrets")
+    target = backup_destination(workspace, output)
     private_directory(target, create=True)
     files: dict[str, object] = {}
     for name, connection in (("state", workspace.state), ("strategies", workspace.strategies)):

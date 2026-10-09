@@ -25,7 +25,8 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   verified backup, and only a prepared step resumes without one. A step's backup alone
   may carry untouched promotion intents (`untouched_promotion_refusal`: no marker, rows,
   flags or catalog trace; a complete manifest matching the intent, its spec and its
-  parent's head, sequence and chain hash) as PREPARED; `backup_workspace`
+  parent's head, sequence and chain hash, holding only what a prepared plan can record)
+  as PREPARED; `backup_workspace`
   rechecks the names it is given and every other backup refuses every pending operation.
   The v1 DDL bytes are a recorded fact, so v1 is built from the v1 domains alone. A v1 store
   stays usable; writes that need a v2 table or a close-only price name the migration.

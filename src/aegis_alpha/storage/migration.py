@@ -30,7 +30,7 @@ from aegis_alpha.storage.market import (
     upgrade_market,
     validate_market,
 )
-from aegis_alpha.storage.paths import read_json, resolve_home
+from aegis_alpha.storage.paths import read_json
 from aegis_alpha.storage.sqlite import schema_checksums
 from aegis_alpha.storage.state import (
     complete_operation,
@@ -464,22 +464,23 @@ def _finish(workspace: Workspace, step: int, budget: ComputeBudget | None) -> No
     complete_operation(workspace.state, step_operation(step), _request_hash(workspace, step))
 
 
-def _backup_targets(output: Path | None, steps: list[int]) -> dict[int, Path]:
+def _backup_targets(workspace: Workspace, output: Path | None, steps: list[int]) -> dict[int, Path]:
     """Where each step that needs one writes its backup.
 
     One backup goes to ``output`` itself. Several go to ``output/<operation ID>``, so
-    each step keeps its own verified rollback snapshot. Either way ``output`` must be
-    new, checked here so a resumed step is not finished before a later one refuses it.
+    each step keeps its own verified rollback snapshot. Either way ``output`` is admitted
+    here as the backup would admit it, so a resumed step is not finished before a later
+    one refuses its destination.
     """
+    from aegis_alpha.storage.backup import backup_destination  # noqa: PLC0415
+
     if not steps:
         return {}
     if output is None:
         raise CoreSchemaError(
             "core_schema_backup_required", "pass --backup-output with a new directory"
         )
-    root = resolve_home(output)
-    if root.exists() or root.is_symlink():
-        raise ValueError("backup destination must be a new directory")
+    root = backup_destination(workspace, output)
     if len(steps) == 1:
         return {steps[0]: output}
     return {step: root / step_operation(step) for step in steps}
@@ -511,7 +512,7 @@ def migrate_core_schema(
         if not pending:
             return _report(workspace, performed=[])
         targets = _backup_targets(
-            backup_output, [step for step, prepared in pending if not prepared]
+            workspace, backup_output, [step for step, prepared in pending if not prepared]
         )
         _quiet(workspace, excluding=_prepared_step(status))
         performed: list[dict[str, object]] = []

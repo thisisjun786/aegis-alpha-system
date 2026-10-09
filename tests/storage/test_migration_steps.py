@@ -7,6 +7,7 @@ case uses a disposable installation this module created; the promotion is synthe
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -43,7 +44,16 @@ from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace
 from tests.storage.capacity_support import FailingCommit
 from tests.storage.core_step_support import add_synthetic_step
-from tests.storage.promotion_support import add_source, at, bar, register_symbols, spec
+from tests.storage.promotion_support import (
+    ZONE,
+    add_bulk_source,
+    add_source,
+    at,
+    bar,
+    bulk_row,
+    register_symbols,
+    spec,
+)
 from tests.storage.test_migration import (
     RECORDED_MARKET,
     RECORDED_STATE,
@@ -147,14 +157,16 @@ def snapshot_operation(root: Path, operation_id: str) -> dict[str, object]:
 
 
 def pending_promotion(
-    root: Path, *, crash: str = "commit", parented: bool = False
+    root: Path, *, crash: str = "commit", parented: bool = False, partial: bool = False
 ) -> tuple[Path, dict[str, object]]:
     """A v2 installation whose one promotion stopped where the rehearsal's did.
 
     ``commit`` fails the promotion's COMMIT with the rehearsal's pin-block error, so the
     intent and its retained evidence stay with no marker, rows or flags. ``catalog``
     stops after the market commit instead, leaving a committed generation uncataloged.
-    ``parented`` first publishes a generation the failed one names as its parent.
+    ``parented`` first publishes a generation the failed one names as its parent;
+    ``partial`` also makes the failed one a bulk response of provider-reported partial
+    rows, so its manifest records a ``partition_row_count`` check against that parent.
     Returns the home and the plan computed before the failure.
     """
     home = root / "home"
@@ -183,14 +195,26 @@ def pending_promotion(
             admitted, [bar("AAA.KO", _DAY, 100.0, retrieved=at("2025-01-10T00:00:00"))], tag="a"
         )
         identity = register_symbols(admitted, pin["source_id"])
-        parent = None
-        if parented:
+        parent, mapper = None, None
+        if parented or partial:
             first = promote(admitted, *spec([pin], identity), apply=True)
             parent = str(first["generation_id"])
+        if parented and not partial:
             pin = add_source(
                 admitted, [bar("AAA.KO", _DAY, 101.0, retrieved=at("2025-01-11T00:00:00"))], tag="b"
             )
-        document = spec([pin], identity, parent=parent)
+        if partial:
+            pin = add_bulk_source(
+                admitted,
+                [bulk_row("AAA", "KO", _DAY, 101)],
+                tag="partial",
+                linked=at("2025-01-20T00:00:00"),
+            )
+            mapper = {
+                "name": "eodhd.bulk_quarantine@1",
+                "args": {"timezone": ZONE, "currencies": {"KO": "KRW", "KQ": "KRW"}},
+            }
+        document = spec([pin], identity, parent=parent, mapper=mapper)
         planned = promote(admitted, *document, apply=False)
         with pytest.MonkeyPatch.context() as patch:
             if crash == "commit":
@@ -356,9 +380,13 @@ def test_a_step_whose_market_landed_resumes_into_the_next_step(
     assert set(intents(home)) == {MIGRATION_OPERATION}
     taken = tmp_path / "taken"
     taken.mkdir()
-    # The v3 step's destination is checked before the v2 step is finished.
+    # The v3 step's destination is admitted as its backup would admit it, before the v2
+    # step is finished: it must be new and outside raw, runs and secrets.
     with pytest.raises(ValueError, match="new directory"):
         migrate_core_schema(home, to_version=synthetic, backup_output=taken)
+    with pytest.raises(ValueError, match="inside raw, runs, or secrets"):
+        migrate_core_schema(home, to_version=synthetic, backup_output=home / "raw" / "new")
+    assert not (home / "raw" / "new").exists()
     assert intents(home)[MIGRATION_OPERATION]["phase"] == "PREPARED"
     report = migrate_core_schema(home, to_version=synthetic, backup_output=tmp_path / "v3")
     assert (report["state"], report["market_version"], report["state_version"]) == ("current", 3, 3)
@@ -389,11 +417,11 @@ def test_an_unknown_step_intent_is_refused(tmp_path: Path) -> None:
         plan_core_migration(home, to_version=2)
 
 
-@pytest.mark.parametrize("parented", [False, True])
+@pytest.mark.parametrize(("parented", "partial"), [(False, False), (True, False), (True, True)])
 def test_an_untouched_promotion_is_carried_through_a_step_and_then_recovered(
-    tmp_path: Path, synthetic: int, *, parented: bool
+    tmp_path: Path, synthetic: int, *, parented: bool, partial: bool
 ) -> None:
-    home, planned = pending_promotion(tmp_path, parented=parented)
+    home, planned = pending_promotion(tmp_path, parented=parented, partial=partial)
     operation_id, generation_id = str(planned["operation_id"]), str(planned["generation_id"])
     with open_workspace(home) as admitted:
         intent = get_operation(admitted.state, operation_id)
@@ -544,6 +572,52 @@ def _unflagged(body: dict[str, object]) -> dict[str, object]:
     return body | {"flags": {"rows": 0}}
 
 
+def _impossible_operation(body: dict[str, object]) -> dict[str, object]:
+    return body | {"operations": {"NOT_A_MARKET_OP": body["row_count"]}}
+
+
+def _boolean_sequence(body: dict[str, object]) -> dict[str, object]:
+    # True equals 1, the sequence a parentless generation has.
+    return body | {"sequence": True}
+
+
+def _refused_rows(body: dict[str, object]) -> dict[str, object]:
+    # A plan that refused rows is never prepared.
+    return body | {"rows": {"refused_required": 1}}
+
+
+def _partition(
+    change: Callable[[dict[str, object]], object],
+) -> Callable[[dict[str, object]], dict[str, object]]:
+    def rewrite(body: dict[str, object]) -> dict[str, object]:
+        check = cast("dict[str, object]", body["partition_row_count"])
+        return body | {"partition_row_count": change(check)}
+
+    return rewrite
+
+
+def _first_date(**fields: object) -> Callable[[dict[str, object]], object]:
+    def change(check: dict[str, object]) -> object:
+        first, *rest = cast("list[dict[str, object]]", check["dates"])
+        return check | {"dates": [first | fields, *rest]}
+
+    return change
+
+
+def _cataloged_partition(home: Path, operation_id: str) -> None:
+    """The partition check row a catalog completion writes, without its other rows."""
+    with open_workspace(home, writable=True) as admitted:
+        intent = cast("dict[str, object]", get_operation(admitted.state, operation_id))
+        rule = f"{intent['target_id']}/partition_row_count"
+        check_id = "qc-" + hashlib.sha256(rule.encode()).hexdigest()
+        admitted.state.execute(
+            "INSERT INTO quality_checks(check_id, dataset_id, version, rule_id, rule_version, "
+            "result, reason, checked_at_us) VALUES (?,?,?,?,?,?,?,?)",
+            (check_id, "prices.kr.eodhd", "1", "partition_row_count", "1", "no_reference", "[]", 0),
+        )
+        admitted.state.commit()
+
+
 @pytest.mark.parametrize(
     ("crash", "alter", "reason"),
     [
@@ -556,12 +630,51 @@ def _unflagged(body: dict[str, object]) -> dict[str, object]:
         ("commit", _manifest_rewritten(_unflagged), "malformed counts"),
         ("commit", _manifest_rewritten(_unlinked), "chain hash"),
         ("commit", _manifest_rewritten(_out_of_sequence), "does not follow its parent"),
+        ("commit", _manifest_rewritten(_impossible_operation), "malformed counts"),
+        ("commit", _manifest_rewritten(_boolean_sequence), "malformed counts"),
+        ("commit", _manifest_rewritten(_refused_rows), "malformed counts"),
+        ("partial", _cataloged_partition, "cataloged"),
+        ("partial", _manifest_rewritten(_partition(lambda c: c | {"dates": [None]})), "partition"),
+        ("partial", _manifest_rewritten(_partition(lambda c: c | {"dates": []})), "partition"),
+        (
+            "partial",
+            _manifest_rewritten(_partition(lambda c: c | {"result": "no_reference"})),
+            "partition",
+        ),
+        (
+            "partial",
+            _manifest_rewritten(_partition(_first_date(session_date="2025-1-2"))),
+            "partition",
+        ),
+        ("partial", _manifest_rewritten(_partition(_first_date(resolved=2))), "partition"),
+        ("partial", _manifest_rewritten(_partition(_first_date(rows=True))), "partition"),
+        ("partial", _manifest_rewritten(_partition(_first_date(extra=1))), "partition"),
+        (
+            "partial",
+            _manifest_rewritten(_partition(_first_date(reference_generation="prm-" + "0" * 64))),
+            "partition",
+        ),
+        (
+            "partial",
+            _manifest_rewritten(_partition(_first_date(reference_date="2025-01-03"))),
+            "partition",
+        ),
+        (
+            "partial",
+            _manifest_rewritten(
+                _partition(lambda c: c | {"dates": [*cast("list[object]", c["dates"])] * 2})
+            ),
+            "partition",
+        ),
     ],
 )
 def test_only_an_untouched_promotion_is_carried(
     tmp_path: Path, synthetic: int, crash: str, alter: Callable[[Path, str], None], reason: str
 ) -> None:
-    home, planned = pending_promotion(tmp_path, crash=crash)
+    # ``partial`` is a failed COMMIT whose manifest records a partition check.
+    home, planned = pending_promotion(
+        tmp_path, crash="commit" if crash == "partial" else crash, partial=crash == "partial"
+    )
     operation_id = str(planned["operation_id"])
     alter(home, operation_id)
     plan = plan_core_migration(home, to_version=synthetic)
