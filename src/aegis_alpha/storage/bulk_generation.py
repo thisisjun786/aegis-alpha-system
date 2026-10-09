@@ -40,13 +40,14 @@ from typing import TYPE_CHECKING, Final
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.storage.market import (
     RECORD_SCHEMA,
+    budgeted,
     chain_digest,
     delta_columns,
     delta_digest,
     generation_chain,
-    limit_duckdb,
     market_version,
     record_identity,
+    rollback,
     rowset_schema,
 )
 from aegis_alpha.storage.market_schema import (
@@ -79,6 +80,7 @@ _MARKER_KEYS: Final = (
     "operation_id",
     "request_hash",
 )
+_WORK: Final = "the bulk generation"
 _COLUMN_TYPES: Final = ("VARCHAR", "BIGINT", "DATE", "DOUBLE", "DECIMAL(38,12)")
 # Every code point str.strip() removes. A text cell made only of these is empty to
 # normalize_rows, so the SQL check uses exactly this class rather than trim()'s spaces.
@@ -155,12 +157,12 @@ def plan_generation_bulk(
     connection: duckdb.DuckDBPyConnection, request: BulkRequest, *, budget: ComputeBudget
 ) -> BulkPlan:
     """Validate and hash the staged rows and return the marker, writing nothing."""
-    with _budgeted(connection, budget):
+    with budgeted(connection, budget, _WORK):
         _ = connection.execute("BEGIN TRANSACTION")
         try:
             return _plan(connection, request, budget)
         finally:
-            _rollback(connection)
+            rollback(connection)
 
 
 def publish_generation_bulk(
@@ -179,7 +181,7 @@ def publish_generation_bulk(
     inserted, so rows that belong to the generation (its quality flags) commit or roll
     back with its marker. It does not run when an identical generation is reused.
     """
-    with _budgeted(connection, budget):
+    with budgeted(connection, budget, _WORK):
         _ = connection.execute("BEGIN TRANSACTION")
         try:
             current = _plan(connection, request, budget)
@@ -192,7 +194,7 @@ def publish_generation_bulk(
                     companion(connection)
             _ = connection.execute("COMMIT")
         except BaseException:
-            _rollback(connection)
+            rollback(connection)
             raise
     return dict(current.marker)
 
@@ -221,17 +223,6 @@ def _check_stored(
         ) from error
 
 
-def _rollback(connection: duckdb.DuckDBPyConnection) -> None:
-    """Roll back the open transaction; a failed COMMIT has already ended it."""
-    import duckdb  # noqa: PLC0415 -- the driver's transaction error type
-
-    try:
-        _ = connection.execute("ROLLBACK")
-    except duckdb.TransactionException as error:
-        if "no transaction is active" not in str(error):
-            raise
-
-
 def _check_reviewed(plan: BulkPlan | None, current: BulkPlan) -> None:
     if plan is not None and dict(plan.marker) != dict(current.marker):
         raise PlanChangedError("bulk generation changed since it was planned; plan again")
@@ -251,34 +242,12 @@ def verify_generation_bulk(
     generation's rows are counted, kept to its domain, rehashed with streaming parity
     and checked as revisions of the heads before it.
     """
-    with _budgeted(connection, budget):
+    with budgeted(connection, budget, _WORK):
         chain = generation_chain(connection, generation_id)
         verify_chain_links(chain)
         for index in range(len(chain)) if deep else (len(chain) - 1,):
             _verify_rows(connection, chain, index, budget)
         return chain[-1]
-
-
-class _budgeted:  # noqa: N801 -- context manager used like a function
-    """Lower DuckDB to the allocation and report its memory exhaustion as a budget error."""
-
-    def __init__(self, connection: duckdb.DuckDBPyConnection, budget: ComputeBudget) -> None:
-        self._connection = connection
-        self._budget = budget
-
-    def __enter__(self) -> None:
-        limit_duckdb(self._connection, self._budget)
-
-    def __exit__(self, kind: object, error: object, traceback: object) -> None:
-        import duckdb  # noqa: PLC0415 -- capacity errors at the budgeted query boundary
-
-        # A COMMIT that cannot allocate reports a transaction error, not an OOM one.
-        if isinstance(error, duckdb.OutOfMemoryException) or (
-            isinstance(error, duckdb.TransactionException) and "allocate" in str(error)
-        ):
-            raise ComputeResourceError(
-                "DuckDB cannot complete the bulk generation within admitted memory limits"
-            ) from error
 
 
 def _plan(

@@ -193,6 +193,15 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   allocation at any row count; DuckDB's share grows with the domain table's constraint
   indexes and is refused as `ComputeResourceError` after a full rollback (see the bulk
   publication section of `dev-notes/design/data-vertical.md`).
+- `market.budgeted(connection, budget, work)` is the DuckDB capacity boundary of bulk
+  publication, the core migration's market step and compaction's market copy: it lowers the
+  connection to the lease's share and reports an `OutOfMemoryException` (lowering the limit
+  included), or a COMMIT's `TransactionException` whose cause right after DuckDB's fixed
+  `Failed to commit: ` prefix is a failed allocation or block pin, as `ComputeResourceError`
+  caused by the DuckDB error. Any other failed COMMIT keeps its own error, including a
+  constraint violation whose quoted key happens to contain those words. A failed COMMIT has
+  already ended its transaction, so the rollback after it must never replace that error with
+  ROLLBACK's "no transaction is active"; market writers use `market.rollback` for that.
 - `source_identity` owns the content source ID (`aas-source-id-v1` over the raw
   addresses, sizes and hashes of the original files plus the output schema major)
   and the `sl:` link. Loader code and transform hashes go to `metadata.lineage`,

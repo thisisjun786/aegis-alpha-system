@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import sys
 from decimal import Decimal
+from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -22,7 +23,8 @@ import duckdb
 import pytest
 
 from aegis_alpha.application.cli import main
-from aegis_alpha.storage import market, publication, workspace
+from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
+from aegis_alpha.storage import market, migration, publication, workspace
 from aegis_alpha.storage.import_document import parse_import
 from aegis_alpha.storage.market import MARKET_CHECKSUMS, read_generation, verify_generation
 from aegis_alpha.storage.migration import (
@@ -37,6 +39,7 @@ from aegis_alpha.storage.migration import (
 from aegis_alpha.storage.state import complete_operation, prepare_operation
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace
+from tests.storage.capacity_support import PIN_BLOCK, FailingCommit
 from tests.storage.test_publication import document
 
 # The digests installations record. v1 is what every store made before v2 carries, so a
@@ -573,3 +576,83 @@ def test_plan_writes_nothing_and_names_the_recorded_checksums(
         == 0
     )
     assert json.loads(capsys.readouterr().out)["state"] == "current"
+
+
+def _exhausted_market_step(
+    monkeypatch: pytest.MonkeyPatch, observed: list[tuple[int, str]]
+) -> None:
+    """Make the market step's COMMIT fail as the rehearsal's did, recording DuckDB's limits."""
+
+    def exhausted(connection: duckdb.DuckDBPyConnection, installation_id: str, target: int) -> int:
+        failing = FailingCommit(connection)
+        try:
+            return market.upgrade_market(failing.borrowed, installation_id, target)
+        finally:
+            observed.extend(failing.settings)
+
+    monkeypatch.setattr(migration, "upgrade_market", exhausted)
+
+
+def test_an_exhausted_market_step_is_a_budget_error_under_the_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = v1_installation(tmp_path)
+    before = stored_v1_generation(home)
+    budget = ComputeBudget(Fraction(1), 64 * 1024 * 1024)
+    observed: list[tuple[int, str]] = []
+    with monkeypatch.context() as patch:
+        _exhausted_market_step(patch, observed)
+        with pytest.raises(ComputeResourceError, match="core schema migration") as caught:
+            migrate_core_schema(
+                home, to_version=2, backup_output=tmp_path / "backup", budget=budget
+            )
+    assert str(caught.value.__cause__) == PIN_BLOCK
+    # The step ran at the lease's DuckDB share, not at the installation's own limits,
+    # although the backup before it reopened the market at those.
+    assert observed == [(1, "48.0 MiB")]
+    # Nothing of the market step landed; the prepared intent makes the command finish it.
+    plan = plan_core_migration(home, to_version=2)
+    assert (plan["state"], plan["market_version"], plan["migration_phase"]) == (
+        "incomplete",
+        1,
+        "PREPARED",
+    )
+    report = migrate_core_schema(home, to_version=2, backup_output=None, budget=budget)
+    assert (report["migrated"], report["state"]) == (True, "current")
+    assert stored_v1_generation(home) == before
+
+
+def test_the_cli_names_an_exhausted_migration_instead_of_a_database_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = v1_installation(tmp_path)
+    _exhausted_market_step(monkeypatch, [])
+    backup = tmp_path / "backup"
+    assert (
+        main(["--home", str(home), "db", "migrate", "--to", "2", "--backup-output", str(backup)])
+        == 1
+    )
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error == "DuckDB cannot complete the core schema migration within admitted memory limits"
+
+
+def test_a_resumed_market_step_keeps_a_non_capacity_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = v1_installation(tmp_path)
+    assert kill_at(home, "_upgrade_market", tmp_path / "backup") == _KILLED
+    conflict = (
+        "TransactionContext Error: Failed to commit: PRIMARY KEY or UNIQUE constraint "
+        'violation: duplicate key "2"'
+    )
+
+    def refused(connection: duckdb.DuckDBPyConnection, installation_id: str, target: int) -> int:
+        return market.upgrade_market(
+            FailingCommit(connection, conflict).borrowed, installation_id, target
+        )
+
+    monkeypatch.setattr(migration, "upgrade_market", refused)
+    with pytest.raises(duckdb.TransactionException) as caught:
+        migrate_core_schema(home, to_version=2, backup_output=None)
+    assert str(caught.value) == conflict
+    assert plan_core_migration(home, to_version=2)["market_version"] == 1

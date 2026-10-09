@@ -20,7 +20,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
 from aegis_alpha.data.serialization import content_sha256
-from aegis_alpha.storage.market import MARKET_CHECKSUMS, upgrade_market, validate_market
+from aegis_alpha.storage.market import (
+    MARKET_CHECKSUMS,
+    budgeted,
+    upgrade_market,
+    validate_market,
+)
 from aegis_alpha.storage.paths import read_json
 from aegis_alpha.storage.sqlite import schema_checksums
 from aegis_alpha.storage.state import (
@@ -237,10 +242,13 @@ def _quiet(workspace: Workspace, *, excluding: str | None) -> None:
         )
 
 
-def _upgrade_market(workspace: Workspace) -> None:
+def _upgrade_market(workspace: Workspace, budget: ComputeBudget | None) -> None:
     from aegis_alpha.storage.workspace import store_info  # noqa: PLC0415
 
-    upgrade_market(workspace.market, workspace.installation_id, CORE_VERSION)
+    # Admission, and the backup's reopen after its checkpoint, use the installation's
+    # own limits; the lease's lower share is applied here, right before the transaction.
+    with budgeted(workspace.market, budget, "the core schema migration"):
+        upgrade_market(workspace.market, workspace.installation_id, CORE_VERSION)
     # The admitted identity is unchanged; only the version it records moved on.
     workspace._market_info = store_info(workspace.market)  # noqa: SLF001 -- same admission
 
@@ -260,11 +268,11 @@ def _write_receipt(workspace: Workspace) -> None:
     write_json(_receipt_path(workspace), receipt)
 
 
-def _finish(workspace: Workspace, request_hash: str) -> None:
+def _finish(workspace: Workspace, request_hash: str, budget: ComputeBudget | None) -> None:
     """Apply whatever the prepared intent still names, then complete it."""
     status = inspect_core_schema(workspace)
     if status.market_version < CORE_VERSION:
-        _upgrade_market(workspace)
+        _upgrade_market(workspace, budget)
     if status.state_version < CORE_VERSION:
         _upgrade_state(workspace)
     if (status.receipt_state_version, status.receipt_market_version) != (
@@ -322,7 +330,7 @@ def migrate_core_schema(
             )
         else:
             _quiet(workspace, excluding=MIGRATION_OPERATION)
-        _finish(workspace, request_hash)
+        _finish(workspace, request_hash, budget)
         return _report(workspace, migrated=True, backup_root=backup_root)
 
 

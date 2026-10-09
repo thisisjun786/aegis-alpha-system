@@ -27,6 +27,7 @@ from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
 from aegis_alpha.storage.backtest_requests import RESEARCH_EXECUTION_MODE, request_schema
+from aegis_alpha.storage.market import rollback
 from aegis_alpha.storage.rowset import rowset_hash
 from aegis_alpha.storage.run_schema import (
     BACKTEST_REQUEST_SCHEMA,
@@ -1517,7 +1518,7 @@ def _write_marker(workspace: Workspace, derived: _Derived, operation_id: str) ->
             )
         workspace.market.execute("COMMIT")
     except BaseException:
-        workspace.market.execute("ROLLBACK")
+        rollback(workspace.market)
         raise
 
 

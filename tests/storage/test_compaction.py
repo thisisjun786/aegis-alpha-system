@@ -8,12 +8,15 @@ import os
 import subprocess
 import sys
 from datetime import date
+from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+import duckdb
 import pyarrow as pa
 import pytest
 
+from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.storage import compaction
 from aegis_alpha.storage.backup import backup
 from aegis_alpha.storage.compaction import compact
@@ -24,6 +27,7 @@ from aegis_alpha.storage.source_library import retired_sources
 from aegis_alpha.storage.source_retirement import retire_sources
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace
+from tests.storage.capacity_support import PIN_BLOCK
 from tests.storage.promotion_support import add_source, at, bar, register_symbols
 from tests.storage.promotion_support import spec as promotion_spec
 from tests.storage.retirement_support import ROWS, commit, group, other_device, spec
@@ -31,7 +35,6 @@ from tests.storage.test_runs import BUDGET as RUN_BUDGET
 from tests.storage.test_runs import RESULT, intent, prepared
 
 if TYPE_CHECKING:
-    from aegis_alpha.compute_resources import ComputeBudget
     from aegis_alpha.storage.workspace import Workspace
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -161,6 +164,51 @@ def test_interrupted_compaction_preserves_original(
         compact(home, target)
     report = compact(home, tmp_path / "second")
     assert report["verification"] == before
+
+
+_CONFLICT = "TransactionContext Error: Failed to commit: PRIMARY KEY or UNIQUE constraint violation"
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [(PIN_BLOCK, ComputeResourceError), (_CONFLICT, duckdb.TransactionException)],
+)
+def test_compaction_copies_under_the_lease_and_names_exhaustion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    message: str,
+    expected: type[Exception],
+) -> None:
+    home = tmp_path / "aas"
+    _installation(home)
+    original = _files(home)
+    target = tmp_path / "compacted"
+    observed: list[object] = []
+
+    def exhausted(connection: duckdb.DuckDBPyConnection, *_args: object) -> None:
+        observed.append(
+            connection.execute(
+                "SELECT current_setting('threads'), current_setting('memory_limit')"
+            ).fetchone()
+        )
+        raise duckdb.TransactionException(message)
+
+    monkeypatch.setattr(compaction, "_copy_rows", exhausted)
+    budget = ComputeBudget(Fraction(1), 64 * 1024 * 1024)
+    with pytest.raises(expected) as caught:
+        compact(home, target, budget=budget)
+    # Only exhausted memory becomes a budget error, and it keeps DuckDB's own error.
+    failure = caught.value
+    if expected is ComputeResourceError:
+        assert str(failure) == (
+            "DuckDB cannot complete the market compaction within admitted memory limits"
+        )
+        failure = failure.__cause__
+    assert str(failure) == message
+    # The new market copied rows at the lease's DuckDB share, not the installation's limits.
+    assert observed == [(1, "48.0 MiB")]
+    assert read_json(target / "installation.json")["phase"] == "restore-incomplete"
+    assert _files(home) == original
 
 
 def test_compaction_root_must_be_new_and_outside_the_installation(tmp_path: Path) -> None:
