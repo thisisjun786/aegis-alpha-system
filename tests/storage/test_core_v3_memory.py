@@ -1,11 +1,11 @@
-"""The rehearsal's failed COMMIT, scaled down: a v2 key index outgrows a fixed DuckDB share.
+"""A failed v2 COMMIT, scaled down: a v2 key index outgrows a fixed DuckDB share.
 
-The rehearsal's 1999 promotion could not commit into a prices table of 133 million rows
-whose key indexes held 24.9 GiB, because DuckDB keeps those indexes in memory whole and
-they grow with every row the table has stored. v3 has no such index, so the same delta
-fits a share sized for the delta alone. This file builds a store of a few hundred
-thousand rows, which takes seconds, so it runs in every lane; it is its own file so the
-file-granular scheduler runs it beside the other v3 cases.
+On a large v2 store a promotion can fail to commit because DuckDB keeps the prices
+table's key indexes in memory whole, and they grow with every row the table has stored.
+v3 has no such index, so the same delta fits a share sized for the delta alone. This
+file builds a store of a few hundred thousand rows, which takes seconds, so it runs in
+every lane; it is its own file so the file-granular scheduler runs it beside the other
+v3 cases.
 """
 
 from __future__ import annotations
@@ -46,9 +46,9 @@ def test_the_rehearsal_failure_shape_publishes_once_the_store_is_v3(tmp_path: Pa
     """A delta that a large keyed table cannot take within a small share, v3 takes.
 
     At 300,000 stored rows the v2 key indexes alone outgrow a 48 MiB DuckDB share, so a
-    10,000-row publication is refused as a budget error (the rehearsal's failure at
-    133 million rows and 26 GiB, scaled down). The same store migrated to v3 within the
-    same lease publishes the same generation, and its marker is the planned one.
+    10,000-row publication is refused as a budget error (the same failure a much larger
+    store meets, scaled down). The same store migrated to v3 within the same lease
+    publishes the same generation, and its marker is the planned one.
     """
     path = tmp_path / "market.duckdb"
     _keyed_prices(path, 2, 300_000)

@@ -11,10 +11,10 @@ from unittest.mock import Mock
 
 import duckdb
 
-# What the rehearsal's promotion COMMIT raised when its index blocks no longer fit.
+# What a promotion COMMIT raises when its index blocks no longer fit DuckDB's memory limit.
 PIN_BLOCK: Final = (
     "TransactionContext Error: Failed to commit: failed to pin block of size 256.0 KiB "
-    "(26.2 GiB/26.2 GiB used)"
+    "(48.0 MiB/48.0 MiB used)"
 )
 
 
