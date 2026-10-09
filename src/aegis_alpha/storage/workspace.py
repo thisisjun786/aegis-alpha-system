@@ -29,6 +29,8 @@ from aegis_alpha.storage.paths import (
 if TYPE_CHECKING:
     import duckdb
 
+    from aegis_alpha.compute_resources import ComputeBudget
+
 _MAX_THREADS = 256
 # The core schema version aas init gives a new state and market store; None is the newest.
 # A store is never upgraded here: an existing one is validated at the version it records.
@@ -97,6 +99,11 @@ def _configure(root: Path) -> StoragePaths:
             create=True,
         )
     return paths
+
+
+def checkpoint(connection: duckdb.DuckDBPyConnection) -> None:
+    """Write the market's write-ahead log into its database file."""
+    connection.execute("CHECKPOINT")
 
 
 def market_connect(
@@ -212,6 +219,16 @@ class Workspace:
     market_resources: dict[str, object]
     _market_identity: tuple[Path, int, int]
     _market_info: dict[str, object]
+    # The compute lease admitted maintenance runs under, once its admission is done: the
+    # market's threads and memory never return above its DuckDB share (``reset_market_limits``,
+    # the checkpoint and the reopened handle of ``checkpointed_market``).
+    market_lease: ComputeBudget | None = None
+
+    def _within_lease(self, connection: duckdb.DuckDBPyConnection) -> None:
+        from aegis_alpha.storage.market import limit_duckdb  # noqa: PLC0415 -- market imports late
+
+        if self.market_lease is not None:
+            limit_duckdb(connection, self.market_lease)
 
     def _market_file(self) -> os.stat_result:
         observed = private_file(self.paths.market)
@@ -225,7 +242,8 @@ class Workspace:
         _ = self._market_file()
         if store_info(self.market) != self._market_info:
             raise ValueError("market identity changed during admitted maintenance")
-        self.market.execute("CHECKPOINT")
+        self._within_lease(self.market)
+        checkpoint(self.market)
         # Checkpoint legitimately changes metadata, but never the admitted file identity.
         admitted = self._market_file()
         self.market.close()
@@ -239,6 +257,7 @@ class Workspace:
                 raise ValueError("market file changed during admitted maintenance")
             connection = market_connect(self.paths.market, resources=self.market_resources)
             try:
+                self._within_lease(connection)
                 observed = self._market_file()
                 _verify_reopened_market(
                     connection,
@@ -252,14 +271,16 @@ class Workspace:
             self.market = connection
 
     def reset_market_limits(self) -> None:
-        """Return the market connection to the installation's own threads and memory limit.
+        """Return the market connection to the installation's limits within ``market_lease``.
 
-        A budgeted step lowers the connection to its lease's share and leaves it there; work
-        that must apply its lease's share afresh, whatever ran before it, resets first.
+        A budgeted step lowers the connection to its share and leaves it there; work that
+        must apply its share afresh, whatever ran before it, resets first. Under a lease the
+        reset ends at the lease's DuckDB share of the installation's limits, never above it.
         """
         resources = self.market_resources or {"threads": 2, "memory_limit": "512MB"}
         self.market.execute("SET threads = ?", [resources["threads"]])
         self.market.execute("SET memory_limit = ?", [resources["memory_limit"]])
+        self._within_lease(self.market)
 
     def close_market(self) -> None:
         """Close the current handle, including one reopened under maintenance."""

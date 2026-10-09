@@ -6,7 +6,7 @@
 소유 schema 파일이 정본이며, 테이블이 존재해도 호출자와 실행 흐름이 연결됐다는 뜻은 아니다.
 제품 책임은 [0015](../decisions/0015-research-engine-product-boundary.md)를 따른다.
 원천 자료실 자료를 typed generation으로 승격하는 명세·결정적 열·시간 규칙·숫자 규칙·품질 flag·
-공급자별 dataset·스키마 v2·원천 은퇴는 [데이터 수직 계약](data-vertical.md)이 소유한다.
+공급자별 dataset·core schema 버전·원천 은퇴는 [데이터 수직 계약](data-vertical.md)이 소유한다.
 [전환 표](#전환-계획과-기존-코드)에서 항목별 현재 상태와 남은 검증을 구분한다. 설치는 [0013](../decisions/0013-first-install-workspace.md),
 현재 실행 상태는 [architecture](../architecture.md), 실제 명령은 [operations](../operations.md)가 소유한다.
 
@@ -75,7 +75,9 @@ DuckDB는 내장 모드에서 한 읽기·쓰기 프로세스 안의 여러 thre
 
 SQLite FK의 연결별 활성화와 WAL의 제한은
 [FK 문서](https://www.sqlite.org/foreignkeys.html), [WAL 문서](https://www.sqlite.org/wal.html)를 따른다.
-DuckDB의 PK·UNIQUE·CHECK·NOT NULL·내부 FK는 지원되는 범위에서 사용한다.
+DuckDB의 PK·UNIQUE·CHECK·NOT NULL·내부 FK는 지원되는 범위에서 사용한다. DuckDB의 PK·UNIQUE 색인은
+메모리에 통째로 올라오므로 행 수가 무한히 자라는 market 도메인 테이블과 `quality_flags`에는 두지 않고,
+그 유일성은 writer와 감사가 지킨다(아래 market.duckdb 절).
 PostgreSQL의 exclusion constraint나 trigger를 DuckDB에도 있다고 가정하지 않는다.
 [DuckDB 제약](https://duckdb.org/docs/current/sql/constraints).
 
@@ -154,9 +156,13 @@ assertion ID와 당시 투영한 유효·지식 구간이 함께 고정돼 hash�
 공통 관측 열은 `generation_id`, `record_id`, `revision_id`, `supersedes_revision_id`,
 `op`(ASSERT/SUPERSEDE/TOMBSTONE), 경제적 유효일·기간, `available_at_us`,
 `revision_known_at_us`, `ingested_at_us`, `source_snapshot_id`, `source_row_hash`다.
-PK는 `(generation_id, record_id, revision_id)`이며 record_id는 도메인의 자연키로 만든
+행의 key는 `(generation_id, record_id, revision_id)`이며 record_id는 도메인의 자연키로 만든
 버전 있는 안정 ID다. 미래 수정은 기존 행 UPDATE 대신 새 revision으로 추가한다.
-도메인 테이블에서 `(record_id, revision_id)`도 UNIQUE다. supersedes는 같은 record의
+도메인 테이블에서 `(record_id, revision_id)`는 전역으로 유일하다. core schema v3는 이 유일성을 DuckDB
+key 색인이 아니라 두 writer와 감사로 강제한다. writer는 게시 트랜잭션 안에서 store를 claim하고, 새
+generation 안의 record마다 revision 하나와 같은 도메인의 다른 모든 generation에 없는 `(record_id,
+revision_id)`를 COMMIT 전에 확인한다. `aas db verify`는 generation별 행 수와 marker를, `--deep`은 도메인 전역
+중복을 감사한다([core schema 버전](data-vertical.md#core-schema-버전)). supersedes는 같은 record의
 revision을 가리키며 그 revision이 고정된 부모 generation chain에 속하는지 writer가 확인한다.
 `supersedes_revision_id`는 최초 ASSERT에서만 null이며 SUPERSEDE·TOMBSTONE에는 필수다.
 공개·수정 인지 시각은 근거가 없으면 null로 보존하되 PIT 사용을 차단한다.
@@ -172,7 +178,7 @@ revision을 가리키며 그 revision이 고정된 부모 generation chain에 �
 | `estimates` | instrument, metric, target_period, as_of, statistic, value/state, analyst_count nullable | 전망 대상 기간과 발표 시점을 분리. 출처·자격 미확인 추정치는 실행 입력 차단 |
 | `filings` (v2) | issuer, filing_id(accession·접수번호), form, filed_date, accepted_at nullable, period_end nullable | 재무 시점의 근거. accession 조인으로 `fundamentals`의 공개 시각을 정함 |
 | `classifications` (v2) | subject/subject_kind, scheme, code, label, effective_from/to | 분류 snapshot은 snapshot 시각부터 알려짐. 과거로 소급하지 않음 |
-| `quality_flags` (v2) | generation, record, revision, rule/version, flag, detail | revision 단위 품질 기록. 값을 바꾸지 않으며 generation manifest가 해시로 고정 |
+| `quality_flags` (v2) | generation, record, revision, rule/version, flag, detail | revision 단위 품질 기록. 값을 바꾸지 않으며 generation manifest가 해시로 고정. flag key 유일성과 revision 참조는 writer가 COMMIT 전에, 감사가 저장 뒤에 확인 |
 | `fx_rates`, `calendar_sessions` | base/quote·fixing_time·rate/state; calendar/venue·session_date·open/close/status | 환산 경로·휴장·조기 종료·time zone 버전 고정 |
 | `feature_values` | contract id/version/hash, input_bundle_hash, instrument, feature_time, value/state | 입력 핀과 계산 정의를 고정. warmup 미달을 0으로 채우지 않음 |
 | `result_commits` | run PK, operation_id UNIQUE, request_hash, manifest_hash, table_hashes/counts | 결과 전체의 DuckDB commit marker. state 완료와 맞아야 성공 결과로 노출 |
@@ -331,9 +337,9 @@ DB 내부 transaction만으로 세 파일의 snapshot이 일치한다고 주장�
 현재 루트에 덮어쓰지 않는다. 다른 위치로 이동해도 ID·논리 hash·입력 pin은 유지한다.
 복원된 DB의 논리 store_id는 유지하되 새 배포 인스턴스 식별자는 별도 발급해 경로·잠금을 재생성한다.
 
-core schema 업그레이드는 [스키마 v2 계약](data-vertical.md#스키마-v2)을 따른다. 설치 잠금과 검증된 백업 뒤에
-대상 schema version과 checksum을 기록하며, 이전 버전의 checksum 행도 남긴다. 새 설치본은 v2이고,
-v1 설치본은 `aas db migrate --to 2`로 올린다. SQLite와 DuckDB 중 하나만 성공하면 설치는
+core schema 업그레이드는 [core schema 버전 계약](data-vertical.md#core-schema-버전)을 따른다. 설치 잠금과 검증된 백업 뒤에
+대상 schema version과 checksum을 기록하며, 이전 버전의 checksum 행도 남긴다. 새 설치본은 v3이고,
+v1·v2 설치본은 `aas db migrate --to 3`으로 한 버전씩 올린다. SQLite와 DuckDB 중 하나만 성공하면 설치는
 migration-incomplete로 남고 앱은 그 설치본을 열지 않는다. 재개 또는 새 루트 백업 복원만 허용한다. 이미지 rollback이 DB downgrade를
 자동 해결하지 않는다. DB 파일 형식과 앱 schema의 호환성 검사는 각각 수행한다.
 
@@ -344,9 +350,9 @@ migration-incomplete로 남고 앱은 그 설치본을 열지 않는다. 재개 
 
 | 단계 | 현재 상태와 소유 코드 | 남은 작업과 완료 기준 |
 | --- | --- | --- |
-| L1 저장소 기반 | 로컬 경로 구현: `storage/paths.py`, `workspace.py`, `locks.py`, `sqlite.py`, 세 schema 파일. `tests/storage/test_workspace.py`에 초기화·잠금·정체성 거부 사례 | 현재 초기화·검증 경로 유지. core schema v2 업그레이드는 `storage/migration.py`·`aas db migrate`(`tests/storage/test_migration.py`). 서비스 소유권 인계는 미구현이며 별도 실패·복구 계약 검증 필요 |
+| L1 저장소 기반 | 로컬 경로 구현: `storage/paths.py`, `workspace.py`, `locks.py`, `sqlite.py`, 세 schema 파일. `tests/storage/test_workspace.py`에 초기화·잠금·정체성 거부 사례 | 현재 초기화·검증 경로 유지. core schema 업그레이드(v3까지)는 `storage/migration.py`·`aas db migrate`(`tests/storage/test_migration.py`). 서비스 소유권 인계는 미구현이며 별도 실패·복구 계약 검증 필요 |
 | L2 전략·상태 | bundle 등록·로드와 영수증 구현: `strategies.py`, `strategy_import.py`, `state.py`. CLI는 등록·목록 제공; lineage·원래 성과용 schema 존재 | 원래 성과·비교 조건의 전체 입력 경로, 실행 입력 bundle·run 소비자 연결 필요. schema만으로 DB 재실행 완료를 주장하지 않음 |
-| L3 시장·publication | 저장·게시·승격 경로 구현, 일부 dataset의 매퍼 미구현. typed JSON import, generation·revision 조회, 중단 게시 재개는 `import_document.py`, `market.py`, `publication.py`(`tests/storage/test_market.py`, `test_publication.py`). staging 테이블의 대량 generation 게시와 증분 검증은 `bulk_generation.py`(`tests/storage/test_bulk_generation.py`). identity 등록·불투명 ID 발급·chunked identity/universe 문서는 `storage/identity.py`·`membership_pins.py`·`universe.py`, KR·US 등록은 `kr_identity.py`·`us_identity.py`(`tests/storage/test_identity_*.py`, `test_kr_identity.py`, `test_us_identity.py`, `test_universe.py`). ordered pin·cutover·grant·flag 제외를 해석하는 predicate-pushdown reader는 `storage/read_heads.py`와 작업 공간 진입점 `market_inputs.load_pinned_heads`(`tests/storage/test_read_heads.py`), 조정 가격 유도는 `adjusted_prices.py`(`tests/storage/test_us_actions.py`). 원천 자료실에서의 승격(명세, 매퍼 레지스트리, 시간·숫자 규칙, head 비교, quality flag, 복구·검증)은 `storage/promotion/`과 `aas data promote`(`tests/storage/test_promotion_*.py`, `test_time_rules.py`, `test_decimal_rules.py`)이고, 공급자별 매퍼가 [dataset 카탈로그](data-vertical.md#dataset-카탈로그)의 dataset을 만든다(`storage/promotion/mappers/`, `kr_prices.py`, `calendar_refresh.py`; `tests/storage/test_kr_prices.py`, `test_us_prices.py`, `test_us_actions.py`, `test_macro_fx.py`, `test_classifications.py`, `test_sec_promotion.py`, `test_dart_promotion.py`, `test_calendar_*.py`). 카탈로그는 `storage/dataset_catalog.py`이고 `aas data datasets`가 돌려준다(`tests/tools/test_dataset_catalog.py`). 설치본 밖 legacy 원본의 `raw/`·원천 자료실 편입은 `aas import legacy`(`storage/legacy_import/`, `tests/storage/test_legacy_import.py`) | 카탈로그에서 매퍼가 `없음`인 dataset(`actions.us.eodhd`·`actions.kr.eodhd`의 Qveris splits·dividends, `status.kr.kind`의 KIND 상장 상태)과 `filings.kr.dart`의 DART 공시 목록 매퍼 `dart.list`는 Linear AAS-77이다. 이 매퍼들(DV-413~416), 원천 은퇴와 compact(Linear AAS-47, DV-33·34·41·379), 기본 digest 검증과 `--deep` 전체 검증(AAS-48, DV-417), 수천만 행 테이블의 유지보수 게시 할당(AAS-54, DV-75)은 [데이터 수직 대응표](data-vertical.md#계약과-테스트-대응표)의 `예정` 행이다. 실제 store의 승격 실행은 운영 전환(AAS-51)의 일이다. 기존 `data/catalog_access.py`·`pinned_prices.py`는 L6의 구경로다 |
+| L3 시장·publication | 저장·게시·승격 경로 구현, 일부 dataset의 매퍼 미구현. typed JSON import, generation·revision 조회, 중단 게시 재개는 `import_document.py`, `market.py`, `publication.py`(`tests/storage/test_market.py`, `test_publication.py`). staging 테이블의 대량 generation 게시와 증분 검증은 `bulk_generation.py`(`tests/storage/test_bulk_generation.py`). 두 writer의 게시 트랜잭션 검사와 저장 뒤 감사는 `market_integrity.py`(`tests/storage/test_market_integrity.py`), key 색인 없는 core v3와 그 재구축은 `market_schema.py`·`migration.py`(`tests/storage/test_core_v3.py`, `test_core_v3_memory.py`). identity 등록·불투명 ID 발급·chunked identity/universe 문서는 `storage/identity.py`·`membership_pins.py`·`universe.py`, KR·US 등록은 `kr_identity.py`·`us_identity.py`(`tests/storage/test_identity_*.py`, `test_kr_identity.py`, `test_us_identity.py`, `test_universe.py`). ordered pin·cutover·grant·flag 제외를 해석하는 predicate-pushdown reader는 `storage/read_heads.py`와 작업 공간 진입점 `market_inputs.load_pinned_heads`(`tests/storage/test_read_heads.py`), 조정 가격 유도는 `adjusted_prices.py`(`tests/storage/test_us_actions.py`). 원천 자료실에서의 승격(명세, 매퍼 레지스트리, 시간·숫자 규칙, head 비교, quality flag, 복구·검증)은 `storage/promotion/`과 `aas data promote`(`tests/storage/test_promotion_*.py`, `test_time_rules.py`, `test_decimal_rules.py`)이고, 공급자별 매퍼가 [dataset 카탈로그](data-vertical.md#dataset-카탈로그)의 dataset을 만든다(`storage/promotion/mappers/`, `kr_prices.py`, `calendar_refresh.py`; `tests/storage/test_kr_prices.py`, `test_us_prices.py`, `test_us_actions.py`, `test_macro_fx.py`, `test_classifications.py`, `test_sec_promotion.py`, `test_dart_promotion.py`, `test_calendar_*.py`). 카탈로그는 `storage/dataset_catalog.py`이고 `aas data datasets`가 돌려준다(`tests/tools/test_dataset_catalog.py`). 설치본 밖 legacy 원본의 `raw/`·원천 자료실 편입은 `aas import legacy`(`storage/legacy_import/`, `tests/storage/test_legacy_import.py`) | 카탈로그에서 매퍼가 `없음`인 dataset(`actions.us.eodhd`·`actions.kr.eodhd`의 Qveris splits·dividends, `status.kr.kind`의 KIND 상장 상태)과 `filings.kr.dart`의 DART 공시 목록 매퍼 `dart.list`는 Linear AAS-77이다. 이 매퍼들(DV-413~416), 원천 은퇴와 compact(Linear AAS-47, DV-33·34·41·379), 기본 digest 검증과 `--deep` 전체 검증(AAS-48, DV-417)은 [데이터 수직 대응표](data-vertical.md#계약과-테스트-대응표)의 `예정` 행이다. 실제 store의 승격 실행은 운영 전환(AAS-51)의 일이다. 기존 `data/catalog_access.py`·`pinned_prices.py`는 L6의 구경로다 |
 | L4 수집·실행 | 완료. 공급자 수집은 모두 내장 설치본에 기록한다. Qveris 일간·이력 수집과 원천 적재(`aas collect qveris`)는 `application/qveris_*.py`·`storage/qveris_import.py`(`tests/application/test_qveris_*.py`, `tests/data/test_qveris_*.py`, `tests/storage/test_qveris_import.py`), KR 공시·상장 수집(`aas collect dart`·`aas collect kind`)은 `storage/kr_collection.py`, SEC·FRED/ALFRED 수집(`aas collect sec`·`aas collect fred`)은 `storage/sec_collection.py`·`fred_collection.py`이며, 모두 `collection_ledger.py`의 job·attempt·usage 기록, `raw/` 보존, 내용 원천 commit을 쓴다(`tests/storage/test_kr_collection.py`, `test_us_collection.py`, `test_collection_ledger.py`). 하루 한 번의 수집·적재·KR identity 증분·dataset chain 이어 붙이기·보고는 단일 writer로 도는 `aas maintain`(`application/maintain*.py`, `storage/maintain_identity.py`·`maintain_promotion.py`, 설치 receipt `application/install_receipt.py`, unit `config/systemd/aas-maintain.*`; `tests/application/test_maintain*.py`, `tests/storage/test_maintain_promotion.py`)이다. 저장 전략→고정 입력→계산→봉투는 `application/backtest_prepare.py`·`aas prepare`가 SELECT-only로 연결하고, strict 경로는 `read_heads`의 exact head binding, identity·universe pin, 거시·FX 입력을 쓴다(`tests/application/test_backtest_prepare.py`, `test_prepare_cli.py`, `test_strict_head_inputs.py`). 연구 경로는 canonical 가격 pin에서 패널을 만든다(`tests/application/test_research_prices.py`). 거시 입력과 계좌 통화가 아닌 가격은 선언의 `macro`·`fx_conversions` grant로 읽고 run이 그 grant와 읽기를 기록한다(`engine/fx_conversion.py`; `tests/engine/test_fx_conversion.py`, `tests/application/test_research_grants.py`). 전략 원본은 `aas strategy promote`가 레지스트리로 등록한다(`storage/strategy_registry.py`). 봉투 회계는 `aas backtest`, run 확정은 `storage/run_schema.py`·`backtest_requests.py`를 소비하는 `application/run_backtest.py`·`aas run`(요청 등록·`open_run`·잠금 없는 계산·`commit_run`·run ID 조회, 명시적 `aas db run-install` 필요; `tests/application/test_run_backtest.py`) | 실제 store에서의 예약 실행 전환(운영 전환 AAS-51), strict 과거 일정의 달력 사전 지식 규칙(AAS-76), 결과 복원 연결. `collection/`, `data/`의 FMP 도구와 `application/daily_collection.py`는 L6의 구경로다. 준비·실행 출력은 `certified=false`다 |
 | L5 설치·백업 | native CLI와 선택적 단일 이미지, `storage/backup.py`의 일관 백업·새 루트 복원 구현. `tests/storage/test_backup.py`에 합성 복원·손상 거부 사례 | 0013의 상시 앱·소켓·예약 실행, 자동 업그레이드, artifact 게시·실제 자료 이전은 미완료. 구현·게시·운영 검증을 각각 기록 |
 | L6 구경로 제거 | PostgreSQL adapter·Alembic chain·Parquet reader와 `legacy` 추가 의존성 유지 | 앞 단계에서 모든 호출자와 실패 계약을 대체한 뒤 미사용 코드·의존성·관련 테스트·CI 선택을 함께 정리. 현재 제거 완료로 표시하지 않음 |
@@ -381,7 +387,7 @@ migration-incomplete로 남고 앱은 그 설치본을 열지 않는다. 재개 
 측정 없이 처리량이나 기존 설계보다 빠르다고 주장하지 않는다. 전체 시장 도메인은 유지하며
 특정 전략만 통과하도록 가격 몇 종목으로 데이터 모델을 축소하지 않는다.
 
-현재 구현은 빈 설치·core schema v2 업그레이드·전략 원문 저장과 전략 레지스트리·typed market
+현재 구현은 빈 설치·core schema v3까지의 업그레이드·전략 원문 저장과 전략 레지스트리·typed market
 generation·시점 조회·게시 재개·일관된 백업과 새 루트 복원, 관례·pin 문서 등록, 공급자 수집과 원천 적재,
 원천 자료실에서 [dataset 카탈로그](data-vertical.md#dataset-카탈로그)의 dataset으로의 승격, identity·universe
 등록, 수집에서 승격된 head까지 잇는 하루 유지보수 실행, exact pin reader, 저장 입력의 준비와 봉투 회계, 그리고 그 둘을 이어 run으로 확정하고 run ID로 다시

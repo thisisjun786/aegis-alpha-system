@@ -285,9 +285,20 @@ PRICE_FIELDS = ("fields", "VARCHAR")
 PRICE_FIELD_VALUES = ("ohlcv", "close")
 
 
-def domain_ddl(name: str, columns: tuple[tuple[str, str], ...], *, fields: bool = False) -> str:
-    checks = """
- PRIMARY KEY(generation_id,record_id,revision_id), UNIQUE(record_id,revision_id),
+_DOMAIN_KEYS = """
+ PRIMARY KEY(generation_id,record_id,revision_id), UNIQUE(record_id,revision_id),"""
+
+
+def domain_ddl(
+    name: str, columns: tuple[tuple[str, str], ...], *, fields: bool = False, keys: bool = True
+) -> str:
+    """One domain table's CREATE text; ``keys=False`` is its v3 shape, without key indexes.
+
+    With ``keys`` the text is byte for byte what v1 and v2 recorded, so their checksums
+    keep matching; v3 leaves out only the key line, so every other rule stays the same.
+    """
+    checks = _DOMAIN_KEYS if keys else ""
+    checks += """
  FOREIGN KEY(generation_id) REFERENCES market_generations(generation_id),
  CHECK(op IN ('ASSERT','SUPERSEDE','TOMBSTONE')),
  CHECK((op='ASSERT' AND supersedes_revision_id IS NULL) OR
@@ -366,7 +377,111 @@ V2_DDL = (
     )
     + QUALITY_FLAGS_DDL
 )
+
+# v3 keeps every rule of v2 except the key indexes: the domain tables' PRIMARY KEY and
+# UNIQUE(record_id, revision_id), and quality_flags' key. Those indexes are held in memory
+# whole and grow with every row a table has ever stored, so a publication into a large
+# table could not commit within any fixed DuckDB share. The rules they enforced are now
+# checked inside every publication transaction (market_integrity) and audited at rest.
+QUALITY_FLAGS_V3_DDL = QUALITY_FLAGS_DDL.replace(
+    ",\n PRIMARY KEY(generation_id,record_id,revision_id,rule_id,rule_version,flag)", ""
+)
+if QUALITY_FLAGS_V3_DDL == QUALITY_FLAGS_DDL:
+    raise RuntimeError("the v3 quality_flags text must leave out exactly the v2 key")
+_QUALITY_FLAGS_COLUMNS = (
+    ("generation_id", "VARCHAR"),
+    ("record_id", "VARCHAR"),
+    ("revision_id", "VARCHAR"),
+    ("rule_id", "VARCHAR"),
+    ("rule_version", "VARCHAR"),
+    ("flag", "VARCHAR"),
+    ("detail", "VARCHAR?"),
+)
+# The domains v3 rebuilds, as they stood when it was written. The list is fixed, so a
+# domain a later version adds never changes v3's text or its checksum.
+_V3_DOMAINS = (
+    "prices",
+    "corporate_actions",
+    "instrument_status",
+    "fundamentals",
+    "macro_observations",
+    "estimates",
+    "fx_rates",
+    "calendar_sessions",
+    "feature_values",
+    "filings",
+    "classifications",
+)
+if tuple(DOMAINS)[: len(_V3_DOMAINS)] != _V3_DOMAINS:
+    raise RuntimeError("v3 rebuilds the domains that stood before it, in catalog order")
+
+
+def _compared(column: str, kind: str) -> str:
+    """The column as the rebuild compares it: by its own value, exactly.
+
+    A text is compared by its bytes, whatever collation the connection defaults to, and
+    a DOUBLE by its shortest round-trip text, because DuckDB's equality holds -0.0 equal
+    to 0.0. Every other type the domains use compares exactly as itself.
+    """
+    quoted = f'"{column}"'
+    base = kind.rstrip("?")
+    if base == "VARCHAR":
+        return f"encode({quoted})"
+    if base == "DOUBLE":
+        return f"CAST({quoted} AS VARCHAR)"
+    return quoted
+
+
+def _rebuild(name: str, create: str, columns: tuple[tuple[str, str], ...]) -> str:
+    """Rebuild one table under ``create`` with every row copied and the copy checked.
+
+    The old table is renamed aside, the new one takes its name, the rows are copied by
+    an explicit column list (CREATE TABLE AS would drop every constraint), and the
+    statement after the copy fails the transaction unless the new table holds the old
+    one's rows exactly: a POSITIONAL JOIN pairs the n-th row of each, and any pair that
+    differs in any column, or a row without a partner, refuses the copy. The copy keeps
+    the old table's order because the connection preserves insertion order, which V3_DDL
+    requires first. Every value is compared, never a hash of it, and the comparison
+    streams, holding no table in memory. Only then is the old table dropped.
+    """
+    aside = f'"{name}_v2_rebuild"'
+    listed = ",".join(f'"{column}"' for column, _ in columns)
+    new = ",".join(f"{_compared(c, kind)} AS n{i}" for i, (c, kind) in enumerate(columns))
+    old = ",".join(f"{_compared(c, kind)} AS o{i}" for i, (c, kind) in enumerate(columns))
+    differs = " OR ".join(f"n{i} IS DISTINCT FROM o{i}" for i in range(len(columns)))
+    return (
+        f'ALTER TABLE "{name}" RENAME TO {aside};\n'  # noqa: S608 -- code-owned schema
+        f"{create.strip()}\n"
+        f'INSERT INTO "{name}" ({listed}) SELECT {listed} FROM {aside};\n'
+        f'SELECT CASE WHEN EXISTS (SELECT 1 FROM (SELECT {new} FROM "{name}") '
+        f"POSITIONAL JOIN (SELECT {old} FROM {aside}) WHERE {differs}) "
+        f"THEN error('the core schema v3 rebuild of {name} changed its rows') END;\n"
+        f"DROP TABLE {aside};\n"
+    )
+
+
+# Each rebuild pairs the copied rows with the old ones by position, so a connection that
+# may reorder an INSERT ... SELECT is refused before any table is touched.
+_V3_ORDERED = (
+    "SELECT CASE WHEN NOT current_setting('preserve_insertion_order') "
+    "THEN error('the core schema v3 rebuild needs preserve_insertion_order') END;\n"
+)
+
+
+def _v3_ddl() -> str:
+    """Every v3 domain table and quality_flags rebuilt in the v3 shape, in catalog order."""
+    parts = [_V3_ORDERED]
+    for name in _V3_DOMAINS:
+        columns = DOMAINS[name]
+        fields = name == "prices"
+        listed = COMMON + columns + ((PRICE_FIELDS,) if fields else ())
+        parts.append(_rebuild(name, domain_ddl(name, columns, fields=fields, keys=False), listed))
+    parts.append(_rebuild("quality_flags", QUALITY_FLAGS_V3_DDL, _QUALITY_FLAGS_COLUMNS))
+    return "".join(parts)
+
+
+V3_DDL = _v3_ddl()
 # Each version's text in order; version N's schema_migrations checksum is SHA-256 of
 # MIGRATIONS[N - 1]. A fresh store applies all of them in one transaction, so a migrated
 # store and a new one hold the same objects and the same receipts.
-MIGRATIONS = (DDL, V2_DDL)
+MIGRATIONS = (DDL, V2_DDL, V3_DDL)

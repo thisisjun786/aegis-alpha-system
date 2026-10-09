@@ -30,6 +30,7 @@ from aegis_alpha.storage.market import (
     upgrade_market,
     validate_market,
 )
+from aegis_alpha.storage.market_integrity import check_core_catalog
 from aegis_alpha.storage.paths import read_json
 from aegis_alpha.storage.sqlite import schema_checksums
 from aegis_alpha.storage.state import (
@@ -368,6 +369,7 @@ def plan_core_migration(
 
     _target(to_version)
     with open_workspace(home, migrating=True, require_strategies=False) as workspace:
+        workspace.market_lease = budget
         status = inspect_core_schema(workspace)
         pending = _pending_steps(status, to_version)
         carried, blocking = _pending_operations(
@@ -425,8 +427,8 @@ def _quiet(
 
 
 def _upgrade_market(workspace: Workspace, budget: ComputeBudget | None, step: int) -> None:
-    # Admission, and the backup's reopen after its checkpoint, use the installation's
-    # own limits; the lease's lower share is applied here, right before the transaction.
+    # Admission uses the installation's own limits; from then on the workspace holds the
+    # market within the lease's share (``market_lease``), applied again here.
     with budgeted(workspace.market, budget, "the core schema migration"):
         upgrade_market(workspace.market, workspace.installation_id, step)
 
@@ -469,6 +471,8 @@ def _write_receipt(workspace: Workspace) -> None:
 
 def _finish(workspace: Workspace, step: int, budget: ComputeBudget | None) -> None:
     """Apply whatever the step's prepared intent still names, then complete it."""
+    from aegis_alpha.storage.verification import verify_publications  # noqa: PLC0415
+
     status = inspect_core_schema(workspace)
     if status.migration_operation != step_operation(step) or status.state != "incomplete":
         raise CoreSchemaError("core_schema_migration_incomplete", "the step has no prepared intent")
@@ -477,6 +481,10 @@ def _finish(workspace: Workspace, step: int, budget: ComputeBudget | None) -> No
     # Also when an earlier run's COMMIT already moved the market: the next step's backup
     # compares the market with what admission recorded.
     _readmit_market(workspace, step)
+    # The landed market holds exactly the catalog an empty store of the step holds, or the
+    # step stays prepared; its backup's verification checked the catalog before it.
+    with budgeted(workspace.market, budget, "the core schema migration"):
+        check_core_catalog(workspace.market)
     if status.state_version < step:
         _upgrade_state(workspace, step)
     if (status.receipt_state_version, status.receipt_market_version) != (step, step):
@@ -484,6 +492,11 @@ def _finish(workspace: Workspace, step: int, budget: ComputeBudget | None) -> No
     checked = inspect_core_schema(workspace)
     if _remaining(checked, step) != ["complete"]:
         raise CoreSchemaError("core_schema_migration_incomplete", "a step did not land")
+    # The proof that the landed rows are the published ones: every committed generation
+    # rehashed against its recorded digest and the market audited for duplicate keys,
+    # however the step was reached (this run's COMMIT or an earlier one's) and whatever
+    # ``deep`` the backup used. The step stays prepared until it passes.
+    verify_publications(workspace, budget=budget, deep=True)
     complete_operation(workspace.state, step_operation(step), _request_hash(workspace, step))
 
 
@@ -523,13 +536,19 @@ def migrate_core_schema(
     ``backup_output``: its backup is taken and verified before its intent, and the intent
     records the backup manifest's SHA-256. A prepared step is finished from its intent
     without a second backup. Nothing is written before the target, the backup
-    destinations and the quiet installation are all checked.
+    destinations and the quiet installation are all checked. A step completes only once
+    every committed publication's rows rehash to their recorded digests (``deep`` is
+    always used for that proof; the flag sets only the backup's verification).
     """
     from aegis_alpha.storage.backup import backup_workspace, manifest_sha256  # noqa: PLC0415
     from aegis_alpha.storage.workspace import open_workspace  # noqa: PLC0415
 
     _target(to_version)
     with open_workspace(home, writable=True, migrating=True) as workspace:
+        # Everything after admission (the carry checks, the backup's verification, its
+        # checkpoint and reopened handle, each step) stays within the lease's DuckDB share.
+        workspace.market_lease = budget
+        workspace.reset_market_limits()
         status = inspect_core_schema(workspace)
         pending = _pending_steps(status, to_version)
         if not pending:

@@ -23,7 +23,9 @@ publication transaction, and ``verification.verify_workspace`` audits stored row
   ``(record_id, revision_id)``. That last check builds the delta's keys and scans the
   whole domain; it is never narrowed to the dataset or the chain.
 - ``check_generation_flags`` holds a generation's quality flags to one row per key and
-  to revisions the generation stores, before COMMIT.
+  to revisions the generation stores, before COMMIT. The bulk writer runs it after it
+  inserts the flags under the new generation's ID. That INSERT is the only write to
+  quality_flags a publication makes, so no other generation's flags can change.
 - ``audit_market`` is the at-rest audit: the core catalog's exact shape, every
   generation's rows counted per domain both ways against its marker, every quality
   flag's reference, and with ``deep`` the domain-wide and flag key duplicates.

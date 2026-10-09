@@ -30,11 +30,26 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   publishes by). Never add a hand-written check of manifest fields beside it. A replan
   that does not fit the lease is `ComputeResourceError`, never a carry; the replan
   applies the lease's share from the installation's limits (`reset_market_limits`), not
-  from what a verification left, so every check decides alike. `--plan` runs
-  under the lease and says each carry was proven by replanning. `backup_workspace`
+  from what a verification left, so every check decides alike. After admission the
+  migration holds the market within the lease (`Workspace.market_lease`): the reset, the
+  backup's checkpoint and its reopened handle never return above the lease's DuckDB
+  share. `--plan` runs under the lease and says each carry was proven by replanning. `backup_workspace`
   rechecks the names it is given and every other backup refuses every pending operation.
   The v1 DDL bytes are a recorded fact, so v1 is built from the v1 domains alone. A v1 store
   stays usable; writes that need a v2 table or a close-only price name the migration.
+  The current version is v3: v2 without the eleven domain tables' `PRIMARY KEY` and
+  `UNIQUE(record_id, revision_id)` and `quality_flags`' key, whose indexes DuckDB holds in
+  memory whole; every other column, NOT NULL, CHECK, default and `FOREIGN KEY(generation_id)`
+  stays. `market_schema.V3_DDL` is built separately from the fixed v3 domain list, so the v1
+  and v2 texts and checksums never move. Its step renames each of the twelve tables aside,
+  creates the v3 table, copies by explicit column list (never CREATE TABLE AS, which drops
+  constraints), compares every copied value by position and refuses the transaction on any
+  difference (and a connection without `preserve_insertion_order` before touching a table),
+  then drops the old table, all in one DuckDB transaction. A step completes only after the
+  landed catalog equals an empty store of its version and every committed generation
+  rehashes deep with the duplicate audit; until then it stays prepared. State v3 changes no
+  table. A v2 store stays usable, but its key indexes grow with every stored row, so large
+  publications belong on v3. No hash takes the DDL, an index or the core version.
   `prices.fields` defaults to `ohlcv`, an OHLCV row reads and hashes in its v1 shape,
   and a generation holding a `close` row hashes `fields` for every row.
 - `verify_workspace`, backup, restore and compact compare stored rows with their recorded
@@ -81,8 +96,10 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   Inside the transaction no row may name the generation before its insert, and after it
   the planned count, one revision per record and no `(record_id, revision_id)` held by any
   other generation of the domain (a scan of the whole domain, not the chain) are checked.
-  A promotion's companion also refuses repeated flag keys, flags of unstored revisions
-  and flags that differ from the manifest's count and digest before COMMIT.
+  A publication's `BulkFlags` are inserted by the writer itself under the new generation's
+  ID, its only write to `quality_flags`; repeated flag keys, flags of unstored revisions
+  and flags that differ from the reviewed count and digest are refused before COMMIT.
+  No caller code runs inside the transaction.
 - Backup takes SQLite snapshots and closes DuckDB after checkpoint while retaining
   installation admission. Restore targets a new root; secrets are excluded. `backup.json`
   lists every `raw/` and `runs/` file, so it is read with its own bound
@@ -143,7 +160,7 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   natural keys) are computed in Python in bounded key-ordered batches. A plan writes nothing; an
   apply retains spec, request and manifest in `raw/`, records a `promotion` intent whose payload
   is the manifest, commits marker, rows and `quality_flags` in one DuckDB transaction through
-  `publish_generation_bulk(companion=...)`, then writes the catalog. `aas db verify` sends a
+  `publish_generation_bulk(flags=BulkFlags(...))`, then writes the catalog. `aas db verify` sends a
   promoted chain to `engine.verify_promotion` instead of the import-document verifier, and
   `db recover` finishes a `promotion` intent only when the retained spec recomputes its manifest.
 - `calendar_declaration` owns the `aas-calendar-declaration-v1` document (regimes, closed
@@ -244,9 +261,12 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   no longer matches is `PlanChangedError`, and an existing marker is reused only for identical
   content. `verify_generation_bulk` checks every chain link from recorded hashes and rehashes
   the requested generation; `deep=True` rehashes every delta. Its Python batches fit the
-  allocation at any row count; DuckDB's share grows with the domain table's constraint
-  indexes and is refused as `ComputeResourceError` after a full rollback (see the bulk
-  publication section of `dev-notes/design/data-vertical.md`).
+  allocation at any row count. On v3 DuckDB's share follows the delta's sort and join
+  working set, which may spill, not the table's stored rows (on v2 the key indexes grow with
+  them); the domain-wide duplicate check scans the domain, so its time grows with it. A
+  publication that does not fit is refused as `ComputeResourceError` after a full rollback;
+  `memory_limit` bounds DuckDB's allocator, not the process RSS (see the bulk publication
+  section of `dev-notes/design/data-vertical.md`).
 - `market.budgeted(connection, budget, work)` is the DuckDB capacity boundary of bulk
   publication, the core migration's market step and compaction's market copy: it lowers the
   connection to the lease's share and reports an `OutOfMemoryException` (lowering the limit

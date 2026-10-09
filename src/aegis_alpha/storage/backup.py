@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, cast
 
 from aegis_alpha.data.descriptor_tree import DescriptorTree, DescriptorTreeError
 from aegis_alpha.storage.locks import private_directory, private_file, require_outside_checkout
+from aegis_alpha.storage.market import budgeted
 from aegis_alpha.storage.paths import DEFAULT_PATHS, load_paths, read_json, resolve_home
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import Workspace, open_workspace, write_json
@@ -196,7 +197,10 @@ def backup_workspace(
         with DescriptorTree.open_path(target) as tree:
             tree.fsync_file(path.name)
         files[path.name] = _file_hash(path)
-    with workspace.checkpointed_market():
+    with (
+        budgeted(workspace.market, budget, "the backup's checkpoint"),
+        workspace.checkpointed_market(),
+    ):
         files["market.duckdb"] = _copy_file(workspace.paths.market, target / "market.duckdb")
     copy_tree(workspace.paths.raw, target / "raw", files, "raw/")
     copy_tree(workspace.paths.runs, target / "runs", files, "runs/")

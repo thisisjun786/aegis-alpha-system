@@ -12,7 +12,8 @@ import math
 import random
 import struct
 import tracemalloc
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
@@ -213,6 +214,26 @@ def _stage(
             [[row.get(n, "ohlcv" if n == "fields" else None) for n, _ in columns] for row in rows],
         )
     return name
+
+
+@contextmanager
+def inside_publication(hook: Callable[[str], None]) -> Iterator[None]:
+    """Run ``hook(generation_id)`` inside each bulk publication, after its rows are checked.
+
+    The writer runs no caller code in its transaction, so a test reaches that point by
+    wrapping the last row check it makes before inserting flags and committing.
+    """
+    actual = bulk_generation.check_inserted_generation
+
+    def checked(
+        connection: duckdb.DuckDBPyConnection, domain: str, generation_id: str, row_count: int
+    ) -> None:
+        actual(connection, domain, generation_id, row_count)
+        hook(generation_id)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(bulk_generation, "check_inserted_generation", checked)
+        yield
 
 
 def _request(
@@ -650,8 +671,8 @@ def test_streaming_memory_stays_within_the_admitted_allowance(tmp_path: Path) ->
         tracemalloc.stop()
     assert plan.marker["row_count"] == rows
     assert peak <= budget.available_bytes
-    # The constraint indexes the insert maintains are DuckDB's share, sized separately;
-    # the lowered limit stays on a connection, so the larger allocation takes a new one.
+    # DuckDB's share (the insert, its checks and COMMIT) is sized separately; the
+    # lowered limit stays on a connection, so the larger allocation takes a new one.
     connection.close()
     connection = duckdb.connect(str(tmp_path / "market.duckdb"))
     marker = publish_generation_bulk(
@@ -708,10 +729,11 @@ def test_commit_exhaustion_rolls_back_as_a_budget_error(tmp_path: Path) -> None:
 
     DuckDB reports that exhaustion as a ``TransactionException``, not an OOM, once the
     insert itself fit. The limits sweep upward from where the insert fails to where
-    the COMMIT succeeds, so the band between is crossed whatever its exact edges.
+    the COMMIT succeeds, so the band between is crossed whatever its exact edges. Only
+    a v2 store still has key indexes for a COMMIT to merge.
     """
     path = tmp_path / "market.duckdb"
-    connection = _store(path)
+    connection = _store(path, version=2)
     _staged_prices(connection, 100_000)
     roomy = ComputeBudget(Fraction(1), 1024 * 1024 * 1024)
     first = publish_generation_bulk(
@@ -762,6 +784,21 @@ def test_commit_exhaustion_rolls_back_as_a_budget_error(tmp_path: Path) -> None:
         PIN_BLOCK,
         "TransactionContext Error: Failed to commit: could not allocate block of size 256.0 KiB",
         "TransactionContext Error: Failed to commit: failed to allocate data of size 512.0 KiB",
+        # The allocator's own message, capitalised.
+        (
+            "TransactionContext Error: Failed to commit: Failed to allocate block of 262144 bytes "
+            "(bad allocation)"
+        ),
+        (
+            "TransactionContext Error: Failed to commit: Failed to re-allocate block of 262144 "
+            "bytes (bad allocation)"
+        ),
+        # Spilling past max_temp_directory_size while memory is full.
+        (
+            "TransactionContext Error: Failed to commit: failed to offload data block of size "
+            "256.0 KiB (1.0 MiB/1.0 MiB used).\nThis limit was set by the "
+            "'max_temp_directory_size' setting."
+        ),
     ],
 )
 def test_commit_capacity_messages_are_budget_errors(message: str) -> None:
@@ -790,6 +827,14 @@ def test_commit_capacity_messages_are_budget_errors(message: str) -> None:
         duckdb.TransactionException(
             "TransactionContext Error: Failed to commit: PRIMARY KEY or UNIQUE constraint "
             'violation: duplicate key "failed to pin block of size 256.0 KiB"'
+        ),
+        duckdb.TransactionException(
+            "TransactionContext Error: Failed to commit: PRIMARY KEY or UNIQUE constraint "
+            'violation: duplicate key "Failed to allocate block of 1 bytes (bad allocation)"'
+        ),
+        # The prefix stays exact; only the cause after it is matched without case.
+        duckdb.TransactionException(
+            "transactioncontext error: failed to commit: failed to pin block of size 1"
         ),
         duckdb.TransactionException("Failed to commit: could not allocate block of size 1"),
         duckdb.IOException("IO Error: No space left on device"),
@@ -840,7 +885,7 @@ def test_a_failed_commit_is_not_replaced_by_its_rollback(
     plan = plan_generation_bulk(connection, request, budget=BUDGET)
     rival = connection.cursor()
 
-    def commit_rival(_: duckdb.DuckDBPyConnection) -> None:
+    def commit_rival(_: str) -> None:
         marker = dict(plan.marker)
         rival.execute(
             "INSERT INTO market_generations ("
@@ -851,8 +896,11 @@ def test_a_failed_commit_is_not_replaced_by_its_rollback(
             list(marker.values()),
         )
 
-    with pytest.raises(duckdb.TransactionException, match="constraint violation") as caught:
-        publish_generation_bulk(connection, request, budget=BUDGET, companion=commit_rival)
+    with (
+        inside_publication(commit_rival),
+        pytest.raises(duckdb.TransactionException, match="constraint violation") as caught,
+    ):
+        publish_generation_bulk(connection, request, budget=BUDGET)
     assert not isinstance(caught.value, ComputeResourceError)
     assert f'"{generation_id}"' in str(caught.value)
     assert "no transaction is active" not in str(caught.value)

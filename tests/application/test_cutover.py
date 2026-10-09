@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 from collections.abc import Sequence
 from pathlib import Path
@@ -473,7 +474,7 @@ _OPTION = re.compile(r"(?<![\w-])--[a-z][a-z0-9-]*")
 # Where one shell command of a bash fence ends.
 _COMMAND_END = re.compile(r"&&|\|\||[|;>]")
 # The rehearsal block's homes, backups, reports and compact target, as the test finds them.
-_REHEARSAL_OUTPUTS = 14
+_REHEARSAL_OUTPUTS = 15
 
 
 def _runbook() -> str:
@@ -543,21 +544,27 @@ def test_the_runbook_names_only_commands_and_options_the_cli_has(
     assert "BACKUPS=~/aas-backups" in text
 
 
-def test_the_rehearsal_writes_only_paths_its_cleanup_removes() -> None:
+def _fences(start: str, end: str) -> list[str]:
     text = _runbook()
-    step = text[text.index("**2. 리허설.**") : text.index("**3. ")]
-    (block,) = re.findall(r"```bash\n(.*?)```", step, re.DOTALL)
+    section = text[text.index(start) : text.index(end, text.index(start))]
+    return re.findall(r"```bash\n(.*?)```", section, re.DOTALL)
+
+
+def test_the_rehearsal_writes_only_paths_its_cleanup_removes() -> None:
+    block, cleanup_block = _fences("**2. 리허설.**", "**3. ")
     # Nothing outside the rehearsal's own installation and outputs is touched.
-    for forbidden in ("systemctl", "sed -i", "receipt", "import legacy", "$LEGACY", "$HOME_V2",
-                      "$HOME_V3", "$OLD_HOME", "jq ", "tar "):  # fmt: skip
+    for forbidden in ("systemctl", "sed -i", "receipt", "import legacy", "$LEGACY", "$HOME_NEW",
+                      "$HOME_FINAL", "$OLD_HOME", "jq ", "tar "):  # fmt: skip
         assert forbidden not in block, forbidden
-    *body, cleanup = block.strip().splitlines()
-    assert cleanup.startswith("rm -rf -- ")
-    assert "rm " not in "\n".join(body)
-    removed = [word.strip('"') for word in cleanup.removeprefix("rm -rf -- ").split()]
+    assert "rm " not in block
+    # The cleanup is its own fence and removes only a rehearsal that ran to its end.
+    (cleanup,) = cleanup_block.strip().splitlines()
+    guard = 'test -f "$RB/complete" && rm -rf -- '
+    assert cleanup.startswith(guard)
+    removed = [word.strip('"') for word in cleanup.removeprefix(guard).split()]
     assert 'RB="$BACKUPS/rehearsal-$TS"' in block
     written = [
-        *re.findall(r"(?:--output|--backup-output|--to|--home|>) (\"[^\"]+\"|\S+)", block),
+        *re.findall(r"(?:--output|--backup-output|--to|--home|>|touch) (\"[^\"]+\"|\S+)", block),
         *re.findall(r"mkdir -m 0700 (.+?)(?:\n|$)", block)[0].split(),
         *re.findall(r"(?:AAS_HOME|REPORTS)=(\"[^\"]+\"|\S+)", block),
     ]
@@ -565,3 +572,106 @@ def test_the_rehearsal_writes_only_paths_its_cleanup_removes() -> None:
     assert len(paths) == _REHEARSAL_OUTPUTS, paths
     for path in paths:
         assert any(path == root or path.startswith(root + "/") for root in removed), path
+
+
+# A stand-in ``aas`` that logs each call, creates the absolute paths it is given (a failed
+# call may leave partial output too) and fails every call whose arguments contain $AAS_FAIL.
+_STUB_AAS = """#!/usr/bin/env bash
+echo "$*" >> "$AAS_LOG"
+for value in "$@"; do case "$value" in /*) [ -e "$value" ] || mkdir -p "$value";; esac; done
+case " $* " in *"$AAS_FAIL"*) exit 3;; esac
+"""
+
+
+def _shell(tmp_path: Path, script: str, fail: str) -> tuple[dict[str, str], list[str]]:
+    """Run runbook fences in one bash, as pasted, against the stand-in ``aas``."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "aas").write_text(_STUB_AAS, encoding="utf-8")
+    (bin_dir / "aas").chmod(0o755)
+    specs = tmp_path / "specs"
+    (specs / "promote").mkdir(parents=True, exist_ok=True)
+    for name in ("a", "b", "c"):
+        (specs / "promote" / f"{name}.json").write_text("{}", encoding="utf-8")
+    (specs / "retirement.json").write_text("{}", encoding="utf-8")
+    log = tmp_path / "aas.log"
+    log.unlink(missing_ok=True)
+    preamble = (
+        f'TS=T; BACKUPS="{tmp_path}/backups"; REHEARSAL="{tmp_path}/rehearsal-$TS"; '
+        f'SPECS="{specs}"\n'
+        "sha() { sha256sum \"$1\" | cut -d' ' -f1; }\n"
+        'mkdir -p -m 0700 "$BACKUPS"\n'
+    )
+    bash = shutil.which("bash")
+    assert bash is not None
+    done = subprocess.run(  # noqa: S603 -- fixed runbook fences against the stand-in aas
+        [bash, "-c", preamble + script],
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin", "AAS_LOG": str(log), "AAS_FAIL": fail},
+        cwd=tmp_path, capture_output=True, text=True, check=False,
+    )  # fmt: skip
+    statuses = dict(line.split("=", 1) for line in done.stdout.splitlines() if "=" in line)
+    calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+    return statuses, calls
+
+
+def _rehearsal_script() -> str:
+    block, cleanup = _fences("**2. 리허설.**", "**3. ")
+    (promote,) = [
+        fence for fence in _fences("**4. 승격.**", "**5. ") if "aas data promote" in fence
+    ]
+    # The rehearsal runs step 4 where its comment says so; the promotion loop stands for it.
+    lines = block.splitlines()
+    (comment,) = [index for index, line in enumerate(lines) if line.strip().startswith("# ")]
+    lines[comment : comment + 1] = promote.splitlines()
+    return "\n".join(lines) + '\necho "rehearsal=$?"\n' + cleanup + 'echo "cleanup=$?"\n'
+
+
+@pytest.mark.parametrize(
+    "fail",
+    ["db migrate", "promote/b.json", "db compact", "verify --deep"],
+)
+def test_a_failed_rehearsal_stops_and_keeps_its_root_backups_and_reports(
+    tmp_path: Path, fail: str
+) -> None:
+    statuses, calls = _shell(tmp_path, _rehearsal_script(), fail)
+    assert statuses["rehearsal"] != "0"
+    assert statuses["cleanup"] != "0"
+    rb = tmp_path / "backups" / "rehearsal-T"
+    assert (tmp_path / "rehearsal-T").is_dir()
+    assert (rb / "reports").is_dir()
+    assert (rb / "migrate").is_dir()
+    assert not (rb / "complete").exists()
+    # Nothing runs after the failed command.
+    (failed,) = [index for index, call in enumerate(calls) if fail in call][:1]
+    assert failed == len(calls) - 1, calls
+    if fail == "promote/b.json":
+        assert not any("promote/c.json" in call or "source-retire" in call for call in calls)
+
+
+def test_a_finished_rehearsal_is_the_only_one_its_cleanup_removes(tmp_path: Path) -> None:
+    statuses, calls = _shell(tmp_path, _rehearsal_script(), "never-matches-a-call")
+    assert statuses == {"rehearsal": "0", "cleanup": "0"}
+    # A plan and an apply for each of the three specs.
+    assert sum("data promote" in call for call in calls) == 2 * 3
+    assert not (tmp_path / "rehearsal-T").exists()
+    assert not (tmp_path / "rehearsal-T-compact").exists()
+    assert not (tmp_path / "backups" / "rehearsal-T").exists()
+    assert (tmp_path / "backups").is_dir()
+
+
+def test_an_adopted_rehearsal_stops_before_recover_when_its_migration_check_fails(
+    tmp_path: Path,
+) -> None:
+    plan, run = _fences("### 리허설 채택", "**4. ")[:2]
+    assert "--plan" in plan
+    assert "--backup-output" not in plan
+    rb = tmp_path / "backups" / "rehearsal-T"
+    (rb / "reports").mkdir(parents=True)
+    (tmp_path / "rehearsal-T").mkdir()
+    script = plan + run + 'echo "adopt=$?"\n'
+    statuses, calls = _shell(tmp_path, script, "verify --deep")
+    assert statuses["adopt"] != "0"
+    assert not any("recover" in call for call in calls)
+    assert (tmp_path / "rehearsal-T").is_dir()
+    assert (rb / "migrate-v3").is_dir()
+    assert (rb / "reports").is_dir()

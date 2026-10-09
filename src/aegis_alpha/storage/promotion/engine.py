@@ -28,14 +28,14 @@ from typing import TYPE_CHECKING, Final, cast
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.storage.bulk_generation import (
+    BulkFlags,
     BulkPlan,
     BulkRequest,
     ParentChangedError,
-    encoded_cell_sql,
+    flags_digest,
     plan_generation_bulk,
     publish_generation_bulk,
     record_identity_sql,
-    stream_rowset,
     verify_generation_bulk,
 )
 from aegis_alpha.storage.market import (
@@ -47,7 +47,7 @@ from aegis_alpha.storage.market import (
     market_version,
     record_identity,
 )
-from aegis_alpha.storage.market_integrity import check_core_names, check_generation_flags
+from aegis_alpha.storage.market_integrity import check_core_names
 from aegis_alpha.storage.market_schema import DOMAIN_VERSIONS, DOMAINS, NATURAL_KEYS
 from aegis_alpha.storage.membership_pins import (
     IdentityPin,
@@ -87,14 +87,6 @@ if TYPE_CHECKING:
 OPERATION_KIND: Final = "promotion"
 MANIFEST_SCHEMA: Final = "aas-promotion-manifest-v1"
 DATASET_OWNER: Final = "promotion"
-FLAG_SCHEMA: Final = (
-    ("record_id", "text"),
-    ("revision_id", "text"),
-    ("rule_id", "text"),
-    ("rule_version", "text"),
-    ("flag", "text"),
-    ("detail", "text"),
-)
 _DEFAULT_BUDGET: Final = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
 _MAX_RAW: Final = 64 * 1024 * 1024
 _SAMPLE: Final = 20
@@ -120,7 +112,6 @@ _TEMP: Final = (
     "cal0",
     "cal1",
 )
-_FLAG_ROW_BYTES: Final = 4096
 _COMPARED_KEYS: Final = tuple(name for name in NATURAL_KEYS["prices"] if name != "price_role")
 PARTIAL_FLAG: Final = "provider_reported_partial"
 PARTITION_CHECK: Final = ("partition_row_count", "1")
@@ -1106,29 +1097,6 @@ def _flags(
     }
 
 
-def flags_digest(
-    market: duckdb.DuckDBPyConnection,
-    relation: str,
-    parameters: list[object],
-    budget: ComputeBudget,
-) -> tuple[str, int]:
-    """The ``aas-rowset-v1`` digest and count of quality flag rows (generation excluded)."""
-    count = _count(market, f"SELECT count(*) FROM ({relation})", parameters)
-    batch = max(1, min(65_536, budget.available_bytes // _FLAG_ROW_BYTES))
-    cells = [encoded_cell_sql(name, kind) for name, kind in FLAG_SCHEMA]
-    columns = ", ".join(_q(name) for name, _ in FLAG_SCHEMA)
-    digest = stream_rowset(
-        market,
-        FLAG_SCHEMA,
-        cells,
-        f"SELECT {columns} FROM ({relation})",
-        parameters,
-        count=count,
-        batch_rows=batch,
-    )
-    return digest, count
-
-
 def _partition_check(
     workspace: Workspace, spec: PromotionSpec, chain: list[str], flags: list[_Flag]
 ) -> dict[str, object] | None:
@@ -1549,6 +1517,26 @@ def _drop(market: duckdb.DuckDBPyConnection) -> None:
         market.execute(f"DROP TABLE IF EXISTS temp.{_q(str(name))}")
 
 
+# What a publication still reads of its plan: the staged delta and the flags to insert.
+_PUBLISHED: Final = (_t("stage"), _t("flags"))
+
+
+def _release_plan(market: duckdb.DuckDBPyConnection) -> None:
+    """Drop every temp table of a finished plan except what its publication reads.
+
+    The plan's marker, manifest and flag digest are already computed, and the staged
+    delta and flags are materialized tables, so nothing a publication hashes or checks
+    reads the sources, mapped rows, heads or diffs any more. Releasing them before the
+    publication transaction leaves DuckDB's share to the insert, its checks and COMMIT.
+    """
+    for (name,) in market.execute(
+        "SELECT table_name FROM duckdb_tables() WHERE temporary AND starts_with(table_name, ?) "
+        "AND table_name NOT IN (SELECT unnest(?::VARCHAR[])) ORDER BY table_name",
+        [_t(""), list(_PUBLISHED)],
+    ).fetchall():
+        market.execute(f"DROP TABLE IF EXISTS temp.{_q(str(name))}")
+
+
 # --- apply, recovery and verification ------------------------------------------------------
 
 
@@ -1719,8 +1707,14 @@ def _existing(
 
 
 def _publish(workspace: Workspace, plan: PromotionPlan, budget: ComputeBudget) -> dict[str, object]:
+    """Publish a finished plan: retain its evidence, prepare the intent, commit, catalog.
+
+    Apply and recovery both publish through here, so both release the plan's other temp
+    tables (``_release_plan``) before the publication transaction.
+    """
     if plan.manifest is None or plan.bulk is None:
         raise ValueError("promotion has nothing to publish")
+    _release_plan(workspace.market)
     for payload in (plan.spec.raw, plan.request, plan.manifest):
         put_raw(workspace.paths.raw, payload)
     manifest_sha = hashlib.sha256(plan.manifest).hexdigest()
@@ -1733,46 +1727,19 @@ def _publish(workspace: Workspace, plan: PromotionPlan, budget: ComputeBudget) -
         expected_parent=plan.spec.parent,
         payload_hash=manifest_sha,
     )
-    generation_id = plan.generation_id
     flags = cast("dict[str, object]", json.loads(plan.manifest)["flags"])
-
-    def companion(connection: duckdb.DuckDBPyConnection) -> None:
-        connection.execute(
-            "INSERT INTO quality_flags SELECT ?, record_id, revision_id, rule_id, rule_version, "
-            f"flag, detail FROM {_t('flags')}",
-            [generation_id],
-        )
-        _gate_flags(connection, plan.spec.domain, generation_id, flags, budget)
-
+    # The temp flags table can change between planning and publication, so the writer
+    # holds the flags it inserts to the manifest's digest before COMMIT; ``_check_flags``
+    # repeats the comparison after COMMIT.
     marker = publish_generation_bulk(
-        workspace.market, _bulk_request(plan), budget=budget, plan=plan.bulk, companion=companion
+        workspace.market,
+        _bulk_request(plan),
+        budget=budget,
+        plan=plan.bulk,
+        flags=BulkFlags(_t("flags"), str(flags["rowset"]), int(str(flags["rows"]))),
     )
     _complete(workspace, operation, plan.spec, json.loads(plan.manifest), budget)
     return marker
-
-
-def _gate_flags(
-    market: duckdb.DuckDBPyConnection,
-    domain: str,
-    generation_id: str,
-    flags: Mapping[str, object],
-    budget: ComputeBudget,
-) -> None:
-    """Before COMMIT: unique flag keys, no orphan revision, and the manifest's count and digest.
-
-    The temp flags table can change between planning and publication, so only a check
-    inside the publication transaction refuses what the manifest does not record.
-    ``_check_flags`` repeats the comparison after COMMIT.
-    """
-    check_generation_flags(market, domain, generation_id)
-    digest, rows = flags_digest(
-        market,
-        "SELECT * FROM quality_flags WHERE generation_id = ?",
-        [generation_id],
-        budget,
-    )
-    if digest != flags["rowset"] or rows != flags["rows"]:
-        raise ValueError("quality flags differ from the promotion manifest")
 
 
 def _check_flags(
@@ -2097,7 +2064,8 @@ def untouched_promotion_refusal(
     The plan runs within ``budget``'s share of the installation's own limits, not of
     whatever share earlier work (a verification, another plan) left on the connection, so
     the migration's plan, its check and its backup's recheck decide alike; the connection
-    is back at the installation's limits afterwards.
+    is back at the installation's limits afterwards, within the workspace's
+    ``market_lease`` when it has one.
     """
     if operation["kind"] != OPERATION_KIND or operation["phase"] != "PREPARED":
         return "not a prepared promotion"

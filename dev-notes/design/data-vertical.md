@@ -1919,25 +1919,36 @@ Norgate security master와 그보다 늦은 Norgate history 내보내기에서�
   행만 다시 해시하며 그 앞 head에 대한 revision 규칙을 검사한다. `deep=True`는 모든 delta를 다시 해시한다.
 - 메모리는 [0016](../decisions/0016-maintenance-admission-budget.md)을 따른다. fetch 전에 SQL 집계로
   가장 넓은 행을 재고, 배치 과금이 호출자 할당의 비DuckDB 몫에 들어가도록 배치 행 수를 정한다. 과금은
-  행 수와 무관하다. 한 행도 들어가지 않으면 `ComputeResourceError`다. 정렬·spill·색인 유지는 같은
+  행 수와 무관하다. 한 행도 들어가지 않으면 `ComputeResourceError`다. 가져올 행이 없는 빈 quality flag
+  관계는 한 행 몫도 요구하지 않고 빈 rowset digest를 돌려준다. 정렬·spill·색인 유지는 같은
   할당에서 유도한 DuckDB 몫이 맡는다. 한도를 넘으면 트랜잭션 전체가 취소되고 `ComputeResourceError`가
   되며, 원래 DuckDB 오류는 그 cause로 남는다. 삽입은 들어갔는데 COMMIT이 색인 block을 할당하거나 pin하지
   못하면 DuckDB는 OOM이 아니라 `TransactionException`으로 보고하고, 고정 접두어 `Failed to commit: `
-  바로 뒤의 원인이 `could not allocate`·`failed to allocate`·`failed to pin block`이면 이것도 같은
-  오류다. 그 밖의 COMMIT 실패(제약 위반, 쓰기 충돌)는 용량 오류가 아니므로 원래 오류 그대로 나간다.
+  바로 뒤의 원인이 `could not allocate`·`failed to allocate`·`failed to re-allocate`·`failed to pin block`·
+  `failed to offload data block`이면 이것도 같은 오류다. 접두어는 그대로 맞추고 원인만 대소문자를 가리지 않으므로
+  allocator의 `Failed to allocate block of N bytes (bad allocation)`도 용량 오류다. `max_temp_directory_size`를
+  다 써서 spill하지 못한 `failed to offload data block ...`은 COMMIT 밖에서는 DuckDB의 OOM이라 그 자체로,
+  COMMIT에서는 위 원인으로 용량 오류다. 그 밖의 COMMIT 실패(제약 위반, 쓰기 충돌)는 용량 오류가 아니므로 원래 오류 그대로 나간다.
   제약 위반이 인용한 key에 같은 문구가 들어 있어도 마찬가지다. 연결이 이미 쥔 메모리보다 낮은 한도로
   내리는 것을 DuckDB가 거절한 OOM도 이 경계 안에서 `ComputeResourceError`가 된다. COMMIT이 실패하면 DuckDB가 이미 트랜잭션을 끝내므로,
   뒤따르는 ROLLBACK의 "no transaction is active" 거절이 원래 오류를 덮지 않는다(`market.rollback`). 이
   경계(`market.budgeted`)는 `aas db migrate`의 market 단계와 `aas db compact`의 market 복사에도 쓰이며,
-  둘 다 설치본 자체의 한도가 아니라 compute lease의 DuckDB 몫으로 낮춘 연결에서 실행한다.
+  둘 다 설치본 자체의 한도가 아니라 compute lease의 DuckDB 몫으로 낮춘 연결에서 실행한다. migration은
+  admission 뒤 작업 공간에 lease를 걸어(`Workspace.market_lease`) PREPARED 승격의 carry 검사가 끝나며 한도를
+  되돌릴 때도, 백업의 CHECKPOINT와 그 뒤 다시 연 연결, 이후 단계도 lease의 DuckDB 몫을 넘지 않는다.
 - 기본 512 MiB 할당은 Python 몫만 행 수와 무관하게 보장한다. 1e7행 계획의 Python peak는 74 MiB다.
-  도메인 테이블의 `PRIMARY KEY(generation_id, record_id, revision_id)`와 `UNIQUE(record_id, revision_id)`
-  색인은 삽입과 COMMIT 중 메모리에 올라오므로, DuckDB 몫은 그 테이블의 전체 행 수에 비례해 커진다.
-  합성 prices 측정에서 checkpoint된 테이블에 10k행 generation을 게시할 때, 기존 1M행이면 512 MiB로
-  통과했고 2M·4M행이면 1 GiB, 8M행이면 1.5 GiB가 필요했다. 빈 테이블에 1M행을 게시할 때는 1 GiB,
-  1e7행을 게시할 때는 16 GiB 할당이 필요했다(RSS 약 9.7 GiB). 따라서 수천만 행 테이블의 백필과
-  유지보수 게시는 기본 할당으로 끝나지 않는다. 색인 제거(다음 core 버전) 또는 기록된 더 큰 할당 grant
-  중 하나를 Linear AAS-54에서 결정하며, 대량 승격(대응표 DV-75)은 그 결정 뒤에 한다.
+  core schema v3의 도메인 테이블과 `quality_flags`에는 key 색인이 없다([market v3](#core-schema-버전)).
+  그래서 DuckDB 몫은 테이블에 쌓인 전체 행 수가 아니라 게시하는 delta를 부호화·정렬하고 기존 행과
+  join하는 working set으로 정해지며, 그 연산자는 DuckDB 임시 디렉터리로 spill할 수 있다. 남는 색인은
+  `FOREIGN KEY(generation_id)`의 색인과 `market_generations`·결과 테이블의 색인이다. 게시 트랜잭션의
+  전역 `(record_id, revision_id)` 검사는 도메인 전체를 읽으므로 시간은 그 도메인의 행 수에 비례한다.
+  `memory_limit`는 DuckDB 할당자의 설정이지 프로세스 RSS의 상한이 아니므로, 할당 grant는 Python 몫과
+  DuckDB 몫을 따로 담는 [0016](../decisions/0016-maintenance-admission-budget.md)의 모델 그대로 정한다.
+  할당 안에서 끝나지 않는 게시는 위와 같이 `ComputeResourceError`로 전체가 취소된다. v2 이하 설치본의
+  `PRIMARY KEY(generation_id, record_id, revision_id)`와 `UNIQUE(record_id, revision_id)` 색인은 삽입과
+  COMMIT 중 메모리에 통째로 올라와 DuckDB 몫이 그 테이블의 전체 행 수에 비례해 커진다. 합성 prices에서
+  checkpoint된 8M행 테이블에 10k행 generation을 게시하는 데 1.5 GiB, 빈 테이블에 1e7행을 게시하는 데
+  16 GiB 할당이 필요했다. 따라서 수천만 행 테이블의 백필과 유지보수 게시는 v3 설치본에서 한다(대응표 DV-75).
 - `storage/read_heads.py`의 `read_heads(connection, binding, query, time_rules, budget)`가 pin한
   chain들의 head를 DuckDB 안에서 투영한다. 작업 공간 진입점은 `market_inputs.load_pinned_heads`이며,
   각 generation이 marker와 같은 committed catalog 버전인지 확인하고 시간 규칙 출처를 보존 증거에서
@@ -2172,10 +2183,10 @@ digest는 grant가 생기기 전과 같다. 빈 배열은 거부한다.
 - 변환 문서(`aas-fx-conversion-v1`)는 규칙, 두 통화, series, 방향(`multiply`·`divide`), 최대 나이,
   `signal_basis`이고 run이 이 문서를 기록한다.
 
-## 스키마 v2
+## core schema 버전
 
-state와 market 저장소는 core schema 버전을 가진다. `aas init`은 새 저장소에 v1과 v2를 한 트랜잭션으로
-적용하므로 새 설치본과 migration한 설치본은 같은 객체와 같은 영수증을 가진다. `aas db migrate --to N
+state와 market 저장소는 core schema 버전을 가지며 현재 버전은 v3이다. `aas init`은 새 저장소에 v1부터
+v3까지를 한 트랜잭션으로 적용하므로 새 설치본과 migration한 설치본은 같은 객체와 같은 영수증을 가진다. `aas db migrate --to N
 --backup-output DIR`이 설치본을 한 버전씩 `N`까지 올린다. `storage/migration.py`가 이 순서를 소유한다.
 `v - 1`에서 `v`로 가는 단계마다 다음을 한다.
 
@@ -2188,9 +2199,11 @@ state와 market 저장소는 core schema 버전을 가진다. `aas init`은 새 
    나중 버전이 생겨도 완료된 intent가 계속 맞는다. v2 단계의 정체성은 출시된 그대로다.
 4. market DDL을 DuckDB 한 트랜잭션으로, state DDL을 SQLite 한 트랜잭션으로 적용한다. 각 트랜잭션은
    `schema_migrations`에 새 버전 행을 더하고 `store_info.schema_version`을 바꾼다. 기존 행은 그대로 남아
-   `(1, v1), (2, v2)`가 된다.
+   `(1, v1), (2, v2), (3, v3)`처럼 이어진다.
 5. 설치 영수증(`installation.json`)의 저장소 버전을 바꾼다.
-6. intent를 완료한다.
+6. 올라간 market의 core catalog가 같은 버전의 빈 저장소와 같은지 확인하고, commit된 모든 generation의
+   행을 기록된 digest로 다시 해시하고 전역 중복 감사(`--deep`의 감사)를 통과시킨 뒤 intent를 완료한다.
+   이 확인은 백업의 `--deep` 여부와 무관하게 언제나 하고, 실패하면 intent는 PREPARED로 남는다.
 
 어느 단계의 intent가 PREPARED인 설치본은 migration-incomplete다. 앱은 그 설치본을 읽기·쓰기 어느
 쪽으로도 열지 않고, 같은 명령을 다시 실행하면 그 단계의 남은 부분부터 재개한다. 재개는 그 단계의
@@ -2232,7 +2245,9 @@ checksum, 다음 단계의 남은 부분(`steps`), 목표까지의 단계별 목
 `da574cef54b69961c341e3e5e92ee16334a5049911ee6b417db643f44bd881dc`로 고정돼 있다. migration하지 않은
 v1 설치본도 정상으로 열리며 v1 기능을 그대로 쓴다. v2 테이블이나 close 전용 가격을 쓰는 게시는 v1
 설치본에서 `aas db migrate --to 2`를 안내하며 거부된다. v1 행은 그대로 옮겨져 읽히고 기록된 delta·chain
-hash로 검증된다. run 추가 스키마 버전은 이 migration과 독립이다.
+hash로 검증된다. v2 설치본도 정상으로 열리고 v2 기능을 그대로 쓰지만, 아래 key 색인 때문에 큰 테이블의
+게시는 DuckDB 몫이 그 테이블의 행 수만큼 커진다([대량 게시](#대량-게시와-reader)). 그래서 대량 승격과
+유지보수 전에 `aas db migrate --to 3`으로 올린다. run 추가 스키마 버전은 이 migration과 독립이다.
 
 market v2:
 
@@ -2257,6 +2272,38 @@ state v2:
 
 `conventions`, `authority_records`, 수집 기록 테이블은 v1 그대로 쓴다. 시간 규칙은 convention이
 아니라 명세와 binding grant가 들고 다닌다.
+
+market v3:
+
+- 열한 도메인 테이블의 `PRIMARY KEY(generation_id, record_id, revision_id)`와 `UNIQUE(record_id,
+  revision_id)`, `quality_flags`의 여섯 열 PRIMARY KEY가 없다. 그 밖의 규칙(열 순서와 타입, NOT NULL,
+  CHECK, `prices.fields` 기본값, 모든 `FOREIGN KEY(generation_id)`)과 `market_generations`·결과 테이블의
+  제약은 v2 그대로다. 그 key가 지키던 규칙은 아래 writer 검사와 감사가 지킨다.
+- DuckDB는 기존 테이블의 제약을 지우지 못하므로 v3 단계는 열두 테이블마다 옛 테이블을 옆 이름으로 옮기고,
+  v3 모양으로 새로 만들고, 명시한 열 목록으로 행을 복사한다(`CREATE TABLE AS`는 모든 제약을 잃는다). 그다음
+  복사한 행을 위치마다 원래 행과 모든 열의 값으로 비교하고(text는 bytes, DOUBLE은 왕복 text로), 다른 행이나
+  짝 없는 행이 하나라도 있으면 단계의 트랜잭션 전체를 거부한다. 위치 비교라서 `preserve_insertion_order`가
+  꺼진 연결은 어느 테이블도 건드리기 전에 거부한다. 비교가 끝나야 옛 테이블을 지운다. 열두 재구축과
+  `schema_migrations`·`store_info` 갱신은 DuckDB 한 트랜잭션이고 compute lease의 DuckDB 몫에서 돈다. 행 수
+  대조만으로는 값 보존이 증명되지 않으므로, 단계는 위 6번의 전체 rehash와 중복 감사를 통과해야 끝난다.
+- 두 writer(`market.publish_generation`, `bulk_generation.publish_generation_bulk`)는 게시 트랜잭션의 첫
+  쓰기로 store를 claim한다. 같은 store의 두 게시 중 하나만 commit되고 다른 하나는 claim이나 COMMIT에서
+  거부된다. 트랜잭션 안에서 삽입 전에 그 generation의 행이 없어야 하고, 삽입 뒤 계획한 행 수, record마다
+  revision 하나, 같은 도메인의 다른 어떤 generation도 같은 `(record_id, revision_id)`를 갖지 않음을 확인한다.
+  마지막 검사는 chain이나 dataset이 아니라 도메인 전체를 읽는다. 게시의 quality flag는 writer가 직접 넣고,
+  반복된 flag key, 저장되지 않은 revision의 flag, 검토한 수·digest와 다른 flag를 COMMIT 전에 거부한다.
+- 저장된 상태는 `aas db verify`와 백업·복원·compact의 검증이 감사한다. 기본 감사는 core catalog가 같은
+  버전의 빈 저장소와 같은지(열 순서·타입·nullability·기본값·제약, add-on과 임시 table 제외), 도메인마다
+  generation별 행 수와 marker의 domain·행 수가 양쪽으로 맞는지, flag가 자기 generation에 저장된 revision을
+  가리키는지 본다. `--deep`은 도메인 전역 `(record_id, revision_id)` 중복과 flag key 중복을 더 본다. 그 검사는
+  실제로 잰 행 수와 key bytes로 pass를 나누고, 한 pass가 할당에 들어가지 않으면 길이를 붙인 key 전체의
+  SHA-256 접두어로 더 나누며, 비교는 원래 key 전체로 한다. 한 행도 할당에 들어가지 않으면
+  `ComputeResourceError`다. 감사는 통과하거나 거부하므로 검증 보고 형식은 그대로다.
+- 해시 형식과 요청·generation·delta·chain·manifest hash는 core 버전과 무관하다. DDL, 색인, 버전은 hash
+  입력이 아니므로 v2에서 게시한 generation은 v3에서 같은 hash로 검증되고, 같은 명세를 v2와 v3에서 승격하면
+  같은 generation이 나온다.
+
+state v3는 테이블을 바꾸지 않는다. 두 저장소가 언제나 같은 core 버전을 갖도록 버전과 checksum만 기록한다.
 
 ## 원천 은퇴와 동치 증명
 
@@ -2508,7 +2555,7 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-72 | 증분 검증은 모든 chain link와 대상 generation의 행을, `deep`은 모든 delta를 다시 해시한다 | `tests/storage/test_bulk_generation.py::test_incremental_verify_checks_links_and_leaf_rows` | 구현 |
 | DV-73 | 대량 게시의 Python 배치 과금은 가장 넓은 행으로 정해지고 행 수와 무관하다. DuckDB 몫은 포함하지 않는다 | `tests/storage/test_bulk_generation.py::test_python_batch_charge_is_independent_of_row_count` | 구현 |
 | DV-74 | DuckDB가 할당 안에서 끝내지 못한 대량 게시는 marker와 행을 남기지 않고 `ComputeResourceError`가 된다 | `tests/storage/test_bulk_generation.py::test_duckdb_exhaustion_rolls_back_as_a_budget_error` | 구현 |
-| DV-75 | 수천만 행 도메인 테이블에 유지보수 generation을 기본 할당 또는 기록된 할당 grant 안에서 게시한다 | `tests/storage/test_bulk_generation.py::test_maintenance_publication_fits_a_large_table` | 예정 |
+| DV-75 | v2 key 색인이 작은 DuckDB 몫을 넘는 큰 테이블에서도 v3로 올린 같은 설치본은 같은 lease 안에서 유지보수 generation을 계획대로 게시하고 검증한다 | `tests/storage/test_core_v3_memory.py::test_the_rehearsal_failure_shape_publishes_once_the_store_is_v3` | 구현 |
 | DV-76 | `aas-head-binding-v1` binding hash와 `aas-head-read-v1` 영수증 형식은 고정 입력과 기대 값으로 고정돼 있다 | `tests/storage/test_read_heads.py::test_head_binding_and_receipt_formats_are_frozen` | 구현 |
 | DV-77 | `read_heads`는 pin이 marker와 다르거나 chain link·행 수가 맞지 않으면 행을 읽지 않고, `rehash`는 모든 delta를 다시 해시한다 | `tests/storage/test_read_heads.py::test_pins_are_verified_before_rows_are_read` | 구현 |
 | DV-78 | generation의 시간 규칙 출처는 보존 증거(승격 명세, 연구 변환, 봉인 import 문서)에서 오고, 출처가 없거나 catalog에 없는 pin은 읽지 않는다 | `tests/storage/test_read_heads.py::test_time_rule_provenance_comes_from_retained_evidence` | 구현 |
@@ -2897,7 +2944,7 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-461 | `raw/`에 있는 manifest라도 verify 보고가 없거나, `complete`가 아니거나, 그 원천이 설치본에 commit으로 없거나, 읽을 수 없는 보고가 있으면 legacy 확인이 실패한다 | `tests/application/test_cutover.py::test_a_retained_manifest_without_a_complete_verify_fails` | 구현 |
 | DV-462 | `PREPARED` storage operation이 남으면 operations 확인이 실패한다 | `tests/application/test_cutover.py::test_a_prepared_operation_fails_the_operations_check` | 구현 |
 | DV-463 | core schema가 현재 버전이 아닌 설치본은 schema 확인이 `outdated`로 실패한다 | `tests/application/test_cutover.py::test_an_outdated_core_schema_fails_the_schema_check` | 구현 |
-| DV-464 | runbook 리허설은 설치본 밖 삭제·systemd·receipt를 실행하지 않고 그 모든 출력 경로를 리허설 정리가 지운다 | `tests/application/test_cutover.py::test_the_rehearsal_writes_only_paths_its_cleanup_removes` | 구현 |
+| DV-464 | runbook 리허설은 설치본 밖 삭제·systemd·receipt를 실행하지 않고, 별도 블록인 리허설 정리는 끝까지 마친 리허설의 모든 출력 경로만 지운다 | `tests/application/test_cutover.py::test_the_rehearsal_writes_only_paths_its_cleanup_removes` | 구현 |
 | DV-465 | 삽입 뒤 COMMIT에서 메모리가 고갈된 대량 게시도 marker와 행을 남기지 않고 `ComputeResourceError`가 된다 | `tests/storage/test_bulk_generation.py::test_commit_exhaustion_rolls_back_as_a_budget_error` | 구현 |
 | DV-466 | 용량과 무관한 COMMIT 실패는 인용한 key가 용량 문구를 담아도 `ComputeResourceError`로 바뀌지 않고, 뒤따르는 ROLLBACK이 그 오류를 덮지 않는다 | `tests/storage/test_bulk_generation.py::test_a_failed_commit_is_not_replaced_by_its_rollback` | 구현 |
 | DV-467 | core migration의 market 단계는 compute lease의 DuckDB 몫에서 실행하고, 그 COMMIT의 고갈은 intent를 남긴 채 `ComputeResourceError`가 된다 | `tests/storage/test_migration.py::test_an_exhausted_market_step_is_a_budget_error_under_the_lease` | 구현 |
@@ -2918,3 +2965,20 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-482 | 재계획이 compute lease 안에서 돌 수 없으면 `--plan`, migration과 그 백업은 `ComputeResourceError`로 거부하고 아무것도 쓰지 않는다 | `tests/storage/test_migration_steps.py::test_a_replan_beyond_the_lease_refuses_the_migration` | 구현 |
 | DV-483 | carry 재계획은 앞선 검증이 낮춘 연결이 아니라 설치본 한도에서 lease 몫으로 돌아, `--plan`이 허용한 lease에서 migration과 그 백업도 같은 승격을 가지고 간다 | `tests/storage/test_migration_steps.py::test_a_carry_is_planned_alike_after_a_verification_lowered_the_connection` | 구현 |
 | DV-484 | 재계획 뒤 게시 전에 head가 옮겨진 승격은 recover에서 예외 없이 pending으로 남고 계획의 임시 table은 지워진다 | `tests/storage/test_migration_steps.py::test_a_head_moved_after_the_replan_leaves_the_promotion_pending` | 구현 |
+| DV-485 | v3는 v2 DDL에서 도메인 테이블과 `quality_flags`의 key만 뺀다 | `tests/storage/test_core_v3.py::test_v3_drops_only_the_key_indexes` | 구현 |
+| DV-486 | v3 저장소는 key를 뺀 모든 열·NOT NULL·CHECK·FK·기본값 규칙을 지킨다 | `tests/storage/test_core_v3.py::test_a_v3_store_holds_every_rule_but_the_keys` | 구현 |
+| DV-487 | 새로 만든 v3 저장소와 migration한 v3 저장소의 core catalog가 같다 | `tests/storage/test_core_v3.py::test_fresh_and_migrated_v3_stores_hold_the_same_catalog` | 구현 |
+| DV-488 | v3 재구축은 행 수가 같아도 값이 바뀐 복사를 거부하고 단계 트랜잭션 전체를 되돌린다 | `tests/storage/test_core_v3.py::test_the_rebuild_refuses_a_copy_that_changed_rows` | 구현 |
+| DV-489 | v3 단계의 어느 경계에서 멈춰도 같은 명령이 백업 없이 끝내고 모든 행과 hash가 그대로다 | `tests/storage/test_core_v3.py::test_a_kill_at_every_boundary_of_the_v3_step_is_finished` | 구현 |
+| DV-490 | v2에서 게시한 승격은 v3에서 같은 요청·generation·delta·chain·manifest hash로 다시 나온다 | `tests/storage/test_core_v3.py::test_a_v2_promotion_replays_on_v3_with_the_same_hashes` | 구현 |
+| DV-491 | migration한 v3 설치본은 compact되고 새 루트가 deep으로 검증된다 | `tests/storage/test_core_v3.py::test_a_migrated_v3_installation_compacts_and_verifies_deep` | 구현 |
+| DV-492 | 대량 writer는 다른 dataset의 generation이 가진 `(record_id, revision_id)`도 COMMIT 전에 거부한다 | `tests/storage/test_market_integrity.py::test_bulk_writer_refuses_a_revision_another_dataset_holds` | 구현 |
+| DV-493 | 한 프로세스의 두 cursor가 같은 key를 게시해도 하나만 commit된다 | `tests/storage/test_market_integrity.py::test_the_judges_two_cursor_counterexample_cannot_commit_both` | 구현 |
+| DV-494 | 반복된 flag key, 저장되지 않은 revision의 flag, 검토하지 않은 flag는 COMMIT 전에 거부된다 | `tests/storage/test_market_integrity.py::test_flag_gate_refuses_repeats_orphans_and_unreviewed_flags` | 구현 |
+| DV-495 | 기본 감사는 generation별 행 수와 marker를 양쪽으로 대조한다 | `tests/storage/test_market_integrity.py::test_count_audit_compares_rows_and_markers_both_ways` | 구현 |
+| DV-496 | 도메인 전역 key와 flag key 중복은 `--deep` 검증만 감사한다 | `tests/storage/test_market_integrity.py::test_only_deep_verify_audits_duplicates` | 구현 |
+| DV-497 | 중복 감사의 pass는 잰 행 수와 key bytes로 나뉘고 치우친 긴 key도 끝까지 검사한다 | `tests/storage/test_market_integrity.py::test_adaptive_audit_splits_skewed_wide_keys_by_measured_size` | 구현 |
+| DV-498 | core catalog는 같은 버전의 빈 저장소와 열 순서·타입·제약까지 같아야 한다 | `tests/storage/test_market_integrity.py::test_core_catalog_matches_an_empty_store_of_its_version` | 구현 |
+| DV-499 | runbook 리허설과 4단계 승격 루프는 첫 실패에서 0이 아닌 상태로 멈추고 리허설 설치본·migration 백업·보고를 남기며 정리는 아무것도 지우지 않는다 | `tests/application/test_cutover.py::test_a_failed_rehearsal_stops_and_keeps_its_root_backups_and_reports` | 구현 |
+| DV-500 | 끝까지 마친 리허설만 완료 표시를 남기고 리허설 정리는 그 리허설의 출력만 지운다 | `tests/application/test_cutover.py::test_a_finished_rehearsal_is_the_only_one_its_cleanup_removes` | 구현 |
+| DV-501 | 리허설 채택은 계획 확인 뒤 별도 블록에서 실행되고 migration 검증이 실패하면 `recover` 전에 멈춘다 | `tests/application/test_cutover.py::test_an_adopted_rehearsal_stops_before_recover_when_its_migration_check_fails` | 구현 |

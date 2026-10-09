@@ -26,6 +26,10 @@ This module publishes a staged DuckDB table instead and keeps the same contract:
   inserted rows pass ``market_integrity``'s checks:
   no earlier row of the generation, the planned count, one revision per record, and no
   ``(record_id, revision_id)`` any other generation of the domain already holds.
+- A generation's quality flags (``BulkFlags``) are inserted by the writer itself, after
+  those checks and under the generation's ID, then held to one row per key, to stored
+  revisions and to their reviewed digest. No caller code runs inside the transaction,
+  so the writer's own INSERTs are its only writes.
 - Memory follows decision 0016: before any row is fetched, an SQL aggregate bounds
   the widest row, and each batch is sized so that its charge fits the caller's
   allocation. A row that cannot fit raises ``ComputeResourceError``. DuckDB's own
@@ -37,7 +41,7 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
@@ -56,6 +60,7 @@ from aegis_alpha.storage.market import (
     rowset_schema,
 )
 from aegis_alpha.storage.market_integrity import (
+    check_generation_flags,
     check_inserted_generation,
     check_new_generation,
     run_publication,
@@ -91,6 +96,15 @@ _MARKER_KEYS: Final = (
     "request_hash",
 )
 _WORK: Final = "the bulk generation"
+_FLAG_TABLE: Final = "quality_flags"
+FLAG_SCHEMA: Final = (
+    ("record_id", "text"),
+    ("revision_id", "text"),
+    ("rule_id", "text"),
+    ("rule_version", "text"),
+    ("flag", "text"),
+    ("detail", "text"),
+)
 _COLUMN_TYPES: Final = ("VARCHAR", "BIGINT", "DATE", "DOUBLE", "DECIMAL(38,12)")
 # Every code point str.strip() removes. A text cell made only of these is empty to
 # normalize_rows, so the SQL check uses exactly this class rather than trim()'s spaces.
@@ -146,6 +160,21 @@ class BulkRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class BulkFlags:
+    """The quality flags a new generation commits with its rows, and their reviewed digest.
+
+    ``staged`` names a table or view with exactly ``FLAG_SCHEMA``'s columns. The writer
+    inserts its rows under the generation's ID, so a publication adds flags to its own
+    generation only. ``rowset`` and ``rows`` are the ``flags_digest`` the inserted flags
+    must have before COMMIT.
+    """
+
+    staged: str
+    rowset: str
+    rows: int
+
+
+@dataclass(frozen=True, slots=True)
 class BulkPlan:
     """The marker a bulk publication records, and whether it already exists."""
 
@@ -181,16 +210,18 @@ def publish_generation_bulk(
     *,
     budget: ComputeBudget,
     plan: BulkPlan | None = None,
-    companion: Callable[[duckdb.DuckDBPyConnection], None] | None = None,
+    flags: BulkFlags | None = None,
 ) -> dict[str, object]:
     """Commit the marker and every staged row in one transaction and return the marker.
 
     The plan is recomputed inside the transaction. When ``plan`` is given, the
-    recomputed marker must equal it, so what commits is what was reviewed.
-    ``companion`` runs inside the same transaction after a new generation's rows are
-    inserted, so rows that belong to the generation (its quality flags) commit or roll
-    back with its marker. It does not run when an identical generation is reused. An
-    error or one interrupt at any point rolls the transaction back.
+    recomputed marker must equal it, so what commits is what was reviewed. ``flags``
+    are inserted under a new generation's ID in the same transaction, after its rows
+    pass their checks, so they commit or roll back with its marker. Nothing else runs
+    in the transaction: the writer's own INSERTs are its only writes, so no other
+    generation's rows or flags can change. Flags are not inserted when an identical
+    generation is reused. An error or one interrupt at any point rolls the transaction
+    back.
     """
 
     def publish() -> BulkPlan:
@@ -207,13 +238,94 @@ def publish_generation_bulk(
             )
             if not _is_table(connection, request.staged):
                 _check_stored(connection, request, budget)
-            if companion is not None:
-                companion(connection)
+            if flags is not None:
+                _insert_flags(connection, request, flags, budget)
         return current
 
     with budgeted(connection, budget, _WORK):
         current = run_publication(connection, publish)
     return dict(current.marker)
+
+
+def _insert_flags(
+    connection: duckdb.DuckDBPyConnection,
+    request: BulkRequest,
+    flags: BulkFlags,
+    budget: ComputeBudget,
+) -> None:
+    """Insert the staged flags under the generation; hold them to keys, revisions and digest.
+
+    No table key holds the flags to one row per key, so the writer refuses a repeated
+    or orphan flag of the generation, and flags other than the reviewed ones, here.
+    """
+    _require_version(connection, 2, "quality flags")  # quality_flags arrive in v2
+    if flags.staged in {*DOMAINS, "market_generations", _FLAG_TABLE}:
+        raise ValueError("quality flags must be staged outside the market tables")
+    staged = _quote(flags.staged)
+    described = {
+        str(row[0])
+        for row in connection.execute(f"DESCRIBE SELECT * FROM {staged}").fetchall()  # noqa: S608 -- quoted validated identifier
+    }
+    if described != {name for name, _ in FLAG_SCHEMA}:
+        raise ValueError("staged quality flags must carry exactly the flag columns")
+    columns = ", ".join(_quote(name) for name, _ in FLAG_SCHEMA)
+    _ = connection.execute(
+        f"INSERT INTO {_FLAG_TABLE} (generation_id, {columns}) SELECT ?, {columns} FROM {staged}",  # noqa: S608 -- code-owned schema and validated identifier
+        [request.generation_id],
+    )
+    check_generation_flags(connection, request.domain, request.generation_id)
+    digest, rows = flags_digest(
+        connection,
+        f"SELECT * FROM {_FLAG_TABLE} WHERE generation_id = ?",  # noqa: S608 -- code-owned table
+        [request.generation_id],
+        budget,
+    )
+    if digest != flags.rowset or rows != flags.rows:
+        raise ValueError("quality flags differ from their reviewed digest")
+
+
+def flags_digest(
+    connection: duckdb.DuckDBPyConnection,
+    relation: str,
+    parameters: list[object],
+    budget: ComputeBudget,
+) -> tuple[str, int]:
+    """The ``aas-rowset-v1`` digest and count of quality flag rows (generation excluded).
+
+    The widest row's encoding is measured in DuckDB before any fetch, and each batch is
+    sized from it against the remaining allowance, so no fetched row exceeds what the
+    budget admits; when not even one row fits, it refuses before fetching any. An empty
+    relation fetches nothing, so it needs no row's allowance: its digest is the empty
+    rowset's.
+    """
+    cells = [encoded_cell_sql(name, kind) for name, kind in FLAG_SCHEMA]
+    columns = ", ".join(_quote(name) for name, _ in FLAG_SCHEMA)
+    found = connection.execute(
+        f"SELECT count(*), coalesce(max(octet_length({' || '.join(cells)})), 0) "  # noqa: S608 -- code-owned encoders over a code-owned relation
+        f"FROM ({relation})",
+        parameters,
+    ).fetchone()
+    if found is None:
+        raise ValueError("integrity query returned no row")
+    count, row_bytes = int(found[0]), int(found[1])
+    if count == 0:
+        return RowsetStream(FLAG_SCHEMA, 0).hexdigest(), 0
+    batch = _hash_batch_rows(row_bytes, budget)
+    if batch < 1:
+        raise ComputeResourceError(
+            f"one quality flag row ({row_bytes} encoded bytes) exceeds the admitted "
+            f"materialization budget {budget.available_bytes} bytes"
+        )
+    digest = stream_rowset(
+        connection,
+        FLAG_SCHEMA,
+        cells,
+        f"SELECT {columns} FROM ({relation})",  # noqa: S608 -- code-owned relation
+        parameters,
+        count=count,
+        batch_rows=batch,
+    )
+    return digest, count
 
 
 def _is_table(connection: duckdb.DuckDBPyConnection, name: str) -> bool:
@@ -585,8 +697,6 @@ def _stats(
 
 def _batch_rows(stats: _Stats, budget: ComputeBudget) -> tuple[int, int]:
     """Admit the hash and identity batches against the allocation before any fetch."""
-    available = budget.available_bytes - stats.row_bytes
-    hash_row = 2 * stats.row_bytes + _ROW_OBJECT_BYTES
     identity_values = 1 + max(len(keys) for keys in NATURAL_KEYS.values())
     identity_row = (
         _IDENTITY_ROW_BYTES
@@ -594,7 +704,7 @@ def _batch_rows(stats: _Stats, budget: ComputeBudget) -> tuple[int, int]:
         + text_bytes(identity_values, stats.identity_characters)
         + (_IDENTITY_CHARACTER_BYTES - TEXT_CHARACTER_BYTES) * stats.identity_characters
     )
-    hash_rows = min(BATCH_ROWS, max(available, 0) // hash_row)
+    hash_rows = _hash_batch_rows(stats.row_bytes, budget)
     identity_rows = min(BATCH_ROWS, budget.available_bytes // identity_row)
     if hash_rows < 1 or identity_rows < 1:
         raise ComputeResourceError(
@@ -602,6 +712,16 @@ def _batch_rows(stats: _Stats, budget: ComputeBudget) -> tuple[int, int]:
             f"materialization budget {budget.available_bytes} bytes"
         )
     return hash_rows, identity_rows
+
+
+def _hash_batch_rows(row_bytes: int, budget: ComputeBudget) -> int:
+    """Rows per hash batch of rows at most ``row_bytes`` wide; below one, none fits.
+
+    The stream keeps the previous row (the hash workspace), and each fetched row is
+    held twice over plus its objects' headers.
+    """
+    available = budget.available_bytes - row_bytes
+    return min(BATCH_ROWS, max(available, 0) // (2 * row_bytes + _ROW_OBJECT_BYTES))
 
 
 # Text that json.dumps writes verbatim between quotes: printable ASCII except '"' and '\\'.

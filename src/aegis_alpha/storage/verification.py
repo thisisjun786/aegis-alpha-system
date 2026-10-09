@@ -31,6 +31,8 @@ from aegis_alpha.storage.strategies import verify_strategy_content
 from aegis_alpha.storage.strategy_import import verify_strategy_imports
 
 if TYPE_CHECKING:
+    import sqlite3
+
     from aegis_alpha.storage.workspace import Workspace
 
 
@@ -151,49 +153,28 @@ def _verify_runs(workspace: Workspace, budget: ComputeBudget) -> list[str]:
     ]
 
 
-def verify_workspace(  # noqa: C901, PLR0912, PLR0915 -- full cross-store verification boundary
+def verify_publications(
     workspace: Workspace, *, budget: ComputeBudget | None = None, deep: bool = False
-) -> dict[str, object]:
-    """Verify under a caller-owned allocation, retaining the serial default when omitted.
+) -> tuple[list[sqlite3.Row], ComputeBudget]:
+    """Verify every committed publication's rows against its evidence, then audit the market.
 
-    The default compares stored rows with their recorded digests: a source table with
-    its recorded columns and row count, a promoted chain by its links and its leaf
-    delta. ``deep`` rehashes every source table and every promoted delta. Everything
-    else is checked the same way in both modes, and the report has the same shape.
-    Both modes audit every market row's generation, domain and count and every quality
-    flag's reference; ``deep`` also refuses a revision or flag key stored twice.
+    Each leaf chain is verified by its own owner (a promotion by its intent, spec,
+    manifest and flags; a sealed import by its retained document), every committed
+    generation must be covered by one, and ``audit_market`` checks the rows at rest. A
+    sealed chain's every delta is always matched; ``deep`` also rehashes every promoted
+    delta, not only the leaf's, and audits duplicate keys. Returns the
+    committed catalog rows and the budget that still holds them, for a caller that goes
+    on verifying with both.
     """
     # Before anything else: every core market name resolves to the stored table.
     check_core_names(workspace.market)
     budget = budget or ComputeBudget(Fraction(1), 512 * 1024 * 1024)
-    # Every step below charges against the same non-DuckDB allowance. DuckDB's own
-    # share is bounded separately by the connection limit derived from this budget.
-    allowance = budget.available_bytes
-    if workspace.strategies is None:
-        raise ValueError("strategy store is required for complete verification")
-    for connection in (workspace.state, workspace.strategies):
-        if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-            raise ValueError("SQLite integrity check failed")
-        if connection.execute("PRAGMA foreign_key_check").fetchall():
-            raise ValueError("SQLite foreign key check failed")
-    # Bound variable-width header enumeration before handing each exact pin to
-    # the shared aggregate/content verifier. A root alone cannot exceed 1 MiB.
-    for sql in (
-        "SELECT EXISTS(SELECT 1 FROM identity_snapshots WHERE length(CAST(snapshot_id AS BLOB))>?)",
-        (
-            "SELECT EXISTS(SELECT 1 FROM universe_versions "
-            "WHERE length(CAST(universe_id AS BLOB))+length(CAST(version AS BLOB))>?)"
-        ),
-    ):
-        if workspace.state.execute(sql, (1024 * 1024,)).fetchone()[0]:
-            raise ValueError("membership root exceeds document byte limit")
-    _verify_membership(workspace, allowance)
     size = workspace.state.execute(
         "SELECT count(*)*2048 + coalesce(sum(32*(length(dataset_id)+length(version)+"
         "length(generation_id)+coalesce(length(parent_generation_id),0))),0) "
         "FROM dataset_versions WHERE status='committed'"
     ).fetchone()[0]
-    if size > allowance // 8:
+    if size > budget.available_bytes // 8:
         raise ComputeResourceError("publication catalog exceeds materialization budget")
     # The catalog rows stay live through every later step, so every later step is
     # admitted against what is left rather than the whole allowance. Accumulate onto
@@ -228,6 +209,48 @@ def verify_workspace(  # noqa: C901, PLR0912, PLR0915 -- full cross-store verifi
     # ways and every flag's reference; deep adds domain-wide duplicate keys. It passes or
     # raises, so the report keeps its shape.
     audit_market(workspace.market, budget, deep=deep)
+    return versions, held
+
+
+def verify_workspace(  # noqa: C901 -- full cross-store verification boundary
+    workspace: Workspace, *, budget: ComputeBudget | None = None, deep: bool = False
+) -> dict[str, object]:
+    """Verify under a caller-owned allocation, retaining the serial default when omitted.
+
+    The default compares stored rows with their recorded digests: a source table with
+    its recorded columns and row count, a promoted chain by its links and its leaf
+    delta. ``deep`` rehashes every source table and every promoted delta. Everything
+    else is checked the same way in both modes, and the report has the same shape.
+    Both modes audit every market row's generation, domain and count and every quality
+    flag's reference; ``deep`` also refuses a revision or flag key stored twice.
+    """
+    # Before anything else, the SQLite and membership checks included: every core market
+    # name resolves to the stored table.
+    check_core_names(workspace.market)
+    budget = budget or ComputeBudget(Fraction(1), 512 * 1024 * 1024)
+    # Every step below charges against the same non-DuckDB allowance. DuckDB's own
+    # share is bounded separately by the connection limit derived from this budget.
+    allowance = budget.available_bytes
+    if workspace.strategies is None:
+        raise ValueError("strategy store is required for complete verification")
+    for connection in (workspace.state, workspace.strategies):
+        if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise ValueError("SQLite integrity check failed")
+        if connection.execute("PRAGMA foreign_key_check").fetchall():
+            raise ValueError("SQLite foreign key check failed")
+    # Bound variable-width header enumeration before handing each exact pin to
+    # the shared aggregate/content verifier. A root alone cannot exceed 1 MiB.
+    for sql in (
+        "SELECT EXISTS(SELECT 1 FROM identity_snapshots WHERE length(CAST(snapshot_id AS BLOB))>?)",
+        (
+            "SELECT EXISTS(SELECT 1 FROM universe_versions "
+            "WHERE length(CAST(universe_id AS BLOB))+length(CAST(version AS BLOB))>?)"
+        ),
+    ):
+        if workspace.state.execute(sql, (1024 * 1024,)).fetchone()[0]:
+            raise ValueError("membership root exceeds document byte limit")
+    _verify_membership(workspace, allowance)
+    versions, held = verify_publications(workspace, budget=budget, deep=deep)
     for source in workspace.state.execute(
         "SELECT relative_path,byte_hash,size_bytes FROM source_files"
     ):
