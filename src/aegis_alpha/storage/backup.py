@@ -10,12 +10,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from aegis_alpha.data.descriptor_tree import DescriptorTree, DescriptorTreeError
-from aegis_alpha.storage.locks import private_directory, private_file
+from aegis_alpha.storage.locks import private_directory, private_file, require_outside_checkout
 from aegis_alpha.storage.paths import DEFAULT_PATHS, load_paths, read_json, resolve_home
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import Workspace, open_workspace, write_json
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
+
     from aegis_alpha.compute_resources import ComputeBudget
 
 _MANIFEST = "backup.json"
@@ -106,23 +108,35 @@ def backup(
         return backup_workspace(workspace, output, budget=budget, deep=deep)
 
 
-def backup_workspace(
-    workspace: Workspace,
-    output: Path | None = None,
-    *,
-    budget: ComputeBudget | None = None,
-    deep: bool = False,
-) -> dict[str, object]:
-    """Back up within an existing maintenance lifetime; never reacquire workspace locks.
+def _carried(
+    workspace: Workspace, carry: Collection[str], budget: ComputeBudget | None
+) -> list[str]:
+    """The prepared operations a backup holds pending, refusing any it may not.
 
-    The installation is verified first, comparing stored rows with their recorded
-    digests unless ``deep`` rehashes them; every copied file is hashed as it is written.
+    Every prepared operation must be one the caller named and one ``aas db recover``
+    would publish (``untouched_promotion_refusal``, which plans each again), checked here
+    rather than trusted, so the names widen nothing: an ordinary backup names none and
+    refuses every one.
     """
-    verification = verify_workspace(workspace, budget=budget, deep=deep)
-    if verification["pending_operations"] or verification["orphan_generations"]:
+    from aegis_alpha.storage.promotion.engine import (  # noqa: PLC0415 -- promotion owner
+        untouched_promotion_refusal,
+    )
+
+    pending = workspace.state.execute(
+        "SELECT operation_id,kind,request_hash,target_id,expected_parent,payload_hash,phase "
+        "FROM storage_operations WHERE phase='PREPARED' ORDER BY operation_id"
+    ).fetchall()
+    if any(
+        row["operation_id"] not in carry
+        or untouched_promotion_refusal(workspace, dict(row), budget=budget)
+        for row in pending
+    ):
         raise ValueError("backup requires recovered operations and no orphan generations")
-    if workspace.state.execute("SELECT 1 FROM runs WHERE status='RUNNING'").fetchone():
-        raise ValueError("backup requires all running analyses to stop")
+    return [str(row["operation_id"]) for row in pending]
+
+
+def backup_destination(workspace: Workspace, output: Path | None) -> Path:
+    """The new directory a backup of ``workspace`` writes, refused before anything is."""
     target = (
         resolve_home(output) if output is not None else workspace.paths.backups / uuid.uuid4().hex
     )
@@ -133,6 +147,39 @@ def backup_workspace(
         for path in (workspace.paths.raw, workspace.paths.runs, workspace.paths.secrets)
     ):
         raise ValueError("backup destination cannot be inside raw, runs, or secrets")
+    require_outside_checkout(target)
+    return target
+
+
+def backup_workspace(
+    workspace: Workspace,
+    output: Path | None = None,
+    *,
+    budget: ComputeBudget | None = None,
+    deep: bool = False,
+    carry: Collection[str] = (),
+) -> dict[str, object]:
+    """Back up within an existing maintenance lifetime; never reacquire workspace locks.
+
+    The installation is verified first, comparing stored rows with their recorded
+    digests unless ``deep`` rehashes them; every copied file is hashed as it is written.
+
+    A backup needs every operation recovered. ``carry`` is the core schema migration's
+    exception alone: the promotion intents it names, each one recovery would publish,
+    stay pending in the copy exactly as the installation holds them with their retained
+    evidence, the logical report counts them, and the manifest lists them as
+    ``carried_operations``. Such a backup is the migration's rollback snapshot, not a
+    recovered installation's backup.
+    """
+    verification = verify_workspace(workspace, budget=budget, deep=deep)
+    if verification["orphan_generations"]:
+        raise ValueError("backup requires recovered operations and no orphan generations")
+    carried = _carried(workspace, carry, budget) if verification["pending_operations"] else []
+    if len(carried) != verification["pending_operations"]:
+        raise ValueError("backup requires recovered operations and no orphan generations")
+    if workspace.state.execute("SELECT 1 FROM runs WHERE status='RUNNING'").fetchone():
+        raise ValueError("backup requires all running analyses to stop")
+    target = backup_destination(workspace, output)
     private_directory(target, create=True)
     files: dict[str, object] = {}
     for name, connection in (("state", workspace.state), ("strategies", workspace.strategies)):
@@ -181,6 +228,8 @@ def backup_workspace(
         "secrets_included": False,
         # The verification mode, kept beside the logical report it does not change.
         "deep": deep,
+        # Only a migration snapshot has this key, so every other manifest keeps its shape.
+        **({"carried_operations": carried} if carried else {}),
     }
     write_json(target / _MANIFEST, manifest)
     _validated_manifest(target)
@@ -191,6 +240,7 @@ def backup_workspace(
         "files": len(files),
         "runs": _run_counts(workspace),
         "deep": deep,
+        **({"carried_operations": carried} if carried else {}),
     }
 
 

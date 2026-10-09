@@ -21,6 +21,18 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   makes ordinary admission refuse the installation until the command is repeated. Each
   step's intent has its own operation id and a request bound to that step's versions
   and checksums, so a completed step's intent still matches after later versions exist.
+  `--to N` runs the steps one at a time; every step without an intent takes its own
+  verified backup, and only a prepared step resumes without one. A step's backup alone
+  may carry a promotion intent as PREPARED only when `aas db recover` would publish it,
+  by recovery's own code (`untouched_promotion_refusal`): no marker, rows, flags or
+  catalog trace, its own retained evidence (`_evidence`), and its retained spec planned
+  again recomputing its manifest exactly (`_replanned`, the comparison recovery
+  publishes by). Never add a hand-written check of manifest fields beside it. A replan
+  that does not fit the lease is `ComputeResourceError`, never a carry; the replan
+  applies the lease's share from the installation's limits (`reset_market_limits`), not
+  from what a verification left, so every check decides alike. `--plan` runs
+  under the lease and says each carry was proven by replanning. `backup_workspace`
+  rechecks the names it is given and every other backup refuses every pending operation.
   The v1 DDL bytes are a recorded fact, so v1 is built from the v1 domains alone. A v1 store
   stays usable; writes that need a v2 table or a close-only price name the migration.
   `prices.fields` defaults to `ohlcv`, an OHLCV row reads and hashes in its v1 shape,

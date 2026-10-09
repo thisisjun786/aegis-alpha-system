@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import TYPE_CHECKING, Final, cast
 
-from aegis_alpha.compute_resources import ComputeBudget
+from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.storage.bulk_generation import (
     BulkPlan,
@@ -40,6 +40,7 @@ from aegis_alpha.storage.bulk_generation import (
 )
 from aegis_alpha.storage.market import (
     RECORD_SCHEMA,
+    budgeted,
     generation_chain,
     limit_duckdb,
     marker_for,
@@ -1921,6 +1922,17 @@ def _complete(
 def _evidence(
     workspace: Workspace, operation: Mapping[str, object]
 ) -> tuple[PromotionSpec, dict[str, object]]:
+    """The retained spec and manifest of a promotion intent, refusing any that is not its own.
+
+    The intent's IDs and parent are its request's, because publication prepares the
+    request's own intent: an intent under any other name would never be the one it
+    completes.
+    """
+    request_hash = str(operation["request_hash"])
+    if (str(operation["target_id"]), str(operation["operation_id"])) != generation_identity(
+        request_hash
+    ):
+        raise ValueError("promotion intent IDs are not its request's")
     manifest_raw = _read_raw(workspace, str(operation["payload_hash"]))
     manifest = json.loads(manifest_raw)
     if (
@@ -1938,9 +1950,33 @@ def _evidence(
     )
     if hashlib.sha256(request).hexdigest() != operation["request_hash"]:
         raise ValueError("retained promotion spec does not match its request")
-    if _read_raw(workspace, str(operation["request_hash"])) != request:
+    if _read_raw(workspace, request_hash) != request:
         raise ValueError("retained promotion request differs from its spec")
+    if operation["expected_parent"] != spec.parent:
+        raise ValueError("promotion intent parent is not its request's")
     return spec, manifest
+
+
+def _replanned(
+    workspace: Workspace,
+    operation: Mapping[str, object],
+    spec: PromotionSpec,
+    budget: ComputeBudget,
+) -> PromotionPlan | None:
+    """The retained spec planned again, if it recomputes exactly the intent's manifest.
+
+    This is the one test an uncommitted intent is published by: ``recover_promotion``
+    publishes the plan it returns, and the core migration carries only an intent it
+    returns a plan for. A moved head is no plan; DuckDB exhausting its memory is
+    ``ComputeResourceError``. The caller drops the plan's temp tables.
+    """
+    try:
+        with budgeted(workspace.market, None, "planning the prepared promotion again"):
+            plan = plan_promotion(workspace, spec, budget=budget)
+    except ParentChangedError:
+        return None
+    recomputed = None if plan.manifest is None else hashlib.sha256(plan.manifest).hexdigest()
+    return plan if recomputed == operation["payload_hash"] else None
 
 
 def recover_promotion(
@@ -1966,16 +2002,91 @@ def recover_promotion(
         _complete(workspace, operation, spec, manifest, budget)
         return True
     try:
-        plan = plan_promotion(workspace, spec, budget=budget)
-        recomputed = None if plan.manifest is None else hashlib.sha256(plan.manifest).hexdigest()
-        if recomputed != operation["payload_hash"]:
+        plan = _replanned(workspace, operation, spec, budget)
+        if plan is None:
             return False
         _publish(workspace, plan, budget)
     except ParentChangedError:
+        # The head moved after the replan: the intent stays pending, as for a moved
+        # head found by the replan itself.
         return False
     finally:
         _drop(workspace.market)
     return True
+
+
+def _residue(workspace: Workspace, operation_id: str, generation_id: str) -> str | None:
+    """What of a promotion intent reached the market or the catalog, or None."""
+    market = workspace.market
+    if market.execute(
+        "SELECT 1 FROM market_generations WHERE operation_id=? OR generation_id=?",
+        [operation_id, generation_id],
+    ).fetchone():
+        return "its generation is committed; recover it first"
+    version = market_version(market)
+    tables = [name for name in DOMAINS if DOMAIN_VERSIONS[name] <= version]
+    if version >= 2:  # noqa: PLR2004 -- quality_flags arrive in v2
+        tables.append("quality_flags")
+    for table in tables:
+        if market.execute(
+            f"SELECT 1 FROM {_q(table)} WHERE generation_id=? LIMIT 1",
+            [generation_id],
+        ).fetchone():
+            return "its generation has stored rows"
+    # Every quality check a catalog completion writes for this generation.
+    check_ids = [
+        "qc-" + hashlib.sha256(f"{generation_id}/{rule}".encode()).hexdigest()
+        for rule in ("promotion", PARTITION_CHECK[0])
+    ]
+    if workspace.state.execute(
+        "SELECT 1 FROM dataset_versions WHERE generation_id=? "
+        "UNION ALL SELECT 1 FROM quality_checks WHERE check_id IN (?, ?)",
+        (generation_id, *check_ids),
+    ).fetchone():
+        return "its generation is cataloged"
+    return None
+
+
+def untouched_promotion_refusal(
+    workspace: Workspace,
+    operation: Mapping[str, object],
+    *,
+    budget: ComputeBudget | None = None,
+) -> str | None:
+    """Why a prepared promotion may not stay pending through a core migration; None if it may.
+
+    Only an intent ``aas db recover`` would publish afterwards may: nothing of it reached
+    the market or the catalog, and recovery's own test holds, by the same code. Its
+    retained evidence is its own (``_evidence``) and its retained spec, planned again,
+    recomputes exactly its manifest (``_replanned``), so nothing a manifest records is
+    trusted. A committed generation is never carried, since its catalog completion is
+    recovery's to finish first. A plan that cannot run within ``budget`` is
+    ``ComputeResourceError``, never a carry.
+
+    The plan runs within ``budget``'s share of the installation's own limits, not of
+    whatever share earlier work (a verification, another plan) left on the connection, so
+    the migration's plan, its check and its backup's recheck decide alike; the connection
+    is back at the installation's limits afterwards.
+    """
+    if operation["kind"] != OPERATION_KIND or operation["phase"] != "PREPARED":
+        return "not a prepared promotion"
+    residue = _residue(workspace, str(operation["operation_id"]), str(operation["target_id"]))
+    if residue is not None:
+        return residue
+    workspace.reset_market_limits()
+    try:
+        spec, _ = _evidence(workspace, operation)
+        plan = _replanned(workspace, operation, spec, budget or _DEFAULT_BUDGET)
+    except ComputeResourceError:
+        raise
+    except (KeyError, TypeError, ValueError, OSError, RecursionError) as error:
+        # Unreadable evidence or a failed plan is a refusal to carry, never a reason to
+        # drop the check.
+        return str(error) or type(error).__name__
+    finally:
+        _drop(workspace.market)
+        workspace.reset_market_limits()
+    return None if plan is not None else "its retained spec no longer plans its manifest"
 
 
 def verify_promotion(

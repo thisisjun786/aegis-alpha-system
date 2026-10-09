@@ -36,10 +36,11 @@ from aegis_alpha.storage.migration import (
     migrate_core_schema,
     plan_core_migration,
 )
-from aegis_alpha.storage.state import complete_operation, prepare_operation
+from aegis_alpha.storage.state import prepare_operation
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace
 from tests.storage.capacity_support import PIN_BLOCK, FailingCommit
+from tests.storage.core_step_support import add_synthetic_step
 from tests.storage.test_publication import document
 
 # The digests installations record. v1 is what every store made before v2 carries, so a
@@ -538,20 +539,22 @@ def test_a_completed_step_intent_outlives_later_steps(tmp_path: Path) -> None:
     migrate_core_schema(home, to_version=2, backup_output=tmp_path / "backup")
     # A later step records its own intent under the same kind; the v2 intent still
     # matches its own step, so the installation reads as current, not invalid.
-    with open_workspace(home, writable=True) as admitted:
-        prepare_operation(
-            admitted.state,
-            operation_id="core-schema-migrate-v3",
-            kind="core-schema-migrate",
-            request_hash=_HASH,
-            target_id=admitted.installation_id,
-            expected_parent=None,
-            payload_hash=_HASH,
-        )
-        complete_operation(admitted.state, "core-schema-migrate-v3", _HASH)
-    with open_workspace(home) as admitted:
-        status = inspect_core_schema(admitted)
-        assert (status.state, status.migration_phase) == ("current", "COMPLETED")
+    with pytest.MonkeyPatch.context() as patch:
+        later = add_synthetic_step(patch)
+        migrate_core_schema(home, to_version=later, backup_output=tmp_path / "later")
+        with open_workspace(home) as admitted:
+            status = inspect_core_schema(admitted)
+            assert (status.state, status.migration_phase) == ("current", "COMPLETED")
+            assert [
+                tuple(row)
+                for row in admitted.state.execute(
+                    "SELECT operation_id, phase FROM storage_operations "
+                    "WHERE kind='core-schema-migrate' ORDER BY operation_id"
+                )
+            ] == [
+                (MIGRATION_OPERATION, "COMPLETED"),
+                ("core-schema-migrate-v3", "COMPLETED"),
+            ]
 
 
 def test_plan_writes_nothing_and_names_the_recorded_checksums(

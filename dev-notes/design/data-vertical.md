@@ -2175,23 +2175,56 @@ digest는 grant가 생기기 전과 같다. 빈 배열은 거부한다.
 ## 스키마 v2
 
 state와 market 저장소는 core schema 버전을 가진다. `aas init`은 새 저장소에 v1과 v2를 한 트랜잭션으로
-적용하므로 새 설치본과 migration한 설치본은 같은 객체와 같은 영수증을 가진다. `aas db migrate --to 2
---backup-output DIR`이 v1 설치본을 v2로 올린다. `storage/migration.py`가 이 순서를 소유한다.
+적용하므로 새 설치본과 migration한 설치본은 같은 객체와 같은 영수증을 가진다. `aas db migrate --to N
+--backup-output DIR`이 설치본을 한 버전씩 `N`까지 올린다. `storage/migration.py`가 이 순서를 소유한다.
+`v - 1`에서 `v`로 가는 단계마다 다음을 한다.
 
-1. 설치 잠금을 잡는다. 실행 중인 run이나 다른 PREPARED 작업이 있으면 거부한다.
-2. `DIR`에 백업을 만들고 검증한다. `DIR`이 없으면 진행하지 않는다.
-3. state에 migration intent를 기록한다. intent의 payload hash는 백업 manifest(`backup.json`)의 SHA-256이다.
+1. 설치 잠금을 잡는다. 실행 중인 run이나 다른 PREPARED 작업이 있으면 거부한다. 예외는 손대지 않은
+   승격 intent 하나뿐이다(아래).
+2. 백업을 만들고 검증한다. 그 경로가 이미 있으면 진행하지 않는다. 백업이 필요한 단계가 하나면 `DIR`
+   자체가 백업이고, 여럿이면 새 `DIR` 아래 단계의 operation ID(`DIR/core-schema-migrate-v2` 등)마다 하나씩 만든다.
+3. state에 그 단계의 intent(`core-schema-migrate-v<v>`)를 기록한다. payload hash는 그 단계 백업
+   manifest(`backup.json`)의 SHA-256이다. 요청은 그 단계의 두 버전과 그때까지의 checksum만 담으므로
+   나중 버전이 생겨도 완료된 intent가 계속 맞는다. v2 단계의 정체성은 출시된 그대로다.
 4. market DDL을 DuckDB 한 트랜잭션으로, state DDL을 SQLite 한 트랜잭션으로 적용한다. 각 트랜잭션은
-   `schema_migrations`에 새 버전 행을 더하고 `store_info.schema_version`을 바꾼다. v1 행은 그대로 남아
+   `schema_migrations`에 새 버전 행을 더하고 `store_info.schema_version`을 바꾼다. 기존 행은 그대로 남아
    `(1, v1), (2, v2)`가 된다.
 5. 설치 영수증(`installation.json`)의 저장소 버전을 바꾼다.
 6. intent를 완료한다.
 
-intent가 PREPARED인 설치본은 migration-incomplete다. 앱은 그 설치본을 읽기·쓰기 어느 쪽으로도 열지
-않고, 같은 명령을 다시 실행하면 남은 단계부터 재개한다. 재개는 백업을 다시 만들지 않으며
-`--backup-output`을 쓰지 않는다. intent 전에 멈추면 설치본은 v1 그대로이고 새 `DIR`로 다시 실행한다.
-`aas db quarantine`은 이 intent를 끝내지 않는다. `--plan`은 저장소를 읽기 전용으로 열어 현재 버전,
-인식한 checksum, 남은 단계를 보고하고 아무것도 쓰지 않는다.
+어느 단계의 intent가 PREPARED인 설치본은 migration-incomplete다. 앱은 그 설치본을 읽기·쓰기 어느
+쪽으로도 열지 않고, 같은 명령을 다시 실행하면 그 단계의 남은 부분부터 재개한다. 재개는 그 단계의
+백업을 다시 만들지 않으며, 그 단계보다 앞선 `--to`는 거부한다. intent가 없는 단계는 언제나 자기 백업부터
+만든다. 그래서 한 단계를 완료하고 다음 단계의 intent 전에 멈춘 설치본은 앞 단계 버전의 완전한
+설치본이고, 새 `DIR`로 다시 실행해야 한다. 재개한 단계의 market COMMIT이 이미 끝났어도 그 단계를 마친
+뒤 같은 호출의 다음 단계 백업은 같은 store·설치 정체성의 그 단계 버전 market만 받는다. 백업 목적지는
+어느 단계도 쓰기 전에 백업이 받는 조건 그대로(새 디렉터리, `raw`·`runs`·`secrets` 밖, Git checkout 밖) 확인한다. 목표 이상인 설치본에는 아무것도 하지 않는다. `aas db
+quarantine`은 이 intent를 끝내지 않는다. `--plan`은 저장소를 읽기 전용으로 열어 현재 버전, 인식한
+checksum, 다음 단계의 남은 부분(`steps`), 목표까지의 단계별 목록(`migrations`), 백업 필요 여부,
+가지고 갈 승격(`carried_operations`)과 막는 작업(`blocking_operations`)을 보고하고 아무것도 쓰지 않는다.
+
+손대지 않은 승격 intent는 PREPARED인 채로 단계를 지난다. 그 조건은 `aas db recover`가 그 intent를
+게시하는 조건이고 같은 코드로 계산한다. kind가 `promotion`이고, 그 operation이나 generation의 marker,
+행, flag, catalog 기록(`dataset_versions`, 그 generation의 `promotion_report`·`partition_row_count` 품질
+검사)이 없어야 한다. 보존된 증거는 intent의 것이어야 한다. operation·generation ID와 parent가 요청에서
+나오고, manifest는 intent가 가리키는 hash의 정규 bytes로서 같은 요청과 generation을 적으며, 보존 요청은
+보존 명세로 다시 만든 그대로다. 마지막으로 보존 명세를 다시 계획해 parent가 아직 dataset의 head이고
+계획한 manifest의 SHA-256이 intent의 payload hash와 같아야 한다. 이 비교는 recover가 게시하기 전에 하는
+비교와 같은 함수이므로 manifest가 적은 어떤 값도 따로 믿지 않는다. 고친 manifest를 다시 hash해 intent에
+걸어도, head가 옮겨졌거나 원천 table이 바뀌었어도 가지고 가지 않는다. 재계획은 앞선 검증이나 계획이
+연결에 남긴 몫이 아니라 설치본의 자원 한도에서 lease 몫을 새로 적용해 돌므로, `--plan`, migration의
+확인, 백업의 재확인은 같은 lease에서 같게 판정한다. 확인이 끝나면 계획의 임시 table을 지우고 market
+연결을 설치본의 자원 한도로 되돌린다. 증거를 읽거나 계획하다 난 오류는 가지고 가지
+않는 이유가 되지만, 계획이 compute lease의 몫 안에서 돌 수 없으면 `ComputeResourceError`로 거부하고
+조용히 가지고 가지 않는다. 그 밖의 PREPARED 작업, marker가 commit된 승격, 실행 중인 run은 계속 막는다.
+이 예외는 단계의 백업에만 넘겨지고 백업이 같은 조건으로 다시 확인한다. 일반 `aas db backup`과 다른
+명령의 백업은 여전히 모든 PREPARED 작업을 거부한다. 그 백업은 intent와 `raw/` 증거를 그대로 담고,
+`logical.pending_operations`는 실제 수를 세며, manifest의 `carried_operations`가 그 operation을 적는다.
+이것은 migration의 rollback snapshot이지 복구를 마친 설치본의 백업이 아니다. migration은 intent를 끝내거나
+바꾸지 않는다. 그 뒤 `aas db recover`가 같은 재계획으로 게시한다. 재계획 뒤 게시 전에 head가 옮겨지면
+게시의 parent 확인이 거부하고, recover는 그 intent를 pending으로 남긴 채 나머지 작업을 이어 간다. `--plan`의 `carried_operations`는
+승격마다 operation·generation ID와 manifest hash를 적고 `proof`로 다시 계획해 증명했음을 밝힌다. 그래서
+`--plan`도 compute lease 안에서 실행한다.
 
 `schema_migrations`의 이력은 1부터 빈틈없이 이어지고 각 행의 checksum은 그 버전 DDL의 SHA-256과
 같아야 한다. 알 수 없는 버전, 빈틈, 다른 checksum은 거부한다. v1 checksum은 market
@@ -2869,3 +2902,19 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-466 | 용량과 무관한 COMMIT 실패는 인용한 key가 용량 문구를 담아도 `ComputeResourceError`로 바뀌지 않고, 뒤따르는 ROLLBACK이 그 오류를 덮지 않는다 | `tests/storage/test_bulk_generation.py::test_a_failed_commit_is_not_replaced_by_its_rollback` | 구현 |
 | DV-467 | core migration의 market 단계는 compute lease의 DuckDB 몫에서 실행하고, 그 COMMIT의 고갈은 intent를 남긴 채 `ComputeResourceError`가 된다 | `tests/storage/test_migration.py::test_an_exhausted_market_step_is_a_budget_error_under_the_lease` | 구현 |
 | DV-468 | compact의 market 복사는 compute lease의 DuckDB 몫에서 실행하고, 고갈은 원본을 바꾸지 않은 채 `ComputeResourceError`가 된다 | `tests/storage/test_compaction.py::test_compaction_copies_under_the_lease_and_names_exhaustion` | 구현 |
+| DV-469 | core migration 단계마다 자기 intent와 백업을 가지며, v2 단계의 요청과 부모 정체성은 나중 버전이 생겨도 출시된 그대로다 | `tests/storage/test_migration_steps.py::test_step_identities_are_frozen_and_outlive_later_steps` | 구현 |
+| DV-470 | 한 호출이 여러 단계를 지나면 단계마다 새 백업을 만들고 각 intent가 자기 백업을 가리킨다 | `tests/storage/test_migration_steps.py::test_one_invocation_takes_every_step_with_its_own_backup` | 구현 |
+| DV-471 | 단계 완료와 다음 단계 intent 사이에서 멈춘 설치본은 다음 단계의 새 백업을 요구한다 | `tests/storage/test_migration_steps.py::test_a_kill_between_steps_needs_the_next_steps_own_backup` | 구현 |
+| DV-472 | 손대지 않은 승격 intent는 증거와 함께 migration 백업에 PREPARED로 실리고, `--plan`은 다시 계획해 증명했다고 적으며, migration 뒤 `aas db recover`가 실패 전 계획과 같은 generation·delta·chain·manifest hash로 게시한다 | `tests/storage/test_migration_steps.py::test_an_untouched_promotion_is_carried_through_a_step_and_then_recovered` | 구현 |
+| DV-473 | marker·catalog 흔적이 있거나 증거가 intent의 것이 아닌 승격은 migration을 막고, 이름을 넘겨도 백업이 다시 거부한다 | `tests/storage/test_migration_steps.py::test_only_a_promotion_recovery_would_publish_is_carried` | 구현 |
+| DV-474 | migration snapshot은 v2만 아는 코드로 복원·검증되고 다시 migration한 뒤 같은 승격을 게시한다 | `tests/storage/test_migration_steps.py::test_the_snapshot_restores_for_v2_code_and_migrates_again` | 구현 |
+| DV-475 | `--to 2`는 나중 버전을 아는 코드에서도 v2에서 멈추고, 다음 단계는 거기서 시작하며, 목표 이상인 설치본은 그대로 둔다 | `tests/storage/test_migration_steps.py::test_to_2_stops_there_and_a_later_step_starts_from_it` | 구현 |
+| DV-476 | 나중 단계 어디서 멈춰도 같은 목표로 다시 실행하면 백업 없이 끝나고, 앞선 목표는 거부된다 | `tests/storage/test_migration_steps.py::test_a_kill_in_a_later_step_is_finished_by_repeating_it` | 구현 |
+| DV-477 | market COMMIT 뒤 멈춘 단계를 재개하는 호출은 다음 단계 백업까지 이어 가고, 그 전에 모든 백업 목적지를 백업의 조건대로 확인한다 | `tests/storage/test_migration_steps.py::test_a_step_whose_market_landed_resumes_into_the_next_step` | 구현 |
+| DV-478 | bytes가 intent와 맞아도 보존 명세를 다시 계획해 같은 manifest가 나오지 않는 승격(고쳐 다시 hash한 manifest, 옮겨진 head, 바뀐 원천)은 migration을 막고 recover도 게시하지 않는다 | `tests/storage/test_migration_steps.py::test_only_a_promotion_recovery_would_publish_is_carried` | 구현 |
+| DV-479 | 승격 증거를 읽다 난 I/O 오류는 가지고 가지 않는 이유가 되며 migration 밖으로 새지 않는다 | `tests/storage/test_migration_steps.py::test_an_evidence_read_error_refuses_the_carry` | 구현 |
+| DV-480 | promotion이 아닌 PREPARED 작업은 carry할 승격과 같은 요청·generation·manifest를 적어도 migration을 막는다 | `tests/storage/test_migration_steps.py::test_a_prepared_operation_of_another_kind_blocks` | 구현 |
+| DV-481 | migration의 carry와 recover의 게시는 한 재계획 구현을 공유해, 그 하나가 거부하면 둘 다 거부한다 | `tests/storage/test_migration_steps.py::test_recovery_and_the_carry_share_one_replan` | 구현 |
+| DV-482 | 재계획이 compute lease 안에서 돌 수 없으면 `--plan`, migration과 그 백업은 `ComputeResourceError`로 거부하고 아무것도 쓰지 않는다 | `tests/storage/test_migration_steps.py::test_a_replan_beyond_the_lease_refuses_the_migration` | 구현 |
+| DV-483 | carry 재계획은 앞선 검증이 낮춘 연결이 아니라 설치본 한도에서 lease 몫으로 돌아, `--plan`이 허용한 lease에서 migration과 그 백업도 같은 승격을 가지고 간다 | `tests/storage/test_migration_steps.py::test_a_carry_is_planned_alike_after_a_verification_lowered_the_connection` | 구현 |
+| DV-484 | 재계획 뒤 게시 전에 head가 옮겨진 승격은 recover에서 예외 없이 pending으로 남고 계획의 임시 table은 지워진다 | `tests/storage/test_migration_steps.py::test_a_head_moved_after_the_replan_leaves_the_promotion_pending` | 구현 |
