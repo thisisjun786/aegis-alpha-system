@@ -389,49 +389,92 @@ QUALITY_FLAGS_V3_DDL = QUALITY_FLAGS_DDL.replace(
 if QUALITY_FLAGS_V3_DDL == QUALITY_FLAGS_DDL:
     raise RuntimeError("the v3 quality_flags text must leave out exactly the v2 key")
 _QUALITY_FLAGS_COLUMNS = (
-    "generation_id",
-    "record_id",
-    "revision_id",
-    "rule_id",
-    "rule_version",
-    "flag",
-    "detail",
+    ("generation_id", "VARCHAR"),
+    ("record_id", "VARCHAR"),
+    ("revision_id", "VARCHAR"),
+    ("rule_id", "VARCHAR"),
+    ("rule_version", "VARCHAR"),
+    ("flag", "VARCHAR"),
+    ("detail", "VARCHAR?"),
 )
+# The domains v3 rebuilds, as they stood when it was written. The list is fixed, so a
+# domain a later version adds never changes v3's text or its checksum.
+_V3_DOMAINS = (
+    "prices",
+    "corporate_actions",
+    "instrument_status",
+    "fundamentals",
+    "macro_observations",
+    "estimates",
+    "fx_rates",
+    "calendar_sessions",
+    "feature_values",
+    "filings",
+    "classifications",
+)
+if tuple(DOMAINS)[: len(_V3_DOMAINS)] != _V3_DOMAINS:
+    raise RuntimeError("v3 rebuilds the domains that stood before it, in catalog order")
 
 
-def _rebuild(name: str, create: str, columns: tuple[str, ...]) -> str:
+def _compared(column: str, kind: str) -> str:
+    """The column as the rebuild compares it: by its own value, exactly.
+
+    A text is compared by its bytes, whatever collation the connection defaults to, and
+    a DOUBLE by its shortest round-trip text, because DuckDB's equality holds -0.0 equal
+    to 0.0. Every other type the domains use compares exactly as itself.
+    """
+    quoted = f'"{column}"'
+    base = kind.rstrip("?")
+    if base == "VARCHAR":
+        return f"encode({quoted})"
+    if base == "DOUBLE":
+        return f"CAST({quoted} AS VARCHAR)"
+    return quoted
+
+
+def _rebuild(name: str, create: str, columns: tuple[tuple[str, str], ...]) -> str:
     """Rebuild one table under ``create`` with every row copied and the copy checked.
 
     The old table is renamed aside, the new one takes its name, the rows are copied by
     an explicit column list (CREATE TABLE AS would drop every constraint), and the
-    statement after the copy fails the transaction unless each generation holds the
-    same number of rows with the same multiset of values in both tables. Only then is
-    the old table dropped.
+    statement after the copy fails the transaction unless the new table holds the old
+    one's rows exactly: a POSITIONAL JOIN pairs the n-th row of each, and any pair that
+    differs in any column, or a row without a partner, refuses the copy. The copy keeps
+    the old table's order because the connection preserves insertion order, which V3_DDL
+    requires first. Every value is compared, never a hash of it, and the comparison
+    streams, holding no table in memory. Only then is the old table dropped.
     """
     aside = f'"{name}_v2_rebuild"'
-    listed = ",".join(f'"{column}"' for column in columns)
-    digest = f"count(*) AS n, sum(hash({listed})::HUGEINT) AS h"
+    listed = ",".join(f'"{column}"' for column, _ in columns)
+    new = ",".join(f"{_compared(c, kind)} AS n{i}" for i, (c, kind) in enumerate(columns))
+    old = ",".join(f"{_compared(c, kind)} AS o{i}" for i, (c, kind) in enumerate(columns))
+    differs = " OR ".join(f"n{i} IS DISTINCT FROM o{i}" for i in range(len(columns)))
     return (
         f'ALTER TABLE "{name}" RENAME TO {aside};\n'  # noqa: S608 -- code-owned schema
         f"{create.strip()}\n"
         f'INSERT INTO "{name}" ({listed}) SELECT {listed} FROM {aside};\n'
-        "SELECT CASE WHEN EXISTS (SELECT 1 FROM "
-        f'(SELECT generation_id, {digest} FROM "{name}" GROUP BY generation_id) a '
-        f"FULL JOIN (SELECT generation_id, {digest} FROM {aside} GROUP BY generation_id) b "
-        "USING (generation_id) WHERE a.n IS DISTINCT FROM b.n OR a.h IS DISTINCT FROM b.h) "
+        f'SELECT CASE WHEN EXISTS (SELECT 1 FROM (SELECT {new} FROM "{name}") '
+        f"POSITIONAL JOIN (SELECT {old} FROM {aside}) WHERE {differs}) "
         f"THEN error('the core schema v3 rebuild of {name} changed its rows') END;\n"
         f"DROP TABLE {aside};\n"
     )
 
 
+# Each rebuild pairs the copied rows with the old ones by position, so a connection that
+# may reorder an INSERT ... SELECT is refused before any table is touched.
+_V3_ORDERED = (
+    "SELECT CASE WHEN NOT current_setting('preserve_insertion_order') "
+    "THEN error('the core schema v3 rebuild needs preserve_insertion_order') END;\n"
+)
+
+
 def _v3_ddl() -> str:
-    """Every domain table and quality_flags rebuilt in the v3 shape, in catalog order."""
-    parts = []
-    for name, columns in DOMAINS.items():
+    """Every v3 domain table and quality_flags rebuilt in the v3 shape, in catalog order."""
+    parts = [_V3_ORDERED]
+    for name in _V3_DOMAINS:
+        columns = DOMAINS[name]
         fields = name == "prices"
-        listed = tuple(column for column, _ in COMMON + columns) + (
-            (PRICE_FIELDS[0],) if fields else ()
-        )
+        listed = COMMON + columns + ((PRICE_FIELDS,) if fields else ())
         parts.append(_rebuild(name, domain_ddl(name, columns, fields=fields, keys=False), listed))
     parts.append(_rebuild("quality_flags", QUALITY_FLAGS_V3_DDL, _QUALITY_FLAGS_COLUMNS))
     return "".join(parts)

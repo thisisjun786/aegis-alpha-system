@@ -17,6 +17,7 @@ import random
 import subprocess
 import sys
 from collections.abc import Callable
+from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
 from typing import Final, cast
@@ -50,6 +51,7 @@ from aegis_alpha.storage.migration import (
     plan_core_migration,
     step_operation,
 )
+from aegis_alpha.storage.paths import load_paths
 from aegis_alpha.storage.promotion import engine
 from aegis_alpha.storage.promotion.engine import promote
 from aegis_alpha.storage.publication import recover_operations
@@ -385,7 +387,7 @@ def _lost(generation: str) -> Callable[[str], str]:
 def test_the_rebuild_refuses_a_copy_that_changed_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, table: str, change: Callable[[str], str]
 ) -> None:
-    """The copy is checked per generation by count and value, not by count alone."""
+    """The copy is compared with the old rows value by value, not by counts alone."""
     connection = duckdb.connect(str(tmp_path / "market.duckdb"), config={"threads": 1})
     market.initialize_market(connection, "synthetic", version=2)
     for seed, domain in enumerate(("prices", "filings")):
@@ -419,6 +421,134 @@ def test_the_rebuild_refuses_a_copy_that_changed_rows(
         "SELECT count(*) FROM duckdb_tables() WHERE ends_with(table_name, '_v2_rebuild')"
     ).fetchone() == (0,)
     connection.close()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        # Two DECIMAL(38,12) values DuckDB hashes alike, so a count and hash sum agree.
+        ("prices", "close", "0.000000000001", "18446744.073709551616"),
+        # DuckDB's equality holds these equal, though they are different stored values.
+        ("feature_values", "value", "0.0::DOUBLE", "-0.0::DOUBLE"),
+    ],
+)
+def test_the_rebuild_compares_values_not_their_hashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: tuple[str, str, str, str]
+) -> None:
+    domain, column, stored, copied = case
+    connection = duckdb.connect(str(tmp_path / "market.duckdb"), config={"threads": 1})
+    market.initialize_market(connection, "synthetic", version=2)
+    _bulk(connection, _first(random.Random(3), domain, 8), domain, "1", None)
+    connection.execute(
+        f'UPDATE "{domain}" SET "{column}" = {stored} WHERE record_id = '
+        f'(SELECT min(record_id) FROM "{domain}")'
+    )
+    if domain == "prices":
+        assert connection.execute(
+            f"SELECT hash({stored}::DECIMAL(38,12)) = hash({copied}::DECIMAL(38,12))"
+        ).fetchone() == (True,)
+    else:
+        assert connection.execute(f"SELECT {stored} = {copied}").fetchone() == (True,)
+    insert = next(
+        line for line in V3_DDL.splitlines() if line.startswith(f'INSERT INTO "{domain}" ')
+    )
+    changed = _value(column, f'CASE WHEN "{column}" = {stored} THEN {copied} ELSE "{column}" END')(
+        insert
+    )
+    monkeypatch.setattr(market, "MIGRATIONS", (DDL, V2_DDL, V3_DDL.replace(insert, changed)))
+    with pytest.raises(duckdb.Error, match=f"v3 rebuild of {domain} changed its rows"):
+        market.upgrade_market(connection, "synthetic", 3)
+    assert market.market_version(connection) == 2
+    connection.close()
+
+
+def test_the_rebuild_refuses_a_connection_that_may_reorder_its_copy(tmp_path: Path) -> None:
+    """The copy is compared row by row in order, so its order must be the old table's."""
+    connection = duckdb.connect(str(tmp_path / "market.duckdb"), config={"threads": 1})
+    market.initialize_market(connection, "synthetic", version=2)
+    connection.execute("SET preserve_insertion_order = false")
+    with pytest.raises(duckdb.Error, match="needs preserve_insertion_order"):
+        market.upgrade_market(connection, "synthetic", 3)
+    assert market.market_version(connection) == 2
+    connection.close()
+
+
+def _corrupted_close(home: Path) -> tuple[str, object]:
+    """The record whose close the cases below change, and its stored close."""
+    with duckdb.connect(str(load_paths(home).market), read_only=True) as connection:
+        found = connection.execute(
+            "SELECT record_id, close FROM prices WHERE close IS NOT NULL ORDER BY record_id LIMIT 1"
+        ).fetchone()
+    assert found is not None
+    return str(found[0]), found[1]
+
+
+def _set_close(connection: duckdb.DuckDBPyConnection, record: str, close: object) -> None:
+    connection.execute("UPDATE prices SET close = ? WHERE record_id = ?", [close, record])
+
+
+def test_a_landed_step_whose_rows_differ_stays_prepared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The step completes only once every committed generation rehashes to its digest.
+
+    Once in the run that commits the market, and again in a run that resumes after an
+    earlier one's COMMIT: a value changed after the rebuild is refused both times, with
+    no deep flag passed, and the step completes once the value is back.
+    """
+    home = v2_installation(tmp_path)
+    before = _stored(home)
+    record, close = _corrupted_close(home)
+
+    def corrupted(connection: duckdb.DuckDBPyConnection, installation_id: str, target: int) -> int:
+        landed = market.upgrade_market(connection, installation_id, target)
+        _set_close(connection, record, Decimal(str(close)) + 1)
+        return landed
+
+    with monkeypatch.context() as patch:
+        patch.setattr(migration, "upgrade_market", corrupted)
+        with pytest.raises(ValueError, match="logical hash/count mismatch"):
+            migrate_core_schema(home, to_version=3, backup_output=tmp_path / "v3-backup")
+    plan = plan_core_migration(home, to_version=3)
+    assert (plan["state"], plan["market_version"], plan["migration_operation"]) == (
+        "incomplete",
+        3,
+        step_operation(3),
+    )
+    with pytest.raises(ValueError, match="logical hash/count mismatch"):
+        migrate_core_schema(home, to_version=3, backup_output=None)
+    assert plan_core_migration(home, to_version=3)["state"] == "incomplete"
+    with duckdb.connect(str(load_paths(home).market)) as connection:
+        _set_close(connection, record, close)
+    report = migrate_core_schema(home, to_version=3, backup_output=None)
+    assert report["state"] == "current"
+    assert _stored(home) == before
+
+
+def test_a_resumed_step_whose_rows_changed_after_commit_stays_prepared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run that died after the market's COMMIT leaves rows a resume must still prove."""
+    home = v2_installation(tmp_path)
+    record, close = _corrupted_close(home)
+
+    def died(*_: object) -> None:
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as patch:
+        patch.setattr(migration, "_upgrade_state", died)
+        with pytest.raises(KeyboardInterrupt):
+            migrate_core_schema(home, to_version=3, backup_output=tmp_path / "v3-backup")
+    assert plan_core_migration(home, to_version=3)["market_version"] == 3
+    with duckdb.connect(str(load_paths(home).market)) as connection:
+        _set_close(connection, record, Decimal(str(close)) + 1)
+    with pytest.raises(ValueError, match="logical hash/count mismatch"):
+        migrate_core_schema(home, to_version=3, backup_output=None)
+    plan = plan_core_migration(home, to_version=3)
+    assert (plan["state"], plan["migration_operation"]) == ("incomplete", step_operation(3))
+    with duckdb.connect(str(load_paths(home).market)) as connection:
+        _set_close(connection, record, close)
+    assert migrate_core_schema(home, to_version=3, backup_output=None)["state"] == "current"
 
 
 def test_an_exhausted_v3_commit_is_a_budget_error_and_resumes(
@@ -565,6 +695,68 @@ def test_a_kill_at_every_boundary_of_the_v3_step_is_finished(tmp_path: Path, ste
 
 
 # --- publication on v3 -------------------------------------------------------------
+
+
+def _flags_of(generation: str, *, revision: str = "revision_id", copies: int = 1) -> str:
+    one = (
+        f"SELECT generation_id, record_id, {revision}, 'rule', '1', 'flag', NULL "
+        f"FROM prices WHERE generation_id = '{generation}'"
+    )
+    return "INSERT INTO quality_flags " + " UNION ALL ".join([one] * copies)
+
+
+def _companion(sql: str) -> Callable[[duckdb.DuckDBPyConnection], None]:
+    def companion(connection: duckdb.DuckDBPyConnection) -> None:
+        connection.execute(sql)
+
+    return companion
+
+
+@pytest.mark.parametrize(
+    ("flags", "message"),
+    [
+        (_flags_of("prices-g2", copies=2), "repeats its key"),
+        (_flags_of("prices-g2", revision="'missing'"), "does not store"),
+        (_flags_of("prices-g1"), "changed another generation's quality flags"),
+    ],
+)
+def test_the_bulk_writer_checks_what_its_companion_stored(flags: str, message: str) -> None:
+    """With no flag key in v3, the public writer refuses a bad companion before COMMIT."""
+    connection = _connection()
+    rng = random.Random(9)
+    first = _first(rng, "prices", 6)
+    _bulk(connection, first, "prices", "1", None)
+    _stage(connection, "prices", _second(rng, "prices", first))
+    request = BulkRequest(
+        dataset_id="synthetic.prices",
+        version="2",
+        generation_id="prices-g2",
+        operation_id="prices-op2",
+        request_hash="2" * 64,
+        parent_id="prices-g1",
+        domain="prices",
+        staged="staged",
+    )
+    with pytest.raises(ValueError, match=message):
+        publish_generation_bulk(connection, request, budget=BUDGET, companion=_companion(flags))
+    # Marker, rows and flags all rolled back together.
+    for table in ("market_generations", "prices", "quality_flags"):
+        assert connection.execute(
+            f"SELECT count(*) FROM {table} WHERE generation_id = 'prices-g2'"
+        ).fetchone() == (0,)
+    assert connection.execute("SELECT count(*) FROM quality_flags").fetchone() == (0,)
+    marker = publish_generation_bulk(
+        connection,
+        request,
+        budget=BUDGET,
+        companion=_companion(_flags_of("prices-g2")),
+    )
+    assert marker["generation_id"] == "prices-g2"
+    assert connection.execute("SELECT count(*) FROM quality_flags").fetchone() == (
+        connection.execute("SELECT count(*) FROM prices WHERE generation_id='prices-g2'").fetchone()
+    )
+    audit_market(connection, BUDGET, deep=True)
+    connection.close()
 
 
 def test_a_publication_reads_only_its_staged_delta_and_flags(

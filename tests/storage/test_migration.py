@@ -49,7 +49,7 @@ from tests.storage.test_publication import document
 RECORDED_MARKET = (
     "ab2383d7cb1181e7b98e7dc054042f82024a6aafc0c0fabb27ee5f94dbe0db7c",
     "094e607049afb422201481d745b584cdf88d077b10dc2e7e83b1e56a09a3038a",
-    "432dd69954ad28e03d9e79bcc330f31862441f82f36c9e424cd6b2f6425cfa37",
+    "75e0bc876a569de02e309cceaf8231734d2642d6684cd914431e058f8c245a4e",
 )
 RECORDED_STATE = (
     "da574cef54b69961c341e3e5e92ee16334a5049911ee6b417db643f44bd881dc",

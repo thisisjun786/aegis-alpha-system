@@ -80,7 +80,7 @@ _HASH = "c" * 64
 _V2_REQUEST = "c5fd3fe558418f3ba31cfab4dfac789054fa1364c4f92dc4894685e4f495aab6"
 _V2_PARENT = "d17ecf0055f145969094bce9879c58f0ef73ec82a526909efb99e56924d6d515"
 # The v3 step's identity, frozen the same way from the moment it ships.
-_V3_REQUEST = "bbd8f1dd7a221c8fa0b39f1a868b581f3d96b880ee2aec57644fd07da5f24c8e"
+_V3_REQUEST = "83aeb16fd7e670e9868203b6b10b70386fefd83227e5088fb5f9ca6a3fb7d9f7"
 _V3_PARENT = "dd72027f71f561a7b9bd57f770f136ab06226db9bfd8c0a56f760682d46e610a"
 _IDS = {
     "installation_id": "synthetic-installation",

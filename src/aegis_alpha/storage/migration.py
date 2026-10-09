@@ -470,6 +470,8 @@ def _write_receipt(workspace: Workspace) -> None:
 
 def _finish(workspace: Workspace, step: int, budget: ComputeBudget | None) -> None:
     """Apply whatever the step's prepared intent still names, then complete it."""
+    from aegis_alpha.storage.verification import verify_publications  # noqa: PLC0415
+
     status = inspect_core_schema(workspace)
     if status.migration_operation != step_operation(step) or status.state != "incomplete":
         raise CoreSchemaError("core_schema_migration_incomplete", "the step has no prepared intent")
@@ -489,6 +491,11 @@ def _finish(workspace: Workspace, step: int, budget: ComputeBudget | None) -> No
     checked = inspect_core_schema(workspace)
     if _remaining(checked, step) != ["complete"]:
         raise CoreSchemaError("core_schema_migration_incomplete", "a step did not land")
+    # The proof that the landed rows are the published ones: every committed generation
+    # rehashed against its recorded digest and the market audited for duplicate keys,
+    # however the step was reached (this run's COMMIT or an earlier one's) and whatever
+    # ``deep`` the backup used. The step stays prepared until it passes.
+    verify_publications(workspace, budget=budget, deep=True)
     complete_operation(workspace.state, step_operation(step), _request_hash(workspace, step))
 
 
@@ -528,7 +535,9 @@ def migrate_core_schema(
     ``backup_output``: its backup is taken and verified before its intent, and the intent
     records the backup manifest's SHA-256. A prepared step is finished from its intent
     without a second backup. Nothing is written before the target, the backup
-    destinations and the quiet installation are all checked.
+    destinations and the quiet installation are all checked. A step completes only once
+    every committed publication's rows rehash to their recorded digests (``deep`` is
+    always used for that proof; the flag sets only the backup's verification).
     """
     from aegis_alpha.storage.backup import backup_workspace, manifest_sha256  # noqa: PLC0415
     from aegis_alpha.storage.workspace import open_workspace  # noqa: PLC0415
