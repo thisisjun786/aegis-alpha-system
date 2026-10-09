@@ -1553,13 +1553,16 @@ migrate·연결, 4단계 전체, 6단계의 은퇴 백업·`source-retire`·`com
 경로(`$REHEARSAL`, `$REHEARSAL-compact`, `$RB`)에 쓰므로 실제 3·6단계의 백업과 compact 대상과 겹치지 않는다. 복원한
 `runtime.json`은 공급자가 없고 `jobs.enabled`가 `false`라 리허설은 공급자를 부르지 않는다. 설치본 밖을 지우는
 6단계의 legacy 정리, systemd 편집과 timer, 설치 receipt는 리허설에서 실행하지 않는다. 리허설은 legacy 원본을
-읽기만 하므로 실제 4단계가 같은 원본을 다시 읽는다. 마지막 `rm -rf` 줄은 끝까지 마친 리허설을 버리는 정리
-예제다. 4단계 도중 멈춘 리허설을 설치본으로 쓸 때는 그 줄을 실행하지 않고 아래 [리허설 채택](#리허설-채택)으로 간다.
+읽기만 하므로 실제 4단계가 같은 원본을 다시 읽는다. 리허설 블록은 `set -eu` subshell이라 명령 하나가
+실패하면 그 자리에서 0이 아닌 상태로 끝나고 리허설 설치본, migration 백업, 보고를 그대로 둔다. 4단계의 두
+루프도 첫 실패에서 0이 아닌 상태로 끝나므로 리허설을 멈춘다. 끝까지 마친 리허설만 `$RB/complete`를 남긴다.
 
 ```bash
-RB="$BACKUPS/rehearsal-$TS"; mkdir -m 0700 "$RB" "$RB/reports"
-aas --home "$REHEARSAL" db restore --backup "$BACKUPS/$TS-v1"
+RB="$BACKUPS/rehearsal-$TS"
 (
+  set -eu
+  mkdir -m 0700 "$RB" "$RB/reports"
+  aas --home "$REHEARSAL" db restore --backup "$BACKUPS/$TS-v1"
   export AAS_HOME="$REHEARSAL" REPORTS="$RB/reports"
   aas db migrate --to 3 --backup-output "$RB/migrate"
   aas db source-link --apply
@@ -1570,8 +1573,15 @@ aas --home "$REHEARSAL" db restore --backup "$BACKUPS/$TS-v1"
   aas db source-retire --spec "$retire" --sha256 "$(sha "$retire")" --backup "$RB/retire" --apply > "$RB/retire.apply.json"
   aas db compact --to "$REHEARSAL-compact" > "$RB/compact.json"
   AAS_HOME="$REHEARSAL-compact" aas db verify --deep > "$RB/verify.json"
+  touch "$RB/complete"
 )
-rm -rf -- "$REHEARSAL" "$REHEARSAL-compact" "$RB"
+```
+
+아래는 끝까지 마친 리허설을 버리는 정리 예제이며 리허설 블록과 따로 실행한다. `$RB/complete`가 없으면 아무것도
+지우지 않는다. 4단계 도중 멈춘 리허설을 설치본으로 쓸 때는 실행하지 않고 [리허설 채택](#리허설-채택)으로 간다.
+
+```bash
+test -f "$RB/complete" && rm -rf -- "$REHEARSAL" "$REHEARSAL-compact" "$RB"
 ```
 
 **3. 설치본 이동, 마이그레이션, 연결.** 1단계 백업을 새 설치본으로 복원하고 그 설치본에서 core schema를 현재
@@ -1606,14 +1616,23 @@ HOME_NEW="$REHEARSAL"; RB="$BACKUPS/rehearsal-$TS"; REPORTS="$RB/reports"
 export AAS_HOME="$HOME_NEW"
 aas db status
 aas db migrate --to 3 --plan > "$RB/migrate-v3.plan.json"
-aas db migrate --to 3 --backup-output "$RB/migrate-v3" > "$RB/migrate-v3.json"
-aas db verify --deep > "$RB/migrate-v3.verify.json"
-aas db recover
-aas db verify
 ```
 
 `--plan`은 남은 단계가 v3 하나이고(`migrations`), `blocking_operations`가 비어 있으며, `carried_operations`가 멈춘
-승격 intent 하나를 `proof`와 함께 적어야 한다. 아니면 실행하지 않는다. `$RB/migrate-v3`는 그 intent를 PREPARED로
+승격 intent 하나를 `proof`와 함께 적어야 한다. 아니면 아래 블록을 실행하지 않는다. 블록은 첫 실패에서 0이 아닌
+상태로 멈추고 리허설 루트, 보존 증거와 보고를 그대로 둔다.
+
+```bash
+(
+  set -eu
+  aas db migrate --to 3 --backup-output "$RB/migrate-v3" > "$RB/migrate-v3.json"
+  aas db verify --deep > "$RB/migrate-v3.verify.json"
+  aas db recover
+  aas db verify
+)
+```
+
+`$RB/migrate-v3`는 그 intent를 PREPARED로
 담은 migration의 rollback snapshot이며 복구를 마친 백업으로 쓰지 않는다. migration 뒤 `verify --deep`은 모든
 generation의 hash와 v3 감사를 통과하고 `pending_operations`가 1이다. `recover`는 보존 명세를 다시 계획해 intent의
 manifest가 그대로 나올 때만 게시하므로 게시한 generation의 hash는 멈추기 전 계획과 같다. `recover`가 그 intent를
@@ -1638,15 +1657,17 @@ manifest가 그대로 나올 때만 게시하므로 게시한 generation의 hash
    기록한 뒤 실행하고 `--verify`가 `complete`인지 확인한다([legacy 원천 편입](#legacy-원천-편입)).
 
    ```bash
-   for manifest in "$SPECS"/legacy-*.json; do
-     name=$(basename "$manifest" .json)
-     aas import legacy --manifest "$manifest" --sha256 "$(sha "$manifest")" --plan > "$REPORTS/$name.plan.json" &&
-     aas import legacy --manifest "$manifest" --sha256 "$(sha "$manifest")" &&
-     aas import legacy --manifest "$manifest" --sha256 "$(sha "$manifest")" --verify > "$REPORTS/$name.verify.json" ||
-     break
-   done
-   aas import sec-companies --source SEC_SUBMISSIONS_SOURCE_ID
-   aas db source-link --apply
+   (
+     set -eu
+     for manifest in "$SPECS"/legacy-*.json; do
+       name=$(basename "$manifest" .json)
+       aas import legacy --manifest "$manifest" --sha256 "$(sha "$manifest")" --plan > "$REPORTS/$name.plan.json"
+       aas import legacy --manifest "$manifest" --sha256 "$(sha "$manifest")"
+       aas import legacy --manifest "$manifest" --sha256 "$(sha "$manifest")" --verify > "$REPORTS/$name.verify.json"
+     done
+     aas import sec-companies --source SEC_SUBMISSIONS_SOURCE_ID
+     aas db source-link --apply
+   )
    ```
 
 5. US identity와 universe: `aas identity us-build --master ID ... --norgate-exports --bindings ID --output
@@ -1656,15 +1677,21 @@ manifest가 그대로 나올 때만 게시하므로 게시한 generation의 hash
    partition, DART), 분류 순서로 파일 이름을 붙인 명세를 하나씩 승격하고 generation마다 검증한다.
 
    ```bash
-   for spec in "$SPECS"/promote/*.json; do
-     name=promote-$(basename "$spec" .json)
-     aas data promote --spec "$spec" --sha256 "$(sha "$spec")" --plan > "$REPORTS/$name.plan.json" &&
-     aas data promote --spec "$spec" --sha256 "$(sha "$spec")" > "$REPORTS/$name.apply.json" &&
-     aas db verify > "$REPORTS/$name.verify.json" ||
-     break
-   done
+   (
+     set -eu
+     for spec in "$SPECS"/promote/*.json; do
+       name=promote-$(basename "$spec" .json)
+       aas data promote --spec "$spec" --sha256 "$(sha "$spec")" --plan > "$REPORTS/$name.plan.json"
+       aas data promote --spec "$spec" --sha256 "$(sha "$spec")" > "$REPORTS/$name.apply.json"
+       aas db verify > "$REPORTS/$name.verify.json"
+     done
+   )
    aas data promotions
    ```
+
+   두 루프는 `set -eu` subshell이라 첫 실패에서 그 명세나 manifest에 멈추고 0이 아닌 상태로 끝난다. 그 뒤의
+   명령을 `&&`로 잇지 않는다. bash는 `&&` 앞의 subshell 안에서 `set -e`를 끄기 때문이다. 멈춘 자리부터 같은
+   루프를 다시 실행하면 끝난 명세와 manifest는 재사용되거나 이미 끝난 일로 보고된다.
 
 7. 전략 레지스트리: `aas strategy promote --source SOURCE_ID --sha256 SHA256 --plan`, 같은 명령의 `--apply`.
 

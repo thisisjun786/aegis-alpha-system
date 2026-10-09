@@ -2938,7 +2938,7 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-461 | `raw/`에 있는 manifest라도 verify 보고가 없거나, `complete`가 아니거나, 그 원천이 설치본에 commit으로 없거나, 읽을 수 없는 보고가 있으면 legacy 확인이 실패한다 | `tests/application/test_cutover.py::test_a_retained_manifest_without_a_complete_verify_fails` | 구현 |
 | DV-462 | `PREPARED` storage operation이 남으면 operations 확인이 실패한다 | `tests/application/test_cutover.py::test_a_prepared_operation_fails_the_operations_check` | 구현 |
 | DV-463 | core schema가 현재 버전이 아닌 설치본은 schema 확인이 `outdated`로 실패한다 | `tests/application/test_cutover.py::test_an_outdated_core_schema_fails_the_schema_check` | 구현 |
-| DV-464 | runbook 리허설은 설치본 밖 삭제·systemd·receipt를 실행하지 않고 그 모든 출력 경로를 리허설 정리가 지운다 | `tests/application/test_cutover.py::test_the_rehearsal_writes_only_paths_its_cleanup_removes` | 구현 |
+| DV-464 | runbook 리허설은 설치본 밖 삭제·systemd·receipt를 실행하지 않고, 별도 블록인 리허설 정리는 끝까지 마친 리허설의 모든 출력 경로만 지운다 | `tests/application/test_cutover.py::test_the_rehearsal_writes_only_paths_its_cleanup_removes` | 구현 |
 | DV-465 | 삽입 뒤 COMMIT에서 메모리가 고갈된 대량 게시도 marker와 행을 남기지 않고 `ComputeResourceError`가 된다 | `tests/storage/test_bulk_generation.py::test_commit_exhaustion_rolls_back_as_a_budget_error` | 구현 |
 | DV-466 | 용량과 무관한 COMMIT 실패는 인용한 key가 용량 문구를 담아도 `ComputeResourceError`로 바뀌지 않고, 뒤따르는 ROLLBACK이 그 오류를 덮지 않는다 | `tests/storage/test_bulk_generation.py::test_a_failed_commit_is_not_replaced_by_its_rollback` | 구현 |
 | DV-467 | core migration의 market 단계는 compute lease의 DuckDB 몫에서 실행하고, 그 COMMIT의 고갈은 intent를 남긴 채 `ComputeResourceError`가 된다 | `tests/storage/test_migration.py::test_an_exhausted_market_step_is_a_budget_error_under_the_lease` | 구현 |
@@ -2973,3 +2973,6 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-496 | 도메인 전역 key와 flag key 중복은 `--deep` 검증만 감사한다 | `tests/storage/test_market_integrity.py::test_only_deep_verify_audits_duplicates` | 구현 |
 | DV-497 | 중복 감사의 pass는 잰 행 수와 key bytes로 나뉘고 치우친 긴 key도 끝까지 검사한다 | `tests/storage/test_market_integrity.py::test_adaptive_audit_splits_skewed_wide_keys_by_measured_size` | 구현 |
 | DV-498 | core catalog는 같은 버전의 빈 저장소와 열 순서·타입·제약까지 같아야 한다 | `tests/storage/test_market_integrity.py::test_core_catalog_matches_an_empty_store_of_its_version` | 구현 |
+| DV-499 | runbook 리허설과 4단계 승격 루프는 첫 실패에서 0이 아닌 상태로 멈추고 리허설 설치본·migration 백업·보고를 남기며 정리는 아무것도 지우지 않는다 | `tests/application/test_cutover.py::test_a_failed_rehearsal_stops_and_keeps_its_root_backups_and_reports` | 구현 |
+| DV-500 | 끝까지 마친 리허설만 완료 표시를 남기고 리허설 정리는 그 리허설의 출력만 지운다 | `tests/application/test_cutover.py::test_a_finished_rehearsal_is_the_only_one_its_cleanup_removes` | 구현 |
+| DV-501 | 리허설 채택은 계획 확인 뒤 별도 블록에서 실행되고 migration 검증이 실패하면 `recover` 전에 멈춘다 | `tests/application/test_cutover.py::test_an_adopted_rehearsal_stops_before_recover_when_its_migration_check_fails` | 구현 |
