@@ -22,7 +22,7 @@ legacy = [
     "alembic>=1.18.5,<2",
     "psycopg[binary]>=3.3.4,<4",
     "pyarrow>=25,<26",
-    "sqlalchemy>=2.0.51,<2.1",
+    "sqlalchemy>=2.0.51,<2.2",
 ]
 
 [project.scripts]
@@ -78,7 +78,7 @@ dev = [
     "alembic>=1.18.5,<2",
     "psycopg[binary]>=3.3.4,<4",
     "pyarrow>=25,<26",
-    "sqlalchemy>=2.0.51,<2.1",
+    "sqlalchemy>=2.0.51,<2.2",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
     "pytest-xdist>=3.8",
