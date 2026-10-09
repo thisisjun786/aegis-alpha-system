@@ -307,6 +307,9 @@ CREATE TABLE source_retirements (
     + f" BEFORE {action} ON source_retirements BEGIN SELECT RAISE(ABORT,'immutable record'); END;"
     for action in ("UPDATE", "DELETE")
 )
+# v3 changes only the market store (its domain tables lose their key indexes). The state
+# store records the version too, because both stores always carry the same core version.
+V3_DDL = "-- core schema v3: the market domain tables drop their key indexes; no state change\n"
 # Version N's schema_migrations checksum covers MIGRATIONS[N - 1]; version 1 also covers
 # the common identity tables sqlite.py prepends, exactly as it always has.
-MIGRATIONS = (DDL, V2_DDL)
+MIGRATIONS = (DDL, V2_DDL, V3_DDL)

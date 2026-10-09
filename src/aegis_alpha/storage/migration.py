@@ -30,6 +30,7 @@ from aegis_alpha.storage.market import (
     upgrade_market,
     validate_market,
 )
+from aegis_alpha.storage.market_integrity import check_core_catalog
 from aegis_alpha.storage.paths import read_json
 from aegis_alpha.storage.sqlite import schema_checksums
 from aegis_alpha.storage.state import (
@@ -477,6 +478,10 @@ def _finish(workspace: Workspace, step: int, budget: ComputeBudget | None) -> No
     # Also when an earlier run's COMMIT already moved the market: the next step's backup
     # compares the market with what admission recorded.
     _readmit_market(workspace, step)
+    # The landed market holds exactly the catalog an empty store of the step holds, or the
+    # step stays prepared; its backup's verification checked the catalog before it.
+    with budgeted(workspace.market, budget, "the core schema migration"):
+        check_core_catalog(workspace.market)
     if status.state_version < step:
         _upgrade_state(workspace, step)
     if (status.receipt_state_version, status.receipt_market_version) != (step, step):

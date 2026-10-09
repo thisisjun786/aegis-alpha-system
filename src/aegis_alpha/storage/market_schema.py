@@ -285,9 +285,20 @@ PRICE_FIELDS = ("fields", "VARCHAR")
 PRICE_FIELD_VALUES = ("ohlcv", "close")
 
 
-def domain_ddl(name: str, columns: tuple[tuple[str, str], ...], *, fields: bool = False) -> str:
-    checks = """
- PRIMARY KEY(generation_id,record_id,revision_id), UNIQUE(record_id,revision_id),
+_DOMAIN_KEYS = """
+ PRIMARY KEY(generation_id,record_id,revision_id), UNIQUE(record_id,revision_id),"""
+
+
+def domain_ddl(
+    name: str, columns: tuple[tuple[str, str], ...], *, fields: bool = False, keys: bool = True
+) -> str:
+    """One domain table's CREATE text; ``keys=False`` is its v3 shape, without key indexes.
+
+    With ``keys`` the text is byte for byte what v1 and v2 recorded, so their checksums
+    keep matching; v3 leaves out only the key line, so every other rule stays the same.
+    """
+    checks = _DOMAIN_KEYS if keys else ""
+    checks += """
  FOREIGN KEY(generation_id) REFERENCES market_generations(generation_id),
  CHECK(op IN ('ASSERT','SUPERSEDE','TOMBSTONE')),
  CHECK((op='ASSERT' AND supersedes_revision_id IS NULL) OR
@@ -366,7 +377,68 @@ V2_DDL = (
     )
     + QUALITY_FLAGS_DDL
 )
+
+# v3 keeps every rule of v2 except the key indexes: the domain tables' PRIMARY KEY and
+# UNIQUE(record_id, revision_id), and quality_flags' key. Those indexes are held in memory
+# whole and grow with every row a table has ever stored, so a publication into a large
+# table could not commit within any fixed DuckDB share. The rules they enforced are now
+# checked inside every publication transaction (market_integrity) and audited at rest.
+QUALITY_FLAGS_V3_DDL = QUALITY_FLAGS_DDL.replace(
+    ",\n PRIMARY KEY(generation_id,record_id,revision_id,rule_id,rule_version,flag)", ""
+)
+if QUALITY_FLAGS_V3_DDL == QUALITY_FLAGS_DDL:
+    raise RuntimeError("the v3 quality_flags text must leave out exactly the v2 key")
+_QUALITY_FLAGS_COLUMNS = (
+    "generation_id",
+    "record_id",
+    "revision_id",
+    "rule_id",
+    "rule_version",
+    "flag",
+    "detail",
+)
+
+
+def _rebuild(name: str, create: str, columns: tuple[str, ...]) -> str:
+    """Rebuild one table under ``create`` with every row copied and the copy checked.
+
+    The old table is renamed aside, the new one takes its name, the rows are copied by
+    an explicit column list (CREATE TABLE AS would drop every constraint), and the
+    statement after the copy fails the transaction unless each generation holds the
+    same number of rows with the same multiset of values in both tables. Only then is
+    the old table dropped.
+    """
+    aside = f'"{name}_v2_rebuild"'
+    listed = ",".join(f'"{column}"' for column in columns)
+    digest = f"count(*) AS n, sum(hash({listed})::HUGEINT) AS h"
+    return (
+        f'ALTER TABLE "{name}" RENAME TO {aside};\n'  # noqa: S608 -- code-owned schema
+        f"{create.strip()}\n"
+        f'INSERT INTO "{name}" ({listed}) SELECT {listed} FROM {aside};\n'
+        "SELECT CASE WHEN EXISTS (SELECT 1 FROM "
+        f'(SELECT generation_id, {digest} FROM "{name}" GROUP BY generation_id) a '
+        f"FULL JOIN (SELECT generation_id, {digest} FROM {aside} GROUP BY generation_id) b "
+        "USING (generation_id) WHERE a.n IS DISTINCT FROM b.n OR a.h IS DISTINCT FROM b.h) "
+        f"THEN error('the core schema v3 rebuild of {name} changed its rows') END;\n"
+        f"DROP TABLE {aside};\n"
+    )
+
+
+def _v3_ddl() -> str:
+    """Every domain table and quality_flags rebuilt in the v3 shape, in catalog order."""
+    parts = []
+    for name, columns in DOMAINS.items():
+        fields = name == "prices"
+        listed = tuple(column for column, _ in COMMON + columns) + (
+            (PRICE_FIELDS[0],) if fields else ()
+        )
+        parts.append(_rebuild(name, domain_ddl(name, columns, fields=fields, keys=False), listed))
+    parts.append(_rebuild("quality_flags", QUALITY_FLAGS_V3_DDL, _QUALITY_FLAGS_COLUMNS))
+    return "".join(parts)
+
+
+V3_DDL = _v3_ddl()
 # Each version's text in order; version N's schema_migrations checksum is SHA-256 of
 # MIGRATIONS[N - 1]. A fresh store applies all of them in one transaction, so a migrated
 # store and a new one hold the same objects and the same receipts.
-MIGRATIONS = (DDL, V2_DDL)
+MIGRATIONS = (DDL, V2_DDL, V3_DDL)

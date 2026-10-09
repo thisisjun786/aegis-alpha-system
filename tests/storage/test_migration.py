@@ -45,14 +45,16 @@ from tests.storage.test_publication import document
 
 # The digests installations record. v1 is what every store made before v2 carries, so a
 # drift in its DDL text shows up here instead of as an operator's store being refused.
-# v2 is frozen the same way from the moment it ships.
+# v2 and v3 are frozen the same way from the moment each ships.
 RECORDED_MARKET = (
     "ab2383d7cb1181e7b98e7dc054042f82024a6aafc0c0fabb27ee5f94dbe0db7c",
     "094e607049afb422201481d745b584cdf88d077b10dc2e7e83b1e56a09a3038a",
+    "432dd69954ad28e03d9e79bcc330f31862441f82f36c9e424cd6b2f6425cfa37",
 )
 RECORDED_STATE = (
     "da574cef54b69961c341e3e5e92ee16334a5049911ee6b417db643f44bd881dc",
     "80f98378e53e79a8580d5b2c966309e0737d976f78ae3332e345e0c0f3d9e296",
+    "81ece2dac7ff62b5b26cd8fc28e73f85cbf9f2b8e32c2bd17e8597d4c65c9181",
 )
 _KILLED = 137
 _HASH = "c" * 64
@@ -212,7 +214,7 @@ def test_recorded_checksums_are_the_ones_installations_carry() -> None:
 def test_a_fresh_install_is_current_and_records_both_versions(tmp_path: Path) -> None:
     home = tmp_path / "home"
     initialize(home)
-    assert versions(home) == {"state": 2, "market": 2}
+    assert versions(home) == {"state": 3, "market": 3}
     assert receipts(home) == {
         "state": list(enumerate(RECORDED_STATE, 1)),
         "market": list(enumerate(RECORDED_MARKET, 1)),
@@ -244,7 +246,8 @@ def test_migration_requires_backup_and_resumes(tmp_path: Path) -> None:
     assert json.loads((tmp_path / "backup" / "backup.json").read_text())["complete"] is True
     # Repeating the command finishes it from the intent; the backup is not taken again.
     report = migrate_core_schema(home, to_version=2, backup_output=None)
-    assert (report["migrated"], report["state"]) == (True, "current")
+    # A v2 installation is complete but older than this code's newest version.
+    assert (report["migrated"], report["state"]) == (True, "outdated")
     assert report["backup_manifest_sha256"] == file_digest(tmp_path / "backup" / "backup.json")
     assert versions(home) == {"state": 2, "market": 2}
     assert stored_v1_generation(home) == before
@@ -277,8 +280,8 @@ def test_a_kill_at_every_step_is_finished_by_repeating_the_command(
     assert migrate_core_schema(home, to_version=2, backup_output=tmp_path / "unused")["migrated"]
     assert not (tmp_path / "unused").exists()
     assert receipts(home) == {
-        "state": list(enumerate(RECORDED_STATE, 1)),
-        "market": list(enumerate(RECORDED_MARKET, 1)),
+        "state": list(enumerate(RECORDED_STATE[:2], 1)),
+        "market": list(enumerate(RECORDED_MARKET[:2], 1)),
     }
     assert stored_v1_generation(home) == before
     with open_workspace(home) as admitted:
@@ -321,17 +324,18 @@ def test_migration_keeps_v1_receipt_and_rejects_unknown(tmp_path: Path) -> None:
     assert recorded_hashes(home) == V1_MARKERS
     assert stored_v1_generation(home) == before
     assert migrate_core_schema(home, to_version=2, backup_output=None)["migrated"] is False
-    for target in (1, 3):
+    unknown = CORE_VERSION + 1
+    for target in (1, unknown):
         with pytest.raises(CoreSchemaError, match="core_schema_unknown_version"):
             migrate_core_schema(home, to_version=target, backup_output=None)
     state = sqlite3.connect(home / "state.sqlite3")
-    state.execute("INSERT INTO schema_migrations VALUES (3, ?, 0)", (_HASH,))
+    state.execute("INSERT INTO schema_migrations VALUES (?, ?, 0)", (unknown, _HASH))
     state.commit()
     state.close()
     with pytest.raises(ValueError, match="unknown store schema version"):
         open_workspace(home).__enter__()
     state = sqlite3.connect(home / "state.sqlite3")
-    state.execute("DELETE FROM schema_migrations WHERE version=3")
+    state.execute("DELETE FROM schema_migrations WHERE version=?", (unknown,))
     state.execute("UPDATE schema_migrations SET checksum=? WHERE version=2", (_HASH,))
     state.commit()
     state.close()
@@ -343,8 +347,9 @@ def test_unknown_market_version_is_refused(tmp_path: Path) -> None:
     home = tmp_path / "home"
     initialize(home)
     connection = duckdb.connect(str(home / "market.duckdb"))
-    connection.execute("INSERT INTO schema_migrations VALUES (3, ?, 0)", [_HASH])
-    connection.execute("UPDATE store_info SET schema_version=3")
+    unknown = CORE_VERSION + 1
+    connection.execute("INSERT INTO schema_migrations VALUES (?, ?, 0)", [unknown, _HASH])
+    connection.execute("UPDATE store_info SET schema_version=?", [unknown])
     connection.close()
     with pytest.raises(ValueError, match="store identity/schema mismatch"):
         open_workspace(home).__enter__()
@@ -554,6 +559,7 @@ def test_a_completed_step_intent_outlives_later_steps(tmp_path: Path) -> None:
             ] == [
                 (MIGRATION_OPERATION, "COMPLETED"),
                 ("core-schema-migrate-v3", "COMPLETED"),
+                ("core-schema-migrate-v4", "COMPLETED"),
             ]
 
 
@@ -578,7 +584,7 @@ def test_plan_writes_nothing_and_names_the_recorded_checksums(
         main(["--home", str(home), "db", "migrate", "--to", "2", "--backup-output", str(backup)])
         == 0
     )
-    assert json.loads(capsys.readouterr().out)["state"] == "current"
+    assert json.loads(capsys.readouterr().out)["state"] == "outdated"
 
 
 def _exhausted_market_step(
@@ -621,7 +627,7 @@ def test_an_exhausted_market_step_is_a_budget_error_under_the_lease(
         "PREPARED",
     )
     report = migrate_core_schema(home, to_version=2, backup_output=None, budget=budget)
-    assert (report["migrated"], report["state"]) == (True, "current")
+    assert (report["migrated"], report["state"]) == (True, "outdated")
     assert stored_v1_generation(home) == before
 
 

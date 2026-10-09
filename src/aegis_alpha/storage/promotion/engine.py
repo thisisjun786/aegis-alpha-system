@@ -1549,6 +1549,26 @@ def _drop(market: duckdb.DuckDBPyConnection) -> None:
         market.execute(f"DROP TABLE IF EXISTS temp.{_q(str(name))}")
 
 
+# What a publication still reads of its plan: the staged delta and the flags to insert.
+_PUBLISHED: Final = (_t("stage"), _t("flags"))
+
+
+def _release_plan(market: duckdb.DuckDBPyConnection) -> None:
+    """Drop every temp table of a finished plan except what its publication reads.
+
+    The plan's marker, manifest and flag digest are already computed, and the staged
+    delta and flags are materialized tables, so nothing a publication hashes or checks
+    reads the sources, mapped rows, heads or diffs any more. Releasing them before the
+    publication transaction leaves DuckDB's share to the insert, its checks and COMMIT.
+    """
+    for (name,) in market.execute(
+        "SELECT table_name FROM duckdb_tables() WHERE temporary AND starts_with(table_name, ?) "
+        "AND table_name NOT IN (SELECT unnest(?::VARCHAR[])) ORDER BY table_name",
+        [_t(""), list(_PUBLISHED)],
+    ).fetchall():
+        market.execute(f"DROP TABLE IF EXISTS temp.{_q(str(name))}")
+
+
 # --- apply, recovery and verification ------------------------------------------------------
 
 
@@ -1719,8 +1739,14 @@ def _existing(
 
 
 def _publish(workspace: Workspace, plan: PromotionPlan, budget: ComputeBudget) -> dict[str, object]:
+    """Publish a finished plan: retain its evidence, prepare the intent, commit, catalog.
+
+    Apply and recovery both publish through here, so both release the plan's other temp
+    tables (``_release_plan``) before the publication transaction.
+    """
     if plan.manifest is None or plan.bulk is None:
         raise ValueError("promotion has nothing to publish")
+    _release_plan(workspace.market)
     for payload in (plan.spec.raw, plan.request, plan.manifest):
         put_raw(workspace.paths.raw, payload)
     manifest_sha = hashlib.sha256(plan.manifest).hexdigest()

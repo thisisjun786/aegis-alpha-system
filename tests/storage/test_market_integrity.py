@@ -1,12 +1,12 @@
 # ruff: noqa: PLR2004, S311, S608, SLF001 -- seeded synthetic fixtures, test-owned SQL, private audit parts
 """Generation integrity holds on key-less tables exactly where the v2 constraints held it.
 
-The v2 store still declares ``PRIMARY KEY(generation_id, record_id, revision_id)`` and
+A v2 store declares ``PRIMARY KEY(generation_id, record_id, revision_id)`` and
 ``UNIQUE(record_id, revision_id)`` on every domain and a six-column key on
-``quality_flags``. Each check here is proved twice: on a v2 store, where the declared
-key refuses the same write, and on a synthetic store whose domain tables are rebuilt
-without those keys (and, where a test needs it, without the foreign keys), where only
-``market_integrity`` stands between the writer and a duplicate.
+``quality_flags``; v3 declares none of them. Each check here is proved twice: on a v2
+store, where the declared key refuses the same write, and on a store whose domain tables
+are rebuilt without those keys (and, where a test needs it, without the foreign keys),
+where only ``market_integrity`` stands between the writer and a duplicate.
 """
 
 from __future__ import annotations
@@ -68,7 +68,7 @@ _OPEN: Final = "another generation publication is open on this market store"
 def _store(path: Path, *, keys: bool = True, foreign: bool = True) -> duckdb.DuckDBPyConnection:
     """A v2 market store; without ``keys`` every domain and the flags lose their keys."""
     connection = duckdb.connect(str(path))
-    market.initialize_market(connection, "synthetic")
+    market.initialize_market(connection, "synthetic", version=2)
     if keys and foreign:
         return connection
     for name, columns in DOMAINS.items():
@@ -762,11 +762,10 @@ def test_flag_gate_refuses_repeats_orphans_and_other_flags(tmp_path: Path) -> No
 @pytest.mark.parametrize(
     ("tamper", "message"),
     [
-        # v2 still keys quality_flags, so its own key refuses a repeat here; the key-less
-        # repeat is test_flag_gate_refuses_repeats_orphans_and_other_flags.
+        # A v3 store has no flag key, so only the companion's gate refuses the repeat.
         (
             "INSERT INTO temp._aas_p_flags SELECT * FROM temp._aas_p_flags LIMIT 1",
-            "PRIMARY KEY or UNIQUE constraint violation",
+            "repeats its key",
         ),
         (
             (
@@ -1001,6 +1000,9 @@ def test_core_catalog_matches_an_empty_store_of_its_version(tmp_path: Path) -> N
     keyless = _store(tmp_path / "keyless.duckdb", keys=False)
     with pytest.raises(ValueError, match="differs from its schema version"):
         check_core_catalog(keyless)
+    # Migrated to v3, whose own domain tables and flags are key-less, it matches again.
+    market.upgrade_market(keyless, "synthetic", 3)
+    check_core_catalog(keyless)
     keyless.close()
 
 

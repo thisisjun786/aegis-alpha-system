@@ -1,8 +1,10 @@
-"""A synthetic core schema step after the newest real one, for the step runner's tests.
+"""Core schema versions this code knows, changed for the step runner's tests.
 
-Its texts change nothing, so a store at that version holds exactly the objects of the
-version before and only its receipts and checksums are new. Every module that binds the
-version tables is patched together, the way a real new version would change them all.
+``add_synthetic_step`` adds a step after the newest real one whose texts change nothing,
+so a store at that version holds exactly the objects of the version before and only its
+receipts and checksums are new. ``know_only`` makes the code know only the versions up to
+one, as the code that shipped that version did. Every module that binds the version
+tables is patched together, the way a real new version would change them all.
 """
 
 from __future__ import annotations
@@ -22,8 +24,17 @@ STATE_STEP: Final = "-- synthetic core step: the state store changes nothing\n"
 
 def add_synthetic_step(patch: pytest.MonkeyPatch) -> int:
     """Make this code know one more core version; return that version."""
-    market_texts = (*market.MIGRATIONS, MARKET_STEP)
-    state_texts = (*state.MIGRATIONS, STATE_STEP)
+    return _know(patch, (*market.MIGRATIONS, MARKET_STEP), (*state.MIGRATIONS, STATE_STEP))
+
+
+def know_only(patch: pytest.MonkeyPatch, version: int) -> int:
+    """Make this code know the core versions up to ``version`` and none after it."""
+    return _know(patch, market.MIGRATIONS[:version], state.MIGRATIONS[:version])
+
+
+def _know(
+    patch: pytest.MonkeyPatch, market_texts: tuple[str, ...], state_texts: tuple[str, ...]
+) -> int:
     market_checksums = tuple(hashlib.sha256(text.encode()).hexdigest() for text in market_texts)
     state_checksums = schema_checksums(state_texts)
     version = len(market_texts)

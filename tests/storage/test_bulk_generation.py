@@ -650,8 +650,8 @@ def test_streaming_memory_stays_within_the_admitted_allowance(tmp_path: Path) ->
         tracemalloc.stop()
     assert plan.marker["row_count"] == rows
     assert peak <= budget.available_bytes
-    # The constraint indexes the insert maintains are DuckDB's share, sized separately;
-    # the lowered limit stays on a connection, so the larger allocation takes a new one.
+    # DuckDB's share (the insert, its checks and COMMIT) is sized separately; the
+    # lowered limit stays on a connection, so the larger allocation takes a new one.
     connection.close()
     connection = duckdb.connect(str(tmp_path / "market.duckdb"))
     marker = publish_generation_bulk(
@@ -708,10 +708,11 @@ def test_commit_exhaustion_rolls_back_as_a_budget_error(tmp_path: Path) -> None:
 
     DuckDB reports that exhaustion as a ``TransactionException``, not an OOM, once the
     insert itself fit. The limits sweep upward from where the insert fails to where
-    the COMMIT succeeds, so the band between is crossed whatever its exact edges.
+    the COMMIT succeeds, so the band between is crossed whatever its exact edges. Only
+    a v2 store still has key indexes for a COMMIT to merge.
     """
     path = tmp_path / "market.duckdb"
-    connection = _store(path)
+    connection = _store(path, version=2)
     _staged_prices(connection, 100_000)
     roomy = ComputeBudget(Fraction(1), 1024 * 1024 * 1024)
     first = publish_generation_bulk(

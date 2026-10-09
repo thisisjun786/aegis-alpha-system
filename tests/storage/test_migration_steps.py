@@ -1,8 +1,8 @@
 """The core schema migration as a runner of single steps, and what a step's backup carries.
 
-The newest real version is followed by a synthetic one (``core_step_support``) whose texts
-change nothing, so every multi-step path runs before a real later version exists. Every
-case uses a disposable installation this module created; the promotion is synthetic.
+Every multi-step path runs through the real steps: v1 to v2, then v2 to v3, the step that
+rebuilds the domain tables without their key indexes. Every case uses a disposable
+installation this module created; the promotion is synthetic.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ from aegis_alpha.storage.backup import backup, backup_workspace, restore
 from aegis_alpha.storage.bulk_generation import BulkPlan, BulkRequest
 from aegis_alpha.storage.market import marker_for, publish_generation
 from aegis_alpha.storage.migration import (
+    CORE_VERSION,
     MIGRATION_OPERATION,
     CoreSchemaError,
     inspect_core_schema,
@@ -47,7 +48,7 @@ from aegis_alpha.storage.state import get_operation, prepare_operation
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace
 from tests.storage.capacity_support import FailingCommit
-from tests.storage.core_step_support import add_synthetic_step
+from tests.storage.core_step_support import know_only
 from tests.storage.promotion_support import (
     ZONE,
     add_bulk_source,
@@ -78,6 +79,9 @@ _HASH = "c" * 64
 # intent was recorded then must still match it under every later version.
 _V2_REQUEST = "c5fd3fe558418f3ba31cfab4dfac789054fa1364c4f92dc4894685e4f495aab6"
 _V2_PARENT = "d17ecf0055f145969094bce9879c58f0ef73ec82a526909efb99e56924d6d515"
+# The v3 step's identity, frozen the same way from the moment it ships.
+_V3_REQUEST = "bbd8f1dd7a221c8fa0b39f1a868b581f3d96b880ee2aec57644fd07da5f24c8e"
+_V3_PARENT = "dd72027f71f561a7b9bd57f770f136ab06226db9bfd8c0a56f760682d46e610a"
 _IDS = {
     "installation_id": "synthetic-installation",
     "state_store_id": "a" * 32,
@@ -87,10 +91,7 @@ _DAY = date(2025, 1, 2)
 _CHILD = """
 import os, sys
 from pathlib import Path
-import pytest
 from aegis_alpha.storage import backup, migration
-from tests.storage.core_step_support import add_synthetic_step
-add_synthetic_step(pytest.MonkeyPatch())
 home, step, output, target = sys.argv[1:5]
 name, _, nth = step.partition(":")
 calls = []
@@ -117,13 +118,13 @@ os._exit(0)
 
 
 @pytest.fixture
-def synthetic(monkeypatch: pytest.MonkeyPatch) -> int:
-    """This code knows one more core version than it ships; that version."""
-    return add_synthetic_step(monkeypatch)
+def latest() -> int:
+    """The newest core version, whose step follows the v2 step."""
+    return CORE_VERSION
 
 
 def kill_at(home: Path, step: str, output: Path, target: int) -> int:
-    """Migrate in a child that knows the synthetic step and dies at ``step``.
+    """Migrate in a child that dies at ``step``.
 
     ``name:n`` dies at the n-th call of that function, so a multi-step run can be
     stopped in a later step.
@@ -180,7 +181,7 @@ def pending_promotion(
     """
     home = root / "home"
     with pytest.MonkeyPatch.context() as patch:
-        # At v2 also when the synthetic step is known, which would install v3.
+        # At v2, where the rehearsal's promotion stopped.
         patch.setattr(workspace, "_INSTALL_VERSION", 2)
         initialize(home)
     publish = engine.publish_generation_bulk
@@ -265,35 +266,34 @@ def _prepare_again(admitted: workspace.Workspace, intent: dict[str, object]) -> 
     )
 
 
-def test_step_identities_are_frozen_and_outlive_later_steps(synthetic: int) -> None:
+def test_step_identities_are_frozen_and_outlive_later_steps(latest: int) -> None:
     assert step_operation(2) == MIGRATION_OPERATION == "core-schema-migrate-v2"
-    # The synthetic step is known, yet the v2 step's identity is the one that shipped.
+    # The v3 step is known, yet the v2 step's identity is the one that shipped.
     assert content_sha256(migration._step_request(2, **_IDS)) == _V2_REQUEST  # noqa: SLF001
     assert migration._expected_parent(2) == _V2_PARENT  # noqa: SLF001
-    later = cast("dict[str, list[str]]", migration._step_request(synthetic, **_IDS))  # noqa: SLF001
+    later = cast("dict[str, list[str]]", migration._step_request(latest, **_IDS))  # noqa: SLF001
+    assert step_operation(latest) == "core-schema-migrate-v3"
     assert (later["from_version"], later["to_version"]) == (2, 3)
-    assert later["market_checksums"][:2] == list(RECORDED_MARKET)
-    assert later["state_checksums"][:2] == list(RECORDED_STATE)
-    assert migration._expected_parent(synthetic) == content_sha256(  # noqa: SLF001
-        {"market": RECORDED_MARKET[1], "state": RECORDED_STATE[1]}
-    )
-    for unknown in (1, synthetic + 1):
+    assert later["market_checksums"] == list(RECORDED_MARKET)
+    assert later["state_checksums"] == list(RECORDED_STATE)
+    assert content_sha256(later) == _V3_REQUEST
+    assert migration._expected_parent(latest) == _V3_PARENT  # noqa: SLF001
+    assert content_sha256({"market": RECORDED_MARKET[1], "state": RECORDED_STATE[1]}) == _V3_PARENT
+    for unknown in (1, latest + 1):
         with pytest.raises(CoreSchemaError, match="core_schema_unknown_version"):
             migration._target(unknown)  # noqa: SLF001
 
 
-def test_one_invocation_takes_every_step_with_its_own_backup(
-    tmp_path: Path, synthetic: int
-) -> None:
+def test_one_invocation_takes_every_step_with_its_own_backup(tmp_path: Path, latest: int) -> None:
     home = v1_installation(tmp_path)
-    plan = plan_core_migration(home, to_version=synthetic)
+    plan = plan_core_migration(home, to_version=latest)
     steps = cast("list[dict[str, object]]", plan["migrations"])
     assert [(entry["operation_id"], entry["backup_required"]) for entry in steps] == [
         ("core-schema-migrate-v2", True),
         ("core-schema-migrate-v3", True),
     ]
     output = tmp_path / "backups"
-    report = migrate_core_schema(home, to_version=synthetic, backup_output=output)
+    report = migrate_core_schema(home, to_version=latest, backup_output=output)
     assert (report["state"], report["market_version"], report["state_version"]) == ("current", 3, 3)
     steps = cast("list[dict[str, object]]", report["migrations"])
     assert [entry["operation_id"] for entry in steps] == [step_operation(2), step_operation(3)]
@@ -315,7 +315,7 @@ def test_one_invocation_takes_every_step_with_its_own_backup(
     assert recorded_hashes(home) == V1_MARKERS
 
 
-def test_to_2_stops_there_and_a_later_step_starts_from_it(tmp_path: Path, synthetic: int) -> None:
+def test_to_2_stops_there_and_a_later_step_starts_from_it(tmp_path: Path, latest: int) -> None:
     home = v1_installation(tmp_path)
     report = migrate_core_schema(home, to_version=2, backup_output=tmp_path / "v2")
     # Only the v2 step ran, under its shipped identity; the installation is now outdated.
@@ -328,9 +328,9 @@ def test_to_2_stops_there_and_a_later_step_starts_from_it(tmp_path: Path, synthe
     with open_workspace(home) as admitted:
         status = inspect_core_schema(admitted)
         assert (status.state, status.migration_phase) == ("outdated", "COMPLETED")
-    plan = plan_core_migration(home, to_version=synthetic)
+    plan = plan_core_migration(home, to_version=latest)
     assert (plan["steps"], plan["backup_required"]) == (list(migration._STEPS), True)  # noqa: SLF001
-    report = migrate_core_schema(home, to_version=synthetic, backup_output=tmp_path / "v3")
+    report = migrate_core_schema(home, to_version=latest, backup_output=tmp_path / "v3")
     assert report["backup_root"] == str(tmp_path / "v3")
     assert intents(home)[MIGRATION_OPERATION] == v2
     # Nothing is downgraded: an earlier target on a later store is a no-op.
@@ -344,16 +344,16 @@ def test_to_2_stops_there_and_a_later_step_starts_from_it(tmp_path: Path, synthe
     ["inside-market", "_upgrade_market", "_upgrade_state", "_write_receipt", "complete_operation"],
 )
 def test_a_kill_in_a_later_step_is_finished_by_repeating_it(
-    tmp_path: Path, synthetic: int, step: str
+    tmp_path: Path, latest: int, step: str
 ) -> None:
     home = tmp_path / "home"
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(workspace, "_INSTALL_VERSION", 2)
         initialize(home)
-    assert kill_at(home, step, tmp_path / "backup", synthetic) == _KILLED
+    assert kill_at(home, step, tmp_path / "backup", latest) == _KILLED
     with pytest.raises(ValueError, match="repeat aas db migrate --to 3"):
         open_workspace(home).__enter__()
-    plan = plan_core_migration(home, to_version=synthetic)
+    plan = plan_core_migration(home, to_version=latest)
     assert (plan["state"], plan["migration_operation"], plan["backup_required"]) == (
         "incomplete",
         step_operation(3),
@@ -362,7 +362,7 @@ def test_a_kill_in_a_later_step_is_finished_by_repeating_it(
     # An earlier target cannot leave the prepared step half done.
     with pytest.raises(CoreSchemaError, match="repeat aas db migrate --to 3"):
         migrate_core_schema(home, to_version=2, backup_output=None)
-    report = migrate_core_schema(home, to_version=synthetic, backup_output=tmp_path / "unused")
+    report = migrate_core_schema(home, to_version=latest, backup_output=tmp_path / "unused")
     assert not (tmp_path / "unused").exists()
     assert report["migrations"] == [
         {
@@ -381,53 +381,51 @@ def test_a_kill_in_a_later_step_is_finished_by_repeating_it(
         ).fetchone() == (0,)
 
 
-def test_a_kill_between_steps_needs_the_next_steps_own_backup(
-    tmp_path: Path, synthetic: int
-) -> None:
+def test_a_kill_between_steps_needs_the_next_steps_own_backup(tmp_path: Path, latest: int) -> None:
     home = v1_installation(tmp_path)
     output = tmp_path / "backups"
     # The v2 step completed; the run died taking the v3 step's backup, before its intent.
-    assert kill_at(home, "backup_workspace:2", output, synthetic) == _KILLED
+    assert kill_at(home, "backup_workspace:2", output, latest) == _KILLED
     assert set(intents(home)) == {MIGRATION_OPERATION}
     assert versions(home) == {"state": 2, "market": 2}
-    plan = plan_core_migration(home, to_version=synthetic)
+    plan = plan_core_migration(home, to_version=latest)
     assert (plan["state"], plan["migration_phase"], plan["backup_required"]) == (
         "outdated",
         "COMPLETED",
         True,
     )
     with pytest.raises(CoreSchemaError, match="core_schema_backup_required"):
-        migrate_core_schema(home, to_version=synthetic, backup_output=None)
+        migrate_core_schema(home, to_version=latest, backup_output=None)
     # The interrupted invocation's directory is not new, so it is not reused.
     with pytest.raises(ValueError, match="new directory"):
-        migrate_core_schema(home, to_version=synthetic, backup_output=output)
+        migrate_core_schema(home, to_version=latest, backup_output=output)
     assert set(intents(home)) == {MIGRATION_OPERATION}
-    report = migrate_core_schema(home, to_version=synthetic, backup_output=tmp_path / "v3")
+    report = migrate_core_schema(home, to_version=latest, backup_output=tmp_path / "v3")
     assert report["backup_manifest_sha256"] == file_digest(tmp_path / "v3" / "backup.json")
     assert recorded_hashes(home) == V1_MARKERS
 
 
 @pytest.mark.parametrize("step", ["_upgrade_state", "_write_receipt", "complete_operation"])
 def test_a_step_whose_market_landed_resumes_into_the_next_step(
-    tmp_path: Path, synthetic: int, step: str
+    tmp_path: Path, latest: int, step: str
 ) -> None:
     home = v1_installation(tmp_path)
     # The v2 step died after its market COMMIT, before the receipt named v2.
-    assert kill_at(home, step, tmp_path / "v2", synthetic) == _KILLED
-    plan = plan_core_migration(home, to_version=synthetic)
-    assert (plan["state"], plan["market_version"]) == ("incomplete", synthetic - 1)
+    assert kill_at(home, step, tmp_path / "v2", latest) == _KILLED
+    plan = plan_core_migration(home, to_version=latest)
+    assert (plan["state"], plan["market_version"]) == ("incomplete", latest - 1)
     assert set(intents(home)) == {MIGRATION_OPERATION}
     taken = tmp_path / "taken"
     taken.mkdir()
     # The v3 step's destination is admitted as its backup would admit it, before the v2
     # step is finished: it must be new and outside raw, runs and secrets.
     with pytest.raises(ValueError, match="new directory"):
-        migrate_core_schema(home, to_version=synthetic, backup_output=taken)
+        migrate_core_schema(home, to_version=latest, backup_output=taken)
     with pytest.raises(ValueError, match="inside raw, runs, or secrets"):
-        migrate_core_schema(home, to_version=synthetic, backup_output=home / "raw" / "new")
+        migrate_core_schema(home, to_version=latest, backup_output=home / "raw" / "new")
     assert not (home / "raw" / "new").exists()
     assert intents(home)[MIGRATION_OPERATION]["phase"] == "PREPARED"
-    report = migrate_core_schema(home, to_version=synthetic, backup_output=tmp_path / "v3")
+    report = migrate_core_schema(home, to_version=latest, backup_output=tmp_path / "v3")
     assert (report["state"], report["market_version"], report["state_version"]) == ("current", 3, 3)
     assert [
         (entry["operation_id"], entry["resumed"])
@@ -435,7 +433,7 @@ def test_a_step_whose_market_landed_resumes_into_the_next_step(
     ] == [(step_operation(2), True), (step_operation(3), False)]
     # The v3 step's backup is of the finished v2 installation.
     stores = json.loads((tmp_path / "v3" / "installation.json").read_text())
-    assert stores["stores"]["market"]["schema_version"] == synthetic - 1
+    assert stores["stores"]["market"]["schema_version"] == latest - 1
     assert recorded_hashes(home) == V1_MARKERS
 
 
@@ -458,7 +456,7 @@ def test_an_unknown_step_intent_is_refused(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(("parented", "partial"), [(False, False), (True, False), (True, True)])
 def test_an_untouched_promotion_is_carried_through_a_step_and_then_recovered(
-    tmp_path: Path, synthetic: int, *, parented: bool, partial: bool
+    tmp_path: Path, latest: int, *, parented: bool, partial: bool
 ) -> None:
     home, planned = pending_promotion(tmp_path, parented=parented, partial=partial)
     operation_id, generation_id = str(planned["operation_id"]), str(planned["generation_id"])
@@ -470,7 +468,7 @@ def test_an_untouched_promotion_is_carried_through_a_step_and_then_recovered(
     with pytest.raises(ValueError, match="recovered operations"):
         backup(home, tmp_path / "ordinary")
     assert not (tmp_path / "ordinary").exists()
-    plan = plan_core_migration(home, to_version=synthetic)
+    plan = plan_core_migration(home, to_version=latest)
     # The plan names the carried intent and says it was proven by planning it again.
     assert plan["carried_operations"] == [
         {
@@ -483,7 +481,7 @@ def test_an_untouched_promotion_is_carried_through_a_step_and_then_recovered(
     ]
     assert plan["blocking_operations"] == []
     snapshot = tmp_path / "snapshot"
-    report = migrate_core_schema(home, to_version=synthetic, backup_output=snapshot)
+    report = migrate_core_schema(home, to_version=latest, backup_output=snapshot)
     assert (report["state"], report["pending_operations"]) == ("current", [operation_id])
     manifest = json.loads((snapshot / "backup.json").read_text())
     # The snapshot says what it holds: the pending intent, counted, with its evidence.
@@ -526,31 +524,29 @@ def test_the_snapshot_restores_for_v2_code_and_migrates_again(tmp_path: Path) ->
     home, planned = pending_promotion(tmp_path)
     operation_id = str(planned["operation_id"])
     snapshot = tmp_path / "snapshot"
-    with pytest.MonkeyPatch.context() as patch:
-        synthetic = add_synthetic_step(patch)
-        migrate_core_schema(home, to_version=synthetic, backup_output=snapshot)
+    migrate_core_schema(home, to_version=CORE_VERSION, backup_output=snapshot)
     # Code that knows only v2 restores it, verifies it like the snapshot was, and reads
     # its frozen receipts and the still pending promotion.
-    restored = restore(snapshot, tmp_path / "restored")
-    assert cast("dict[str, object]", restored["verification"])["pending_operations"] == 1
-    assert receipts(tmp_path / "restored") == {
-        "state": list(enumerate(RECORDED_STATE, 1)),
-        "market": list(enumerate(RECORDED_MARKET, 1)),
-    }
     with pytest.MonkeyPatch.context() as patch:
-        synthetic = add_synthetic_step(patch)
-        report = migrate_core_schema(
-            tmp_path / "restored", to_version=synthetic, backup_output=tmp_path / "again"
+        know_only(patch, 2)
+        restored = restore(snapshot, tmp_path / "restored")
+        assert cast("dict[str, object]", restored["verification"])["pending_operations"] == 1
+        assert receipts(tmp_path / "restored") == {
+            "state": list(enumerate(RECORDED_STATE[:2], 1)),
+            "market": list(enumerate(RECORDED_MARKET[:2], 1)),
+        }
+    report = migrate_core_schema(
+        tmp_path / "restored", to_version=CORE_VERSION, backup_output=tmp_path / "again"
+    )
+    assert report["pending_operations"] == [operation_id]
+    with open_workspace(tmp_path / "restored", writable=True) as admitted:
+        assert recover_operations(admitted)["recovered"] == [operation_id]
+        marker = marker_for(admitted.market, str(planned["generation_id"]))
+        expected = cast("dict[str, object]", planned["marker"])
+        assert (marker["delta_hash"], marker["chain_hash"]) == (
+            expected["delta_hash"],
+            expected["chain_hash"],
         )
-        assert report["pending_operations"] == [operation_id]
-        with open_workspace(tmp_path / "restored", writable=True) as admitted:
-            assert recover_operations(admitted)["recovered"] == [operation_id]
-            marker = marker_for(admitted.market, str(planned["generation_id"]))
-            expected = cast("dict[str, object]", planned["marker"])
-            assert (marker["delta_hash"], marker["chain_hash"]) == (
-                expected["delta_hash"],
-                expected["chain_hash"],
-            )
 
 
 def _committed(home: Path, operation_id: str) -> None:
@@ -694,7 +690,7 @@ _REPLANNED = "no longer plans its manifest"
     ],
 )
 def test_only_a_promotion_recovery_would_publish_is_carried(
-    tmp_path: Path, synthetic: int, fixture: str, alter: Callable[[Path, str], None], reason: str
+    tmp_path: Path, latest: int, fixture: str, alter: Callable[[Path, str], None], reason: str
 ) -> None:
     home, planned = pending_promotion(
         tmp_path,
@@ -705,10 +701,10 @@ def test_only_a_promotion_recovery_would_publish_is_carried(
     )
     operation_id = str(planned["operation_id"])
     alter(home, operation_id)
-    plan = plan_core_migration(home, to_version=synthetic)
+    plan = plan_core_migration(home, to_version=latest)
     assert (plan["carried_operations"], plan["blocking_operations"]) == ([], [operation_id])
     with pytest.raises(CoreSchemaError, match="core_schema_busy"):
-        migrate_core_schema(home, to_version=synthetic, backup_output=tmp_path / "snapshot")
+        migrate_core_schema(home, to_version=latest, backup_output=tmp_path / "snapshot")
     assert not (tmp_path / "snapshot").exists()
     assert versions(home) == {"state": 2, "market": 2}
     with open_workspace(home, writable=True) as admitted:
@@ -729,7 +725,7 @@ def test_only_a_promotion_recovery_would_publish_is_carried(
     assert not (tmp_path / "named").exists()
 
 
-def test_a_promotion_intent_of_another_request_blocks(tmp_path: Path, synthetic: int) -> None:
+def test_a_promotion_intent_of_another_request_blocks(tmp_path: Path, latest: int) -> None:
     home, planned = pending_promotion(tmp_path)
     with open_workspace(home, writable=True) as admitted:
         # A promotion's operation and generation IDs come from its request hash.
@@ -742,18 +738,18 @@ def test_a_promotion_intent_of_another_request_blocks(tmp_path: Path, synthetic:
             expected_parent=None,
             payload_hash=_HASH,
         )
-    plan = plan_core_migration(home, to_version=synthetic)
+    plan = plan_core_migration(home, to_version=latest)
     carried = cast("list[dict[str, object]]", plan["carried_operations"])
     assert [entry["operation_id"] for entry in carried] == [planned["operation_id"]]
     assert plan["blocking_operations"] == ["promotion:" + "d" * 64]
     with pytest.raises(CoreSchemaError, match="promotion:d"):
-        migrate_core_schema(home, to_version=synthetic, backup_output=tmp_path / "snapshot")
+        migrate_core_schema(home, to_version=latest, backup_output=tmp_path / "snapshot")
     assert not (tmp_path / "snapshot").exists()
 
 
 @pytest.mark.parametrize("kind", ["market_publish", "source_import", "run_commit", "source-retire"])
 def test_a_prepared_operation_of_another_kind_blocks(
-    tmp_path: Path, synthetic: int, kind: str
+    tmp_path: Path, latest: int, kind: str
 ) -> None:
     home, planned = pending_promotion(tmp_path)
     with open_workspace(home, writable=True) as admitted:
@@ -764,16 +760,16 @@ def test_a_prepared_operation_of_another_kind_blocks(
         other = carried | {"operation_id": f"{kind}:other", "kind": kind}
         _prepare_again(admitted, other)
         assert engine.untouched_promotion_refusal(admitted, other) == "not a prepared promotion"
-    plan = plan_core_migration(home, to_version=synthetic)
+    plan = plan_core_migration(home, to_version=latest)
     assert plan["blocking_operations"] == [f"{kind}:other"]
     with pytest.raises(CoreSchemaError, match="core_schema_busy"):
-        migrate_core_schema(home, to_version=synthetic, backup_output=tmp_path / "snapshot")
+        migrate_core_schema(home, to_version=latest, backup_output=tmp_path / "snapshot")
     assert not (tmp_path / "snapshot").exists()
     assert versions(home) == {"state": 2, "market": 2}
 
 
 def test_recovery_and_the_carry_share_one_replan(
-    tmp_path: Path, synthetic: int, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, latest: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home, planned = pending_promotion(tmp_path)
     operation_id = str(planned["operation_id"])
@@ -799,14 +795,14 @@ def test_recovery_and_the_carry_share_one_replan(
             )
             assert engine.recover_promotion(admitted, intent) is False
             assert calls == [operation_id, operation_id]
-        plan = plan_core_migration(home, to_version=synthetic)
+        plan = plan_core_migration(home, to_version=latest)
         assert (plan["carried_operations"], plan["blocking_operations"]) == ([], [operation_id])
-    plan = plan_core_migration(home, to_version=synthetic)
+    plan = plan_core_migration(home, to_version=latest)
     assert plan["blocking_operations"] == []
 
 
 def test_a_carry_is_planned_alike_after_a_verification_lowered_the_connection(
-    tmp_path: Path, synthetic: int, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, latest: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home, planned = pending_promotion(tmp_path)
     operation_id = str(planned["operation_id"])
@@ -836,12 +832,12 @@ def test_a_carry_is_planned_alike_after_a_verification_lowered_the_connection(
         return original(admitted, retained, budget=budget)
 
     monkeypatch.setattr(engine, "plan_promotion", traced)
-    plan = plan_core_migration(home, to_version=synthetic, budget=lease)
+    plan = plan_core_migration(home, to_version=latest, budget=lease)
     assert [entry["operation_id"] for entry in cast("list[dict]", plan["carried_operations"])] == [
         operation_id
     ]
     report = migrate_core_schema(
-        home, to_version=synthetic, backup_output=tmp_path / "snapshot", budget=lease
+        home, to_version=latest, backup_output=tmp_path / "snapshot", budget=lease
     )
     assert (report["state"], report["pending_operations"]) == ("current", [operation_id])
     # The plan, the migration's check and its backup's recheck each start from the
@@ -910,7 +906,7 @@ def test_a_head_moved_after_the_replan_leaves_the_promotion_pending(
 
 
 def test_a_replan_beyond_the_lease_refuses_the_migration(
-    tmp_path: Path, synthetic: int, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, latest: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home, planned = pending_promotion(tmp_path)
 
@@ -920,9 +916,9 @@ def test_a_replan_beyond_the_lease_refuses_the_migration(
     monkeypatch.setattr(engine, "plan_promotion", exhausted)
     # Never a silent carry, and never a refusal that hides the cause.
     with pytest.raises(ComputeResourceError, match="planning the prepared promotion again"):
-        plan_core_migration(home, to_version=synthetic)
+        plan_core_migration(home, to_version=latest)
     with pytest.raises(ComputeResourceError, match="planning the prepared promotion again"):
-        migrate_core_schema(home, to_version=synthetic, backup_output=tmp_path / "snapshot")
+        migrate_core_schema(home, to_version=latest, backup_output=tmp_path / "snapshot")
     assert not (tmp_path / "snapshot").exists()
     assert versions(home) == {"state": 2, "market": 2}
     with open_workspace(home, writable=True) as admitted:
