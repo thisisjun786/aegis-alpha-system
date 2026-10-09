@@ -28,7 +28,9 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   catalog trace, its own retained evidence (`_evidence`), and its retained spec planned
   again recomputing its manifest exactly (`_replanned`, the comparison recovery
   publishes by). Never add a hand-written check of manifest fields beside it. A replan
-  that does not fit the lease is `ComputeResourceError`, never a carry; `--plan` runs
+  that does not fit the lease is `ComputeResourceError`, never a carry; the replan
+  applies the lease's share from the installation's limits (`reset_market_limits`), not
+  from what a verification left, so every check decides alike. `--plan` runs
   under the lease and says each carry was proven by replanning. `backup_workspace`
   rechecks the names it is given and every other backup refuses every pending operation.
   The v1 DDL bytes are a recorded fact, so v1 is built from the v1 domains alone. A v1 store
