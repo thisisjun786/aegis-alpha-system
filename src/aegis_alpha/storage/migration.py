@@ -369,6 +369,7 @@ def plan_core_migration(
 
     _target(to_version)
     with open_workspace(home, migrating=True, require_strategies=False) as workspace:
+        workspace.market_lease = budget
         status = inspect_core_schema(workspace)
         pending = _pending_steps(status, to_version)
         carried, blocking = _pending_operations(
@@ -426,8 +427,8 @@ def _quiet(
 
 
 def _upgrade_market(workspace: Workspace, budget: ComputeBudget | None, step: int) -> None:
-    # Admission, and the backup's reopen after its checkpoint, use the installation's
-    # own limits; the lease's lower share is applied here, right before the transaction.
+    # Admission uses the installation's own limits; from then on the workspace holds the
+    # market within the lease's share (``market_lease``), applied again here.
     with budgeted(workspace.market, budget, "the core schema migration"):
         upgrade_market(workspace.market, workspace.installation_id, step)
 
@@ -544,6 +545,10 @@ def migrate_core_schema(
 
     _target(to_version)
     with open_workspace(home, writable=True, migrating=True) as workspace:
+        # Everything after admission (the carry checks, the backup's verification, its
+        # checkpoint and reopened handle, each step) stays within the lease's DuckDB share.
+        workspace.market_lease = budget
+        workspace.reset_market_limits()
         status = inspect_core_schema(workspace)
         pending = _pending_steps(status, to_version)
         if not pending:

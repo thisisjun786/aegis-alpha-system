@@ -846,6 +846,57 @@ def test_a_carry_is_planned_alike_after_a_verification_lowered_the_connection(
     assert len(set(limits)) == 1
 
 
+def test_the_migration_backup_checkpoints_within_the_lease(
+    tmp_path: Path, latest: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, planned = pending_promotion(tmp_path)
+    operation_id = str(planned["operation_id"])
+    lease = ComputeBudget(Fraction(1), 32 * 1024 * 1024)
+    observed: dict[str, list[tuple[int, int]]] = {"checkpoint": [], "finish": [], "admitted": []}
+
+    def limits(connection: duckdb.DuckDBPyConnection) -> tuple[int, int]:
+        row = connection.execute(
+            "SELECT parse_formatted_bytes(current_setting('memory_limit')), "
+            "current_setting('threads')::BIGINT"
+        ).fetchone()
+        assert row is not None
+        return int(row[0]), int(row[1])
+
+    checkpoint = workspace.checkpoint
+
+    def traced_checkpoint(connection: duckdb.DuckDBPyConnection) -> None:
+        observed["checkpoint"].append(limits(connection))
+        checkpoint(connection)
+
+    finish = migration._finish  # noqa: SLF001
+
+    def traced_finish(
+        admitted: workspace.Workspace, step: int, budget: ComputeBudget | None
+    ) -> None:
+        # The step after the backup runs on the handle the checkpoint reopened.
+        observed["finish"].append(limits(admitted.market))
+        finish(admitted, step, budget)
+
+    with open_workspace(home) as admitted:
+        observed["admitted"].append(limits(admitted.market))
+    monkeypatch.setattr(workspace, "checkpoint", traced_checkpoint)
+    monkeypatch.setattr(migration, "_finish", traced_finish)
+    report = migrate_core_schema(
+        home, to_version=latest, backup_output=tmp_path / "snapshot", budget=lease
+    )
+    assert (report["state"], report["pending_operations"]) == ("current", [operation_id])
+    share = (lease.duckdb_memory_limit_bytes, lease.duckdb_threads)
+    # The installation's own limits are larger than the lease's share, and the carry
+    # check restored them before the backup; its CHECKPOINT and every later step still
+    # ran within the share.
+    assert all(memory > share[0] and threads > share[1] for memory, threads in observed["admitted"])
+    assert observed["checkpoint"]
+    assert observed["finish"]
+    for memory, threads in observed["checkpoint"] + observed["finish"]:
+        assert memory <= share[0]
+        assert threads <= share[1]
+
+
 def test_a_head_moved_after_the_replan_leaves_the_promotion_pending(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -2064,7 +2064,8 @@ def untouched_promotion_refusal(
     The plan runs within ``budget``'s share of the installation's own limits, not of
     whatever share earlier work (a verification, another plan) left on the connection, so
     the migration's plan, its check and its backup's recheck decide alike; the connection
-    is back at the installation's limits afterwards.
+    is back at the installation's limits afterwards, within the workspace's
+    ``market_lease`` when it has one.
     """
     if operation["kind"] != OPERATION_KIND or operation["phase"] != "PREPARED":
         return "not a prepared promotion"
