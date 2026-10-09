@@ -23,7 +23,9 @@ publication transaction, and ``verification.verify_workspace`` audits stored row
   ``(record_id, revision_id)``. That last check builds the delta's keys and scans the
   whole domain; it is never narrowed to the dataset or the chain.
 - ``check_generation_flags`` holds a generation's quality flags to one row per key and
-  to revisions the generation stores, before COMMIT.
+  to revisions the generation stores, before COMMIT. The bulk writer runs it after its
+  companion inserts the flags, with ``other_flags`` holding every other generation's
+  flags to what they were before the companion ran.
 - ``audit_market`` is the at-rest audit: the core catalog's exact shape, every
   generation's rows counted per domain both ways against its marker, every quality
   flag's reference, and with ``deep`` the domain-wide and flag key duplicates.
@@ -328,6 +330,21 @@ def check_generation_flags(
             [generation_id, generation_id],
         ):
             raise ValueError("a quality flag names a revision the generation does not store")
+
+
+def other_flags(connection: duckdb.DuckDBPyConnection, generation_id: str) -> int:
+    """How many quality flags name a generation other than ``generation_id``."""
+    with budgeted(connection, None, _WORK):
+        return int(
+            str(
+                _one(
+                    connection,
+                    "SELECT count(*) FILTER (WHERE generation_id IS DISTINCT FROM ?) "  # noqa: S608 -- code-owned table
+                    f"FROM {_FLAGS}",
+                    [generation_id],
+                )
+            )
+        )
 
 
 def audit_market(

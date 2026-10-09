@@ -56,8 +56,10 @@ from aegis_alpha.storage.market import (
     rowset_schema,
 )
 from aegis_alpha.storage.market_integrity import (
+    check_generation_flags,
     check_inserted_generation,
     check_new_generation,
+    other_flags,
     run_publication,
 )
 from aegis_alpha.storage.market_schema import (
@@ -189,8 +191,9 @@ def publish_generation_bulk(
     recomputed marker must equal it, so what commits is what was reviewed.
     ``companion`` runs inside the same transaction after a new generation's rows are
     inserted, so rows that belong to the generation (its quality flags) commit or roll
-    back with its marker. It does not run when an identical generation is reused. An
-    error or one interrupt at any point rolls the transaction back.
+    back with its marker. It does not run when an identical generation is reused. What
+    it leaves must pass ``check_generation_flags`` and change no other generation's flags.
+    An error or one interrupt at any point rolls the transaction back.
     """
 
     def publish() -> BulkPlan:
@@ -208,12 +211,29 @@ def publish_generation_bulk(
             if not _is_table(connection, request.staged):
                 _check_stored(connection, request, budget)
             if companion is not None:
-                companion(connection)
+                _run_companion(connection, request, companion)
         return current
 
     with budgeted(connection, budget, _WORK):
         current = run_publication(connection, publish)
     return dict(current.marker)
+
+
+def _run_companion(
+    connection: duckdb.DuckDBPyConnection,
+    request: BulkRequest,
+    companion: Callable[[duckdb.DuckDBPyConnection], None],
+) -> None:
+    """Run the companion, then check the flags it stored before the generation commits.
+
+    No table key holds the flags to one row per key, so the writer itself refuses a
+    repeated or orphan flag of the generation, and any change to another generation's.
+    """
+    others = other_flags(connection, request.generation_id)
+    companion(connection)
+    check_generation_flags(connection, request.domain, request.generation_id)
+    if other_flags(connection, request.generation_id) != others:
+        raise ValueError("a companion changed another generation's quality flags")
 
 
 def _is_table(connection: duckdb.DuckDBPyConnection, name: str) -> bool:
