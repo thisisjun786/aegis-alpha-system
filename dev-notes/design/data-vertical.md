@@ -2203,26 +2203,25 @@ quarantine`은 이 intent를 끝내지 않는다. `--plan`은 저장소를 읽�
 checksum, 다음 단계의 남은 부분(`steps`), 목표까지의 단계별 목록(`migrations`), 백업 필요 여부,
 가지고 갈 승격(`carried_operations`)과 막는 작업(`blocking_operations`)을 보고하고 아무것도 쓰지 않는다.
 
-손대지 않은 승격 intent는 PREPARED인 채로 단계를 지난다. kind가 `promotion`이고 operation·generation
-ID가 요청 hash에서 나오며, 그 operation이나 generation의 marker, 행, flag, catalog 기록이 없고, 보존된
-요청·명세·manifest가 intent와 정확히 맞아야 한다. 다시 계획하지 않고 확인할 수 있는 것은 모두 확인한다.
-manifest는 `aas-promotion-manifest-v1`의 필드를 빠짐·추가 없이 정해진 형식으로 담고(`source_outcomes`는
-mapper가 결과를 셀 때만, `partition_row_count`는 선택), dataset·domain·명세 hash·원천 pin·identity
-snapshot·parent는 명세와, operation ID는 intent와 같으며, 연산별 행 수의 합이 `row_count`다. 준비된
-계획에서 늘 성립하는 것도 확인한다. 연산 이름은 `ASSERT`·`SUPERSEDE`·`TOMBSTONE`, 행 상태는 `ok`·`held`·
-`unresolved`·`ambiguous`뿐이며(거부된 행이 있는 계획은 준비되지 않는다) 각 수는 1 이상이고, sequence는
-bool이 아닌 양의 정수다. `partition_row_count`의 날짜 기록은 정해진 필드만 담고 날짜 순으로 한 번씩
-나오며, 해결 행 수가 원천 행 수를 넘지 않고, 기준은 없거나 그 날짜 이전의 parent chain generation에서
-온 것이며, `result`는 그 기록이 뜻하는 값이다. 명세의
-parent는 아직 dataset의 head이고 sequence·version은 parent 다음이며, `chain_hash`는 parent의 chain hash와
-manifest 필드로 다시 계산한 값과 같다. catalog 기록에는 그 generation의 `promotion_report`와
-`partition_row_count` 품질 검사가 모두 포함된다. 증거를 읽다 난 오류도 가지고 가지 않는 이유가 된다. 그 밖의 PREPARED 작업, marker가 commit된 승격,
-실행 중인 run은 계속 막는다. 이 예외는 단계의 백업에만 넘겨지고 백업이 스스로 다시 확인한다. 일반
-`aas db backup`과 다른 명령의 백업은 여전히 모든 PREPARED 작업을 거부한다. 그 백업은 intent와 `raw/`
-증거를 그대로 담고, `logical.pending_operations`는 실제 수를 세며, manifest의 `carried_operations`가 그
-operation을 적는다. 이것은 migration의 rollback snapshot이지 복구를 마친 설치본의 백업이 아니다.
-migration은 intent를 끝내거나 바꾸지 않는다. 그 뒤 `aas db recover`가 보존된 명세로 다시 계획하고
-intent의 manifest와 같을 때만 게시한다.
+손대지 않은 승격 intent는 PREPARED인 채로 단계를 지난다. 그 조건은 `aas db recover`가 그 intent를
+게시하는 조건이고 같은 코드로 계산한다. kind가 `promotion`이고, 그 operation이나 generation의 marker,
+행, flag, catalog 기록(`dataset_versions`, 그 generation의 `promotion_report`·`partition_row_count` 품질
+검사)이 없어야 한다. 보존된 증거는 intent의 것이어야 한다. operation·generation ID와 parent가 요청에서
+나오고, manifest는 intent가 가리키는 hash의 정규 bytes로서 같은 요청과 generation을 적으며, 보존 요청은
+보존 명세로 다시 만든 그대로다. 마지막으로 보존 명세를 다시 계획해 parent가 아직 dataset의 head이고
+계획한 manifest의 SHA-256이 intent의 payload hash와 같아야 한다. 이 비교는 recover가 게시하기 전에 하는
+비교와 같은 함수이므로 manifest가 적은 어떤 값도 따로 믿지 않는다. 고친 manifest를 다시 hash해 intent에
+걸어도, head가 옮겨졌거나 원천 table이 바뀌었어도 가지고 가지 않는다. 확인이 끝나면 계획의 임시
+table을 지우고 market 연결을 설치본의 자원 한도로 되돌린다. 증거를 읽거나 계획하다 난 오류는 가지고 가지
+않는 이유가 되지만, 계획이 compute lease의 몫 안에서 돌 수 없으면 `ComputeResourceError`로 거부하고
+조용히 가지고 가지 않는다. 그 밖의 PREPARED 작업, marker가 commit된 승격, 실행 중인 run은 계속 막는다.
+이 예외는 단계의 백업에만 넘겨지고 백업이 같은 조건으로 다시 확인한다. 일반 `aas db backup`과 다른
+명령의 백업은 여전히 모든 PREPARED 작업을 거부한다. 그 백업은 intent와 `raw/` 증거를 그대로 담고,
+`logical.pending_operations`는 실제 수를 세며, manifest의 `carried_operations`가 그 operation을 적는다.
+이것은 migration의 rollback snapshot이지 복구를 마친 설치본의 백업이 아니다. migration은 intent를 끝내거나
+바꾸지 않는다. 그 뒤 `aas db recover`가 같은 재계획으로 게시한다. `--plan`의 `carried_operations`는
+승격마다 operation·generation ID와 manifest hash를 적고 `proof`로 다시 계획해 증명했음을 밝힌다. 그래서
+`--plan`도 compute lease 안에서 실행한다.
 
 `schema_migrations`의 이력은 1부터 빈틈없이 이어지고 각 행의 checksum은 그 버전 DDL의 SHA-256과
 같아야 한다. 알 수 없는 버전, 빈틈, 다른 checksum은 거부한다. v1 checksum은 market
@@ -2903,11 +2902,14 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-469 | core migration 단계마다 자기 intent와 백업을 가지며, v2 단계의 요청과 부모 정체성은 나중 버전이 생겨도 출시된 그대로다 | `tests/storage/test_migration_steps.py::test_step_identities_are_frozen_and_outlive_later_steps` | 구현 |
 | DV-470 | 한 호출이 여러 단계를 지나면 단계마다 새 백업을 만들고 각 intent가 자기 백업을 가리킨다 | `tests/storage/test_migration_steps.py::test_one_invocation_takes_every_step_with_its_own_backup` | 구현 |
 | DV-471 | 단계 완료와 다음 단계 intent 사이에서 멈춘 설치본은 다음 단계의 새 백업을 요구한다 | `tests/storage/test_migration_steps.py::test_a_kill_between_steps_needs_the_next_steps_own_backup` | 구현 |
-| DV-472 | 손대지 않은 승격 intent는 증거와 함께 migration 백업에 PREPARED로 실리고, migration 뒤 `aas db recover`가 실패 전 계획과 같은 hash로 게시한다 | `tests/storage/test_migration_steps.py::test_an_untouched_promotion_is_carried_through_a_step_and_then_recovered` | 구현 |
-| DV-473 | commit된 승격, 증거가 없거나 맞지 않는 승격은 migration을 막고, 이름을 넘겨도 백업이 다시 거부한다 | `tests/storage/test_migration_steps.py::test_only_an_untouched_promotion_is_carried` | 구현 |
+| DV-472 | 손대지 않은 승격 intent는 증거와 함께 migration 백업에 PREPARED로 실리고, `--plan`은 다시 계획해 증명했다고 적으며, migration 뒤 `aas db recover`가 실패 전 계획과 같은 generation·delta·chain·manifest hash로 게시한다 | `tests/storage/test_migration_steps.py::test_an_untouched_promotion_is_carried_through_a_step_and_then_recovered` | 구현 |
+| DV-473 | marker·catalog 흔적이 있거나 증거가 intent의 것이 아닌 승격은 migration을 막고, 이름을 넘겨도 백업이 다시 거부한다 | `tests/storage/test_migration_steps.py::test_only_a_promotion_recovery_would_publish_is_carried` | 구현 |
 | DV-474 | migration snapshot은 v2만 아는 코드로 복원·검증되고 다시 migration한 뒤 같은 승격을 게시한다 | `tests/storage/test_migration_steps.py::test_the_snapshot_restores_for_v2_code_and_migrates_again` | 구현 |
 | DV-475 | `--to 2`는 나중 버전을 아는 코드에서도 v2에서 멈추고, 다음 단계는 거기서 시작하며, 목표 이상인 설치본은 그대로 둔다 | `tests/storage/test_migration_steps.py::test_to_2_stops_there_and_a_later_step_starts_from_it` | 구현 |
 | DV-476 | 나중 단계 어디서 멈춰도 같은 목표로 다시 실행하면 백업 없이 끝나고, 앞선 목표는 거부된다 | `tests/storage/test_migration_steps.py::test_a_kill_in_a_later_step_is_finished_by_repeating_it` | 구현 |
 | DV-477 | market COMMIT 뒤 멈춘 단계를 재개하는 호출은 다음 단계 백업까지 이어 가고, 그 전에 모든 백업 목적지를 백업의 조건대로 확인한다 | `tests/storage/test_migration_steps.py::test_a_step_whose_market_landed_resumes_into_the_next_step` | 구현 |
-| DV-478 | 필드가 빠졌거나 명세·parent·chain, 준비된 계획의 연산·행 상태·sequence·partition 기록 불변식과 모순되는 manifest의 승격은 migration을 막고, 이름을 넘겨도 백업이 다시 거부한다 | `tests/storage/test_migration_steps.py::test_only_an_untouched_promotion_is_carried` | 구현 |
+| DV-478 | bytes가 intent와 맞아도 보존 명세를 다시 계획해 같은 manifest가 나오지 않는 승격(고쳐 다시 hash한 manifest, 옮겨진 head, 바뀐 원천)은 migration을 막고 recover도 게시하지 않는다 | `tests/storage/test_migration_steps.py::test_only_a_promotion_recovery_would_publish_is_carried` | 구현 |
 | DV-479 | 승격 증거를 읽다 난 I/O 오류는 가지고 가지 않는 이유가 되며 migration 밖으로 새지 않는다 | `tests/storage/test_migration_steps.py::test_an_evidence_read_error_refuses_the_carry` | 구현 |
+| DV-480 | promotion이 아닌 PREPARED 작업은 carry할 승격과 같은 요청·generation·manifest를 적어도 migration을 막는다 | `tests/storage/test_migration_steps.py::test_a_prepared_operation_of_another_kind_blocks` | 구현 |
+| DV-481 | migration의 carry와 recover의 게시는 한 재계획 구현을 공유해, 그 하나가 거부하면 둘 다 거부한다 | `tests/storage/test_migration_steps.py::test_recovery_and_the_carry_share_one_replan` | 구현 |
+| DV-482 | 재계획이 compute lease 안에서 돌 수 없으면 `--plan`, migration과 그 백업은 `ComputeResourceError`로 거부하고 아무것도 쓰지 않는다 | `tests/storage/test_migration_steps.py::test_a_replan_beyond_the_lease_refuses_the_migration` | 구현 |

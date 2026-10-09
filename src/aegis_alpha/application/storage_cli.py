@@ -313,11 +313,11 @@ def _maintenance(home: Path, args: argparse.Namespace) -> dict[str, object]:  # 
     else:
         private_directory(home)
         stores = load_paths(home).stores()
-    if args.db_command == "migrate" and args.plan:
-        # Read-only: no backup is taken, so no compute lease is needed either.
-        return plan_core_migration(home, to_version=args.to_version)
     # Acquire the compute lease before workspace admission, as other bulk readers do.
     with price_compute(excluded_locks=storage_lock_targets(home, stores)) as budget:
+        if args.db_command == "migrate" and args.plan:
+            # Read-only, but a carried promotion is proven by planning it again.
+            return plan_core_migration(home, to_version=args.to_version, budget=budget)
         if args.db_command == "backup":
             return backup(home, args.output, budget=budget, deep=args.deep)
         if args.db_command == "restore":

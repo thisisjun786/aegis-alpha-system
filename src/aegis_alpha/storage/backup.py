@@ -108,12 +108,15 @@ def backup(
         return backup_workspace(workspace, output, budget=budget, deep=deep)
 
 
-def _carried(workspace: Workspace, carry: Collection[str]) -> list[str]:
+def _carried(
+    workspace: Workspace, carry: Collection[str], budget: ComputeBudget | None
+) -> list[str]:
     """The prepared operations a backup holds pending, refusing any it may not.
 
-    Every prepared operation must be one the caller named and an untouched promotion
-    intent (``untouched_promotion_refusal``), checked here rather than trusted, so the
-    names widen nothing: an ordinary backup names none and refuses every one.
+    Every prepared operation must be one the caller named and one ``aas db recover``
+    would publish (``untouched_promotion_refusal``, which plans each again), checked here
+    rather than trusted, so the names widen nothing: an ordinary backup names none and
+    refuses every one.
     """
     from aegis_alpha.storage.promotion.engine import (  # noqa: PLC0415 -- promotion owner
         untouched_promotion_refusal,
@@ -124,7 +127,8 @@ def _carried(workspace: Workspace, carry: Collection[str]) -> list[str]:
         "FROM storage_operations WHERE phase='PREPARED' ORDER BY operation_id"
     ).fetchall()
     if any(
-        row["operation_id"] not in carry or untouched_promotion_refusal(workspace, dict(row))
+        row["operation_id"] not in carry
+        or untouched_promotion_refusal(workspace, dict(row), budget=budget)
         for row in pending
     ):
         raise ValueError("backup requires recovered operations and no orphan generations")
@@ -161,15 +165,16 @@ def backup_workspace(
     digests unless ``deep`` rehashes them; every copied file is hashed as it is written.
 
     A backup needs every operation recovered. ``carry`` is the core schema migration's
-    exception alone: the untouched promotion intents it names stay pending in the copy,
-    exactly as the installation holds them with their retained evidence, the logical
-    report counts them, and the manifest lists them as ``carried_operations``. Such a
-    backup is the migration's rollback snapshot, not a recovered installation's backup.
+    exception alone: the promotion intents it names, each one recovery would publish,
+    stay pending in the copy exactly as the installation holds them with their retained
+    evidence, the logical report counts them, and the manifest lists them as
+    ``carried_operations``. Such a backup is the migration's rollback snapshot, not a
+    recovered installation's backup.
     """
     verification = verify_workspace(workspace, budget=budget, deep=deep)
     if verification["orphan_generations"]:
         raise ValueError("backup requires recovered operations and no orphan generations")
-    carried = _carried(workspace, carry) if verification["pending_operations"] else []
+    carried = _carried(workspace, carry, budget) if verification["pending_operations"] else []
     if len(carried) != verification["pending_operations"]:
         raise ValueError("backup requires recovered operations and no orphan generations")
     if workspace.state.execute("SELECT 1 FROM runs WHERE status='RUNNING'").fetchone():

@@ -20,14 +20,12 @@ from __future__ import annotations
 # ruff: noqa: S608 -- every dynamic identifier is engine-owned and quoted; values are bound.
 import hashlib
 import json
-import re
 import time
 from dataclasses import dataclass, field
-from datetime import date
 from fractions import Fraction
 from typing import TYPE_CHECKING, Final, cast
 
-from aegis_alpha.compute_resources import ComputeBudget
+from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.storage.bulk_generation import (
     BulkPlan,
@@ -42,7 +40,7 @@ from aegis_alpha.storage.bulk_generation import (
 )
 from aegis_alpha.storage.market import (
     RECORD_SCHEMA,
-    chain_digest,
+    budgeted,
     generation_chain,
     limit_duckdb,
     marker_for,
@@ -76,6 +74,7 @@ from aegis_alpha.storage.state import atomic, complete_operation, get_operation,
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
+    from datetime import date
     from pathlib import Path
 
     import duckdb
@@ -1923,6 +1922,17 @@ def _complete(
 def _evidence(
     workspace: Workspace, operation: Mapping[str, object]
 ) -> tuple[PromotionSpec, dict[str, object]]:
+    """The retained spec and manifest of a promotion intent, refusing any that is not its own.
+
+    The intent's IDs and parent are its request's, because publication prepares the
+    request's own intent: an intent under any other name would never be the one it
+    completes.
+    """
+    request_hash = str(operation["request_hash"])
+    if (str(operation["target_id"]), str(operation["operation_id"])) != generation_identity(
+        request_hash
+    ):
+        raise ValueError("promotion intent IDs are not its request's")
     manifest_raw = _read_raw(workspace, str(operation["payload_hash"]))
     manifest = json.loads(manifest_raw)
     if (
@@ -1940,9 +1950,33 @@ def _evidence(
     )
     if hashlib.sha256(request).hexdigest() != operation["request_hash"]:
         raise ValueError("retained promotion spec does not match its request")
-    if _read_raw(workspace, str(operation["request_hash"])) != request:
+    if _read_raw(workspace, request_hash) != request:
         raise ValueError("retained promotion request differs from its spec")
+    if operation["expected_parent"] != spec.parent:
+        raise ValueError("promotion intent parent is not its request's")
     return spec, manifest
+
+
+def _replanned(
+    workspace: Workspace,
+    operation: Mapping[str, object],
+    spec: PromotionSpec,
+    budget: ComputeBudget,
+) -> PromotionPlan | None:
+    """The retained spec planned again, if it recomputes exactly the intent's manifest.
+
+    This is the one test an uncommitted intent is published by: ``recover_promotion``
+    publishes the plan it returns, and the core migration carries only an intent it
+    returns a plan for. A moved head is no plan; DuckDB exhausting its memory is
+    ``ComputeResourceError``. The caller drops the plan's temp tables.
+    """
+    try:
+        with budgeted(workspace.market, None, "planning the prepared promotion again"):
+            plan = plan_promotion(workspace, spec, budget=budget)
+    except ParentChangedError:
+        return None
+    recomputed = None if plan.manifest is None else hashlib.sha256(plan.manifest).hexdigest()
+    return plan if recomputed == operation["payload_hash"] else None
 
 
 def recover_promotion(
@@ -1968,262 +2002,17 @@ def recover_promotion(
         _complete(workspace, operation, spec, manifest, budget)
         return True
     try:
-        plan = plan_promotion(workspace, spec, budget=budget)
-        recomputed = None if plan.manifest is None else hashlib.sha256(plan.manifest).hexdigest()
-        if recomputed != operation["payload_hash"]:
+        plan = _replanned(workspace, operation, spec, budget)
+        if plan is None:
             return False
         _publish(workspace, plan, budget)
-    except ParentChangedError:
-        return False
     finally:
         _drop(workspace.market)
     return True
 
 
-_MANIFEST_KEYS: Final = frozenset(
-    {
-        "schema",
-        "request_hash",
-        "spec_sha256",
-        "dataset_id",
-        "domain",
-        "version",
-        "generation_id",
-        "operation_id",
-        "parent",
-        "sequence",
-        "delta_hash",
-        "chain_hash",
-        "row_count",
-        "operations",
-        "flags",
-        "rows",
-        "unchanged",
-        "stale",
-        "ingested_through_us",
-        "sources",
-        "identity_snapshot",
-    }
-)
-_PARTITION_DATE_KEYS: Final = frozenset(
-    {
-        "session_date",
-        "rows",
-        "resolved",
-        "reference_date",
-        "reference_rows",
-        "reference_generation",
-    }
-)
-_DELTA_OPS: Final = frozenset({"ASSERT", "SUPERSEDE", "TOMBSTONE"})
-# A prepared plan has no refusals, so no ``refused_*`` status ever reaches its manifest.
-_PREPARED_STATUSES: Final = frozenset({"ok", "held", "unresolved", "ambiguous"})
-_SHA256: Final = re.compile(r"[0-9a-f]{64}")
-
-
-def _count_value(value: object, *, low: int = 0) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value >= low
-
-
-def _counts(value: object, names: frozenset[str] | None = None, *, low: int = 0) -> bool:
-    """A mapping of names (any, or only ``names``) to counts of at least ``low``."""
-    return isinstance(value, dict) and all(
-        isinstance(key, str) and (names is None or key in names) and _count_value(count, low=low)
-        for key, count in value.items()
-    )
-
-
-def _iso_date(value: object) -> date | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        parsed = date.fromisoformat(value)
-    except ValueError:
-        return None
-    return parsed if parsed.isoformat() == value else None
-
-
-def _partition_refusal(check: object, chain: set[str]) -> str | None:
-    """Why a recorded ``partition_row_count`` check is not one planning could write, or None.
-
-    Each date record holds exactly the planned fields: a session date counted once in
-    ascending order, its source and resolved rows, and either no reference or one taken
-    on or before it from a generation of the parent chain. The result is the one those
-    records imply.
-    """
-    malformed = "retained promotion manifest has a malformed partition check"
-    if (
-        not isinstance(check, dict)
-        or check.keys() != {"rule", "result", "dates"}
-        or check["rule"] != "@".join(PARTITION_CHECK)
-        or not isinstance(check["dates"], list)
-        or not check["dates"]
-    ):
-        return malformed
-    previous: date | None = None
-    compared = []
-    for item in cast("list[object]", check["dates"]):
-        if not isinstance(item, dict) or item.keys() != _PARTITION_DATE_KEYS:
-            return malformed
-        session = _iso_date(item["session_date"])
-        rows, resolved = item["rows"], item["resolved"]
-        if (
-            session is None
-            or (previous is not None and session <= previous)
-            or not _count_value(rows, low=1)
-            or not _count_value(resolved)
-            or cast("int", resolved) > cast("int", rows)
-        ):
-            return malformed
-        previous = session
-        reference = (item["reference_date"], item["reference_rows"], item["reference_generation"])
-        if reference == (None, None, None):
-            continue
-        day = _iso_date(reference[0])
-        if (
-            day is None
-            or day > session
-            or not _count_value(reference[1], low=1)
-            or reference[2] not in chain
-        ):
-            return malformed
-        compared.append(cast("int", resolved) < cast("int", reference[1]))
-    result = (
-        "no_reference"
-        if not compared
-        else "below_reference"
-        if any(compared)
-        else "at_least_reference"
-    )
-    return None if check["result"] == result else malformed
-
-
-def _digest_value(value: object) -> bool:
-    return isinstance(value, str) and _SHA256.fullmatch(value) is not None
-
-
-def _manifest_refusal(  # noqa: C901, PLR0911 -- one reason per manifest field group
-    workspace: Workspace,
-    operation: Mapping[str, object],
-    spec: PromotionSpec,
-    manifest: Mapping[str, object],
-) -> str | None:
-    """Why a retained manifest is not one this intent's spec could have planned, or None.
-
-    Only what holds without planning again is checked: the manifest has exactly the
-    ``aas-promotion-manifest-v1`` fields with their types, names this intent and its
-    spec, follows the spec's parent (still the dataset's head) in sequence and chain
-    hash, and counts as many delta rows as its operations. Recovery still publishes only
-    a plan that recomputes the manifest exactly; this keeps an incomplete or contradictory
-    one from being carried as if it would.
-    """
-    # Only a mapper of response rows records coverage; a partition check is optional.
-    required = set(_MANIFEST_KEYS)
-    if spec.mapper.outcome(spec.mapper_args) is not None:
-        required.add("source_outcomes")
-    keys = set(manifest)
-    if not required <= keys or keys - required - {"partition_row_count"}:
-        return "retained promotion manifest lacks or adds fields"
-    expected = {
-        "spec_sha256": spec.sha256,
-        "dataset_id": spec.dataset_id,
-        "domain": spec.domain,
-        "operation_id": operation["operation_id"],
-        "parent": spec.parent,
-        "sources": [
-            {"source_id": pin.source_id, "table": pin.table, "digest": pin.table_digest}
-            for pin in spec.sources
-        ],
-        "identity_snapshot": None
-        if spec.identity_snapshot is None
-        else {
-            "snapshot_id": spec.identity_snapshot.snapshot_id,
-            "content_hash": spec.identity_snapshot.content_hash,
-        },
-    }
-    if any(manifest[key] != value for key, value in expected.items()):
-        return "retained promotion manifest does not match its spec"
-    if operation["expected_parent"] != spec.parent:
-        return "retained promotion manifest does not match its intent"
-    flags = manifest["flags"]
-    operations = manifest["operations"]
-    if (
-        not _digest_value(manifest["delta_hash"])
-        or not _digest_value(manifest["chain_hash"])
-        or not _count_value(manifest["row_count"], low=1)
-        or not _counts(operations, _DELTA_OPS, low=1)
-        or sum(cast("dict[str, int]", operations).values()) != manifest["row_count"]
-        or not isinstance(flags, dict)
-        or flags.keys() != {"rowset", "rows"}
-        or not _digest_value(flags["rowset"])
-        or not _count_value(flags["rows"])
-        or not _counts(manifest["rows"], _PREPARED_STATUSES, low=1)
-        or not _count_value(manifest["sequence"], low=1)
-        or not isinstance(manifest["version"], str)
-        or not _count_value(manifest["unchanged"])
-        or not _count_value(manifest["stale"])
-        or not (
-            manifest["ingested_through_us"] is None or _count_value(manifest["ingested_through_us"])
-        )
-        or ("source_outcomes" in manifest and not _counts(manifest["source_outcomes"]))
-    ):
-        return "retained promotion manifest has malformed counts or hashes"
-    try:
-        head = dataset_head(workspace, spec.dataset_id)
-        chain = [] if spec.parent is None else generation_chain(workspace.market, spec.parent)
-    except ValueError as error:
-        return str(error)
-    if head != spec.parent:
-        # Recovery would find the parent moved and leave the intent pending.
-        return "its spec parent is no longer the dataset head"
-    if "partition_row_count" in manifest:
-        refusal = _partition_refusal(
-            manifest["partition_row_count"], {str(item["generation_id"]) for item in chain}
-        )
-        if refusal is not None:
-            return refusal
-    parent = chain[-1] if chain else None
-    sequence = 1 if parent is None else cast("int", parent["sequence"]) + 1
-    if parent is not None and (parent["dataset_id"], parent["domain"]) != (
-        spec.dataset_id,
-        spec.domain,
-    ):
-        return "its parent generation belongs to another dataset"
-    if (manifest["sequence"], manifest["version"]) != (sequence, str(sequence)):
-        return "retained promotion manifest does not follow its parent"
-    link = chain_digest(
-        parent_chain_hash=None if parent is None else parent["chain_hash"],
-        dataset_id=spec.dataset_id,
-        version=manifest["version"],
-        generation_id=operation["target_id"],
-        domain=spec.domain,
-        delta_hash=str(manifest["delta_hash"]),
-        parent_id=spec.parent,
-        operation_id=operation["operation_id"],
-        request_hash=operation["request_hash"],
-        row_count=manifest["row_count"],
-    )
-    if link != manifest["chain_hash"]:
-        return "retained promotion manifest chain hash does not follow its parent"
-    return None
-
-
-def untouched_promotion_refusal(  # noqa: PLR0911 -- one reason per piece of evidence
-    workspace: Workspace, operation: Mapping[str, object]
-) -> str | None:
-    """Why a prepared promotion is not an untouched, fully evidenced intent; None if it is.
-
-    Only such an intent may stay pending through a core schema migration and the backup
-    it takes: nothing of it reached the market or the catalog, and its retained request,
-    spec and manifest still name exactly this intent, so ``aas db recover`` publishes it
-    afterwards from the same evidence. A committed generation is never carried, since
-    its catalog completion is recovery's to finish first.
-    """
-    if operation["kind"] != OPERATION_KIND or operation["phase"] != "PREPARED":
-        return "not a prepared promotion"
-    operation_id, generation_id = str(operation["operation_id"]), str(operation["target_id"])
-    if (generation_id, operation_id) != generation_identity(str(operation["request_hash"])):
-        return "its identity is not its request's"
+def _residue(workspace: Workspace, operation_id: str, generation_id: str) -> str | None:
+    """What of a promotion intent reached the market or the catalog, or None."""
     market = workspace.market
     if market.execute(
         "SELECT 1 FROM market_generations WHERE operation_id=? OR generation_id=?",
@@ -2251,12 +2040,42 @@ def untouched_promotion_refusal(  # noqa: PLR0911 -- one reason per piece of evi
         (generation_id, *check_ids),
     ).fetchone():
         return "its generation is cataloged"
+    return None
+
+
+def untouched_promotion_refusal(
+    workspace: Workspace,
+    operation: Mapping[str, object],
+    *,
+    budget: ComputeBudget | None = None,
+) -> str | None:
+    """Why a prepared promotion may not stay pending through a core migration; None if it may.
+
+    Only an intent ``aas db recover`` would publish afterwards may: nothing of it reached
+    the market or the catalog, and recovery's own test holds, by the same code. Its
+    retained evidence is its own (``_evidence``) and its retained spec, planned again,
+    recomputes exactly its manifest (``_replanned``), so nothing a manifest records is
+    trusted. A committed generation is never carried, since its catalog completion is
+    recovery's to finish first. A plan that cannot run within ``budget`` is
+    ``ComputeResourceError``, never a carry.
+    """
+    if operation["kind"] != OPERATION_KIND or operation["phase"] != "PREPARED":
+        return "not a prepared promotion"
+    residue = _residue(workspace, str(operation["operation_id"]), str(operation["target_id"]))
+    if residue is not None:
+        return residue
     try:
-        spec, manifest = _evidence(workspace, operation)
-        return _manifest_refusal(workspace, operation, spec, manifest)
+        spec, _ = _evidence(workspace, operation)
+        plan = _replanned(workspace, operation, spec, budget or _DEFAULT_BUDGET)
+    except ComputeResourceError:
+        raise
     except (KeyError, TypeError, ValueError, OSError, RecursionError) as error:
-        # Unreadable evidence is a refusal to carry, never a reason to drop the check.
+        # Unreadable evidence or a failed plan is a refusal to carry, never a reason to
+        # drop the check.
         return str(error) or type(error).__name__
+    finally:
+        _drop(workspace.market)
+    return None if plan is not None else "its retained spec no longer plans its manifest"
 
 
 def verify_promotion(

@@ -382,7 +382,7 @@ aas db source-retire --spec /path/to/retirement.json --sha256 SHA256 --backup /p
 aas db compact --to /path/to/new-root
 ```
 
-`db migrate --plan`은 state·market을 읽기 전용으로 열어 각 저장소의 버전, 인식한 `schema_migrations` checksum,
+`db migrate --plan`은 compute lease 안에서 state·market을 읽기 전용으로 열어 각 저장소의 버전, 인식한 `schema_migrations` checksum,
 다음 단계의 남은 부분(`backup`, `intent`, `market`, `state`, `receipt`, `complete`), 목표까지의 단계별 목록
 (`migrations`), 백업 필요 여부, 가지고 갈 승격(`carried_operations`)과 막는 작업(`blocking_operations`)을
 보고하고 아무것도 쓰지 않는다. 실행은 한 버전씩 올리며, 단계마다 실행 중인 run이나 PREPARED 작업이
@@ -394,8 +394,10 @@ aas db compact --to /path/to/new-root
 담는다. 목표 이상인 설치본에는 아무것도 하지 않는다. 중간에 멈춘 설치본은 다른 명령으로 열리지 않으며,
 같은 명령을 다시 실행하면 그 단계의 백업 없이 남은 부분부터 끝낸다. 한 단계를 끝내고 다음 단계의 백업
 도중 멈췄으면 다음 단계는 새 `--backup-output`을 요구한다. `aas db recover`와 `aas db quarantine`은 이
-작업을 다루지 않는다. COMMIT 전에 멈춘 승격 intent(marker·행·flag·catalog가 없고 보존 요청·명세와
-빠짐없고 준비된 계획의 불변식을 지키는 manifest가 intent·parent와 맞는 것)만 PREPARED인 채로 단계를 지나고, 그 단계의 백업에 그대로 담긴다. 그 백업은 migration의
+작업을 다루지 않는다. COMMIT 전에 멈춘 승격 intent 가운데 `aas db recover`가 게시할 것(marker·행·flag·
+catalog가 없고, 보존 증거가 intent의 것이며, 보존 명세를 다시 계획하면 intent의 manifest가 그대로 나오는
+것)만 PREPARED인 채로 단계를 지나고, 그 단계의 백업에 그대로 담긴다. `--plan`은 그런 승격마다 다시 계획해
+증명했다고 적는다. 그 재계획이 compute lease 안에서 돌 수 없으면 `ComputeResourceError`로 멈춘다. 그 백업은 migration의
 rollback snapshot이며 복구를 마친 백업으로 쓰지 않는다. migration 뒤 `aas db recover`가 그 승격을
 게시한다. 규칙은 [데이터 수직 계약의 스키마 v2](design/data-vertical.md#스키마-v2)가 소유한다.
 

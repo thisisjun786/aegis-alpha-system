@@ -60,6 +60,8 @@ _FIRST_STEP = 2
 _HASH_FORMAT = "aas-canonical-json-sha256-v1"
 _REQUEST_SCHEMA = "aas-core-schema-migrate-v1"
 _STEPS = ("backup", "intent", "market", "state", "receipt", "complete")
+# How a plan report says a carried promotion was admitted: by recovery's own test.
+_CARRY_PROOF = "replanned: the retained spec recomputes the intent's manifest"
 
 
 class CoreSchemaError(ValueError):
@@ -308,29 +310,41 @@ def _receipts(workspace: Workspace) -> dict[str, list[list[object]]]:
 
 
 def _pending_operations(
-    workspace: Workspace, *, excluding: str | None
-) -> tuple[list[str], list[str]]:
+    workspace: Workspace, *, excluding: str | None, budget: ComputeBudget | None
+) -> tuple[list[dict[str, object]], list[str]]:
     """``(carried, blocking)``: the other prepared operations, and the ones that stop a step.
 
-    A migration carries only an untouched promotion intent, which keeps its intent and
-    retained evidence and is published by ``aas db recover`` afterwards. Every other
-    prepared operation, including a promotion whose generation is committed, blocks.
+    A migration carries only a promotion intent ``aas db recover`` would publish after it,
+    by recovery's own test (``untouched_promotion_refusal``): nothing of it reached the
+    market or the catalog, and its retained spec, planned again within ``budget``,
+    recomputes its manifest exactly. It keeps its intent and retained evidence. Every
+    other prepared operation, including a promotion whose generation is committed,
+    blocks; a plan that does not fit ``budget`` is ``ComputeResourceError``.
     """
     from aegis_alpha.storage.promotion.engine import (  # noqa: PLC0415 -- promotion owner
         untouched_promotion_refusal,
     )
 
-    carried: list[str] = []
+    carried: list[dict[str, object]] = []
     blocking: list[str] = []
-    for row in workspace.state.execute(
-        "SELECT operation_id,kind,request_hash,target_id,expected_parent,payload_hash,phase "
-        "FROM storage_operations WHERE phase='PREPARED' AND operation_id IS NOT ? "
-        "ORDER BY operation_id",
-        (excluding,),
-    ).fetchall():
-        operation = dict(row)
-        refusal = untouched_promotion_refusal(workspace, operation)
-        (blocking if refusal else carried).append(str(operation["operation_id"]))
+    try:
+        for row in workspace.state.execute(
+            "SELECT operation_id,kind,request_hash,target_id,expected_parent,payload_hash,phase "
+            "FROM storage_operations WHERE phase='PREPARED' AND operation_id IS NOT ? "
+            "ORDER BY operation_id",
+            (excluding,),
+        ).fetchall():
+            operation = dict(row)
+            if untouched_promotion_refusal(workspace, operation, budget=budget) is None:
+                carried.append(operation)
+            else:
+                blocking.append(str(operation["operation_id"]))
+    finally:
+        # A plan lowers the connection to its budget's share; the market step applies the
+        # lease's own share right before its transaction, from the installation's limits.
+        resources = workspace.market_resources
+        workspace.market.execute("SET threads = ?", [resources["threads"]])
+        workspace.market.execute("SET memory_limit = ?", [resources["memory_limit"]])
     return carried, blocking
 
 
@@ -344,15 +358,18 @@ def _prepared_step(status: CoreSchemaStatus) -> str | None:
     return status.migration_operation if status.state == "incomplete" else None
 
 
-def plan_core_migration(home: Path, *, to_version: int) -> dict[str, object]:
+def plan_core_migration(
+    home: Path, *, to_version: int, budget: ComputeBudget | None = None
+) -> dict[str, object]:
     """Report the installation's versions, recognised checksums and remaining steps.
 
     The stores are opened read-only and nothing is written, so this is safe beside a
     live installation's readers. An unrecognised checksum or version is refused here
     exactly as the migration would refuse it. ``steps`` is the next step's remaining
-    parts and ``migrations`` lists every step up to ``to_version``; ``carried_operations``
-    are the prepared promotions a step's backup would hold pending, and
-    ``blocking_operations`` the prepared operations that refuse it.
+    parts and ``migrations`` lists every step up to ``to_version``. ``carried_operations``
+    names each prepared promotion a step's backup would hold pending, proven by planning
+    its retained spec again within ``budget`` (``proof``), and ``blocking_operations``
+    the prepared operations that refuse it.
     """
     from aegis_alpha.storage.workspace import open_workspace  # noqa: PLC0415
 
@@ -360,7 +377,9 @@ def plan_core_migration(home: Path, *, to_version: int) -> dict[str, object]:
     with open_workspace(home, migrating=True, require_strategies=False) as workspace:
         status = inspect_core_schema(workspace)
         pending = _pending_steps(status, to_version)
-        carried, blocking = _pending_operations(workspace, excluding=_prepared_step(status))
+        carried, blocking = _pending_operations(
+            workspace, excluding=_prepared_step(status), budget=budget
+        )
         migrations = [
             {
                 "operation_id": step_operation(step),
@@ -380,25 +399,36 @@ def plan_core_migration(home: Path, *, to_version: int) -> dict[str, object]:
             "steps": migrations[0]["steps"] if migrations else [],
             "migrations": migrations,
             "backup_required": any(not prepared for _, prepared in pending),
-            "carried_operations": carried,
+            "carried_operations": [
+                {
+                    "operation_id": operation["operation_id"],
+                    "kind": operation["kind"],
+                    "generation_id": operation["target_id"],
+                    "manifest_sha256": operation["payload_hash"],
+                    "proof": _CARRY_PROOF,
+                }
+                for operation in carried
+            ],
             "blocking_operations": blocking,
             "running_analyses": _running(workspace),
         }
 
 
-def _quiet(workspace: Workspace, *, excluding: str | None) -> list[str]:
+def _quiet(
+    workspace: Workspace, *, excluding: str | None, budget: ComputeBudget | None
+) -> list[str]:
     """Refuse to migrate while anything else could be writing either store.
 
-    Returns the untouched promotion intents the step carries through its backup.
+    Returns the promotion intents the step carries through its backup.
     """
-    carried, blocking = _pending_operations(workspace, excluding=excluding)
+    carried, blocking = _pending_operations(workspace, excluding=excluding, budget=budget)
     if _running(workspace) or blocking:
         raise CoreSchemaError(
             "core_schema_busy",
             "stop running analyses and recover prepared operations first"
             + (" (" + ", ".join(blocking) + ")" if blocking else ""),
         )
-    return carried
+    return [str(operation["operation_id"]) for operation in carried]
 
 
 def _upgrade_market(workspace: Workspace, budget: ComputeBudget | None, step: int) -> None:
@@ -514,12 +544,17 @@ def migrate_core_schema(
         targets = _backup_targets(
             workspace, backup_output, [step for step, prepared in pending if not prepared]
         )
-        _quiet(workspace, excluding=_prepared_step(status))
+        excluding = _prepared_step(status)
+        carried = _quiet(workspace, excluding=excluding, budget=budget)
+        # Planning a carried promotion again is the costly part of the check, so it is
+        # repeated only when a step landed, or a prepared step was left out, since.
+        proven = excluding is None
         performed: list[dict[str, object]] = []
         for step, prepared in pending:
             backup_root = None
             if not prepared:
-                carried = _quiet(workspace, excluding=None)
+                if not proven:
+                    carried = _quiet(workspace, excluding=None, budget=budget)
                 backup = backup_workspace(
                     workspace, targets[step], budget=budget, deep=deep, carry=carried
                 )
@@ -534,6 +569,7 @@ def migrate_core_schema(
                     payload_hash=manifest_sha256(Path(backup_root)),
                 )
             _finish(workspace, step, budget)
+            proven = False
             performed.append({"step": step, "resumed": prepared, "backup_root": backup_root})
         return _report(workspace, performed=performed)
 

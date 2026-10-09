@@ -13,11 +13,12 @@ import os
 import sqlite3
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import date
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
+import duckdb
 import pytest
 
 from aegis_alpha.application.cutover import backup_check, read_backup
@@ -37,8 +38,10 @@ from aegis_alpha.storage.migration import (
 )
 from aegis_alpha.storage.promotion import engine, formats
 from aegis_alpha.storage.promotion.engine import promote
+from aegis_alpha.storage.promotion.spec import PromotionSpec, parse_spec
 from aegis_alpha.storage.publication import recover_operations
 from aegis_alpha.storage.raw import put_raw
+from aegis_alpha.storage.source_reader import resolve_source
 from aegis_alpha.storage.state import get_operation, prepare_operation
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace
@@ -64,9 +67,6 @@ from tests.storage.test_migration import (
     v1_installation,
     versions,
 )
-
-if TYPE_CHECKING:
-    import duckdb
 
 _KILLED = 137
 _ROOT = Path(__file__).resolve().parents[2]
@@ -157,7 +157,12 @@ def snapshot_operation(root: Path, operation_id: str) -> dict[str, object]:
 
 
 def pending_promotion(
-    root: Path, *, crash: str = "commit", parented: bool = False, partial: bool = False
+    root: Path,
+    *,
+    crash: str = "commit",
+    parented: bool = False,
+    partial: bool = False,
+    moved: bool = False,
 ) -> tuple[Path, dict[str, object]]:
     """A v2 installation whose one promotion stopped where the rehearsal's did.
 
@@ -167,7 +172,8 @@ def pending_promotion(
     ``parented`` first publishes a generation the failed one names as its parent;
     ``partial`` also makes the failed one a bulk response of provider-reported partial
     rows, so its manifest records a ``partition_row_count`` check against that parent.
-    Returns the home and the plan computed before the failure.
+    ``moved`` then publishes another child of that parent, so the parent is no longer
+    the head. Returns the home and the plan computed before the failure.
     """
     home = root / "home"
     with pytest.MonkeyPatch.context() as patch:
@@ -223,7 +229,37 @@ def pending_promotion(
                 patch.setattr(engine, "_complete", killed)
             with pytest.raises(ComputeResourceError if crash == "commit" else RuntimeError):
                 promote(admitted, *document, apply=True)
+        if moved:
+            # The intent is set aside only so promote admits another request, then
+            # recorded again exactly as it was.
+            failed = cast(
+                "dict[str, object]", get_operation(admitted.state, str(planned["operation_id"]))
+            )
+            _delete_operation(admitted, str(failed["operation_id"]))
+            other = add_source(
+                admitted, [bar("AAA.KO", _DAY, 102.0, retrieved=at("2025-01-12T00:00:00"))], tag="c"
+            )
+            promote(admitted, *spec([other], identity, parent=parent), apply=True)
+            _prepare_again(admitted, failed)
     return home, planned
+
+
+def _delete_operation(admitted: workspace.Workspace, operation_id: str) -> None:
+    admitted.state.execute("DELETE FROM storage_operations WHERE operation_id=?", (operation_id,))
+    admitted.state.commit()
+
+
+def _prepare_again(admitted: workspace.Workspace, intent: dict[str, object]) -> None:
+    prepare_operation(
+        admitted.state,
+        operation_id=str(intent["operation_id"]),
+        kind=str(intent["kind"]),
+        request_hash=str(intent["request_hash"]),
+        target_id=str(intent["target_id"]),
+        expected_parent=cast("str | None", intent["expected_parent"]),
+        payload_hash=str(intent["payload_hash"]),
+        created_at_us=cast("int", intent["created_at_us"]),
+    )
 
 
 def test_step_identities_are_frozen_and_outlive_later_steps(synthetic: int) -> None:
@@ -432,7 +468,17 @@ def test_an_untouched_promotion_is_carried_through_a_step_and_then_recovered(
         backup(home, tmp_path / "ordinary")
     assert not (tmp_path / "ordinary").exists()
     plan = plan_core_migration(home, to_version=synthetic)
-    assert (plan["carried_operations"], plan["blocking_operations"]) == ([operation_id], [])
+    # The plan names the carried intent and says it was proven by planning it again.
+    assert plan["carried_operations"] == [
+        {
+            "operation_id": operation_id,
+            "kind": "promotion",
+            "generation_id": generation_id,
+            "manifest_sha256": intent["payload_hash"],
+            "proof": "replanned: the retained spec recomputes the intent's manifest",
+        }
+    ]
+    assert plan["blocking_operations"] == []
     snapshot = tmp_path / "snapshot"
     report = migrate_core_schema(home, to_version=synthetic, backup_output=snapshot)
     assert (report["state"], report["pending_operations"]) == ("current", [operation_id])
@@ -448,16 +494,25 @@ def test_an_untouched_promotion_is_carried_through_a_step_and_then_recovered(
         assert get_operation(admitted.state, operation_id) == intent
         assert recover_operations(admitted)["recovered"] == [operation_id]
         marker = marker_for(admitted.market, generation_id)
-        # Recovery published exactly what was planned before the failed COMMIT.
+        # Recovery published exactly what was planned before the failed COMMIT, under
+        # the manifest the intent recorded then.
         expected = cast("dict[str, object]", planned["marker"])
-        for key in ("generation_id", "request_hash", "delta_hash", "chain_hash", "row_count"):
+        keys = ("generation_id", "request_hash", "delta_hash", "chain_hash", "row_count")
+        for key in (*keys, "version", "sequence", "parent_id"):
             assert marker[key] == expected[key]
+        retained = json.loads(engine._read_raw(admitted, str(intent["payload_hash"])))  # noqa: SLF001
+        assert [retained[key] for key in keys] == [expected[key] for key in keys]
         recovered = get_operation(admitted.state, operation_id)
         assert recovered is not None
         assert (recovered["phase"], recovered["payload_hash"]) == (
             "COMPLETED",
             intent["payload_hash"],
         )
+        cataloged = admitted.state.execute(
+            "SELECT chain_hash, manifest_hash FROM dataset_versions WHERE generation_id=?",
+            (generation_id,),
+        ).fetchone()
+        assert tuple(cataloged) == (expected["chain_hash"], expected["request_hash"])
         assert verify_workspace(admitted)["pending_operations"] == 0
         # The snapshot is no recovered installation's backup: the cutover check sees the
         # promotion and the migration completed after it.
@@ -499,6 +554,10 @@ def _committed(home: Path, operation_id: str) -> None:
     del home, operation_id  # the fixture's own crash left the generation committed
 
 
+def _untouched(home: Path, operation_id: str) -> None:
+    del home, operation_id  # the fixture's own state is the case
+
+
 def _manifest_gone(home: Path, operation_id: str) -> None:
     intent = intents_any(home, operation_id)
     digest = str(intent["payload_hash"])
@@ -516,13 +575,26 @@ def intents_any(home: Path, operation_id: str) -> dict[str, object]:
         return cast("dict[str, object]", get_operation(admitted.state, operation_id))
 
 
+def _intent_rewritten(**fields: object) -> Callable[[Path, str], None]:
+    """Record the intent again with ``fields`` changed and everything else as it was."""
+
+    def alter(home: Path, operation_id: str) -> None:
+        with open_workspace(home, writable=True) as admitted:
+            intent = cast("dict[str, object]", get_operation(admitted.state, operation_id))
+            _delete_operation(admitted, operation_id)
+            _prepare_again(admitted, intent | fields)
+
+    return alter
+
+
 def _manifest_rewritten(
     change: Callable[[dict[str, object]], dict[str, object]],
 ) -> Callable[[Path, str], None]:
     """Retain a changed manifest and point a fresh intent of the same request at it.
 
-    The manifest is content-addressed and the intent names it, so only evidence that
-    is itself contradictory or incomplete is left for the carry check to refuse.
+    The manifest is content-addressed and the intent names it, so its bytes are
+    consistent with the intent; only planning the retained spec again can tell that no
+    plan records it.
     """
 
     def alter(home: Path, operation_id: str) -> None:
@@ -530,19 +602,8 @@ def _manifest_rewritten(
             intent = cast("dict[str, object]", get_operation(admitted.state, operation_id))
             body = json.loads(engine._read_raw(admitted, str(intent["payload_hash"])))  # noqa: SLF001
             _, digest, _ = put_raw(admitted.paths.raw, formats.canonical(change(body)))
-            admitted.state.execute(
-                "DELETE FROM storage_operations WHERE operation_id=?", (operation_id,)
-            )
-            admitted.state.commit()
-            prepare_operation(
-                admitted.state,
-                operation_id=operation_id,
-                kind=str(intent["kind"]),
-                request_hash=str(intent["request_hash"]),
-                target_id=str(intent["target_id"]),
-                expected_parent=cast("str | None", intent["expected_parent"]),
-                payload_hash=digest,
-            )
+            _delete_operation(admitted, operation_id)
+            _prepare_again(admitted, intent | {"payload_hash": digest})
 
     return alter
 
@@ -560,120 +621,84 @@ def _uncounted(body: dict[str, object]) -> dict[str, object]:
     return body | {"row_count": cast("int", body["row_count"]) + 1}
 
 
-def _unlinked(body: dict[str, object]) -> dict[str, object]:
-    return body | {"chain_hash": "0" * 64}
-
-
-def _out_of_sequence(body: dict[str, object]) -> dict[str, object]:
-    return body | {"sequence": 2, "version": "2"}
-
-
-def _unflagged(body: dict[str, object]) -> dict[str, object]:
-    return body | {"flags": {"rows": 0}}
-
-
-def _impossible_operation(body: dict[str, object]) -> dict[str, object]:
-    return body | {"operations": {"NOT_A_MARKET_OP": body["row_count"]}}
-
-
-def _boolean_sequence(body: dict[str, object]) -> dict[str, object]:
-    # True equals 1, the sequence a parentless generation has.
-    return body | {"sequence": True}
+def _restated(body: dict[str, object]) -> dict[str, object]:
+    # Every field keeps its type and agrees with every other; only the plan disagrees.
+    return body | {"unchanged": cast("int", body["unchanged"]) + 1}
 
 
 def _refused_rows(body: dict[str, object]) -> dict[str, object]:
-    # A plan that refused rows is never prepared.
     return body | {"rows": {"refused_required": 1}}
 
 
-def _partition(
-    change: Callable[[dict[str, object]], object],
-) -> Callable[[dict[str, object]], dict[str, object]]:
-    def rewrite(body: dict[str, object]) -> dict[str, object]:
-        check = cast("dict[str, object]", body["partition_row_count"])
-        return body | {"partition_row_count": change(check)}
-
-    return rewrite
+def _restated_partition(body: dict[str, object]) -> dict[str, object]:
+    check = cast("dict[str, object]", body["partition_row_count"])
+    return body | {"partition_row_count": check | {"result": "no_reference"}}
 
 
-def _first_date(**fields: object) -> Callable[[dict[str, object]], object]:
-    def change(check: dict[str, object]) -> object:
-        first, *rest = cast("list[dict[str, object]]", check["dates"])
-        return check | {"dates": [first | fields, *rest]}
-
-    return change
-
-
-def _cataloged_partition(home: Path, operation_id: str) -> None:
-    """The partition check row a catalog completion writes, without its other rows."""
+def _source_changed(home: Path, operation_id: str) -> None:
+    """Change a value of the pinned source table, keeping its row count."""
     with open_workspace(home, writable=True) as admitted:
         intent = cast("dict[str, object]", get_operation(admitted.state, operation_id))
-        rule = f"{intent['target_id']}/partition_row_count"
-        check_id = "qc-" + hashlib.sha256(rule.encode()).hexdigest()
-        admitted.state.execute(
-            "INSERT INTO quality_checks(check_id, dataset_id, version, rule_id, rule_version, "
-            "result, reason, checked_at_us) VALUES (?,?,?,?,?,?,?,?)",
-            (check_id, "prices.kr.eodhd", "1", "partition_row_count", "1", "no_reference", "[]", 0),
-        )
-        admitted.state.commit()
+        manifest = json.loads(engine._read_raw(admitted, str(intent["payload_hash"])))  # noqa: SLF001
+        spec_sha = str(manifest["spec_sha256"])
+        retained = parse_spec(engine._read_raw(admitted, spec_sha), spec_sha)  # noqa: SLF001
+        target = resolve_source(admitted, retained.sources[0])["target"]
+        admitted.market.execute(f'UPDATE "{target}" SET close = close + 1')  # noqa: S608
+
+
+def _cataloged(rule: str) -> Callable[[Path, str], None]:
+    """One quality check a catalog completion writes, without its other rows."""
+
+    def alter(home: Path, operation_id: str) -> None:
+        with open_workspace(home, writable=True) as admitted:
+            intent = cast("dict[str, object]", get_operation(admitted.state, operation_id))
+            check_id = "qc-" + hashlib.sha256(f"{intent['target_id']}/{rule}".encode()).hexdigest()
+            admitted.state.execute(
+                "INSERT INTO quality_checks(check_id, dataset_id, version, rule_id, "
+                "rule_version, result, reason, checked_at_us) VALUES (?,?,?,?,?,?,?,?)",
+                (check_id, "prices.kr.eodhd", "1", rule, "1", "recorded", "[]", 0),
+            )
+            admitted.state.commit()
+
+    return alter
+
+
+_REPLANNED = "no longer plans its manifest"
 
 
 @pytest.mark.parametrize(
-    ("crash", "alter", "reason"),
+    ("fixture", "alter", "reason"),
     [
+        # What reached the market or the catalog.
         ("catalog", _committed, "committed"),
+        # A quality check needs a catalog version, so these follow a cataloged parent.
+        ("partial", _cataloged("promotion"), "cataloged"),
+        ("partial", _cataloged("partition_row_count"), "cataloged"),
+        # Evidence that is not the intent's own.
         ("commit", _manifest_gone, "absent from raw"),
         ("commit", _request_altered, "does not match its address"),
-        ("commit", _manifest_rewritten(_identity_only), "lacks or adds fields"),
-        ("commit", _manifest_rewritten(_other_dataset), "does not match its spec"),
-        ("commit", _manifest_rewritten(_uncounted), "malformed counts"),
-        ("commit", _manifest_rewritten(_unflagged), "malformed counts"),
-        ("commit", _manifest_rewritten(_unlinked), "chain hash"),
-        ("commit", _manifest_rewritten(_out_of_sequence), "does not follow its parent"),
-        ("commit", _manifest_rewritten(_impossible_operation), "malformed counts"),
-        ("commit", _manifest_rewritten(_boolean_sequence), "malformed counts"),
-        ("commit", _manifest_rewritten(_refused_rows), "malformed counts"),
-        ("partial", _cataloged_partition, "cataloged"),
-        ("partial", _manifest_rewritten(_partition(lambda c: c | {"dates": [None]})), "partition"),
-        ("partial", _manifest_rewritten(_partition(lambda c: c | {"dates": []})), "partition"),
-        (
-            "partial",
-            _manifest_rewritten(_partition(lambda c: c | {"result": "no_reference"})),
-            "partition",
-        ),
-        (
-            "partial",
-            _manifest_rewritten(_partition(_first_date(session_date="2025-1-2"))),
-            "partition",
-        ),
-        ("partial", _manifest_rewritten(_partition(_first_date(resolved=2))), "partition"),
-        ("partial", _manifest_rewritten(_partition(_first_date(rows=True))), "partition"),
-        ("partial", _manifest_rewritten(_partition(_first_date(extra=1))), "partition"),
-        (
-            "partial",
-            _manifest_rewritten(_partition(_first_date(reference_generation="prm-" + "0" * 64))),
-            "partition",
-        ),
-        (
-            "partial",
-            _manifest_rewritten(_partition(_first_date(reference_date="2025-01-03"))),
-            "partition",
-        ),
-        (
-            "partial",
-            _manifest_rewritten(
-                _partition(lambda c: c | {"dates": [*cast("list[object]", c["dates"])] * 2})
-            ),
-            "partition",
-        ),
+        ("commit", _intent_rewritten(expected_parent="prm-" + "0" * 64), "parent is not its"),
+        # Manifests consistent with the intent that no plan of its spec records.
+        ("commit", _manifest_rewritten(_identity_only), _REPLANNED),
+        ("commit", _manifest_rewritten(_other_dataset), _REPLANNED),
+        ("commit", _manifest_rewritten(_uncounted), _REPLANNED),
+        ("commit", _manifest_rewritten(_restated), _REPLANNED),
+        ("commit", _manifest_rewritten(_refused_rows), _REPLANNED),
+        ("partial", _manifest_rewritten(_restated_partition), _REPLANNED),
+        # A plan that no longer reproduces the intent: a moved head, a changed source.
+        ("moved", _untouched, _REPLANNED),
+        ("commit", _source_changed, "differs from the pin"),
     ],
 )
-def test_only_an_untouched_promotion_is_carried(
-    tmp_path: Path, synthetic: int, crash: str, alter: Callable[[Path, str], None], reason: str
+def test_only_a_promotion_recovery_would_publish_is_carried(
+    tmp_path: Path, synthetic: int, fixture: str, alter: Callable[[Path, str], None], reason: str
 ) -> None:
-    # ``partial`` is a failed COMMIT whose manifest records a partition check.
     home, planned = pending_promotion(
-        tmp_path, crash="commit" if crash == "partial" else crash, partial=crash == "partial"
+        tmp_path,
+        crash="catalog" if fixture == "catalog" else "commit",
+        parented=fixture == "moved",
+        partial=fixture == "partial",
+        moved=fixture == "moved",
     )
     operation_id = str(planned["operation_id"])
     alter(home, operation_id)
@@ -684,14 +709,20 @@ def test_only_an_untouched_promotion_is_carried(
     assert not (tmp_path / "snapshot").exists()
     assert versions(home) == {"state": 2, "market": 2}
     with open_workspace(home, writable=True) as admitted:
-        refusal = engine.untouched_promotion_refusal(
-            admitted, cast("dict[str, object]", get_operation(admitted.state, operation_id))
-        )
+        intent = cast("dict[str, object]", get_operation(admitted.state, operation_id))
+        refusal = engine.untouched_promotion_refusal(admitted, intent)
         assert refusal is not None
         assert reason in refusal
+        # The check leaves no plan behind on the connection.
+        assert admitted.market.execute(
+            "SELECT count(*) FROM duckdb_tables() WHERE temporary"
+        ).fetchone() == (0,)
         # Naming the operation does not admit it: the backup checks it again itself.
         with pytest.raises(ValueError, match="recovered operations"):
             backup_workspace(admitted, tmp_path / "named", carry=[operation_id])
+        if reason == _REPLANNED:
+            # Recovery, by the same test, would not publish it either.
+            assert engine.recover_promotion(admitted, intent) is False
     assert not (tmp_path / "named").exists()
 
 
@@ -709,11 +740,93 @@ def test_a_promotion_intent_of_another_request_blocks(tmp_path: Path, synthetic:
             payload_hash=_HASH,
         )
     plan = plan_core_migration(home, to_version=synthetic)
-    assert plan["carried_operations"] == [planned["operation_id"]]
+    carried = cast("list[dict[str, object]]", plan["carried_operations"])
+    assert [entry["operation_id"] for entry in carried] == [planned["operation_id"]]
     assert plan["blocking_operations"] == ["promotion:" + "d" * 64]
     with pytest.raises(CoreSchemaError, match="promotion:d"):
         migrate_core_schema(home, to_version=synthetic, backup_output=tmp_path / "snapshot")
     assert not (tmp_path / "snapshot").exists()
+
+
+@pytest.mark.parametrize("kind", ["market_publish", "source_import", "run_commit", "source-retire"])
+def test_a_prepared_operation_of_another_kind_blocks(
+    tmp_path: Path, synthetic: int, kind: str
+) -> None:
+    home, planned = pending_promotion(tmp_path)
+    with open_workspace(home, writable=True) as admitted:
+        carried = cast(
+            "dict[str, object]", get_operation(admitted.state, str(planned["operation_id"]))
+        )
+        # Even one naming the carried promotion's own request, generation and manifest.
+        other = carried | {"operation_id": f"{kind}:other", "kind": kind}
+        _prepare_again(admitted, other)
+        assert engine.untouched_promotion_refusal(admitted, other) == "not a prepared promotion"
+    plan = plan_core_migration(home, to_version=synthetic)
+    assert plan["blocking_operations"] == [f"{kind}:other"]
+    with pytest.raises(CoreSchemaError, match="core_schema_busy"):
+        migrate_core_schema(home, to_version=synthetic, backup_output=tmp_path / "snapshot")
+    assert not (tmp_path / "snapshot").exists()
+    assert versions(home) == {"state": 2, "market": 2}
+
+
+def test_recovery_and_the_carry_share_one_replan(
+    tmp_path: Path, synthetic: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, planned = pending_promotion(tmp_path)
+    operation_id = str(planned["operation_id"])
+    shared = engine._replanned  # noqa: SLF001
+    calls: list[str] = []
+
+    def refusing(
+        admitted: workspace.Workspace,
+        operation: Mapping[str, object],
+        retained: PromotionSpec,
+        budget: ComputeBudget,
+    ) -> None:
+        calls.append(str(operation["operation_id"]))
+        assert shared(admitted, operation, retained, budget) is not None
+
+    with monkeypatch.context() as patch:
+        patch.setattr(engine, "_replanned", refusing)
+        with open_workspace(home, writable=True) as admitted:
+            intent = cast("dict[str, object]", get_operation(admitted.state, operation_id))
+            # Refusing the one replan refuses both the carry and the publication.
+            assert engine.untouched_promotion_refusal(admitted, intent) == (
+                "its retained spec " + _REPLANNED
+            )
+            assert engine.recover_promotion(admitted, intent) is False
+            assert calls == [operation_id, operation_id]
+        plan = plan_core_migration(home, to_version=synthetic)
+        assert (plan["carried_operations"], plan["blocking_operations"]) == ([], [operation_id])
+    plan = plan_core_migration(home, to_version=synthetic)
+    assert plan["blocking_operations"] == []
+
+
+def test_a_replan_beyond_the_lease_refuses_the_migration(
+    tmp_path: Path, synthetic: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, planned = pending_promotion(tmp_path)
+
+    def exhausted(*_: object, **__: object) -> None:
+        raise duckdb.OutOfMemoryException("Out of Memory Error: synthetic exhaustion")
+
+    monkeypatch.setattr(engine, "plan_promotion", exhausted)
+    # Never a silent carry, and never a refusal that hides the cause.
+    with pytest.raises(ComputeResourceError, match="planning the prepared promotion again"):
+        plan_core_migration(home, to_version=synthetic)
+    with pytest.raises(ComputeResourceError, match="planning the prepared promotion again"):
+        migrate_core_schema(home, to_version=synthetic, backup_output=tmp_path / "snapshot")
+    assert not (tmp_path / "snapshot").exists()
+    assert versions(home) == {"state": 2, "market": 2}
+    with open_workspace(home, writable=True) as admitted:
+        intent = cast(
+            "dict[str, object]", get_operation(admitted.state, str(planned["operation_id"]))
+        )
+        with pytest.raises(ComputeResourceError):
+            backup_workspace(admitted, tmp_path / "named", carry=[str(intent["operation_id"])])
+        with pytest.raises(ComputeResourceError):
+            engine.recover_promotion(admitted, intent)
+        assert get_operation(admitted.state, str(intent["operation_id"])) == intent
 
 
 def test_an_evidence_read_error_refuses_the_carry(
