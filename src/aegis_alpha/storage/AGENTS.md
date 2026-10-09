@@ -41,6 +41,48 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   digests by default: a source table's recorded columns and row count, a promoted chain's links
   and leaf delta. `deep=True` (`--deep`) rehashes every source table and promoted delta; the
   report is the same in both modes. Compact always verifies the rewritten root deep.
+  Both modes also run `market_integrity.audit_market`: the core tables' catalog equals an
+  empty store of the same version (columns, types, nullability, defaults, constraints;
+  add-on and temporary tables aside), every domain's rows per generation match the
+  markers' domain and count both ways, and every quality flag names a stored revision of
+  its marker; `deep` adds domain-wide `(record_id, revision_id)` and flag key duplicates,
+  checked in passes sized from measured rows and key bytes. Each audit passes or raises.
+- `market_integrity` holds generation integrity without relying on key constraints. Both
+  writers open their publication with `begin_publication`: BEGIN, then a first write that
+  claims the store by negating `store_info.schema_version` and negating it back, so every
+  value is unchanged and the row is written (DuckDB records no write, and so no conflict,
+  for an UPDATE that sets the value already held). Of two transactions that wrote that
+  row, DuckDB lets only one commit, so a second publication on the store, from another
+  cursor, connection or thread, is refused at its claim or COMMIT (`commit_publication`)
+  with "another generation publication is open on this market store", exhausted memory
+  being classified first. DuckDB's file lock does not serialize two cursors of one
+  process. The claim lives in the transaction, so ROLLBACK or closing the connection
+  releases it, and no lock is held in Python. Both writers run their transaction through
+  `run_publication`, which rolls back on any error and once more in `finally`, so one
+  interrupt anywhere, the error handler and ROLLBACK included, leaves no claim held. A
+  connection or cursor object serves one caller at a time: two threads sharing one object
+  share its transaction, and a second BEGIN on it ends the first one's.
+  Threat model: in contract are concurrent publications in one process through the aas
+  APIs (separate cursors or connections), an interrupt or crash at any point, malformed,
+  duplicate or forged input documents, retained evidence that no longer matches, and
+  at-rest loss or corruption, which the audits detect. Out of contract is code in the same
+  process that manipulates the admitted DuckDB connection itself: creating catalog objects
+  that shadow core tables, changing `search_path`, ATTACHing other databases, sharing one
+  `DuckDBPyConnection` object across threads, or issuing DML directly against stored
+  tables. Such code can delete stored rows outright, so statements name core tables
+  unqualified and no statement defends against it on its own. Defense in depth for the
+  shadowing class is one check, `market_integrity.check_core_names`: the current database
+  is persistent, `search_path` is DuckDB's default, and no temporary or attached table and
+  no view (a registered Python object included) carries a core table's name, compared
+  without case. `begin_publication` runs it before BEGIN, so both writers and their reuse
+  of an identical generation refuse before reading or writing; the promotion's reuse
+  answer, `audit_market` and `verify_workspace` run it first.
+  `market.publish_generation` plans after the claim, as the bulk writer does.
+  Inside the transaction no row may name the generation before its insert, and after it
+  the planned count, one revision per record and no `(record_id, revision_id)` held by any
+  other generation of the domain (a scan of the whole domain, not the chain) are checked.
+  A promotion's companion also refuses repeated flag keys, flags of unstored revisions
+  and flags that differ from the manifest's count and digest before COMMIT.
 - Backup takes SQLite snapshots and closes DuckDB after checkpoint while retaining
   installation admission. Restore targets a new root; secrets are excluded. `backup.json`
   lists every `raw/` and `runs/` file, so it is read with its own bound

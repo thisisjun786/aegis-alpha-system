@@ -19,6 +19,7 @@ from aegis_alpha.storage.input_pins import (
 )
 from aegis_alpha.storage.market import generation_chain
 from aegis_alpha.storage.market_inputs import verify_sealed_publication
+from aegis_alpha.storage.market_integrity import audit_market, check_core_names
 from aegis_alpha.storage.membership_pins import (
     IdentityPin,
     UniversePin,
@@ -159,7 +160,11 @@ def verify_workspace(  # noqa: C901, PLR0912, PLR0915 -- full cross-store verifi
     its recorded columns and row count, a promoted chain by its links and its leaf
     delta. ``deep`` rehashes every source table and every promoted delta. Everything
     else is checked the same way in both modes, and the report has the same shape.
+    Both modes audit every market row's generation, domain and count and every quality
+    flag's reference; ``deep`` also refuses a revision or flag key stored twice.
     """
+    # Before anything else: every core market name resolves to the stored table.
+    check_core_names(workspace.market)
     budget = budget or ComputeBudget(Fraction(1), 512 * 1024 * 1024)
     # Every step below charges against the same non-DuckDB allowance. DuckDB's own
     # share is bounded separately by the connection limit derived from this budget.
@@ -218,6 +223,11 @@ def verify_workspace(  # noqa: C901, PLR0912, PLR0915 -- full cross-store verifi
         )
     if covered != committed:
         raise ValueError("committed publications are not covered by verified leaf chains")
+    # The rows themselves, beyond what each chain's links and digests say: the core
+    # catalog's shape, every domain's per-generation counts against the markers both
+    # ways and every flag's reference; deep adds domain-wide duplicate keys. It passes or
+    # raises, so the report keeps its shape.
+    audit_market(workspace.market, budget, deep=deep)
     for source in workspace.state.execute(
         "SELECT relative_path,byte_hash,size_bytes FROM source_files"
     ):
