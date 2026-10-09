@@ -21,6 +21,11 @@ This module publishes a staged DuckDB table instead and keeps the same contract:
   marker no longer matches fails with ``PlanChangedError``. An existing marker with
   the same generation or operation ID is returned only when its content is exactly
   the requested content, so a leftover generation is never adopted by another request.
+- The transaction (``market_integrity.run_publication``) first claims the store, before
+  the plan, so no other publication commits between the plan and COMMIT, and the
+  inserted rows pass ``market_integrity``'s checks:
+  no earlier row of the generation, the planned count, one revision per record, and no
+  ``(record_id, revision_id)`` any other generation of the domain already holds.
 - Memory follows decision 0016: before any row is fetched, an SQL aggregate bounds
   the widest row, and each batch is sized so that its charge fits the caller's
   allocation. A row that cannot fit raises ``ComputeResourceError``. DuckDB's own
@@ -49,6 +54,11 @@ from aegis_alpha.storage.market import (
     record_identity,
     rollback,
     rowset_schema,
+)
+from aegis_alpha.storage.market_integrity import (
+    check_inserted_generation,
+    check_new_generation,
+    run_publication,
 )
 from aegis_alpha.storage.market_schema import (
     COMMON,
@@ -179,23 +189,30 @@ def publish_generation_bulk(
     recomputed marker must equal it, so what commits is what was reviewed.
     ``companion`` runs inside the same transaction after a new generation's rows are
     inserted, so rows that belong to the generation (its quality flags) commit or roll
-    back with its marker. It does not run when an identical generation is reused.
+    back with its marker. It does not run when an identical generation is reused. An
+    error or one interrupt at any point rolls the transaction back.
     """
+
+    def publish() -> BulkPlan:
+        current = _plan(connection, request, budget)
+        _check_reviewed(plan, current)
+        if not current.reused:
+            check_new_generation(connection, request.generation_id)
+            _insert(connection, request, current)
+            check_inserted_generation(
+                connection,
+                request.domain,
+                request.generation_id,
+                int(str(current.marker["row_count"])),
+            )
+            if not _is_table(connection, request.staged):
+                _check_stored(connection, request, budget)
+            if companion is not None:
+                companion(connection)
+        return current
+
     with budgeted(connection, budget, _WORK):
-        _ = connection.execute("BEGIN TRANSACTION")
-        try:
-            current = _plan(connection, request, budget)
-            _check_reviewed(plan, current)
-            if not current.reused:
-                _insert(connection, request, current)
-                if not _is_table(connection, request.staged):
-                    _check_stored(connection, request, budget)
-                if companion is not None:
-                    companion(connection)
-            _ = connection.execute("COMMIT")
-        except BaseException:
-            rollback(connection)
-            raise
+        current = run_publication(connection, publish)
     return dict(current.marker)
 
 
@@ -394,12 +411,6 @@ def _insert(connection: duckdb.DuckDBPyConnection, request: BulkRequest, plan: B
         f"INSERT INTO {_quote(request.domain)} ({target}) SELECT {selected} FROM {staged}",  # noqa: S608 -- code-owned schema and validated identifier
         [request.generation_id],
     )
-    stored = connection.execute(
-        f"SELECT count(*) FROM {_quote(request.domain)} WHERE generation_id=?",  # noqa: S608 -- code-owned schema
-        [request.generation_id],
-    ).fetchone()
-    if stored is None or stored[0] != marker["row_count"]:
-        raise ValueError("bulk generation stored a different row count than it planned")
 
 
 def _quote(name: str) -> str:

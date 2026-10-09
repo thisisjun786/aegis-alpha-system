@@ -47,6 +47,7 @@ from aegis_alpha.storage.market import (
     market_version,
     record_identity,
 )
+from aegis_alpha.storage.market_integrity import check_core_names, check_generation_flags
 from aegis_alpha.storage.market_schema import DOMAIN_VERSIONS, DOMAINS, NATURAL_KEYS
 from aegis_alpha.storage.membership_pins import (
     IdentityPin,
@@ -1702,7 +1703,11 @@ def _existing(
     apply: bool,
     budget: ComputeBudget,
 ) -> dict[str, object]:
-    """The answer for a request that already has an intent: reuse, resume or refuse."""
+    """The answer for a request that already has an intent: reuse, resume or refuse.
+
+    ``check_core_names`` runs first, so the reuse answer never verifies a stand-in table.
+    """
+    check_core_names(workspace.market)
     if operation["phase"] == "QUARANTINED":
         raise ValueError("this promotion request is quarantined")
     if operation["phase"] == "PREPARED" and not recover_promotion(
@@ -1729,6 +1734,7 @@ def _publish(workspace: Workspace, plan: PromotionPlan, budget: ComputeBudget) -
         payload_hash=manifest_sha,
     )
     generation_id = plan.generation_id
+    flags = cast("dict[str, object]", json.loads(plan.manifest)["flags"])
 
     def companion(connection: duckdb.DuckDBPyConnection) -> None:
         connection.execute(
@@ -1736,12 +1742,37 @@ def _publish(workspace: Workspace, plan: PromotionPlan, budget: ComputeBudget) -
             f"flag, detail FROM {_t('flags')}",
             [generation_id],
         )
+        _gate_flags(connection, plan.spec.domain, generation_id, flags, budget)
 
     marker = publish_generation_bulk(
         workspace.market, _bulk_request(plan), budget=budget, plan=plan.bulk, companion=companion
     )
     _complete(workspace, operation, plan.spec, json.loads(plan.manifest), budget)
     return marker
+
+
+def _gate_flags(
+    market: duckdb.DuckDBPyConnection,
+    domain: str,
+    generation_id: str,
+    flags: Mapping[str, object],
+    budget: ComputeBudget,
+) -> None:
+    """Before COMMIT: unique flag keys, no orphan revision, and the manifest's count and digest.
+
+    The temp flags table can change between planning and publication, so only a check
+    inside the publication transaction refuses what the manifest does not record.
+    ``_check_flags`` repeats the comparison after COMMIT.
+    """
+    check_generation_flags(market, domain, generation_id)
+    digest, rows = flags_digest(
+        market,
+        "SELECT * FROM quality_flags WHERE generation_id = ?",
+        [generation_id],
+        budget,
+    )
+    if digest != flags["rowset"] or rows != flags["rows"]:
+        raise ValueError("quality flags differ from the promotion manifest")
 
 
 def _check_flags(

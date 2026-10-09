@@ -607,42 +607,65 @@ def publish_generation(  # noqa: PLR0913 -- exact publication pins
     domain: str,
     rows: list[dict[str, object]],
 ) -> dict[str, object]:
-    marker, normalized = plan_generation(
-        connection,
-        dataset_id=dataset_id,
-        version=version,
-        generation_id=generation_id,
-        operation_id=operation_id,
-        request_hash=request_hash,
-        parent_id=parent_id,
-        domain=domain,
-        rows=rows,
+    """Plan and commit one generation from Python rows in one transaction.
+
+    The transaction (``market_integrity.run_publication``) first claims this store, the
+    plan is made after the claim, and the inserted rows pass the shared integrity checks
+    before COMMIT, so no other publication can commit between the parent check and this
+    one's COMMIT. An error or one interrupt at any point rolls the transaction back.
+    """
+    from aegis_alpha.storage.market_integrity import (  # noqa: PLC0415 -- it imports this module
+        check_inserted_generation,
+        run_publication,
     )
-    if connection.execute(
-        "SELECT 1 FROM market_generations WHERE generation_id=?", [generation_id]
-    ).fetchone():
+
+    def publish() -> dict[str, object]:
+        marker, normalized = plan_generation(
+            connection,
+            dataset_id=dataset_id,
+            version=version,
+            generation_id=generation_id,
+            operation_id=operation_id,
+            request_hash=request_hash,
+            parent_id=parent_id,
+            domain=domain,
+            rows=rows,
+        )
+        if not connection.execute(
+            "SELECT 1 FROM market_generations WHERE generation_id=?", [generation_id]
+        ).fetchone():
+            _insert_rows(connection, marker, domain, normalized)
+            check_inserted_generation(connection, domain, generation_id, len(normalized))
         return marker
+
+    return run_publication(connection, publish)
+
+
+def _insert_rows(
+    connection: duckdb.DuckDBPyConnection,
+    marker: Mapping[str, object],
+    domain: str,
+    normalized: list[dict[str, object]],
+) -> None:
+    from aegis_alpha.storage.market_integrity import (  # noqa: PLC0415 -- it imports this module
+        check_new_generation,
+    )
+
+    check_new_generation(connection, str(marker["generation_id"]))
     names = [name for name, _ in COMMON + DOMAINS[domain]]
     if any(PRICE_FIELDS[0] in row for row in normalized):
         names.append(PRICE_FIELDS[0])
         normalized = [{PRICE_FIELDS[0]: "ohlcv", **row} for row in normalized]
-    connection.execute("BEGIN TRANSACTION")
-    try:
-        connection.execute(
-            "INSERT INTO market_generations VALUES ("  # noqa: S608 -- placeholder count only
-            + ",".join("?" for _ in _MARKER_COLUMNS)
-            + ")",
-            list(marker.values()),
-        )
-        selected = ", ".join(f'"{name}"' for name in names)
-        placeholders = ",".join("?" for _ in names)
-        sql = f'INSERT INTO "{domain}" ({selected}) VALUES ({placeholders})'  # noqa: S608 -- schema allowlist
-        connection.executemany(sql, [[row[name] for name in names] for row in normalized])
-        connection.execute("COMMIT")
-    except BaseException:
-        rollback(connection)
-        raise
-    return marker
+    connection.execute(
+        "INSERT INTO market_generations VALUES ("  # noqa: S608 -- placeholder count only
+        + ",".join("?" for _ in _MARKER_COLUMNS)
+        + ")",
+        list(marker.values()),
+    )
+    selected = ", ".join(f'"{name}"' for name in names)
+    placeholders = ",".join("?" for _ in names)
+    sql = f'INSERT INTO "{domain}" ({selected}) VALUES ({placeholders})'  # noqa: S608 -- schema allowlist
+    connection.executemany(sql, [[row[name] for name in names] for row in normalized])
 
 
 def verify_generation(
