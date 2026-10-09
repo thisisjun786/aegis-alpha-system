@@ -17,6 +17,7 @@ import random
 import subprocess
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
@@ -28,8 +29,10 @@ import pytest
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.storage import market, migration, publication, workspace
 from aegis_alpha.storage.bulk_generation import (
+    BulkFlags,
     BulkPlan,
     BulkRequest,
+    flags_digest,
     publish_generation_bulk,
     verify_generation_bulk,
 )
@@ -697,35 +700,57 @@ def test_a_kill_at_every_boundary_of_the_v3_step_is_finished(tmp_path: Path, ste
 # --- publication on v3 -------------------------------------------------------------
 
 
-def _flags_of(generation: str, *, revision: str = "revision_id", copies: int = 1) -> str:
+def _stage_flags(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    revision: str = "revision_id",
+    copies: int = 1,
+    generation: bool = False,
+) -> BulkFlags:
+    """One flag per staged row as ``staged_flags``, with its reviewed digest."""
+    named = "'prices-g1' AS generation_id, " if generation else ""
     one = (
-        f"SELECT generation_id, record_id, {revision}, 'rule', '1', 'flag', NULL "
-        f"FROM prices WHERE generation_id = '{generation}'"
+        f"SELECT {named}record_id, {revision} AS revision_id, 'rule' AS rule_id, "
+        "'1' AS rule_version, 'flag' AS flag, NULL::VARCHAR AS detail FROM staged"
     )
-    return "INSERT INTO quality_flags " + " UNION ALL ".join([one] * copies)
+    connection.execute(
+        "CREATE OR REPLACE TEMP TABLE staged_flags AS " + " UNION ALL ".join([one] * copies)
+    )
+    if generation:
+        return BulkFlags("staged_flags", "0" * 64, 0)
+    digest, rows = flags_digest(connection, "SELECT * FROM staged_flags", [], BUDGET)
+    return BulkFlags("staged_flags", digest, rows)
 
 
-def _companion(sql: str) -> Callable[[duckdb.DuckDBPyConnection], None]:
-    def companion(connection: duckdb.DuckDBPyConnection) -> None:
-        connection.execute(sql)
-
-    return companion
+def _flag_rows(connection: duckdb.DuckDBPyConnection, generation: str) -> list[tuple[object, ...]]:
+    return connection.execute(
+        "SELECT * FROM quality_flags WHERE generation_id = ? ORDER BY ALL", [generation]
+    ).fetchall()
 
 
 @pytest.mark.parametrize(
-    ("flags", "message"),
+    ("case", "message"),
     [
-        (_flags_of("prices-g2", copies=2), "repeats its key"),
-        (_flags_of("prices-g2", revision="'missing'"), "does not store"),
-        (_flags_of("prices-g1"), "changed another generation's quality flags"),
+        ("repeat", "repeats its key"),
+        ("orphan", "does not store"),
+        ("generation", "exactly the flag columns"),
+        ("unreviewed", "differ from their reviewed digest"),
     ],
 )
-def test_the_bulk_writer_checks_what_its_companion_stored(flags: str, message: str) -> None:
-    """With no flag key in v3, the public writer refuses a bad companion before COMMIT."""
+def test_the_bulk_writer_checks_the_flags_it_inserts(case: str, message: str) -> None:
+    """With no flag key in v3, the writer refuses bad flags before COMMIT, and only ever
+    inserts flags under the new generation, so no other generation's flags can change."""
     connection = _connection()
     rng = random.Random(9)
     first = _first(rng, "prices", 6)
     _bulk(connection, first, "prices", "1", None)
+    # Two distinct flags per prices-g1 row, written at rest.
+    connection.execute(
+        "INSERT INTO quality_flags SELECT generation_id, record_id, revision_id, 'rule', '1', "
+        "f.flag, NULL FROM prices, (VALUES ('a'), ('b')) f(flag)"
+    )
+    before = _flag_rows(connection, "prices-g1")
+    assert len(before) == 12  # six rows, two flags each
     _stage(connection, "prices", _second(rng, "prices", first))
     request = BulkRequest(
         dataset_id="synthetic.prices",
@@ -737,24 +762,32 @@ def test_the_bulk_writer_checks_what_its_companion_stored(flags: str, message: s
         domain="prices",
         staged="staged",
     )
+    if case == "repeat":
+        flags = _stage_flags(connection, copies=2)
+    elif case == "orphan":
+        flags = _stage_flags(connection, revision="'missing'")
+    elif case == "generation":
+        flags = _stage_flags(connection, generation=True)
+    else:
+        flags = replace(_stage_flags(connection), rowset="0" * 64)
     with pytest.raises(ValueError, match=message):
-        publish_generation_bulk(connection, request, budget=BUDGET, companion=_companion(flags))
+        publish_generation_bulk(connection, request, budget=BUDGET, flags=flags)
     # Marker, rows and flags all rolled back together.
     for table in ("market_generations", "prices", "quality_flags"):
         assert connection.execute(
             f"SELECT count(*) FROM {table} WHERE generation_id = 'prices-g2'"
         ).fetchone() == (0,)
-    assert connection.execute("SELECT count(*) FROM quality_flags").fetchone() == (0,)
+    assert _flag_rows(connection, "prices-g1") == before
     marker = publish_generation_bulk(
-        connection,
-        request,
-        budget=BUDGET,
-        companion=_companion(_flags_of("prices-g2")),
+        connection, request, budget=BUDGET, flags=_stage_flags(connection)
     )
     assert marker["generation_id"] == "prices-g2"
-    assert connection.execute("SELECT count(*) FROM quality_flags").fetchone() == (
+    assert connection.execute(
+        "SELECT count(*) FROM quality_flags WHERE generation_id='prices-g2'"
+    ).fetchone() == (
         connection.execute("SELECT count(*) FROM prices WHERE generation_id='prices-g2'").fetchone()
     )
+    assert _flag_rows(connection, "prices-g1") == before
     audit_market(connection, BUDGET, deep=True)
     connection.close()
 
@@ -772,7 +805,7 @@ def test_a_publication_reads_only_its_staged_delta_and_flags(
         *,
         budget: ComputeBudget,
         plan: BulkPlan | None = None,
-        companion: Callable[[duckdb.DuckDBPyConnection], None] | None = None,
+        flags: BulkFlags | None = None,
     ) -> dict[str, object]:
         seen.append(
             {
@@ -782,7 +815,7 @@ def test_a_publication_reads_only_its_staged_delta_and_flags(
                 ).fetchall()
             }
         )
-        return actual(connection, request, budget=budget, plan=plan, companion=companion)
+        return actual(connection, request, budget=budget, plan=plan, flags=flags)
 
     root = tmp_path / "apply"
     initialize(root)

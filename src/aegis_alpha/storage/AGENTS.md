@@ -81,8 +81,10 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   Inside the transaction no row may name the generation before its insert, and after it
   the planned count, one revision per record and no `(record_id, revision_id)` held by any
   other generation of the domain (a scan of the whole domain, not the chain) are checked.
-  A promotion's companion also refuses repeated flag keys, flags of unstored revisions
-  and flags that differ from the manifest's count and digest before COMMIT.
+  A publication's `BulkFlags` are inserted by the writer itself under the new generation's
+  ID, its only write to `quality_flags`; repeated flag keys, flags of unstored revisions
+  and flags that differ from the reviewed count and digest are refused before COMMIT.
+  No caller code runs inside the transaction.
 - Backup takes SQLite snapshots and closes DuckDB after checkpoint while retaining
   installation admission. Restore targets a new root; secrets are excluded. `backup.json`
   lists every `raw/` and `runs/` file, so it is read with its own bound
@@ -143,7 +145,7 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   natural keys) are computed in Python in bounded key-ordered batches. A plan writes nothing; an
   apply retains spec, request and manifest in `raw/`, records a `promotion` intent whose payload
   is the manifest, commits marker, rows and `quality_flags` in one DuckDB transaction through
-  `publish_generation_bulk(companion=...)`, then writes the catalog. `aas db verify` sends a
+  `publish_generation_bulk(flags=BulkFlags(...))`, then writes the catalog. `aas db verify` sends a
   promoted chain to `engine.verify_promotion` instead of the import-document verifier, and
   `db recover` finishes a `promotion` intent only when the retained spec recomputes its manifest.
 - `calendar_declaration` owns the `aas-calendar-declaration-v1` document (regimes, closed

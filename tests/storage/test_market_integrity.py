@@ -31,7 +31,12 @@ from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.storage import bulk_generation, market, market_integrity, publication
 from aegis_alpha.storage.backup import backup, restore
-from aegis_alpha.storage.bulk_generation import BulkPlan, BulkRequest, publish_generation_bulk
+from aegis_alpha.storage.bulk_generation import (
+    BulkFlags,
+    BulkPlan,
+    BulkRequest,
+    publish_generation_bulk,
+)
 from aegis_alpha.storage.compaction import compact
 from aegis_alpha.storage.import_document import parse_import
 from aegis_alpha.storage.market_integrity import (
@@ -55,7 +60,7 @@ from aegis_alpha.storage.market_schema import (
 from aegis_alpha.storage.promotion import engine
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace, store_info
-from tests.storage.test_bulk_generation import _first, _request, _stage
+from tests.storage.test_bulk_generation import _first, _request, _stage, inside_publication
 from tests.storage.test_publication import document
 
 BUDGET: Final = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
@@ -309,7 +314,9 @@ def test_the_judges_two_cursor_counterexample_cannot_commit_both(tmp_path: Path)
     # The writers themselves, the second started inside the first's transaction.
     refused: list[BaseException] = []
 
-    def rival(_: duckdb.DuckDBPyConnection) -> None:
+    def rival(generation_id: str) -> None:
+        if generation_id == "o1":
+            return
         request = replace(
             _request("1", parent=None, domain="prices", staged="staged_second"),
             dataset_id="other",
@@ -322,7 +329,8 @@ def test_the_judges_two_cursor_counterexample_cannot_commit_both(tmp_path: Path)
             refused.append(error)
 
     request = _request("1", parent=None, domain="prices", staged="staged_first")
-    publish_generation_bulk(first, request, budget=BUDGET, companion=rival)
+    with inside_publication(rival):
+        publish_generation_bulk(first, request, budget=BUDGET)
     assert [str(error) for error in refused] == [_OPEN]
     assert _count(connection, "SELECT count(*) FROM prices") == 3
     audit_duplicates(connection)
@@ -359,7 +367,9 @@ def test_without_the_claim_both_cursors_commit(
     _stage(first, "prices", rows, name="staged_first")
     _stage(second, "prices", rows, name="staged_second")
 
-    def rival(_: duckdb.DuckDBPyConnection) -> None:
+    def rival(generation_id: str) -> None:
+        if generation_id == "o1":
+            return
         request = replace(
             _request("1", parent=None, domain="prices", staged="staged_second"),
             dataset_id="other",
@@ -369,7 +379,8 @@ def test_without_the_claim_both_cursors_commit(
         publish_generation_bulk(second, request, budget=BUDGET)
 
     request = _request("1", parent=None, domain="prices", staged="staged_first")
-    publish_generation_bulk(first, request, budget=BUDGET, companion=rival)
+    with inside_publication(rival):
+        publish_generation_bulk(first, request, budget=BUDGET)
     assert _count(connection, "SELECT count(*) FROM prices") == 6
     with pytest.raises(ValueError, match="stored more than once"):
         audit_duplicates(connection)
@@ -389,16 +400,18 @@ def test_a_publication_cannot_start_inside_another_on_the_same_store(
     rival = connection.cursor() if rival_kind == "cursor" else duckdb.connect(str(path))
     refused: list[BaseException] = []
 
-    def nested(_: duckdb.DuckDBPyConnection) -> None:
+    def nested(generation_id: str) -> None:
+        if generation_id != "g1":
+            return
         try:
             _publish(rival, _price_rows(), dataset="other", generation="o1")
         except ValueError as error:
             refused.append(error)
             raise
 
-    with pytest.raises(ValueError, match=_OPEN):
+    with inside_publication(nested), pytest.raises(ValueError, match=_OPEN):
         publish_generation_bulk(
-            connection, _request("1", parent=None, domain="prices"), budget=BUDGET, companion=nested
+            connection, _request("1", parent=None, domain="prices"), budget=BUDGET
         )
     assert len(refused) == 1
     assert _count(connection, "SELECT count(*) FROM market_generations") == 0
@@ -735,34 +748,83 @@ def _flag(connection: duckdb.DuckDBPyConnection, revision: str, flag: str = "f")
     )
 
 
-def test_flag_gate_refuses_repeats_orphans_and_other_flags(tmp_path: Path) -> None:
+def test_flag_gate_refuses_repeats_orphans_and_unreviewed_flags(tmp_path: Path) -> None:
     connection = _store(tmp_path / "market.duckdb", keys=False)
     _publish(connection, _price_rows())
     _flag(connection, "r1")
     check_generation_flags(connection, "prices", "g1")
-    digest, rows = engine.flags_digest(
-        connection, "SELECT * FROM quality_flags WHERE generation_id = ?", ["g1"], BUDGET
-    )
-    manifest = {"rowset": digest, "rows": rows}
-    engine._gate_flags(connection, "prices", "g1", manifest, BUDGET)
-    _flag(connection, "r1", flag="other")
-    with pytest.raises(ValueError, match="differ from the promotion manifest"):
-        engine._gate_flags(connection, "prices", "g1", manifest, BUDGET)
-    connection.execute("DELETE FROM quality_flags WHERE flag='other'")
-    _flag(connection, "r1")
-    with pytest.raises(ValueError, match="repeats its key"):
-        engine._gate_flags(connection, "prices", "g1", manifest, BUDGET)
     connection.execute("DELETE FROM quality_flags")
     _flag(connection, "r-missing")
     with pytest.raises(ValueError, match="does not store"):
         check_generation_flags(connection, "prices", "g1")
+    connection.execute("DELETE FROM quality_flags")
+    # The writer holds the flags it inserts to their reviewed digest before COMMIT.
+    _stage(connection, "prices", _first(random.Random(17), "prices", 2))
+    connection.execute(
+        "CREATE TEMP TABLE staged_flags AS SELECT record_id, revision_id, 'rule' AS rule_id, "
+        "'1' AS rule_version, 'f' AS flag, NULL::VARCHAR AS detail FROM staged"
+    )
+    digest, rows = bulk_generation.flags_digest(
+        connection, "SELECT * FROM staged_flags", [], BUDGET
+    )
+    request = replace(_request("1", parent=None, domain="prices"), dataset_id="other")
+    request = replace(request, generation_id="o1", operation_id="op-o1")
+    connection.execute("INSERT INTO staged_flags SELECT * FROM staged_flags LIMIT 1")
+    with pytest.raises(ValueError, match="repeats its key"):
+        publish_generation_bulk(
+            connection,
+            request,
+            budget=BUDGET,
+            flags=BulkFlags(
+                "staged_flags",
+                *bulk_generation.flags_digest(connection, "SELECT * FROM staged_flags", [], BUDGET),
+            ),
+        )
+    connection.execute(
+        "DELETE FROM staged_flags; INSERT INTO staged_flags SELECT record_id, revision_id, "
+        "'rule', '1', 'f', NULL FROM staged"
+    )
+    connection.execute(
+        "UPDATE staged_flags SET detail = 'changed' "
+        "WHERE record_id = (SELECT min(record_id) FROM staged_flags)"
+    )
+    with pytest.raises(ValueError, match="differ from their reviewed digest"):
+        publish_generation_bulk(
+            connection, request, budget=BUDGET, flags=BulkFlags("staged_flags", digest, rows)
+        )
+    assert (
+        _count(connection, "SELECT count(*) FROM market_generations WHERE generation_id='o1'") == 0
+    )
+    assert _count(connection, "SELECT count(*) FROM quality_flags") == 0
+    connection.execute("UPDATE staged_flags SET detail = NULL")
+    publish_generation_bulk(
+        connection, request, budget=BUDGET, flags=BulkFlags("staged_flags", digest, rows)
+    )
+    assert _count(connection, "SELECT count(*) FROM quality_flags WHERE generation_id='o1'") == rows
+    connection.close()
+
+
+@pytest.mark.parametrize("staged", ["quality_flags", "prices", "market_generations"])
+def test_flags_are_never_copied_from_a_market_table(tmp_path: Path, staged: str) -> None:
+    """The writer's flag INSERT reads a staged relation only, never another generation's rows."""
+    connection = _store(tmp_path / "market.duckdb", keys=False)
+    _stage(connection, "prices", _first(random.Random(19), "prices", 2))
+    with pytest.raises(ValueError, match="outside the market tables"):
+        publish_generation_bulk(
+            connection,
+            _request("1", parent=None, domain="prices"),
+            budget=BUDGET,
+            flags=BulkFlags(staged, "0" * 64, 0),
+        )
+    assert _count(connection, "SELECT count(*) FROM market_generations") == 0
+    assert _count(connection, "SELECT count(*) FROM prices") == 0
     connection.close()
 
 
 @pytest.mark.parametrize(
     ("tamper", "message"),
     [
-        # A v3 store has no flag key, so only the companion's gate refuses the repeat.
+        # A v3 store has no flag key, so only the writer's flag check refuses the repeat.
         (
             "INSERT INTO temp._aas_p_flags SELECT * FROM temp._aas_p_flags LIMIT 1",
             "repeats its key",
@@ -776,7 +838,7 @@ def test_flag_gate_refuses_repeats_orphans_and_other_flags(tmp_path: Path) -> No
         ),
         (
             "DELETE FROM temp._aas_p_flags WHERE flag='time_precision_day'",
-            "differ from the promotion",
+            "differ from their reviewed digest",
         ),
     ],
 )
@@ -801,10 +863,10 @@ def test_promotion_flags_changed_after_planning_never_commit(
         *,
         budget: ComputeBudget,
         plan: BulkPlan | None = None,
-        companion: Callable[[duckdb.DuckDBPyConnection], None] | None = None,
+        flags: BulkFlags | None = None,
     ) -> dict[str, object]:
         connection.execute(tamper)
-        return actual(connection, request, budget=budget, plan=plan, companion=companion)
+        return actual(connection, request, budget=budget, plan=plan, flags=flags)
 
     monkeypatch.setattr(engine, "publish_generation_bulk", tampered)
     with open_workspace(root, writable=True, strategy_write=True) as workspace:

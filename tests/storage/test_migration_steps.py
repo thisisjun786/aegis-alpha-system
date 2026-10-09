@@ -27,7 +27,7 @@ from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.serialization import content_sha256
 from aegis_alpha.storage import migration, workspace
 from aegis_alpha.storage.backup import backup, backup_workspace, restore
-from aegis_alpha.storage.bulk_generation import BulkPlan, BulkRequest
+from aegis_alpha.storage.bulk_generation import BulkFlags, BulkPlan, BulkRequest
 from aegis_alpha.storage.market import marker_for, publish_generation
 from aegis_alpha.storage.migration import (
     CORE_VERSION,
@@ -192,10 +192,10 @@ def pending_promotion(
         *,
         budget: ComputeBudget,
         plan: BulkPlan | None = None,
-        companion: Callable[[duckdb.DuckDBPyConnection], None] | None = None,
+        flags: BulkFlags | None = None,
     ) -> dict[str, object]:
         failing = FailingCommit(connection).borrowed
-        return publish(failing, request, budget=budget, plan=plan, companion=companion)
+        return publish(failing, request, budget=budget, plan=plan, flags=flags)
 
     def killed(*_: object, **__: object) -> None:
         raise RuntimeError("process killed")

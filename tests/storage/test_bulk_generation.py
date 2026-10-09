@@ -12,7 +12,8 @@ import math
 import random
 import struct
 import tracemalloc
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
@@ -213,6 +214,26 @@ def _stage(
             [[row.get(n, "ohlcv" if n == "fields" else None) for n, _ in columns] for row in rows],
         )
     return name
+
+
+@contextmanager
+def inside_publication(hook: Callable[[str], None]) -> Iterator[None]:
+    """Run ``hook(generation_id)`` inside each bulk publication, after its rows are checked.
+
+    The writer runs no caller code in its transaction, so a test reaches that point by
+    wrapping the last row check it makes before inserting flags and committing.
+    """
+    actual = bulk_generation.check_inserted_generation
+
+    def checked(
+        connection: duckdb.DuckDBPyConnection, domain: str, generation_id: str, row_count: int
+    ) -> None:
+        actual(connection, domain, generation_id, row_count)
+        hook(generation_id)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(bulk_generation, "check_inserted_generation", checked)
+        yield
 
 
 def _request(
@@ -841,7 +862,7 @@ def test_a_failed_commit_is_not_replaced_by_its_rollback(
     plan = plan_generation_bulk(connection, request, budget=BUDGET)
     rival = connection.cursor()
 
-    def commit_rival(_: duckdb.DuckDBPyConnection) -> None:
+    def commit_rival(_: str) -> None:
         marker = dict(plan.marker)
         rival.execute(
             "INSERT INTO market_generations ("
@@ -852,8 +873,11 @@ def test_a_failed_commit_is_not_replaced_by_its_rollback(
             list(marker.values()),
         )
 
-    with pytest.raises(duckdb.TransactionException, match="constraint violation") as caught:
-        publish_generation_bulk(connection, request, budget=BUDGET, companion=commit_rival)
+    with (
+        inside_publication(commit_rival),
+        pytest.raises(duckdb.TransactionException, match="constraint violation") as caught,
+    ):
+        publish_generation_bulk(connection, request, budget=BUDGET)
     assert not isinstance(caught.value, ComputeResourceError)
     assert f'"{generation_id}"' in str(caught.value)
     assert "no transaction is active" not in str(caught.value)
