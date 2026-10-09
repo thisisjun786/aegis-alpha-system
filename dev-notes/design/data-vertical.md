@@ -1919,17 +1919,23 @@ Norgate security master와 그보다 늦은 Norgate history 내보내기에서�
   행만 다시 해시하며 그 앞 head에 대한 revision 규칙을 검사한다. `deep=True`는 모든 delta를 다시 해시한다.
 - 메모리는 [0016](../decisions/0016-maintenance-admission-budget.md)을 따른다. fetch 전에 SQL 집계로
   가장 넓은 행을 재고, 배치 과금이 호출자 할당의 비DuckDB 몫에 들어가도록 배치 행 수를 정한다. 과금은
-  행 수와 무관하다. 한 행도 들어가지 않으면 `ComputeResourceError`다. 정렬·spill·색인 유지는 같은
+  행 수와 무관하다. 한 행도 들어가지 않으면 `ComputeResourceError`다. 가져올 행이 없는 빈 quality flag
+  관계는 한 행 몫도 요구하지 않고 빈 rowset digest를 돌려준다. 정렬·spill·색인 유지는 같은
   할당에서 유도한 DuckDB 몫이 맡는다. 한도를 넘으면 트랜잭션 전체가 취소되고 `ComputeResourceError`가
   되며, 원래 DuckDB 오류는 그 cause로 남는다. 삽입은 들어갔는데 COMMIT이 색인 block을 할당하거나 pin하지
   못하면 DuckDB는 OOM이 아니라 `TransactionException`으로 보고하고, 고정 접두어 `Failed to commit: `
-  바로 뒤의 원인이 `could not allocate`·`failed to allocate`·`failed to pin block`이면 이것도 같은
-  오류다. 그 밖의 COMMIT 실패(제약 위반, 쓰기 충돌)는 용량 오류가 아니므로 원래 오류 그대로 나간다.
+  바로 뒤의 원인이 `could not allocate`·`failed to allocate`·`failed to re-allocate`·`failed to pin block`·
+  `failed to offload data block`이면 이것도 같은 오류다. 접두어는 그대로 맞추고 원인만 대소문자를 가리지 않으므로
+  allocator의 `Failed to allocate block of N bytes (bad allocation)`도 용량 오류다. `max_temp_directory_size`를
+  다 써서 spill하지 못한 `failed to offload data block ...`은 COMMIT 밖에서는 DuckDB의 OOM이라 그 자체로,
+  COMMIT에서는 위 원인으로 용량 오류다. 그 밖의 COMMIT 실패(제약 위반, 쓰기 충돌)는 용량 오류가 아니므로 원래 오류 그대로 나간다.
   제약 위반이 인용한 key에 같은 문구가 들어 있어도 마찬가지다. 연결이 이미 쥔 메모리보다 낮은 한도로
   내리는 것을 DuckDB가 거절한 OOM도 이 경계 안에서 `ComputeResourceError`가 된다. COMMIT이 실패하면 DuckDB가 이미 트랜잭션을 끝내므로,
   뒤따르는 ROLLBACK의 "no transaction is active" 거절이 원래 오류를 덮지 않는다(`market.rollback`). 이
   경계(`market.budgeted`)는 `aas db migrate`의 market 단계와 `aas db compact`의 market 복사에도 쓰이며,
-  둘 다 설치본 자체의 한도가 아니라 compute lease의 DuckDB 몫으로 낮춘 연결에서 실행한다.
+  둘 다 설치본 자체의 한도가 아니라 compute lease의 DuckDB 몫으로 낮춘 연결에서 실행한다. migration은
+  admission 뒤 작업 공간에 lease를 걸어(`Workspace.market_lease`) PREPARED 승격의 carry 검사가 끝나며 한도를
+  되돌릴 때도, 백업의 CHECKPOINT와 그 뒤 다시 연 연결, 이후 단계도 lease의 DuckDB 몫을 넘지 않는다.
 - 기본 512 MiB 할당은 Python 몫만 행 수와 무관하게 보장한다. 1e7행 계획의 Python peak는 74 MiB다.
   core schema v3의 도메인 테이블과 `quality_flags`에는 key 색인이 없다([market v3](#core-schema-버전)).
   그래서 DuckDB 몫은 테이블에 쌓인 전체 행 수가 아니라 게시하는 delta를 부호화·정렬하고 기존 행과

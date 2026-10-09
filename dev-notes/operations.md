@@ -392,8 +392,11 @@ aas db compact --to /path/to/new-root
 단계도 쓰기 전에 백업과 같은 조건(새 디렉터리, `raw`·`runs`·`secrets`와 Git checkout 밖)으로 확인한다. 응답은 두
 저장소의 버전과 영수증 행, 이번에 끝낸 단계마다 백업 경로와 manifest SHA-256, 남은 PREPARED 작업을
 담는다. 목표 이상인 설치본에는 아무것도 하지 않는다. 중간에 멈춘 설치본은 다른 명령으로 열리지 않으며,
-같은 명령을 다시 실행하면 그 단계의 백업 없이 남은 부분부터 끝낸다. 한 단계를 끝내고 다음 단계의 백업
-도중 멈췄으면 다음 단계는 새 `--backup-output`을 요구한다. `aas db recover`와 `aas db quarantine`은 이
+intent를 기록한 단계(PREPARED)는 같은 명령을 다시 실행하면 그 단계의 백업 없이 남은 부분부터 끝난다. 그 뒤에
+아직 intent가 없는 단계가 남았으면(`--to 3`이 v2 intent 뒤에 멈췄거나 v2를 끝내고 v3 intent 전에 멈춘 경우) 그
+단계는 새 백업이 필요하므로 새 `--backup-output`으로 다시 실행한다. 이미 쓴 디렉터리를 다시 주면 아무것도 쓰기
+전에 거부한다. 새 디렉터리에는 남은 백업이 하나면 그 디렉터리 자체에, 여럿이면 operation ID마다 백업이 생긴다.
+`aas db recover`와 `aas db quarantine`은 이
 작업을 다루지 않는다. COMMIT 전에 멈춘 승격 intent 가운데 `aas db recover`가 게시할 것(marker·행·flag·
 catalog가 없고, 보존 증거가 intent의 것이며, 보존 명세를 다시 계획하면 intent의 manifest가 그대로 나오는
 것)만 PREPARED인 채로 단계를 지나고, 그 단계의 백업에 그대로 담긴다. `--plan`은 그런 승격마다 다시 계획해
@@ -1597,9 +1600,12 @@ aas db source-link --apply
 ```
 
 `migrate --to 3`은 v1 설치본을 v2와 v3 두 단계로 올리고, 단계마다 `$BACKUPS/$TS-migrate/core-schema-migrate-v2`와
-`.../core-schema-migrate-v3`에 검증된 백업을 만든 뒤에만 그 단계의 intent를 기록한다. 단계의 intent 뒤에 멈추면 같은
-명령이 그 단계를 백업 없이 끝내고, 한 단계를 끝내고 다음 단계의 intent 전에 멈추면 새 `--backup-output`으로
-다시 실행한다. v3 단계는 market의 도메인 테이블과 `quality_flags`를 한 트랜잭션에서 다시 쓰므로 market 장치에
+`.../core-schema-migrate-v3`에 검증된 백업을 만든 뒤에만 그 단계의 intent를 기록한다. v3 intent 뒤에 멈췄으면 같은
+명령이 그 단계를 백업 없이 끝낸다. 아직 intent가 없는 단계가 남았을 때(v2 intent 뒤에 멈췄거나 v2를 끝내고
+v3 intent 전에 멈춘 경우) `$BACKUPS/$TS-migrate`가 이미 생겼으면 같은 명령은 아무것도 쓰기 전에 거부되므로 새
+경로로 다시 실행한다(`aas db migrate --to 3 --backup-output "$BACKUPS/$TS-migrate-2"`). 그 실행은 PREPARED인 단계를
+백업 없이 끝내고 남은 단계의 백업을 새 경로에 만든다. v3 단계는 market의 도메인 테이블과 `quality_flags`를 한
+트랜잭션에서 다시 쓰므로 market 장치에
 그 테이블을 한 벌 더 담을 여유와 DuckDB 임시 디렉터리의 spill 여유가 필요하고, 단계를 끝내기 전 모든 generation을
 다시 해시한다. `--plan`의 `blocking_operations`가 비어 있어야 실행한다. `source-link --plan`의 `unbacked`·`corrupt`·`incomplete`·`invalid`가 비어 있어야 다음 단계로 간다.
 
@@ -1632,15 +1638,17 @@ aas db migrate --to 3 --plan > "$RB/migrate-v3.plan.json"
 )
 ```
 
-`$RB/migrate-v3`는 그 intent를 PREPARED로
-담은 migration의 rollback snapshot이며 복구를 마친 백업으로 쓰지 않는다. migration 뒤 `verify --deep`은 모든
+migration이 v3 intent 뒤에 멈췄으면 같은 블록을 다시 실행한다. v3 intent 전에 멈췄고 `$RB/migrate-v3`가 이미
+생겼으면 같은 명령은 거부되므로 블록의 첫 명령만 새 경로(`$RB/migrate-v3-2`)로 바꿔 실행한다. `$RB/migrate-v3`는 그
+intent를 PREPARED로 담은 migration의 rollback snapshot이며 복구를 마친 백업으로 쓰지 않는다. migration 뒤 `verify --deep`은 모든
 generation의 hash와 v3 감사를 통과하고 `pending_operations`가 1이다. `recover`는 보존 명세를 다시 계획해 intent의
 manifest가 그대로 나올 때만 게시하므로 게시한 generation의 hash는 멈추기 전 계획과 같다. `recover`가 그 intent를
 `pending`으로 남기면 멈추고 보존 증거를 그대로 둔다. 게시가 끝나면 멈춘 명세부터 4단계 6을 이어 간다. 멈춘
 명세의 `--plan`과 실행은 게시된 generation을 검증해 `reused`로 돌려주고 새 generation을 만들지 않으며, 그
 다음 명세부터 새 generation이 생긴다. 앞선 명세와 앞선 dataset은 다시 승격하지 않는다. 이어서 4단계 7과
-5–7단계를 `AAS_HOME="$HOME_NEW"`로 실행한다. `$RB`의 migration 백업(`$RB/migrate`, `$RB/migrate-v3`)은 7단계의
-`$TS-migrate`에 해당하고, `$RB/reports`는 7단계가 읽으므로 그때까지 둔다.
+5–7단계를 `AAS_HOME="$HOME_NEW"`로 실행한다. `$RB`의 migration 백업(`$RB/migrate*`: `$RB/migrate`, `$RB/migrate-v3`와
+다시 실행한 새 경로)은 3단계의 `$TS-migrate*`에 해당해 6단계 끝의 보존 규칙을 따르고, `$RB/reports`는 7단계가
+읽으므로 그때까지 둔다.
 
 **4. 승격.** 아래 순서로 dataset의 첫 generation을 만든다. 명세와 문서는 모두 `$SPECS`의 비공개 파일이고,
 `[owner]`는 각 `--plan` 보고(원천·매핑 행 수, `blocking`, `refusals`, 미해결 표본)를 보고 실행한다. 실행은
@@ -1805,7 +1813,8 @@ if [ "$AAS_HOME" = "$HOME_FINAL" ]; then
 fi
 ```
 
-원래 설치본(`$OLD_HOME`과 그 `runtime.json`이 가리키는 market·`raw/`)과 `$HOME_NEW`는 7일 동안 두고, 그동안
+원래 설치본(`$OLD_HOME`과 그 `runtime.json`이 가리키는 market·`raw/`)과 `$HOME_NEW`, core schema migration의
+rollback snapshot(3단계의 `$BACKUPS/$TS-migrate*`, 리허설을 채택했으면 `$RB/migrate*`)은 7일 동안 두고, 그동안
 유지보수 실행이 성공하고 7단계가 통과하면 지운다. 기본 설치 위치를 쓰지 않으므로 대화형 셸도
 `AAS_HOME="$HOME_FINAL"`를 설정한다.
 
