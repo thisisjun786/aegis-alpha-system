@@ -23,6 +23,7 @@ from aegis_alpha.storage.market import (
 )
 from aegis_alpha.storage.paths import read_json
 from aegis_alpha.storage.workspace import initialize, open_workspace, write_json
+from tests.storage.capacity_support import PIN_BLOCK, FailingCommit
 from tests.storage.test_publication import document
 
 
@@ -527,3 +528,49 @@ def test_project_heads_rejects_invalid_cutoffs(cutoff: int) -> None:
 def test_legacy_reader_preserves_limit_admission(limit: int) -> None:
     with duckdb.connect() as connection, pytest.raises(ValueError, match="limit"):
         read_generation(connection, "absent", limit=limit)
+
+
+@pytest.mark.parametrize("write", ["initialize", "upgrade", "publish"])
+def test_a_failed_commit_surfaces_as_itself_and_leaves_nothing(tmp_path: Path, write: str) -> None:
+    """Each market transaction re-raises its COMMIT's own error, not ROLLBACK's refusal."""
+    connection = duckdb.connect(str(tmp_path / "market.duckdb"))
+    if write != "initialize":
+        initialize_market(connection, "synthetic", version=1 if write == "upgrade" else None)
+    before = connection.execute(
+        "SELECT table_name FROM duckdb_tables() ORDER BY table_name"
+    ).fetchall()
+    failing = FailingCommit(connection)
+    writes = {
+        "initialize": lambda borrowed: initialize_market(borrowed, "synthetic"),
+        "upgrade": lambda borrowed: market.upgrade_market(borrowed, "synthetic", 2),
+        "publish": lambda borrowed: publish(
+            borrowed, [parse_import(document()).rows[0]], version="1"
+        ),
+    }
+    with pytest.raises(duckdb.TransactionException) as caught:
+        writes[write](failing.borrowed)
+    assert str(caught.value) == PIN_BLOCK
+    assert failing.commits == 1
+    # The failed COMMIT already ended the transaction: nothing it wrote remains.
+    assert (
+        connection.execute("SELECT table_name FROM duckdb_tables() ORDER BY table_name").fetchall()
+        == before
+    )
+    if write == "upgrade":
+        assert market.validate_market(connection, "synthetic") == 1
+    if write == "publish":
+        assert connection.execute("SELECT count(*) FROM market_generations").fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM prices").fetchone() == (0,)
+    connection.close()
+
+
+def test_rollback_refuses_everything_but_an_ended_transaction() -> None:
+    connection = duckdb.connect()
+    market.rollback(connection)
+    connection.execute("BEGIN TRANSACTION")
+    connection.execute("CREATE TABLE t(a INTEGER)")
+    market.rollback(connection)
+    assert connection.execute("SELECT count(*) FROM duckdb_tables()").fetchone() == (0,)
+    connection.close()
+    with pytest.raises(duckdb.ConnectionException):
+        market.rollback(connection)

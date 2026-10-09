@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Literal
 
 from aegis_alpha.data.serialization import content_sha256
+from aegis_alpha.storage.market import rollback
 from aegis_alpha.storage.state import atomic, complete_operation, get_operation, prepare_operation
 
 if TYPE_CHECKING:
@@ -436,7 +437,7 @@ def _install_market(workspace: Workspace) -> None:
         )
         workspace.market.execute("COMMIT")
     except BaseException:
-        workspace.market.execute("ROLLBACK")
+        rollback(workspace.market)
         raise
     _local_market(workspace)
 

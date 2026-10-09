@@ -34,6 +34,7 @@ from aegis_alpha.storage.bulk_generation import (
 )
 from aegis_alpha.storage.market_schema import COMMON, DOMAINS, NATURAL_KEYS
 from aegis_alpha.storage.rowset import RowsetStream, encode_row, rowset_hash
+from tests.storage.capacity_support import PIN_BLOCK
 
 BUDGET: Final = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
 _TEXT: Final = "aZ09-_.:/é한字😀\t \x7f\u0085\u00a0"
@@ -659,8 +660,8 @@ def test_streaming_memory_stays_within_the_admitted_allowance(tmp_path: Path) ->
     connection.close()
 
 
-def _staged_prices(connection: duckdb.DuckDBPyConnection, rows: int) -> None:
-    """``rows`` valid canonical OHLCV prices staged as table ``staged``."""
+def _staged_prices(connection: duckdb.DuckDBPyConnection, rows: int, *, first: int = 0) -> None:
+    """``rows`` valid canonical OHLCV prices, from instrument ``first``, staged as ``staged``."""
     connection.execute(
         f"""CREATE TABLE staged AS
         SELECT sha256(json_array('aas-record-v1', 'prices', json_array(
@@ -677,7 +678,7 @@ def _staged_prices(connection: duckdb.DuckDBPyConnection, rows: int) -> None:
                (i / 7)::DECIMAL(38,12) AS "open", (i / 3)::DECIMAL(38,12) AS high,
                (i / 9)::DECIMAL(38,12) AS low, (i / 5)::DECIMAL(38,12) AS "close",
                i::DECIMAL(38,12) AS volume, 'canonical' AS price_role, 'present' AS value_state
-        FROM range({rows}) t(i)"""
+        FROM range({first}, {first + rows}) t(i)"""
     )
 
 
@@ -701,17 +702,137 @@ def test_duckdb_exhaustion_rolls_back_as_a_budget_error(tmp_path: Path) -> None:
     connection.close()
 
 
-def test_commit_allocation_failure_is_a_budget_error() -> None:
+def test_commit_exhaustion_rolls_back_as_a_budget_error(tmp_path: Path) -> None:
+    """A COMMIT that cannot pin or allocate the index blocks it merges is a budget error.
+
+    DuckDB reports that exhaustion as a ``TransactionException``, not an OOM, once the
+    insert itself fit. The limits sweep upward from where the insert fails to where
+    the COMMIT succeeds, so the band between is crossed whatever its exact edges.
+    """
+    path = tmp_path / "market.duckdb"
+    connection = _store(path)
+    _staged_prices(connection, 100_000)
+    roomy = ComputeBudget(Fraction(1), 1024 * 1024 * 1024)
+    first = publish_generation_bulk(
+        connection, _request("1", parent=None, domain="prices"), budget=roomy
+    )
+    connection.execute("DROP TABLE staged")
+    _staged_prices(connection, 15_000, first=100_000)
+    connection.execute("CHECKPOINT")
+    connection.close()
+    request = _request("2", parent="g1", domain="prices")
+    failures: list[ComputeResourceError] = []
+    marker = None
+    for mebibytes in range(40, 160, 8):
+        # A lowered limit stays on its connection, so each larger one takes a new one.
+        connection = duckdb.connect(str(path))
+        try:
+            marker = publish_generation_bulk(
+                connection, request, budget=ComputeBudget(Fraction(1), mebibytes * 1024 * 1024)
+            )
+        except ComputeResourceError as error:
+            failures.append(error)
+            # The whole transaction is gone: no marker, no row, and the head is unchanged.
+            assert connection.execute("SELECT count(*) FROM market_generations").fetchone() == (1,)
+            assert connection.execute(
+                "SELECT count(*) FROM prices WHERE generation_id='g2'"
+            ).fetchone() == (0,)
+            continue
+        finally:
+            connection.close()
+        break
+    assert marker is not None
+    causes = [failure.__cause__ for failure in failures]
+    assert all(isinstance(cause, duckdb.Error) for cause in causes)
+    assert any(
+        isinstance(cause, duckdb.TransactionException)
+        and str(cause).startswith("TransactionContext Error: Failed to commit")
+        for cause in causes
+    )
+    connection = duckdb.connect(str(path))
+    assert market.verify_generation(connection, "g2") == marker
+    assert market.verify_generation(connection, "g1") == first
+    connection.close()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        PIN_BLOCK,
+        "TransactionContext Error: Failed to commit: could not allocate block of size 256.0 KiB",
+        "TransactionContext Error: Failed to commit: failed to allocate data of size 512.0 KiB",
+    ],
+)
+def test_commit_capacity_messages_are_budget_errors(message: str) -> None:
     connection = duckdb.connect()
     with (
-        pytest.raises(ComputeResourceError, match="within admitted memory"),
-        bulk_generation._budgeted(connection, BUDGET),
+        pytest.raises(ComputeResourceError, match="within admitted memory") as caught,
+        market.budgeted(connection, BUDGET, "the bulk generation"),
     ):
-        raise duckdb.TransactionException("Failed to commit: could not allocate block")
-    with pytest.raises(duckdb.TransactionException), bulk_generation._budgeted(connection, BUDGET):
-        raise duckdb.TransactionException("Conflict on tuple deletion")
+        raise duckdb.TransactionException(message)
+    assert str(caught.value.__cause__) == message
+    with pytest.raises(ComputeResourceError), market.budgeted(connection, None, "work"):
+        raise duckdb.OutOfMemoryException("Out of Memory Error: failed to pin block")
+    connection.close()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        duckdb.TransactionException("Conflict on tuple deletion"),
+        duckdb.TransactionException(
+            "TransactionContext Error: Failed to commit: PRIMARY KEY or UNIQUE constraint "
+            'violation: duplicate key "5"'
+        ),
+        duckdb.TransactionException("TransactionContext Error: Failed to commit"),
+        duckdb.IOException("IO Error: No space left on device"),
+        ValueError("allocate"),
+    ],
+)
+def test_other_failures_keep_their_own_error(error: Exception) -> None:
+    """Only exhausted memory is capacity; any other failed COMMIT is what it says it is."""
+    connection = duckdb.connect()
+    with pytest.raises(type(error)) as caught, market.budgeted(connection, BUDGET, "work"):
+        raise error
+    assert caught.value is error
+    connection.close()
+
+
+def test_a_failed_commit_is_not_replaced_by_its_rollback(tmp_path: Path) -> None:
+    """A real COMMIT refused for a non-capacity reason surfaces as itself, not as a budget error.
+
+    A second connection commits the same marker first, so this one's COMMIT fails on the
+    marker key after DuckDB has already ended its transaction. Its own ROLLBACK must
+    not replace that error with "no transaction is active".
+    """
+    rows = _first(random.Random(41), "prices", 3)
+    connection = _store(tmp_path / "market.duckdb")
+    _stage(connection, "prices", rows)
+    request = _request("1", parent=None, domain="prices")
+    plan = plan_generation_bulk(connection, request, budget=BUDGET)
+    rival = connection.cursor()
+
+    def commit_rival(_: duckdb.DuckDBPyConnection) -> None:
+        marker = dict(plan.marker)
+        rival.execute(
+            "INSERT INTO market_generations ("
+            + ", ".join(marker)
+            + ") VALUES ("
+            + ", ".join("?" for _ in marker)
+            + ")",
+            list(marker.values()),
+        )
+
+    with pytest.raises(duckdb.TransactionException, match="Failed to commit") as caught:
+        publish_generation_bulk(connection, request, budget=BUDGET, companion=commit_rival)
+    assert not isinstance(caught.value, ComputeResourceError)
+    assert "no transaction is active" not in str(caught.value)
+    # Only the rival's marker committed; none of this publication's rows did.
+    assert connection.execute("SELECT count(*) FROM market_generations").fetchone() == (1,)
+    assert connection.execute("SELECT count(*) FROM prices").fetchone() == (0,)
     # A COMMIT that failed has already ended its transaction; rollback accepts that.
-    bulk_generation._rollback(connection)
+    market.rollback(connection)
+    rival.close()
     connection.close()
 
 

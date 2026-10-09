@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, cast
 
 from aegis_alpha.storage.backup import copy_tree
 from aegis_alpha.storage.locks import private_directory, require_outside_checkout
-from aegis_alpha.storage.market import limit_duckdb
+from aegis_alpha.storage.market import budgeted
 from aegis_alpha.storage.paths import DEFAULT_PATHS, read_json, resolve_home
 from aegis_alpha.storage.source_library_schema import quoted
 from aegis_alpha.storage.verification import verify_workspace
@@ -171,19 +171,22 @@ def _market(workspace: Workspace, target: Path, budget: ComputeBudget | None) ->
         )
         try:
             target.chmod(0o600)
-            if budget is not None:
-                limit_duckdb(connection, budget)
-            source = str(workspace.paths.market).replace("'", "''")
-            connection.execute(f"ATTACH '{source}' AS {_SOURCE_ALIAS} (READ_ONLY)")
-            name = cast("tuple[str]", connection.execute("SELECT current_database()").fetchone())
-            connection.execute(f"COPY FROM DATABASE {_SOURCE_ALIAS} TO {quoted(name[0])} (SCHEMA)")
-            tables, selves = _ordered_tables(connection)
-            # One statement per table (or chain level): a failure leaves the new root
-            # incomplete, never the original changed.
-            for table in tables:
-                _copy_rows(connection, name[0], table, selves.get(table, []))
-            connection.execute(f"DETACH {_SOURCE_ALIAS}")
-            connection.execute("CHECKPOINT")
+            with budgeted(connection, budget, "the market compaction"):
+                source = str(workspace.paths.market).replace("'", "''")
+                connection.execute(f"ATTACH '{source}' AS {_SOURCE_ALIAS} (READ_ONLY)")
+                name = cast(
+                    "tuple[str]", connection.execute("SELECT current_database()").fetchone()
+                )
+                connection.execute(
+                    f"COPY FROM DATABASE {_SOURCE_ALIAS} TO {quoted(name[0])} (SCHEMA)"
+                )
+                tables, selves = _ordered_tables(connection)
+                # One statement per table (or chain level): a failure leaves the new root
+                # incomplete, never the original changed.
+                for table in tables:
+                    _copy_rows(connection, name[0], table, selves.get(table, []))
+                connection.execute(f"DETACH {_SOURCE_ALIAS}")
+                connection.execute("CHECKPOINT")
         finally:
             connection.close()
 

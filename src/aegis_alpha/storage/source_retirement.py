@@ -46,7 +46,7 @@ from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.engine.codec import decode_json
 from aegis_alpha.storage import source_library_schema as schema
 from aegis_alpha.storage.bulk_generation import encoded_cell_sql, stream_rowset
-from aegis_alpha.storage.market import limit_duckdb
+from aegis_alpha.storage.market import limit_duckdb, rollback
 from aegis_alpha.storage.raw import put_raw
 from aegis_alpha.storage.rowset import ROWSET_FORMAT
 from aegis_alpha.storage.source_identity import LINK_PREFIX
@@ -1097,7 +1097,7 @@ def finish_retirement(  # noqa: C901, PLR0912 -- drop, record and complete one i
                 market.execute("DROP TABLE " + schema.quoted(target))
             market.execute("COMMIT")
         except BaseException:
-            market.execute("ROLLBACK")
+            rollback(market)
             raise
     columns = (
         "source_id",

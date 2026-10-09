@@ -7,7 +7,8 @@ import json
 import math
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, localcontext
 from types import MappingProxyType
@@ -51,6 +52,12 @@ _MARKER_COLUMNS = (
 _SHA256_LENGTH = 64
 _MAX_READ_ROWS = 100_000
 _CLOSE_ONLY_NULLS = ("open", "high", "low", "volume")
+# DuckDB reports exhausting its memory limit as an OutOfMemoryException, except at
+# COMMIT, which reports the same exhaustion as a TransactionException naming the
+# allocation or block pin that failed. Any other failed COMMIT (a constraint violation,
+# a write conflict) is not a capacity error and keeps its own type.
+_COMMIT_CAPACITY = ("allocate", "failed to pin block")
+_NO_TRANSACTION = "no transaction is active"
 
 
 def initialize_market(
@@ -87,7 +94,7 @@ def initialize_market(
             )
         connection.execute("COMMIT")
     except BaseException:
-        connection.execute("ROLLBACK")
+        rollback(connection)
         raise
     return target
 
@@ -134,7 +141,7 @@ def upgrade_market(connection: duckdb.DuckDBPyConnection, installation_id: str, 
         connection.execute("UPDATE store_info SET schema_version=?", [target])
         connection.execute("COMMIT")
     except BaseException:
-        connection.execute("ROLLBACK")
+        rollback(connection)
         raise
     return validate_market(connection, installation_id)
 
@@ -626,7 +633,7 @@ def publish_generation(  # noqa: PLR0913 -- exact publication pins
         connection.executemany(sql, [[row[name] for name in names] for row in normalized])
         connection.execute("COMMIT")
     except BaseException:
-        connection.execute("ROLLBACK")
+        rollback(connection)
         raise
     return marker
 
@@ -748,6 +755,52 @@ def limit_duckdb(connection: duckdb.DuckDBPyConnection, budget: ComputeBudget) -
         _ = connection.execute(
             "SET memory_limit = ?", [f"{min(memory, budget.duckdb_memory_limit_bytes)}B"]
         )
+
+
+def capacity_error(error: BaseException) -> bool:
+    """Whether ``error`` is DuckDB running out of its memory limit, at COMMIT or before."""
+    import duckdb  # noqa: PLC0415 -- the driver's error types
+
+    return isinstance(error, duckdb.OutOfMemoryException) or (
+        isinstance(error, duckdb.TransactionException)
+        and any(phrase in str(error) for phrase in _COMMIT_CAPACITY)
+    )
+
+
+@contextmanager
+def budgeted(
+    connection: duckdb.DuckDBPyConnection, budget: ComputeBudget | None, work: str
+) -> Iterator[None]:
+    """Lower DuckDB to ``budget`` and report its memory exhaustion in ``work`` as a budget error.
+
+    Without a budget the connection keeps its configured limits and only the error is
+    reported. A ``ComputeResourceError`` keeps the DuckDB error as its cause; every other
+    error passes unchanged.
+    """
+    if budget is not None:
+        limit_duckdb(connection, budget)
+    try:
+        yield
+    except Exception as error:
+        if capacity_error(error):
+            raise ComputeResourceError(
+                f"DuckDB cannot complete {work} within admitted memory limits"
+            ) from error
+        raise
+
+
+def rollback(connection: duckdb.DuckDBPyConnection) -> None:
+    """Roll back the open transaction; a COMMIT that failed has already ended it.
+
+    So the error a failed COMMIT raised is never replaced by ROLLBACK's refusal.
+    """
+    import duckdb  # noqa: PLC0415 -- the driver's transaction error type
+
+    try:
+        _ = connection.execute("ROLLBACK")
+    except duckdb.TransactionException as error:
+        if _NO_TRANSACTION not in str(error):
+            raise
 
 
 def _admit_chain_memory(
