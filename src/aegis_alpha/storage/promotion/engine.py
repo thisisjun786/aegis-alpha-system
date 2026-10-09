@@ -1978,6 +1978,59 @@ def recover_promotion(
     return True
 
 
+def untouched_promotion_refusal(  # noqa: PLR0911 -- one reason per piece of evidence
+    workspace: Workspace, operation: Mapping[str, object]
+) -> str | None:
+    """Why a prepared promotion is not an untouched, fully evidenced intent; None if it is.
+
+    Only such an intent may stay pending through a core schema migration and the backup
+    it takes: nothing of it reached the market or the catalog, and its retained request,
+    spec and manifest still name exactly this intent, so ``aas db recover`` publishes it
+    afterwards from the same evidence. A committed generation is never carried, since
+    its catalog completion is recovery's to finish first.
+    """
+    if operation["kind"] != OPERATION_KIND or operation["phase"] != "PREPARED":
+        return "not a prepared promotion"
+    operation_id, generation_id = str(operation["operation_id"]), str(operation["target_id"])
+    if (generation_id, operation_id) != generation_identity(str(operation["request_hash"])):
+        return "its identity is not its request's"
+    market = workspace.market
+    if market.execute(
+        "SELECT 1 FROM market_generations WHERE operation_id=? OR generation_id=?",
+        [operation_id, generation_id],
+    ).fetchone():
+        return "its generation is committed; recover it first"
+    version = market_version(market)
+    tables = [name for name in DOMAINS if DOMAIN_VERSIONS[name] <= version]
+    if version >= 2:  # noqa: PLR2004 -- quality_flags arrive in v2
+        tables.append("quality_flags")
+    for table in tables:
+        if market.execute(
+            f"SELECT 1 FROM {_q(table)} WHERE generation_id=? LIMIT 1",
+            [generation_id],
+        ).fetchone():
+            return "its generation has stored rows"
+    check_id = "qc-" + hashlib.sha256(f"{generation_id}/promotion".encode()).hexdigest()
+    if workspace.state.execute(
+        "SELECT 1 FROM dataset_versions WHERE generation_id=? "
+        "UNION ALL SELECT 1 FROM quality_checks WHERE check_id=?",
+        (generation_id, check_id),
+    ).fetchone():
+        return "its generation is cataloged"
+    try:
+        spec, manifest = _evidence(workspace, operation)
+    except (KeyError, TypeError, ValueError) as error:
+        # Unreadable evidence is a refusal to carry, never a reason to drop the check.
+        return str(error) or type(error).__name__
+    if (
+        manifest.get("operation_id") != operation_id
+        or manifest.get("parent") != spec.parent
+        or operation["expected_parent"] != spec.parent
+    ):
+        return "retained promotion manifest does not match its intent"
+    return None
+
+
 def verify_promotion(
     workspace: Workspace,
     generation_id: str,

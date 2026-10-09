@@ -21,6 +21,11 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   makes ordinary admission refuse the installation until the command is repeated. Each
   step's intent has its own operation id and a request bound to that step's versions
   and checksums, so a completed step's intent still matches after later versions exist.
+  `--to N` runs the steps one at a time; every step without an intent takes its own
+  verified backup, and only a prepared step resumes without one. A step's backup alone
+  may carry untouched promotion intents (`untouched_promotion_refusal`: no marker, rows,
+  flags or catalog trace, evidence matching the intent) as PREPARED; `backup_workspace`
+  rechecks the names it is given and every other backup refuses every pending operation.
   The v1 DDL bytes are a recorded fact, so v1 is built from the v1 domains alone. A v1 store
   stays usable; writes that need a v2 table or a close-only price name the migration.
   `prices.fields` defaults to `ohlcv`, an OHLCV row reads and hashes in its v1 shape,
