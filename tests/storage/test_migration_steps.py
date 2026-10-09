@@ -15,6 +15,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Mapping
 from datetime import date
+from fractions import Fraction
 from pathlib import Path
 from typing import cast
 
@@ -27,7 +28,7 @@ from aegis_alpha.data.serialization import content_sha256
 from aegis_alpha.storage import migration, workspace
 from aegis_alpha.storage.backup import backup, backup_workspace, restore
 from aegis_alpha.storage.bulk_generation import BulkPlan, BulkRequest
-from aegis_alpha.storage.market import marker_for
+from aegis_alpha.storage.market import marker_for, publish_generation
 from aegis_alpha.storage.migration import (
     MIGRATION_OPERATION,
     CoreSchemaError,
@@ -67,6 +68,8 @@ from tests.storage.test_migration import (
     v1_installation,
     versions,
 )
+from tests.storage.test_observation_inputs import _observation_spec
+from tests.storage.test_research_inputs import _register_domain
 
 _KILLED = 137
 _ROOT = Path(__file__).resolve().parents[2]
@@ -800,6 +803,110 @@ def test_recovery_and_the_carry_share_one_replan(
         assert (plan["carried_operations"], plan["blocking_operations"]) == ([], [operation_id])
     plan = plan_core_migration(home, to_version=synthetic)
     assert plan["blocking_operations"] == []
+
+
+def test_a_carry_is_planned_alike_after_a_verification_lowered_the_connection(
+    tmp_path: Path, synthetic: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, planned = pending_promotion(tmp_path)
+    operation_id = str(planned["operation_id"])
+    with open_workspace(home, writable=True, strategy_write=True) as admitted:
+        # A published observation input, whose verification runs on a component share
+        # of the lease and leaves the connection there.
+        intent = cast("dict[str, object]", get_operation(admitted.state, operation_id))
+        _delete_operation(admitted, operation_id)
+        observed = _observation_spec(admitted, tmp_path / "observed.sqlite3")
+        _register_domain(admitted, observed, "observation")
+        _prepare_again(admitted, intent)
+    lease = ComputeBudget(Fraction(1), 32 * 1024 * 1024)
+    original = engine.plan_promotion
+    limits: list[tuple[object, ...]] = []
+
+    def traced(
+        admitted: workspace.Workspace, retained: PromotionSpec, *, budget: ComputeBudget
+    ) -> object:
+        limits.append(
+            cast(
+                "tuple[object, ...]",
+                admitted.market.execute(
+                    "SELECT current_setting('threads'), current_setting('memory_limit')"
+                ).fetchone(),
+            )
+        )
+        return original(admitted, retained, budget=budget)
+
+    monkeypatch.setattr(engine, "plan_promotion", traced)
+    plan = plan_core_migration(home, to_version=synthetic, budget=lease)
+    assert [entry["operation_id"] for entry in cast("list[dict]", plan["carried_operations"])] == [
+        operation_id
+    ]
+    report = migrate_core_schema(
+        home, to_version=synthetic, backup_output=tmp_path / "snapshot", budget=lease
+    )
+    assert (report["state"], report["pending_operations"]) == ("current", [operation_id])
+    # The plan, the migration's check and its backup's recheck each start from the
+    # installation's own limits, so the lease the plan admitted admits the migration.
+    assert len(limits) == 3  # noqa: PLR2004 -- plan, quiet check, backup recheck
+    assert len(set(limits)) == 1
+
+
+def test_a_head_moved_after_the_replan_leaves_the_promotion_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, planned = pending_promotion(tmp_path)
+    operation_id = str(planned["operation_id"])
+    shared = engine._replanned  # noqa: SLF001
+
+    def moved(
+        admitted: workspace.Workspace,
+        operation: Mapping[str, object],
+        retained: PromotionSpec,
+        budget: ComputeBudget,
+    ) -> object:
+        plan = shared(admitted, operation, retained, budget)
+        assert plan is not None
+        # Another writer's generation of the same dataset lands between the replan and
+        # its publication.
+        staged = admitted.market.execute("SELECT * FROM _aas_p_stage").fetchone()
+        assert staged is not None
+        row = dict(zip([item[0] for item in admitted.market.description], staged, strict=True))
+        row.pop("record_id")
+        row["revision_id"] = "independent-revision"
+        other = admitted.market.cursor()
+        try:
+            publish_generation(
+                other,
+                dataset_id=retained.dataset_id,
+                version="independent",
+                generation_id="independent-generation",
+                operation_id="independent-operation",
+                request_hash="f" * 64,
+                parent_id=None,
+                domain=retained.domain,
+                rows=[row],
+            )
+        finally:
+            other.close()
+        return plan
+
+    monkeypatch.setattr(engine, "_replanned", moved)
+    with open_workspace(home, writable=True) as admitted:
+        intent = cast("dict[str, object]", get_operation(admitted.state, operation_id))
+        # The publication's parent check refuses it; recovery reports the intent pending
+        # rather than failing, and drops the plan.
+        assert recover_operations(admitted) == {
+            "recovered": [],
+            "pending": [operation_id],
+            "provider_calls": 0,
+        }
+        assert get_operation(admitted.state, operation_id) == intent
+        assert admitted.market.execute(
+            "SELECT count(*) FROM market_generations WHERE generation_id=?",
+            [planned["generation_id"]],
+        ).fetchone() == (0,)
+        assert admitted.market.execute(
+            "SELECT count(*) FROM duckdb_tables() WHERE temporary"
+        ).fetchone() == (0,)
 
 
 def test_a_replan_beyond_the_lease_refuses_the_migration(

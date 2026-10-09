@@ -327,24 +327,17 @@ def _pending_operations(
 
     carried: list[dict[str, object]] = []
     blocking: list[str] = []
-    try:
-        for row in workspace.state.execute(
-            "SELECT operation_id,kind,request_hash,target_id,expected_parent,payload_hash,phase "
-            "FROM storage_operations WHERE phase='PREPARED' AND operation_id IS NOT ? "
-            "ORDER BY operation_id",
-            (excluding,),
-        ).fetchall():
-            operation = dict(row)
-            if untouched_promotion_refusal(workspace, operation, budget=budget) is None:
-                carried.append(operation)
-            else:
-                blocking.append(str(operation["operation_id"]))
-    finally:
-        # A plan lowers the connection to its budget's share; the market step applies the
-        # lease's own share right before its transaction, from the installation's limits.
-        resources = workspace.market_resources
-        workspace.market.execute("SET threads = ?", [resources["threads"]])
-        workspace.market.execute("SET memory_limit = ?", [resources["memory_limit"]])
+    for row in workspace.state.execute(
+        "SELECT operation_id,kind,request_hash,target_id,expected_parent,payload_hash,phase "
+        "FROM storage_operations WHERE phase='PREPARED' AND operation_id IS NOT ? "
+        "ORDER BY operation_id",
+        (excluding,),
+    ).fetchall():
+        operation = dict(row)
+        if untouched_promotion_refusal(workspace, operation, budget=budget) is None:
+            carried.append(operation)
+        else:
+            blocking.append(str(operation["operation_id"]))
     return carried, blocking
 
 

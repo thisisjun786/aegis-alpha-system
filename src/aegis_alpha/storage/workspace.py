@@ -251,6 +251,16 @@ class Workspace:
                 raise
             self.market = connection
 
+    def reset_market_limits(self) -> None:
+        """Return the market connection to the installation's own threads and memory limit.
+
+        A budgeted step lowers the connection to its lease's share and leaves it there; work
+        that must apply its lease's share afresh, whatever ran before it, resets first.
+        """
+        resources = self.market_resources or {"threads": 2, "memory_limit": "512MB"}
+        self.market.execute("SET threads = ?", [resources["threads"]])
+        self.market.execute("SET memory_limit = ?", [resources["memory_limit"]])
+
     def close_market(self) -> None:
         """Close the current handle, including one reopened under maintenance."""
         self.market.close()

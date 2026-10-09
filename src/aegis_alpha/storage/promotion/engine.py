@@ -2006,6 +2006,10 @@ def recover_promotion(
         if plan is None:
             return False
         _publish(workspace, plan, budget)
+    except ParentChangedError:
+        # The head moved after the replan: the intent stays pending, as for a moved
+        # head found by the replan itself.
+        return False
     finally:
         _drop(workspace.market)
     return True
@@ -2058,12 +2062,18 @@ def untouched_promotion_refusal(
     trusted. A committed generation is never carried, since its catalog completion is
     recovery's to finish first. A plan that cannot run within ``budget`` is
     ``ComputeResourceError``, never a carry.
+
+    The plan runs within ``budget``'s share of the installation's own limits, not of
+    whatever share earlier work (a verification, another plan) left on the connection, so
+    the migration's plan, its check and its backup's recheck decide alike; the connection
+    is back at the installation's limits afterwards.
     """
     if operation["kind"] != OPERATION_KIND or operation["phase"] != "PREPARED":
         return "not a prepared promotion"
     residue = _residue(workspace, str(operation["operation_id"]), str(operation["target_id"]))
     if residue is not None:
         return residue
+    workspace.reset_market_limits()
     try:
         spec, _ = _evidence(workspace, operation)
         plan = _replanned(workspace, operation, spec, budget or _DEFAULT_BUDGET)
@@ -2075,6 +2085,7 @@ def untouched_promotion_refusal(
         return str(error) or type(error).__name__
     finally:
         _drop(workspace.market)
+        workspace.reset_market_limits()
     return None if plan is not None else "its retained spec no longer plans its manifest"
 
 

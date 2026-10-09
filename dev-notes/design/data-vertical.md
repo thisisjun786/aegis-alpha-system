@@ -2211,15 +2211,18 @@ checksum, 다음 단계의 남은 부분(`steps`), 목표까지의 단계별 목
 보존 명세로 다시 만든 그대로다. 마지막으로 보존 명세를 다시 계획해 parent가 아직 dataset의 head이고
 계획한 manifest의 SHA-256이 intent의 payload hash와 같아야 한다. 이 비교는 recover가 게시하기 전에 하는
 비교와 같은 함수이므로 manifest가 적은 어떤 값도 따로 믿지 않는다. 고친 manifest를 다시 hash해 intent에
-걸어도, head가 옮겨졌거나 원천 table이 바뀌었어도 가지고 가지 않는다. 확인이 끝나면 계획의 임시
-table을 지우고 market 연결을 설치본의 자원 한도로 되돌린다. 증거를 읽거나 계획하다 난 오류는 가지고 가지
+걸어도, head가 옮겨졌거나 원천 table이 바뀌었어도 가지고 가지 않는다. 재계획은 앞선 검증이나 계획이
+연결에 남긴 몫이 아니라 설치본의 자원 한도에서 lease 몫을 새로 적용해 돌므로, `--plan`, migration의
+확인, 백업의 재확인은 같은 lease에서 같게 판정한다. 확인이 끝나면 계획의 임시 table을 지우고 market
+연결을 설치본의 자원 한도로 되돌린다. 증거를 읽거나 계획하다 난 오류는 가지고 가지
 않는 이유가 되지만, 계획이 compute lease의 몫 안에서 돌 수 없으면 `ComputeResourceError`로 거부하고
 조용히 가지고 가지 않는다. 그 밖의 PREPARED 작업, marker가 commit된 승격, 실행 중인 run은 계속 막는다.
 이 예외는 단계의 백업에만 넘겨지고 백업이 같은 조건으로 다시 확인한다. 일반 `aas db backup`과 다른
 명령의 백업은 여전히 모든 PREPARED 작업을 거부한다. 그 백업은 intent와 `raw/` 증거를 그대로 담고,
 `logical.pending_operations`는 실제 수를 세며, manifest의 `carried_operations`가 그 operation을 적는다.
 이것은 migration의 rollback snapshot이지 복구를 마친 설치본의 백업이 아니다. migration은 intent를 끝내거나
-바꾸지 않는다. 그 뒤 `aas db recover`가 같은 재계획으로 게시한다. `--plan`의 `carried_operations`는
+바꾸지 않는다. 그 뒤 `aas db recover`가 같은 재계획으로 게시한다. 재계획 뒤 게시 전에 head가 옮겨지면
+게시의 parent 확인이 거부하고, recover는 그 intent를 pending으로 남긴 채 나머지 작업을 이어 간다. `--plan`의 `carried_operations`는
 승격마다 operation·generation ID와 manifest hash를 적고 `proof`로 다시 계획해 증명했음을 밝힌다. 그래서
 `--plan`도 compute lease 안에서 실행한다.
 
@@ -2913,3 +2916,5 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-480 | promotion이 아닌 PREPARED 작업은 carry할 승격과 같은 요청·generation·manifest를 적어도 migration을 막는다 | `tests/storage/test_migration_steps.py::test_a_prepared_operation_of_another_kind_blocks` | 구현 |
 | DV-481 | migration의 carry와 recover의 게시는 한 재계획 구현을 공유해, 그 하나가 거부하면 둘 다 거부한다 | `tests/storage/test_migration_steps.py::test_recovery_and_the_carry_share_one_replan` | 구현 |
 | DV-482 | 재계획이 compute lease 안에서 돌 수 없으면 `--plan`, migration과 그 백업은 `ComputeResourceError`로 거부하고 아무것도 쓰지 않는다 | `tests/storage/test_migration_steps.py::test_a_replan_beyond_the_lease_refuses_the_migration` | 구현 |
+| DV-483 | carry 재계획은 앞선 검증이 낮춘 연결이 아니라 설치본 한도에서 lease 몫으로 돌아, `--plan`이 허용한 lease에서 migration과 그 백업도 같은 승격을 가지고 간다 | `tests/storage/test_migration_steps.py::test_a_carry_is_planned_alike_after_a_verification_lowered_the_connection` | 구현 |
+| DV-484 | 재계획 뒤 게시 전에 head가 옮겨진 승격은 recover에서 예외 없이 pending으로 남고 계획의 임시 table은 지워진다 | `tests/storage/test_migration_steps.py::test_a_head_moved_after_the_replan_leaves_the_promotion_pending` | 구현 |
