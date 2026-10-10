@@ -501,7 +501,7 @@ microsecond, 시간 입력은 `session_date` 하나다. 값 일부만 있는 bar
 (`norgate.prices_none@1`, `norgate.reference_history@1`, `norgate.fx_history@1`)는 `norgate-history-csv-`
 원천만 받는다.
 
-분류 매퍼 `norgate.classification@1`, `sec.sic@1`, `kind.industry@1`은 [분류](#분류)가 소유한다.
+분류 매퍼 `norgate.classification@1`, `sec.sic@1`, `kind.industry@1`, `kind.industry@2`는 [분류](#분류)가 소유한다.
 
 기업행동과 상장 상태 매퍼(`norgate.dividends@1`, `norgate.capital_adjustments@1`, `fmp.dividends@1`,
 `fmp.splits@1`, `norgate.status@1`)는 [기업행동과 상장 상태 매퍼](#기업행동과-상장-상태-매퍼)가 소유한다.
@@ -941,6 +941,7 @@ KRX 토요일 session은 확인되지 않은 반일 마감 대신 평일 마감�
 | `norgate.classification@1` | Norgate security master(`assetid`, `subtype1`..`subtype3`, `exchange`, `exchange_full`, 텍스트 `first_date`·`last_date`). 인자 `scheme`과 내보내기 날짜 `as_of` | instrument `mint('norgate_assetid', assetid)`. `norgate.security_type`: code는 유형 경로 `subtype1 > subtype2 > subtype3`(있는 단계만, 건너뛴 단계 없이), label은 가장 구체적인 단계. `norgate.exchange`: code는 `exchange`, label은 `exchange_full` |
 | `sec.sic@1` | `aas import sec-companies`가 SEC submissions archive에서 commit한 `companies` 테이블. 인자 `as_of`는 archive 수집 날짜 | issuer `mint('sec_cik', member의 10자리 CIK)`. code는 네 자리 SIC, label은 `sicDescription` |
 | `kind.industry@1` | `aas identity kr-import`가 commit한 KIND 상장 목록(`short_code`, `industry`, `retrieved_at_utc`). 인자 없음 | instrument는 identity key(`kind`, `krx_short_code`)를 수집 시각에 해석한 값. `as_of`는 그 수집 시각의 Asia/Seoul 날짜. KIND 업종은 코드가 없으므로 code와 label이 모두 업종 원문 |
+| `kind.industry@2` | `kind.industry@1`과 같은 열. 인자 없음 | `kind.industry@1`과 같되, (`short_code`, `industry`, `retrieved_at_utc`)가 같은 원천 행은 한 번만 매핑한다. 그중 원천 행 hash가 가장 작은 행, 같으면 가장 낮은 (`_aas_pin`, `_aas_ordinal`)의 행이 매핑되고 provenance도 그 행의 것이다 |
 
 - Norgate: asset ID가 양의 정수(18자리 이하)가 아니거나 `first_date`·`last_date`가 `as_of`보다 늦은
   행(선언한 내보내기 날짜와 모순)은 주체가 없고, 유형 단계가 비거나 건너뛴 행과 거래소 이름이 빈 행은
@@ -950,6 +951,12 @@ KRX 토요일 session은 확인되지 않은 반일 마감 대신 평일 마감�
   다른 CIK를 말하는 문서는 주체가 없다. 네 자리가 아닌 SIC는 코드가 없다. 설명 없이 SIC만 싣는 회사(미배정 `0000` 포함)는 분류가 없는 행이다.
 - KIND: `retrieved_at_utc`가 `Z`로 끝나는 UTC 시각이 아니면 수집 시각과 날짜가 없어 거부된다.
   snapshot에서 해석되지 않는 단축코드는 다른 승격처럼 미해결 보고에 남는다.
+- KIND 목록은 한 회사를 분류가 읽지 않는 열(행정구역 통합 전후의 `지역` 등)만 다른 두 행으로 싣기도 하고,
+  `aas identity kr-import`는 원본 행을 모두 남긴다. `kind.industry@1`은 그런 행마다 분류 행을 내므로 같은
+  natural key가 반복돼 승격이 거부된다. `kind.industry@2`는 그런 행을 한 번만 매핑하고 나머지는 선택되지
+  않은 원천 행으로 남긴다. 원천 행 hash는 행 내용만으로 정해지므로 수집 순서가 달라도 같은 행과 같은 hash가
+  나온다. 한 수집 시각에 같은 단축코드가 다른 업종으로 실린 두 행은 둘 다 매핑돼 반복된 natural key로
+  거부되고, 어느 업종도 고르지 않는다.
 
 `aas import sec-companies --source SOURCE_ID [--plan]`은 `sec.submissions_zip@1`로 편입한
 `sec-submissions-zip-*` 내용 원천의 member 색인으로 `raw/`의 archive를 읽고, `CIK##########.json`
@@ -1078,7 +1085,7 @@ ASCII escape와 바이트까지 같다.
 | `fx.usdkrw.fred` | `fx_rates` | canonical | `fred.fx_series@1` | `unknown_null@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | FRED DEXKOUS(legacy CSV 편입본과 ALFRED 수집). H.10 발표 지연 때문에 strict 읽기는 고르지 않는다. 우선순위는 소비자 pin |
 | `classifications.us.norgate` | `classifications` | canonical | `norgate.classification@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | Norgate 증권 유형(`norgate.security_type`)과 상장 거래소(`norgate.exchange`) snapshot, 과거로 소급하지 않음. [분류](#분류) |
 | `classifications.us.sec` | `classifications` | canonical | `sec.sic@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | SEC SIC(`sec.sic`) snapshot, issuer 주체 |
-| `classifications.kr.kind` | `classifications` | canonical | `kind.industry@1` | `source_column@1` | 없음 | 없음 | 없음 | 아니오 | KIND 업종(`kind.industry`) snapshot, 단축코드를 identity snapshot으로 해석, 수집 시각부터 알려짐 |
+| `classifications.kr.kind` | `classifications` | canonical | `kind.industry@1`, `kind.industry@2` | `source_column@1` | 없음 | 없음 | 없음 | 아니오 | KIND 업종(`kind.industry`) snapshot, 단축코드를 identity snapshot으로 해석, 수집 시각부터 알려짐 |
 
 identity 원천(Norgate master, SEC submissions, FMP profile, DART 고유번호, KIND 목록)은 typed generation이
 아니라 [identity 등록](#identity-등록과-chunked-문서)으로 state에 들어간다. 지수 구성과 상장 universe도
@@ -1527,7 +1534,7 @@ template의 snapshot을 그대로 쓴다. US identity 원천(Norgate master, FMP
 | `fundamentals.kr.dart` | `dart.fnltt@1` | `opendart-receipts-*` `receipts` | |
 | `macro.us.alfred` | `fred.alfred@1` | `fred-alfred-observations-*` `observations` | |
 | `fx.usdkrw.fred` | `fred.fx_series@1` | `fred-series-csv-*` `observations` | |
-| `classifications.kr.kind` | `kind.industry@1` | `kind-listings-*` `listings` | |
+| `classifications.kr.kind` | `kind.industry@2` | `kind-listings-*` `listings` | |
 | `prices.us.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.US` |
 | `prices.kr.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.KO`·`.KQ` |
 | `prices.kr.eodhd` | `eodhd.bulk_quarantine@1` | `qveris-bulk-quarantine-*` `quarantine` | 사유 `provider_reported_partial`, 거래소 `KO`·`KQ` |
@@ -2982,3 +2989,4 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-499 | runbook 리허설과 4단계 승격 루프는 첫 실패에서 0이 아닌 상태로 멈추고 리허설 설치본·migration 백업·보고를 남기며 정리는 아무것도 지우지 않는다 | `tests/application/test_cutover.py::test_a_failed_rehearsal_stops_and_keeps_its_root_backups_and_reports` | 구현 |
 | DV-500 | 끝까지 마친 리허설만 완료 표시를 남기고 리허설 정리는 그 리허설의 출력만 지운다 | `tests/application/test_cutover.py::test_a_finished_rehearsal_is_the_only_one_its_cleanup_removes` | 구현 |
 | DV-501 | 리허설 채택은 계획 확인 뒤 별도 블록에서 실행되고 migration 검증이 실패하면 `recover` 전에 멈춘다 | `tests/application/test_cutover.py::test_an_adopted_rehearsal_stops_before_recover_when_its_migration_check_fails` | 구현 |
+| DV-502 | `kind.industry@2`는 업종 판정에 쓰지 않는 열만 다른 원천 행을 instrument당 한 분류 행으로 승격하고 입력 행 순서와 무관하게 같은 record·revision hash를 내며, 한 수집 시각에 업종이 다른 두 행은 거부한다 | `tests/storage/test_classifications.py::test_kind_industry_v2_maps_repeated_rows_once` | 구현 |

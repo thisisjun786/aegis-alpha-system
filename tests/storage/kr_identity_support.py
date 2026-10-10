@@ -21,7 +21,7 @@ from aegis_alpha.storage.raw import put_raw
 from aegis_alpha.storage.source_identity import LINK_PREFIX, SourceContent, SourceFile
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
     from pathlib import Path
 
     from aegis_alpha.storage.workspace import Workspace
@@ -145,24 +145,29 @@ def kind_listing(  # noqa: PLR0913 -- one synthetic receipt spells every field a
     header: tuple[str, ...] = _HEADER,
     status: int = 200,
     industries: Mapping[str, str] | None = None,
+    cells: Sequence[tuple[str | None, str]] | None = None,
 ) -> tuple[bytes, bytes]:
     """A KIND receipt and its EUC-KR HTML table; each row is (name, short code, listed on).
 
     ``industries`` gives a short code's industry text; any other row's is ``제조업``.
+    ``cells`` gives each row, by position, its (industry, 지역) text; a None industry
+    keeps the one ``industries`` gives, and a row past the list is in ``서울특별시``.
     """
-    cells = "".join(f"<th>{name}</th>" for name in header)
+    heads = "".join(f"<th>{name}</th>" for name in header)
     industry = industries or {}
+    given = list(cells or [])
+    given += [(None, "서울특별시")] * (len(rows) - len(given))
     body = "".join(
         "<tr>"
         f"<td>{name}</td><td>\n\t\t유가\n\t</td>"
         f"<td style=\"mso-number-format:'@';\">{code}</td>"
-        f"<td>{industry.get(code, '제조업')}</td><td>합성 제품</td><td>{listed}</td><td>12월</td>"
-        "<td>대표</td><td> http://example.invalid </td><td>서울특별시</td></tr>"
-        for name, code, listed in rows
+        f"<td>{stated or industry.get(code, '제조업')}</td><td>합성 제품</td><td>{listed}</td>"
+        f"<td>12월</td><td>대표</td><td> http://example.invalid </td><td>{region}</td></tr>"
+        for (name, code, listed), (stated, region) in zip(rows, given, strict=False)
     )
     raw = (
         '<html><head><meta charset="euc-kr"/></head><body><table>'
-        f"<tr>{cells}</tr>{body}</table></body></html>"
+        f"<tr>{heads}</tr>{body}</table></body></html>"
     ).encode("euc-kr")
     fingerprint = hashlib.sha256(list_id.encode()).hexdigest()
     receipt = {

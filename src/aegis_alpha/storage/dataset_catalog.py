@@ -248,7 +248,7 @@ CATALOG: Final[tuple[CatalogEntry, ...]] = (
         "classifications.kr.kind",
         "classifications",
         "canonical",
-        ("kind.industry@1",),
+        ("kind.industry@1", "kind.industry@2"),
         ("source_column@1",),
     ),
 )

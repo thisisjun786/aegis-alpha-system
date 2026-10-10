@@ -363,9 +363,10 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   before its ex-date. The receipt (`aas-adjusted-read-v1`) carries both head-read receipts
   and the withheld rules.
 - `promotion/mappers/classifications.py` promotes snapshot classifications
-  (`norgate.classification@1`, `sec.sic@1`, `kind.industry@1`). A row starts at its
-  snapshot's date and is never extended into the past; a later snapshot adds rows of its
-  own date. A subject whose source carries its permanent anchor (Norgate asset ID, SEC CIK)
+  (`norgate.classification@1`, `sec.sic@1`, `kind.industry@1`, `kind.industry@2`, which
+  maps KIND rows repeated on short code, industry and collection instant once). A row
+  starts at its snapshot's date and is never extended into the past; a later snapshot adds
+  rows of its own date. A subject whose source carries its permanent anchor (Norgate asset ID, SEC CIK)
   is minted in SQL exactly as `identity.mint_*` does and pins no identity snapshot; a KRX
   short code resolves `subject_id` through the pinned snapshot. `sec_companies` owns
   `aas import sec-companies`, which commits each CIK document's header from a retained

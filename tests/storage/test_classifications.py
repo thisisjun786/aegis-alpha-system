@@ -545,6 +545,131 @@ def test_kind_industries_resolve_short_codes_through_the_snapshot(ws: Workspace)
     assert _read(ws, generation, cutoff=observed) == expected
 
 
+def test_kind_industry_v2_maps_repeated_rows_once() -> None:
+    at = "2026-09-05T15:30:00Z"
+    merged = ("100010", "반도체 제조업", at, "전남광주통합특별시", "b")
+    before = ("100010", "반도체 제조업", at, "전라남도", "a")
+    other = ("100020", "은행 및 저축기관", at, "서울특별시", "c")
+    split = [
+        ("100030", "제조업", at, "서울특별시", "d"),
+        ("100030", "도매업", at, "부산광역시", "e"),
+    ]
+    later = ("100010", "반도체 제조업", "2026-09-05T15:31:00Z", "전라남도", "f")
+
+    def mapped(name: str, rows: Sequence[tuple[str, ...]]) -> list[tuple[object, ...]]:
+        connection = duckdb.connect()
+        connection.execute("SET TimeZone='UTC'")
+        connection.execute(
+            "CREATE TABLE src (_aas_pin INTEGER, _aas_ordinal BIGINT, _aas_row_hash VARCHAR, "
+            "short_code VARCHAR, industry VARCHAR, retrieved_at_utc VARCHAR, region VARCHAR)"
+        )
+        connection.executemany(
+            "INSERT INTO src VALUES (0, ?, ?, ?, ?, ?, ?)",
+            [(index, row[4], *row[:4]) for index, row in enumerate(rows)],
+        )
+        return connection.execute(
+            "SELECT _aas_row_hash, _aas_id_token, _aas_id_at_us, code, label, effective_from "  # noqa: S608
+            f"FROM ({mapper(name).select('src', {})}) ORDER BY _aas_row_hash"
+        ).fetchall()
+
+    rows = [merged, other, before, *split, later]
+    once = mapped("kind.industry@2", rows)
+    # One row per (short code, industry, instant): the smallest row hash, in any order.
+    assert [row[0] for row in once] == ["a", "c", "d", "e", "f"]
+    assert mapped("kind.industry@2", rows[::-1]) == once
+    assert mapped("kind.industry@2", [before, merged]) == mapped(
+        "kind.industry@2", [merged, before]
+    )
+    # Two industries of one short code at one instant both map, for the engine to refuse.
+    assert [row[3] for row in once if row[1] == "100030"] == ["제조업", "도매업"]
+    every = mapped("kind.industry@1", rows)
+    assert [row[0] for row in every] == ["a", "b", "c", "d", "e", "f"]
+    assert [row[1:] for row in every if row[0] != "b"] == [row[1:] for row in once]
+    with pytest.raises(ValueError, match=r"kind\.industry@2 takes no arguments"):
+        mapper("kind.industry@2").check_args({"x": 1})
+
+
+def _kind_world(
+    workspace: Workspace, cells: Sequence[tuple[str | None, str]], codes: Sequence[str]
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Commit a KIND list of ``codes`` and snapshot it; the listings pin and the identity."""
+    listed = isin("710000100")
+    job = eodhd_unit(*eodhd_job([symbol("100010", listed)]))
+    import_unit(workspace, job)
+    rows = [("합성전자", code, "1975-06-11") for code in codes]
+    kind = kind_unit(*kind_listing(rows, cells=cells))
+    committed = import_unit(workspace, kind)
+    registry = build_from_workspace(
+        workspace, eodhd=[job.content.source_id], kind=[kind.content.source_id]
+    )
+    register_identities(
+        workspace.state,
+        decode_registry(registry.raw(), expected_file_sha256=registry.sha256()),
+        apply=True,
+    )
+    snapshot = snapshot_identities(workspace.state, "kr", created_at_us=5, apply=True)
+    identity = {
+        "snapshot_id": str(snapshot["snapshot_id"]),
+        "content_hash": str(snapshot["content_hash"]),
+    }
+    pin = {
+        "source_id": kind.content.source_id,
+        "source_sha256": kind.content.sha256,
+        "table": "listings",
+        "digest": str(committed["digest"]),
+    }
+    return pin, identity
+
+
+def _kind_spec(name: str, pin: dict[str, str], identity: dict[str, str]) -> tuple[bytes, str]:
+    return _spec(
+        [pin],
+        name,
+        {},
+        dataset="classifications.kr.kind",
+        rule=OBSERVED_RULE,
+        identity=identity,
+    )
+
+
+def test_kind_industry_v2_publishes_one_row_per_instrument_in_any_row_order(
+    tmp_path: Path,
+) -> None:
+    regions = [(None, "전남광주통합특별시"), (None, "전라남도")]
+    stored = []
+    for order, cells in (("a", regions), ("b", regions[::-1])):
+        initialize(tmp_path / order)
+        with open_workspace(tmp_path / order, writable=True, strategy_write=True) as workspace:
+            pin, identity = _kind_world(workspace, cells, ["100010", "100010"])
+            refused = promote(workspace, *_kind_spec("kind.industry@1", pin, identity), apply=False)
+            assert refused["published"] is False
+            assert "1 natural keys repeat across 2 source rows" in cast(
+                "list[str]", refused["refusals"]
+            )
+            applied = promote(workspace, *_kind_spec("kind.industry@2", pin, identity), apply=True)
+            assert applied["published"] is True, applied["refusals"]
+            assert applied["rows"] == {"ok": 1}
+            assert applied["unselected_rows"] == 1
+            stored.append(
+                workspace.market.execute(
+                    "SELECT subject_id, code, record_id, revision_id, source_row_hash "
+                    "FROM classifications WHERE generation_id=?",
+                    [str(applied["generation_id"])],
+                ).fetchall()
+            )
+    assert len(stored[0]) == 1
+    assert stored[0][0][:2] == (mint_instrument("krx_isin", isin("710000100")), "제조업")
+    assert stored[0] == stored[1]
+
+
+def test_kind_industry_v2_refuses_two_industries_at_one_instant(ws: Workspace) -> None:
+    cells = [("반도체 제조업", "전라남도"), ("은행 및 저축기관", "전라남도")]
+    pin, identity = _kind_world(ws, cells, ["100010", "100010"])
+    planned = promote(ws, *_kind_spec("kind.industry@2", pin, identity), apply=False)
+    assert planned["published"] is False
+    assert "1 natural keys repeat across 2 source rows" in cast("list[str]", planned["refusals"])
+
+
 def _submissions(documents: Mapping[str, Mapping[str, object] | bytes]) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:

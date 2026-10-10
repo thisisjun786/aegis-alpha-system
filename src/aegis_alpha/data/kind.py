@@ -5,7 +5,8 @@ its Excel download button sends. A list is named only by its market: asking agai
 another day is another attempt of the same request. The receipt this module builds is
 the shape ``storage.kr_identity.kind_unit`` reads (request ``source_id``, HTTP status,
 response size and SHA-256, retrieval instant), so a collected list commits as a
-``kind-listings`` content source that ``kind.listings@1`` and ``kind.industry@1`` read.
+``kind-listings`` content source that ``kind.listings@1`` and ``kind.industry@1``/``@2``
+read.
 """
 
 from __future__ import annotations

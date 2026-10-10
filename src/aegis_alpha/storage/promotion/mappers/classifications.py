@@ -42,7 +42,18 @@ SIC or no description has no classification. A company whose latest filing is af
 (``short_code``, ``industry``, ``retrieved_at_utc``). The instrument is the snapshot's
 resolution of (``kind``, ``krx_short_code``) at the collection instant, and ``as_of`` is
 that instant's date in Asia/Seoul. KIND names an industry without a code, so the code and
-the label are both its text.
+the label are both its text. Every source row with an industry maps to a row.
+
+``kind.industry@2`` reads the same columns and maps them the same way, except that source
+rows equal in (``short_code``, ``industry``, ``retrieved_at_utc``) map once. KIND repeats
+a company on rows that differ only in a column no classification reads (the 지역 region
+of an administrative merger, for one), and ``aas identity kr-import`` keeps every raw row.
+Of such rows the one with the smallest source row hash maps, then the lowest
+(``_aas_pin``, ``_aas_ordinal``), and its provenance is the row's; the hash depends only on
+the row's content, so the classification rows and their hashes do not depend on the order
+in which the rows were collected. The other rows stay in the source, unselected. Two rows
+of one short code at one instant with different industries both map, and the promotion
+refuses the repeated natural key rather than choosing an industry.
 """
 
 from __future__ import annotations
@@ -72,6 +83,9 @@ INDUSTRY: Final = "kind.industry"
 KIND_ZONE: Final = "Asia/Seoul"
 TYPE_SEPARATOR: Final = " > "
 COMPANIES_PREFIX: Final = "sec-submissions-companies-"
+# kind.industry@2 maps source rows repeated on (short_code, industry, retrieved_at_utc) once.
+_KIND_COLLAPSED: Final = 2
+_KIND_MAJORS: Final = frozenset({1, _KIND_COLLAPSED})
 
 
 def _observed_us(text: str) -> str:
@@ -264,8 +278,9 @@ class SecSic:
 
 
 class KindIndustry:
+    """``kind.industry@1`` maps every source row; ``@2`` maps each repeated row once."""
+
     name: Final = "kind.industry"
-    major: Final = 1
     provider: Final = "kind"
     domain: Final = "classifications"
     source_prefixes: Final = ()
@@ -276,9 +291,14 @@ class KindIndustry:
     expands: Final = False
     time_inputs: Final[Mapping[str, InputKind]] = {"observed_at": "utc_us", "as_of": "date"}
 
+    def __init__(self, major: int = 1) -> None:
+        if major not in _KIND_MAJORS:
+            raise ValueError(f"kind.industry has no major {major}")
+        self.major = major
+
     def check_args(self, args: Mapping[str, object]) -> None:
         if args:
-            raise ValueError("kind.industry@1 takes no arguments")
+            raise ValueError(f"kind.industry@{self.major} takes no arguments")
 
     def source_columns(self) -> Mapping[str, frozenset[str]]:
         return {"short_code": _TEXT, "industry": _TEXT, "retrieved_at_utc": _TEXT}
@@ -298,6 +318,13 @@ class KindIndustry:
         del args
         observed = _observed_us("retrieved_at_utc")
         local = _kind_day("_k_observed")
+        once = ""
+        if self.major == _KIND_COLLAPSED:
+            # Content first, so the kept row does not depend on the collection order.
+            once = (
+                " QUALIFY row_number() OVER (PARTITION BY short_code, industry, "
+                "retrieved_at_utc ORDER BY _aas_row_hash NULLS LAST, _aas_pin, _aas_ordinal) = 1"
+            )
         return (
             _COMMON
             + "_k_observed AS _aas_ingested_at_us, "
@@ -308,5 +335,5 @@ class KindIndustry:
             + f"{sql_literal(INDUSTRY)} AS scheme, industry AS code, industry AS label, "
             + f"{local} AS effective_from, CAST(NULL AS DATE) AS effective_to FROM ("
             + f"SELECT *, {observed} AS _k_observed FROM {source} "
-            + f"WHERE {_nonempty('industry')}))"
+            + f"WHERE {_nonempty('industry')}{once}))"
         )

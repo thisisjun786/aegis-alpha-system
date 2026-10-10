@@ -125,7 +125,7 @@ ROUTES: Final = (
     Route("fundamentals.kr.dart", "dart.fnltt@1", "opendart-receipts-", "receipts"),
     Route("macro.us.alfred", "fred.alfred@1", "fred-alfred-observations-", "observations"),
     Route("fx.usdkrw.fred", "fred.fx_series@1", "fred-series-csv-", "observations"),
-    Route("classifications.kr.kind", "kind.industry@1", "kind-listings-", "listings"),
+    Route("classifications.kr.kind", "kind.industry@2", "kind-listings-", "listings"),
     Route("prices.us.eodhd", "eodhd.bars@1", "qveris-bulk-bars-", "bars", _US_SYMBOL),
     Route("prices.kr.eodhd", "eodhd.bars@1", "qveris-bulk-bars-", "bars", _KR_SYMBOL),
     Route("prices.kr.eodhd", "eodhd.bulk_quarantine@1", "qveris-bulk-quarantine-",
