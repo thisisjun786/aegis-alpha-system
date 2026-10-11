@@ -93,6 +93,9 @@ KIND_COLUMNS: Final = (
     "region",
     "retrieved_at_utc",
 )
+# The columns ``kind.listings@1`` reads; a ``kind-listings`` table without them (the
+# ``korea.public_response@1`` legacy import) is no KR identity source.
+KIND_REQUIRED: Final = ("short_code", "listed_on", "retrieved_at_utc")
 EODHD_COLUMNS: Final = (
     "exchange_code",
     "delisted",
@@ -666,7 +669,7 @@ def map_kind_listings(sources: Sequence[SourceRows]) -> tuple[list[ListingClaim]
     report = MapperReport()
     claims: list[ListingClaim] = []
     for source in sources:
-        _require(source, ("short_code", "listed_on", "retrieved_at_utc"), KIND_MAPPER)
+        _require(source, KIND_REQUIRED, KIND_MAPPER)
         for row, row_hash in source.records():
             report.rows += 1
             code, listed = row["short_code"], row["listed_on"]

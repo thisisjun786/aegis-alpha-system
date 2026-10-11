@@ -1513,18 +1513,22 @@ SystemExit) 정산하지 않는다. 그 `started` attempt는 다음 실행이 �
 적재하고, 없으면 `waiting_for_identity`로 보고한다. 완료된 KR 종목 목록 job은 [KR 등록](#kr-등록)의
 `qveris-eodhd-exchange-symbols-*` 원천이 된다.
 
-**identity 증분.** commit된 KR identity 원천(EODHD KR 종목 목록, KIND 목록, 완료된 `corp_codes` 답을 담은
-OpenDART receipts 테이블) 중 `sl:` 연결이 가장 새로운 유지보수 snapshot보다 늦은 것이 있거나 유지보수 snapshot이
+**identity 증분.** commit된 KR identity 원천(EODHD KR 종목 목록, `kind.listings@1`이 읽는 열(`short_code`,
+`listed_on`, `retrieved_at_utc`)이 있는 KIND 목록, 완료된 `corp_codes` 답을 담은 OpenDART receipts 테이블) 중 `sl:` 연결이 가장 새로운 유지보수 snapshot보다 늦은 것이 있거나 유지보수 snapshot이
 없으면, 등록된 KR assertion이 인용하는 모든 원천과 그 새 원천으로 KR registry 문서를 만들어 등록한다. 같은 행은
 재사용되고 충돌은 문서 전체를 거부한다. 유지보수 identity snapshot은 등록된 모든 assertion의 snapshot이고 ID는
 `maintain-`과 정렬한 assertion ID 목록의 SHA-256 앞 32자다. 그래서 registry가 그대로면 같은 snapshot이고
 assertion 집합이 바뀐 실행만 새 snapshot을 등록한다. 아무것도 등록하지 않았고 유지보수 snapshot이 없으면 승격
 template의 snapshot을 그대로 쓴다. US identity 원천(Norgate master, FMP profile, SEC archive)은 동결된 전환
-입력이라 유지보수 증분이 없다.
+입력이라 유지보수 증분이 없다. `korea.public_response@1` legacy import가 commit한 `kind-listings-*`
+`listings` 테이블은 원천 ID 접두어와 테이블 이름이 같지만 그 열이 없으므로 KR identity 원천이 아니다. 단계는
+그런 원천을 건너뛰고 보고의 `skipped_sources`(`kind`)에 원천 ID로 남긴다.
 
 **승격.** route 하나는 카탈로그 dataset 하나, 그것을 만드는 등록 매퍼, 수집 원천 모양(원천 ID 접두어와 테이블),
 여러 dataset이 나누는 모양이면 route한 테이블의 모든 행이 만족할 조건이다. 일부 행만 만족하는 테이블은
-`mixed`로 건너뛰고 빈 테이블은 `empty`다.
+`mixed`로 건너뛰고 빈 테이블은 `empty`다. route 매퍼가 읽는 열(`source_columns`)이 하나라도 없는 테이블은 같은
+접두어와 테이블 이름을 쓰는 다른 모양(`korea.public_response@1` legacy import의 `kind-listings`)이므로 `shape`로
+건너뛴다.
 
 | dataset | 매퍼 | 원천 | 조건 |
 | --- | --- | --- | --- |
@@ -1534,15 +1538,19 @@ template의 snapshot을 그대로 쓴다. US identity 원천(Norgate master, FMP
 | `fundamentals.kr.dart` | `dart.fnltt@1` | `opendart-receipts-*` `receipts` | |
 | `macro.us.alfred` | `fred.alfred@1` | `fred-alfred-observations-*` `observations` | |
 | `fx.usdkrw.fred` | `fred.fx_series@1` | `fred-series-csv-*` `observations` | |
-| `classifications.kr.kind` | `kind.industry@2` | `kind-listings-*` `listings` | |
+| `classifications.kr.kind` | `kind.industry@2`, 이어 받는 `kind.industry@1` | `kind-listings-*` `listings` | `short_code`·`industry`·`retrieved_at_utc` 열 |
 | `prices.us.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.US` |
 | `prices.kr.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.KO`·`.KQ` |
 | `prices.kr.eodhd` | `eodhd.bulk_quarantine@1` | `qveris-bulk-quarantine-*` `quarantine` | 사유 `provider_reported_partial`, 거래소 `KO`·`KQ` |
 | `prices.kr.eodhd.ref` | `eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1` | 위 두 모양 | 위와 같음 |
 
-route는 chain을 이어 붙일 뿐 시작하지 않는다. template은 그 dataset에서 route의 매퍼를 쓴 가장 늦은 committed
-generation의 명세(운영자의 백필이거나 앞선 유지보수 generation)다. head가 없으면 `no_head`, 그 매퍼의 generation이
-없으면 `no_template`로 보고하고 아무것도 쓰지 않는다. 유지보수 명세는 template에서 다음만 바꾼다.
+route는 chain을 이어 붙일 뿐 시작하지 않는다. template은 그 dataset에서 route의 매퍼, 또는 route가 이어 받는
+이전 major 매퍼를 쓴 가장 늦은 committed generation의 명세(운영자의 백필이거나 앞선 유지보수 generation)이고,
+chain은 그 generation의 매퍼로 이어진다. 그래서 `classifications.kr.kind`는 가장 늦은 generation이
+`kind.industry@1`인 chain을 `@1`로 잇고, 운영자가 `kind.industry@2`로 게시한 chain(새 chain이거나 `@1` chain 위의
+`@2` generation)은 그때부터 `@2`로 잇는다. `@1`에서 `@2`로 넘어가는 것은 운영자의 `@2` 게시이고 유지보수는 chain의
+매퍼를 바꾸지 않는다. head가 없으면 `no_head`, 그 매퍼들의 generation이 없으면 `no_template`로 보고하고 아무것도
+쓰지 않는다. 보고의 `mapper`는 chain을 이은 매퍼다. 유지보수 명세는 template에서 다음만 바꾼다.
 
 - `target.parent`: dataset head.
 - `sources`: 새 원천 테이블 하나.
@@ -1570,7 +1578,7 @@ generation, 결과 `promoted`·`unchanged`)를 남긴다. 검사 ID는 (dataset,
 
 매퍼가 아직 없는 dataset(`actions.us.eodhd`·`actions.kr.eodhd`의 Qveris `splits`·`dividends`, `status.kr.kind`,
 identity가 해석한 US 보류 행의 `prices.us.eodhd` 재처리)의 수집 원천은 승격하지 않고 `unmapped`에 dataset별
-테이블 수로 남는다.
+테이블 수로 남는다. `status.kr.kind`는 `kind.listings@1`이 읽는 열이 있는 KIND 목록만 센다.
 
 **보고와 종료 코드.** 실행 보고(`aas-maintain-report-v1`)는 단계마다의 결과, 실패한 단계, 멈춘 공급자를 담고
 정확한 bytes를 `raw/`에, 같은 bytes를 `<runtime>/maintain-report.json`에 둔다. 종료 코드는 모든 단계가
@@ -2990,3 +2998,6 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-500 | 끝까지 마친 리허설만 완료 표시를 남기고 리허설 정리는 그 리허설의 출력만 지운다 | `tests/application/test_cutover.py::test_a_finished_rehearsal_is_the_only_one_its_cleanup_removes` | 구현 |
 | DV-501 | 리허설 채택은 계획 확인 뒤 별도 블록에서 실행되고 migration 검증이 실패하면 `recover` 전에 멈춘다 | `tests/application/test_cutover.py::test_an_adopted_rehearsal_stops_before_recover_when_its_migration_check_fails` | 구현 |
 | DV-502 | `kind.industry@2`는 업종 판정에 쓰지 않는 열만 다른 원천 행을 instrument당 한 분류 행으로 승격하고 입력 행 순서와 무관하게 같은 record·revision hash를 내며, 한 수집 시각에 업종이 다른 두 행은 거부한다 | `tests/storage/test_classifications.py::test_kind_industry_v2_maps_repeated_rows_once` | 구현 |
+| DV-503 | `classifications.kr.kind` route는 가장 늦은 generation이 `kind.industry@1`인 chain을 `@1`로 잇고(`no_template` 없음), `@2` generation이 게시된 chain은 `@2`로 잇는다 | `tests/storage/test_maintain_kind.py::test_a_kind_chain_continues_with_the_mapper_of_its_latest_generation` | 구현 |
+| DV-504 | legacy `korea.public_response@1` 모양의 `kind-listings` 원천은 identity 증분과 `classifications.kr.kind` route가 건너뛰고 보고하며, `kr-import` 모양의 원천은 그대로 쓴다 | `tests/storage/test_maintain_kind.py::test_legacy_shaped_kind_listings_are_skipped_and_reported` | 구현 |
+| DV-505 | legacy 모양의 `kind-listings` 원천이 있는 설치본의 `aas maintain plan --promotions`는 identity와 승격 단계를 실패 없이 계획한다 | `tests/application/test_maintain.py::test_a_plan_skips_legacy_shaped_kind_listings` | 구현 |

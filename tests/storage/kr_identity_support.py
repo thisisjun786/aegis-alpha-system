@@ -17,6 +17,7 @@ import pyarrow as pa
 from aegis_alpha.identity.records import IdentifierType, IdentifierValueError, normalize_identifier
 from aegis_alpha.storage import source_library
 from aegis_alpha.storage.kr_identity import SourceRows
+from aegis_alpha.storage.legacy_import.public import LISTINGS_COLUMNS
 from aegis_alpha.storage.raw import put_raw
 from aegis_alpha.storage.source_identity import LINK_PREFIX, SourceContent, SourceFile
 
@@ -181,6 +182,24 @@ def kind_listing(  # noqa: PLR0913 -- one synthetic receipt spells every field a
         "status": status,
     }
     return json.dumps(receipt).encode(), raw
+
+
+def commit_legacy_kind_listing(workspace: Workspace, code: str = "100010") -> str:
+    """Commit a ``kind-listings`` table in the ``korea.public_response@1`` legacy shape.
+
+    Its source ID prefix and table name are those of a KIND list ``aas identity kr-import``
+    commits, but it has none of the ``kind.listings@1`` columns. Returns its source ID.
+    """
+    _, digest, size = put_raw(workspace.paths.raw, f"synthetic legacy KIND {code}".encode())
+    content = SourceContent("kind", "listings", 1, (SourceFile(digest, size),))
+    types = {"string": pa.string(), "int64": pa.int64()}
+    schema = pa.schema([(name, types[kind]) for name, kind in LISTINGS_COLUMNS])
+    values = {"stock_code": [code], "company_name": ["합성전자"], "market": ["유가"],
+              "listed_on": ["1975-06-11"], "fiscal_month": [12], "raw_fields": ["{}"],
+              "source_rows": ["[]"]}  # fmt: skip
+    table = pa.table(values, schema=schema)
+    source_library.import_content_arrow(workspace, content, "listings", table.to_reader())
+    return content.source_id
 
 
 def write_kind_listing(directory: Path, receipt: bytes, raw: bytes) -> Path:

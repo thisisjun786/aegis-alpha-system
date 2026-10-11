@@ -4,12 +4,18 @@ A route names one dataset of the catalog, the registered mapper that builds it f
 collected source shape (a source ID prefix and table), and, for a shape that several
 datasets share, the predicate every row of a routed table satisfies (an exchange's
 symbols, partial-response rows of a KR exchange). A table whose rows do not all satisfy
-it is left to the other routes of the shape; an empty table is skipped.
+it is left to the other routes of the shape; an empty table is skipped. A table that
+lacks a column the route's mapper reads (its ``source_columns``) is another shape under
+the same prefix and table name (the ``korea.public_response@1`` legacy import of
+``kind-listings``): it is skipped and counted as ``shape``.
 
 A route continues a chain; it never starts one. Its template is the spec of the latest
-committed generation of the dataset that used the route's mapper: an operator's
-backfill or an earlier maintenance generation. A maintenance spec is that spec with
-only these fields advanced:
+committed generation of the dataset that used one of the route's mappers: its own, or
+an earlier major it ``continues`` (an operator's backfill or an earlier maintenance
+generation). That generation's mapper is the one the chain continues with, so
+``classifications.kr.kind`` continues a chain whose latest generation used
+``kind.industry@1`` under ``@1`` and one an operator published under ``kind.industry@2``
+under ``@2``. A maintenance spec is that spec with only these fields advanced:
 
 - ``target.parent``: the dataset head;
 - ``sources``: the one new source table;
@@ -58,6 +64,7 @@ from typing import TYPE_CHECKING, Final, cast
 
 import duckdb
 
+from aegis_alpha.storage.kr_identity import KIND_REQUIRED
 from aegis_alpha.storage.membership_pins import IdentityPin, membership_parts
 from aegis_alpha.storage.promotion import formats
 from aegis_alpha.storage.promotion.engine import dataset_head, promote
@@ -115,6 +122,12 @@ class Route:
     prefix: str
     table: str
     accept: str | None = None
+    continues: tuple[str, ...] = ()
+
+    @property
+    def mappers(self) -> tuple[str, ...]:
+        """The route's mapper and the earlier majors whose chains it continues."""
+        return (self.mapper, *self.continues)
 
 
 # In dependency order: SEC facts take each filing's acceptance from the filings head.
@@ -125,7 +138,8 @@ ROUTES: Final = (
     Route("fundamentals.kr.dart", "dart.fnltt@1", "opendart-receipts-", "receipts"),
     Route("macro.us.alfred", "fred.alfred@1", "fred-alfred-observations-", "observations"),
     Route("fx.usdkrw.fred", "fred.fx_series@1", "fred-series-csv-", "observations"),
-    Route("classifications.kr.kind", "kind.industry@2", "kind-listings-", "listings"),
+    Route("classifications.kr.kind", "kind.industry@2", "kind-listings-", "listings",
+          continues=("kind.industry@1",)),
     Route("prices.us.eodhd", "eodhd.bars@1", "qveris-bulk-bars-", "bars", _US_SYMBOL),
     Route("prices.kr.eodhd", "eodhd.bars@1", "qveris-bulk-bars-", "bars", _KR_SYMBOL),
     Route("prices.kr.eodhd", "eodhd.bulk_quarantine@1", "qveris-bulk-quarantine-",
@@ -137,14 +151,16 @@ ROUTES: Final = (
 )  # fmt: skip
 
 # Collected shapes whose dataset has no registered mapper yet: counted, never promoted.
+# The last field names the columns a table of the shape has (the KIND listings that
+# ``aas collect kind`` and ``aas identity kr-import`` commit, not the legacy import).
 UNMAPPED: Final = (
-    ("actions.us.eodhd", "qveris-splits-", "splits", "provider_symbol LIKE '%.US'"),
-    ("actions.us.eodhd", "qveris-dividends-", "dividends", "provider_symbol LIKE '%.US'"),
-    ("actions.kr.eodhd", "qveris-splits-", "splits", _KR_SYMBOL),
-    ("actions.kr.eodhd", "qveris-dividends-", "dividends", _KR_SYMBOL),
-    ("status.kr.kind", "kind-listings-", "listings", None),
+    ("actions.us.eodhd", "qveris-splits-", "splits", "provider_symbol LIKE '%.US'", ()),
+    ("actions.us.eodhd", "qveris-dividends-", "dividends", "provider_symbol LIKE '%.US'", ()),
+    ("actions.kr.eodhd", "qveris-splits-", "splits", _KR_SYMBOL, ()),
+    ("actions.kr.eodhd", "qveris-dividends-", "dividends", _KR_SYMBOL, ()),
+    ("status.kr.kind", "kind-listings-", "listings", None, KIND_REQUIRED),
     ("prices.us.eodhd", "qveris-bulk-quarantine-", "quarantine",
-     f"{_EXCHANGE} = 'US'"),
+     f"{_EXCHANGE} = 'US'", ()),
 )  # fmt: skip
 
 
@@ -226,12 +242,17 @@ def candidates(  # noqa: PLR0913 -- the route and the pass's lookups
 ) -> list[Candidate]:
     """The route's committed, nonempty tables not yet done whose every row it accepts.
 
-    They are in ``sl:`` link order, then source ID order.
+    A table without every column the route's mappers read is another shape: it is
+    skipped as ``shape``. They are in ``sl:`` link order, then source ID order.
     """
+    needed = {name for each in route.mappers for name in mapper(each).source_columns()}
     found: list[Candidate] = []
     for table in committed_tables(workspace, route.prefix):
         entry = table.entry
         if table.store != "market" or entry["name"] != route.table or entry["format"] != "arrow":
+            continue
+        if not needed <= set(table.columns):
+            skipped["shape"] = skipped.get("shape", 0) + 1
             continue
         if done is not None and (table.source_id, route.table) in done:
             skipped["done"] = skipped.get("done", 0) + 1
@@ -326,22 +347,26 @@ def _resolution(
     return {"snapshot_id": snapshot["snapshot_id"], "key_sha256": digest}
 
 
-def _template(workspace: Workspace, dataset_id: str, mapper_name: str) -> tuple[str, dict] | None:
+def _template(
+    workspace: Workspace, dataset_id: str, mappers: Sequence[str]
+) -> tuple[str, str, dict] | None:
+    """The latest committed spec of ``dataset_id`` under one of ``mappers``: hash, mapper, spec."""
     row = workspace.state.execute(
-        "SELECT transform_hash FROM dataset_versions WHERE dataset_id=? AND normalizer_version=? "
-        "AND status='committed' ORDER BY sequence DESC LIMIT 1",
-        (dataset_id, mapper_name),
+        "SELECT transform_hash, normalizer_version FROM dataset_versions WHERE dataset_id=? "
+        "AND normalizer_version IN (SELECT value FROM json_each(?)) AND status='committed' "
+        "ORDER BY sequence DESC LIMIT 1",
+        (dataset_id, json.dumps(list(mappers))),
     ).fetchone()
     if row is None:
         return None
-    digest = str(row[0])
+    digest, name = str(row[0]), str(row[1])
     from aegis_alpha.data.descriptor_tree import DescriptorTree  # noqa: PLC0415
 
     with DescriptorTree.open_path(workspace.paths.raw) as tree:
         raw = tree.read_bytes(f"{digest[:2]}/{digest}", max_bytes=64 * 1024 * 1024)
     if hashlib.sha256(raw).hexdigest() != digest:
         raise ValueError(f"the retained spec of {dataset_id} differs from its transform hash")
-    return digest, cast("dict", json.loads(raw))
+    return digest, name, cast("dict", json.loads(raw))
 
 
 def head_pin(workspace: Workspace, dataset_id: str) -> dict[str, str] | None:
@@ -550,9 +575,11 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
             runs.append(run)
             run.skipped["done"] = 0
             run.head = dataset_head(workspace, dataset_id)
-            found = None if run.head is None else _template(workspace, dataset_id, route.mapper)
+            found = None if run.head is None else _template(workspace, dataset_id, route.mappers)
+            # The chain continues with the mapper its latest generation used.
+            run.mapper = route.mapper if found is None else found[1]
             resolution = (
-                None if found is None else _resolution(workspace, found[1], route.mapper, identity)
+                None if found is None else _resolution(workspace, found[2], run.mapper, identity)
             )
             done = _done(
                 workspace, dataset_id, None if resolution is None else resolution["key_sha256"]
@@ -566,7 +593,7 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
                 run.status = "no_template" if pending else "current"
                 run.skipped["no_template"] = len(pending)
                 continue
-            run.template, template = found
+            run.template, _, template = found
             if identity_failed and template.get("identity_snapshot") is not None:
                 # Without this run's snapshot, new listings would resolve against an older one.
                 run.status = "identity_unavailable" if pending else "current"
@@ -607,10 +634,12 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
 def unmapped(workspace: Workspace) -> dict[str, int]:
     """Nonempty collected tables of each dataset that no registered mapper promotes yet."""
     counts: dict[str, int] = {}
-    for dataset_id, prefix, name, accept in UNMAPPED:
+    for dataset_id, prefix, name, accept, columns in UNMAPPED:
         for table in committed_tables(workspace, prefix):
             entry = table.entry
             if table.store != "market" or entry["name"] != name or not entry["rows"]:
+                continue
+            if columns and not set(columns) <= set(table.columns):
                 continue
             if accept is not None:
                 target = _quote(str(entry["target"]))
