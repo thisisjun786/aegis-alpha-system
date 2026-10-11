@@ -26,7 +26,7 @@ from aegis_alpha.data.qveris_contracts import (
     load_json,
     object_value,
 )
-from aegis_alpha.data.qveris_payloads import validate_payload
+from aegis_alpha.data.qveris_payloads import empty_action_day, validate_payload
 
 _SHA = re.compile(r"[0-9a-f]{64}")
 _RATIO = re.compile(r"(?P<new>[0-9]+(?:\.[0-9]+)?)/(?P<old>[0-9]+(?:\.[0-9]+)?)")
@@ -149,7 +149,9 @@ def read_completed_job(  # noqa: C901, PLR0912, PLR0915 -- one complete evidence
         usage = object_value(billing.get("usage"))
         if any(usage.get(key) != intent.get(key) for key in ("tool_id", "session_id", "search_id")):
             raise ValueError("Qveris usage identity differs")
-        warning = usage.get("outcome") not in {None, "success"}
+        warning = usage.get("outcome") not in {None, "success"} and not empty_action_day(
+            job, raw, usage
+        )
         expected_status = "RAW_ACQUIRED_WITH_WARNINGS" if warning else "RAW_ACQUIRED"
         if marker.get("status") != expected_status:
             raise ValueError("Qveris completion warning state differs from usage")
@@ -166,7 +168,9 @@ def read_completed_job(  # noqa: C901, PLR0912, PLR0915 -- one complete evidence
         retrieved = datetime.fromisoformat(str(response.get("retrieved_at_utc")))
         if retrieved.utcoffset() is None:
             raise ValueError("Qveris retrieval timestamp must be timezone-aware")
-        shape = validate_payload(job, job.parameters, raw, retrieved_on=retrieved.date())
+        shape = validate_payload(
+            job, job.parameters, raw, retrieved_on=retrieved.date(), usage=usage
+        )
         if type(marker.get("rows")) is not int or shape.rows != marker.get("rows"):
             raise ValueError("Qveris completion row count differs")
         values = object_value(raw.get("result")).get("data")

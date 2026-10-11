@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from http import HTTPStatus
@@ -13,6 +14,7 @@ from aegis_alpha.data.qveris_contracts import (
     EOD_UNIVERSE_TOOL,
     FRED_TOOL,
     QverisJob,
+    credit_value,
     object_value,
 )
 
@@ -165,28 +167,70 @@ def _fred(  # noqa: C901 -- pagination and row vintage acceptance guards
     return PageShape(len(rows), tuple(keys), next_offset if next_offset < count else None, count)
 
 
-def validate_payload(  # noqa: C901 -- reviewed endpoint variants
+_CONTINUATION = (
+    "truncated_content",
+    "full_content_file_url",
+    "truncated",
+    "next_page",
+    "next_cursor",
+)
+
+
+def empty_action_day(
+    job: QverisJob, response: Mapping[str, object], usage: Mapping[str, object]
+) -> bool:
+    """Whether ``response`` is Qveris's uncharged answer for an exchange day without actions.
+
+    Qveris answers an EODHD bulk ``splits``/``dividends`` download that has no rows as a failed
+    execution with an empty array, settled as ``failed_not_charged`` with usage outcome
+    ``empty_result`` (``result.empty``). The day has no actions: the same fact as a successful
+    empty download. Every other failed, charged, nonempty or continued answer stays a failure.
+    """
+    result = response.get("result")
+    execution = response.get("execution_id")
+    if (
+        job.tool_id != EOD_TOOL
+        or job.dataset not in {"splits", "dividends"}
+        or response.get("success") is not False
+        or not isinstance(execution, str)
+        or not execution
+        or not isinstance(result, Mapping)
+        or result.get("status_code") != HTTPStatus.OK
+        or result.get("data") != []
+        or any(result.get(key) for key in _CONTINUATION)
+        or usage.get("execution_id") != execution
+        or usage.get("outcome") != "empty_result"
+        or usage.get("reason_code") != "result.empty"
+        or usage.get("charge_outcome") != "failed_not_charged"
+    ):
+        return False
+    try:
+        return all(
+            credit_value(usage.get(key)) == 0
+            for key in ("actual_amount_credits", "settled_amount_credits")
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def validate_payload(  # noqa: C901, PLR0912 -- reviewed endpoint variants
     job: QverisJob,
     parameters: dict[str, object],
     response: dict[str, object],
     *,
     retrieved_on: date | None = None,
+    usage: Mapping[str, object] | None = None,
 ) -> PageShape:
+    """Check one page against its endpoint; ``usage`` (the settled billing's usage row) admits
+    Qveris's uncharged empty answer for an exchange day without actions (``empty_action_day``)."""
+    if usage is not None and empty_action_day(job, response, usage):
+        return PageShape(0, ())
     if response.get("success") is not True or not isinstance(response.get("execution_id"), str):
         raise ValueError("Qveris execute did not succeed with an execution ID")
     result = object_value(response.get("result"))
     if result.get("status_code") != HTTPStatus.OK:
         raise ValueError("upstream returned an unsuccessful status")
-    if any(
-        result.get(key)
-        for key in (
-            "truncated_content",
-            "full_content_file_url",
-            "truncated",
-            "next_page",
-            "next_cursor",
-        )
-    ):
+    if any(result.get(key) for key in _CONTINUATION):
         raise ValueError("Qveris result is truncated or needs an unsupported continuation")
     data = result.get("data")
     if job.tool_id == EOD_TOOL:

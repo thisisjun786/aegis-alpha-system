@@ -196,6 +196,26 @@ class FakeQveris:
                 "success": False,
                 "result": {"status_code": 200, "data": "unusable provider text"},
             }
+        if self.failure == "empty-result":
+            # Qveris's answer for a bulk download without rows: failed, empty and uncharged.
+            self.balance += self.price
+            self.ledger.pop()
+            usage.update(
+                charge_outcome="failed_not_charged",
+                actual_amount_credits="0.0",
+                settled_amount_credits="0.0",
+                quantity=None,
+                success=False,
+                billable_success=False,
+                outcome="empty_result",
+                reason_code="result.empty",
+            )
+            return {
+                "execution_id": execution,
+                "success": False,
+                "error_message": "Provider returned no valid result data.",
+                "result": {"status_code": 200, "data": []},
+            }
         if self.failure == "duplicate-usage":
             self.usage.append({**usage, "id": execution + "-duplicate"})
         if self.failure == "over-quote":
