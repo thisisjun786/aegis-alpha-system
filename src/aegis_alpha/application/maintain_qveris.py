@@ -760,7 +760,9 @@ def collect(  # noqa: PLR0913 -- the run's explicit inputs
         "settled_before": before,
         "resumed": None
         if resumed is None
-        else {key: resumed[key] for key in ("requested", "completed", "failed", "stopped")},
+        else {
+            key: resumed[key] for key in ("requested", "completed", "failed", "empty", "stopped")
+        },
         **plan.report(),
     }
     # A paid page still unsettled after the resume needs settlement or quarantine.

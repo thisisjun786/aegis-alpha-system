@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from aegis_alpha.data.qveris_acquisition import acquire_jobs, acquisition_plan
+from aegis_alpha.data.qveris_payloads import QverisEmptyAnswerError
 from aegis_alpha.data.qveris_store import QverisStore
 from aegis_alpha.data.sec_evidence import publish_bytes
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
@@ -61,14 +62,18 @@ def collect_cohort(
     """Acquire ``jobs`` in order, one at a time, recording progress after each job.
 
     A settled failure is recorded and the cohort continues; a provider warning is a
-    completion (``warned``) and never stops it. An uncertain or failed preflight stops
-    the cohort (``stopped``), as does a budget refusal, which attempted nothing; a budget
-    refusal with unresolved evidence in the store is reported as that uncertain stop.
+    completion (``warned``) and never stops it. An uncharged empty answer for an exchange
+    day of actions (``QverisEmptyAnswerError``) is counted ``empty``: neither a completion
+    nor a failure, so the request is asked again by rule and the cohort is not partial. An
+    uncertain or failed preflight stops the cohort (``stopped``), as does a budget refusal,
+    which attempted nothing; a budget refusal with unresolved evidence in the store is
+    reported as that uncertain stop.
     """
     acquisition_plan(jobs, root)
     cohort_id = content_sha256([job.document() for job in jobs])
-    completed = failed = reused = warned = calls = 0
+    completed = failed = empty = reused = warned = calls = 0
     failure_rows: list[dict[str, object]] = []
+    empty_rows: list[dict[str, object]] = []
     run_id = uuid4().hex
     report_dir = root / "cohorts" / cohort_id
     publish_bytes(report_dir / "jobs.json", canonical_json_bytes([job.document() for job in jobs]))
@@ -86,20 +91,27 @@ def collect_cohort(
                     unresolved = store.pending_pages()
                     prefix = f"jobs/{job.fingerprint}/"
                     terminal = store.exists(prefix + "0000.billing.json") and not unresolved
-                failure_rows.append(
-                    {
-                        "index": index,
-                        "job_id": job.job_id,
-                        "fingerprint": job.fingerprint,
-                        "error_class": type(error).__name__,
-                        "reason": str(error),
-                        "known_settled_failure": terminal,
-                    }
-                )
-                if terminal:
-                    failed += 1
+                if terminal and isinstance(error, QverisEmptyAnswerError):
+                    # Settled, uncharged and empty: not a failure; the request stays open.
+                    empty += 1
+                    empty_rows.append(
+                        {"index": index, "job_id": job.job_id, "fingerprint": job.fingerprint}
+                    )
                 else:
-                    stopped = "PENDING_OR_PREFLIGHT_FAILURE"
+                    failure_rows.append(
+                        {
+                            "index": index,
+                            "job_id": job.job_id,
+                            "fingerprint": job.fingerprint,
+                            "error_class": type(error).__name__,
+                            "reason": str(error),
+                            "known_settled_failure": terminal,
+                        }
+                    )
+                    if terminal:
+                        failed += 1
+                    else:
+                        stopped = "PENDING_OR_PREFLIGHT_FAILURE"
         else:
             completed += 1
             calls += int(str(result["provider_calls_this_run"]))
@@ -111,10 +123,11 @@ def collect_cohort(
             "cohort_id": cohort_id,
             "run_id": run_id,
             "requested": len(jobs),
-            "processed": completed + failed,
+            "processed": completed + failed + empty,
             "completed": completed,
             "failed": failed,
-            "pending": len(jobs) - completed - failed,
+            "empty": empty,
+            "pending": len(jobs) - completed - failed - empty,
             "reused": reused,
             "warned": warned,
             "successful_job_calls_this_run": calls,
@@ -123,7 +136,9 @@ def collect_cohort(
         }
         publish_bytes(
             report_dir / f"{run_id}-{index:06d}.json",
-            canonical_json_bytes({**snapshot, "failures": failure_rows}),
+            canonical_json_bytes(
+                {**snapshot, "failures": failure_rows, "empty_answers": empty_rows}
+            ),
         )
         if progress:
             progress(snapshot)
@@ -132,6 +147,7 @@ def collect_cohort(
     result = {
         **snapshot,
         "failures": failure_rows,
+        "empty_answers": empty_rows,
         "status": _status(failed=failed, stopped=stopped),
         "billing_authority": "per-execution billing receipts, including failed jobs",
     }

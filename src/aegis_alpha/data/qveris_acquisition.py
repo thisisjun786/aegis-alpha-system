@@ -297,7 +297,13 @@ def _finish_job(  # noqa: C901, PLR0912, PLR0913, PLR0915 -- sequential durable 
             raise ValueError("Qveris response and billing execution IDs differ")
         retrieved_at = store.document(f"{page}.response.json")["retrieved_at_utc"]
         retrieved_on = datetime.fromisoformat(str(retrieved_at)).date()
-        shape = validate_payload(job, parameters, document, retrieved_on=retrieved_on)
+        shape = validate_payload(
+            job,
+            parameters,
+            document,
+            retrieved_on=retrieved_on,
+            usage=object_value(billing["usage"]),
+        )
         if total is not None and shape.total != total:
             raise ValueError("provider count changed between pages")
         total = shape.total
