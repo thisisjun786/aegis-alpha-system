@@ -5,7 +5,9 @@ committed KR identity source is newer (by its ``sl:`` link) than the newest main
 identity snapshot, or when no such snapshot exists. The build reads every source the
 registered KR assertions cite, so registered claims rebuild with the same assertion IDs,
 plus every newer source: EODHD KR symbol lists (``qveris-eodhd-exchange-symbols-*``),
-KIND lists (``kind-listings-*``) and OpenDART receipts tables that hold a completed
+KIND lists (``kind-listings-*`` tables with the ``kind.listings@1`` columns; a legacy
+``korea.public_response@1`` table of the same name is skipped and listed in the report's
+``skipped_sources``) and OpenDART receipts tables that hold a completed
 ``corp_codes`` answer. The document is registered like any other (``aas identity
 register``): identical rows are reused, a conflict refuses the whole document.
 
@@ -48,20 +50,32 @@ def _linked(workspace: Workspace) -> dict[str, int]:
     }
 
 
-def _sources(workspace: Workspace) -> dict[str, list[str]]:
-    """Committed KR identity sources by build slot (``eodhd``, ``kind``, ``dart``)."""
+def _sources(workspace: Workspace) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Committed KR identity sources by build slot (``eodhd``, ``kind``, ``dart``).
+
+    The second mapping lists the ``kind-listings`` sources skipped because their table
+    lacks a column ``kind.listings@1`` reads (``kr_identity.KIND_REQUIRED``): the
+    ``korea.public_response@1`` legacy import shares the source ID prefix and table name.
+    """
     found: dict[str, list[str]] = {"eodhd": [], "kind": [], "dart": []}
-    for slot, prefix, name in (
-        ("eodhd", EODHD_PREFIX, kr_identity.EODHD_TABLE),
-        ("kind", KIND_PREFIX, kr_identity.KIND_TABLE),
-    ):
-        found[slot] = sorted(
-            {
-                table.source_id
-                for table in committed_tables(workspace, prefix)
-                if table.store == "market" and table.entry["name"] == name
-            }
-        )
+    skipped: dict[str, list[str]] = {"kind": []}
+    found["eodhd"] = sorted(
+        {
+            table.source_id
+            for table in committed_tables(workspace, EODHD_PREFIX)
+            if table.store == "market" and table.entry["name"] == kr_identity.EODHD_TABLE
+        }
+    )
+    kind: set[str] = set()
+    for table in committed_tables(workspace, KIND_PREFIX):
+        if table.store != "market" or table.entry["name"] != kr_identity.KIND_TABLE:
+            continue
+        if set(kr_identity.KIND_REQUIRED) <= set(table.columns):
+            kind.add(table.source_id)
+        else:
+            skipped["kind"].append(table.source_id)
+    found["kind"] = sorted(kind)
+    skipped["kind"].sort()
     for table in committed_tables(workspace, DART_PREFIX):
         if table.store != "market" or table.entry["name"] != kr_identity.DART_TABLE:
             continue
@@ -72,7 +86,7 @@ def _sources(workspace: Workspace) -> dict[str, list[str]]:
         if row is not None and int(row[0]):
             found["dart"].append(table.source_id)
     found["dart"].sort()
-    return found
+    return found, skipped
 
 
 def _cited(workspace: Workspace) -> dict[str, set[str]]:
@@ -117,7 +131,8 @@ def advance(workspace: Workspace, *, apply: bool, now_us: int) -> dict[str, obje
     report: dict[str, object] = {"mode": "apply" if apply else "plan"}
     newest = _newest_snapshot(workspace)
     linked = _linked(workspace)
-    sources = _sources(workspace)
+    sources, skipped = _sources(workspace)
+    report["skipped_sources"] = skipped
     since = None if newest is None else newest[1]
     fresh = {
         slot: [item for item in items if since is None or linked.get(item, 0) > since]

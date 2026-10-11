@@ -263,6 +263,7 @@ def _registry() -> dict[str, Mapper]:
         KoreaObservations("bok"),
         KoreaObservations("oecd"),
         KindIndustry(),
+        KindIndustry(2),
         NorgateClassification(),
         SecSic(),
         SecCompanyfacts(),

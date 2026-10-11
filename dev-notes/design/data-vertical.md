@@ -501,7 +501,7 @@ microsecond, 시간 입력은 `session_date` 하나다. 값 일부만 있는 bar
 (`norgate.prices_none@1`, `norgate.reference_history@1`, `norgate.fx_history@1`)는 `norgate-history-csv-`
 원천만 받는다.
 
-분류 매퍼 `norgate.classification@1`, `sec.sic@1`, `kind.industry@1`은 [분류](#분류)가 소유한다.
+분류 매퍼 `norgate.classification@1`, `sec.sic@1`, `kind.industry@1`, `kind.industry@2`는 [분류](#분류)가 소유한다.
 
 기업행동과 상장 상태 매퍼(`norgate.dividends@1`, `norgate.capital_adjustments@1`, `fmp.dividends@1`,
 `fmp.splits@1`, `norgate.status@1`)는 [기업행동과 상장 상태 매퍼](#기업행동과-상장-상태-매퍼)가 소유한다.
@@ -941,6 +941,7 @@ KRX 토요일 session은 확인되지 않은 반일 마감 대신 평일 마감�
 | `norgate.classification@1` | Norgate security master(`assetid`, `subtype1`..`subtype3`, `exchange`, `exchange_full`, 텍스트 `first_date`·`last_date`). 인자 `scheme`과 내보내기 날짜 `as_of` | instrument `mint('norgate_assetid', assetid)`. `norgate.security_type`: code는 유형 경로 `subtype1 > subtype2 > subtype3`(있는 단계만, 건너뛴 단계 없이), label은 가장 구체적인 단계. `norgate.exchange`: code는 `exchange`, label은 `exchange_full` |
 | `sec.sic@1` | `aas import sec-companies`가 SEC submissions archive에서 commit한 `companies` 테이블. 인자 `as_of`는 archive 수집 날짜 | issuer `mint('sec_cik', member의 10자리 CIK)`. code는 네 자리 SIC, label은 `sicDescription` |
 | `kind.industry@1` | `aas identity kr-import`가 commit한 KIND 상장 목록(`short_code`, `industry`, `retrieved_at_utc`). 인자 없음 | instrument는 identity key(`kind`, `krx_short_code`)를 수집 시각에 해석한 값. `as_of`는 그 수집 시각의 Asia/Seoul 날짜. KIND 업종은 코드가 없으므로 code와 label이 모두 업종 원문 |
+| `kind.industry@2` | `kind.industry@1`과 같은 열. 인자 없음 | `kind.industry@1`과 같되, (`short_code`, `industry`, `retrieved_at_utc`)가 같은 원천 행은 한 번만 매핑한다. 그중 원천 행 hash가 가장 작은 행, 같으면 가장 낮은 (`_aas_pin`, `_aas_ordinal`)의 행이 매핑되고 provenance도 그 행의 것이다 |
 
 - Norgate: asset ID가 양의 정수(18자리 이하)가 아니거나 `first_date`·`last_date`가 `as_of`보다 늦은
   행(선언한 내보내기 날짜와 모순)은 주체가 없고, 유형 단계가 비거나 건너뛴 행과 거래소 이름이 빈 행은
@@ -950,6 +951,12 @@ KRX 토요일 session은 확인되지 않은 반일 마감 대신 평일 마감�
   다른 CIK를 말하는 문서는 주체가 없다. 네 자리가 아닌 SIC는 코드가 없다. 설명 없이 SIC만 싣는 회사(미배정 `0000` 포함)는 분류가 없는 행이다.
 - KIND: `retrieved_at_utc`가 `Z`로 끝나는 UTC 시각이 아니면 수집 시각과 날짜가 없어 거부된다.
   snapshot에서 해석되지 않는 단축코드는 다른 승격처럼 미해결 보고에 남는다.
+- KIND 목록은 한 회사를 분류가 읽지 않는 열(행정구역 통합 전후의 `지역` 등)만 다른 두 행으로 싣기도 하고,
+  `aas identity kr-import`는 원본 행을 모두 남긴다. `kind.industry@1`은 그런 행마다 분류 행을 내므로 같은
+  natural key가 반복돼 승격이 거부된다. `kind.industry@2`는 그런 행을 한 번만 매핑하고 나머지는 선택되지
+  않은 원천 행으로 남긴다. 원천 행 hash는 행 내용만으로 정해지므로 수집 순서가 달라도 같은 행과 같은 hash가
+  나온다. 한 수집 시각에 같은 단축코드가 다른 업종으로 실린 두 행은 둘 다 매핑돼 반복된 natural key로
+  거부되고, 어느 업종도 고르지 않는다.
 
 `aas import sec-companies --source SOURCE_ID [--plan]`은 `sec.submissions_zip@1`로 편입한
 `sec-submissions-zip-*` 내용 원천의 member 색인으로 `raw/`의 archive를 읽고, `CIK##########.json`
@@ -1078,7 +1085,7 @@ ASCII escape와 바이트까지 같다.
 | `fx.usdkrw.fred` | `fx_rates` | canonical | `fred.fx_series@1` | `unknown_null@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | FRED DEXKOUS(legacy CSV 편입본과 ALFRED 수집). H.10 발표 지연 때문에 strict 읽기는 고르지 않는다. 우선순위는 소비자 pin |
 | `classifications.us.norgate` | `classifications` | canonical | `norgate.classification@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | Norgate 증권 유형(`norgate.security_type`)과 상장 거래소(`norgate.exchange`) snapshot, 과거로 소급하지 않음. [분류](#분류) |
 | `classifications.us.sec` | `classifications` | canonical | `sec.sic@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | SEC SIC(`sec.sic`) snapshot, issuer 주체 |
-| `classifications.kr.kind` | `classifications` | canonical | `kind.industry@1` | `source_column@1` | 없음 | 없음 | 없음 | 아니오 | KIND 업종(`kind.industry`) snapshot, 단축코드를 identity snapshot으로 해석, 수집 시각부터 알려짐 |
+| `classifications.kr.kind` | `classifications` | canonical | `kind.industry@1`, `kind.industry@2` | `source_column@1` | 없음 | 없음 | 없음 | 아니오 | KIND 업종(`kind.industry`) snapshot, 단축코드를 identity snapshot으로 해석, 수집 시각부터 알려짐 |
 
 identity 원천(Norgate master, SEC submissions, FMP profile, DART 고유번호, KIND 목록)은 typed generation이
 아니라 [identity 등록](#identity-등록과-chunked-문서)으로 state에 들어간다. 지수 구성과 상장 universe도
@@ -1506,18 +1513,22 @@ SystemExit) 정산하지 않는다. 그 `started` attempt는 다음 실행이 �
 적재하고, 없으면 `waiting_for_identity`로 보고한다. 완료된 KR 종목 목록 job은 [KR 등록](#kr-등록)의
 `qveris-eodhd-exchange-symbols-*` 원천이 된다.
 
-**identity 증분.** commit된 KR identity 원천(EODHD KR 종목 목록, KIND 목록, 완료된 `corp_codes` 답을 담은
-OpenDART receipts 테이블) 중 `sl:` 연결이 가장 새로운 유지보수 snapshot보다 늦은 것이 있거나 유지보수 snapshot이
+**identity 증분.** commit된 KR identity 원천(EODHD KR 종목 목록, `kind.listings@1`이 읽는 열(`short_code`,
+`listed_on`, `retrieved_at_utc`)이 있는 KIND 목록, 완료된 `corp_codes` 답을 담은 OpenDART receipts 테이블) 중 `sl:` 연결이 가장 새로운 유지보수 snapshot보다 늦은 것이 있거나 유지보수 snapshot이
 없으면, 등록된 KR assertion이 인용하는 모든 원천과 그 새 원천으로 KR registry 문서를 만들어 등록한다. 같은 행은
 재사용되고 충돌은 문서 전체를 거부한다. 유지보수 identity snapshot은 등록된 모든 assertion의 snapshot이고 ID는
 `maintain-`과 정렬한 assertion ID 목록의 SHA-256 앞 32자다. 그래서 registry가 그대로면 같은 snapshot이고
 assertion 집합이 바뀐 실행만 새 snapshot을 등록한다. 아무것도 등록하지 않았고 유지보수 snapshot이 없으면 승격
 template의 snapshot을 그대로 쓴다. US identity 원천(Norgate master, FMP profile, SEC archive)은 동결된 전환
-입력이라 유지보수 증분이 없다.
+입력이라 유지보수 증분이 없다. `korea.public_response@1` legacy import가 commit한 `kind-listings-*`
+`listings` 테이블은 원천 ID 접두어와 테이블 이름이 같지만 그 열이 없으므로 KR identity 원천이 아니다. 단계는
+그런 원천을 건너뛰고 보고의 `skipped_sources`(`kind`)에 원천 ID로 남긴다.
 
 **승격.** route 하나는 카탈로그 dataset 하나, 그것을 만드는 등록 매퍼, 수집 원천 모양(원천 ID 접두어와 테이블),
 여러 dataset이 나누는 모양이면 route한 테이블의 모든 행이 만족할 조건이다. 일부 행만 만족하는 테이블은
-`mixed`로 건너뛰고 빈 테이블은 `empty`다.
+`mixed`로 건너뛰고 빈 테이블은 `empty`다. route 매퍼가 읽는 열(`source_columns`)이 하나라도 없는 테이블은 같은
+접두어와 테이블 이름을 쓰는 다른 모양(`korea.public_response@1` legacy import의 `kind-listings`)이므로 `shape`로
+건너뛴다.
 
 | dataset | 매퍼 | 원천 | 조건 |
 | --- | --- | --- | --- |
@@ -1527,15 +1538,19 @@ template의 snapshot을 그대로 쓴다. US identity 원천(Norgate master, FMP
 | `fundamentals.kr.dart` | `dart.fnltt@1` | `opendart-receipts-*` `receipts` | |
 | `macro.us.alfred` | `fred.alfred@1` | `fred-alfred-observations-*` `observations` | |
 | `fx.usdkrw.fred` | `fred.fx_series@1` | `fred-series-csv-*` `observations` | |
-| `classifications.kr.kind` | `kind.industry@1` | `kind-listings-*` `listings` | |
+| `classifications.kr.kind` | `kind.industry@2`, 이어 받는 `kind.industry@1` | `kind-listings-*` `listings` | `short_code`·`industry`·`retrieved_at_utc` 열 |
 | `prices.us.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.US` |
 | `prices.kr.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.KO`·`.KQ` |
 | `prices.kr.eodhd` | `eodhd.bulk_quarantine@1` | `qveris-bulk-quarantine-*` `quarantine` | 사유 `provider_reported_partial`, 거래소 `KO`·`KQ` |
 | `prices.kr.eodhd.ref` | `eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1` | 위 두 모양 | 위와 같음 |
 
-route는 chain을 이어 붙일 뿐 시작하지 않는다. template은 그 dataset에서 route의 매퍼를 쓴 가장 늦은 committed
-generation의 명세(운영자의 백필이거나 앞선 유지보수 generation)다. head가 없으면 `no_head`, 그 매퍼의 generation이
-없으면 `no_template`로 보고하고 아무것도 쓰지 않는다. 유지보수 명세는 template에서 다음만 바꾼다.
+route는 chain을 이어 붙일 뿐 시작하지 않는다. template은 그 dataset에서 route의 매퍼, 또는 route가 이어 받는
+이전 major 매퍼를 쓴 가장 늦은 committed generation의 명세(운영자의 백필이거나 앞선 유지보수 generation)이고,
+chain은 그 generation의 매퍼로 이어진다. 그래서 `classifications.kr.kind`는 가장 늦은 generation이
+`kind.industry@1`인 chain을 `@1`로 잇고, 운영자가 `kind.industry@2`로 게시한 chain(새 chain이거나 `@1` chain 위의
+`@2` generation)은 그때부터 `@2`로 잇는다. `@1`에서 `@2`로 넘어가는 것은 운영자의 `@2` 게시이고 유지보수는 chain의
+매퍼를 바꾸지 않는다. head가 없으면 `no_head`, 그 매퍼들의 generation이 없으면 `no_template`로 보고하고 아무것도
+쓰지 않는다. 보고의 `mapper`는 chain을 이은 매퍼다. 유지보수 명세는 template에서 다음만 바꾼다.
 
 - `target.parent`: dataset head.
 - `sources`: 새 원천 테이블 하나.
@@ -1563,7 +1578,7 @@ generation, 결과 `promoted`·`unchanged`)를 남긴다. 검사 ID는 (dataset,
 
 매퍼가 아직 없는 dataset(`actions.us.eodhd`·`actions.kr.eodhd`의 Qveris `splits`·`dividends`, `status.kr.kind`,
 identity가 해석한 US 보류 행의 `prices.us.eodhd` 재처리)의 수집 원천은 승격하지 않고 `unmapped`에 dataset별
-테이블 수로 남는다.
+테이블 수로 남는다. `status.kr.kind`는 `kind.listings@1`이 읽는 열이 있는 KIND 목록만 센다.
 
 **보고와 종료 코드.** 실행 보고(`aas-maintain-report-v1`)는 단계마다의 결과, 실패한 단계, 멈춘 공급자를 담고
 정확한 bytes를 `raw/`에, 같은 bytes를 `<runtime>/maintain-report.json`에 둔다. 종료 코드는 모든 단계가
@@ -2982,3 +2997,7 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-499 | runbook 리허설과 4단계 승격 루프는 첫 실패에서 0이 아닌 상태로 멈추고 리허설 설치본·migration 백업·보고를 남기며 정리는 아무것도 지우지 않는다 | `tests/application/test_cutover.py::test_a_failed_rehearsal_stops_and_keeps_its_root_backups_and_reports` | 구현 |
 | DV-500 | 끝까지 마친 리허설만 완료 표시를 남기고 리허설 정리는 그 리허설의 출력만 지운다 | `tests/application/test_cutover.py::test_a_finished_rehearsal_is_the_only_one_its_cleanup_removes` | 구현 |
 | DV-501 | 리허설 채택은 계획 확인 뒤 별도 블록에서 실행되고 migration 검증이 실패하면 `recover` 전에 멈춘다 | `tests/application/test_cutover.py::test_an_adopted_rehearsal_stops_before_recover_when_its_migration_check_fails` | 구현 |
+| DV-502 | `kind.industry@2`는 업종 판정에 쓰지 않는 열만 다른 원천 행을 instrument당 한 분류 행으로 승격하고 입력 행 순서와 무관하게 같은 record·revision hash를 내며, 한 수집 시각에 업종이 다른 두 행은 거부한다 | `tests/storage/test_classifications.py::test_kind_industry_v2_maps_repeated_rows_once` | 구현 |
+| DV-503 | `classifications.kr.kind` route는 가장 늦은 generation이 `kind.industry@1`인 chain을 `@1`로 잇고(`no_template` 없음), `@2` generation이 게시된 chain은 `@2`로 잇는다 | `tests/storage/test_maintain_kind.py::test_a_kind_chain_continues_with_the_mapper_of_its_latest_generation` | 구현 |
+| DV-504 | legacy `korea.public_response@1` 모양의 `kind-listings` 원천은 identity 증분과 `classifications.kr.kind` route가 건너뛰고 보고하며, `kr-import` 모양의 원천은 그대로 쓴다 | `tests/storage/test_maintain_kind.py::test_legacy_shaped_kind_listings_are_skipped_and_reported` | 구현 |
+| DV-505 | legacy 모양의 `kind-listings` 원천이 있는 설치본의 `aas maintain plan --promotions`는 identity와 승격 단계를 실패 없이 계획한다 | `tests/application/test_maintain.py::test_a_plan_skips_legacy_shaped_kind_listings` | 구현 |

@@ -52,7 +52,12 @@ from tests.data.us_collect_support import (
     SecFiling,
 )
 from tests.storage import dart_receipt_support as dart
-from tests.storage.kr_identity_support import isin, kind_listing, symbol
+from tests.storage.kr_identity_support import (
+    commit_legacy_kind_listing,
+    isin,
+    kind_listing,
+    symbol,
+)
 from tests.storage.promotion_support import register_symbols
 from tests.storage.promotion_support import spec as price_spec
 from tests.storage.test_macro_fx import _rule, _spec
@@ -472,7 +477,7 @@ def _kr_cutover(ws: Workspace, identity: dict[str, str]) -> dict[str, tuple[int,
         "target": {"domain": "classifications", "dataset_id": "classifications.kr.kind",
                    "parent": None},
         "sources": listings,
-        "mapper": {"name": "kind.industry@1", "args": {}},
+        "mapper": {"name": "kind.industry@2", "args": {}},
         "partition": None,
         "time_rules": {"available_at_us": OBSERVED, "revision_known_at_us": OBSERVED},
         "decimal_rule": {},
@@ -555,6 +560,38 @@ def test_new_kr_listings_advance_identity_and_every_kr_chain(tmp_path: Path) -> 
     assert world.qveris.execute_count == executed
     with open_workspace(world.home) as ws:
         assert {name: _head(ws, name) for name in heads} == state
+
+
+def test_a_plan_skips_legacy_shaped_kind_listings(tmp_path: Path) -> None:
+    world = KrWorld(tmp_path)
+    first = world.run()
+    assert first["exit_code"] == 0, first["failed_stages"]
+    stages = cast("dict[str, dict[str, object]]", first["stages"])
+    snapshot = cast("dict[str, str]", stages["identity"]["snapshot"])
+    with open_workspace(world.home, writable=True, strategy_write=True) as ws:
+        _kr_cutover(ws, snapshot)
+        # The legacy importer's kind-listings source shares the prefix and table name.
+        legacy = commit_legacy_kind_listing(ws)
+        kind = [table.source_id for table in committed_tables(ws, "kind-listings-")]
+    listed = sorted(set(kind) - {legacy})
+    assert len(listed) == 2  # the KOSPI and KOSDAQ lists
+    world.clock.advance(hours=1)
+    with open_workspace(world.home) as ws:
+        planned = plan_maintenance(ws, world.config, now=world.clock.now,
+                                   policies=world.policies, promotions=True)  # fmt: skip
+    assert planned["failed_stages"] == []
+    stages = cast("dict[str, dict[str, object]]", planned["stages"])
+    assert stages["identity"]["skipped_sources"] == {"kind": [legacy]}
+    runs = cast("list[dict[str, object]]", stages["promote"]["datasets"])
+    (run,) = [item for item in runs if item["dataset_id"] == "classifications.kr.kind"]
+    assert cast("dict[str, int]", run["skipped"])["shape"] == 1
+    # The kr-import lists the cutover pinned are still read, and planned once more.
+    sources = cast("list[dict[str, object]]", run["sources"])
+    assert sorted((str(item["source_id"]), item["status"]) for item in sources) == [
+        (source_id, "planned") for source_id in listed
+    ]
+    unmapped = cast("dict[str, int]", stages["promote"]["unmapped"])
+    assert unmapped["status.kr.kind"] == 2
 
 
 def test_an_unsettled_paid_page_stops_every_run_until_its_settlement(tmp_path: Path) -> None:

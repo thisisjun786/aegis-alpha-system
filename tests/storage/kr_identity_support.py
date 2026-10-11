@@ -17,11 +17,12 @@ import pyarrow as pa
 from aegis_alpha.identity.records import IdentifierType, IdentifierValueError, normalize_identifier
 from aegis_alpha.storage import source_library
 from aegis_alpha.storage.kr_identity import SourceRows
+from aegis_alpha.storage.legacy_import.public import LISTINGS_COLUMNS
 from aegis_alpha.storage.raw import put_raw
 from aegis_alpha.storage.source_identity import LINK_PREFIX, SourceContent, SourceFile
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
     from pathlib import Path
 
     from aegis_alpha.storage.workspace import Workspace
@@ -145,24 +146,29 @@ def kind_listing(  # noqa: PLR0913 -- one synthetic receipt spells every field a
     header: tuple[str, ...] = _HEADER,
     status: int = 200,
     industries: Mapping[str, str] | None = None,
+    cells: Sequence[tuple[str | None, str]] | None = None,
 ) -> tuple[bytes, bytes]:
     """A KIND receipt and its EUC-KR HTML table; each row is (name, short code, listed on).
 
     ``industries`` gives a short code's industry text; any other row's is ``제조업``.
+    ``cells`` gives each row, by position, its (industry, 지역) text; a None industry
+    keeps the one ``industries`` gives, and a row past the list is in ``서울특별시``.
     """
-    cells = "".join(f"<th>{name}</th>" for name in header)
+    heads = "".join(f"<th>{name}</th>" for name in header)
     industry = industries or {}
+    given = list(cells or [])
+    given += [(None, "서울특별시")] * (len(rows) - len(given))
     body = "".join(
         "<tr>"
         f"<td>{name}</td><td>\n\t\t유가\n\t</td>"
         f"<td style=\"mso-number-format:'@';\">{code}</td>"
-        f"<td>{industry.get(code, '제조업')}</td><td>합성 제품</td><td>{listed}</td><td>12월</td>"
-        "<td>대표</td><td> http://example.invalid </td><td>서울특별시</td></tr>"
-        for name, code, listed in rows
+        f"<td>{stated or industry.get(code, '제조업')}</td><td>합성 제품</td><td>{listed}</td>"
+        f"<td>12월</td><td>대표</td><td> http://example.invalid </td><td>{region}</td></tr>"
+        for (name, code, listed), (stated, region) in zip(rows, given, strict=False)
     )
     raw = (
         '<html><head><meta charset="euc-kr"/></head><body><table>'
-        f"<tr>{cells}</tr>{body}</table></body></html>"
+        f"<tr>{heads}</tr>{body}</table></body></html>"
     ).encode("euc-kr")
     fingerprint = hashlib.sha256(list_id.encode()).hexdigest()
     receipt = {
@@ -176,6 +182,24 @@ def kind_listing(  # noqa: PLR0913 -- one synthetic receipt spells every field a
         "status": status,
     }
     return json.dumps(receipt).encode(), raw
+
+
+def commit_legacy_kind_listing(workspace: Workspace, code: str = "100010") -> str:
+    """Commit a ``kind-listings`` table in the ``korea.public_response@1`` legacy shape.
+
+    Its source ID prefix and table name are those of a KIND list ``aas identity kr-import``
+    commits, but it has none of the ``kind.listings@1`` columns. Returns its source ID.
+    """
+    _, digest, size = put_raw(workspace.paths.raw, f"synthetic legacy KIND {code}".encode())
+    content = SourceContent("kind", "listings", 1, (SourceFile(digest, size),))
+    types = {"string": pa.string(), "int64": pa.int64()}
+    schema = pa.schema([(name, types[kind]) for name, kind in LISTINGS_COLUMNS])
+    values = {"stock_code": [code], "company_name": ["합성전자"], "market": ["유가"],
+              "listed_on": ["1975-06-11"], "fiscal_month": [12], "raw_fields": ["{}"],
+              "source_rows": ["[]"]}  # fmt: skip
+    table = pa.table(values, schema=schema)
+    source_library.import_content_arrow(workspace, content, "listings", table.to_reader())
+    return content.source_id
 
 
 def write_kind_listing(directory: Path, receipt: bytes, raw: bytes) -> Path:
