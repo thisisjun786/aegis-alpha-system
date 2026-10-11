@@ -219,9 +219,10 @@ group 정산은 usage와 계정 ledger로 한 번 한다. 정산 중 인증·quo
 - 정산된 실패(검증할 수 없는 응답 형태 포함)는 기록하고 다음 job으로 간다. 공급자 경고(`RAW_ACQUIRED_WITH_WARNINGS`)는 완료이며
   `warned`로 세고 수집을 멈추지 않는다.
 - 거래소 일간 `splits`·`dividends` 내려받기에 행이 없으면 Qveris는 빈 배열을 실패한 실행으로 답하고 과금하지
-  않는다(usage `empty_result`·`result.empty`, `failed_not_charged`, 정산 0). 이 답은 그날 기업행동이 없다는
-  완료(`RAW_ACQUIRED`, 0행)로 성공한 빈 내려받기와 같다. 그 밖의 실패·과금·행이 있는 답과 `prices`의 빈 답은
-  실패로 남는다.
+  않는다(usage `success`·`billable_success` false, 수량 없음, `failed_not_charged`, `empty_result`·`result.empty`,
+  금액 0). 이 빈 답은 `empty`로 세며 완료도 실패도 아니다. cohort와 실행을 `PARTIAL`로 만들지 않고, 완료가
+  없으므로 그 요청은 정산된 실패처럼 규칙에 따라 다시 물어 늦게 들어온 기업행동도 받는다. 그 밖의 실패·과금·
+  모순된 정산·행이 있는 답과 `prices`의 빈 답은 실패다.
 - 결과가 불확실한 유료 호출은 수집을 멈추고(`stopped`, 종료 코드 2) 자동으로 다시 호출하지 않는다.
 - 예산 거부(유료 호출 수·크레딧·HTTP 시도 수·시간·서버 잔액)는 intent를 만들기 전에 일어나므로 시도한
   것이 없다. 남은 job은 `pending`이고 상태는 `budget_exhausted`(종료 코드 0)다. 다음 실행은 완료된 job을
@@ -3005,4 +3006,4 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-503 | `classifications.kr.kind` route는 가장 늦은 generation이 `kind.industry@1`인 chain을 `@1`로 잇고(`no_template` 없음), `@2` generation이 게시된 chain은 `@2`로 잇는다 | `tests/storage/test_maintain_kind.py::test_a_kind_chain_continues_with_the_mapper_of_its_latest_generation` | 구현 |
 | DV-504 | legacy `korea.public_response@1` 모양의 `kind-listings` 원천은 identity 증분과 `classifications.kr.kind` route가 건너뛰고 보고하며, `kr-import` 모양의 원천은 그대로 쓴다 | `tests/storage/test_maintain_kind.py::test_legacy_shaped_kind_listings_are_skipped_and_reported` | 구현 |
 | DV-505 | legacy 모양의 `kind-listings` 원천이 있는 설치본의 `aas maintain plan --promotions`는 identity와 승격 단계를 실패 없이 계획한다 | `tests/application/test_maintain.py::test_a_plan_skips_legacy_shaped_kind_listings` | 구현 |
-| DV-506 | Qveris가 거래소 일간 `splits`·`dividends`의 빈 결과를 과금 없는 실패(`empty_result`)로 답하면 그날 기업행동이 없는 완료(0행)이고, `prices`의 빈 답과 다른 실패·과금된 답은 실패로 남는다 | `tests/data/test_qveris_actions_fx.py::test_an_uncharged_empty_result_is_an_exchange_day_without_actions` | 구현 |
+| DV-506 | Qveris가 거래소 일간 `splits`·`dividends`의 빈 결과를 과금 없는 실패(`empty_result`)로 답하면 `empty`로 세고 실패나 완료로 세지 않으며, 요청은 열린 채 규칙에 따라 다시 묻고, `prices`의 빈 답과 다른 실패·과금·모순된 답은 실패다 | `tests/data/test_qveris_empty_answer.py::test_an_empty_answer_is_counted_empty_and_leaves_the_request_open` | 구현 |

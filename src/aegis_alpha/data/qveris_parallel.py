@@ -45,6 +45,7 @@ from aegis_alpha.data.qveris_contracts import (
     credit_value,
     object_value,
 )
+from aegis_alpha.data.qveris_payloads import QverisEmptyAnswerError
 from aegis_alpha.data.qveris_store import QverisStore
 from aegis_alpha.data.serialization import content_sha256
 
@@ -349,7 +350,7 @@ def _settle(  # noqa: C901, PLR0912, PLR0915 -- ordered crash-safe settlement st
             result = {
                 "job_id": job.job_id,
                 "fingerprint": job.fingerprint,
-                "status": "FAILED",
+                "status": "EMPTY" if isinstance(error, QverisEmptyAnswerError) else "FAILED",
                 "reused": False,
                 "provider_calls_this_run": 0,
                 "reason": str(error),
@@ -432,10 +433,10 @@ def _acquire_locked(  # noqa: C901, PLR0912, PLR0913, PLR0915 -- ordered coordin
                     },
                 )
                 old[job.fingerprint] = {**result, "reused": True}
-            except (ValueError, RuntimeError, TypeError):
+            except (ValueError, RuntimeError, TypeError) as error:
                 old[job.fingerprint] = {
                     "fingerprint": job.fingerprint,
-                    "status": "FAILED",
+                    "status": "EMPTY" if isinstance(error, QverisEmptyAnswerError) else "FAILED",
                     "reused": True,
                     "provider_calls_this_run": 0,
                 }

@@ -48,10 +48,10 @@ def interleave_cohorts(cohorts: tuple[tuple[QverisJob, ...], ...]) -> tuple[Qver
     return tuple(result)
 
 
-def _counts(value: object, group: list[QverisJob]) -> tuple[int, int, int, int]:
+def _counts(value: object, group: list[QverisJob]) -> tuple[int, int, int, int, int]:
     if not isinstance(value, list) or len(value) != len(group):
         raise ValueError("parallel result does not cover the scheduled group")
-    completed = failed = reused = warned = 0
+    completed = failed = empty = reused = warned = 0
     fingerprints = []
     for item in value:
         row = object_value(item)
@@ -61,12 +61,14 @@ def _counts(value: object, group: list[QverisJob]) -> tuple[int, int, int, int]:
             warned += row.get("status") == WARNED
         elif row.get("status") == "FAILED":
             failed += 1
+        elif row.get("status") == "EMPTY":
+            empty += 1
         else:
             raise ValueError("parallel result is incomplete")
         reused += row.get("reused") is True
     if fingerprints != [job.fingerprint for job in group]:
         raise ValueError("parallel result identities differ from scheduled group")
-    return completed, failed, reused, warned
+    return completed, failed, empty, reused, warned
 
 
 def _group(remaining: deque[QverisJob], workers: int) -> list[QverisJob]:
@@ -89,7 +91,8 @@ def collect_parallel_cohorts(  # noqa: C901, PLR0913, PLR0915 -- one scheduler l
     """Interleave the cohorts and acquire them in groups of at most ``workers`` jobs.
 
     Single-page tools run as one parallel group; any other tool runs serially. A group
-    that settles with failures is counted and scheduling continues. An uncertain group,
+    that settles with failures is counted and scheduling continues; uncharged empty answers
+    for exchange days of actions are counted ``empty`` and are not failures. An uncertain group,
     a group refused by the budget, or a changed result identity stops scheduling, and
     the unprocessed jobs are reported as pending. A budget refusal counts as budget
     exhaustion only when the store holds no unresolved page or group.
@@ -103,7 +106,7 @@ def collect_parallel_cohorts(  # noqa: C901, PLR0913, PLR0915 -- one scheduler l
     report_root = root / "parallel-cohorts" / cohort_id
     publish_bytes(report_root / "jobs.json", canonical_json_bytes([j.document() for j in jobs]))
     remaining = deque(jobs)
-    completed = failed = reused = warned = calls = processed = 0
+    completed = failed = empty = reused = warned = calls = processed = 0
     stopped: str | None = None
     batch_index = 0
     snapshot: dict[str, object] = {}
@@ -114,6 +117,7 @@ def collect_parallel_cohorts(  # noqa: C901, PLR0913, PLR0915 -- one scheduler l
                 serial = collect_cohort(tuple(group), root, client_factory(), budget=budget)
                 completed += int(str(serial["completed"]))
                 failed += int(str(serial["failed"]))
+                empty += int(str(serial["empty"]))
                 reused += int(str(serial["reused"]))
                 warned += int(str(serial["warned"]))
                 calls += int(str(serial["successful_job_calls_this_run"]))
@@ -129,9 +133,10 @@ def collect_parallel_cohorts(  # noqa: C901, PLR0913, PLR0915 -- one scheduler l
                     # The group settled: count its completions and calls, then stop.
                     result, stopped = error.result, "PROVIDER_STOP"
                 calls += int(str(result["provider_calls_this_run"]))
-                done, errors, cached, flagged = _counts(result["jobs"], group)
+                done, errors, blank, cached, flagged = _counts(result["jobs"], group)
                 completed += done
                 failed += errors
+                empty += blank
                 reused += cached
                 warned += flagged
                 processed += len(group)
@@ -148,6 +153,7 @@ def collect_parallel_cohorts(  # noqa: C901, PLR0913, PLR0915 -- one scheduler l
             "processed": processed,
             "completed": completed,
             "failed": failed,
+            "empty": empty,
             "pending": len(jobs) - processed,
             "reused": reused,
             "warned": warned,

@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from pathlib import Path
 
 import pytest
 
-from aegis_alpha.data.qveris_acquisition import acquire_jobs
 from aegis_alpha.data.qveris_contracts import EOD_HISTORY_JSON_TOOL, QverisJob
 from aegis_alpha.data.qveris_native import (
     normalize_bulk_actions,
@@ -16,13 +14,10 @@ from aegis_alpha.data.qveris_native import (
     normalize_price_history,
     read_completed_job,
 )
-from aegis_alpha.data.qveris_payloads import empty_action_day, validate_payload
 from aegis_alpha.data.serialization import canonical_json_bytes
 from tests.data.qveris_support import (
     KR_IDENTITY,
     OBSERVED,
-    ScriptedQveris,
-    account_key,
     bar,
     bulk_job,
     complete,
@@ -165,101 +160,3 @@ def test_us_single_instrument_history_uses_the_shared_bar_rules(tmp_path: Path) 
     assert [h["reason"] for h in normalized.quarantine] == ["invalid_price_or_volume"]
     with pytest.raises(ValueError, match="splits or dividends"):
         normalize_bulk_actions(_read(tmp_path, job), IDENTITIES)
-
-
-def _empty_result(root: Path, job: QverisJob) -> ScriptedQveris:
-    client = ScriptedQveris({}, account_key(root))
-    client.failure = "empty-result"
-    acquire_jobs((job,), root, client)
-    return client
-
-
-@pytest.mark.parametrize("dataset", ["splits", "dividends"])
-def test_an_uncharged_empty_result_is_an_exchange_day_without_actions(
-    tmp_path: Path, dataset: str
-) -> None:
-    job = bulk_job("KO", dataset)
-    client = _empty_result(tmp_path, job)
-    marker = json.loads((tmp_path / "jobs" / job.fingerprint / "complete.json").read_bytes())
-    assert (marker["status"], marker["rows"], marker["settled_credits"]) == (
-        "RAW_ACQUIRED",
-        0,
-        "0.0",
-    )
-    assert "gateway_warnings" not in marker
-    history = _read(tmp_path, job)
-    assert not history.provider_warning
-    normalized = normalize_bulk_actions(history, IDENTITIES)
-    assert normalized.rows == normalized.quarantine == ()
-    # The completion is reused from its pinned pages without another paid call.
-    acquire_jobs((job,), tmp_path, client)
-    assert client.execute_count == 1
-
-
-def test_an_empty_result_for_prices_stays_a_failure(tmp_path: Path) -> None:
-    job = bulk_job("KO", "prices")
-    with pytest.raises(ValueError, match="did not succeed"):
-        _empty_result(tmp_path, job)
-    assert not (tmp_path / "jobs" / job.fingerprint / "complete.json").exists()
-
-
-EMPTY_USAGE: dict[str, object] = {
-    "execution_id": "exec-1",
-    "outcome": "empty_result",
-    "reason_code": "result.empty",
-    "charge_outcome": "failed_not_charged",
-    "actual_amount_credits": "0.0",
-    "settled_amount_credits": "0.0",
-}
-EMPTY_RESPONSE: dict[str, object] = {
-    "execution_id": "exec-1",
-    "success": False,
-    "result": {"status_code": 200, "data": []},
-}
-
-
-def test_only_the_exact_uncharged_empty_answer_is_admitted() -> None:
-    job = bulk_job("KQ", "dividends")
-    assert empty_action_day(job, EMPTY_RESPONSE, EMPTY_USAGE)
-    assert validate_payload(job, job.parameters, EMPTY_RESPONSE, usage=EMPTY_USAGE).rows == 0
-    with pytest.raises(ValueError, match="did not succeed"):
-        validate_payload(job, job.parameters, EMPTY_RESPONSE)
-    result = EMPTY_RESPONSE["result"]
-    assert isinstance(result, dict)
-    refused_responses = [
-        {**EMPTY_RESPONSE, "success": True},
-        {**EMPTY_RESPONSE, "execution_id": "exec-2"},
-        {**EMPTY_RESPONSE, "result": {**result, "status_code": 500}},
-        {**EMPTY_RESPONSE, "result": {**result, "data": "no rows"}},
-        {
-            **EMPTY_RESPONSE,
-            "result": {
-                **result,
-                "data": [
-                    {
-                        "code": "A",
-                        "exchange": "KQ",
-                        "date": "2026-08-31",
-                        "dividend": "1",
-                        "currency": "KRW",
-                    }
-                ],
-            },
-        },
-        {**EMPTY_RESPONSE, "result": {**result, "truncated": True}},
-    ]
-    for response in refused_responses:
-        assert not empty_action_day(job, response, EMPTY_USAGE), response
-    refused_usage = [
-        {**EMPTY_USAGE, "outcome": "partial_success"},
-        {**EMPTY_USAGE, "reason_code": "provider.error"},
-        {**EMPTY_USAGE, "charge_outcome": "charged"},
-        {**EMPTY_USAGE, "actual_amount_credits": "2.81"},
-        {**EMPTY_USAGE, "settled_amount_credits": "0.01"},
-        {**EMPTY_USAGE, "settled_amount_credits": None},
-        {**EMPTY_USAGE, "execution_id": "exec-2"},
-    ]
-    for usage in refused_usage:
-        assert not empty_action_day(job, EMPTY_RESPONSE, usage), usage
-    for other in (bulk_job("KQ", "prices"), fx_job(), history_job()):
-        assert not empty_action_day(other, EMPTY_RESPONSE, EMPTY_USAGE)

@@ -26,7 +26,7 @@ from aegis_alpha.data.qveris_contracts import (
     load_json,
     object_value,
 )
-from aegis_alpha.data.qveris_payloads import empty_action_day, validate_payload
+from aegis_alpha.data.qveris_payloads import validate_payload
 from aegis_alpha.data.qveris_store import QverisStore, validate_destination
 from aegis_alpha.data.serialization import content_sha256
 
@@ -297,8 +297,13 @@ def _finish_job(  # noqa: C901, PLR0912, PLR0913, PLR0915 -- sequential durable 
             raise ValueError("Qveris response and billing execution IDs differ")
         retrieved_at = store.document(f"{page}.response.json")["retrieved_at_utc"]
         retrieved_on = datetime.fromisoformat(str(retrieved_at)).date()
-        usage = object_value(billing["usage"])
-        shape = validate_payload(job, parameters, document, retrieved_on=retrieved_on, usage=usage)
+        shape = validate_payload(
+            job,
+            parameters,
+            document,
+            retrieved_on=retrieved_on,
+            usage=object_value(billing["usage"]),
+        )
         if total is not None and shape.total != total:
             raise ValueError("provider count changed between pages")
         total = shape.total
@@ -312,9 +317,8 @@ def _finish_job(  # noqa: C901, PLR0912, PLR0913, PLR0915 -- sequential durable 
         keys.update(shape.keys)
         rows += shape.rows
         cost += credit_value(billing["settled_credits"])
-        if usage.get("outcome") not in {None, "success"} and not empty_action_day(
-            job, document, usage
-        ):
+        usage = object_value(billing["usage"])
+        if usage.get("outcome") not in {None, "success"}:
             warnings.append(
                 {
                     "page": number,
