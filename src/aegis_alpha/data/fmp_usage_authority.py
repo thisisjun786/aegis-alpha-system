@@ -26,6 +26,7 @@ from aegis_alpha.collection.usage_checkpoint_crypto import (
     Ed25519PublicKeyring,
     TrustedEd25519PublicKey,
 )
+from aegis_alpha.storage.checkout import require_outside_checkout
 
 _AUTHORITY_SCHEMA: Final = "aegis-alpha/fmp-usage-authority"
 _AUTHORITY_VERSION: Final = 1
@@ -130,8 +131,9 @@ def _read_external_artifact(path: Path) -> bytes:
         raise ValueError("authority artifact path is invalid")
     if any(part.is_symlink() for part in (path, *path.parents)):
         raise ValueError("authority artifact path must not contain symlinks")
-    if any((parent / ".git").exists() for parent in (path.parent, *path.parents)):
-        raise ValueError("authority artifact must be outside a Git repository")
+    require_outside_checkout(
+        path.parent, error=ValueError, message="authority artifact must be outside a Git repository"
+    )
     directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY
     file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):

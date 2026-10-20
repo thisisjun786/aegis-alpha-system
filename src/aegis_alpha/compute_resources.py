@@ -20,6 +20,7 @@ from threading import Event
 from typing import BinaryIO
 
 from aegis_alpha.data.descriptor_tree import DescriptorTree
+from aegis_alpha.storage.checkout import require_outside_checkout
 
 HOST_CPU_ENV = "AAS_HOST_CPU_LIMIT"
 HOST_MEMORY_ENV = "AAS_HOST_MEMORY_LIMIT_BYTES"
@@ -338,8 +339,9 @@ def compute_lock_path(environ: Mapping[str, str] | None = None) -> Path:
 def _validate_lock_path(path: Path) -> None:
     if not isinstance(path, Path) or not path.is_absolute() or ".." in path.parts or not path.name:
         raise ComputeResourceError("compute lock must be an exact absolute file path")
-    if any((parent / ".git").exists() for parent in path.parents):
-        raise ComputeResourceError("compute lock must be outside Git")
+    require_outside_checkout(
+        path.parent, error=ComputeResourceError, message="compute lock must be outside Git"
+    )
 
 
 def _lock_identity(tree: DescriptorTree, handle: BinaryIO) -> tuple[int, int]:

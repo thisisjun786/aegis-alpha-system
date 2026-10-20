@@ -13,6 +13,7 @@ from aegis_alpha.storage.locks import file_lock
 from aegis_alpha.storage.paths import load_paths, resolve_home
 from aegis_alpha.storage.sqlite import connect
 from aegis_alpha.storage.workspace import initialize, open_workspace, write_json
+from tests.checkout_support import init_repository
 
 _PRIVATE_FILE = 0o600
 _PRIVATE_DIRECTORY = 0o700
@@ -108,7 +109,7 @@ def test_config_cannot_alias_stores_or_git_checkout(tmp_path: Path) -> None:
         load_paths(home)
     repo = tmp_path / "repo"
     repo.mkdir()
-    (repo / ".git").mkdir()
+    init_repository(repo)
     with pytest.raises(ValueError, match="Git checkout"):
         initialize(repo / "data")
 

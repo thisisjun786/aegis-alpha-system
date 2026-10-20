@@ -59,6 +59,7 @@ from aegis_alpha.data.fred_alfred_series import (
     watermark_stream,
 )
 from aegis_alpha.data.serialization import canonical_json_bytes
+from aegis_alpha.storage.checkout import containing_checkout
 
 ALLOWED_HOST = "api.stlouisfed.org"
 BASE_URL = f"https://{ALLOWED_HOST}"
@@ -213,10 +214,7 @@ class CollectorOutcome:
 
 
 def containing_git_repository(path: Path) -> Path | None:
-    for candidate in (path, *path.parents):
-        if (candidate / ".git").exists():
-            return candidate
-    return None
+    return containing_checkout(path)
 
 
 def validate_destination(label: str, destination: Path) -> Path:

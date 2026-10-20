@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from aegis_alpha.application.data_config import _pairs
 from aegis_alpha.data.descriptor_tree import DescriptorTree
+from aegis_alpha.storage.checkout import require_outside_checkout
 
 _MAX_RECORD_BYTES = 8 * 1024 * 1024
 _MAX_RECORD_FILES = 100_000
@@ -54,8 +55,7 @@ def encoded(value: object) -> bytes:
 def validate_root(root: Path) -> None:
     if not root.is_absolute() or ".." in root.parts or root.is_symlink():
         raise ValueError("collection state needs an absolute directory without aliases")
-    if any((path / ".git").exists() for path in (root, *root.parents)):
-        raise ValueError("collection state must be outside Git")
+    require_outside_checkout(root, error=ValueError, message="collection state must be outside Git")
 
 
 def _private(tree: DescriptorTree) -> None:
