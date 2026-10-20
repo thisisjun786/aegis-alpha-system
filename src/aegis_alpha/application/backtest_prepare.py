@@ -171,6 +171,25 @@ CALCULATION_MODULES = (
     "aegis_alpha.storage.strategy_import",
     "aegis_alpha.storage.strategy_requirements",
 )
+# v1 retains its preparation/calculation scope. v2 additionally names the sources
+# that interpret an envelope, calculate accounting, serialize and commit results.
+# This is a closed installed-source inventory, not runtime import discovery.
+EXECUTION_MODULES = tuple(
+    sorted(
+        set(CALCULATION_MODULES)
+        | {
+            "aegis_alpha.application.backtest_cli",
+            "aegis_alpha.application.research_run",
+            "aegis_alpha.application.run_backtest",
+            "aegis_alpha.application.run_research",
+            "aegis_alpha.application.run_staging",
+            "aegis_alpha.storage.backtest_requests",
+            "aegis_alpha.storage.publication",
+            "aegis_alpha.storage.run_schema",
+            "aegis_alpha.storage.runs",
+        }
+    )
+)
 
 type Row = Mapping[str, object]
 
@@ -297,7 +316,7 @@ class PreparedBacktest:
         return self.projection.request_hash
 
 
-def calculation_identity() -> EngineIdentity:
+def _source_hash(modules: tuple[str, ...], schema: str) -> str:
     root = files("aegis_alpha")
     inventory = [
         {
@@ -308,22 +327,26 @@ def calculation_identity() -> EngineIdentity:
                 ).read_bytes()
             ).hexdigest(),
         }
-        for module in CALCULATION_MODULES
+        for module in modules
     ]
+    return content_sha256({"schema": schema, "hash_format": _J, "files": inventory})
+
+
+def calculation_identity() -> EngineIdentity:
+    """Preparation and execution provenance for a new request; never rewrite old IDs."""
     return cast(
         "EngineIdentity",
         _frozen(
             {
-                "schema": "aas-engine-identity-v1",
+                "schema": "aas-engine-identity-v2",
                 "hash_format": _J,
                 "package_version": version("aegis-alpha-system"),
                 "contract_version": ENGINE_CONTRACT_VERSION_V1,
-                "calculation_source_hash": content_sha256(
-                    {
-                        "schema": "aas-calculation-sources-v1",
-                        "hash_format": _J,
-                        "files": inventory,
-                    }
+                "calculation_source_hash": _source_hash(
+                    CALCULATION_MODULES, "aas-calculation-sources-v1"
+                ),
+                "execution_source_hash": _source_hash(
+                    EXECUTION_MODULES, "aas-execution-sources-v1"
                 ),
             }
         ),
@@ -2239,11 +2262,11 @@ def prepare_backtest(
     )
 
 
-# A declared run is named by its own content, so two identical declarations over one
-# installation name one run rather than looking like two results.
+# A declared run binds its content and provenance, including sources and environment.
+# Identical results across source revisions can therefore have different run IDs.
 RESEARCH_RUN_ID_SCHEMA = "aas-research-run-id-v1"
-# The declared path's own decisions are made here and in the contract module, and the
-# engine identity covers neither, so a declared run names their source itself.
+# Retained preparation-only digest for declared runs, including old v1 identities.
+# New v2 engine identities also cover these owners in their execution inventory.
 RESEARCH_SOURCE_SCHEMA = "aas-research-sources-v1"
 # A decision needs a session to fill on, so one observed session is not a period.
 _MINIMUM_RESEARCH_SESSIONS = 2
@@ -2351,9 +2374,9 @@ class PreparedResearchRun:
 
         A generated identifier would make two identical runs look like two results. This
         one is derived from the declaration, the envelope it produced and the sealed
-        provenance, so the same declaration over the same installation always names the
-        same run, and any change to inputs, conventions or engine identity names a
-        different one. That is what makes a requery meaningful without a run record.
+        provenance. The same inputs, installed code and environment name the same run;
+        a source revision names a different one even if its result bytes are identical.
+        Result reproduction and identity reproduction are separate claims.
         """
         return "research-" + content_sha256(
             {
