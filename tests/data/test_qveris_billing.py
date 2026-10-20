@@ -13,6 +13,7 @@ from aegis_alpha.data.qveris_billing import audit_request
 from aegis_alpha.data.qveris_client import QverisDocumentError, QverisResponse
 from aegis_alpha.data.qveris_store import QverisStore
 from aegis_alpha.data.serialization import canonical_json_bytes
+from tests.isolation import synthetic_account
 
 # Serial: these tests take the host-wide Qveris account lease (an abstract Unix socket named by
 # the synthetic account), so every file that takes it runs in one xdist worker.
@@ -24,7 +25,7 @@ _AUDIT_CALLS = 2
 
 
 class AuditClient:
-    account_key = "synthetic-account"
+    account_key = synthetic_account("qveris-billing")
 
     def __init__(self, response: QverisResponse) -> None:
         self.response = response
@@ -114,7 +115,7 @@ def test_successful_audit_projection_preserves_bytes(tmp_path: Path) -> None:
 
 
 def test_existing_evidence_longer_than_new_payload_is_rejected(tmp_path: Path) -> None:
-    with QverisStore(tmp_path, "synthetic") as store:
+    with QverisStore(tmp_path, synthetic_account("qveris-billing-size")) as store:
         store.publish("existing", b"abcdef")
         with pytest.raises(DescriptorTreeError, match="size cap"):
             store.publish("existing", b"abc")

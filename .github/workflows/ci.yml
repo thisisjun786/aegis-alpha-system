@@ -117,6 +117,8 @@ jobs:
       - run: ./scripts/verify-lane-test
         env:
           AAS_TEST_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+          # Every runner must use the same worker budget to compute the same partition.
+          AAS_TEST_WORKERS: 4
           # Seconds per test file as CI measures them, in the shard weight format;
           # `python -m tests.sharding merge` joins the shards into the weight table.
           PYTEST_ADDOPTS: --test-durations-out=${{ runner.temp }}/durations-${{ matrix.shard }}.json
