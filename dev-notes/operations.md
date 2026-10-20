@@ -964,6 +964,9 @@ C단계는 bundle pin뿐 아니라 실제 보존 입력도 다시 검사한다. 
 패널·가격·거시·환율 grant를 각 저장 소유자로 확인한다. 준비 후 사용한 pin이나 보존 변환
 파일이 바뀌면 SUCCESS나 성공 영수증을 남기지 않는다. 이 검사는 전략 판단이나 회계를
 다시 실행하지 않으며 `commit_run`과 같은 설치 잠금 안에서 끝난다.
+head binding은 marker와 행 수가 그대로여도 실제 generation delta를 deep 재해시하여
+변경을 거부한다. proxy와 derived definition의 간접 가격 입력도 준비 때 사용한 전용 reader로
+보존 transform을 재검증한다.
 
 기록하는 `engine_hash`는 봉인된 엔진 정체성 전체의 해시다. 기존 v1은 준비 목록만 덮어
 회계·응답 직렬화 변경을 놓칠 수 있었다. 새 v2는 `execution_source_hash`도 포함하므로

@@ -190,12 +190,11 @@ def test_retry_chain_preserves_failed_attempts_and_refuses_duplicate_success(  #
     attempt = receipt["run"]["run_id"]
     assert receipt["run"]["status"] == "SUCCESS"
     assert receipt["calculation_id"] == next(iter(frozen))
-    assert (
-        research_module.rerun_research_run(
-            attempt, home=home, declaration=path, declaration_sha256=sha(path.read_bytes())
-        )["reproduced"]
-        is True
+    reproduction = research_module.rerun_research_run(
+        attempt, home=home, declaration=path, declaration_sha256=sha(path.read_bytes())
     )
+    assert reproduction["result_reproduced"] is True
+    assert reproduction["identity_reproduced"] is True
     with open_workspace(home) as workspace:
         assert read_run(workspace, attempt)["prior_run_id"] == prior
         for run_id, (record, events, files) in frozen.items():

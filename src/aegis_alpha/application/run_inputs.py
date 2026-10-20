@@ -8,11 +8,14 @@ from typing import TYPE_CHECKING
 from aegis_alpha.application.research_run import parse_declared_request
 from aegis_alpha.application.run_staging import admit, json_object, json_text
 from aegis_alpha.engine.codec import decode_json
-from aegis_alpha.storage.input_pins import DefinitionPin, read_definition
+from aegis_alpha.storage.bulk_generation import verify_generation_bulk
+from aegis_alpha.storage.input_pins import DefinitionPin, read_definition, read_head_binding
+from aegis_alpha.storage.market import marker_for
 from aegis_alpha.storage.market_inputs import (
     GenerationPin,
     admit_native_input,
     load_pinned_observations,
+    load_pinned_proxy,
     verify_head_binding,
     verify_sealed_publication,
 )
@@ -20,6 +23,7 @@ from aegis_alpha.storage.strategies import load_strategy
 
 if TYPE_CHECKING:
     from aegis_alpha.compute_resources import ComputeBudget
+    from aegis_alpha.storage.read_heads import HeadBinding
     from aegis_alpha.storage.workspace import Workspace
 
 
@@ -99,7 +103,49 @@ def verify_run_inputs(workspace: Workspace, raw: bytes, *, budget: ComputeBudget
         if grant.prices is not None:
             bindings.append(grant.prices)
     for binding in bindings:
-        verify_head_binding(workspace, binding, budget=budget)
+        _verify_head(workspace, binding, budget)
+
+
+def _verify_head(workspace: Workspace, binding: HeadBinding, budget: ComputeBudget) -> None:
+    """Verify retained provenance and every actual delta, not only marker identities."""
+    verify_head_binding(workspace, binding, budget=budget)
+    for item in binding.pins:
+        verify_generation_bulk(workspace.market, item.pin.generation_id, budget=budget, deep=True)
+
+
+def _derived_publications(
+    workspace: Workspace, binding: dict[str, object], budget: ComputeBudget
+) -> None:
+    """Re-admit indirect native prices through the same owner preparation uses."""
+    raw = read_definition(
+        workspace,
+        DefinitionPin(
+            "derived",
+            *(json_text(binding[key], key) for key in ("ref_id", "ref_version", "hash")),
+        ),
+        budget=budget,
+    )
+    admit(budget, len(raw))
+    budget = replace(budget, reserved_bytes=budget.reserved_bytes + 128 * len(raw))
+    definition = json_object(decode_json(raw), "derived definition")
+    inputs = definition["inputs"]
+    if not isinstance(inputs, list):
+        raise TypeError("derived inputs must be an array")
+    for item in inputs:
+        descriptor = json_object(json_object(item, "derived input")["pin"], "generation reference")
+        pinned = json_object(descriptor["pin"], "generation pin")
+        pin = GenerationPin(
+            *(
+                json_text(pinned[key], key)
+                for key in ("dataset_id", "version", "generation_id", "chain_hash", "manifest_hash")
+            )
+        )
+        if marker_for(workspace.market, pin.generation_id)["domain"] == "prices":
+            admit_native_input(
+                workspace, pin, expected_schema="aas-price-transform-v1", budget=budget
+            )
+        else:
+            verify_sealed_publication(workspace, pin.generation_id, budget=budget)
 
 
 def _strict_publications(
@@ -110,6 +156,14 @@ def _strict_publications(
         raise TypeError("bindings must be an array")
     for item in bindings:
         binding = json_object(item, "binding")
+        if binding["ref_kind"] == "heads":
+            _verify_head(
+                workspace, read_head_binding(workspace, json_text(binding["hash"], "hash")), budget
+            )
+            continue
+        if binding["ref_kind"] == "derived":
+            _derived_publications(workspace, binding, budget)
+            continue
         if binding["ref_kind"] != "generation":
             continue
         row = workspace.state.execute(
@@ -130,5 +184,7 @@ def _strict_publications(
                 else "aas-price-transform-v1",
                 budget=budget,
             )
+        elif binding["role"] == "proxy":
+            load_pinned_proxy(workspace, pin, budget=budget)
         else:
             verify_sealed_publication(workspace, pin.generation_id, budget=budget)
