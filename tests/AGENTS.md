@@ -64,8 +64,9 @@ The root `conftest.py` owns network, home, data-root and disposable DB isolation
   a name relative to its directory rather than by its 107-byte-limited absolute path.
 - **Fast local loop.** `uv run --no-sync pytest -n auto --dist loadgroup -m 'not database'
   <paths>` for the area you change; `./scripts/verify-lane-test` for the whole lane. For
-  fsync-heavy storage tests use `TMPDIR=/dev/shm/aas-$USER`, never `/tmp` (a stray `/tmp/.git`
-  makes storage refuse paths). Use `AAS_TEST_WORKERS=0`, or omit `-n`, to debug in one process.
+  fsync-heavy storage tests use `TMPDIR=/dev/shm/aas-$USER` for faster temporary writes.
+  Storage refuses real Git repositories in the ancestry; empty `.git` targets are ignored.
+  Use `AAS_TEST_WORKERS=0`, or omit `-n`, to debug in one process.
 - **Sharding is file-granular and deterministic.** `sharding.py` (registered from `conftest.py`)
   adds `--test-shard INDEX/COUNT`. After marker selection it balances whole test files over the
   shards by the measured seconds in `shard_weights.json`. Files sharing an xdist group form

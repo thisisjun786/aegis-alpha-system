@@ -15,6 +15,7 @@ import pytest
 
 from aegis_alpha.storage import raw, source_library
 from aegis_alpha.storage.workspace import initialize, open_workspace
+from tests.checkout_support import init_repository
 
 
 @pytest.fixture
@@ -39,7 +40,7 @@ def test_import_rejects_source_when_inside_checkout(source: Path, *, git_file: b
     if git_file:
         marker.write_text("gitdir: synthetic-unused\n")
     else:
-        marker.mkdir()
+        init_repository(checkout)
     moved = source.replace(checkout / source.name)
     original = moved.read_bytes()
     with open_workspace(home, writable=True, strategy_write=True) as workspace:
@@ -60,7 +61,7 @@ def test_archive_rejects_source_when_inside_checkout(source: Path) -> None:
     root.mkdir(mode=0o700)
     checkout = source.parent / "checkout"
     checkout.mkdir(mode=0o700)
-    (checkout / ".git").mkdir()
+    init_repository(checkout)
     moved = source.replace(checkout / source.name)
     # When archival attempts to admit that source.
     with pytest.raises(ValueError, match="Git checkout"):
@@ -187,7 +188,7 @@ def test_cli_rejects_source_when_inside_checkout(source: Path) -> None:
     initialize(home)
     checkout = source.parent / "checkout"
     checkout.mkdir(mode=0o700)
-    (checkout / ".git").mkdir()
+    init_repository(checkout)
     moved = source.replace(checkout / source.name)
     digest = hashlib.sha256(moved.read_bytes()).hexdigest()
     # When source-import crosses the real subprocess CLI surface.

@@ -33,6 +33,7 @@ from aegis_alpha.data.fred_alfred_series import (
 )
 from aegis_alpha.data.sec_evidence import open_directory, publish_bytes, read_bytes
 from aegis_alpha.data.serialization import canonical_json_bytes
+from aegis_alpha.storage.checkout import require_outside_checkout
 
 PAGE_LIMIT = 100000
 MAX_PAGES = 1000
@@ -45,8 +46,9 @@ def plan_archive(root: Path, series: Sequence[str], max_calls: int) -> dict[str,
     selected = validate_series_universe(series)
     if not root.is_absolute() or ".." in root.parts or "fred-manual" not in root.parts:
         raise ValueError("manual FRED root must be absolute under a distinct fred-manual directory")
-    if any((parent / ".git").exists() for parent in (root, *root.parents)):
-        raise ValueError("manual FRED archive must be outside Git")
+    require_outside_checkout(
+        root, error=ValueError, message="manual FRED archive must be outside Git"
+    )
     if type(max_calls) is not int or max_calls < 1:
         raise ValueError("manual FRED max_calls must be positive")
     return {

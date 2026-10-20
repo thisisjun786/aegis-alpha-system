@@ -30,6 +30,7 @@ from typing import Final, Protocol, Self
 from urllib.parse import quote, urlencode, urlsplit
 
 from aegis_alpha.data.descriptor_tree import DescriptorTree, DescriptorTreeError
+from aegis_alpha.storage.checkout import require_outside_checkout
 
 QVERIS_BASE_URL: Final = "https://qveris.ai/api/v1"
 ALLOWED_HOST: Final = "qveris.ai"
@@ -272,8 +273,11 @@ def _read_key_file(key_file: Path) -> str:
         raise QverisKeyFileError("Qveris key file must be an absolute path without traversal")
     if key_file.name in {"", ".", ".."}:
         raise QverisKeyFileError("Qveris key file must name a regular file")
-    if any((parent / ".git").exists() for parent in (key_file.parent, *key_file.parents)):
-        raise QverisKeyFileError("Qveris key file must be outside a Git repository")
+    require_outside_checkout(
+        key_file.parent,
+        error=QverisKeyFileError,
+        message="Qveris key file must be outside a Git repository",
+    )
     try:
         with (
             DescriptorTree.open_path(key_file.parent) as tree,

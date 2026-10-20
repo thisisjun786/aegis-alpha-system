@@ -80,6 +80,7 @@ from aegis_alpha.data.fmp_rate_limit import (
     UsageEvidenceUnavailableError,
 )
 from aegis_alpha.data.serialization import canonical_json_bytes
+from tests.checkout_support import init_repository
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -1147,7 +1148,7 @@ def test_the_fail_closed_gate_is_reached_only_after_every_earlier_gate(tmp_path:
 
 def test_a_git_contained_destination_means_zero_calls(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
-    (repository / ".git").mkdir(parents=True)
+    init_repository(repository)
     with pytest.raises(DestinationError, match="outside a Git repository"):
         run_preflight(
             registry_path=FIXTURE_ROOT / "registry_pending.json",
@@ -1301,7 +1302,7 @@ def test_build_universe_preflight_validates_the_manifest_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repository = tmp_path / "repository"
-    (repository / ".git").mkdir(parents=True)
+    init_repository(repository)
     arguments = argparse.Namespace(
         command="build-universe",
         registry=FIXTURE_ROOT / "registry_cleared.json",
