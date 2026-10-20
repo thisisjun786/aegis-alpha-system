@@ -5,7 +5,9 @@ shard collects the same items under the same marker selection, so every shard
 computes the same partition: the union of all shards is the unsharded run and no
 file runs twice. A whole file stays in one shard, so module fixtures are built once.
 
-Files are balanced by the measured seconds in ``shard_weights.json``. A file the
+Files sharing a serial group form one shard unit. Units are balanced by estimated
+xdist wall time using the measured seconds in ``shard_weights.json`` and the worker
+count (which must match across all shards). A file the
 table does not list is estimated from its item count at the table's mean
 seconds per test, so a new file needs no table edit to be scheduled. Refresh the
 table with ``--test-durations-out`` from an unsharded run of the same lane, or join
@@ -27,6 +29,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
+
+from tests.scheduling import scope_of
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -108,26 +112,80 @@ def estimates(counts: Mapping[str, int], weights: Mapping[str, int]) -> dict[str
     return {name: weights.get(name, counts[name] * per_test) for name in counts}
 
 
-def partition(counts: Mapping[str, int], weights: Mapping[str, int], count: int) -> list[list[str]]:
-    """Longest-first greedy balance of files over ``count`` shards, ties broken by name."""
+def partition(
+    counts: Mapping[str, int],
+    weights: Mapping[str, int],
+    count: int,
+    *,
+    workers: int = 1,
+    groups: Iterable[Iterable[str]] = (),
+) -> list[list[str]]:
+    """Balance max(total / workers, longest serial unit), with stable tie breaking.
+
+    A file is indivisible, and files sharing a serial group form one unit. Overlapping
+    groups are joined so even a file with both grouped and ungrouped tests stays whole.
+    The estimate is a lower bound, not a promise of scheduler or runner throughput.
+    """
     if count < 1:
         raise ValueError("shard count must be positive")
+    if workers < 1:
+        raise ValueError("worker count must be positive")
     cost = estimates(counts, weights)
+    units = {name: {name} for name in counts}
+    for group in groups:
+        members = set().union(*(units[name] for name in group if name in units))
+        for name in members:
+            units[name] = members
+    combined = {tuple(sorted(members)) for members in units.values()}
+    unit_cost = {unit: sum(cost[name] for name in unit) for unit in combined}
     shards: list[list[str]] = [[] for _ in range(count)]
     loads = [0] * count
-    for name in sorted(cost, key=lambda name: (-cost[name], name)):
-        target = min(range(count), key=lambda shard: (loads[shard], shard))
-        shards[target].append(name)
-        loads[target] += cost[name]
+    longest = [0] * count
+    for unit in sorted(unit_cost, key=lambda unit: (-unit_cost[unit], unit)):
+        duration = unit_cost[unit]
+        target = min(
+            range(count),
+            key=lambda shard: (
+                max(loads[shard] + duration, workers * max(longest[shard], duration)),
+                loads[shard],
+                shard,
+            ),
+        )
+        shards[target].extend(unit)
+        loads[target] += duration
+        longest[target] = max(longest[target], duration)
     return [sorted(files) for files in shards]
 
 
 def select(
-    nodeids: Iterable[str], weights: Mapping[str, int], index: int, count: int
+    nodeids: Iterable[str],
+    weights: Mapping[str, int],
+    index: int,
+    count: int,
+    *,
+    workers: int = 1,
 ) -> frozenset[str]:
     """The test files that shard ``index`` of ``count`` runs."""
+    nodeids = tuple(nodeids)
     counts = Counter(file_of(nodeid) for nodeid in nodeids)
-    return frozenset(partition(counts, weights, count)[index - 1])
+    groups: defaultdict[str, set[str]] = defaultdict(set)
+    for nodeid in nodeids:
+        groups[scope_of(nodeid)].add(file_of(nodeid))
+    return frozenset(
+        partition(counts, weights, count, workers=workers, groups=groups.values())[index - 1]
+    )
+
+
+def _grouped_nodeid(item: pytest.Item) -> str:
+    # Read markers ourselves: serial collection has no xdist suffix, and hook ordering
+    # must not change the partition. Match xdist's combined, sorted group name.
+    names = {
+        str(mark.args[0] if mark.args else mark.kwargs.get("name", "default"))
+        for mark in item.iter_markers("xdist_group")
+    }
+    if names:
+        return f"{item.nodeid}@{'_'.join(sorted(names))}"
+    return item.nodeid
 
 
 class DurationRecorder:
@@ -181,7 +239,11 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     if shard is None:
         return
     index, count = shard
-    files = select((item.nodeid for item in items), load_weights(), index, count)
+    workerinput = getattr(config, "workerinput", {})
+    workers = workerinput.get("workercount", config.getoption("numprocesses", default=0)) or 1
+    files = select(
+        (_grouped_nodeid(item) for item in items), load_weights(), index, count, workers=workers
+    )
     kept = [item for item in items if file_of(item.nodeid) in files]
     dropped = [item for item in items if file_of(item.nodeid) not in files]
     if dropped:

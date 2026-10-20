@@ -50,11 +50,14 @@ The root `conftest.py` owns network, home, data-root and disposable DB isolation
   abstract Unix socket, a system-wide lock) carries
   `pytestmark = pytest.mark.xdist_group("<resource>")` under a `# Serial: <reason>` comment;
   every file of one group runs in one worker. Today the only group is
-  `qveris-account-lease`: the Qveris store binds an abstract socket named by the account, and
-  the synthetic accounts are fixed. `conftest.py` fails a test that enters `QverisStore`
-  outside that group. A group serializes one run only: two pytest runs on one host still
-  contend for the same socket, so a test that starts a nested pytest run points it at
-  generated files under `tmp_path`, never at test files that take a host-wide resource.
+  `qveris-account-lease`: the Qveris store binds an abstract socket named by the account.
+  Synthetic clients use `isolation.synthetic_account` to derive stable accounts from the
+  process's isolation root, or `qveris_support.account_key` for a specific disposable raw
+  root, so independent pytest invocations do not contend. Never add a fixed lease-taking
+  account. Cross-process exclusion probes pass the same generated account explicitly to
+  their children and exercise the unchanged production lease. `conftest.py` still fails a
+  test that enters `QverisStore` outside the group. Nested scheduling probes use generated
+  files under `tmp_path`; the concurrent-account probe starts isolated pytest processes.
   Under xdist a grouped test's reported node ID ends in `@<group>`. `AAS_TEST_WORKERS=0` runs
   serially.
   xdist puts `tmp_path` one directory deeper (`popen-gwN/`), so bind an `AF_UNIX` socket by
@@ -65,8 +68,14 @@ The root `conftest.py` owns network, home, data-root and disposable DB isolation
   makes storage refuse paths). Use `AAS_TEST_WORKERS=0`, or omit `-n`, to debug in one process.
 - **Sharding is file-granular and deterministic.** `sharding.py` (registered from `conftest.py`)
   adds `--test-shard INDEX/COUNT`. After marker selection it balances whole test files over the
-  shards by the measured seconds in `shard_weights.json`; a file the table lacks is estimated
-  from its test count at the table's mean rate. Every CI `tests` shard publishes the seconds it
+  shards by the measured seconds in `shard_weights.json`. Files sharing an xdist group form
+  one indivisible shard unit, including transitive groups through a shared file. Longest
+  units go first, minimizing estimated wall time `max(total / workers, longest unit)`;
+  ties use total work and shard index. All shards must use the same worker count (CI pins
+  four); serial runs use one. A file the table lacks is estimated from its test count at
+  the table's mean rate. The current table comes from all four artifacts of CI run
+  [38603653880](https://github.com/thisisjun786/aegis-alpha-system/actions/runs/38603653880),
+  measured with four workers per runner. Every CI `tests` shard publishes the seconds it
   measured as the `test-durations-<INDEX>` artifact; when shard durations drift apart, refresh
   the table from one run's artifacts with `python -m tests.sharding merge durations-*.json`
   (it refuses inputs that leave out a weighed file the `-m "not database"` lane still runs,

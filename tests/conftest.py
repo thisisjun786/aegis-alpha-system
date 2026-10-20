@@ -35,7 +35,7 @@ from aegis_alpha.metadata.schema import metadata  # noqa: E402
 
 # CI splits the database-free lane into deterministic file shards (tests/sharding.py), and
 # xdist runs whole files or declared serial groups per worker (tests/scheduling.py).
-pytest_plugins = ["tests.sharding", "tests.scheduling"]
+pytest_plugins = ["tests.scheduling", "tests.sharding"]
 
 _DATABASE_PREFIX = "aas_owned_"
 _DATABASE_SUFFIX = "_test"

@@ -82,6 +82,105 @@ def test_more_shards_than_files_leaves_empty_shards() -> None:
     assert select(["tests/test_only.py::test_x"], {}, 2, 3) == frozenset()
 
 
+def test_serial_group_is_one_shard_unit() -> None:
+    nodeids = [
+        "tests/test_a.py::test_one@lease",
+        "tests/test_b.py::test_two@lease",
+        "tests/test_c.py::test_three",
+    ]
+    weights = {nodeid.split("::")[0]: 1000 for nodeid in nodeids}
+    shards = [select(nodeids, weights, index, 2) for index in (1, 2)]
+    assert {"tests/test_a.py", "tests/test_b.py"} in shards
+    assert frozenset().union(*shards) == frozenset(weights)
+
+
+def test_parallel_shards_balance_wall_time_instead_of_summed_seconds() -> None:
+    # A 10-second file pins one runner for 10s. Two 6-second files fit on the
+    # other runner's two workers; adding a 4-second file there gives 10s as well.
+    weights = dict(zip("abcd", (10, 6, 6, 4), strict=True))
+    counts = dict.fromkeys(weights, 1)
+    assert partition(counts, weights, 2, workers=2) == [["a"], ["b", "c", "d"]]
+    assert partition(counts, weights, 2, workers=1) == [["a", "d"], ["b", "c"]]
+
+
+def test_overlapping_groups_keep_every_file_whole() -> None:
+    nodeids = [
+        "tests/test_a.py::test_one@first",
+        "tests/test_b.py::test_two@first",
+        "tests/test_b.py::test_three@second",
+        "tests/test_c.py::test_four@second",
+        "tests/test_c.py::test_five",
+        "tests/test_d.py::test_six[email@example]",
+    ]
+    shards = [select(nodeids, {}, index, 3, workers=4) for index in (1, 2, 3)]
+    assert {"tests/test_a.py", "tests/test_b.py", "tests/test_c.py"} in shards
+    assert sorted(name for shard in shards for name in shard) == [
+        "tests/test_a.py",
+        "tests/test_b.py",
+        "tests/test_c.py",
+        "tests/test_d.py",
+    ]
+    assert select(reversed(nodeids), {}, 1, 3, workers=4) == shards[0]
+
+
+@pytest.mark.parametrize(("count", "workers"), [(0, 1), (1, 0), (1, -1)])
+def test_partition_refuses_nonpositive_capacity(count: int, workers: int) -> None:
+    with pytest.raises(ValueError, match="must be positive"):
+        partition({}, {}, count, workers=workers)
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_marked_files_stay_together_in_collected_shards(tmp_path: Path, workers: int) -> None:
+    (tmp_path / "pytest.ini").write_text("[pytest]\n")
+    for name, mark in (
+        ("a", 'pytestmark = pytest.mark.xdist_group("lease")'),
+        ("b", 'pytestmark = pytest.mark.xdist_group(name="lease")'),
+        ("c", ""),
+    ):
+        (tmp_path / f"test_{name}.py").write_text(
+            f"import pytest\n{mark}\n\ndef test_one():\n    pass\n"
+        )
+    environment = {key: value for key, value in os.environ.items() if key != "PYTEST_ADDOPTS"}
+    environment["PYTHONPATH"] = str(_ROOT)
+    shards = []
+    for index in (1, 2, 3):
+        result = subprocess.run(  # noqa: S603 -- generated tests, fixed interpreter
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "--collect-only",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+                "-p",
+                "tests.scheduling",
+                "-p",
+                "tests.sharding",
+                "-n",
+                str(workers),
+                "--dist",
+                "loadgroup",
+                "--test-shard",
+                f"{index}/3",
+            ],
+            cwd=tmp_path,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        shards.append({line for line in result.stdout.splitlines() if "::" in line})
+    assert {"test_a.py::test_one", "test_b.py::test_one"} in shards
+    assert sorted(nodeid for shard in shards for nodeid in shard) == [
+        "test_a.py::test_one",
+        "test_b.py::test_one",
+        "test_c.py::test_one",
+    ]
+
+
 @pytest.mark.parametrize(
     "table",
     [[], {"tests/test_a.py": -1}, {"tests/test_a.py": True}, {"src/a.py": 1}, {"tests/a": 1}],
