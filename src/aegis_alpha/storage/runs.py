@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.data.serialization import canonical_json_bytes, content_sha256
+from aegis_alpha.json_memory import json_bytes_memory, json_file_memory
 from aegis_alpha.storage.backtest_requests import RESEARCH_EXECUTION_MODE, request_schema
 from aegis_alpha.storage.market import rollback
 from aegis_alpha.storage.rowset import rowset_hash
@@ -103,8 +104,8 @@ _DECLARED_RESULT_STATUS = {
 }
 _MEDIA_TYPE = "application/json"
 _SHA_LENGTH = 64
-# A sealed document is decoded whole, so it is charged at the expansion the state
-# stores already use for their own documents, before anything is read.
+# Small state metadata retains its existing conservative byte charge. Run artifacts
+# use a shape-aware scan: bytes, decoded graphs and projection/sort copies.
 _DOCUMENT_OVERHEAD = 2048
 _DOCUMENT_EXPANSION = 128
 # Fields the frozen result row cannot hold, kept in the run add-on on the same ordinal.
@@ -602,19 +603,23 @@ def _pin_rows(pins: tuple[RunStrategyPin, ...]) -> list[tuple[object, ...]]:
     ]
 
 
+def _request_memory(workspace: Workspace, bundle_id: str) -> int:
+    return int(
+        workspace.state.execute(
+            "SELECT coalesce(max(2048 + 128*length(CAST(request_bytes AS BLOB))),0) "
+            "FROM backtest_requests WHERE bundle_id=?",
+            (bundle_id,),
+        ).fetchone()[0]
+    )
+
+
 def _sealed_request(
     workspace: Workspace, bundle_id: str, request_hash: str, budget: ComputeBudget | None
 ) -> dict[str, object]:
     """Read the registered request this run must match, charged before it is decoded."""
     _admit(
         budget,
-        int(
-            workspace.state.execute(
-                "SELECT coalesce(max(2048 + 128*length(CAST(request_bytes AS BLOB))),0) "
-                "FROM backtest_requests WHERE bundle_id=?",
-                (bundle_id,),
-            ).fetchone()[0]
-        ),
+        _request_memory(workspace, bundle_id),
         "backtest request exceeds materialization budget",
     )
     row = workspace.state.execute(
@@ -915,8 +920,8 @@ def open_run(
     # Both sidecars are decoded below and stay live while the request is decoded
     # beside them, so they are charged first and then reserved rather than compared
     # twice against the same allowance.
-    inputs = _DOCUMENT_OVERHEAD + _DOCUMENT_EXPANSION * (
-        len(intent.envelope_bytes) + len(intent.preparation_bytes)
+    inputs = json_bytes_memory(intent.envelope_bytes, copies=4) + json_bytes_memory(
+        intent.preparation_bytes, copies=4
     )
     _admit(budget, inputs, "run inputs exceed materialization budget")
     held = _allowance(budget)
@@ -1066,6 +1071,16 @@ def _marker(
     }
 
 
+def _sealed_memory(workspace: Workspace, run_id: str, name: str) -> int:
+    # Four live graphs cover decoding, normalized/projected rows and sorting/encoding.
+    # The same admission applies at open, commit, verification and recovery.
+    with (
+        DescriptorTree.open_path(workspace.paths.runs) as tree,
+        tree.binary_reader(run_id + "/" + name, require_single_link=True) as handle,
+    ):
+        return json_file_memory(handle, copies=4)
+
+
 def _read_sealed(workspace: Workspace, run_id: str, name: str) -> bytes:
     with (
         DescriptorTree.open_path(workspace.paths.runs) as tree,
@@ -1173,6 +1188,7 @@ class _Derived:
     counts: dict[str, int]
     manifest: str
     metrics: dict[str, tuple[Decimal | None, str]]
+    materialization_bytes: int
     # What a declared run's preparation sealed, or None when the request names it itself.
     # Its kind and two digests rather than the decoded document, so the projection keeps
     # holding derived facts instead of a second copy of an artifact.
@@ -1186,11 +1202,8 @@ def _derive(
     measured = {name: _artifact_digest(workspace, run_id, name) for name in _ARTIFACTS}
     sizes = {name: size for name, (_hash, size) in measured.items()}
     artifacts = {name: digest for name, (digest, _size) in measured.items()}
-    _admit(
-        budget,
-        _DOCUMENT_OVERHEAD + _DOCUMENT_EXPANSION * sum(sizes.values()),
-        "run artifacts exceed materialization budget",
-    )
+    charge = sum(_sealed_memory(workspace, run_id, name) for name in _ARTIFACTS)
+    _admit(budget, charge, "run artifacts exceed materialization budget")
     envelope_bytes = _read_sealed(workspace, run_id, _ENVELOPE)
     preparation_bytes = _read_sealed(workspace, run_id, _PREPARATION)
     backtest_bytes = _read_sealed(workspace, run_id, _BACKTEST)
@@ -1206,6 +1219,7 @@ def _derive(
         counts=projected.counts,
         manifest=manifest_hash(request_hash, artifacts, (projected.hashes, projected.counts)),
         metrics=projected.metrics,
+        materialization_bytes=charge,
         prepared=projected.prepared,
     )
 
@@ -1578,6 +1592,35 @@ def _reserved(budget: ComputeBudget | None, derived: _Derived) -> ComputeBudget:
     return replace(held, reserved_bytes=held.reserved_bytes + charge * _ROW_COPIES)
 
 
+def _readback_warning(workspace: Workspace, derived: _Derived) -> dict[str, object]:
+    """Check the default reader's admission without repeating its projections.
+
+    A caller can legitimately create a larger run on an explicit allocation. Report
+    that readback needs it too; never silently produce an unreadable default receipt.
+    These are the same charges used by verify_run, including the retained projection.
+    """
+    try:
+        _admit(None, derived.materialization_bytes, "run artifacts exceed materialization budget")
+        held = _reserved(None, derived)
+        _admit(held, _row_charge(workspace, derived.run_id), "stored rows exceed budget")
+        bundle_id = workspace.state.execute(
+            "SELECT bundle_id FROM runs WHERE run_id=?", (derived.run_id,)
+        ).fetchone()[0]
+        _admit(held, _request_memory(workspace, bundle_id), "request exceeds budget")
+        _marker(workspace, derived.run_id)
+    except ComputeResourceError:
+        return {
+            "warnings": [
+                (
+                    "This run exceeds the default readback budget; use the explicit compute budget "
+                    "environment used to create it for run show, rerun and recovery. "
+                    "runtime.json resources only configure DuckDB."
+                )
+            ]
+        }
+    return {}
+
+
 def _finish(
     workspace: Workspace,
     derived: _Derived,
@@ -1590,6 +1633,7 @@ def _finish(
     hashes, counts = table_receipts(_stored_rows(workspace, run_id, _reserved(budget, derived)))
     if hashes != derived.hashes or counts != derived.counts:
         raise RunStorageError("stored result rows disagree with the sealed evidence")
+    warning = _readback_warning(workspace, derived)
     now = time.time_ns() // 1000
     with atomic(workspace.state):
         for name in _ARTIFACTS:
@@ -1629,6 +1673,7 @@ def _finish(
         "run_id": run_id,
         "status": "SUCCESS",
         "result_hash": derived.manifest,
+        **warning,
         "module": derived.module,
         "artifacts": derived.artifacts,
         "table_hashes": derived.hashes,
@@ -1678,8 +1723,8 @@ def _check_candidate(
     ]
     _admit(
         budget,
-        _DOCUMENT_OVERHEAD
-        + _DOCUMENT_EXPANSION * (sum(size for _hash, size in measured) + len(backtest_bytes)),
+        sum(_sealed_memory(workspace, handle.run_id, name) for name in (_ENVELOPE, _PREPARATION))
+        + json_bytes_memory(backtest_bytes, copies=4),
         "run artifacts exceed materialization budget",
     )
     sealed = dict(zip((_ENVELOPE, _PREPARATION), measured, strict=True))
