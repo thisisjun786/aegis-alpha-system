@@ -270,7 +270,7 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   allocation at any row count. On v3 DuckDB's share follows the delta's sort and join
   working set, which may spill, not the table's stored rows (on v2 the key indexes grow with
   them); the domain-wide duplicate check scans the domain, so its time grows with it. A
-  publication that does not fit is refused as `ComputeResourceError` after a full rollback;
+  publication that does not fit is refused as `ComputeResourceError` after a proven rollback;
   `memory_limit` bounds DuckDB's allocator, not the process RSS (see the bulk publication
   section of `dev-notes/design/data-vertical.md`).
 - `market.budgeted(connection, budget, work)` is the DuckDB capacity boundary of bulk
@@ -282,6 +282,24 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   constraint violation whose quoted key happens to contain those words. A failed COMMIT has
   already ended its transaction, so the rollback after it must never replace that error with
   ROLLBACK's "no transaction is active"; market writers use `market.rollback` for that.
+- A bulk COMMIT error is ambiguous until durable evidence is read. `run_publication`
+  rolls back before calling the bulk writer's resolver, which reads the dataset head,
+  marker, rows and flags in a fresh transaction. An exact planned marker whose rows and
+  flags verify is returned normally, so promotion completes its state catalog. Absence
+  of both the marker and any generation rows/flags proves rollback and preserves the
+  original error (including its capacity classification). Unreadable or inconsistent
+  evidence raises `PublicationOutcomeUnknownError` naming the generation and recovery;
+  it never becomes a claim that nothing was published. Interrupts still propagate and
+  the durable intent supports recovery. No provider is called again by this resolution.
+- `market.generation_chain` fetches the pinned dataset's markers through the pinned
+  sequence in one query, then follows the actual parent links. Missing parents, cycles,
+  cross-dataset parents and invalid sequence bounds are refused. Callers still verify
+  every chain hash and the same delta/revision rules; batching removes per-ancestor SQL
+  round trips without a persistent cache, schema change or weakened verification.
+  Bulk revision checks and promotion head queries bind ancestry as one JSON string,
+  decoded to `VARCHAR[]` inside DuckDB. This is only parameter transport, not a stored
+  format: it preserves escaped IDs and avoids per-ID Python scalar-type discovery in
+  the driver. Direct Python lists make repeated plan/apply checks grow with the chain.
 - `source_identity` owns the content source ID (`aas-source-id-v1` over the raw
   addresses, sizes and hashes of the original files plus the output schema major)
   and the `sl:` link. Loader code and transform hashes go to `metadata.lineage`,

@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
-from aegis_alpha.data.descriptor_tree import DescriptorTreeError
 from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.engine.bundle import load_bundle
 from aegis_alpha.engine.errors import ContractDefinitionError
@@ -59,8 +58,13 @@ def test_admitted_manifest_uses_caller_verification_budget(tmp_path: Path) -> No
     with open_workspace(home, writable=True) as workspace:
         publication.publish_document(workspace, admitted)
     with open_workspace(home) as workspace:
-        with pytest.raises(DescriptorTreeError, match="size cap"):
-            verify_workspace(workspace)
+        # Text-heavy evidence now fits the default allocation. A genuinely smaller
+        # caller allocation must still refuse it before decoding, and a larger one
+        # must continue through verification, backup and restore unchanged.
+        tight = ComputeBudget(Fraction(1), 128 * 1024 * 1024)
+        with pytest.raises(ComputeResourceError, match="materialization budget"):
+            verify_workspace(workspace, budget=tight)
+        assert verify_workspace(workspace)["verified"] is True
         verified = verify_workspace(workspace, budget=budget)
         assert verified["verified"] is True
         assert verified["dataset_versions"] == 1

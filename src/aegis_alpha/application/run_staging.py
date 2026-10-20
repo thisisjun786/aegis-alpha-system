@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, cast
 from aegis_alpha.compute_resources import ComputeResourceError
 from aegis_alpha.data.serialization import content_sha256
 from aegis_alpha.engine.codec import decode_json
+from aegis_alpha.json_memory import json_bytes_memory
 from aegis_alpha.storage.backtest_requests import read_backtest_request
 from aegis_alpha.storage.input_pins import HASH_FORMAT
 from aegis_alpha.storage.locks import private_directory, storage_lock_targets
@@ -66,9 +67,6 @@ MAX_REASON_CHARS = 512
 # before stage A registers anything, not after.
 MAX_REASON_BYTES = 4096
 RUN_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}")
-# A sealed document is decoded whole before it is used, so it is charged at the same
-# expansion the run store already charges for decoding one of its own artifacts.
-_DOCUMENT_EXPANSION = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,9 +165,9 @@ def retaining(budget: ComputeBudget, *held: bytes) -> ComputeBudget:
     return replace(budget, reserved_bytes=budget.reserved_bytes + sum(len(item) for item in held))
 
 
-def admit(budget: ComputeBudget, size: int) -> None:
+def admit(budget: ComputeBudget, *documents: bytes) -> None:
     """Charge a materialization before it happens, never after it is in memory."""
-    if size * _DOCUMENT_EXPANSION > budget.available_bytes:
+    if sum(json_bytes_memory(raw, copies=4) for raw in documents) > budget.available_bytes:
         raise ComputeResourceError("accounting exceeds the remaining materialization budget")
 
 

@@ -200,10 +200,18 @@ def commit_publication(connection: duckdb.DuckDBPyConnection) -> None:
         raise
 
 
-def run_publication[T](connection: duckdb.DuckDBPyConnection, work: Callable[[], T]) -> T:
+def run_publication[T](
+    connection: duckdb.DuckDBPyConnection,
+    work: Callable[[], T],
+    *,
+    resolve_commit: Callable[[T], bool] | None = None,
+) -> T:
     """Claim the store, run ``work`` and COMMIT in one transaction, and return its result.
 
-    Any error, an interrupt included, rolls the transaction back and propagates. The
+    A COMMIT error need not mean that its writes were lost. After rollback, an optional
+    resolver reads durable evidence in a fresh snapshot and returns true only for a
+    verified publication. Otherwise the error propagates. Interrupts always propagate.
+    Any other error, an interrupt included, rolls the transaction back and propagates. The
     ROLLBACK runs a second time in ``finally``: an interrupt that lands in the error
     handler before the first ROLLBACK ran, or inside it, would otherwise leave the
     transaction and its claim open on the connection, refusing every other publication on
@@ -215,13 +223,27 @@ def run_publication[T](connection: duckdb.DuckDBPyConnection, work: Callable[[],
         try:
             begin_publication(connection)
             result = work()
-            commit_publication(connection)
+            _commit_or_resolve(connection, result, resolve_commit)
         except BaseException:
             rollback(connection)
             raise
     finally:
         rollback(connection)
     return result
+
+
+def _commit_or_resolve[T](
+    connection: duckdb.DuckDBPyConnection,
+    result: T,
+    resolve_commit: Callable[[T], bool] | None,
+) -> None:
+    """Keep COMMIT resolution inside the caller's uninterrupted cleanup boundary."""
+    try:
+        commit_publication(connection)
+    except Exception:
+        rollback(connection)
+        if resolve_commit is None or not resolve_commit(result):
+            raise
 
 
 def _version(connection: duckdb.DuckDBPyConnection) -> int:

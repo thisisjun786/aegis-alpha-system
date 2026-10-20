@@ -1937,18 +1937,28 @@ Norgate security master와 그보다 늦은 Norgate history 내보내기에서�
   marker는 내용이 정확히 같은 요청에만 재사용되고, 다른 요청은 남아 있는 generation을 채택하지 못한다.
 - `verify_generation_bulk`는 chain의 모든 marker link를 기록된 hash로 다시 계산하고, 대상 generation의
   행만 다시 해시하며 그 앞 head에 대한 revision 규칙을 검사한다. `deep=True`는 모든 delta를 다시 해시한다.
+- chain marker는 pin한 dataset의 해당 sequence까지 한 쿼리로 읽고 실제 parent 링크를 따라간다.
+  승격의 head 조회와 대량 revision 검사는 조상 ID를 JSON 문자열 하나로 전달해 DuckDB 안에서 배열로
+  해석한다. generation마다 SQL을 호출하거나 Python 배열 원소마다 타입을 판별하는 비용을 없애며,
+  저장 형식·hash·revision 규칙과 모든 chain link 검증은 유지한다.
+- 대량 COMMIT의 예외만으로 게시되지 않았다고 판단하지 않는다. 먼저 ROLLBACK하고 새 읽기 트랜잭션에서
+  dataset head와 marker를 다시 읽는다. 계획과 같은 marker·행·flag가 검증되면 그 generation을 반환하고
+  승격은 catalog 완료를 계속한다. marker도 행·flag도 없을 때만 취소를 증명하고 원래 오류를 전파한다.
+  증거를 읽지 못하거나 서로 다르면 `PublicationOutcomeUnknownError`가 generation ID와 `aas db recover`
+  안내를 담는다. 이때 원래 COMMIT 오류도 예외 문맥에 남고, 불완전한 marker를 성공으로 채택하지 않는다.
 - 메모리는 [0016](../decisions/0016-maintenance-admission-budget.md)을 따른다. fetch 전에 SQL 집계로
   가장 넓은 행을 재고, 배치 과금이 호출자 할당의 비DuckDB 몫에 들어가도록 배치 행 수를 정한다. 과금은
   행 수와 무관하다. 한 행도 들어가지 않으면 `ComputeResourceError`다. 가져올 행이 없는 빈 quality flag
   관계는 한 행 몫도 요구하지 않고 빈 rowset digest를 돌려준다. 정렬·spill·색인 유지는 같은
-  할당에서 유도한 DuckDB 몫이 맡는다. 한도를 넘으면 트랜잭션 전체가 취소되고 `ComputeResourceError`가
+  할당에서 유도한 DuckDB 몫이 맡는다. 한도를 넘고 트랜잭션 취소가 확인되면 `ComputeResourceError`가
   되며, 원래 DuckDB 오류는 그 cause로 남는다. 삽입은 들어갔는데 COMMIT이 색인 block을 할당하거나 pin하지
   못하면 DuckDB는 OOM이 아니라 `TransactionException`으로 보고하고, 고정 접두어 `Failed to commit: `
   바로 뒤의 원인이 `could not allocate`·`failed to allocate`·`failed to re-allocate`·`failed to pin block`·
   `failed to offload data block`이면 이것도 같은 오류다. 접두어는 그대로 맞추고 원인만 대소문자를 가리지 않으므로
   allocator의 `Failed to allocate block of N bytes (bad allocation)`도 용량 오류다. `max_temp_directory_size`를
   다 써서 spill하지 못한 `failed to offload data block ...`은 COMMIT 밖에서는 DuckDB의 OOM이라 그 자체로,
-  COMMIT에서는 위 원인으로 용량 오류다. 그 밖의 COMMIT 실패(제약 위반, 쓰기 충돌)는 용량 오류가 아니므로 원래 오류 그대로 나간다.
+  COMMIT에서는 위 원인으로 용량 오류다. 그 밖의 COMMIT 실패(제약 위반, 쓰기 충돌)는 용량 오류가 아니다.
+  대량 게시의 결과 판정 뒤 취소가 증명되면 원래 오류 그대로 나간다.
   제약 위반이 인용한 key에 같은 문구가 들어 있어도 마찬가지다. 연결이 이미 쥔 메모리보다 낮은 한도로
   내리는 것을 DuckDB가 거절한 OOM도 이 경계 안에서 `ComputeResourceError`가 된다. COMMIT이 실패하면 DuckDB가 이미 트랜잭션을 끝내므로,
   뒤따르는 ROLLBACK의 "no transaction is active" 거절이 원래 오류를 덮지 않는다(`market.rollback`). 이
@@ -2965,8 +2975,8 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-462 | `PREPARED` storage operation이 남으면 operations 확인이 실패한다 | `tests/application/test_cutover.py::test_a_prepared_operation_fails_the_operations_check` | 구현 |
 | DV-463 | core schema가 현재 버전이 아닌 설치본은 schema 확인이 `outdated`로 실패한다 | `tests/application/test_cutover.py::test_an_outdated_core_schema_fails_the_schema_check` | 구현 |
 | DV-464 | runbook 리허설은 설치본 밖 삭제·systemd·receipt를 실행하지 않고, 별도 블록인 리허설 정리는 끝까지 마친 리허설의 모든 출력 경로만 지운다 | `tests/application/test_cutover.py::test_the_rehearsal_writes_only_paths_its_cleanup_removes` | 구현 |
-| DV-465 | 삽입 뒤 COMMIT에서 메모리가 고갈된 대량 게시도 marker와 행을 남기지 않고 `ComputeResourceError`가 된다 | `tests/storage/test_bulk_generation.py::test_commit_exhaustion_rolls_back_as_a_budget_error` | 구현 |
-| DV-466 | 용량과 무관한 COMMIT 실패는 인용한 key가 용량 문구를 담아도 `ComputeResourceError`로 바뀌지 않고, 뒤따르는 ROLLBACK이 그 오류를 덮지 않는다 | `tests/storage/test_bulk_generation.py::test_a_failed_commit_is_not_replaced_by_its_rollback` | 구현 |
+| DV-465 | 삽입 뒤 COMMIT에서 메모리가 고갈되고 marker와 행이 남지 않은 대량 게시는 `ComputeResourceError`가 된다 | `tests/storage/test_bulk_generation.py::test_commit_exhaustion_rolls_back_as_a_budget_error` | 구현 |
+| DV-466 | COMMIT 제약 실패 뒤 다른 writer의 불완전한 marker를 성공으로 채택하지 않고 결과 미확정을 보고한다. 인용한 key의 용량 문구는 `ComputeResourceError`로 오인되지 않으며 원래 오류가 예외 문맥에 남는다 | `tests/storage/test_bulk_generation.py::test_a_failed_commit_does_not_adopt_a_rivals_incomplete_marker` | 구현 |
 | DV-467 | core migration의 market 단계는 compute lease의 DuckDB 몫에서 실행하고, 그 COMMIT의 고갈은 intent를 남긴 채 `ComputeResourceError`가 된다 | `tests/storage/test_migration.py::test_an_exhausted_market_step_is_a_budget_error_under_the_lease` | 구현 |
 | DV-468 | compact의 market 복사는 compute lease의 DuckDB 몫에서 실행하고, 고갈은 원본을 바꾸지 않은 채 `ComputeResourceError`가 된다 | `tests/storage/test_compaction.py::test_compaction_copies_under_the_lease_and_names_exhaustion` | 구현 |
 | DV-469 | core migration 단계마다 자기 intent와 백업을 가지며, v2 단계의 요청과 부모 정체성은 나중 버전이 생겨도 출시된 그대로다 | `tests/storage/test_migration_steps.py::test_step_identities_are_frozen_and_outlive_later_steps` | 구현 |
@@ -3007,3 +3017,7 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-504 | legacy `korea.public_response@1` 모양의 `kind-listings` 원천은 identity 증분과 `classifications.kr.kind` route가 건너뛰고 보고하며, `kr-import` 모양의 원천은 그대로 쓴다 | `tests/storage/test_maintain_kind.py::test_legacy_shaped_kind_listings_are_skipped_and_reported` | 구현 |
 | DV-505 | legacy 모양의 `kind-listings` 원천이 있는 설치본의 `aas maintain plan --promotions`는 identity와 승격 단계를 실패 없이 계획한다 | `tests/application/test_maintain.py::test_a_plan_skips_legacy_shaped_kind_listings` | 구현 |
 | DV-506 | Qveris가 거래소 일간 `splits`·`dividends`의 빈 결과를 과금 없는 실패(`empty_result`)로 답하면 `empty`로 세고 실패나 완료로 세지 않으며, 요청은 열린 채 규칙에 따라 다시 묻고, `prices`의 빈 답과 다른 실패·과금·모순된 답은 실패다 | `tests/data/test_qveris_empty_answer.py::test_an_empty_answer_is_counted_empty_and_leaves_the_request_open` | 구현 |
+| DV-507 | COMMIT 예외 뒤 실제 게시된 generation은 성공으로 반환되고, 취소된 시도는 marker·행·flag를 남기지 않으며 재진입과 복구가 같은 결과를 확인한다 | `tests/storage/test_promotion_engine.py::test_commit_error_resolves_durable_publication` | 구현 |
+| DV-508 | COMMIT 뒤 증거를 읽지 못하거나 저장된 행·flag가 계획과 다르면 성공이나 취소로 추정하지 않고 결과 미확정과 복구를 안내한다 | `tests/storage/test_promotion_engine.py::test_commit_error_never_guesses_from_unverified_evidence` | 구현 |
+| DV-509 | 2,539개 marker의 chain과 과거 pin은 각각 한 쿼리로 읽고 실제 parent 링크 순서를 유지한다 | `tests/storage/test_market.py::test_long_chain_uses_one_marker_query` | 구현 |
+| DV-510 | 대량 revision 검사는 조상 ID를 scalar 하나로 전달하고 이스케이프와 비ASCII 문자가 있는 ID도 같은 chain·행으로 검증된다 | `tests/storage/test_bulk_generation.py::test_revision_checks_bind_ancestry_as_one_scalar` | 구현 |

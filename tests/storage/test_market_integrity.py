@@ -543,6 +543,7 @@ _TRANSACTION: Final = {
     market_integrity.run_publication.__code__,
     market_integrity.begin_publication.__code__,
     market_integrity.commit_publication.__code__,
+    market_integrity._commit_or_resolve.__code__,
     market_integrity._refuse_conflict.__code__,
     market.rollback.__code__,
 }
@@ -667,6 +668,7 @@ def test_an_interrupt_anywhere_leaves_the_next_publication_free(
     unreached = {market_integrity._refuse_conflict.__code__}
     if refusal is not None:
         unreached.add(market_integrity.commit_publication.__code__)
+        unreached.add(market_integrity._commit_or_resolve.__code__)
     if (writer, outcome) == ("python", "parent"):
         unreached.add(market._insert_rows.__code__)
     assert codes - interrupted == unreached

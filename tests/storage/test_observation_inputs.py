@@ -19,7 +19,6 @@ import pytest
 from aegis_alpha.application.data_cli import execute_native_data
 from aegis_alpha.application.storage_cli import add_commands
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
-from aegis_alpha.data.descriptor_tree import DescriptorTreeError
 from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.storage import (
     import_document,
@@ -940,7 +939,9 @@ def test_the_sealed_document_is_charged_while_its_publication_is_verified(
         lease = _lease(32 * sealed + 2 * retained)
         # Ignoring what the classifier holds live, the chain is admitted and the run
         # only stops further in, at the bounded read of a sealed delta.
-        with pytest.raises(DescriptorTreeError, match="size cap"):
+        with pytest.raises(
+            ComputeResourceError, match="pinned document exceeds materialization budget"
+        ):
             _ = market_inputs._verify_observation_publication(  # noqa: SLF001 -- the charge is under test
                 workspace, pin, {identity}, _scan_cache(), lease
             )

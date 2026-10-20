@@ -19,7 +19,8 @@ from datetime import date, timedelta
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
-from typing import Final
+from typing import Final, cast
+from unittest.mock import Mock
 
 import duckdb
 import pytest
@@ -30,6 +31,7 @@ from aegis_alpha.storage.bulk_generation import (
     BulkRequest,
     ParentChangedError,
     PlanChangedError,
+    PublicationOutcomeUnknownError,
     plan_generation_bulk,
     publish_generation_bulk,
     verify_generation_bulk,
@@ -249,6 +251,27 @@ def _request(
         domain=domain,
         staged=staged,
     )
+
+
+def test_revision_checks_bind_ancestry_as_one_scalar(tmp_path: Path) -> None:
+    """Driver conversion must not inspect Python objects for every ancestor ID."""
+    with _store(tmp_path / "market.duckdb") as connection:
+        rows = _first(random.Random(41), "prices", 3)
+        _stage(connection, "prices", rows)
+        parent = "g'한\\\"[]"
+        request = replace(_request("1", parent=None, domain="prices"), generation_id=parent)
+        publish_generation_bulk(connection, request, budget=BUDGET)
+        _stage(connection, "prices", _second(random.Random(43), "prices", rows))
+        observer = Mock(spec=duckdb.DuckDBPyConnection, wraps=connection)
+        marker = publish_generation_bulk(
+            cast("duckdb.DuckDBPyConnection", observer),
+            _request("2", parent=parent, domain="prices"),
+            budget=BUDGET,
+        )
+        assert market.verify_generation(connection, "g2") == marker
+        for call in observer.execute.call_args_list:
+            if len(call.args) > 1:
+                assert all(not isinstance(value, list) for value in call.args[1]), call.args[0]
 
 
 def _python(
@@ -868,15 +891,16 @@ def test_lowering_below_held_memory_is_a_budget_error() -> None:
 @pytest.mark.parametrize(
     "generation_id", ["g1", "failed to pin block", "could not allocate", "failed to allocate"]
 )
-def test_a_failed_commit_is_not_replaced_by_its_rollback(
+def test_a_failed_commit_does_not_adopt_a_rivals_incomplete_marker(
     tmp_path: Path, generation_id: str
 ) -> None:
-    """A real COMMIT refused for a non-capacity reason surfaces as itself, not as a budget error.
+    """A real constraint failure with inconsistent durable evidence is never adopted.
 
     A second connection commits the same marker first, so this one's COMMIT fails on the
     marker key after DuckDB has already ended its transaction. Its own ROLLBACK must
-    not replace that error with "no transaction is active". The violation quotes the
-    generation ID, so an ID that reads like a capacity message must not make it one.
+    not replace that error with "no transaction is active". The marker has no rows, so
+    resolution must report unknown instead of success, retaining the constraint error
+    in its exception chain. Quoted generation IDs must not become capacity errors.
     """
     rows = _first(random.Random(41), "prices", 3)
     connection = _store(tmp_path / "market.duckdb")
@@ -898,12 +922,17 @@ def test_a_failed_commit_is_not_replaced_by_its_rollback(
 
     with (
         inside_publication(commit_rival),
-        pytest.raises(duckdb.TransactionException, match="constraint violation") as caught,
+        pytest.raises(PublicationOutcomeUnknownError, match=r"outcome.*unknown") as caught,
     ):
         publish_generation_bulk(connection, request, budget=BUDGET)
     assert not isinstance(caught.value, ComputeResourceError)
-    assert f'"{generation_id}"' in str(caught.value)
-    assert "no transaction is active" not in str(caught.value)
+    verification = caught.value.__cause__
+    assert isinstance(verification, ValueError)
+    original = verification.__context__
+    assert isinstance(original, duckdb.TransactionException)
+    assert f'"{generation_id}"' in str(original)
+    assert "constraint violation" in str(original)
+    assert "no transaction is active" not in str(original)
     # Only the rival's marker committed; none of this publication's rows did.
     assert connection.execute("SELECT count(*) FROM market_generations").fetchone() == (1,)
     assert connection.execute("SELECT count(*) FROM prices").fetchone() == (0,)

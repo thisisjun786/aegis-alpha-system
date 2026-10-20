@@ -14,6 +14,7 @@ import pytest
 
 from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.storage import market, publication
+from aegis_alpha.storage.bulk_generation import verify_chain_links
 from aegis_alpha.storage.import_document import parse_import
 from aegis_alpha.storage.market import (
     initialize_market,
@@ -46,6 +47,50 @@ def publish(
         domain=domain,
         rows=rows,
     )
+
+
+def test_long_chain_uses_one_marker_query() -> None:
+    """Metadata traversal costs one query, including a historical pin with later children."""
+    length = 2539
+    with duckdb.connect() as connection:
+        initialize_market(connection, "synthetic")
+        marker = publish(connection, [parse_import(document()).rows[0]], version="1")
+        connection.execute("BEGIN")
+        for sequence in range(2, length + 1):
+            parent_hash = marker["chain_hash"]
+            marker = {
+                **marker,
+                "generation_id": f"g{sequence}",
+                "version": str(sequence),
+                "parent_id": f"g{sequence - 1}",
+                "sequence": sequence,
+                "operation_id": f"op{sequence}",
+            }
+            marker["chain_hash"] = market.chain_digest(
+                parent_chain_hash=parent_hash,
+                domain=str(marker["domain"]),
+                delta_hash=str(marker["delta_hash"]),
+                **{
+                    key: value
+                    for key, value in marker.items()
+                    if key
+                    not in {"chain_hash", "sequence", "record_schema", "domain", "delta_hash"}
+                },
+            )
+            connection.execute(
+                "INSERT INTO market_generations VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                list(marker.values()),
+            )
+        connection.execute("COMMIT")
+        observer = Mock(spec=duckdb.DuckDBPyConnection, wraps=connection)
+        chain = market.generation_chain(cast("duckdb.DuckDBPyConnection", observer), f"g{length}")
+        assert len(chain) == length
+        verify_chain_links(chain)
+        assert observer.execute.call_count == 1
+        observer.reset_mock()
+        early = market.generation_chain(cast("duckdb.DuckDBPyConnection", observer), "g2")
+        assert [item["generation_id"] for item in early] == ["g1", "g2"]
+        assert observer.execute.call_count == 1
 
 
 def test_revision_replay_tombstone_and_restart(tmp_path: Path) -> None:
