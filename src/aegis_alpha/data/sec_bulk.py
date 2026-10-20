@@ -26,6 +26,7 @@ from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.data.sec_evidence import open_directory, publish_bytes, read_bytes
 from aegis_alpha.data.sec_transport import assert_user_agent_absent, validate_user_agent
 from aegis_alpha.data.serialization import canonical_json_bytes
+from aegis_alpha.storage.checkout import require_outside_checkout
 
 ARCHIVES = {
     "companyfacts": "https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip",
@@ -81,8 +82,9 @@ def archive_plan(name: str, output_root: Path, max_bytes: int) -> dict[str, obje
         raise BulkError("unknown SEC bulk archive")
     if not output_root.is_absolute() or ".." in output_root.parts:
         raise BulkError("SEC bulk output root must be absolute without traversal")
-    if any((parent / ".git").exists() for parent in (output_root, *output_root.parents)):
-        raise BulkError("SEC bulk output must be outside Git")
+    require_outside_checkout(
+        output_root, error=BulkError, message="SEC bulk output must be outside Git"
+    )
     if type(max_bytes) is not int or max_bytes < 1:
         raise BulkError("SEC bulk max bytes must be positive")
     return {

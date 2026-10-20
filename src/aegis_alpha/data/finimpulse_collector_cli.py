@@ -65,6 +65,7 @@ from aegis_alpha.data.finimpulse_recurring_authority import (
 )
 from aegis_alpha.data.finimpulse_recurring_errors import RecurringAuthorityError
 from aegis_alpha.metadata.registry import MetadataRegistry
+from aegis_alpha.storage.checkout import containing_checkout
 
 PRECONDITION_EXIT = 2
 
@@ -75,10 +76,7 @@ def _read_universe(path: Path) -> tuple[str, ...]:
 
 
 def _containing_git_repository(path: Path) -> Path | None:
-    for candidate in (path, *path.parents):
-        if (candidate / ".git").exists():
-            return candidate
-    return None
+    return containing_checkout(path)
 
 
 def validate_live_destinations(**destinations: Path) -> None:

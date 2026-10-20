@@ -15,7 +15,12 @@ aas doctor
 소스 대신 로컬 wheel을 설치할 수도 있다. 원격 release가 게시됐다는 뜻은 아니다.
 기본 위치는 `~/.aas`, 선택 순서는 `--home`, `AAS_HOME`, 기본값이다.
 `runtime.json`의 상대 경로는 이 루트에서 해석한다. 사용자 설정 파일과 DB는 0600,
-디렉터리는 0700으로 유지한다. 자료는 Git checkout 밖의 로컬 Linux 파일시스템에 둔다.
+디렉터리는 0700으로 유지한다. 자료는 Git 저장소 밖의 로컬 Linux 파일시스템에 둔다.
+저장소 판정은 경로 자신과 상위의 실제 `.git` 표식을 확인한다. 첫 줄이 `gitdir:`로 시작하는
+일반 파일(연결 worktree·submodule), 또는 `HEAD` 파일과 `objects/`·`refs/` 디렉터리
+(대신 `commondir` 파일도 허용)을 갖춘 디렉터리면 거부한다. 빈 디렉터리와 이 구조가 없는
+합성 표식은 무시한다. 심볼릭 링크 표식은 대상을 확인하며, 권한 등으로 검사할 수 없으면
+보수적으로 거부한다. 이 검사는 Git 실행 파일을 요구하지 않는다.
 
 `init`은 빈 상태·전략 SQLite와 시장 DuckDB, raw/runs/secrets/backups/runtime 디렉터리를
 만든다. 재실행은 저장 내용을 유지하고 중단된 초기화를 재개한다. 다른 설치의 DB는 자동
@@ -1573,13 +1578,22 @@ mkdir -m 0700 "$REPORTS"
 설치본의 state, strategies, market, `raw/`, `runs/` 크기만큼 공간을 쓴다.
 
 **0. 동결.** 설치본에 쓰는 legacy timer와 service를 멈추고 남은 작업을 정리한다. ETF 탐색 unit은
-설치본에 쓰지 않으므로 5단계에서 은퇴한다. 저장소는 Git checkout 안의 경로를 거부하므로(상위 어딘가의 빈
-`.git`도 그렇다) 먼저 전환이 쓰는 경로의 상위에 `.git`이 없는지 확인한다. 아무것도 출력되지 않아야 한다.
+설치본에 쓰지 않으므로 5단계에서 은퇴한다. 먼저 전환 경로가 실제 Git 저장소 안에 있지 않은지
+설치된 앱의 공통 검사로 확인한다. `HEAD`와 `objects/`·`refs/`(또는 `commondir`), 혹은
+`gitdir:` 파일이 있는 표식만 저장소로 판정한다. 빈 `.git`은 경로를 옮길 이유가 아니다.
+검사할 수 없는 표식도 거부하며, 아래 명령은 아무것도 출력되지 않아야 한다.
 
 ```bash
-for p in "$OLD_HOME" "$BACKUPS" "$REHEARSAL" "$HOME_NEW" "$HOME_FINAL" "$QVERIS" "$SPECS"; do
-  d=$(realpath -m "$p"); while [ "$d" != / ]; do [ -e "$d/.git" ] && echo "$d/.git"; d=$(dirname "$d"); done
-done
+python - "$OLD_HOME" "$BACKUPS" "$REHEARSAL" "$HOME_NEW" "$HOME_FINAL" "$QVERIS" "$SPECS" <<'PY'
+import sys
+from pathlib import Path
+from aegis_alpha.storage.checkout import containing_checkout
+
+for value in sys.argv[1:]:
+    repository = containing_checkout(Path(value).resolve())
+    if repository is not None:
+        print(repository / ".git")
+PY
 for unit in $LEGACY_UNITS; do systemctl --user stop "$unit.timer" "$unit.service"; done
 systemctl --user list-units --all 'aas-*'   # 위 service가 모두 active가 아님
 AAS_HOME="$OLD_HOME" aas db recover

@@ -35,6 +35,7 @@ from aegis_alpha.data.qveris_client import (
     RefuseRedirectHandler,
     make_https_opener,
 )
+from tests.checkout_support import init_repository
 
 NOW = datetime(2026, 9, 6, 12, 0, tzinfo=UTC)
 SYNTHETIC_CREDENTIAL = "unit-test-credential"
@@ -218,7 +219,7 @@ def test_key_file_hard_link_is_refused(tmp_path: Path) -> None:
 
 
 def test_key_file_inside_git_is_refused(tmp_path: Path) -> None:
-    (tmp_path / ".git").mkdir()
+    init_repository(tmp_path)
     nested = tmp_path / "secrets"
     nested.mkdir()
     path = _write_key(nested)

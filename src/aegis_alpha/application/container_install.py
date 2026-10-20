@@ -19,6 +19,7 @@ from aegis_alpha.application.container_runtime import (
 )
 from aegis_alpha.application.installation_lock import installation_admission
 from aegis_alpha.data.descriptor_tree import DescriptorTree
+from aegis_alpha.storage.checkout import require_outside_checkout
 
 _MANAGED = "# AAS_MANAGED_CONTAINER_V1 "
 _MAX_INSTALL_FILE_BYTES = 64 * 1024
@@ -49,8 +50,9 @@ def _private_directory(path: Path) -> None:
         info = os.fstat(tree.descriptor)
         if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
             raise ValueError("installation state must be private and owned by this user")
-    if any((parent / ".git").exists() for parent in (path, *path.parents)):
-        raise ValueError("installation state must be outside Git")
+    require_outside_checkout(
+        path, error=ValueError, message="installation state must be outside Git"
+    )
 
 
 def _write_owned(path: Path, payload: bytes, owner: str, *, executable: bool = False) -> None:

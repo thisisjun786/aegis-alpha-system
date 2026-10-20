@@ -46,6 +46,7 @@ from aegis_alpha.data.fred_alfred_series import (
     series_universe_sha256,
     watermark_dataset,
 )
+from tests.checkout_support import init_repository
 
 if TYPE_CHECKING:
     from sqlalchemy import Engine
@@ -408,7 +409,7 @@ def test_normalized_parquet_is_hive_partitioned(tmp_path: Path) -> None:
 
 def test_git_contained_destinations_are_rejected(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
-    (repository / ".git").mkdir(parents=True)
+    init_repository(repository)
     with pytest.raises(DestinationError, match="outside a Git repository"):
         validate_destination("raw store root", repository / "raw")
 

@@ -23,6 +23,7 @@ from aegis_alpha.collection.usage_checkpoint_crypto import (
     TrustedEd25519PublicKey,
 )
 from aegis_alpha.data.fmp_owner_approval import OwnerApprovalAuthority
+from aegis_alpha.storage.checkout import require_outside_checkout
 
 _SCHEMA: Final = "aegis-alpha/fmp-owner-approval-authority"
 _VERSION: Final = 1
@@ -95,8 +96,9 @@ def _read_external(path: Path, collector_uid: int, owner: OwnershipReader) -> by
         raise ValueError("owner approval authority path must be absolute")
     if any(part.is_symlink() for part in (path, *path.parents)):
         raise ValueError("owner approval authority path must not contain symlinks")
-    if any((parent / ".git").exists() for parent in (path.parent, *path.parents)):
-        raise ValueError("owner approval authority must be outside Git")
+    require_outside_checkout(
+        path.parent, error=ValueError, message="owner approval authority must be outside Git"
+    )
     directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY
     file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):

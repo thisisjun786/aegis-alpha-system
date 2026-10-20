@@ -23,6 +23,7 @@ from aegis_alpha.collection.usage_checkpoint_crypto import (
     Ed25519PublicKeyring,
     TrustedEd25519PublicKey,
 )
+from aegis_alpha.storage.checkout import require_outside_checkout
 
 OWNER_AUTHORITY_ENV: Final = "AAS_FRED_OWNER_APPROVAL_AUTHORITY_PATH"
 _SCHEMA: Final = "aegis-alpha/fred-owner-approval-authority"
@@ -110,8 +111,9 @@ def _read_external(path: Path, collector_uid: int, owner: OwnershipReader) -> by
         raise OwnerAuthorityError("owner authority path must be absolute")
     if any(part.is_symlink() for part in (path, *path.parents)):
         raise OwnerAuthorityError("owner authority path must not contain symlinks")
-    if any((parent / ".git").exists() for parent in (path.parent, *path.parents)):
-        raise OwnerAuthorityError("owner authority must be outside Git")
+    require_outside_checkout(
+        path.parent, error=OwnerAuthorityError, message="owner authority must be outside Git"
+    )
     directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY
     file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):

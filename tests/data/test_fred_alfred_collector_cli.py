@@ -52,6 +52,7 @@ from aegis_alpha.data.fred_alfred_series import (
     series_universe_sha256,
 )
 from aegis_alpha.data.fred_alfred_usage_budget import CONTROL_PLANE_URL_ENV
+from tests.checkout_support import init_repository
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -712,7 +713,7 @@ def test_macro_universe_live_run_still_needs_signed_authority(tmp_path: Path) ->
 
 def test_git_contained_destination_means_zero_calls(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
-    (repository / ".git").mkdir(parents=True)
+    init_repository(repository)
     with pytest.raises(DestinationError, match="outside a Git repository"):
         run_preflight(
             registry_path=REPO_REGISTRY,
