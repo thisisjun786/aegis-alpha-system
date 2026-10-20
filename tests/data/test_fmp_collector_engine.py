@@ -72,6 +72,7 @@ from aegis_alpha.data.fmp_symbol_observation import parse_provider_records
 from aegis_alpha.data.fmp_universe_run import run_universe_build
 from aegis_alpha.data.fmp_windows import DateWindow, UniverseEntry, parse_universe_manifest
 from aegis_alpha.data.serialization import canonical_json_bytes
+from tests.checkout_support import init_repository
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -341,7 +342,7 @@ def _collector(  # noqa: PLR0913 - explicit synthetic wiring for each injected p
 
 def test_git_contained_destinations_are_rejected(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
-    (repository / ".git").mkdir(parents=True)
+    init_repository(repository)
     with pytest.raises(DestinationError, match="outside a Git repository"):
         validate_destination("raw store root", repository / "raw")
     outside = validate_destination("raw store root", tmp_path / "outside" / "raw")
@@ -350,7 +351,7 @@ def test_git_contained_destinations_are_rejected(tmp_path: Path) -> None:
 
 def test_destination_validation_resolves_symlinks(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
-    (repository / ".git").mkdir(parents=True)
+    init_repository(repository)
     link = tmp_path / "link"
     link.symlink_to(repository, target_is_directory=True)
     with pytest.raises(DestinationError, match="outside a Git repository"):

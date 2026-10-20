@@ -36,6 +36,7 @@ from aegis_alpha.data.finimpulse_recurring_authority import (
     verify_recurring_authority,
 )
 from aegis_alpha.data.finimpulse_recurring_revocation import require_not_revoked, revocation_path
+from tests.checkout_support import init_repository
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "collect_finimpulse_estimates.py"
@@ -182,7 +183,7 @@ def test_cli_fails_closed_without_the_environment_credential(tmp_path: Path) -> 
 
 def test_cli_rejects_destinations_inside_a_git_repository(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
-    (repository / ".git").mkdir(parents=True)
+    init_repository(repository)
     transport = RecordingTransport("baseline")
 
     code, _, stderr = run_cli(

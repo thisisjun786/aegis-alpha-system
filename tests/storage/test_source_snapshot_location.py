@@ -10,6 +10,7 @@ from urllib.parse import unquote, urlsplit
 
 from aegis_alpha.storage import source_library
 from aegis_alpha.storage.workspace import initialize, open_workspace
+from tests.checkout_support import init_repository
 
 if TYPE_CHECKING:
     import pytest
@@ -28,7 +29,7 @@ def test_sqlite_image_uses_admitted_runtime_instead_of_git_tmpdir(
     digest = hashlib.sha256(source.read_bytes()).hexdigest()
     git_tmp = tmp_path / "git-tmp"
     git_tmp.mkdir()
-    (git_tmp / ".git").mkdir()
+    init_repository(git_tmp)
     monkeypatch.setattr(tempfile, "tempdir", str(git_tmp))
     home = tmp_path / "home"
     initialize(home)

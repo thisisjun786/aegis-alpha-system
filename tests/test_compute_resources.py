@@ -26,6 +26,7 @@ from aegis_alpha.compute_resources import (
     compute_lock_path,
     resolve_compute_budget,
 )
+from tests.checkout_support import init_repository
 
 if TYPE_CHECKING:
     from multiprocessing.synchronize import Event as ProcessEvent
@@ -262,7 +263,7 @@ def test_unsafe_lease_paths_refuse(tmp_path: Path, kind: str) -> None:
         alias.symlink_to(target, target_is_directory=True)
         path = alias / "compute.lock"
     elif kind == "git":
-        (tmp_path / ".git").mkdir()
+        init_repository(tmp_path)
     with pytest.raises(ValueError, match=r"lock|file|aliases|Git"), compute_lease(path):  # noqa: PT012 - test acquisition and release refusals
         assert kind == "replacement"
         other.replace(path)
