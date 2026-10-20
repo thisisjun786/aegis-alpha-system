@@ -841,6 +841,56 @@ def test_compute_identity_order_context_and_empty_traps() -> None:
     assert changed.request_hash != projection.request_hash
 
 
+def test_v2_execution_identity_round_trips_without_reinterpreting_v1() -> None:
+    body, definition, docs = fixture()
+    parsed, legacy = project(body, definition, docs)
+    engine, environment = identities()
+    engine.update(schema="aas-engine-identity-v2", execution_source_hash="e" * 64)
+    current = request_projection(
+        parsed,
+        definition=definition,
+        convention_documents=docs,
+        engine_identity=engine,
+        environment_identity=environment,
+    )
+    assert current.request_hash != legacy.request_hash
+    assert legacy.request_hash == "2f22d30ad50217b4d1eb916356e7c3fff38d96383cb61a2f5840dc1a7b865f47"
+    assert (
+        current.request_hash == "b856a262c9c541248b95b61c6d390aed52101550218e33fc1c3cf609a1ba49c1"
+    )
+    assert emit(parsed, current) == emit(parsed, legacy)
+    for projection in (legacy, current):
+        _, read = parse_backtest_request(
+            projection.canonical_bytes, definition=definition, convention_documents=docs
+        )
+        assert read == projection
+        assert read.request_hash == content_sha256(json.loads(projection.canonical_bytes))
+
+
+@pytest.mark.parametrize("fault", ["missing", "invalid", "unknown", "v1-extra"])
+def test_execution_identity_versions_fail_closed(fault: str) -> None:
+    body, definition, docs = fixture()
+    parsed, _ = project(body, definition, docs)
+    engine, environment = identities()
+    engine.update(schema="aas-engine-identity-v2", execution_source_hash="e" * 64)
+    if fault == "missing":
+        del engine["execution_source_hash"]
+    elif fault == "invalid":
+        engine["execution_source_hash"] = "invalid"
+    else:
+        engine["schema"] = (
+            "aas-engine-identity-v3" if fault == "unknown" else "aas-engine-identity-v1"
+        )
+    with pytest.raises(ValueError, match=r".+"):
+        request_projection(
+            parsed,
+            definition=definition,
+            convention_documents=docs,
+            engine_identity=engine,
+            environment_identity=environment,
+        )
+
+
 @pytest.mark.parametrize(
     "flow",
     [
