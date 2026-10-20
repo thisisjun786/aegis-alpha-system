@@ -502,16 +502,15 @@ def test_only_a_declared_run_is_re_prepared_from_a_declaration(
     assert cast("Document", preparation["matches"])["run_id"] is False
 
 
-def test_a_run_cannot_be_recorded_as_its_own_predecessor(
+def test_a_successful_run_cannot_be_retried_under_another_bundle(
     sample: tuple[Path, Document, Document, Document],
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Refused before stage A registers anything, so a bad run field strands nothing.
 
-    A declaration always prepares to the same identity, so naming that identity as the
-    predecessor is how a caller reaches this. The run store refuses it too, but only
-    once the declaration is already filed under a bundle name it keeps for good.
+    Naming a successful calculation as the predecessor cannot bypass duplicate
+    refusal, even when the caller proposes another bundle name.
     """
     home, base, offense, _defense = sample
     _installed(home)
@@ -519,7 +518,7 @@ def test_a_run_cannot_be_recorded_as_its_own_predecessor(
     run_id = _run_id(_execute(home, path, capsys))
     with open_workspace(home) as workspace:
         before = workspace.state.execute("SELECT count(*) FROM input_bundles").fetchone()[0]
-    with pytest.raises(ValueError, match="its own predecessor"):
+    with pytest.raises(ValueError, match="FAILED or INTERRUPTED"):
         _ = run_research(
             RunResearchRequest(
                 declaration=path,

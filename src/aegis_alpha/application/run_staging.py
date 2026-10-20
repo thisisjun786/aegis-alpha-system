@@ -175,15 +175,20 @@ def record(
     home: Path, opened: Opened, result: RunResult, request_hash: str, budget: ComputeBudget
 ) -> dict[str, object]:
     """Stage C: reopen briefly, re-authenticate installation and pins, then commit."""
+    from aegis_alpha.application.run_inputs import (  # noqa: PLC0415 -- shares JSON validators
+        verify_run_inputs,
+    )
+
     with open_workspace(home, writable=True) as workspace:
         if installation_identity(workspace) != opened.installation:
             raise ValueError("installation identity changed after the inputs were prepared")
         # Re-reading the registered request re-verifies every binding, so a generation
         # or pinned document that moved during the calculation is refused before a
         # result is recorded rather than after.
-        read_backtest_request(
+        raw = read_backtest_request(
             workspace, opened.bundle, expected_request_hash=request_hash, budget=budget
         )
+        verify_run_inputs(workspace, raw, budget=retaining(budget, raw))
         return commit_run(workspace, opened.handle, result, budget=budget)
 
 

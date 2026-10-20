@@ -984,6 +984,87 @@ def open_run(
     )
 
 
+def declared_attempt_id(calculation_id: str, prior_run_id: str) -> str:
+    """One stable successor name per calculation and predecessor."""
+    return "research-attempt-" + content_sha256(
+        {
+            "schema": "aas-research-attempt-v1",
+            "calculation_id": calculation_id,
+            "prior_run_id": prior_run_id,
+        }
+    )
+
+
+def declared_attempt(workspace: Workspace, intent: RunIntent) -> RunIntent:
+    """Select one explicit successor without reopening or replacing an earlier attempt.
+
+    The caller supplies the stable calculation ID. The first attempt retains that ID;
+    each failed predecessor permits exactly one deterministically named successor.
+    Selection and open_run must share the caller's installation admission.
+    """
+    require_run_schema(workspace)
+    calculation_id = _text(intent.run_id, "calculation_id")
+    root = workspace.state.execute(
+        "SELECT status FROM runs WHERE run_id=?", (intent.run_id,)
+    ).fetchone()
+    prior = intent.prior_run_id
+    if (
+        prior is not None
+        and not workspace.state.execute("SELECT 1 FROM runs WHERE run_id=?", (prior,)).fetchone()
+    ):
+        raise RunStorageError("prior_run_id names no recorded run")
+    if root is None:
+        return intent
+    if prior is None:
+        raise RunStorageError(
+            "run ID already identifies a different or finished run; "
+            "recover RUNNING attempts with aas db recover, then retry FAILED/INTERRUPTED "
+            "with prior_run_id"
+        )
+    if root["status"] not in {"FAILED", "INTERRUPTED"}:
+        raise RunStorageError(
+            "retry requires a FAILED or INTERRUPTED predecessor; "
+            "recover RUNNING attempts with aas db recover"
+        )
+    previous = workspace.state.execute(
+        "SELECT r.status,r.prior_run_id,d.request_schema,o.request_hash,o.payload_hash "
+        "FROM runs r JOIN run_details d ON d.run_id=r.run_id "
+        "JOIN storage_operations o ON o.operation_id=? WHERE r.run_id=?",
+        ("run:" + prior, prior),
+    ).fetchone()
+    payload = _inputs_hash(
+        intent.bundle_id,
+        hashlib.sha256(intent.envelope_bytes).hexdigest(),
+        hashlib.sha256(intent.preparation_bytes).hexdigest(),
+    )
+    if (
+        previous is None
+        or previous["request_schema"] not in _RESEARCH_PREPARATIONS
+        or previous["request_hash"] != intent.request_hash
+        or previous["payload_hash"] != payload
+    ):
+        raise RunStorageError("retry predecessor identifies a different calculation or bundle")
+    _require_recorded_metadata(workspace, prior)
+    if prior != calculation_id and (
+        previous["prior_run_id"] is None
+        or prior != declared_attempt_id(calculation_id, previous["prior_run_id"])
+    ):
+        raise RunStorageError("retry predecessor is outside this calculation's attempt lineage")
+    if previous["status"] not in {"FAILED", "INTERRUPTED"}:
+        raise RunStorageError(
+            "retry requires a FAILED or INTERRUPTED predecessor; "
+            "recover RUNNING attempts with aas db recover"
+        )
+    if _marker(workspace, prior) is not None:
+        raise RunStorageError("a run with a committed marker must be recovered, not recalculated")
+    attempt_id = declared_attempt_id(calculation_id, prior)
+    if workspace.state.execute("SELECT 1 FROM runs WHERE run_id=?", (attempt_id,)).fetchone():
+        raise RunStorageError(
+            "retry predecessor already has an attempt: " + attempt_id + "; recover or use that ID"
+        )
+    return replace(intent, run_id=attempt_id)
+
+
 def _open_intent(
     workspace: Workspace, intent: RunIntent, durable: _DurableIntent, schema: str
 ) -> None:

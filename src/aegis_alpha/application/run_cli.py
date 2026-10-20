@@ -84,7 +84,10 @@ def _research_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) 
     research.add_argument(
         "--bundle-id", help="Input bundle name; default derives from the declaration"
     )
-    research.add_argument("--prior-run-id", help="Recomputation predecessor run ID")
+    research.add_argument(
+        "--prior-run-id",
+        help="Predecessor run ID; retry the same calculation only after FAILED/INTERRUPTED",
+    )
     research.add_argument(
         "--envelope-output",
         type=Path,

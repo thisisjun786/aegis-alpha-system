@@ -494,6 +494,13 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   invisible to the PREPARED-only scan. Every receipt is derived from the sealed files,
   never from caller-supplied values, and a strategy pin must name a version the private
   store admitted. Result `at_us` encodes a session date as midnight UTC, not an instant.
+- `declared_attempt` selects a declared calculation's attempt under the same installation
+  admission as `open_run`. The first attempt retains the preparation's stable ID. An
+  explicit `prior_run_id` naming a FAILED/INTERRUPTED attempt with the same request and
+  sealed-input commitment permits one deterministic successor. Ended rows and sealed
+  bytes stay intact. RUNNING belongs to recovery; SUCCESS and QUARANTINED cannot be
+  retried. A committed marker never authorizes recalculation. The low-level `open_run`
+  identical-open contract and the strict run path retain their existing semantics.
 - The run add-on is versioned per store. `run_details.request_schema` carries an explicit
   allow-list, `REQUEST_SCHEMAS`, and `_open_intent` records the schema of the request that
   was actually registered rather than a constant. v1 named `aas-backtest-request-v1` alone,
