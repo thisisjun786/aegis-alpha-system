@@ -480,7 +480,7 @@ _CONTENT_PROPERTIES = {
 # Content keys a request carries only when it uses them, so a request without one keeps the
 # bytes, and the hash, it had before the key existed.
 _OPTIONAL = frozenset({"fx_conversions"})
-_ENGINE = _shape(
+_ENGINE_V1 = _shape(
     {
         "schema": _const("aas-engine-identity-v1"),
         "hash_format": _const(_J),
@@ -489,6 +489,14 @@ _ENGINE = _shape(
         "calculation_source_hash": _HASH,
     }
 )
+_ENGINE_V2 = _shape(
+    {
+        **_object(_ENGINE_V1["properties"]),
+        "schema": _const("aas-engine-identity-v2"),
+        "execution_source_hash": _HASH,
+    }
+)
+_ENGINE = {"oneOf": [_ENGINE_V1, _ENGINE_V2]}
 _ENVIRONMENT = _shape(
     {
         "schema": _const("aas-environment-identity-v1"),
@@ -975,15 +983,21 @@ def parse_prepare_request(raw: bytes) -> ParsedPrepareRequest:
 
 
 def _engine_identity(value: object) -> Record:
-    row = _fields(value, _object(_ENGINE["properties"]).keys())
+    schema = _object(value).get("schema")
+    if schema not in ("aas-engine-identity-v1", "aas-engine-identity-v2"):
+        raise ValueError("unsupported engine identity")
+    shape = _ENGINE_V1 if schema == "aas-engine-identity-v1" else _ENGINE_V2
+    row = _fields(value, _object(shape["properties"]).keys())
     if (row["schema"], row["hash_format"], row["contract_version"]) != (
-        "aas-engine-identity-v1",
+        schema,
         _J,
         ENGINE_CONTRACT_VERSION_V1,
     ):
         raise ValueError("unsupported engine identity")
     _text(row["package_version"])
     _hash(row["calculation_source_hash"])
+    if schema == "aas-engine-identity-v2":
+        _hash(row["execution_source_hash"])
     return row
 
 
