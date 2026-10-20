@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from aegis_alpha.application.research_run import parse_declared_request
 from aegis_alpha.application.run_staging import admit, json_object, json_text
 from aegis_alpha.engine.codec import decode_json
+from aegis_alpha.json_memory import json_bytes_memory
 from aegis_alpha.storage.bulk_generation import verify_generation_bulk
 from aegis_alpha.storage.input_pins import DefinitionPin, read_definition, read_head_binding
 from aegis_alpha.storage.market import marker_for
@@ -56,9 +57,11 @@ def verify_run_inputs(workspace: Workspace, raw: bytes, *, budget: ComputeBudget
     next, and neither replay nor accounting is called here.
     """
     # The JSON mapping and parsed declaration can coexist. Reserve both graphs
-    # before expanding either, at the run store's document expansion allowance.
-    admit(budget, 2 * len(raw))
-    budget = replace(budget, reserved_bytes=budget.reserved_bytes + 256 * len(raw))
+    # before expanding either, with the same per-document estimate used by admit.
+    admit(budget, raw, raw)
+    budget = replace(
+        budget, reserved_bytes=budget.reserved_bytes + 2 * json_bytes_memory(raw, copies=4)
+    )
     body = json_object(decode_json(raw), "stored request")
     if body.get("schema") == "aas-backtest-request-v1":
         _strategy(workspace, json_object(body["strategy"], "strategy"))
@@ -125,8 +128,10 @@ def _derived_publications(
         ),
         budget=budget,
     )
-    admit(budget, len(raw))
-    budget = replace(budget, reserved_bytes=budget.reserved_bytes + 128 * len(raw))
+    admit(budget, raw)
+    budget = replace(
+        budget, reserved_bytes=budget.reserved_bytes + json_bytes_memory(raw, copies=4)
+    )
     definition = json_object(decode_json(raw), "derived definition")
     inputs = definition["inputs"]
     if not isinstance(inputs, list):
