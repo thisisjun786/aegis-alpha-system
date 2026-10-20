@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections.abc import Iterator
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -311,6 +312,19 @@ def test_dart_receipt_must_be_one_completed_corp_code_archive() -> None:
     assert registry.document["issuers"] == []
     mappers = cast("dict[str, dict[str, Any]]", registry.report()["mappers"])
     assert mappers["dart.corp_codes@1"]["refused"] == {"corp_name_invalid": 1}
+
+
+def test_dart_source_hash_is_stable_across_fixture_times_and_receipt_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    xml = corp_code_xml([("00100010", "합성전자", "100010")])
+    job = _rows(eodhd_job([symbol("100010", SAMSUNG_LIKE)]))
+    monkeypatch.setattr(time, "localtime", lambda: time.struct_time((2026, 1, 1, 0, 0, 0, 3, 1, 0)))
+    rows = dart_rows(xml)
+    first = build_kr_registry(job, dart=[dart_source(rows)])
+    monkeypatch.setattr(time, "localtime", lambda: time.struct_time((2026, 1, 1, 0, 0, 4, 3, 1, 0)))
+    assert dart_rows(xml) == rows
+    assert build_kr_registry(job, dart=[dart_source(tuple(reversed(rows)))]).raw() == first.raw()
 
 
 def test_kr_sources_import_as_content_and_register_as_one_document(ws: Workspace) -> None:
