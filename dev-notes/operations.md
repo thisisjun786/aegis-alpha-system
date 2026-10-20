@@ -885,12 +885,23 @@ compute 환경이 없으면 `None`을 yield한다. 아래 실습 5단계가 이 
 정체성이고, `engine.backtest_request`의 `request_projection`·`export_envelope`는 저장소 없이
 순수 투영·내보내기만 맡는다.
 
-계산 소스 정체성은 `backtest_prepare.CALCULATION_MODULES`에 명시된 47개 모듈의
-설치된 정확한 바이트를 해시한다. 엔진과 두 데이터 직렬화 helper뿐 아니라 준비의 해석·입력
-승인을 담당하는 application·storage 모듈을 포함한다. 런타임 import 탐색이나 패키지 전체
-해시는 아니며, 선택된 파일의 주석 변경도 정체성을 바꾼다. 이전 27개 범위로 생성한 정규
-요청 P·pin·artifact는 수정하지 않고 원래 정체성으로 읽는다. 새 준비의 소스 해시와
-`request_hash`는 의도적으로 달라지지만, 같은 입력·동작의 기존 봉투와 회계 결과는 그대로다.
+새 준비는 `aas-engine-identity-v2`를 기록한다. `calculation_source_hash`는 기존
+`aas-calculation-sources-v1` 형식과 `backtest_prepare.CALCULATION_MODULES` 범위를 유지한다.
+준비의 해석·입력 승인과 엔진 계산을 식별하지만 회계 진입점·결과 직렬화 전체를 보장하지 않는다.
+추가 필드 `execution_source_hash`는 `aas-execution-sources-v1` 형식으로
+`backtest_prepare.EXECUTION_MODULES`의 설치된 정확한 바이트를 해시한다. 준비·엔진에 더해
+`application.backtest_cli`의 회계 해석, 선언과 run 연결, `storage.publication.json_value`의
+직렬화, `storage.runs`의 결과 투영·확정을 포함한다. 두 형식은 schema·hash_format·정렬된
+files 목록(module·파일 SHA-256)의 canonical JSON을 해시한다. 파일이 없으면 준비를 거부한다.
+
+닫힌 소스 목록이며 런타임 import 탐색이나 패키지 전체 해시는 아니다. 새 의미 소유자를 추가하면
+목록과 행동 회귀도 갱신한다. 선택된 파일의 주석 변경도 정체성을 바꾼다. 기존 엔진 v1의
+`calculation_source_hash`와 선언의 `preparation_source_sha256`는 당시 준비 범위만 증명하며,
+회계·직렬화 정체성으로 격상하지 않는다. 기존 요청 P·선언·run ID·pin·artifact는 수정하지 않고
+원래 바이트와 해시로 읽는다. 새 엄격 요청의 `request_hash`는 v2 엔진 정체성을 포함하므로
+달라진다. 선언의 내용 해시는 그대로이며 새 연구 run ID는 선언·봉투·코드와 환경을 포함한
+봉인 출처를 묶는다. 같은 입력·코드·환경은 같은 ID를 만들고, 코드 개정이 바뀌면 결과 바이트가
+같더라도 다른 ID를 만든다. 내용이 같은 결과와 출처가 같은 실행은 서로 다른 비교다.
 
 이 정체성은 안정된 설치 소스와 지원 런타임을 전제로 하며 전체 소프트웨어 공급망의 해시가
 아니다. 순수 엔진과 달리 준비 경로는 DuckDB·SQLite 및 선택적 Arrow 소스의 PyArrow를
@@ -948,10 +959,10 @@ run 이력에 남는다. 어느 쪽이든 성공 영수증은 없다. 그 run을
 `reserved_bytes`로 뺀다. 각각은 들어가지만 합치면 할당을 넘는 두 적재가 동시에 살아 있는
 상황을 막는다. 남은 여유가 없으면 그 단계를 시작하기 전에 거부한다.
 
-기록하는 `engine_hash`는 준비 목록 `CALCULATION_MODULES`의 정체성이다. 회계를 실행하는
-`application/backtest_cli`와 응답을 직렬화하는 `storage.publication`은 그 목록에 없다.
-두 파일만 바뀌면 같은 `request_hash`가 다른 결과 바이트를 봉인할 수 있다. 목록을 넓히면
-모든 요청의 `request_hash`가 바뀌므로 준비 정체성을 소유한 별도 결정으로 다룬다.
+기록하는 `engine_hash`는 봉인된 엔진 정체성 전체의 해시다. 기존 v1은 준비 목록만 덮어
+회계·응답 직렬화 변경을 놓칠 수 있었다. 새 v2는 `execution_source_hash`도 포함하므로
+`application.backtest_cli`와 `storage.publication` 변경을 식별한다. 기존 run의 v1 해시를
+다시 쓰지 않으며, 새 준비와의 출처 차이는 결과 재현과 별도로 비교한다.
 
 계산 도중 프로세스가 죽으면 run은 RUNNING으로 남는다. 기존 복구 계약이 그대로 적용된다.
 표시자가 없으면 `aas db recover`가 INTERRUPTED로 끝내고, 정상 표시자가 있으면 저장을
@@ -1030,9 +1041,9 @@ aas run rerun --run-id <같은 run ID> --declaration "$LAB/declaration.json" --s
 ```
 
 선택 인자는 `--reason`, `--bundle-id`, `--prior-run-id`, `--envelope-output PATH`로 `aas run execute`와
-같다. `--run-id`는 없다. 선언과 그것이 만든 봉투의 내용이 run 식별자를 정하므로 같은 선언은 늘
-같은 run을 가리키고, 이름을 고를 수 있으면 한 계산을 다른 이름으로 접수하게 된다. 같은 선언을
-두 번 실행하면 두 번째는 끝난 run을 다시 열지 못하고 거부된다.
+같다. `--run-id`는 없다. 선언·봉투·봉인 출처가 run 식별자를 정하므로 호출자가 이름을
+고를 수 없다. 같은 입력·코드·환경으로 두 번 실행하면 두 번째는 끝난 run을 다시 열지 못하고
+거부된다. 코드 개정이 바뀌면 결과가 같더라도 새 run ID가 된다.
 
 선언 파일은 원하는 대로 써도 된다. 등록·해시·묶음의 기준은 canonical 형식이고 `--sha256`은
 파일 바이트를 확인한다. 응답의 `declaration_sha256`은 파일의 것, `request_hash`는 canonical
@@ -1051,9 +1062,21 @@ aas run rerun --run-id <같은 run ID> --declaration "$LAB/declaration.json" --s
 
 `aas run rerun`은 아무것도 쓰지 않는다. `--run-id`만 주면 봉인한 봉투를 같은 회계에 다시 넣어
 저장한 결과 바이트와 맞춰 보고, 선언을 함께 주면 준비까지 다시 해서 run 식별자·봉투·봉인 문서를
-각각 비교한다. 결과 재현과 준비 재현은 서로 다른 주장이므로 `checked`에 실제로 확인한 것만
-올리고 각각의 결과를 따로 적는다. 바뀐 봉투에서 결과만 재현되는 경우가 있으므로 한쪽을 다른
-쪽의 근거로 쓰지 않는다.
+각각 비교한다. 응답은 `aas-run-reproduction-v2`이며 판정은 다음과 같다.
+
+| 필드 | 뜻 |
+| --- | --- |
+| `result_reproduced` | 봉인한 봉투를 현재 회계에 넣은 결과가 저장한 결과와 바이트 단위로 같은가 |
+| `identity_reproduced` | 다시 준비한 run ID·봉투·출처가 모두 같은가; 선언을 주지 않으면 `null` |
+| `reproduced` | `result_reproduced`의 별칭; 이전 응답의 전체 비교 AND 판정을 대체 |
+| `checks.preparation` | 각 바이트/ID의 일치 여부와 `recorded_engine`·`current_engine`을 함께 표시 |
+
+코드 개정 뒤 결과가 같으면 `result_reproduced=true`, `identity_reproduced=false`일 수 있다.
+회계 결과도 달라지면 둘 다 false다. 기존 v1 run도 그대로 조회·재실행하며 없는 실행 해시를
+추정하지 않는다. 준비 비교에서 v1과 v2 차이를 드러내고 결과 비교는 독립적으로 수행한다.
+`checked`에는 실제로 확인한 것만 올린다. 결과 일치가 선언·입력·출처 일치를 대신하지 않으므로
+출처까지 요구하는 호출자는 `identity_reproduced`도 확인해야 한다. 이 명령은 선언을 함께 줘도
+결과 비교에는 원래 봉인한 봉투를 사용하며, 새 봉투의 결과까지 실행해 비교하는 명령은 아니다.
 
 기록은 가독성이지 자격이 아니다. 저장한 run이 있어도 `admit_native_input`은 같은 pin을 도메인에서
 거부하고, 같은 문서를 `aas run execute`에 넘기면 거부된다.

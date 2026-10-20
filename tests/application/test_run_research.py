@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import json
 import shutil
-from typing import TYPE_CHECKING, Any, cast
+from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
+from aegis_alpha.application import backtest_prepare as prepare_module
 from aegis_alpha.application import run_research as research_module
 from aegis_alpha.application.cli import main
 from aegis_alpha.application.research_run import (
@@ -48,9 +50,6 @@ from tests.application.test_research_composition import (  # noqa: F401 -- share
 )
 from tests.application.test_storage_cli import run_cli
 from tests.storage.test_run_migration import install_v1
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 type Document = dict[str, Any]
 
@@ -273,6 +272,9 @@ def test_a_stored_declared_run_reproduces_from_its_own_sealed_evidence(
     result_only = _rerun(home, run_id, capsys)
     assert result_only["checked"] == ["result"]
     assert result_only["reproduced"] is True
+    assert result_only["schema"] == "aas-run-reproduction-v2"
+    assert result_only["result_reproduced"] is True
+    assert result_only["identity_reproduced"] is None
     checks = cast("Document", result_only["checks"])
     assert cast("Document", checks["result"])["reproduced"] is True
 
@@ -281,6 +283,7 @@ def test_a_stored_declared_run_reproduces_from_its_own_sealed_evidence(
     )
     assert both["checked"] == ["preparation", "result"]
     assert both["reproduced"] is True
+    assert both["identity_reproduced"] is True
     preparation = cast("Document", cast("Document", both["checks"])["preparation"])
     assert preparation["matches"] == {"run_id": True, "envelope": True, "preparation": True}
     assert preparation["request_hash"] == receipt["request_hash"]
@@ -308,6 +311,89 @@ def test_a_result_that_no_longer_reproduces_is_reported_as_such(
     result = cast("Document", cast("Document", report["checks"])["result"])
     assert result["reproduced"] is False
     assert result["recorded_sha256"] != result["recomputed_sha256"]
+
+
+@pytest.mark.parametrize("changed_result", [False, True])
+@pytest.mark.parametrize("source_name", ["backtest_prepare.py", "backtest_cli.py"])
+def test_a_code_revision_separates_result_and_identity_reproduction(
+    sample: tuple[Path, Document, Document, Document],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    source_name: str,
+    *,
+    changed_result: bool,
+) -> None:
+    home, base, offense, _defense = sample
+    _installed(home)
+    path = _write(home.parent, "sleeve.json", _as_sleeve_run(base, offense))
+    run_id = _run_id(_execute(home, path, capsys))
+    original_read = Path.read_bytes
+
+    def revision(source: Path) -> bytes:
+        raw = original_read(source)
+        return raw + b"\n# synthetic revision\n" if source.name == source_name else raw
+
+    monkeypatch.setattr(Path, "read_bytes", revision)
+    genuine = research_module.run_document
+    if changed_result:
+
+        def altered(raw: bytes, digest: str) -> Document:
+            return {**genuine(raw, digest), "execution_convention": "synthetic new accounting"}
+
+        monkeypatch.setattr(research_module, "run_document", altered)
+
+    report = _rerun(
+        home, run_id, capsys, "--declaration", str(path), "--sha256", sha(path.read_bytes())
+    )
+    assert report["checks"]["result"]["reproduced"] is not changed_result
+    assert report["checks"]["preparation"]["matches"] == {
+        "run_id": False,
+        "envelope": True,
+        "preparation": False,
+    }
+    assert report["reproduced"] is not changed_result
+    assert report["result_reproduced"] is not changed_result
+    assert report["identity_reproduced"] is False
+    preparation = report["checks"]["preparation"]
+    assert preparation["recorded_engine"]["schema"] == "aas-engine-identity-v2"
+    assert preparation["recorded_engine"] != preparation["current_engine"]
+    # A new revision may record the same declaration under its new identity.
+    second = _execute(home, path, capsys)
+    assert _run_id(second) != run_id
+    assert _show(home, run_id, capsys)["run"]["status"] == "SUCCESS"
+
+
+def test_legacy_sealed_run_is_readable_and_rerunnable_without_rewriting(
+    sample: tuple[Path, Document, Document, Document],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, base, offense, _defense = sample
+    _installed(home)
+    path = _write(tmp_path, "sleeve.json", _as_sleeve_run(base, offense))
+    legacy = dict(prepare_module.calculation_identity())
+    legacy["schema"] = "aas-engine-identity-v1"
+    del legacy["execution_source_hash"]
+    with monkeypatch.context() as old:
+        old.setattr(prepare_module, "calculation_identity", lambda: legacy)
+        receipt = _execute(home, path, capsys)
+    run_id = _run_id(receipt)
+    before = _show(home, run_id, capsys)
+    with open_workspace(home) as workspace:
+        sealed = read_run_evidence(workspace, run_id, budget=BUDGET)
+    report = _rerun(
+        home, run_id, capsys, "--declaration", str(path), "--sha256", sha(path.read_bytes())
+    )
+    assert report["result_reproduced"] is True
+    assert report["identity_reproduced"] is False
+    preparation = report["checks"]["preparation"]
+    assert preparation["recorded_engine"] == legacy
+    assert preparation["current_engine"]["schema"] == "aas-engine-identity-v2"
+    assert preparation["request_hash"] == receipt["request_hash"]
+    assert _show(home, run_id, capsys) == before
+    with open_workspace(home) as workspace:
+        assert read_run_evidence(workspace, run_id, budget=BUDGET) == sealed
 
 
 def test_a_rerun_takes_a_declaration_and_its_digest_together_or_not_at_all(
@@ -410,7 +496,8 @@ def test_only_a_declared_run_is_re_prepared_from_a_declaration(
         declaration=composition,
         declaration_sha256=sha(composition.read_bytes()),
     )
-    assert other["reproduced"] is False
+    assert other["result_reproduced"] is True
+    assert other["identity_reproduced"] is False
     preparation = cast("Document", cast("Document", other["checks"])["preparation"])
     assert cast("Document", preparation["matches"])["run_id"] is False
 
