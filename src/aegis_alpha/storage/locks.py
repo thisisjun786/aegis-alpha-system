@@ -10,13 +10,11 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from aegis_alpha.data.descriptor_tree import DescriptorTree
+from aegis_alpha.storage.checkout import (
+    require_outside_checkout as require_outside_checkout,  # noqa: PLC0414 -- retained import contract
+)
 
 _REMOTE_FILESYSTEMS = frozenset({"nfs", "nfs4", "cifs", "smb3", "9p", "fuse.sshfs", "ceph", "afs"})
-
-
-def require_outside_checkout(path: Path) -> None:
-    if any((parent / ".git").exists() for parent in (path, *path.parents)):
-        raise ValueError("persistent storage cannot be inside a Git checkout")
 
 
 def private_directory(path: Path, *, create: bool = False) -> None:

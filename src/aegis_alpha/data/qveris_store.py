@@ -22,6 +22,7 @@ from aegis_alpha.data.qveris_contracts import (
 )
 from aegis_alpha.data.sec_evidence import open_directory
 from aegis_alpha.data.serialization import canonical_json_bytes
+from aegis_alpha.storage.checkout import require_outside_checkout
 
 
 class QverisDestinationError(RuntimeError):
@@ -32,8 +33,11 @@ def validate_destination(label: str, destination: Path) -> Path:
     """Admit roots using the retained sec_collector rule without its runtime imports."""
     if not destination.is_absolute() or ".." in destination.parts:
         raise QverisDestinationError(f"{label} must be an absolute path without parent traversal")
-    if any((parent / ".git").exists() for parent in (destination, *destination.parents)):
-        raise QverisDestinationError(f"{label} must be outside a Git repository")
+    require_outside_checkout(
+        destination,
+        error=QverisDestinationError,
+        message=f"{label} must be outside a Git repository",
+    )
     if destination.is_symlink():
         raise QverisDestinationError(f"{label} must not be a symlink")
     ancestor = destination if destination.is_dir() else destination.parent

@@ -91,6 +91,7 @@ from aegis_alpha.data.sec_transport import (
     require_allowed_url,
 )
 from aegis_alpha.data.serialization import canonical_json_bytes
+from aegis_alpha.storage.checkout import containing_checkout
 
 TASK_ID: Final = "AAS-DATA-013"
 SCHEMA_VERSION: Final = 1
@@ -196,10 +197,7 @@ class CollectorOutcome:
 
 
 def containing_git_repository(path: Path) -> Path | None:
-    for candidate in (path, *path.parents):
-        if (candidate / ".git").exists():
-            return candidate
-    return None
+    return containing_checkout(path)
 
 
 def validate_destination(label: str, destination: Path) -> Path:

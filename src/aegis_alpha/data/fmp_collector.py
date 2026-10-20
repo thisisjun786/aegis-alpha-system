@@ -90,6 +90,7 @@ from aegis_alpha.data.fmp_windows import (
     plan_incremental_window,
 )
 from aegis_alpha.data.serialization import canonical_json_bytes
+from aegis_alpha.storage.checkout import containing_checkout
 
 #: Guardrail G2: the only host this collector may ever contact.
 ALLOWED_HOST: Final = "financialmodelingprep.com"
@@ -227,10 +228,7 @@ class CollectorOutcome:
 
 
 def containing_git_repository(path: Path) -> Path | None:
-    for candidate in (path, *path.parents):
-        if (candidate / ".git").exists():
-            return candidate
-    return None
+    return containing_checkout(path)
 
 
 def validate_destination(label: str, destination: Path) -> Path:
