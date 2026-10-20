@@ -259,12 +259,16 @@ def _verify_pin(workspace: Workspace, pin: GenerationPin, budget: ComputeBudget)
 
 
 def _heads_sql(domain: str) -> str:
-    """Every record's head over a chain given as one VARCHAR[] parameter."""
+    """Every record's head over a chain bound as one JSON string array.
+
+    A scalar binding avoids the driver's per-element Python type discovery on long
+    ancestry lists; DuckDB decodes exactly the same IDs before projecting the heads.
+    """
     return (
         "SELECT * EXCLUDE (_aas_rank) FROM (SELECT p.*, row_number() OVER "
         "(PARTITION BY p.record_id ORDER BY g.sequence DESC) AS _aas_rank "
         f"FROM {_q(domain)} p JOIN market_generations g ON g.generation_id = p.generation_id "
-        "WHERE p.generation_id IN (SELECT unnest(?::VARCHAR[]))) WHERE _aas_rank = 1"
+        "WHERE p.generation_id IN (SELECT unnest(?::JSON::VARCHAR[]))) WHERE _aas_rank = 1"
     )
 
 
@@ -362,7 +366,7 @@ def _calendars(workspace: Workspace, spec: PromotionSpec, budget: ComputeBudget)
             f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT session_date, open_at_us, close_at_us "
             f"FROM ({_heads_sql('calendar_sessions')}) WHERE op <> 'TOMBSTONE' "
             "AND calendar_id = ? AND venue = ?",
-            [chain, rule.args["calendar_id"], rule.args["venue"]],
+            [json.dumps(chain), rule.args["calendar_id"], rule.args["venue"]],
         )
         tables[index] = name
     return tables
@@ -387,7 +391,7 @@ def _references(workspace: Workspace, spec: PromotionSpec, budget: ComputeBudget
         workspace.market.execute(
             f"CREATE OR REPLACE TEMP TABLE {reference_table(name)} AS SELECT {columns} "
             f"FROM ({_heads_sql(reference.domain)}) WHERE op <> 'TOMBSTONE'",
-            [chain],
+            [json.dumps(chain)],
         )
 
 
@@ -791,7 +795,7 @@ def _diff(
         f"CREATE OR REPLACE TEMP TABLE {_t('head')} AS SELECT * FROM ({_heads_sql(domain)}) p "
         f"WHERE p.record_id IN (SELECT record_id FROM {_t('rows')} WHERE record_id IS NOT NULL) "
         f"OR ({scope})",
-        [chain],
+        [json.dumps(chain)],
     )
     op = (
         "CASE WHEN h.record_id IS NULL THEN 'ASSERT' WHEN h.op = 'TOMBSTONE' THEN 'SUPERSEDE' "
@@ -1058,7 +1062,7 @@ def _flags(
         market.execute(
             f"CREATE OR REPLACE TEMP TABLE {_t('ref')} AS SELECT {keys}, {column} AS v "
             f"FROM ({_heads_sql('prices')}) WHERE op <> 'TOMBSTONE' AND value_state = 'present'",
-            [chain],
+            [json.dumps(chain)],
         )
         tolerance = f"CAST('{rule.tolerance}' AS DECIMAL(38,12))"
         same = " AND ".join(
@@ -1136,14 +1140,14 @@ def _partition_check(
                 "row_number() OVER (PARTITION BY p.record_id ORDER BY g.sequence DESC) "
                 f"AS _aas_rank FROM {_q(spec.domain)} p JOIN market_generations g "
                 "ON g.generation_id = p.generation_id "
-                "WHERE p.generation_id IN (SELECT unnest(?::VARCHAR[])) "
+                "WHERE p.generation_id IN (SELECT unnest(?::JSON::VARCHAR[])) "
                 f"AND p.{day} >= ?::DATE - INTERVAL {_REFERENCE_LOOKBACK_DAYS} DAY "
                 f"AND p.{day} <= ?::DATE) h "
                 "WHERE _aas_rank = 1 AND op <> 'TOMBSTONE' GROUP BY 1 "
                 "HAVING NOT bool_or(EXISTS (SELECT 1 FROM quality_flags f "
                 "WHERE f.generation_id = h.generation_id AND f.record_id = h.record_id "
                 "AND f.revision_id = h.revision_id AND f.flag = ?)) ORDER BY 1",
-                [chain, found[0][0], found[-1][0], PARTIAL_FLAG],
+                [json.dumps(chain), found[0][0], found[-1][0], PARTIAL_FLAG],
             ).fetchall()
         ]
     dates = []

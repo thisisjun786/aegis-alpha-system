@@ -384,6 +384,23 @@ def marker_for(connection: duckdb.DuckDBPyConnection, generation_id: str) -> dic
 def generation_chain(
     connection: duckdb.DuckDBPyConnection, generation_id: str
 ) -> list[dict[str, object]]:
+    """Read a pinned chain in one query, then follow its actual parent links.
+
+    Dataset/sequence bounds exclude unrelated datasets and descendants of a historical
+    pin. A parent outside those bounds is corrupt, not an ancestor to silently omit.
+    Link/hash validation stays with the callers that already own it.
+    """
+    rows = connection.execute(
+        "SELECT "  # noqa: S608 -- code-owned columns
+        + ",".join("g." + name for name in _MARKER_COLUMNS)
+        + " FROM market_generations g JOIN market_generations head "
+        "ON g.dataset_id=head.dataset_id AND g.sequence<=head.sequence "
+        "WHERE head.generation_id=?",
+        [generation_id],
+    ).fetchall()
+    markers = {str(row[0]): dict(zip(_MARKER_COLUMNS, row, strict=True)) for row in rows}
+    if generation_id not in markers:
+        raise ValueError("market generation does not exist")
     chain = []
     seen = set()
     current: str | None = generation_id
@@ -391,7 +408,11 @@ def generation_chain(
         if current in seen:
             raise ValueError("market generation cycle")
         seen.add(current)
-        marker = marker_for(connection, current)
+        if current not in markers:
+            raise ValueError(
+                "generation chain crosses dataset ownership or has an invalid sequence"
+            )
+        marker = markers[current]
         chain.append(marker)
         parent = marker["parent_id"]
         current = str(parent) if parent is not None else None
