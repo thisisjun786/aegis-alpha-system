@@ -14,15 +14,19 @@ from decimal import Decimal
 from pathlib import Path
 from typing import cast
 
+import duckdb
 import pytest
 
-from aegis_alpha.storage.bulk_generation import ParentChangedError
+from aegis_alpha.compute_resources import ComputeResourceError
+from aegis_alpha.storage import bulk_generation, market_integrity
+from aegis_alpha.storage.bulk_generation import ParentChangedError, PublicationOutcomeUnknownError
 from aegis_alpha.storage.identity import mint_instrument
 from aegis_alpha.storage.promotion import engine, formats
 from aegis_alpha.storage.promotion.engine import promote, verify_promotion
 from aegis_alpha.storage.publication import recover_operations
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
+from tests.storage.capacity_support import PIN_BLOCK
 from tests.storage.promotion_support import (
     SYMBOLS,
     add_source,
@@ -86,6 +90,86 @@ def test_same_request_reuses_generation(ws: Workspace) -> None:
     assert second["generation_id"] == planned["generation_id"] == first["generation_id"]
     assert ws.market.execute("SELECT count(*) FROM market_generations").fetchone() == (1,)
     assert engine.list_promotions(ws)[0]["phase"] == "COMPLETED"
+
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_commit_error_resolves_durable_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, committed: bool
+) -> None:
+    """A failed COMMIT can have either durable outcome; restart agrees with the caller."""
+    root = tmp_path / "aas"
+    initialize(root)
+    with open_workspace(root, writable=True, strategy_write=True) as workspace:
+        pin, identity = _setup(workspace, [bar("AAA.KO", D1, 100.0, retrieved=LATE)])
+        first = _apply(workspace, spec([pin], identity))
+        parent = str(first["generation_id"])
+        pin = add_source(workspace, [bar("AAA.KO", D1, 101.1, retrieved=LATER)], tag="correction")
+        document = spec([pin], identity, parent=parent)
+        planned = _plan(workspace, document)
+        generation = str(planned["generation_id"])
+
+        def failed_commit(connection: duckdb.DuckDBPyConnection) -> None:
+            connection.execute("COMMIT" if committed else "ROLLBACK")
+            raise duckdb.TransactionException(PIN_BLOCK)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(market_integrity, "commit_publication", failed_commit)
+            if committed:
+                result = _apply(workspace, document)
+                assert result["published"] is True
+                assert result["generation_id"] == generation
+            else:
+                with pytest.raises(ComputeResourceError) as caught:
+                    _apply(workspace, document)
+                assert str(caught.value.__cause__) == PIN_BLOCK
+        assert engine.dataset_head(workspace, "prices.kr.eodhd") == (
+            generation if committed else parent
+        )
+
+    with open_workspace(root, writable=True, strategy_write=True) as workspace:
+        assert engine.dataset_head(workspace, "prices.kr.eodhd") == (
+            generation if committed else parent
+        )
+        for table in ("market_generations", "prices", "quality_flags"):
+            count = workspace.market.execute(
+                f"SELECT count(*) FROM {table} WHERE generation_id=?",  # noqa: S608 -- fixed test tables
+                [generation],
+            ).fetchone()
+            assert count is not None
+            assert (count[0] > 0) is committed
+        if not committed:
+            recover_operations(workspace)
+        assert engine.dataset_head(workspace, "prices.kr.eodhd") == generation
+        assert verify_promotion(workspace, generation, deep=True)["verified"] is True
+        assert _apply(workspace, document)["reused"] is True
+
+
+@pytest.mark.parametrize("evidence", ["unreadable", "changed_rows", "changed_flags"])
+def test_commit_error_never_guesses_from_unverified_evidence(
+    ws: Workspace, monkeypatch: pytest.MonkeyPatch, evidence: str
+) -> None:
+    pin, identity = _setup(ws, [bar("AAA.KO", D1, 100.1, retrieved=LATE)])
+    document = spec([pin], identity)
+    generation = str(_plan(ws, document)["generation_id"])
+
+    def unreadable(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise ComputeResourceError("synthetic verification budget exhaustion")
+
+    def failed_commit(connection: duckdb.DuckDBPyConnection) -> None:
+        connection.execute("COMMIT")
+        if evidence == "unreadable":
+            monkeypatch.setattr(bulk_generation, "verify_generation_bulk", unreadable)
+        elif evidence == "changed_rows":
+            connection.execute("UPDATE prices SET close=999 WHERE generation_id=?", [generation])
+        else:
+            connection.execute("DELETE FROM quality_flags WHERE generation_id=?", [generation])
+        raise duckdb.TransactionException(PIN_BLOCK)
+
+    monkeypatch.setattr(market_integrity, "commit_publication", failed_commit)
+    with pytest.raises(PublicationOutcomeUnknownError, match=generation + ".*recover"):
+        _apply(ws, document)
+    assert ws.state.execute("SELECT count(*) FROM dataset_versions").fetchone()[0] == 0
+    assert engine.list_promotions(ws)[0]["phase"] == "PREPARED"
 
 
 def test_repromotion_yields_empty_delta(ws: Workspace) -> None:

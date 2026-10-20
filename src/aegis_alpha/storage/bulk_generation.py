@@ -39,10 +39,12 @@ This module publishes a staged DuckDB table instead and keeps the same contract:
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import partial
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
@@ -138,6 +140,10 @@ class PlanChangedError(ValueError):
     """The generation recomputed at publication differs from the reviewed plan."""
 
 
+class PublicationOutcomeUnknownError(RuntimeError):
+    """COMMIT failed and durable evidence could not prove publication or rollback."""
+
+
 @dataclass(frozen=True, slots=True)
 class BulkRequest:
     """Identity of one bulk generation and the staged table that holds its rows.
@@ -220,8 +226,10 @@ def publish_generation_bulk(
     pass their checks, so they commit or roll back with its marker. Nothing else runs
     in the transaction: the writer's own INSERTs are its only writes, so no other
     generation's rows or flags can change. Flags are not inserted when an identical
-    generation is reused. An error or one interrupt at any point rolls the transaction
-    back.
+    generation is reused. A COMMIT error is resolved from durable evidence after
+    rollback: return the verified generation if it landed, or propagate the original
+    error if no marker, rows or flags landed. Unreadable or inconsistent evidence is an
+    explicit unknown outcome requiring recovery. Interrupts propagate for recovery.
     """
 
     def publish() -> BulkPlan:
@@ -243,8 +251,62 @@ def publish_generation_bulk(
         return current
 
     with budgeted(connection, budget, _WORK):
-        current = run_publication(connection, publish)
+        current = run_publication(
+            connection,
+            publish,
+            resolve_commit=partial(_resolve_commit, connection, flags=flags, budget=budget),
+        )
     return dict(current.marker)
+
+
+def _resolve_commit(
+    connection: duckdb.DuckDBPyConnection,
+    plan: BulkPlan,
+    flags: BulkFlags | None,
+    budget: ComputeBudget,
+) -> bool:
+    """Determine the failed COMMIT's outcome from a new, read-only transaction."""
+    generation = str(plan.marker["generation_id"])
+    try:
+        connection.execute("BEGIN TRANSACTION")
+        head = connection.execute(
+            "SELECT generation_id FROM market_generations WHERE dataset_id=? "
+            "ORDER BY sequence DESC LIMIT 1",
+            [plan.marker["dataset_id"]],
+        ).fetchone()
+        found = connection.execute(
+            "SELECT generation_id FROM market_generations WHERE generation_id=? OR operation_id=?",
+            [generation, plan.marker["operation_id"]],
+        ).fetchall()
+        if not found:
+            check_new_generation(connection, generation)
+            return False
+        marker = verify_generation_bulk(connection, generation, budget=budget)
+        if (
+            marker != dict(plan.marker)
+            or head is None
+            or generation
+            not in {item["generation_id"] for item in generation_chain(connection, str(head[0]))}
+        ):
+            raise ValueError("committed generation differs from the planned publication/head")  # noqa: TRY301 -- report all inconsistent evidence as an unknown outcome
+        if flags is not None:
+            check_generation_flags(connection, str(marker["domain"]), generation)
+            digest, rows = flags_digest(
+                connection,
+                "SELECT * FROM quality_flags WHERE generation_id=?",
+                [generation],
+                budget,
+            )
+            if (digest, rows) != (flags.rowset, flags.rows):
+                raise ValueError("committed quality flags differ from the planned publication")  # noqa: TRY301 -- report all inconsistent evidence as an unknown outcome
+    except Exception as error:
+        raise PublicationOutcomeUnknownError(
+            f"COMMIT outcome for generation {generation} is unknown; run aas db recover "
+            "before retrying with another parent"
+        ) from error
+    finally:
+        rollback(connection)
+    return True
 
 
 def _insert_flags(
@@ -911,7 +973,7 @@ WITH delta AS (
 ), prior AS (
  SELECT p.record_id, p.revision_id, p.available_at_us, p.revision_known_at_us, g.sequence
  FROM {table} p JOIN market_generations g ON g.generation_id = p.generation_id
- WHERE p.generation_id IN (SELECT unnest(?::VARCHAR[]))
+ WHERE p.generation_id IN (SELECT unnest(?::JSON::VARCHAR[]))
    AND p.record_id IN (SELECT record_id FROM delta)
 ), head AS (
  SELECT * FROM prior
@@ -933,7 +995,9 @@ SELECT
          AND (d.available_at_us < h.available_at_us
               OR d.revision_known_at_us < h.revision_known_at_us))
 """  # noqa: S608 -- code-owned schema over a code-owned relation
-    result = connection.execute(sql, [*parameters, ancestors]).fetchone()
+    # Bind one scalar: DuckDB's Python list conversion probes optional scalar types
+    # per element, making each revision check grow expensive with the chain length.
+    result = connection.execute(sql, [*parameters, json.dumps(ancestors)]).fetchone()
     messages = (
         "one delta can contain only one revision per natural record",
         "duplicate market revision",
