@@ -24,6 +24,7 @@ from aegis_alpha.compute_resources import ComputeBudget, ComputeResourceError
 from aegis_alpha.data.descriptor_tree import DescriptorTree
 from aegis_alpha.data.serialization import canonical_json_bytes
 from aegis_alpha.engine.codec import decode_json
+from aegis_alpha.json_memory import json_bytes_memory, json_file_memory
 from aegis_alpha.storage import market
 from aegis_alpha.storage.import_document import ImportDocument, parse_import
 from aegis_alpha.storage.market_schema import COMMON, DOMAINS, text_bytes
@@ -347,18 +348,28 @@ def _transform(
     return (
         digest,
         body,
-        replace(budget, reserved_bytes=budget.reserved_bytes + 32 * len(payload)),
+        replace(
+            budget, reserved_bytes=budget.reserved_bytes + json_bytes_memory(payload, copies=2)
+        ),
     )
 
 
 def _raw_payload(workspace: Workspace, digest: str, budget: ComputeBudget) -> bytes:
     _digest(digest)
-    # JSON objects can cost much more than encoded bytes; bound before reading.
-    with DescriptorTree.open_path(workspace.paths.raw) as tree:
-        payload = tree.read_bytes(
-            digest[:2] + "/" + digest,
-            max_bytes=(budget.available_bytes) // 32,
-        )
+    # The caller has already carved out its component and charged retained state.
+    # Compare a structural decode estimate with those remaining bytes directly; a
+    # second encoded-byte divisor would turn that reservation into another ceiling.
+    with (
+        DescriptorTree.open_path(workspace.paths.raw) as tree,
+        tree.binary_reader(digest[:2] + "/" + digest) as handle,
+    ):
+        if json_file_memory(handle, copies=2) > budget.available_bytes:
+            raise ComputeResourceError("pinned document exceeds materialization budget")
+        size = handle.tell()
+        handle.seek(0)
+        payload = handle.read(size + 1)
+        if len(payload) != size:
+            raise ValueError("pinned document changed while reading")
     if hashlib.sha256(payload).hexdigest() != digest:
         raise ValueError("pinned transform hash mismatch")
     return payload
@@ -927,7 +938,10 @@ def _proxy_publication(
         workspace,
         pin,
         document,
-        replace(budget, reserved_bytes=budget.reserved_bytes + 32 * len(document.payload)),
+        replace(
+            budget,
+            reserved_bytes=budget.reserved_bytes + json_bytes_memory(document.payload, copies=2),
+        ),
     )
 
 

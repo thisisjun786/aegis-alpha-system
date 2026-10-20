@@ -783,7 +783,9 @@ def test_oversized_publication_is_bounded_before_decode(stored: Workspace) -> No
     selected = pin(stored)
     path = stored.paths.raw / selected.manifest_hash[:2] / selected.manifest_hash
     path.write_bytes(b" " * (BUDGET.memory_limit_bytes // 32))
-    with pytest.raises(ValueError, match=r"size|bound|large"):
+    with pytest.raises(
+        ComputeResourceError, match="pinned document exceeds materialization budget"
+    ):
         api().verify_sealed_publication(stored, selected.generation_id, budget=BUDGET)
 
 

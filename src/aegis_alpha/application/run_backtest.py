@@ -358,7 +358,7 @@ def _staged(
         # run_document takes no budget of its own, so the decode it is about to perform
         # is admitted here against what this command still holds live. A refusal ends the
         # run cleanly instead of letting the host kill a process mid-calculation.
-        admit(retained, len(carried.envelope_bytes))
+        admit(retained, carried.envelope_bytes)
         response = run_document(carried.envelope_bytes, carried.envelope_sha256)
         result = RunResult(canonical_json_bytes(response))
         # The sealed bytes are the response. Dropping the decoded copy keeps it from
@@ -387,7 +387,7 @@ def _staged(
     # The run is stored. Both documents the receipt reports are decoded from the sealed
     # bytes, so the charge is made before either is expanded; a refusal here leaves a
     # readable SUCCESS run rather than a wrong receipt.
-    admit(retained, len(result.backtest_bytes) + len(carried.envelope_bytes))
+    admit(retained, result.backtest_bytes, carried.envelope_bytes)
     sealed = json_object(decode_json(result.backtest_bytes), "sealed backtest result")
     return _receipt(request, carried, opened, _Outcome(sealed, recorded, exported))
 
