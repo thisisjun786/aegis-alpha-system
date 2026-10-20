@@ -959,10 +959,10 @@ run 이력에 남는다. 어느 쪽이든 성공 영수증은 없다. 그 run을
 `reserved_bytes`로 뺀다. 각각은 들어가지만 합치면 할당을 넘는 두 적재가 동시에 살아 있는
 상황을 막는다. 남은 여유가 없으면 그 단계를 시작하기 전에 거부한다.
 
-기록하는 `engine_hash`는 준비 목록 `CALCULATION_MODULES`의 정체성이다. 회계를 실행하는
-`application/backtest_cli`와 응답을 직렬화하는 `storage.publication`은 그 목록에 없다.
-두 파일만 바뀌면 같은 `request_hash`가 다른 결과 바이트를 봉인할 수 있다. 목록을 넓히면
-모든 요청의 `request_hash`가 바뀌므로 준비 정체성을 소유한 별도 결정으로 다룬다.
+기록하는 `engine_hash`는 봉인된 엔진 정체성 전체의 해시다. 기존 v1은 준비 목록만 덮어
+회계·응답 직렬화 변경을 놓칠 수 있었다. 새 v2는 `execution_source_hash`도 포함하므로
+`application.backtest_cli`와 `storage.publication` 변경을 식별한다. 기존 run의 v1 해시를
+다시 쓰지 않으며, 새 준비와의 출처 차이는 결과 재현과 별도로 비교한다.
 
 계산 도중 프로세스가 죽으면 run은 RUNNING으로 남는다. 기존 복구 계약이 그대로 적용된다.
 표시자가 없으면 `aas db recover`가 INTERRUPTED로 끝내고, 정상 표시자가 있으면 저장을
@@ -1041,9 +1041,9 @@ aas run rerun --run-id <같은 run ID> --declaration "$LAB/declaration.json" --s
 ```
 
 선택 인자는 `--reason`, `--bundle-id`, `--prior-run-id`, `--envelope-output PATH`로 `aas run execute`와
-같다. `--run-id`는 없다. 선언과 그것이 만든 봉투의 내용이 run 식별자를 정하므로 같은 선언은 늘
-같은 run을 가리키고, 이름을 고를 수 있으면 한 계산을 다른 이름으로 접수하게 된다. 같은 선언을
-두 번 실행하면 두 번째는 끝난 run을 다시 열지 못하고 거부된다.
+같다. `--run-id`는 없다. 선언·봉투·봉인 출처가 run 식별자를 정하므로 호출자가 이름을
+고를 수 없다. 같은 입력·코드·환경으로 두 번 실행하면 두 번째는 끝난 run을 다시 열지 못하고
+거부된다. 코드 개정이 바뀌면 결과가 같더라도 새 run ID가 된다.
 
 선언 파일은 원하는 대로 써도 된다. 등록·해시·묶음의 기준은 canonical 형식이고 `--sha256`은
 파일 바이트를 확인한다. 응답의 `declaration_sha256`은 파일의 것, `request_hash`는 canonical
