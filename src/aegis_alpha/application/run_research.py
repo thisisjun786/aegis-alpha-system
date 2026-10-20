@@ -63,6 +63,8 @@ from aegis_alpha.storage.runs import (
     RunIntent,
     RunResult,
     RunStrategyPin,
+    declared_attempt,
+    declared_attempt_id,
     open_run,
     read_run,
     read_run_evidence,
@@ -97,11 +99,9 @@ _DECLARED_SCHEMAS = frozenset({RESEARCH_RUN_SCHEMA, RESEARCH_COMPOSITION_SCHEMA}
 class RunResearchRequest:
     """One integrated declared-run request.
 
-    There is no run_id field, and that is the point. A declared run's identity is derived
-    from the declaration by the preparation, so the same declaration always names the same
-    run and a caller cannot file one calculation under a name of its own choosing. Every
-    other recorded identity is taken from the declaration or its sealed preparation for
-    the same reason.
+    There is no caller-selected run_id. Preparation derives the calculation identity;
+    the first attempt uses it unchanged. prior_run_id explicitly links a new attempt
+    after FAILED/INTERRUPTED, without changing the calculation or earlier evidence.
     """
 
     declaration: Path
@@ -352,32 +352,22 @@ def _open(
     into an executable request shape on the way in, and the store keeps the two roots
     apart rather than translating between them.
     """
+    bundle_id = bundle_name(
+        request.bundle_id, declared.bindings, carried.request_hash, prefix=_BUNDLE_PREFIX
+    )
     document = canonical_json_bytes(
         {
             "schema": BUNDLE_SCHEMA,
             "hash_format": HASH_FORMAT,
-            "bundle_id": bundle_name(
-                request.bundle_id, declared.bindings, carried.request_hash, prefix=_BUNDLE_PREFIX
-            ),
+            "bundle_id": bundle_id,
             "bindings": declared.bindings,
         }
     )
     with open_workspace(home, writable=True) as workspace:
         # Registration is durable and a bundle name binds one request for good, so the
-        # run-only fields are checked first. open_run cannot run inside another
-        # transaction, so stage A cannot be one atomic write; refusing a predecessor
-        # nobody recorded, or one that is this run itself, is what keeps a bad run field
-        # from stranding a registration. The run store refuses both too, but only after
-        # the declaration is already filed.
-        if request.prior_run_id == carried.run_id:
-            raise ValueError("a run cannot be its own predecessor")
-        if (
-            request.prior_run_id is not None
-            and not workspace.state.execute(
-                "SELECT 1 FROM runs WHERE run_id=?", (request.prior_run_id,)
-            ).fetchone()
-        ):
-            raise ValueError("prior_run_id names no recorded run")
+        # run-only fields and the attempt lineage are checked first. open_run cannot
+        # run inside another transaction, so stage A cannot be one atomic write.
+        intent = declared_attempt(workspace, _intent(carried, request, bundle_id))
         bundle = register_input_bundle(
             workspace,
             document,
@@ -391,7 +381,7 @@ def _open(
             expected_request_hash=carried.request_hash,
             budget=budget,
         )
-        handle = open_run(workspace, _intent(carried, request, bundle.bundle_id), budget=budget)
+        handle = open_run(workspace, intent, budget=budget)
         return Opened(handle, bundle, installation_identity(workspace))
 
 
@@ -411,6 +401,7 @@ def _receipt(
     """
     return {
         "executed": True,
+        "calculation_id": carried.run_id,
         "declaration_sha256": request.declaration_sha256,
         "request_hash": carried.request_hash,
         "request_schema": carried.schema_version,
@@ -508,9 +499,9 @@ def run_research(request: RunResearchRequest) -> dict[str, object]:
     an --envelope-output export is written before the run is opened, and a run
     interrupted while its inputs are being sealed stays RUNNING for aas db recover.
 
-    Running the same declaration twice does not record it twice. The second attempt
-    prepares to the same run identity and the run store refuses to reopen a finished run
-    under it, which is what stops one calculation from appearing as two results.
+    Running the same declaration twice does not record it twice. An explicit
+    prior_run_id permits a successor only after FAILED/INTERRUPTED; RUNNING attempts
+    belong to recovery and successful attempts cannot be recorded again.
     """
     declared = _declared(_read_declaration(request.declaration, request.declaration_sha256))
     output = None if request.envelope_output is None else admitted_path(request.envelope_output)
@@ -588,7 +579,7 @@ def _reproduced(
         }
     }
     if declared is not None:
-        checks["preparation"] = _repreparation(home, run_id, declared, evidence, retained)
+        checks["preparation"] = _repreparation(home, payload, declared, evidence, retained)
     return {
         "run_id": run_id,
         "checked": sorted(checks),
@@ -604,7 +595,7 @@ def _reproduced(
 
 def _repreparation(
     home: Path,
-    run_id: str,
+    payload: dict[str, object],
     declared: _Declared,
     evidence: RunEvidence,
     budget: ComputeBudget,
@@ -617,8 +608,13 @@ def _repreparation(
     """
     with open_workspace(home) as workspace:
         prepared = prepare_research_run(workspace, declared.request, budget=budget)
+    run_id = payload["run_id"]
+    prior = payload["prior_run_id"]
     matches = {
-        "run_id": prepared.run_id == run_id,
+        "run_id": (
+            prepared.run_id == run_id
+            or (isinstance(prior, str) and declared_attempt_id(prepared.run_id, prior) == run_id)
+        ),
         "envelope": prepared.envelope.canonical_bytes == evidence.envelope,
         "preparation": prepared.provenance == evidence.preparation,
     }

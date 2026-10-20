@@ -948,6 +948,12 @@ run 이력에 남는다. 어느 쪽이든 성공 영수증은 없다. 그 run을
 `reserved_bytes`로 뺀다. 각각은 들어가지만 합치면 할당을 넘는 두 적재가 동시에 살아 있는
 상황을 막는다. 남은 여유가 없으면 그 단계를 시작하기 전에 거부한다.
 
+C단계는 bundle pin뿐 아니라 실제 보존 입력도 다시 검사한다. strict 경로의 generation은
+원본 publication과 가격·달력 변환을 검증하고, 선언 경로는 양쪽 슬리브·membership·관측
+패널·가격·거시·환율 grant를 각 저장 소유자로 확인한다. 준비 후 사용한 pin이나 보존 변환
+파일이 바뀌면 SUCCESS나 성공 영수증을 남기지 않는다. 이 검사는 전략 판단이나 회계를
+다시 실행하지 않으며 `commit_run`과 같은 설치 잠금 안에서 끝난다.
+
 기록하는 `engine_hash`는 준비 목록 `CALCULATION_MODULES`의 정체성이다. 회계를 실행하는
 `application/backtest_cli`와 응답을 직렬화하는 `storage.publication`은 그 목록에 없다.
 두 파일만 바뀌면 같은 `request_hash`가 다른 결과 바이트를 봉인할 수 있다. 목록을 넓히면
@@ -1029,10 +1035,36 @@ aas run rerun --run-id <같은 run ID>
 aas run rerun --run-id <같은 run ID> --declaration "$LAB/declaration.json" --sha256 "$DECLARATION_SHA256"
 ```
 
-선택 인자는 `--reason`, `--bundle-id`, `--prior-run-id`, `--envelope-output PATH`로 `aas run execute`와
-같다. `--run-id`는 없다. 선언과 그것이 만든 봉투의 내용이 run 식별자를 정하므로 같은 선언은 늘
-같은 run을 가리키고, 이름을 고를 수 있으면 한 계산을 다른 이름으로 접수하게 된다. 같은 선언을
-두 번 실행하면 두 번째는 끝난 run을 다시 열지 못하고 거부된다.
+선택 인자는 `--reason`, `--bundle-id`, `--prior-run-id`, `--envelope-output PATH`다.
+`--run-id`는 없다. 선언·봉투·봉인 준비 문서가 정하는 안정 계산 ID는 기존과 같으며 성공
+응답의 `calculation_id`로 나온다. 첫 실행 시도의 `run.run_id`는 이 ID다. 같은 명령을
+단순 반복하면 기존 시도를 다시 열지 않고 거부한다.
+
+계산이나 marker 이전 저장이 실패해 FAILED가 되면 **같은 선언과 bundle**에
+`--prior-run-id <실패한 시도 ID>`를 주어 새 시도를 연다. Python에서는
+`run_research(RunResearchRequest(..., prior_run_id=failed_id))`다. 새 ID는 계산 ID와
+선행 시도 ID에서 결정되며, 같은 선행 시도에 두 번째 후속 시도를 만들 수 없다. 재시도도
+실패했다면 그 새 ID를 다음 `prior_run_id`로 지정한다. 이전 run·event·봉인 파일은 그대로
+남고, `aas run show --run-id <성공한 시도 ID>`의 `prior_run_id`가 계보를 보여준다.
+기존 ID를 최신 성공으로 바꿔 해석하지 않는다. `aas run list`는 실패한 시도도 나열한다.
+
+프로세스가 중단되어 RUNNING으로 남았으면 계산 프로세스가 끝났음을 확인한 뒤 복구한다.
+
+```bash
+aas run list
+aas db recover
+aas run research --declaration "$LAB/declaration.json" --sha256 "$DECLARATION_SHA256" \
+  --prior-run-id <FAILED-또는-INTERRUPTED-시도-ID>
+```
+
+`db recover`는 marker가 없으면 INTERRUPTED로 끝내며 새 계산을 하지 않는다. 정상 marker가
+있으면 기존 시도를 SUCCESS로 완료한다. SUCCESS·QUARANTINED는 재시도할 수 없고, marker가
+있는 시도를 새 계산으로 우회할 수도 없다. `--envelope-output`을 다시 쓸 때는 새 경로를
+지정하거나 생략한다. 이전 내보내기와 봉인 파일을 덮어쓰지 않는다.
+
+스키마 이전은 추가하지 않는다. 기존 첫 시도 ID·조회·저장 형식은 유지된다. 다른 계산을
+처음 실행하며 `prior_run_id`로 기존 run을 연결하던 사용과 strict `aas run execute`의
+재계산 연결도 유지된다. 같은 계산의 재시도는 위의 실패 상태와 동일 입력 조건을 따른다.
 
 선언 파일은 원하는 대로 써도 된다. 등록·해시·묶음의 기준은 canonical 형식이고 `--sha256`은
 파일 바이트를 확인한다. 응답의 `declaration_sha256`은 파일의 것, `request_hash`는 canonical
@@ -1050,10 +1082,18 @@ aas run rerun --run-id <같은 run ID> --declaration "$LAB/declaration.json" --s
 항목을 그대로 적는다.
 
 `aas run rerun`은 아무것도 쓰지 않는다. `--run-id`만 주면 봉인한 봉투를 같은 회계에 다시 넣어
-저장한 결과 바이트와 맞춰 보고, 선언을 함께 주면 준비까지 다시 해서 run 식별자·봉투·봉인 문서를
+저장한 결과 바이트와 맞춰 보고, 선언을 함께 주면 준비까지 다시 해서 계산/시도 식별자·봉투·봉인 문서를
 각각 비교한다. 결과 재현과 준비 재현은 서로 다른 주장이므로 `checked`에 실제로 확인한 것만
 올리고 각각의 결과를 따로 적는다. 바뀐 봉투에서 결과만 재현되는 경우가 있으므로 한쪽을 다른
 쪽의 근거로 쓰지 않는다.
+
+[#15](https://github.com/thisisjun786/aegis-alpha-system/issues/15)의 미검증 통합 경계는
+[직접 통합 회귀](../tests/application/test_run_boundaries.py)로 연결된다. 별도 프로세스의
+설치 잠금, 준비 후 pin·보존 파일 변경, 등록됐지만 strict ETF 실행 또는 선언 슬리브의
+지원 범위를 벗어나는 전략을 CLI/API에서 검사한다. 정상 대조군과 프로세스·잠금 정리도
+포함한다. [재시도 회귀](../tests/application/test_research_retry.py)는 일회 계산 실패,
+marker 전 실패, 실제 자식 프로세스 종료와 marker 후 복구를 검사한다. 모두 합성 임시
+설치이며 실제 공급자나 운영 자료의 검증을 뜻하지 않는다.
 
 기록은 가독성이지 자격이 아니다. 저장한 run이 있어도 `admit_native_input`은 같은 pin을 도메인에서
 거부하고, 같은 문서를 `aas run execute`에 넘기면 거부된다.
