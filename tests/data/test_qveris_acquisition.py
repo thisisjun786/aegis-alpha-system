@@ -20,6 +20,7 @@ from aegis_alpha.data.qveris_contracts import (
 )
 from aegis_alpha.data.qveris_store import QverisStore
 from aegis_alpha.data.serialization import canonical_json_bytes
+from tests.isolation import synthetic_account
 
 # Serial: these tests take the host-wide Qveris account lease (an abstract Unix socket named by
 # the synthetic account), so every file that takes it runs in one xdist worker.
@@ -75,7 +76,7 @@ def fred_job() -> QverisJob:
 
 
 class FakeQveris:
-    account_key = "synthetic-credential-digest"
+    account_key = synthetic_account("qveris-acquisition")
 
     def __init__(self) -> None:
         self.balance = Decimal(100)

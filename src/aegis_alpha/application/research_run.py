@@ -1108,10 +1108,9 @@ def declared_provenance(request: ResearchRunRequest, prepared: PreparationRecord
             "point_in_time_certified": False,
             "executable_prices": False,
             "engine": dict(prepared.engine),
-            # The engine identity covers the calculation modules. The declared path's
-            # own decisions are made in the preparation, so its source is named too;
-            # otherwise a stored run would keep its identity across a change to the
-            # code that produced it.
+            # Retain the declared preparation digest, including for legacy engine v1.
+            # New engine v2 also covers these sources and the later accounting and
+            # serialization. This field alone never attests that execution scope.
             "preparation_source_sha256": _digest(
                 prepared.preparation_source_sha256, "preparation_source_sha256"
             ),

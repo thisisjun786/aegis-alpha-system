@@ -99,9 +99,10 @@ _DECLARED_SCHEMAS = frozenset({RESEARCH_RUN_SCHEMA, RESEARCH_COMPOSITION_SCHEMA}
 class RunResearchRequest:
     """One integrated declared-run request.
 
-    There is no caller-selected run_id. Preparation derives the calculation identity;
-    the first attempt uses it unchanged. prior_run_id explicitly links a new attempt
-    after FAILED/INTERRUPTED, without changing the calculation or earlier evidence.
+    There is no caller-selected run_id. Preparation derives the calculation identity
+    from the declaration, envelope, installed sources and environment. The first
+    attempt uses it unchanged. prior_run_id explicitly links a new attempt after
+    FAILED/INTERRUPTED, without changing the calculation or earlier evidence.
     """
 
     declaration: Path
@@ -499,9 +500,11 @@ def run_research(request: RunResearchRequest) -> dict[str, object]:
     an --envelope-output export is written before the run is opened, and a run
     interrupted while its inputs are being sealed stays RUNNING for aas db recover.
 
-    Running the same declaration twice does not record it twice. An explicit
-    prior_run_id permits a successor only after FAILED/INTERRUPTED; RUNNING attempts
-    belong to recovery and successful attempts cannot be recorded again.
+    Repeating the same declaration, inputs, code and environment does not record it
+    twice. An explicit prior_run_id permits a successor only after FAILED/INTERRUPTED;
+    RUNNING belongs to recovery and successful attempts cannot be recorded again.
+    A source revision can name a new calculation with identical results; rerun
+    reports result and identity reproduction separately.
     """
     declared = _declared(_read_declaration(request.declaration, request.declaration_sha256))
     output = None if request.envelope_output is None else admitted_path(request.envelope_output)
@@ -526,7 +529,9 @@ def rerun_research_run(
 ) -> dict[str, object]:
     """Reproduce one recorded run from its own sealed evidence. Writes nothing.
 
-    Determinism here is two separate claims, and each is reported on its own. The result
+    The versioned report separates two claims. `reproduced` is an alias
+    for `result_reproduced`, never an aggregate of result and identity comparisons.
+    `identity_reproduced` is null unless re-preparation was requested. The result
     claim is that the sealed envelope, run through the same accounting, still produces
     exactly the bytes the run committed. The preparation claim is that the declaration
     still prepares to the same run identity, envelope and sealed document, and only a
@@ -571,21 +576,26 @@ def _reproduced(
     recomputed = canonical_json_bytes(
         run_document(evidence.envelope, hashlib.sha256(evidence.envelope).hexdigest())
     )
+    result_reproduced = recomputed == evidence.backtest
     checks: dict[str, object] = {
         "result": {
-            "reproduced": recomputed == evidence.backtest,
+            "reproduced": result_reproduced,
             "recorded_sha256": hashlib.sha256(evidence.backtest).hexdigest(),
             "recomputed_sha256": hashlib.sha256(recomputed).hexdigest(),
         }
     }
+    identity_reproduced = None
     if declared is not None:
-        checks["preparation"] = _repreparation(home, payload, declared, evidence, retained)
+        preparation = _repreparation(home, payload, declared, evidence, retained)
+        checks["preparation"] = preparation
+        identity_reproduced = preparation["reproduced"]
     return {
+        "schema": "aas-run-reproduction-v2",
         "run_id": run_id,
         "checked": sorted(checks),
-        "reproduced": all(
-            bool(check["reproduced"]) for check in checks.values() if isinstance(check, dict)
-        ),
+        "reproduced": result_reproduced,
+        "result_reproduced": result_reproduced,
+        "identity_reproduced": identity_reproduced,
         "checks": checks,
         "run": payload,
         "research_only": True,
@@ -618,9 +628,13 @@ def _repreparation(
         "envelope": prepared.envelope.canonical_bytes == evidence.envelope,
         "preparation": prepared.provenance == evidence.preparation,
     }
+    recorded = json_object(decode_json(evidence.preparation), "recorded preparation")
+    current = json_object(decode_json(prepared.provenance), "current preparation")
     return {
         "reproduced": all(matches.values()),
         "matches": matches,
+        "recorded_engine": recorded["engine"],
+        "current_engine": current["engine"],
         # The file's digest, the same thing the command took and the run's receipt
         # reported, so a caller can hold the three against each other.
         "declaration_sha256": declared.file_sha256,

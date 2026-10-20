@@ -20,6 +20,7 @@ root, and the worker replaces it with its own.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import pwd
 from pathlib import Path
@@ -44,6 +45,16 @@ OWNER = "AAS_PYTEST_ISOLATION_ROOT"
 CONTAINER_STATE = Path("/state/aas")
 # State a native installation keeps under a user's home.
 _HOME_STATE = (".aas", ".local/share/aegis-alpha")
+
+
+def synthetic_account(name: str) -> str:
+    """Stable within a test process, distinct across independently isolated processes.
+
+    Pass this value explicitly to child probes testing exclusion: production account
+    leases must still exclude the same account across processes and raw roots.
+    """
+    root = os.environ[OWNER]
+    return "synthetic-" + hashlib.sha256(f"{root}/{name}".encode()).hexdigest()
 
 
 def isolate(root: Path, environ: MutableMapping[str, str]) -> None:
