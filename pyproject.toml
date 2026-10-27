@@ -21,7 +21,7 @@ dependencies = [
 legacy = [
     "alembic>=1.18.5,<2",
     "psycopg[binary]>=3.3.4,<4",
-    "pyarrow>=25,<26",
+    "pyarrow>=25,<27",
     "sqlalchemy>=2.0.51,<2.1",
 ]
 
@@ -77,7 +77,7 @@ module-name = "aegis_alpha"
 dev = [
     "alembic>=1.18.5,<2",
     "psycopg[binary]>=3.3.4,<4",
-    "pyarrow>=25,<26",
+    "pyarrow>=25,<27",
     "sqlalchemy>=2.0.51,<2.1",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
