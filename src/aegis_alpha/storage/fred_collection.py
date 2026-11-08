@@ -371,7 +371,8 @@ def collect_fred(  # noqa: PLR0913 -- every bound of one run is explicit
         committed.extend(commit_fred_batch(workspace, collection.Batch.of(PROVIDER, chunk)))
     known = load_known(workspace) if recovered else before
     caller = collection.Caller(
-        workspace, PROVIDER, policy.sha256, client.request, classify, fred.stops_run,
+        workspace, PROVIDER, policy.sha256, client.request, classify,
+        lambda _request, response: fred.stops_run(response),
         _dataset(policy), clock, sleep, max_calls, min_interval,
     )  # fmt: skip
     run = Run(workspace, caller, known.knowledge, batch_size, committed=committed)

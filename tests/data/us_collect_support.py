@@ -238,11 +238,19 @@ def companyfacts_bytes(cik: str, facts: list[SecFact]) -> bytes:
 
 @dataclass(slots=True)
 class FakeSec:
-    """EDGAR indexes per day (a missing day answers 404) and each CIK's documents."""
+    """EDGAR indexes per day (a missing day answers ``missing``) and each CIK's documents.
+
+    EDGAR's archive answers 403 for a daily index it does not hold, as for a refusal; a
+    fake with ``missing=403`` does the same, and its quarter listings (``index.json``) name
+    the ``master`` index of every weekday that is not a holiday. ``blocked`` days have an
+    index the listing names, but asking it is refused with 403.
+    """
 
     filings: list[SecFiling] = field(default_factory=list)
     facts: dict[str, list[SecFact]] = field(default_factory=dict)
     holidays: set[date] = field(default_factory=set)
+    missing: int = 404
+    blocked: set[date] = field(default_factory=set)
     # Accessions EDGAR has not yet added to their filer's submissions document.
     unlisted: set[str] = field(default_factory=set)
     refuse: int | None = None
@@ -250,7 +258,7 @@ class FakeSec:
     fail: set[str] = field(default_factory=set)
     calls: list[tuple[str, str]] = field(default_factory=list)
 
-    def __call__(  # noqa: PLR0911 -- one answer per route
+    def __call__(
         self, method: str, url: str, body: bytes | None, headers: Mapping[str, str]
     ) -> HttpAnswer:
         del body
@@ -260,15 +268,7 @@ class FakeSec:
             self.calls.append(("refused", url))
             return HttpAnswer(self.refuse, TEXT, b"Request Rate Threshold Exceeded")
         if url.startswith("https://www.sec.gov/Archives/edgar/daily-index/"):
-            stamp = url.rsplit(".", 2)[-2]
-            day = date(int(stamp[:4]), int(stamp[4:6]), int(stamp[6:]))
-            self.calls.append(("daily_index", day.isoformat()))
-            if "daily_index" in self.fail:
-                raise TransportError("synthetic transport failure")
-            listed = [f for f in self.filings if f.filed == day]
-            if day in self.holidays or day.weekday() >= 5:  # noqa: PLR2004 -- weekend
-                return HttpAnswer(404, TEXT, b"Not Found")
-            return HttpAnswer(200, TEXT, index_bytes(day, listed))
+            return self._listing(url) if url.endswith("/index.json") else self._index(url)
         cik = url.rsplit("CIK", 1)[-1].removesuffix(".json")
         if url.startswith("https://data.sec.gov/submissions/"):
             self.calls.append(("submissions", cik))
@@ -288,3 +288,45 @@ class FakeSec:
 
     def asked(self, endpoint: str) -> list[str]:
         return [key for name, key in self.calls if name == endpoint]
+
+    def _index(self, url: str) -> HttpAnswer:
+        stamp = url.rsplit(".", 2)[-2]
+        day = date(int(stamp[:4]), int(stamp[4:6]), int(stamp[6:]))
+        self.calls.append(("daily_index", day.isoformat()))
+        if "daily_index" in self.fail:
+            raise TransportError("synthetic transport failure")
+        if day in self.blocked:
+            return HttpAnswer(403, TEXT, b"Request Rate Threshold Exceeded")
+        if day in self.holidays or day.weekday() >= 5:  # noqa: PLR2004 -- weekend
+            return HttpAnswer(self.missing, TEXT, b"Not Found")
+        return HttpAnswer(200, TEXT, index_bytes(day, [f for f in self.filings if f.filed == day]))
+
+    def _listing(self, url: str) -> HttpAnswer:
+        directory = url.removeprefix("https://www.sec.gov/Archives/edgar/").removesuffix(
+            "index.json"
+        )
+        _, year, quarter = directory.rstrip("/").split("/")
+        self.calls.append(("daily_index_listing", f"{year}/{quarter}"))
+        if "daily_index_listing" in self.fail:
+            raise TransportError("synthetic transport failure")
+        body = listing_bytes(int(year), int(quarter.removeprefix("QTR")), self.holidays)
+        return HttpAnswer(200, JSON, body)
+
+
+def listing_bytes(year: int, quarter: int, holidays: set[date]) -> bytes:
+    """A quarter directory's ``index.json`` in EDGAR's shape: an index per business day.
+
+    Every weekday of the quarter that is not a holiday has a ``company`` and a ``master``
+    index; the times and sizes are synthetic.
+    """
+    day = date(year, 3 * quarter - 2, 1)
+    items: list[dict[str, str]] = []
+    while day.year == year and (day.month - 1) // 3 + 1 == quarter:
+        if day.weekday() < 5 and day not in holidays:  # noqa: PLR2004 -- weekend
+            for kind in ("company", "master"):
+                name = f"{kind}.{day:%Y%m%d}.idx"
+                items.append({"last-modified": f"{day:%m/%d/%Y} 10:01:39 PM", "name": name,
+                              "type": "file", "href": name, "size": "512 KB"})  # fmt: skip
+        day += timedelta(days=1)
+    directory = {"item": items, "name": f"daily-index/{year}/QTR{quarter}/", "parent-dir": "../"}
+    return json.dumps({"directory": directory}).encode()

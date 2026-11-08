@@ -4,7 +4,12 @@ Endpoints (``Request.provider`` is ``sec``):
 
 - ``daily_index`` (``Archives/edgar/daily-index/<year>/QTR<n>/master.<YYYYMMDD>.idx``): the
   filings EDGAR disseminated on one business day, parameter ``day``. A day without an index
-  (a weekend or EDGAR holiday) answers 404, which is ``NO_DATA``.
+  (a weekend or EDGAR holiday) answers 404, which is ``NO_DATA``, or 403, as EDGAR's archive
+  answers for an object it does not hold.
+- ``daily_index_listing`` (``Archives/edgar/daily-index/<year>/QTR<n>/index.json``): the
+  files of the quarter directory of ``day``, asked when that day's index answers 403. A
+  listing that does not name the day's ``master`` index is ``NO_DATA`` for the day; one that
+  names it is ``COMPLETED``, and the 403 stands as a refusal.
 - ``submissions`` (``data.sec.gov/submissions/CIK##########.json``): a filer's submissions
   document, parameter ``cik`` (ten digits). Its ``filings.recent`` arrays carry each
   filing's acceptance instant.
@@ -38,16 +43,20 @@ from aegis_alpha.data.sec_transport import (
 
 PROVIDER: Final = "sec"
 DAILY_INDEX: Final = "daily_index"
+DAILY_INDEX_LISTING: Final = "daily_index_listing"
 SUBMISSIONS: Final = "submissions"
 COMPANYFACTS: Final = "companyfacts"
-ENDPOINTS: Final = (DAILY_INDEX, SUBMISSIONS, COMPANYFACTS)
+ENDPOINTS: Final = (DAILY_INDEX, DAILY_INDEX_LISTING, SUBMISSIONS, COMPANYFACTS)
 DATASETS: Final[Mapping[str, str]] = {
     DAILY_INDEX: "filings.us.sec",
+    DAILY_INDEX_LISTING: "filings.us.sec",
     SUBMISSIONS: "filings.us.sec",
     COMPANYFACTS: "fundamentals.us.sec",
 }
 EDGAR_ZONE: Final = ZoneInfo("America/New_York")
 # SEC answers a request rate it refuses, or a missing contact, with 403; 429 is a limit.
+# EDGAR's archive also answers 403 for an object it does not hold, such as the daily index
+# of a holiday, so a refused daily index is checked against its quarter's listing.
 STOP_HTTP: Final = frozenset({403, 429})
 MAX_RESPONSE_BYTES: Final = 256 * 1024 * 1024
 # Periodic, current and foreign issuer reports and their amendments: the filings whose
@@ -76,6 +85,7 @@ _FACT_KEYS: Final = frozenset({"start", "end", "val", "accn", "fy", "fp", "form"
 _FACT_REQUIRED: Final = frozenset({"end", "val", "accn", "form", "filed"})
 _DECIMAL: Final = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?")
 _HTTP_OK: Final = 200
+_HTTP_FORBIDDEN: Final = 403
 _HTTP_NOT_FOUND: Final = 404
 _WEEKEND: Final = 5
 _QUARTER_MONTHS: Final = 3
@@ -103,6 +113,11 @@ def daily_index(day: date) -> Request:
     return Request.of(PROVIDER, DAILY_INDEX, {"day": day.isoformat()})
 
 
+def daily_index_listing(day: date) -> Request:
+    """The listing of ``day``'s quarter directory, asked about that day's ``master`` index."""
+    return Request.of(PROVIDER, DAILY_INDEX_LISTING, {"day": day.isoformat()})
+
+
 def submissions(cik: str) -> Request:
     return Request.of(PROVIDER, SUBMISSIONS, {"cik": cik10(cik)})
 
@@ -116,24 +131,31 @@ def check(request: Request) -> None:
     if request.provider != PROVIDER or request.endpoint not in ENDPOINTS:
         raise ValueError(f"unsupported SEC request {request.endpoint!r}")
     parameters = request.parameters
-    if request.endpoint == DAILY_INDEX:
+    if request.endpoint in {DAILY_INDEX, DAILY_INDEX_LISTING}:
         if set(parameters) != {"day"} or _DAY.fullmatch(parameters["day"]) is None:
-            raise ValueError("daily_index takes exactly day as YYYY-MM-DD")
+            raise ValueError(f"{request.endpoint} takes exactly day as YYYY-MM-DD")
         date.fromisoformat(parameters["day"])
     elif set(parameters) != {"cik"} or _CIK.fullmatch(parameters["cik"]) is None:
         raise ValueError(f"{request.endpoint} takes exactly cik as ten digits")
 
 
+def quarter_directory(day: date) -> str:
+    """``daily-index/<year>/QTR<n>/``, the archive directory of a day's index."""
+    return f"daily-index/{day.year}/QTR{(day.month - 1) // _QUARTER_MONTHS + 1}/"
+
+
+def index_name(day: date) -> str:
+    """The file name of a day's ``master`` index in its quarter directory."""
+    return f"master.{day:%Y%m%d}.idx"
+
+
 def url(request: Request) -> str:
     check(request)
     parameters = request.parameters
-    if request.endpoint == DAILY_INDEX:
+    if request.endpoint in {DAILY_INDEX, DAILY_INDEX_LISTING}:
         day = date.fromisoformat(parameters["day"])
-        quarter = (day.month - 1) // _QUARTER_MONTHS + 1
-        return (
-            f"https://www.sec.gov/Archives/edgar/daily-index/{day.year}/QTR{quarter}/"
-            f"master.{day:%Y%m%d}.idx"
-        )
+        name = index_name(day) if request.endpoint == DAILY_INDEX else "index.json"
+        return f"https://www.sec.gov/Archives/edgar/{quarter_directory(day)}{name}"
     if request.endpoint == SUBMISSIONS:
         return f"https://data.sec.gov/submissions/CIK{parameters['cik']}.json"
     return f"https://data.sec.gov/api/xbrl/companyfacts/CIK{parameters['cik']}.json"
@@ -344,12 +366,43 @@ def _concept_facts(taxonomy: str, tag: str, concept: object) -> Iterator[Fact]:
             yield _fact(taxonomy, tag, str(unit), item)
 
 
+def listing_names_index(body: bytes, day: date) -> bool:
+    """Whether a quarter listing (``index.json``) names ``day``'s ``master`` index.
+
+    The listing must be the directory of the day's quarter, each item a named entry; any
+    other answer is refused, so only a readable listing can say a day has no index.
+    """
+    directory = _json(body).get("directory")
+    if not isinstance(directory, dict) or directory.get("name") != quarter_directory(day):
+        raise ValueError("SEC listing is not the directory of the day's quarter")
+    items = directory.get("item")
+    if not isinstance(items, list) or not all(
+        isinstance(item, dict) and isinstance(item.get("name"), str) for item in items
+    ):
+        raise ValueError("SEC listing items are not named entries")
+    return index_name(day) in {item["name"] for item in items}
+
+
+def _classify_listing(request: Request, response: Response) -> tuple[str, str | None]:
+    if response.status != _HTTP_OK:
+        return FAILED, f"http {response.status}"
+    try:
+        named = listing_names_index(response.body, request_day(request))
+    except ValueError as error:
+        return FAILED, f"unreadable answer: {error}"
+    return (COMPLETED if named else NO_DATA), None
+
+
 def classify(request: Request, response: Response) -> tuple[str, str | None]:
     """The outcome and a reason: the outcome only routes the collector.
 
     A readable answer is ``COMPLETED``; 404 (no index that day, no document for the CIK)
-    is ``NO_DATA``; anything else is ``FAILED`` with the reason.
+    is ``NO_DATA``; anything else is ``FAILED`` with the reason. A quarter listing is read
+    for its day: ``NO_DATA`` when it does not name the day's index, ``COMPLETED`` when it
+    does, and ``FAILED`` for any answer that is not a readable listing (a 404 included).
     """
+    if request.endpoint == DAILY_INDEX_LISTING:
+        return _classify_listing(request, response)
     if response.status == _HTTP_NOT_FOUND:
         return NO_DATA, None
     if response.status != _HTTP_OK:
@@ -367,9 +420,19 @@ def classify(request: Request, response: Response) -> tuple[str, str | None]:
     return COMPLETED, None
 
 
-def stops_run(response: Response) -> bool:
-    """Whether no later call in this run can be answered: SEC refused the rate or contact."""
-    return response.status in STOP_HTTP
+def index_refused(request: Request, response: Response) -> bool:
+    """A daily index answered 403: a missing object or a refusal, as its listing tells."""
+    return request.endpoint == DAILY_INDEX and response.status == _HTTP_FORBIDDEN
+
+
+def stops_run(request: Request, response: Response) -> bool:
+    """Whether no later call in this run can be answered: SEC refused the rate or contact.
+
+    A daily index answering 403 does not stop the run by itself; the collector asks its
+    quarter listing and stops unless the listing shows the day has no index. A listing
+    answering 403 or 429 stops it as any other refusal does.
+    """
+    return response.status in STOP_HTTP and not index_refused(request, response)
 
 
 # --- client -----------------------------------------------------------------------------------
@@ -503,7 +566,10 @@ def weekdays(first: date, last: date) -> Iterator[date]:
 
 
 def covered(knowledge: SecKnowledge, day: date) -> bool:
-    """An index day is covered by an answered index, or a 404 read after the next day ended."""
+    """An index day is covered by an answered index, or no index read after the next day ended.
+
+    No index is a 404, or a 403 whose quarter listing does not name the day's index.
+    """
     answer = knowledge.days.get(day)
     if answer is None:
         return False

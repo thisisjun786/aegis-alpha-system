@@ -5,7 +5,9 @@
 answer, the response bytes and a canonical receipt (``aas-<provider>-receipt-v1``) go to
 ``raw/`` and the attempt ``succeeded`` with a ``charged`` event naming the receipt; a call
 without an answer is ``uncertain``. A refused key, rate or contact stops the run, and so do
-three transport failures in a row.
+three transport failures in a row. Whether an answer is a refusal is the collector's rule,
+read from the request and its answer (SEC checks a refused daily index against its quarter
+listing before it stops).
 
 A batch document (``aas-<provider>-batch-v1``) lists the receipts of one commit in
 collection order, so the batch, its receipts and their responses are one complete unit
@@ -436,7 +438,7 @@ class Caller:
     policy_hash: str
     call: Callable[[Request], Response]
     classify: Callable[[Request, Response], tuple[str, str | None]]
-    stops: Callable[[Response], bool]
+    stops: Callable[[Request, Response], bool]
     dataset: Callable[[Request], str]
     clock: Clock
     sleep: Callable[[float], None]
@@ -502,6 +504,6 @@ class Caller:
             at_us=self._now_us(),
         )
         self.outcomes[outcome] += 1
-        if self.stops(response):
+        if self.stops(request, response):
             self.stopped = f"provider_refused:{response.status}"
         return Retained(self.provider, receipt, response.body), outcome, response

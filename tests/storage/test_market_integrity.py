@@ -22,7 +22,7 @@ from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 from types import CodeType, FrameType, FunctionType
-from typing import Final, cast
+from typing import TYPE_CHECKING, Final, cast
 
 import duckdb
 import pytest
@@ -69,6 +69,9 @@ from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import initialize, open_workspace, store_info
 from tests.storage.test_bulk_generation import _first, _request, _stage, inside_publication
 from tests.storage.test_publication import document
+
+if TYPE_CHECKING:
+    from _typeshed import TraceFunction
 
 BUDGET: Final = ComputeBudget(Fraction(1), 512 * 1024 * 1024)
 _KEYS: Final = " PRIMARY KEY(generation_id,record_id,revision_id), UNIQUE(record_id,revision_id),"
@@ -501,9 +504,7 @@ def test_only_a_write_conflict_at_commit_is_the_open_publication(
     connection.close()
 
 
-def _interrupting(
-    codes: set[CodeType], target: int
-) -> tuple[Callable[..., object], list[CodeType]]:
+def _interrupting(codes: set[CodeType], target: int) -> tuple[TraceFunction, list[CodeType]]:
     """A trace raising one ``KeyboardInterrupt`` at the ``target``-th call, line or return.
 
     Only frames of ``codes`` count: the writers', their transaction's and ROLLBACK's. A
@@ -519,12 +520,12 @@ def _interrupting(
         if len(seen) == target + 1:
             raise KeyboardInterrupt
 
-    def local(frame: FrameType, event: str, _arg: object) -> Callable[..., object] | None:
+    def local(frame: FrameType, event: str, _arg: object) -> TraceFunction:
         if event in {"line", "return"}:
             tick(frame)
         return local
 
-    def trace(frame: FrameType, _event: str, _arg: object) -> Callable[..., object] | None:
+    def trace(frame: FrameType, _event: str, _arg: object) -> TraceFunction | None:
         if frame.f_code not in codes:
             return None
         tick(frame)
@@ -579,9 +580,7 @@ def _interrupted_publication(
     return functools.partial(publish_generation_bulk, connection, request, budget=BUDGET)
 
 
-def _run_traced(
-    publish: Callable[[], object], trace: Callable[..., object]
-) -> BaseException | None:
+def _run_traced(publish: Callable[[], object], trace: TraceFunction) -> BaseException | None:
     """Run ``publish`` under ``trace``; the interrupt or refusal it raised, if any."""
     previous = sys.gettrace()
     sys.settrace(trace)
