@@ -790,13 +790,76 @@ def test_a_refused_rate_stops_the_run_and_the_contact_is_never_retained(ws: Work
     fake.refuse = 403
     result = _sec_run(ws, fake, FakeClock(SEC_NOW))
     assert result["stopped"] == "provider_refused:403"
-    assert result["provider_calls"] == 1
+    # The refused index is checked against its quarter listing once, which is refused too.
+    assert result["provider_calls"] == 2
     (receipts,) = _sources(result, "sec-collect-receipts-")
-    assert receipts["rows"] == 1
+    assert receipts["rows"] == 2
     contact = USER_AGENT.encode()
     for path in ws.paths.raw.rglob("*"):
         if path.is_file():
             assert contact not in path.read_bytes()
+
+
+def test_a_holiday_index_refused_with_403_is_a_day_without_an_index(ws: Workspace) -> None:
+    fake = _sec_fake()
+    fake.missing = 403  # EDGAR's archive answers 403 for an index it does not hold
+    clock = FakeClock(SEC_NOW)
+    first = _sec_run(ws, fake, clock)
+    # The holiday's 403 is checked against its quarter listing, which omits it: the run
+    # goes on to the documents instead of stopping.
+    assert fake.calls == [
+        ("daily_index", "2026-09-14"), ("daily_index", "2026-09-15"),
+        ("daily_index", "2026-09-16"), ("daily_index_listing", "2026/QTR3"),
+        ("submissions", CIK), ("submissions", OTHER), ("companyfacts", CIK),
+    ]  # fmt: skip
+    assert first["stopped"] is None
+    assert first["outcomes"] == {"COMPLETED": 5, "FAILED": 1, "NO_DATA": 1}
+    # As with a 404, an answer read the next morning does not cover the day yet.
+    assert first["covered_through"] == "2026-09-15"
+    clock.advance(days=1)  # Friday
+    calls = len(fake.calls)
+    second = _sec_run(ws, fake, clock)
+    assert fake.calls[calls:] == [
+        ("daily_index", "2026-09-16"), ("daily_index_listing", "2026/QTR3"),
+        ("daily_index", "2026-09-17"),
+    ]  # fmt: skip
+    assert second["stopped"] is None
+    assert second["covered_through"] == "2026-09-17"
+    # What the committed receipts say is what the run saw: nothing is left to ask.
+    known = sec_collection.load_known(ws).knowledge
+    assert sec.covered(known, WED)
+    plan = sec_collection.plan_sec(ws, now=clock.now, policy=sec.SecPolicy(issuers="all"))
+    assert plan["requests"] == {}
+    assert verify_workspace(ws)["verified"] is True
+
+
+def test_a_403_on_an_index_its_listing_names_still_stops_the_run(ws: Workspace) -> None:
+    fake = _sec_fake()
+    fake.missing = 403
+    fake.blocked = {TUE}  # TUE has an index, and asking it is refused
+    clock = FakeClock(SEC_NOW)
+    result = _sec_run(ws, fake, clock)
+    assert fake.calls == [
+        ("daily_index", "2026-09-14"), ("daily_index", "2026-09-15"),
+        ("daily_index_listing", "2026/QTR3"),
+    ]  # fmt: skip
+    assert result["stopped"] == "provider_refused:403"
+    assert result["covered_through"] == "2026-09-14"
+    # The refused day stays uncovered, so the next run asks it first again.
+    plan = sec_collection.plan_sec(ws, now=clock.now, policy=sec.SecPolicy(issuers="all"))
+    assert plan["covered_through"] == "2026-09-14"
+    # An unreadable listing keeps the refusal too.
+    fake.blocked = {WED}
+    fake.fail = {"daily_index_listing"}
+    clock.advance(days=1)
+    calls = len(fake.calls)
+    again = _sec_run(ws, fake, clock)
+    assert fake.calls[calls:] == [
+        ("daily_index", "2026-09-15"), ("daily_index", "2026-09-16"),
+        ("daily_index_listing", "2026/QTR3"),
+    ]  # fmt: skip
+    assert again["stopped"] == "provider_refused:403"
+    assert again["covered_through"] == "2026-09-15"
 
 
 def test_a_csv_download_whose_rows_do_not_read_is_failed_and_asked_again(

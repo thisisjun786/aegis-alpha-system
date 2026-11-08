@@ -18,6 +18,7 @@ from tests.data.us_collect_support import (
     SecFiling,
     companyfacts_bytes,
     index_bytes,
+    listing_bytes,
     submissions_bytes,
 )
 
@@ -103,8 +104,44 @@ def test_a_daily_index_keeps_every_line_and_reads_the_filings() -> None:
     assert sec.classify(request, _response(200, body)) == (COMPLETED, None)
     assert sec.classify(request, _response(404, b"Not Found")) == (NO_DATA, None)
     assert sec.classify(request, _response(200, b"<html>maintenance</html>"))[0] == FAILED
-    assert sec.stops_run(_response(403, b"Request Rate Threshold Exceeded"))
-    assert not sec.stops_run(_response(404, b""))
+    assert not sec.stops_run(request, _response(403, b"Request Rate Threshold Exceeded"))
+    assert sec.index_refused(request, _response(403, b"Access Denied"))
+    assert sec.stops_run(sec.submissions(CIK), _response(403, b"Rate Threshold Exceeded"))
+    assert sec.stops_run(request, _response(429, b""))
+    assert not sec.stops_run(request, _response(404, b""))
+
+
+# EDGAR's QTR4 2026 listing has no index for Columbus Day (10-12); QTR3 none for Labor Day.
+COLUMBUS, LABOR = date(2026, 10, 12), date(2026, 9, 7)
+
+
+def test_a_refused_index_is_no_index_only_when_its_quarter_listing_omits_it() -> None:
+    assert sec.url(sec.daily_index_listing(COLUMBUS)) == (
+        "https://www.sec.gov/Archives/edgar/daily-index/2026/QTR4/index.json"
+    )
+    for holiday in (COLUMBUS, LABOR):
+        quarter = (holiday.month - 1) // 3 + 1
+        listing = listing_bytes(holiday.year, quarter, {holiday})
+        request = sec.daily_index_listing(holiday)
+        # The listing omits the holiday: no index that day, the same as a 404.
+        assert sec.classify(request, _response(200, listing)) == (NO_DATA, None)
+        # It names the next business day: that index exists, so its 403 stays a refusal.
+        after = holiday + timedelta(days=1)
+        assert sec.classify(sec.daily_index_listing(after), _response(200, listing)) == (
+            COMPLETED, None,
+        )  # fmt: skip
+        # The listing never stops the run, and a refused listing does.
+        assert not sec.stops_run(request, _response(200, listing))
+        assert sec.stops_run(request, _response(403, b"Access Denied"))
+    listing = listing_bytes(2026, 4, {COLUMBUS})
+    other = listing_bytes(2026, 3, set())
+    request = sec.daily_index_listing(COLUMBUS)
+    # Only a readable listing of the day's quarter can say the day has no index.
+    for status, body in ((200, other), (200, b"<html>maintenance</html>"),
+                         (200, b'{"directory": {"name": "daily-index/2026/QTR4/"}}'),
+                         (404, listing), (403, listing)):  # fmt: skip
+        assert sec.classify(request, _response(status, body))[0] == FAILED
+    assert sec.classify(sec.daily_index(COLUMBUS), _response(403, b"Access Denied"))[0] == FAILED
 
 
 def test_company_facts_keep_each_number_as_written() -> None:

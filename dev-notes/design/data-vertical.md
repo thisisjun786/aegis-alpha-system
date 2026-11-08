@@ -1342,6 +1342,7 @@ fingerprint = sha256(정규 JSON ["aas-<provider>-request-v1", endpoint, paramet
 | 공급자 | endpoint | 공급자 경로 | parameter |
 | --- | --- | --- | --- |
 | `sec` | `daily_index` | `Archives/edgar/daily-index/<연>/QTR<n>/master.<YYYYMMDD>.idx` | `day` |
+| `sec` | `daily_index_listing` | `Archives/edgar/daily-index/<연>/QTR<n>/index.json` | `day` |
 | `sec` | `submissions` | `data.sec.gov/submissions/CIK##########.json` | `cik`(10자리) |
 | `sec` | `companyfacts` | `data.sec.gov/api/xbrl/companyfacts/CIK##########.json` | `cik` |
 | `fred` | `vintage_dates` | `fred/series/vintagedates` | `series_id`, `realtime_start`, `realtime_end`, `limit=10000`, `offset`, `file_type=json` |
@@ -1351,7 +1352,7 @@ fingerprint = sha256(정규 JSON ["aas-<provider>-request-v1", endpoint, paramet
 FRED 키는 `vintage_dates`·`observations`의 공급자 URL에만 실리고, SEC의 공정 접근 `User-Agent`(연락처
 포함)는 header에만 실린다. 둘 다 요청·receipt·원천에 들어가지 않으며, 답이 그 값(SEC는 `User-Agent` 전체나
 그 안의 연락처 주소)을 되돌려 주면 그 답을 보존하지 않는다. 두 명령은 commit에 쓰는 pyarrow(legacy extra)가
-없으면 정산이나 호출 전에 멈춘다. SEC는 HTTP 403·429, FRED는 401·403·429와 키를 거부하는 400이 실행을 멈춘다. 전송 실패가
+없으면 정산이나 호출 전에 멈춘다. SEC는 HTTP 403·429, FRED는 401·403·429와 키를 거부하는 400이 실행을 멈춘다. 다만 SEC `daily_index`의 403은 그 분기 목록을 본 뒤에 정한다(아래 SEC 1단계). 전송 실패가
 세 번 이어져도 멈춘다. 호출 상한은 `--max-calls`(SEC 기본 2,000, FRED 기본 500)이고, 호출 간격은 SEC
 0.125초(초당 10회 한도), FRED 0.5초(분당 120회 한도)다.
 
@@ -1378,7 +1379,11 @@ batch의 것만 읽는다.
 1. **색인.** 처음 알려진 색인 날(없으면 오늘의 30일 전, `--since`가 있으면 그 날)부터 어제까지의 평일 중
    덮이지 않은 날의 `daily_index`를 묻는다. 날은 `COMPLETED` 답으로 덮인다. 404(주말이 아닌 EDGAR
    휴일)는 그 다음 날이 끝난 뒤(New York 날짜로 이틀 뒤) 받은 것일 때만 덮는다. 그보다 이른 404는 아직
-   게시되지 않은 색인일 수 있다.
+   게시되지 않은 색인일 수 있다. EDGAR 보관소는 없는 색인에도 403을 준다. 그래서 `daily_index`가 403이면
+   그 분기 목록(`daily_index_listing`, 이유 `index_refused`)을 한 번 묻는다. 그 분기 디렉터리의 목록이고
+   그날 `master` 파일이 없으면 `NO_DATA`이고, 그날은 404와 같은 규칙으로 덮인다. 목록에 그날 파일이 있거나,
+   목록이 읽히지 않거나 거부되거나 답이 없으면 403은 거부로 남아 실행을 멈춘다. 목록 답은 receipt로만
+   남고 파생 테이블은 없다.
 2. **submissions.** 색인 공시 중 양식이 `filing_forms`(10-K·10-Q·10-KT·10-QT·8-K·20-F·40-F·6-K와 각
    정정)에 들고 발행인 범위(`registered`: `mint_issuer('sec_cik', cik)`가 identity에 등록된 제출자, 또는
    `all`)에 드는 공시를 원한다. 아직 나열되지 않은 공시가 있는 제출자마다 문서를 한 번 묻는다. 이유는 둘이다.
@@ -2860,7 +2865,7 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-347 | `fred.alfred@1`이 읽는 legacy 테이블도 알려진 vintage 날을 정하고, 받은 FRED 날에 시작한 vintage는 세지 않는다 | `tests/storage/test_us_collection.py::test_a_legacy_alfred_table_sets_the_known_vintage_day` | 구현 |
 | DV-348 | CSV 내려받기는 `fred.series_csv@1` 편입과 같은 원천이고 `fred.fx_series@1`로 승격된다 | `tests/storage/test_us_collection.py::test_the_csv_download_is_the_source_the_legacy_import_makes` | 구현 |
 | DV-349 | SEC 요청은 문서를 이름 짓고 연락처 `User-Agent`는 header에만 실리며 그것이나 연락처 주소를 되돌리는 답은 보존되지 않는다 | `tests/data/test_sec_collect.py::test_requests_name_the_document_and_never_the_contact` | 구현 |
-| DV-350 | 일일 색인은 모든 줄을 남기고 다섯 칸으로 읽힌 줄만 공시가 되며 header는 열 이름(대소문자·공백 무시, `File Name`·`Filename`)으로 찾고 경로의 CIK가 다른 줄은 공시가 아니며 404는 `NO_DATA`, 403은 실행을 멈춘다 | `tests/data/test_sec_collect.py::test_a_daily_index_keeps_every_line_and_reads_the_filings` | 구현 |
+| DV-350 | 일일 색인은 모든 줄을 남기고 다섯 칸으로 읽힌 줄만 공시가 되며 header는 열 이름(대소문자·공백 무시, `File Name`·`Filename`)으로 찾고 경로의 CIK가 다른 줄은 공시가 아니며 404는 `NO_DATA`, 색인의 403은 분기 목록을 보고 정하고 그 밖의 403·429는 실행을 멈춘다 | `tests/data/test_sec_collect.py::test_a_daily_index_keeps_every_line_and_reads_the_filings` | 구현 |
 | DV-351 | companyfacts 사실은 숫자의 JSON 원문을 그대로 남기고 다른 CIK·되풀이된 key·알 수 없는 필드·십진수가 아닌 값은 답을 거부한다 | `tests/data/test_sec_collect.py::test_company_facts_keep_each_number_as_written` | 구현 |
 | DV-352 | 색인 날은 답이나 다음 날이 끝난 뒤 받은 404로만 덮이고 빈 날은 알려진 가장 이른 날부터 채운다 | `tests/data/test_sec_collect.py::test_index_days_are_covered_by_an_answer_or_a_404_after_the_next_day` | 구현 |
 | DV-353 | 문서는 제출자마다 원한 공시로 한 번 묻고 나열되지 않은 공시는 창 안에서 하루 뒤 다시 묻으며 발행인 범위 밖은 세어진다 | `tests/data/test_sec_collect.py::test_documents_are_asked_per_filer_for_the_wanted_filings_and_retried_in_window` | 구현 |
@@ -3021,3 +3026,6 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-508 | COMMIT 뒤 증거를 읽지 못하거나 저장된 행·flag가 계획과 다르면 성공이나 취소로 추정하지 않고 결과 미확정과 복구를 안내한다 | `tests/storage/test_promotion_engine.py::test_commit_error_never_guesses_from_unverified_evidence` | 구현 |
 | DV-509 | 2,539개 marker의 chain과 과거 pin은 각각 한 쿼리로 읽고 실제 parent 링크 순서를 유지한다 | `tests/storage/test_market.py::test_long_chain_uses_one_marker_query` | 구현 |
 | DV-510 | 대량 revision 검사는 조상 ID를 scalar 하나로 전달하고 이스케이프와 비ASCII 문자가 있는 ID도 같은 chain·행으로 검증된다 | `tests/storage/test_bulk_generation.py::test_revision_checks_bind_ancestry_as_one_scalar` | 구현 |
+| DV-511 | 색인의 403은 분기 목록이 그날 `master` 파일을 싣지 않을 때만 `NO_DATA`이고, 다른 분기·읽히지 않는 목록·목록의 403·404는 `FAILED`다 | `tests/data/test_sec_collect.py::test_a_refused_index_is_no_index_only_when_its_quarter_listing_omits_it` | 구현 |
+| DV-512 | 403을 준 휴일 색인은 분기 목록이 싣지 않으면 404처럼 이틀 뒤 덮이고 실행은 멈추지 않는다 | `tests/storage/test_us_collection.py::test_a_holiday_index_refused_with_403_is_a_day_without_an_index` | 구현 |
+| DV-513 | 분기 목록이 싣는 날의 403, 읽히지 않는 목록은 거부로 남아 실행을 멈추고 그날은 덮이지 않는다 | `tests/storage/test_us_collection.py::test_a_403_on_an_index_its_listing_names_still_stops_the_run` | 구현 |

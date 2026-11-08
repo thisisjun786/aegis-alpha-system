@@ -10,7 +10,10 @@
    and the filings companyfacts answers reported facts of;
 3. read every uncovered weekday's daily index up to yesterday (New York), then ask each
    filer's submissions document for its wanted filings that are not listed yet, and its
-   companyfacts for its wanted reports that have no facts yet (``data.sec_collect``);
+   companyfacts for its wanted reports that have no facts yet (``data.sec_collect``). A
+   daily index answering 403 is checked against its quarter listing: a listing without
+   the day's index makes the day one without an index, as a 404 does; any other answer
+   leaves the refusal standing and stops the run;
 4. commit each batch (up to ``batch_size`` receipts or ``batch_bytes`` of responses) as
    content sources of its files, the receipts source last:
 
@@ -35,7 +38,7 @@ from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Final, cast
 
 from aegis_alpha.data import sec_collect as sec
-from aegis_alpha.data.provider_request import COMPLETED, FAILED, Request, Response
+from aegis_alpha.data.provider_request import COMPLETED, FAILED, NO_DATA, Request, Response
 from aegis_alpha.storage import collection_ledger as ledger
 from aegis_alpha.storage import provider_collection as collection
 from aegis_alpha.storage.identity import mint_issuer
@@ -162,6 +165,8 @@ def commit_sec_batch(workspace: Workspace, batch: collection.Batch) -> list[dict
         endpoint = item.request.endpoint
         if endpoint == sec.DAILY_INDEX:
             entries.extend(entry_rows(item))
+        elif endpoint == sec.DAILY_INDEX_LISTING:
+            continue  # a listing only tells whether a day has an index; its bytes stay raw
         elif endpoint == sec.SUBMISSIONS:
             filings.extend(submission_rows(item))
         else:
@@ -228,6 +233,10 @@ def _read_receipts(workspace: Workspace, known: Known) -> set[str]:
         request = Request.from_document(PROVIDER, json.loads(cast("str", request_json)))
         if endpoint == sec.DAILY_INDEX:
             known.knowledge.index(sec.request_day(request), cast("str", outcome), at)
+        elif endpoint == sec.DAILY_INDEX_LISTING:
+            # Only a listing without the day's index answers for the day.
+            if outcome == NO_DATA:
+                known.knowledge.index(sec.request_day(request), NO_DATA, at)
         else:
             known.knowledge.ask(cast("str", endpoint), request.parameters["cik"], at)
     return batches
@@ -322,6 +331,8 @@ class Run:
             if outcome == COMPLETED:
                 for line in sec.parse_index(response.body):
                     self.knowledge.file(line, at)
+            elif sec.index_refused(request, response):
+                self.check_listing(sec.request_day(request), response.status)
         else:
             self.knowledge.ask(request.endpoint, request.parameters["cik"], at)
             if outcome == COMPLETED:
@@ -337,6 +348,24 @@ class Run:
                 )
                 target.update(cast("set[str]", done))
         self.flush()
+
+    def check_listing(self, day: date, status: int) -> None:
+        """Ask the quarter listing of a refused index; the refusal stands unless it is absent.
+
+        EDGAR's archive answers 403 for an object it does not hold, such as the index of a
+        holiday, so a listing that does not name the day's index makes the day one without
+        an index, as a 404 does. A listing that names it, any other answer, or none at all
+        keeps the refusal, which stops the run as any other refusal does.
+        """
+        answered = self.caller.ask(sec.daily_index_listing(day), "index_refused")
+        if answered is not None:
+            retained, outcome, response = answered
+            self.pending.append(retained)
+            if outcome == NO_DATA:
+                self.knowledge.index(day, NO_DATA, response.retrieved_at)
+                return
+        if self.caller.stopped is None:
+            self.caller.stopped = f"provider_refused:{status}"
 
 
 def collect_sec(  # noqa: PLR0913 -- every bound of one run is explicit
