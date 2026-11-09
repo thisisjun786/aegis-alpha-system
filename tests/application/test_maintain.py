@@ -648,6 +648,25 @@ def test_a_database_error_in_one_stage_leaves_the_later_stages_and_the_report(
     assert stored["failed_stages"] == ["promote"]
 
 
+def test_every_stage_reports_its_elapsed_time_and_memory(tmp_path: Path) -> None:
+    world = World(tmp_path)
+    world.config = replace(world.config, jobs_enabled=False)
+    report = world.run()
+    resources = cast("dict[str, dict[str, object]]", report["stage_resources"])
+    # Jobs are off, so no provider stage runs.
+    assert list(resources) == [
+        "recover", "runtime", "calendars", "import", "identity", "promote", "heads"]  # fmt: skip
+    for numbers in resources.values():
+        assert set(numbers) == {
+            "elapsed_seconds", "process_peak_rss_bytes", "cgroup_peak_bytes",
+            "cgroup_current_bytes", "cgroup_anon_bytes", "cgroup_file_bytes",
+            "cgroup_swap_bytes", "cgroup_swap_peak_bytes",
+        }  # fmt: skip
+        assert cast("float", numbers["elapsed_seconds"]) >= 0
+    stored = json.loads((world.home / "runtime" / "maintain-report.json").read_text())
+    assert stored["stage_resources"] == resources
+
+
 def _kr_new_listing(world: KrWorld, *, symbol_list: bool) -> None:
     """KIND lists a new company and both days' KO sessions trade it; EODHD lists it if asked."""
     world.listings.append(("합성신규", "000777", "2026-09-16"))
