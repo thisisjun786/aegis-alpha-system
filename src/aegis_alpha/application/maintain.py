@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Final, cast
 
+from aegis_alpha.application.stage_resources import StageMeter
 from aegis_alpha.data.serialization import canonical_json_bytes
 
 if TYPE_CHECKING:
@@ -126,12 +127,31 @@ class _Run:
     failed: list[str] = field(default_factory=list)
     stopped: list[str] = field(default_factory=list)
     uncertain: list[str] = field(default_factory=list)
+    meter: StageMeter = field(default_factory=StageMeter)
+    resources: dict[str, object] = field(default_factory=dict)
 
     def local(self, name: str, action: Callable[[], dict[str, object]]) -> dict[str, object] | None:
         """A stage that reads or writes only the installation: errors keep their message.
 
         Database errors (DuckDB, SQLite, out of memory among them) are local errors too.
         """
+        probe = self.meter.start()
+        try:
+            return self._local(name, action)
+        finally:
+            self.resources[name] = probe.finish()
+
+    def provider(self, name: str, action: Callable[[], dict[str, object]]) -> None:
+        """A provider stage: a failure is recorded by type only, never with its message."""
+        probe = self.meter.start()
+        try:
+            self._provider(name, action)
+        finally:
+            self.resources[name] = probe.finish()
+
+    def _local(
+        self, name: str, action: Callable[[], dict[str, object]]
+    ) -> dict[str, object] | None:
         import sqlite3
 
         import duckdb
@@ -146,8 +166,7 @@ class _Run:
         self.stages[name] = result
         return result
 
-    def provider(self, name: str, action: Callable[[], dict[str, object]]) -> None:
-        """A provider stage: a failure is recorded by type only, never with its message."""
+    def _provider(self, name: str, action: Callable[[], dict[str, object]]) -> None:
         try:
             result = action()
         except Exception as error:  # noqa: BLE001 -- keep other providers; no credential-bearing text
@@ -374,6 +393,7 @@ def run_maintenance(  # noqa: PLR0913 -- the run's explicit inputs
         "failed_stages": run.failed,
         "stopped_providers": [*run.stopped, *run.uncertain],
         "stages": run.stages,
+        "stage_resources": run.resources,
         "exit_code": code,
     }
     report["report_sha256"] = _write_report(workspace, report)

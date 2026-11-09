@@ -1591,7 +1591,9 @@ identity가 해석한 US 보류 행의 `prices.us.eodhd` 재처리)의 수집 �
 테이블 수로 남는다. `status.kr.kind`는 `kind.listings@1`이 읽는 열이 있는 KIND 목록만 센다.
 
 **보고와 종료 코드.** 실행 보고(`aas-maintain-report-v1`)는 단계마다의 결과, 실패한 단계, 멈춘 공급자를 담고
-정확한 bytes를 `raw/`에, 같은 bytes를 `<runtime>/maintain-report.json`에 둔다. 종료 코드는 모든 단계가
+정확한 bytes를 `raw/`에, 같은 bytes를 `<runtime>/maintain-report.json`에 둔다. `stage_resources`는 단계마다
+걸린 초, 그 단계 동안 프로세스의 최대 RSS, 프로세스 cgroup v2의 단계 중 최대·현재 메모리, anon, file, swap(단계 중
+최대 swap 포함)을 담는다. 읽을 수 없는 값은 null이고 측정은 실행을 실패시키지 않는다. 종료 코드는 모든 단계가
 끝나면(예산 소진 포함) 0, 단계가 실패했거나 공급자가 거부로 멈췄으면 1, Qveris가 정산이나 격리가 필요한 불확실한
 유료 호출로 멈췄으면 2다. `plan`은 설치본을 읽기 전용으로 열어 같은 단계를 계획만 한다. 자격 증명을 읽지 않고
 공급자를 부르지 않으며 쓰지 않는다. `--promotions`는 새 원천마다의 승격 계획까지 현재 head에 대해 계산한다.
