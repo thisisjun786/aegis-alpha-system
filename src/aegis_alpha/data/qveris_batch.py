@@ -5,11 +5,12 @@ from __future__ import annotations
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, Unpack
+from typing import TYPE_CHECKING, TypedDict, Unpack, cast
 from uuid import uuid4
 
 from aegis_alpha.data.qveris_acquisition import acquire_jobs, acquisition_plan
 from aegis_alpha.data.qveris_client import QverisTransportError
+from aegis_alpha.data.qveris_contracts import MAX_PAGES
 from aegis_alpha.data.qveris_payloads import QverisEmptyAnswerError
 from aegis_alpha.data.qveris_store import QverisStore
 from aegis_alpha.data.sec_evidence import publish_bytes
@@ -79,13 +80,31 @@ def _acquire_job(
     budget: InvocationBudget | None,
     pause: Callable[[], None],
 ) -> dict[str, object]:
+    with QverisStore(root, client.account_key) as store:
+        existing = {
+            number
+            for number in range(MAX_PAGES)
+            if store.exists(f"jobs/{job.fingerprint}/{number:04d}.intent.json")
+        }
     try:
         return acquire_jobs((job,), root, client, budget=budget)
     except (ValueError, TypeError, RuntimeError) as error:
         if not _retryable_transport(error, root, client.account_key):
             raise
+    with QverisStore(root, client.account_key) as store:
+        # Only new, settled intents were executed by the failed attempt, not an earlier run.
+        calls = sum(
+            store.exists(f"jobs/{job.fingerprint}/{number:04d}.intent.json")
+            and store.exists(f"jobs/{job.fingerprint}/{number:04d}.billing.json")
+            for number in range(MAX_PAGES)
+            if number not in existing
+        )
     pause()
-    return acquire_jobs((job,), root, client, budget=budget)
+    result = acquire_jobs((job,), root, client, budget=budget)
+    (item,) = cast("list[dict[str, object]]", result["jobs"])
+    item["provider_calls_this_run"] = int(str(item["provider_calls_this_run"])) + calls
+    result["provider_calls_this_run"] = int(str(result["provider_calls_this_run"])) + calls
+    return result
 
 
 class TransportRetry(TypedDict, total=False):

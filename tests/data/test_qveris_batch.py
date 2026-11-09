@@ -10,8 +10,9 @@ from typing import cast
 import pytest
 
 from aegis_alpha.data.qveris_acquisition import acquire_jobs
-from aegis_alpha.data.qveris_batch import budget_stop, collect_cohort
+from aegis_alpha.data.qveris_batch import _acquire_job, budget_stop, collect_cohort
 from aegis_alpha.data.qveris_client import QverisResponse, QverisTransportError
+from aegis_alpha.data.qveris_parallel_batch import collect_parallel_cohorts
 from aegis_alpha.data.qveris_store import QverisStore
 from tests.data.test_qveris_acquisition import FakeQveris, eod_job, fred_job
 
@@ -179,8 +180,42 @@ def test_later_page_preflight_transport_reuses_billed_page(tmp_path: Path) -> No
     assert (result["completed"], result["failed"], result["stopped"]) == (1, 0, None)
     pages = 2
     assert client.execute_count == len(client.usage) == len(client.ledger) == pages
+    assert result["successful_job_calls_this_run"] == pages
     assert client.balance == Decimal(100) - client.price * pages
     assert delays == [0.25]
+
+
+@pytest.mark.parametrize("route", ["direct", "parallel", "job"])
+@pytest.mark.parametrize("existing_page", [False, True])
+def test_retry_call_counts_include_only_this_runs_executions(
+    tmp_path: Path, route: str, *, existing_page: bool, pauses: list[float]
+) -> None:
+    client = TransportQveris("/tools/probe", 1)
+    client.fail_after_executions = 1
+    job = fred_job()
+    if existing_page:
+        with pytest.raises(QverisTransportError):
+            acquire_jobs((job,), tmp_path, client)
+        client.remaining = 1
+    before = client.execute_count
+
+    if route == "parallel":
+        result = collect_parallel_cohorts(((job,),), tmp_path, lambda: client)
+        reported = result["provider_calls_this_run"]
+    elif route == "job":
+        result = _acquire_job(job, tmp_path, client, None, lambda: pauses.append(30.0))
+        reported = result["provider_calls_this_run"]
+        (item,) = cast("list[dict[str, object]]", result["jobs"])
+        assert item["provider_calls_this_run"] == reported
+    else:
+        result = collect_cohort((job,), tmp_path, client)
+        reported = result["successful_job_calls_this_run"]
+
+    expected = 1 if existing_page else 2
+    assert client.execute_count - before == expected
+    assert reported == expected
+    assert result["status"] == "RAW_ACQUIRED"
+    assert pauses == [30.0]
 
 
 @pytest.mark.parametrize("failure", ["schema", "failed-not-charged", "timeout"])
