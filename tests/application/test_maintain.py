@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import ssl
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -34,7 +35,7 @@ from aegis_alpha.data import fred_collect as fred
 from aegis_alpha.data import sec_collect as sec
 from aegis_alpha.data.opendart import OpenDartClient
 from aegis_alpha.data.opendart_cohort import CohortPolicy
-from aegis_alpha.data.qveris_client import QverisResponse
+from aegis_alpha.data.qveris_client import QverisResponse, QverisTransportError
 from aegis_alpha.storage import maintain_identity, maintain_promotion
 from aegis_alpha.storage.identity import mint_instrument
 from aegis_alpha.storage.promotion.engine import promote
@@ -91,6 +92,7 @@ class DatedQveris(ScriptedQveris):
         self.clock = clock
         self.crash_on_settlement = False
         self.settlement_down = False
+        self.preflight_drops = 0
 
     def request(
         self,
@@ -99,6 +101,10 @@ class DatedQveris(ScriptedQveris):
         body: dict[str, object] | None = None,
         query: dict[str, str | int] | None = None,
     ) -> QverisResponse:
+        if path == "/tools/probe" and self.preflight_drops:
+            self.preflight_drops -= 1
+            self.calls.append(path)
+            raise QverisTransportError(ssl.SSLEOFError("synthetic TLS drop"))
         if path == "/auth/usage/history/v2" and self.crash_on_settlement:
             self.crash_on_settlement = False
             raise KeyboardInterrupt  # the process dies after a paid call, before settling it
@@ -242,6 +248,24 @@ def _advance(world: World) -> None:
     world.sec.filings.append(LATE)
     world.sec.facts[OTHER] = [SecFact(LATE.accession, "Assets", "77", date(2026, 6, 30), WED)]
     world.qveris.rows = {**world.qveris.rows, **_bulk_rows(WED)}
+
+
+def test_qveris_preflight_transport_recovers_with_successful_maintain(tmp_path: Path) -> None:
+    world = World(tmp_path)
+    world.qveris.preflight_drops = 1
+    pauses: list[float] = []
+    world.policies = replace(world.policies, sleep=pauses.append)
+
+    report = world.run()
+
+    assert (report["status"], report["exit_code"]) == ("succeeded", 0)
+    assert pauses.count(30.0) == 1
+    assert world.qveris.execute_count == len(world.qveris.usage) == 2
+    assert len(world.qveris.ledger) == 2
+    assert world.qveris.calls.count("/tools/probe") == 3
+    stages = cast("dict[str, dict[str, object]]", report["stages"])
+    assert stages["qveris"]["status"] == "succeeded"
+    assert stages["qveris"]["settled_after"] == {"succeeded": 2, "uncertain": 0, "released": 0}
 
 
 def test_two_daily_runs_continue_every_chain_and_repeat_nothing(tmp_path: Path) -> None:

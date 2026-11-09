@@ -303,7 +303,8 @@ def _collect(  # noqa: C901 -- one stage per provider, in order
             from aegis_alpha.application.maintain_qveris import collect
 
             result = collect(workspace, qveris.raw_root, qveris.policy, qveris.caps, port,
-                             today=clock().astimezone(UTC).date(), clock=clock)  # fmt: skip
+                             today=clock().astimezone(UTC).date(), clock=clock,
+                             sleep=sleep)  # fmt: skip
             if result["status"] == "stopped":
                 run.uncertain.append("qveris")
             elif result["status"] == "partial":
