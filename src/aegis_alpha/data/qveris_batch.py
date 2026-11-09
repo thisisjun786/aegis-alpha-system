@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict, Unpack
 from uuid import uuid4
 
 from aegis_alpha.data.qveris_acquisition import acquire_jobs, acquisition_plan
+from aegis_alpha.data.qveris_client import QverisTransportError
 from aegis_alpha.data.qveris_payloads import QverisEmptyAnswerError
 from aegis_alpha.data.qveris_store import QverisStore
 from aegis_alpha.data.sec_evidence import publish_bytes
@@ -51,6 +53,46 @@ def budget_stop(error: BaseException, root: Path, account_key: str) -> str | Non
     return None if unresolved else code
 
 
+def _retryable_transport(error: BaseException, root: Path, account_key: str) -> bool:
+    errors = [error]
+    seen: set[int] = set()
+    while errors:
+        current = errors.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, QverisTransportError):
+            # Execute publishes an intent first. Pending evidence forbids a retry;
+            # billed pages reuse their intent and never execute a second time.
+            with QverisStore(root, account_key) as store:
+                return not store.pending_pages() and not store.pending_batches()
+        errors.extend(
+            linked for linked in (current.__cause__, current.__context__) if linked is not None
+        )
+    return False
+
+
+def _acquire_job(
+    job: QverisJob,
+    root: Path,
+    client: QverisPort,
+    budget: InvocationBudget | None,
+    pause: Callable[[], None],
+) -> dict[str, object]:
+    try:
+        return acquire_jobs((job,), root, client, budget=budget)
+    except (ValueError, TypeError, RuntimeError) as error:
+        if not _retryable_transport(error, root, client.account_key):
+            raise
+    pause()
+    return acquire_jobs((job,), root, client, budget=budget)
+
+
+class TransportRetry(TypedDict, total=False):
+    sleep: Callable[[float], None]
+    retry_delay_seconds: float
+
+
 def collect_cohort(
     jobs: tuple[QverisJob, ...],
     root: Path,
@@ -58,6 +100,7 @@ def collect_cohort(
     *,
     budget: InvocationBudget | None = None,
     progress: Callable[[dict[str, object]], None] | None = None,
+    **retry: Unpack[TransportRetry],
 ) -> dict[str, object]:
     """Acquire ``jobs`` in order, one at a time, recording progress after each job.
 
@@ -65,11 +108,15 @@ def collect_cohort(
     completion (``warned``) and never stops it. An uncharged empty answer for an exchange
     day of actions (``QverisEmptyAnswerError``) is counted ``empty``: neither a completion
     nor a failure, so the request is asked again by rule and the cohort is not partial. An
-    uncertain or failed preflight stops the cohort (``stopped``), as does a budget refusal,
+    unsettled execution stops the cohort (``stopped``). A transport failure with no pending
+    page or group retries the same job once after a pause; other preflight failures stop
+    immediately. A second failure follows the usual failure handling, as does a budget refusal,
     which attempted nothing; a budget refusal with unresolved evidence in the store is
     reported as that uncertain stop.
     """
     acquisition_plan(jobs, root)
+    sleep = retry.get("sleep", time.sleep)
+    retry_delay_seconds = retry.get("retry_delay_seconds", 30.0)
     cohort_id = content_sha256([job.document() for job in jobs])
     completed = failed = empty = reused = warned = calls = 0
     failure_rows: list[dict[str, object]] = []
@@ -81,7 +128,7 @@ def collect_cohort(
     snapshot: dict[str, object] = {}
     for index, job in enumerate(jobs):
         try:
-            result = acquire_jobs((job,), root, client, budget=budget)
+            result = _acquire_job(job, root, client, budget, lambda: sleep(retry_delay_seconds))
         except (ValueError, TypeError, RuntimeError) as error:
             stop = budget_stop(error, root, client.account_key)
             if stop is not None:

@@ -59,6 +59,7 @@ from __future__ import annotations
 
 # ruff: noqa: PLC0415 -- provider clients and storage modules load with the stage that uses them.
 import hashlib
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -735,6 +736,7 @@ def collect(  # noqa: PLR0913 -- the run's explicit inputs
     today: date,
     clock: Callable[[], datetime],
     declarations: Sequence[Declaration] = (),
+    sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, object]:
     """Resume and settle earlier asks, plan, reserve, ask the cohort in order, settle again."""
     from aegis_alpha.data import qveris
@@ -751,7 +753,7 @@ def collect(  # noqa: PLR0913 -- the run's explicit inputs
     resumed: dict[str, object] | None = None
     if resumable:
         resumed = collect_cohort(
-            tuple(resumable), raw_root, session.client(), budget=_resume_budget()
+            tuple(resumable), raw_root, session.client(), budget=_resume_budget(), sleep=sleep
         )
         asks = raw_asks(raw_root)
     before = settle(workspace, asks, clock=clock)
@@ -776,7 +778,11 @@ def collect(  # noqa: PLR0913 -- the run's explicit inputs
     # started attempts stay started until the next run has resumed their asks.
     try:
         cohort = collect_cohort(
-            tuple(item.job for item in plan.planned), raw_root, session.client(), budget=budget
+            tuple(item.job for item in plan.planned),
+            raw_root,
+            session.client(),
+            budget=budget,
+            sleep=sleep,
         )
     except Exception:
         session.finish()
