@@ -31,7 +31,13 @@ New York start of the day after the master's last observed session (its ``throug
 date). Extending a claim past ``through`` needs newer evidence registered as a later
 interval. An FMP profile or SEC filer matched by ticker names the listing only when it was
 retrieved inside that interval (``fmp_after_master_through``, ``sec_after_master_through``
-and the ``before_ticker_claim`` pair otherwise).
+and the ``before_ticker_claim`` pair otherwise). The later intervals are a history export's
+window and the registered per-day claims of dated EODHD US symbol lists
+(``us_symbols``, ``eodhd.us_symbol_list@1``); FMP and SEC rows are judged against every
+one of them alike (``fmp_after_symbol_list`` past the last list day). The list claims stay
+owned by the registry: the build reads them, gives them to that judgement and never
+rebuilds them, so ``check_registered`` neither requires their sources nor reports them
+withdrawn.
 
 Every claim cites its source as ``sl:<source_id>`` with the ``aas-source-row-v1`` hash of
 the row it came from. A Norgate or SEC claim is known from its source's ``sl:`` link
@@ -88,6 +94,8 @@ FMP_TABLE: Final = "observations"
 SEC_TABLE: Final = "members"
 BINDINGS_TABLE: Final = "observations"
 SEC_PREFIX: Final = "sec-submissions-zip-"
+LIST_SOURCE: Final = LINK_PREFIX + "qveris-eodhd-exchange-symbols-"
+"""The ``sl:`` prefix of the dated symbol lists that support per-day claims."""
 VENUE: Final = "XNYS"
 REFERENCE_VENUE: Final = "XXXX"
 """ISO 10383's "no market": a reference series (an index, a rate) trades on no venue."""
@@ -707,6 +715,8 @@ class UsRegistry:
     """Each EODHD US symbol an export lists after ``through``: (instrument, start, end)."""
     export_through: date | None = None
     """The exports' last observed equity session; export ticker claims end the day after it."""
+    listed: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
+    """Each EODHD US symbol's registered per-day symbol-list claims: (start, end)."""
 
     def raw(self) -> bytes:
         return formats.canonical(self.document)
@@ -732,7 +742,12 @@ class UsRegistry:
             status = self.symbols.get(symbol, "unresolved:not_a_listed_norgate_ticker")
             window = self.windows.get(symbol)
             at = session_start_us(day)
-            if window is not None and window[1] <= at < window[2]:
+            days = self.listed.get(symbol, [])
+            if any(start <= at < end for start, end in days):
+                reason = "resolved"
+            elif days and at >= max(end for _, end in days):
+                reason = "after_symbol_list"
+            elif window is not None and window[1] <= at < window[2]:
                 reason = "resolved"
             elif status.startswith("ins-"):
                 start, end = self.intervals[symbol]
@@ -1346,12 +1361,46 @@ def _export_window(  # noqa: PLR0913 -- the window reads the master's view of ev
     return claims
 
 
+@dataclass(frozen=True, slots=True)
+class ListedClaim:
+    """A registered per-day ``eodhd_symbol`` claim that a dated US symbol list supports."""
+
+    assetid: str
+    symbol: str
+    start: int
+    end: int
+    evidence: Evidence
+
+
+def listed_claims(state: sqlite3.Connection) -> list[ListedClaim]:
+    """The registered, not superseded symbol-list claims of Norgate instruments (SELECT only)."""
+    rows = state.execute(
+        "SELECT a.token, (SELECT min(n.token) FROM identity_assertions n WHERE "
+        "n.instrument_id = a.instrument_id AND n.provider = 'norgate' AND "
+        "n.namespace = 'norgate_assetid'), a.valid_from_us, a.valid_to_us, a.known_from_us, "
+        "a.source_snapshot_id, a.source_hash FROM identity_assertions a "
+        "WHERE a.provider = 'eodhd' AND a.namespace = 'eodhd_symbol' "
+        "AND substr(a.token, -3) = '.US' AND a.valid_to_us IS NOT NULL "
+        "AND substr(a.source_snapshot_id, 1, ?) = ? AND a.assertion_id NOT IN ("
+        "SELECT supersedes_assertion_id FROM identity_assertions "
+        "WHERE supersedes_assertion_id IS NOT NULL) ORDER BY a.token, a.valid_from_us",
+        (len(LIST_SOURCE), LIST_SOURCE),
+    )
+    return [
+        ListedClaim(str(assetid), str(token), int(start), int(end),
+                    Evidence(str(source), str(source_hash), int(known)))
+        for token, assetid, start, end, known, source, source_hash in rows
+        if assetid is not None
+    ]  # fmt: skip
+
+
 def build_us_registry(
     master: LinkedRows,
     *,
     fmp: Sequence[SourceRows] = (),
     sec: Sequence[tuple[LinkedRows, SourceFile, ArchiveOpener]] = (),
     exports: Sequence[ExportRows] = (),
+    listed: Sequence[ListedClaim] = (),
 ) -> UsRegistry:
     """Build the US ``aas-identity-registry-v1`` document from pinned source rows.
 
@@ -1359,7 +1408,8 @@ def build_us_registry(
     its later history exports add the series it lacks and the ticker claims of the sessions
     they show after the master's last one. The document lists issuers by CIK, instruments by
     asset ID and assertions by provider, namespace and token, so the same sources always
-    give the same bytes.
+    give the same bytes. ``listed`` are the registered symbol-list claims FMP and SEC rows
+    are judged against beside the master's and the exports'; the document never repeats them.
     """
     unresolved: dict[str, dict[str, list[str]]] = {
         key: defaultdict(list)
@@ -1404,6 +1454,14 @@ def build_us_registry(
         )
         for ticker, claim in windows.items():
             claims.setdefault(ticker, []).append(claim)
+    etf = {listing.assetid: listing.asset_type == "etf" for listing in accepted}
+    for item in listed:
+        claims.setdefault(item.symbol.removesuffix(".US"), []).append(
+            _Claim(item.assetid, item.start, item.end, etf=etf.get(item.assetid, False),
+                   evidence=item.evidence, after="after_symbol_list")
+        )  # fmt: skip
+    for held in claims.values():
+        held.sort(key=lambda claim: claim.start)
     profiles, refused, mappers[FMP_MAPPER] = map_fmp_profiles(fmp)
     agreed = _profiles(profiles, refused, claims, unresolved["fmp"])
     filers, mappers[SEC_MAPPER] = _sec_filers(sec)
@@ -1455,7 +1513,15 @@ def build_us_registry(
         through=bounds.through,
         windows=exported.windows,
         export_through=exported.through,
+        listed=_listed_intervals(listed),
     )
+
+
+def _listed_intervals(listed: Sequence[ListedClaim]) -> dict[str, list[tuple[int, int]]]:
+    intervals: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    for item in listed:
+        intervals[item.symbol].append((item.start, item.end))
+    return dict(intervals)
 
 
 def compare_bindings(registry: UsRegistry, bindings: SourceRows) -> dict[str, object]:
@@ -1493,8 +1559,8 @@ def compare_bindings(registry: UsRegistry, bindings: SourceRows) -> dict[str, ob
     }
 
 
-# Registered assertions the US registry owns: Norgate, SEC and FMP claims and EODHD US
-# symbols.
+# Registered assertions the US registry owns: Norgate, SEC and FMP claims and the EODHD US
+# symbols of the master and exports (the symbol lists' per-day claims are read, not rebuilt).
 _US_ASSERTIONS: Final = (
     "SELECT a.assertion_id,a.provider,a.namespace,a.token,a.source_snapshot_id,"
     # A non-correlated IN is evaluated once; a correlated EXISTS would scan the table per
@@ -1502,7 +1568,8 @@ _US_ASSERTIONS: Final = (
     "a.assertion_id IN (SELECT supersedes_assertion_id FROM identity_assertions"
     " WHERE supersedes_assertion_id IS NOT NULL)"
     " FROM identity_assertions a WHERE a.provider IN ('norgate','sec','fmp')"
-    " OR (a.provider='eodhd' AND a.namespace='eodhd_symbol' AND a.token LIKE '%.US')"
+    " OR (a.provider='eodhd' AND a.namespace='eodhd_symbol' AND a.token LIKE '%.US'"
+    " AND substr(a.source_snapshot_id,1,?)<>?)"
     " ORDER BY a.provider,a.namespace,a.token,a.assertion_id"
 )
 
@@ -1522,7 +1589,7 @@ def check_registered(registry: UsRegistry, state: sqlite3.Connection) -> UsRegis
     missing: set[str] = set()
     withdrawn: list[dict[str, object]] = []
     for assertion_id, provider, namespace, token, source, corrected in state.execute(
-        _US_ASSERTIONS
+        _US_ASSERTIONS, (len(LIST_SOURCE), LIST_SOURCE)
     ):
         if source not in registry.sources:
             missing.add(str(source))
@@ -1621,6 +1688,7 @@ def build_from_workspace(  # noqa: PLR0913 -- one keyword per source kind
         fmp=[read_rows(workspace, source, FMP_TABLE) for source in fmp],
         sec=sec_inputs,
         exports=[read_export_rows(workspace, source) for source in exports],
+        listed=listed_claims(state),
     )
     if bindings is not None:
         registry.bindings = compare_bindings(

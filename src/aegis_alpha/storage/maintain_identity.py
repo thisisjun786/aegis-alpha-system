@@ -1,4 +1,4 @@
-"""Maintenance identity: the KR registry advanced by new listings, and the snapshot it pins.
+"""Maintenance identity: KR listings and dated US symbol lists, and the snapshot they pin.
 
 A run builds the KR registry document (``kr_identity.build_from_workspace``) when a
 committed KR identity source is newer (by its ``sl:`` link) than the newest maintenance
@@ -15,9 +15,19 @@ The maintenance identity snapshot projects every registered assertion. Its ID is
 ``maintain-`` and the first 32 hex digits of the SHA-256 of the sorted assertion IDs, so
 an unchanged registry names the same snapshot and a run registers a new one only when the
 assertion set changed. A run that registers nothing and finds no maintenance snapshot
-leaves each promotion template's own snapshot in place. US identity sources (Norgate
-master, FMP profiles, the SEC archive) are frozen inputs of the cutover registry and have
-no maintenance increment.
+leaves each promotion template's own snapshot in place.
+
+The US registry's Norgate master, FMP profiles and SEC archive are frozen inputs of the
+cutover registry. Its increment is the dated EODHD US symbol list (an
+``qveris-eodhd-exchange-symbols-*`` source whose rows were asked for ``US``, which the KR
+build never reads): when one is linked after the newest maintenance snapshot, the run
+builds ``eodhd.us_symbol_list@1`` claims (``us_symbols``) from the new lists against the
+registered claims and registers that document. Earlier lists never anchor a claim (what
+they showed that may be continued is a registered claim now), but they are read again as
+veto evidence for the days a new claim would cover before the new lists
+(``us_symbols.build_increment``, ``veto_sources`` in the report), so lists that arrive
+one run at a time give the claims one build of all of them gives. Its report
+is ``us_symbols``; the KR report keys are unchanged.
 """
 
 from __future__ import annotations
@@ -26,7 +36,7 @@ import hashlib
 from typing import TYPE_CHECKING, Final
 
 from aegis_alpha.data.serialization import canonical_json_bytes
-from aegis_alpha.storage import identity, kr_identity
+from aegis_alpha.storage import identity, kr_identity, us_symbols
 from aegis_alpha.storage.provider_collection import committed_tables
 from aegis_alpha.storage.source_identity import LINK_PREFIX
 
@@ -59,11 +69,14 @@ def _sources(workspace: Workspace) -> tuple[dict[str, list[str]], dict[str, list
     """
     found: dict[str, list[str]] = {"eodhd": [], "kind": [], "dart": []}
     skipped: dict[str, list[str]] = {"kind": []}
+    us = us_symbols.list_sources(workspace)
     found["eodhd"] = sorted(
         {
             table.source_id
             for table in committed_tables(workspace, EODHD_PREFIX)
-            if table.store == "market" and table.entry["name"] == kr_identity.EODHD_TABLE
+            if table.store == "market"
+            and table.entry["name"] == kr_identity.EODHD_TABLE
+            and table.source_id not in us
         }
     )
     kind: set[str] = set()
@@ -126,8 +139,32 @@ def _pin(workspace: Workspace, snapshot: str) -> dict[str, str] | None:
     return None if row is None else {"snapshot_id": snapshot, "content_hash": str(row[0])}
 
 
+def _advance_us(
+    workspace: Workspace, *, apply: bool, since: int | None
+) -> tuple[dict[str, object], bool]:
+    """Register the per-day US symbol claims of lists linked after ``since``."""
+    lists = us_symbols.list_sources(workspace)
+    fresh = {item: at for item, at in lists.items() if since is None or at > since}
+    if not fresh:
+        return {"new_sources": 0, "registry": "no_new_sources"}, False
+    earlier = {item: at for item, at in lists.items() if item not in fresh}
+    built, read = us_symbols.build_from_workspace(workspace, fresh, earlier)
+    report: dict[str, object] = {"new_sources": len(fresh), "inputs": len(fresh),
+                                 "veto_sources": read, **built.report()}  # fmt: skip
+    if not built.assertions:
+        report["registry"] = "no_new_claims"
+        return report, False
+    raw = canonical_json_bytes(built.document())
+    document = identity.decode_registry(raw, expected_file_sha256=hashlib.sha256(raw).hexdigest())
+    result = identity.register_identities(workspace.state, document, apply=apply)
+    report["registry"] = {"document_sha256": hashlib.sha256(raw).hexdigest(),
+                          "registration": result}  # fmt: skip
+    added = result.get("new")
+    return report, apply and isinstance(added, dict) and any(added.values())
+
+
 def advance(workspace: Workspace, *, apply: bool, now_us: int) -> dict[str, object]:
-    """Register new KR identity claims, then pin the maintenance snapshot of the registry."""
+    """Register new KR and US identity claims, then pin the maintenance snapshot."""
     report: dict[str, object] = {"mode": "apply" if apply else "plan"}
     newest = _newest_snapshot(workspace)
     linked = _linked(workspace)
@@ -166,6 +203,9 @@ def advance(workspace: Workspace, *, apply: bool, now_us: int) -> dict[str, obje
         }  # fmt: skip
         added = result.get("new")
         registered = apply and isinstance(added, dict) and any(added.values())
+    us, us_registered = _advance_us(workspace, apply=apply, since=since)
+    report["us_symbols"] = us
+    registered = registered or us_registered
     current = snapshot_id(workspace)
     pin = _pin(workspace, current)
     if pin is None and apply and (registered or newest is not None):
