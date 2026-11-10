@@ -77,7 +77,7 @@ from aegis_alpha.storage.us_identity import LIST_SOURCE, NEW_YORK, session_start
 
 if TYPE_CHECKING:
     import sqlite3
-    from collections.abc import Iterable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
 
     from aegis_alpha.storage.workspace import Workspace
 
@@ -183,6 +183,10 @@ class Observation:
     reason: str | None
     isin: str | None
     evidence: Evidence
+    names: str | None = None
+    """The instrument the row's ISIN names (a valid, registered, unambiguous ISIN in USD),
+    even when the row is refused for repeating a symbol or an ISIN: such a row contradicts a
+    claim of another instrument. A row naming no instrument contradicts nothing."""
 
     def outcome(self) -> str:
         return self.instrument_id or f"unresolved:{self.reason}"
@@ -243,7 +247,7 @@ def _observations(
         isin, instrument, reason = _owner(row, registry)
         evidence = Evidence(source.snapshot_id, row_hash, retrieved)
         listed.append(Observation(f"{code}.{EXCHANGE}", covered_day(retrieved), instrument,
-                                  reason, isin, evidence))  # fmt: skip
+                                  reason, isin, evidence, instrument))  # fmt: skip
     return listed
 
 
@@ -277,7 +281,7 @@ def map_us_symbol_lists(
             else:
                 report.refuse(reason)
                 found.append(Observation(item.symbol, item.day, None, reason, item.isin,
-                                         item.evidence))  # fmt: skip
+                                         item.evidence, item.names))  # fmt: skip
     return found, report
 
 
@@ -431,18 +435,42 @@ class _Index:
     Only registered claims and the claims this build accepts anchor a later day: an
     observation the build rejected (a moved, unbracketed or unverifiable row) or a
     Saturday or Sunday one is never the earlier end of a claim, so lists alone can never
-    carry a ticker to an instrument that no registered claim shows holding it.
+    carry a ticker to an instrument that no registered claim shows holding it. Every
+    observation that names an instrument, judged or veto-only, rejected or not, is a veto:
+    a claim never covers a day on which its symbol is observed naming another instrument or
+    its instrument is observed under another symbol. Days are judged in day order, so a
+    claim depends only on claims of earlier days, as when the lists arrive day by day.
     """
 
     held: dict[str, list[Held]]
     """Registered claims by symbol."""
     holdings: dict[str, list[Held]]
     """Registered claims by instrument."""
-    accepted: dict[str, list[tuple[date, date, str, str]]]
+    accepted: dict[str, list[tuple[date, date, str, str]]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
     """Each symbol's claims this build accepted: first day, last day, instrument, source."""
-    named: dict[str, list[tuple[date, str]]]
-    """Each instrument's observed days and the symbol naming it, sorted by (day, symbol):
-    ``other_symbol`` bisects it."""
+    accepted_by: dict[str, list[tuple[str, date, date]]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+    """Each instrument's claims this build accepted: symbol, first day, last day."""
+    named: dict[str, list[tuple[date, str]]] = field(default_factory=lambda: defaultdict(list))
+    """Each instrument's observed days and the symbol naming it, sorted by (day, symbol)."""
+    seen: dict[str, list[tuple[date, str]]] = field(default_factory=lambda: defaultdict(list))
+    """Each symbol's observed days and the instrument named, sorted by (day, instrument)."""
+
+    def observe(self, observations: Iterable[Observation]) -> None:
+        """Index every observation that names an instrument, each list in day order."""
+        for item in observations:
+            if item.names is not None:
+                self.named[item.names].append((item.day, item.symbol))
+                self.seen[item.symbol].append((item.day, item.names))
+        for found in (*self.named.values(), *self.seen.values()):
+            found.sort()
+
+    def accept(self, symbol: str, first: date, last: date, instrument: str, source: str) -> None:
+        self.accepted[symbol].append((first, last, instrument, source))
+        self.accepted_by[instrument].append((symbol, first, last))
 
     def before(self, symbol: str, day: date) -> _Before | None:
         """The latest earlier day a registered or accepted claim shows the symbol's holder."""
@@ -471,25 +499,45 @@ class _Index:
         return any(first < day and held == instrument
                    for first, _, held, _ in self.accepted.get(symbol, []))  # fmt: skip
 
+    def contradicted(self, symbol: str, instrument: str, first: date, last: date) -> bool:
+        """Whether ``symbol`` is observed naming another instrument on a day of the claim."""
+        days = self.seen.get(symbol, [])
+        position = bisect_left(days, (first, ""))
+        return any(named != instrument for seen, named in days[position:] if seen <= last)
+
     def other_symbol(self, instrument: str, symbol: str, first: date, last: date) -> bool:
-        """Whether ``instrument`` holds another US symbol on a day of ``[first, last]``."""
+        """Whether ``instrument`` holds or is observed under another US symbol on a day of
+        ``[first, last]``."""
         low, high = session_start_us(first), session_start_us(last + timedelta(days=1))
         for item in self.holdings.get(instrument, []):
             if item.token != symbol and item.start < high and (item.end is None or item.end > low):
                 return True
+        if any(other != symbol and start <= last and first <= end
+               for other, start, end in self.accepted_by.get(instrument, [])):  # fmt: skip
+            return True
         days = self.named.get(instrument, [])
         position = bisect_left(days, (first, ""))
         return any(other != symbol for seen, other in days[position:] if seen <= last)
 
 
-def build_symbol_claims(sources: Sequence[SourceRows], registry: Registry) -> SymbolClaims:
-    """The ``eodhd_symbol`` claims the lists show beyond the registered ones."""
+def build_symbol_claims(
+    sources: Sequence[SourceRows],
+    registry: Registry,
+    context: Sequence[SourceRows] = (),
+) -> SymbolClaims:
+    """The ``eodhd_symbol`` claims the lists show beyond the registered ones.
+
+    ``context`` lists (earlier lists a maintenance run reads again) are veto evidence
+    only: their rows can stop a claim, never anchor or make one.
+    """
     claims = SymbolClaims()
     observations, claims.mapper = map_us_symbol_lists(sources, registry)
-    index = _Index(defaultdict(list), defaultdict(list), defaultdict(list), defaultdict(list))
+    vetoes, _ = map_us_symbol_lists(context, registry)
+    index = _Index(defaultdict(list), defaultdict(list))
     for item in registry.held:
         index.held[item.token].append(item)
         index.holdings[item.instrument_id].append(item)
+    index.observe([*observations, *vetoes])
     _registry_edge(claims, registry)
     grouped: dict[tuple[str, date], list[Observation]] = defaultdict(list)
     for item in observations:
@@ -498,8 +546,7 @@ def build_symbol_claims(sources: Sequence[SourceRows], registry: Registry) -> Sy
     listed_days = [_new_york_day(item.start) for item in registry.held if item.listed]
     claims.first_listed = min([*listed_days, *claims.observed_days], default=None)
     days = _outcomes(grouped)
-    _observe(index, days)
-    for (symbol, day), outcome in sorted(days.items()):
+    for (symbol, day), outcome in sorted(days.items(), key=lambda item: (item[0][1], item[0][0])):
         if _weekend(day):
             continue
         judged = _judge(symbol, day, outcome, index)
@@ -519,7 +566,7 @@ def build_symbol_claims(sources: Sequence[SourceRows], registry: Registry) -> Sy
             _assertion(registry.anchors[outcome], symbol, first, day, evidence)
         )
         claims.claimed_days.add(day)
-        index.accepted[symbol].append((first, day, outcome, evidence.source))
+        index.accept(symbol, first, day, outcome, evidence.source)
         if first < day:
             claims.bridges.append({
                 "symbol": symbol, "from": first.isoformat(), "through": day.isoformat(),
@@ -529,16 +576,6 @@ def build_symbol_claims(sources: Sequence[SourceRows], registry: Registry) -> Sy
             })  # fmt: skip
     _continued(claims, registry)
     return claims
-
-
-def _observe(index: _Index, days: Mapping[tuple[str, date], str]) -> None:
-    """Index the instruments every observed symbol-day names (rejected days included: they
-    only ever stop a claim, never anchor one), each in (day, symbol) order for bisection."""
-    for (symbol, day), outcome in days.items():
-        if not outcome.startswith("unresolved:"):
-            index.named[outcome].append((day, symbol))
-    for named in index.named.values():
-        named.sort()
 
 
 def _registry_edge(claims: SymbolClaims, registry: Registry) -> None:
@@ -596,8 +633,10 @@ def _continue(
     """The first day a claim continuing ``before`` covers through ``day``, or why none.
 
     Weekend days alone between the two need no claim; a gap with a weekday is bridged by
-    one claim from the day after ``before`` when it is at most ``MAX_BRIDGE_DAYS`` long and
-    the instrument held no other symbol meanwhile.
+    one claim from the day after ``before`` when it is at most ``MAX_BRIDGE_DAYS`` long.
+    Either claim is refused when an observation of the symbol on one of its days names
+    another instrument (``list_contradicted``), or the instrument holds or is observed
+    under another symbol on one of them (``list_symbol_moved``).
     """
     first = before.day + timedelta(days=1)
     bridged = bool(_weekdays(first, day))
@@ -606,6 +645,8 @@ def _continue(
         first = day
     elif (day - first).days + 1 > MAX_BRIDGE_DAYS:
         reason = "list_gap_too_long"
+    if reason is None and index.contradicted(symbol, outcome, first, day):
+        reason = "list_contradicted"
     if reason is None and index.other_symbol(outcome, symbol, first, day):
         reason = "list_symbol_moved"
     if reason is not None:
@@ -667,7 +708,76 @@ def list_sources(workspace: Workspace) -> dict[str, int]:
     return found
 
 
-def build_from_workspace(workspace: Workspace, source_ids: Sequence[str]) -> SymbolClaims:
-    """Read the named US lists and the registry, and build their new per-day claims."""
-    sources = [pinned_rows(workspace, source, EODHD_TABLE) for source in sorted(source_ids)]
-    return build_symbol_claims(sources, read_registry(workspace.state))
+@dataclass(frozen=True, slots=True)
+class Earlier:
+    """A list linked before a run's new lists: veto evidence its build may load."""
+
+    linked_at_us: int
+    load: Callable[[Callable[[Mapping[str, object]], bool]], SourceRows]
+    """Read the list, keeping only the rows the given predicate keeps."""
+
+
+def build_increment(
+    fresh: Sequence[SourceRows], registry: Registry, earlier: Sequence[Earlier], floor: int
+) -> tuple[SymbolClaims, int]:
+    """Build the new lists' claims with the earlier lists their claims' days need as vetoes.
+
+    A claim's days reach back to the day after its earlier end; any list that covers one of
+    them was linked at or after that day's New York start. So the build runs on the new
+    lists (``floor``: the earliest of their link instants), then reads the earlier lists
+    linked from the earliest such start up to ``floor`` (keeping only
+    rows of the claims' symbols or their instruments' ISINs) and builds again, until no
+    claim needs an earlier list it has not read. A daily run whose claims start today
+    reads none. Returns the claims and the number of earlier lists read.
+    """
+    if not fresh:
+        return build_symbol_claims(fresh, registry), 0
+    isins: dict[str, set[str]] = defaultdict(set)
+    for value, owners in registry.owners.items():
+        for owner in owners:
+            isins[owner].add(value)
+    need: int | None = None
+    codes: set[str] = set()
+    wanted: set[str] = set()
+    context: list[SourceRows] = []
+    while True:
+        built = build_symbol_claims(fresh, registry, context)
+        reaching = [row for row in built.assertions if cast("int", row["valid_from_us"]) < floor]
+        if not reaching:
+            return built, len(context)
+        start = min(cast("int", row["valid_from_us"]) for row in reaching)
+        more_codes = {str(row["token"]).removesuffix(f".{EXCHANGE}") for row in reaching}
+        more_isins = {value for row in reaching for value in isins[_owner_of(row, registry)]}
+        if need is not None and start >= need and more_codes <= codes and more_isins <= wanted:
+            return built, len(context)
+        need = start if need is None else min(need, start)
+        codes |= more_codes
+        wanted |= more_isins
+
+        keep = _keeper(frozenset(codes), frozenset(wanted))
+        context = [item.load(keep) for item in earlier if need <= item.linked_at_us < floor]
+
+
+def _keeper(codes: frozenset[str], isins: frozenset[str]) -> Callable[[Mapping[str, object]], bool]:
+    """Keep a list row of one of ``codes`` or naming one of ``isins``."""
+    return lambda row: row.get("code") in codes or row.get("isin") in isins
+
+
+def _owner_of(row: Mapping[str, object], registry: Registry) -> str:
+    anchor = cast("dict[str, str]", row["instrument"])["anchor_token"]
+    return next(key for key, value in registry.anchors.items() if value == anchor)
+
+
+def build_from_workspace(
+    workspace: Workspace, fresh: Mapping[str, int], earlier: Mapping[str, int] | None = None
+) -> tuple[SymbolClaims, int]:
+    """Read the new US lists (source ID -> link instant) and the registry and build their
+    claims; ``earlier`` are the lists linked before them, read again only as vetoes."""
+    sources = [pinned_rows(workspace, source, EODHD_TABLE) for source in sorted(fresh)]
+
+    def loader(source: str) -> Callable[[Callable[[Mapping[str, object]], bool]], SourceRows]:
+        return lambda keep: pinned_rows(workspace, source, EODHD_TABLE, keep)
+
+    older = [Earlier(at, loader(source)) for source, at in sorted((earlier or {}).items())]
+    floor = min(fresh.values(), default=0)
+    return build_increment(sources, read_registry(workspace.state), older, floor)

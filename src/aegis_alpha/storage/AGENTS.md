@@ -259,7 +259,8 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   `us_symbols` (`eodhd.us_symbol_list@1`): a dated EODHD US list names an instrument only
   through a registered FMP ISIN; a day is claimed when the symbol's previous holder (a
   registered claim or one this build accepted, never a rejected observation) is the same
-  instrument, as that one New York day
+  instrument and no observation (earlier lists read again as veto-only) shows the symbol
+  naming another instrument or the instrument under another symbol on its days, as that one New York day
   or, over a gap with weekdays, one bridge claim of at most `MAX_BRIDGE_DAYS` verified at
   both ends; every other day stays unresolved with its reason.
   `promote_datasets` reports `standing_unresolved` from the persisted `maintain_source@1`

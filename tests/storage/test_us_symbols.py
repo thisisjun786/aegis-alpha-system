@@ -218,6 +218,32 @@ def test_another_symbol_of_the_instrument_inside_the_gap_stops_the_bridge_in_any
     assert report["already_claimed"] == 1
 
 
+def test_an_observation_naming_another_holder_inside_the_claim_blocks_it() -> None:
+    # AAA is registered for A through Tuesday 09-08; Wednesday's list names AAA as B,
+    # Thursday's as A again. Wednesday is moved, and it contradicts a bridge over it.
+    lists = [_list(_evening(WED), [_row("AAA", ISIN_B)]),
+             _list(_evening(THU), [_row("AAA", ISIN_A)])]  # fmt: skip
+    built = build_symbol_claims(lists, _registry(_base("AAA.US", IA, TUE)))
+    assert built.assertions == []
+    assert built.report()["unresolved_days"] == {"list_contradicted": 1, "list_symbol_moved": 1}
+    assert built.report()["bridge_unresolved"] == {"list_contradicted": 1}
+    # A repeated row still names its holder: two AAA rows (B and A) on Wednesday block too.
+    repeated = [_list(_evening(WED), [_row("AAA", ISIN_B), _row("AAA", ISIN_A)]),
+                _list(_evening(THU), [_row("AAA", ISIN_A)])]  # fmt: skip
+    assert build_symbol_claims(repeated, _registry(_base("AAA.US", IA, TUE))).assertions == []
+
+
+def test_rows_naming_no_instrument_contradict_nothing() -> None:
+    # Wednesday's AAA rows name no instrument (no ISIN, a bad check digit, an unregistered
+    # ISIN, another currency): they neither anchor nor stop Thursday's bridge from Tuesday.
+    rows = (_row("AAA", None), _row("AAA", bad_check_digit(ISIN_A)),
+            _row("AAA", isin("000000099", "US")), _row("AAA", ISIN_B, currency="EUR"))  # fmt: skip
+    for row in rows:
+        lists = [_list(_evening(WED), [row]), _list(_evening(THU), [_row("AAA", ISIN_A)])]
+        built = build_symbol_claims(lists, _registry(_base("AAA.US", IA, TUE)))
+        assert _claims(built.document()) == [_span_claim("AAA.US", A, WED, THU)], row
+
+
 def test_both_ends_agreeing_still_needs_a_valid_unambiguous_isin() -> None:
     monday = date(2026, 9, 21)
     shared = isin("000000088", "US")
@@ -594,3 +620,36 @@ def test_two_maintenance_runs_of_rejected_lists_register_nothing(ws: Workspace) 
         ("sl:qveris-eodhd-exchange-symbols-",),
     ).fetchone()
     assert claimed[0] == 0
+
+
+def test_an_earlier_run_s_rejected_rows_still_veto_a_later_bridge(ws: Workspace) -> None:
+    # Wednesday's run sees ZZZ name A (rejected: nothing registered shows ZZZ) and BBB
+    # continue B (accepted, so the run pins a new snapshot). Thursday's run then sees AAA
+    # name A after AAA's registered Tuesday: the bridge over Wednesday would cross A's
+    # observed ZZZ, exactly as one build of both lists finds, so it is refused.
+    first = _bars(ws, TUE, "AAA.US")
+    _register_base(ws, first["source_id"])
+    anchor = {"anchor_namespace": "norgate_assetid", "anchor_token": B}
+    end = session_start_us(WED)
+    other = {
+        "schema": "aas-identity-registry-v1", "issuers": [],
+        "instruments": [{**anchor, "issuer": None, "asset_type": "unclassified",
+                         "venue": "XNYS"}],
+        "assertions": [{"instrument": anchor, "provider": provider, "namespace": namespace,
+                        "token": token, "valid_from_us": UNBOUNDED, "valid_to_us": valid_to,
+                        "known_from_us": 1, "supersedes_assertion_id": None,
+                        "source_snapshot_id": "sl:" + first["source_id"],
+                        "source_hash": hashlib.sha256(token.encode()).hexdigest()}
+                       for provider, namespace, token, valid_to in (
+                           ("norgate", "norgate_assetid", B, None), ("fmp", "isin", ISIN_B, None),
+                           ("eodhd", "eodhd_symbol", "BBB.US", end))],
+    }  # fmt: skip
+    register_identities(ws.state, parse_registry(other), apply=True)
+    _import_list(ws, WED, [_row("ZZZ", ISIN_A), _row("BBB", ISIN_B)])
+    wednesday = maintain_identity.advance(ws, apply=True, now_us=_now())
+    assert cast("dict[str, object]", wednesday["us_symbols"])["claims"] == 1  # BBB
+    _import_list(ws, THU, [_row("AAA", ISIN_A)])
+    thursday = maintain_identity.advance(ws, apply=True, now_us=_now())
+    us = cast("dict[str, object]", thursday["us_symbols"])
+    assert (us["claims"], us["veto_sources"]) == (0, 1)
+    assert us["unresolved"] == {"list_symbol_moved": ["AAA.US"]}

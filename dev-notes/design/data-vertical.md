@@ -1546,8 +1546,19 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
   될 수 없고, build가 거부한 관측(이동·앞 보유자 없음·검증 불가)과 토·일 관측도 앞쪽 끝이 되지 않는다. 그래서 목록만으로는
   등록 claim이 보여 주지 않는 상품으로 티커를 옮길 수 없다(거부된 목록 두 개가 연달아 와도 마찬가지). 재사용·이름 변경·새
   상장은 독립된 등록 claim이 생길 때까지 해석하지 않는다(#99: 수집 시점 사이에 티커가 바뀔 수 있으니 양 끝에서 확인되지
-  않는 연결은 Risk 7대로 해석하지 않는다). 그러므로 identity 단계는 새 목록만 읽는다(앞선 목록이 보여 준 것 중 이어
-  갈 수 있는 것은 이미 등록 claim이다).
+  않는 연결은 Risk 7대로 해석하지 않는다).
+- **거부권(veto).** 상품을 가리키는 관측은 판정됐든 아니든, 거부됐든 아니든(반복된 심볼·ISIN 행 포함) 모두 claim을
+  막을 수 있다. claim은 그 심볼이 다른 상품을 가리키는 관측이 있는 날(`list_contradicted`), 그 상품이 다른 심볼로
+  관측되거나 다른 심볼의 등록·수용 claim이 있는 날(`list_symbol_moved`)을 덮지 않는다. 상품을 가리키지 않는 행(ISIN
+  없음·무효·미등록·모호, USD 아님)은 아무것도 반박하지 않는다(앞쪽 끝도 거부권도 아니다). 토·일만 사이에 있는 하루
+  claim의 창은 그날뿐이라 주말 관측은 막지 않는다.
+- **판정 순서와 앞선 목록.** 날들은 날짜 순으로 판정되므로 claim은 앞 날들의 claim에만 달려 있다. identity 단계는 새
+  목록을 판정하고, 새 claim이 새 목록보다 이른 날을 덮으면 그 날부터 연결된 앞선 목록을 그 claim의 심볼과 상품 ISIN
+  행만 남겨 다시 읽어 거부권으로만 쓴다(`us_symbols.build_increment`, 보고의 `veto_sources`). 앞쪽 끝이나 claim은
+  만들지 않는다. 오늘 시작하는 하루 claim은 앞선 목록을 읽지 않는다. 그래서 목록이 덮는 날의 순서대로 한 실행씩
+  도착하면 등록되는 claim은 모든 목록을 한 번에 만든 것과 같다(무작위 시나리오 테스트). 단, 이미 판정한 날에 대해
+  다른 증거를 가진 목록이 뒤의 실행에 오면 등록된 claim은 철회되지 않는다(append-only). 그 날은 `list_registered_conflict`로
+  보고되어 운영자가 볼 일이다.
 - 사이가 토·일뿐이면 claim은 뉴욕 하루 `d`다. 평일이 비어 있으면 claim 하나가 그 공백을 잇는다: `before` 다음 날의
   뉴욕 시작부터 `d` 다음 날의 뉴욕 시작까지, 최대 `MAX_BRIDGE_DAYS`(120) 역일. 이은 날은 양 끝에서 확인된 것이지
   날마다 관측된 것이 아니며, 보고의 `bridges`(심볼, 처음·끝 날, 평일 수, 양 끝의 증거, 표본 100), `bridged_symbols`,
@@ -3092,3 +3103,8 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-527 | 공백 안에서 같은 상품을 다른 심볼로 보인 관측은 관측 순서와 상관없이 그 bridge를 `list_symbol_moved`로 막는다 | `tests/storage/test_us_symbols.py::test_another_symbol_of_the_instrument_inside_the_gap_stops_the_bridge_in_any_order` | 구현 |
 | DV-528 | 범위 key의 SHA-256은 partition 날짜의 어느 시각(어느 시간대)에 성립하는 짧은 claim이든 바뀌고, 이틀 뒤의 claim에는 바뀌지 않는다 | `tests/storage/test_maintain_promotion.py::test_a_scoped_key_covers_every_instant_of_its_dates_and_nothing_two_days_on` | 구현 |
 | DV-529 | 범위 key의 SHA-256은 member 행의 입력 순서와 무관하다 | `tests/storage/test_maintain_promotion.py::test_a_scoped_key_does_not_depend_on_the_order_of_its_rows` | 구현 |
+| DV-530 | claim의 날에 그 심볼이 다른 상품을 가리키는 관측(반복 행 포함)이 있으면 bridge를 `list_contradicted`로 막는다 | `tests/storage/test_us_symbols.py::test_an_observation_naming_another_holder_inside_the_claim_blocks_it` | 구현 |
+| DV-531 | 상품을 가리키지 않는 행(ISIN 없음·무효·미등록, USD 아님)은 bridge를 막지도 잇지도 않는다 | `tests/storage/test_us_symbols.py::test_rows_naming_no_instrument_contradict_nothing` | 구현 |
+| DV-532 | 앞선 실행이 거부한 관측은 뒤 실행의 bridge에 대한 거부권으로 다시 읽힌다 | `tests/storage/test_us_symbols.py::test_an_earlier_run_s_rejected_rows_still_veto_a_later_bridge` | 구현 |
+| DV-533 | 무작위 시나리오에서 한 번의 build는 목록 순서와 무관하고, 다른 상품·다른 심볼 관측이 있는 날이나 다른 상품의 등록 claim을 덮지 않으며, 모든 claim이 등록·수용 claim에서 이어진다 | `tests/storage/test_us_symbol_invariants.py::test_batch_builds_are_order_free_and_safe` | 구현 |
+| DV-534 | 덮는 날 순서로 한 실행씩 도착한 목록으로 유지보수 identity 단계가 등록하는 claim은 한 번의 build와 같다 | `tests/storage/test_us_symbol_invariants.py::test_run_by_run_maintenance_registers_what_one_build_finds` | 구현 |

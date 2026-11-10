@@ -1568,9 +1568,9 @@ identity 단계는 그 목록의 행을 등록된 FMP ISIN으로 Norgate 상품�
 그 빈 날부터 그날까지를 claim 하나로 잇는다(최대 120일). **이은(bridged) 날은 양 끝에서 같은 상품으로
 확인된 것이지 날마다 관측된 것이 아니다.** 보고의 `bridges`(표본), `bridged_symbols`, `bridged_days`,
 `bridge_unresolved`가 그 범위를 밝힌다. 양 끝이 다르거나(재사용·이름 변경), 사이에 다른 상품의 등록 claim이
-있거나, 너무 길거나, 새 상장·모호·검증 불가인 행은 사유와 함께 `stages.identity.us_symbols.unresolved`에
+있거나, 그 날들에 그 심볼이 다른 상품으로 관측되었거나(`list_contradicted`), 너무 길거나, 새 상장·모호·검증 불가인 행은 사유와 함께 `stages.identity.us_symbols.unresolved`에
 남는다. 마지막 Norgate claim 뒤 첫 목록 전의 평일은 `history_gap`(이어진 심볼 수와 남은 심볼 표본), 목록
-사이의 빈 평일은 `observation_gaps`로 보고된다. 규칙은
+사이의 빈 평일은 `observation_gaps`로 보고된다. 새 claim이 이른 날을 덮으면 앞선 목록을 거부권으로만 다시 읽고 그 수를 `veto_sources`로 보고한다. 규칙은
 [유지보수 실행](design/data-vertical.md#유지보수-실행)이 소유한다.
 
 **보고의 `promote` 단계.** `unresolved`는 이번 실행이 `unresolved`로 기록한 dataset 목록이다(뜻은 그대로).

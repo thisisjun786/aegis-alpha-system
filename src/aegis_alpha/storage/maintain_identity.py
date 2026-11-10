@@ -22,9 +22,11 @@ cutover registry. Its increment is the dated EODHD US symbol list (an
 ``qveris-eodhd-exchange-symbols-*`` source whose rows were asked for ``US``, which the KR
 build never reads): when one is linked after the newest maintenance snapshot, the run
 builds ``eodhd.us_symbol_list@1`` claims (``us_symbols``) from the new lists against the
-registered claims and registers that document. Earlier lists are not read again: what
-they showed that a later day may continue from is a registered claim now, and what they
-rejected never anchors a claim. Its report
+registered claims and registers that document. Earlier lists never anchor a claim (what
+they showed that may be continued is a registered claim now), but they are read again as
+veto evidence for the days a new claim would cover before the new lists
+(``us_symbols.build_increment``, ``veto_sources`` in the report), so lists that arrive
+one run at a time give the claims one build of all of them gives. Its report
 is ``us_symbols``; the KR report keys are unchanged.
 """
 
@@ -142,12 +144,13 @@ def _advance_us(
 ) -> tuple[dict[str, object], bool]:
     """Register the per-day US symbol claims of lists linked after ``since``."""
     lists = us_symbols.list_sources(workspace)
-    fresh = sorted(item for item, at in lists.items() if since is None or at > since)
+    fresh = {item: at for item, at in lists.items() if since is None or at > since}
     if not fresh:
         return {"new_sources": 0, "registry": "no_new_sources"}, False
-    built = us_symbols.build_from_workspace(workspace, fresh)
+    earlier = {item: at for item, at in lists.items() if item not in fresh}
+    built, read = us_symbols.build_from_workspace(workspace, fresh, earlier)
     report: dict[str, object] = {"new_sources": len(fresh), "inputs": len(fresh),
-                                 **built.report()}  # fmt: skip
+                                 "veto_sources": read, **built.report()}  # fmt: skip
     if not built.assertions:
         report["registry"] = "no_new_claims"
         return report, False
