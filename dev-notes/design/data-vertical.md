@@ -1533,7 +1533,7 @@ SystemExit) 정산하지 않는다. 그 `started` attempt는 다음 실행이 �
 assertion 집합이 바뀐 실행만 새 snapshot을 등록한다. 아무것도 등록하지 않았고 유지보수 snapshot이 없으면 승격
 template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC archive는 동결된 전환 입력이고, US 증분은
 날짜가 있는 EODHD US 종목 목록(`eodhd.us_symbol_list@1`, `storage/us_symbols.py`)이다. 새 US 목록이 있으면 그 목록과
-가장 이른 새 목록보다 7일 안에 연결된 목록을 등록된 claim과 대조해 새 claim만의 문서를 등록하고 보고는
+등록된 claim과 대조해 새 claim만의 문서를 등록하고 보고는
 `us_symbols`다(KR 보고 키는 그대로). 규칙은 이렇다.
 
 - 관측은 `EXCHANGE_CODE=US`, `delisted=0` 목록의 행이고 page receipt의 수집 시각을 갖는다. 그 행은 수집 시각의
@@ -1541,9 +1541,13 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
 - 행은 ISIN으로만 상품을 가리킨다. 검사 숫자가 맞고, 정정되지 않은 등록 FMP `isin` assertion이 Norgate asset ID가
   있는 상품 하나만 가리키며, 통화가 USD여야 한다. 티커·이름·거래소로는 상품을 정하지 않고 목록은 상품을 mint하지 않는다.
 - 평일 `d`의 관측이 모두 같은 상품 `I`를 가리키고(그 관측들의 다른 심볼은 `I`를 가리키지 않음), 그 심볼에 대해 무언가를
-  보여 주는 바로 앞 날(`before`: 앞선 관측이나 master·export·앞선 목록의 등록 claim)이 `I`를 보이며, `before` 다음 날부터
-  `d`까지 `I`가 다른 US 심볼을 갖지 않을 때 claim을 만든다. 오늘의 목록은 앞쪽 끝이 될 수 없다(#99: 수집 시점 사이에
-  티커가 바뀔 수 있으니 양 끝에서 확인되지 않는 연결은 Risk 7대로 해석하지 않는다).
+  보여 주는 바로 앞 claim(`before`: master·export·앞선 목록의 등록 claim, 또는 같은 build가 앞 날에 받아들인 claim)이
+  `I`를 보이며, `before` 다음 날부터 `d`까지 `I`가 다른 US 심볼을 갖지 않을 때 claim을 만든다. 오늘의 목록은 앞쪽 끝이
+  될 수 없고, build가 거부한 관측(이동·앞 보유자 없음·검증 불가)과 토·일 관측도 앞쪽 끝이 되지 않는다. 그래서 목록만으로는
+  등록 claim이 보여 주지 않는 상품으로 티커를 옮길 수 없다(거부된 목록 두 개가 연달아 와도 마찬가지). 재사용·이름 변경·새
+  상장은 독립된 등록 claim이 생길 때까지 해석하지 않는다(#99: 수집 시점 사이에 티커가 바뀔 수 있으니 양 끝에서 확인되지
+  않는 연결은 Risk 7대로 해석하지 않는다). 그러므로 identity 단계는 새 목록만 읽는다(앞선 목록이 보여 준 것 중 이어
+  갈 수 있는 것은 이미 등록 claim이다).
 - 사이가 토·일뿐이면 claim은 뉴욕 하루 `d`다. 평일이 비어 있으면 claim 하나가 그 공백을 잇는다: `before` 다음 날의
   뉴욕 시작부터 `d` 다음 날의 뉴욕 시작까지, 최대 `MAX_BRIDGE_DAYS`(120) 역일. 이은 날은 양 끝에서 확인된 것이지
   날마다 관측된 것이 아니며, 보고의 `bridges`(심볼, 처음·끝 날, 평일 수, 양 끝의 증거, 표본 100), `bridged_symbols`,
@@ -1616,7 +1620,9 @@ generation, 결과 `promoted`·`unchanged`)를 남긴다. 검사 ID는 (dataset,
 유효 구간)의 SHA-256을 함께 남긴다. 그 원천은 실행이 pin할 snapshot의 그 행이 달라지면 다시 계획되므로 뒤에 등록된 상장이 해석하는 행이
 빠지지 않는다. 원천의 모든 단계에 partition이 있으면 기록은 그 범위(`key_scope`, 첫 `from`과 마지막 `to`)를
 남기고, SHA-256은 key의 긴 행과 짧은 행(유효 구간이 8일 이하, 목록의 하루 claim 같은) 중 어느 시간대에서든 그
-날짜들의 해석 시각에 성립할 수 있는 것만 덮는다(`aas-maintain-key-scope-v1`). 그래서 뒤 날짜의 claim이 등록돼도
+날짜들의 **어느 시각에든** 성립할 수 있는 것만 덮는다(`aas-maintain-key-scope-v1`). 매퍼가 날짜의 시작이 아니라 행의
+수집 시각에 해석할 수 있기 때문이다(예: 서울 23:30에 받은 KIND 목록). 그래서 바로 다음 날의 claim은 그 원천을 한 번 더
+계획하게 하고, 그보다 뒤의 claim은 그러지 않는다. 그래서 뒤 날짜의 claim이 등록돼도
 그 원천은 다시 계획되지 않고, 매일의 identity 증분이 기다리는 모든 원천을 다시 계획하지 않는다. 범위가 없는
 기록은 key 전체의 SHA-256을 그대로 쓴다. 검사 ID는 그 SHA-256까지에서 나온다. 결과의 `unresolved`는 이번
 실행이 그런 원천을 기록한 dataset이고, `standing_unresolved`는 이번 실행과 상관없이 원천마다 가장 늦은 기록이

@@ -236,16 +236,22 @@ def test_saturday_and_sunday_need_no_observation() -> None:
     assert built.report()["history_gap"] is None
 
 
-def test_a_reused_or_renamed_ticker_waits_for_a_bracketing_day() -> None:
-    # Wednesday AAA names B (reused) and ZZZ names A (renamed): neither is shown the day
-    # before, so both wait; Thursday both are bracketed by Wednesday's own observation.
+def test_rejected_lists_never_bootstrap_a_reused_or_renamed_ticker() -> None:
+    # Wednesday and Thursday AAA names B (reused) and ZZZ names A (renamed). A rejected
+    # observation never anchors the next day, so two consecutive lists claim nothing:
+    # the change waits for an independent registered claim.
     rows = [_row("AAA", ISIN_B), _row("ZZZ", ISIN_A)]
     lists = [_list(_evening(WED), rows), _list(_evening(THU), rows)]
     built = build_symbol_claims(lists, _registry(_base("AAA.US", IA, TUE)))
-    assert _claims(built.document()) == [_day("AAA.US", B, THU), _day("ZZZ.US", A, THU)]
+    assert built.assertions == []
     report = built.report()
     assert report["unresolved"] == {"list_not_bracketed": ["ZZZ.US"],
                                     "list_symbol_moved": ["AAA.US"]}  # fmt: skip
+    assert report["unresolved_days"] == {"list_not_bracketed": 2, "list_symbol_moved": 2}
+    # Once a registered claim shows B holding AAA on Wednesday, Thursday continues it.
+    wednesday = Held("AAA.US", IB, session_start_us(WED), session_start_us(THU), listed=True)
+    anchored = build_symbol_claims(lists[1:], _registry(_base("AAA.US", IA, TUE), wednesday))
+    assert _claims(anchored.document()) == [_day("AAA.US", B, THU)]
 
 
 def test_conflicting_or_unverifiable_rows_name_no_instrument() -> None:
@@ -429,12 +435,20 @@ def test_list_claims_reach_a_new_snapshot_and_promote_the_rows_they_waited_for(
         "sources": 1, "rows": 2, "rows_unavailable": 0, "unresolved_tokens": 1,
         "unpublished_sources": 0, "oldest_date": WED.isoformat()}  # fmt: skip
 
-    # Thursday's list adds a later day: Wednesday's waiting source is not planned again.
+    # Thursday's claim starts within Wednesday's latest possible instants (14 hours past the
+    # UTC day), so Wednesday's waiting source is planned once more; Friday's claim is not.
     _import_list(ws, THU, [_row("AAA", ISIN_A)])
     later = maintain_identity.advance(ws, apply=True, now_us=_now())
     assert cast("dict[str, object]", later["us_symbols"])["claims"] == 1
-    newer = cast("dict[str, str]", later["snapshot"])
-    assert newer["snapshot_id"] != snapshot["snapshot_id"]
+    adjacent = cast("dict[str, str]", later["snapshot"])
+    assert adjacent["snapshot_id"] != snapshot["snapshot_id"]
+    once = _run(promote_datasets(ws, apply=True, now_us=45, routes=[ROUTE], identity=adjacent))
+    assert [item["source_id"] for item in cast("list[dict[str, object]]", once["sources"])] == [
+        waiting["source_id"]
+    ]
+    _import_list(ws, FRI, [_row("AAA", ISIN_A)])
+    newer = cast("dict[str, str]", maintain_identity.advance(ws, apply=True,
+                                                            now_us=_now())["snapshot"])  # fmt: skip
     settled = _run(promote_datasets(ws, apply=True, now_us=50, routes=[ROUTE], identity=newer))
     assert (settled["status"], settled["sources"]) == ("current", [])
     # Nothing new: the stage reports no new list and pins the same snapshot.
@@ -444,7 +458,7 @@ def test_list_claims_reach_a_new_snapshot_and_promote_the_rows_they_waited_for(
 
     # The US build reads the list claims for FMP and SEC rows and never requires their
     # lists: a build of the cutover's own source neither refuses nor reports them withdrawn.
-    assert [item.symbol for item in listed_claims(ws.state)] == ["AAA.US", "AAA.US"]
+    assert [item.symbol for item in listed_claims(ws.state)] == ["AAA.US"] * 3
     empty: dict[str, object] = {
         "schema": "aas-identity-registry-v1", "issuers": [], "instruments": [], "assertions": []
     }  # fmt: skip
@@ -527,3 +541,40 @@ def test_a_bridge_promotes_every_held_session_once_and_a_later_day_replans_nothi
     newer = cast("dict[str, str]", later["snapshot"])
     settled = _run(promote_datasets(ws, apply=True, now_us=40, routes=[ROUTE], identity=newer))
     assert (settled["status"], settled["sources"]) == ("current", [])
+
+
+def test_two_maintenance_runs_of_rejected_lists_register_nothing(ws: Workspace) -> None:
+    # Each run reads only its own new list: Thursday's run never takes Wednesday's
+    # rejected rows as the earlier end, so a hostile pair of lists cannot rebind AAA to B
+    # or ZZZ to A.
+    first = _bars(ws, TUE, "AAA.US")
+    _register_base(ws, first["source_id"])
+    anchor = {"anchor_namespace": "norgate_assetid", "anchor_token": B}
+    other = {
+        "schema": "aas-identity-registry-v1", "issuers": [],
+        "instruments": [{**anchor, "issuer": None, "asset_type": "unclassified",
+                         "venue": "XNYS"}],
+        "assertions": [{"instrument": anchor, "provider": provider, "namespace": namespace,
+                        "token": token, "valid_from_us": UNBOUNDED, "valid_to_us": None,
+                        "known_from_us": 1, "supersedes_assertion_id": None,
+                        "source_snapshot_id": "sl:" + first["source_id"],
+                        "source_hash": hashlib.sha256(token.encode()).hexdigest()}
+                       for provider, namespace, token in (("norgate", "norgate_assetid", B),
+                                                          ("fmp", "isin", ISIN_B))],
+    }  # fmt: skip
+    register_identities(ws.state, parse_registry(other), apply=True)
+    rows = [_row("AAA", ISIN_B), _row("ZZZ", ISIN_A)]
+    for day in (WED, THU):
+        _import_list(ws, day, rows)
+        us = cast(
+            "dict[str, object]",
+            maintain_identity.advance(ws, apply=True, now_us=_now())["us_symbols"],
+        )
+        assert (us["claims"], us["registry"]) == (0, "no_new_claims")
+        assert us["unresolved"] == {"list_not_bracketed": ["ZZZ.US"],
+                                    "list_symbol_moved": ["AAA.US"]}  # fmt: skip
+    claimed = ws.state.execute(
+        "SELECT count(*) FROM identity_assertions WHERE substr(source_snapshot_id, 1, 33) = ?",
+        ("sl:qveris-eodhd-exchange-symbols-",),
+    ).fetchone()
+    assert claimed[0] == 0

@@ -15,10 +15,13 @@ unresolved):
   a Norgate asset ID, and the row's currency must be USD. A ticker, a name, an exchange or
   a price never names an instrument, and a list never mints one.
 - A weekday ``d`` whose observations all name instrument ``I`` for ``<Code>.US`` (and no
-  other symbol of them names ``I``) is claimed when the latest earlier day anything shows
-  about the symbol (``before``: an earlier observation, or a registered claim of the
-  master, an export or an earlier list) shows ``I`` holding it, and ``I`` holds no other US
-  symbol from the day after ``before`` through ``d``. Today's list is never the earlier end.
+  other symbol of them names ``I``) is claimed when the latest earlier claim of the symbol
+  (``before``: a registered claim of the master, an export or an earlier list, or a claim
+  this build accepted for an earlier day) shows ``I`` holding it, and ``I`` holds no other
+  US symbol from the day after ``before`` through ``d``. Today's list is never the earlier
+  end, and neither is any observation the build rejected (or a Saturday or Sunday one):
+  lists alone never carry a ticker to an instrument no registered claim shows holding it,
+  so a reused, renamed or new ticker waits for independent registered evidence.
 - With only Saturdays and Sundays between the two, the claim is the one New York day ``d``.
   Otherwise one claim bridges the gap: from the New York start of the day after ``before``
   to that of the day after ``d``, at most ``MAX_BRIDGE_DAYS`` calendar days. Bridged days
@@ -33,8 +36,8 @@ Every day that cannot be claimed stays unresolved with its reason (data-vertical
 ``list_isin_missing``, ``list_isin_invalid``, ``list_isin_unregistered`` (a new listing or
 a security the registry never tied to an ISIN), ``list_isin_ambiguous``,
 ``list_currency_not_usd``, ``list_symbol_repeated``, ``list_isin_repeated``,
-``list_observations_disagree``, ``list_not_bracketed`` (nothing earlier shows the symbol,
-or the latest earlier observation names no instrument), ``list_symbol_moved`` (the symbol
+``list_observations_disagree``, ``list_not_bracketed`` (no registered or accepted claim
+shows the symbol earlier: a new or renamed listing), ``list_symbol_moved`` (the symbol
 named another instrument before, or the instrument held another symbol meanwhile: a
 reused or renamed ticker), ``list_registered_conflict`` (a registered claim of another
 instrument covers the day, or sits between the instrument's earlier claim and the day) and
@@ -418,30 +421,34 @@ class _Before:
     outcome: str
     """The instrument shown holding the symbol, or ``unresolved:<reason>``."""
     evidence: str
-    """``registered`` or the ``sl:`` source of the observation."""
+    """``registered``, or the ``sl:`` source of the accepted claim's end observation."""
 
 
 @dataclass(slots=True)
 class _Index:
-    """What a build judges each symbol-day against."""
+    """What a build judges each symbol-day against.
+
+    Only registered claims and the claims this build accepts anchor a later day: an
+    observation the build rejected (a moved, unbracketed or unverifiable row) or a
+    Saturday or Sunday one is never the earlier end of a claim, so lists alone can never
+    carry a ticker to an instrument that no registered claim shows holding it.
+    """
 
     held: dict[str, list[Held]]
     """Registered claims by symbol."""
     holdings: dict[str, list[Held]]
     """Registered claims by instrument."""
-    observed: dict[str, list[tuple[date, str]]]
-    """Each symbol's observed days and outcomes, in day order."""
+    accepted: dict[str, list[tuple[date, date, str, str]]]
+    """Each symbol's claims this build accepted: first day, last day, instrument, source."""
     named: dict[str, list[tuple[date, str]]]
     """Each instrument's observed days and the symbol naming it, in day order."""
-    sources: dict[tuple[str, date], str]
 
     def before(self, symbol: str, day: date) -> _Before | None:
+        """The latest earlier day a registered or accepted claim shows the symbol's holder."""
         found: _Before | None = None
-        days = self.observed.get(symbol, [])
-        position = bisect_left(days, (day, ""))
-        if position:
-            seen, outcome = days[position - 1]
-            found = _Before(seen, outcome, self.sources[symbol, seen])
+        for _, last, instrument, source in self.accepted.get(symbol, []):
+            if last < day and (found is None or last >= found.day):
+                found = _Before(last, instrument, source)
         start = session_start_us(day)
         for item in self.held.get(symbol, []):
             if item.start >= start:
@@ -454,13 +461,14 @@ class _Index:
         return found
 
     def held_before(self, symbol: str, instrument: str, day: date) -> bool:
-        """Whether ``instrument`` is shown holding ``symbol`` on some day before ``day``."""
+        """Whether a registered or accepted claim shows ``instrument`` holding ``symbol``
+        before ``day``."""
         start = session_start_us(day)
         if any(item.instrument_id == instrument and item.start < start
                for item in self.held.get(symbol, [])):  # fmt: skip
             return True
-        return any(seen < day and outcome == instrument
-                   for seen, outcome in self.observed.get(symbol, []))  # fmt: skip
+        return any(first < day and held == instrument
+                   for first, _, held, _ in self.accepted.get(symbol, []))  # fmt: skip
 
     def other_symbol(self, instrument: str, symbol: str, first: date, last: date) -> bool:
         """Whether ``instrument`` holds another US symbol on a day of ``[first, last]``."""
@@ -477,7 +485,7 @@ def build_symbol_claims(sources: Sequence[SourceRows], registry: Registry) -> Sy
     """The ``eodhd_symbol`` claims the lists show beyond the registered ones."""
     claims = SymbolClaims()
     observations, claims.mapper = map_us_symbol_lists(sources, registry)
-    index = _Index(defaultdict(list), defaultdict(list), defaultdict(list), defaultdict(list), {})
+    index = _Index(defaultdict(list), defaultdict(list), defaultdict(list), defaultdict(list))
     for item in registry.held:
         index.held[item.token].append(item)
         index.holdings[item.instrument_id].append(item)
@@ -489,7 +497,7 @@ def build_symbol_claims(sources: Sequence[SourceRows], registry: Registry) -> Sy
     listed_days = [_new_york_day(item.start) for item in registry.held if item.listed]
     claims.first_listed = min([*listed_days, *claims.observed_days], default=None)
     days = _outcomes(grouped)
-    _observe(index, days, grouped)
+    _observe(index, days)
     for (symbol, day), outcome in sorted(days.items()):
         if _weekend(day):
             continue
@@ -510,6 +518,7 @@ def build_symbol_claims(sources: Sequence[SourceRows], registry: Registry) -> Sy
             _assertion(registry.anchors[outcome], symbol, first, day, evidence)
         )
         claims.claimed_days.add(day)
+        index.accepted[symbol].append((first, day, outcome, evidence.source))
         if first < day:
             claims.bridges.append({
                 "symbol": symbol, "from": first.isoformat(), "through": day.isoformat(),
@@ -521,21 +530,12 @@ def build_symbol_claims(sources: Sequence[SourceRows], registry: Registry) -> Sy
     return claims
 
 
-def _observe(
-    index: _Index,
-    days: Mapping[tuple[str, date], str],
-    grouped: Mapping[tuple[str, date], list[Observation]],
-) -> None:
-    """Index every observed symbol-day by symbol and the instruments it names."""
+def _observe(index: _Index, days: Mapping[tuple[str, date], str]) -> None:
+    """Index the instruments every observed symbol-day names (rejected days included: they
+    only ever stop a claim, never anchor one)."""
     for (symbol, day), outcome in sorted(days.items()):
-        index.observed[symbol].append((day, outcome))
-        index.sources[symbol, day] = min(
-            (item.evidence for item in grouped[symbol, day]), key=lambda item: item.order()
-        ).source
         if not outcome.startswith("unresolved:"):
             index.named[outcome].append((day, symbol))
-    for named in index.named.values():
-        named.sort()
 
 
 def _registry_edge(claims: SymbolClaims, registry: Registry) -> None:

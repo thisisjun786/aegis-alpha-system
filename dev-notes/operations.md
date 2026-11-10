@@ -1563,8 +1563,8 @@ identity 증분 계획, dataset마다 새 원천과 단계를 낸다. `--promoti
 ```
 
 `symbol_lists`의 `US`는 상장 목록(`delisted=0`) 하나를 매일 묻는다(KR 목록은 `symbol_list_days`마다).
-identity 단계는 그 목록의 행을 등록된 FMP ISIN으로 Norgate 상품에 잇는다. 그 심볼이 바로 앞에(관측이나
-등록된 claim으로) 같은 상품에 있었으면 claim을 등록한다. 사이가 토·일뿐이면 그날 하루, 평일이 비어 있으면
+identity 단계는 그 목록의 행을 등록된 FMP ISIN으로 Norgate 상품에 잇는다. 그 심볼이 바로 앞에(등록된 claim이나
+같은 실행이 받아들인 claim으로, 거부된 관측은 아님) 같은 상품에 있었으면 claim을 등록한다. 사이가 토·일뿐이면 그날 하루, 평일이 비어 있으면
 그 빈 날부터 그날까지를 claim 하나로 잇는다(최대 120일). **이은(bridged) 날은 양 끝에서 같은 상품으로
 확인된 것이지 날마다 관측된 것이 아니다.** 보고의 `bridges`(표본), `bridged_symbols`, `bridged_days`,
 `bridge_unresolved`가 그 범위를 밝힌다. 양 끝이 다르거나(재사용·이름 변경), 사이에 다른 상품의 등록 claim이

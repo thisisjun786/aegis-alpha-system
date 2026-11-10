@@ -9,14 +9,19 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
 import pytest
 
 from aegis_alpha.storage import maintain_promotion
-from aegis_alpha.storage.maintain_promotion import Route, maintenance_spec, promote_datasets
+from aegis_alpha.storage.maintain_promotion import (
+    KeyMembers,
+    Route,
+    maintenance_spec,
+    promote_datasets,
+)
 from aegis_alpha.storage.promotion.engine import dataset_head, promote
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
 from tests.storage.promotion_support import add_source, at, bar, register_symbols, spec
@@ -128,3 +133,28 @@ def test_generation_pins_advance_and_the_identity_replaces_only_a_pinned_snapsho
                                            step=maintain_promotion.Step(None),
                                            identity=other))  # fmt: skip
     assert unpinned["identity_snapshot"] is None
+
+
+def _instant(moment: datetime) -> int:
+    return (moment - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(microseconds=1)
+
+
+def test_a_scoped_key_covers_every_instant_of_its_dates_and_nothing_two_days_on() -> None:
+    # A one-day partition of 2026-09-16. Mappers may resolve at a row's own instant: a KIND
+    # list retrieved at 23:30 in Seoul (14:30 UTC) or a US row at 23:30 in New York
+    # (03:30 UTC the next day). A short claim starting just before either must change the
+    # source's scoped key; one starting two New York days later must not.
+    day = date(2026, 9, 16)
+    hour = 3_600_000_000
+    base: list[tuple[str, str, int, int | None]] = [("AAA.KO", "ins-a", -(2**63), None)]
+
+    def scoped(*extra: tuple[str, str, int, int | None]) -> str:
+        return KeyMembers("s", sorted([*base, *extra])).scoped_sha256(day, day + timedelta(days=1))
+
+    unchanged = scoped()
+    seoul = _instant(datetime(2026, 9, 16, 14, 15, tzinfo=UTC))
+    new_york = _instant(datetime(2026, 9, 17, 3, 15, tzinfo=UTC))
+    later = _instant(datetime(2026, 9, 18, 4, tzinfo=UTC))
+    assert scoped(("NEW.KO", "ins-b", seoul, seoul + 24 * hour)) != unchanged
+    assert scoped(("NEW.US", "ins-c", new_york, new_york + 24 * hour)) != unchanged
+    assert scoped(("LATE.US", "ins-d", later, later + 24 * hour)) == unchanged

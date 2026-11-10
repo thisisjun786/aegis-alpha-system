@@ -21,11 +21,10 @@ The US registry's Norgate master, FMP profiles and SEC archive are frozen inputs
 cutover registry. Its increment is the dated EODHD US symbol list (an
 ``qveris-eodhd-exchange-symbols-*`` source whose rows were asked for ``US``, which the KR
 build never reads): when one is linked after the newest maintenance snapshot, the run
-builds ``eodhd.us_symbol_list@1`` claims (``us_symbols``) from the new lists and the lists
-linked up to ``US_CONTEXT_DAYS`` before the earliest of them against the registered
-claims, and registers that document. The context lists hold the earlier observations a
-claim may continue from when no registered claim shows them: a renamed or newly registered
-ticker's first day, which no claim covers, starts its continuation the next day. Its report
+builds ``eodhd.us_symbol_list@1`` claims (``us_symbols``) from the new lists against the
+registered claims and registers that document. Earlier lists are not read again: what
+they showed that a later day may continue from is a registered claim now, and what they
+rejected never anchors a claim. Its report
 is ``us_symbols``; the KR report keys are unchanged.
 """
 
@@ -47,8 +46,6 @@ EODHD_PREFIX: Final = f"{kr_identity.EODHD_PROVIDER}-{kr_identity.EODHD_SHAPE}-"
 KIND_PREFIX: Final = f"{kr_identity.KIND_PROVIDER}-{kr_identity.KIND_SHAPE}-"
 DART_PREFIX: Final = "opendart-receipts-"
 _CITED: Final = {"eodhd": "eodhd", "kind": "kind", "dart": "dart"}
-US_CONTEXT_DAYS: Final = 7
-_DAY_US: Final = 86_400_000_000
 
 
 def _linked(workspace: Workspace) -> dict[str, int]:
@@ -141,17 +138,15 @@ def _pin(workspace: Workspace, snapshot: str) -> dict[str, str] | None:
 
 
 def _advance_us(
-    workspace: Workspace, *, apply: bool, since: int | None, linked: dict[str, int]
+    workspace: Workspace, *, apply: bool, since: int | None
 ) -> tuple[dict[str, object], bool]:
     """Register the per-day US symbol claims of lists linked after ``since``."""
     lists = us_symbols.list_sources(workspace)
     fresh = sorted(item for item, at in lists.items() if since is None or at > since)
     if not fresh:
         return {"new_sources": 0, "registry": "no_new_sources"}, False
-    earliest = min(linked[item] for item in fresh) - US_CONTEXT_DAYS * _DAY_US
-    inputs = sorted(item for item, at in lists.items() if at >= earliest)
-    built = us_symbols.build_from_workspace(workspace, inputs)
-    report: dict[str, object] = {"new_sources": len(fresh), "inputs": len(inputs),
+    built = us_symbols.build_from_workspace(workspace, fresh)
+    report: dict[str, object] = {"new_sources": len(fresh), "inputs": len(fresh),
                                  **built.report()}  # fmt: skip
     if not built.assertions:
         report["registry"] = "no_new_claims"
@@ -205,7 +200,7 @@ def advance(workspace: Workspace, *, apply: bool, now_us: int) -> dict[str, obje
         }  # fmt: skip
         added = result.get("new")
         registered = apply and isinstance(added, dict) and any(added.values())
-    us, us_registered = _advance_us(workspace, apply=apply, since=since, linked=linked)
+    us, us_registered = _advance_us(workspace, apply=apply, since=since)
     report["us_symbols"] = us
     registered = registered or us_registered
     current = snapshot_id(workspace)

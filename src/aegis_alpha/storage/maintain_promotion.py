@@ -48,7 +48,8 @@ resolves that key with other rows, so a listing registered later reaches its row
 every step of the source has a partition, the record names that scope (``key_scope``,
 the first ``from`` and last ``to``) and the SHA-256 covers the key's long-lived rows and
 only the short ones (valid at most ``SHORT_DAYS`` days, such as a symbol list's per-day
-claims) that can hold at a resolution instant of those dates in any time zone
+claims) that can hold at any instant of those dates in any time zone, because a mapper may
+resolve at a row's own instant rather than at the start of its date
 (``aas-maintain-key-scope-v1``). A claim registered for a later day then leaves the
 source settled, so daily identity increments do not plan every waiting source again; a
 record without a scope keeps the whole key's SHA-256. A refused or
@@ -100,7 +101,7 @@ SCOPE_FORMAT: Final = "aas-maintain-key-scope-v1"
 SHORT_DAYS: Final = 8
 _DAY_US: Final = 86_400_000_000
 _ZONE_US: Final = 14 * 3_600_000_000
-"""The widest UTC offset: a date's local start lies within it of its UTC start."""
+"""The widest UTC offset: every local instant of a date lies within it of the UTC date."""
 _PIN_KEYS: Final = frozenset({"dataset_id", "version", "generation_id", "chain_hash",
                               "manifest_hash"})  # fmt: skip
 _EXCHANGE: Final = (
@@ -345,10 +346,13 @@ class KeyMembers:
         return self._long, self._short
 
     def scoped_sha256(self, first: date, stop: date) -> str:
-        """SHA-256 of the long rows and the short rows that can hold on ``[first, stop)``."""
+        """SHA-256 of the long rows and the short rows that can hold at any instant of the
+        dates ``[first, stop)`` in any time zone."""
         long, short = self._split()
         low = _utc_start_us(first) - _ZONE_US
-        high = _utc_start_us(stop - timedelta(days=1)) + _ZONE_US
+        # Any instant of the dates in any zone: a mapper may resolve at a row's retrieval
+        # instant (KIND lists late in the evening), not at the start of its date.
+        high = _utc_start_us(stop) + _ZONE_US
         begin = bisect_left(self._starts, low - SHORT_DAYS * _DAY_US)
         end = bisect_right(self._starts, high)
         inside = sorted(list(row) for row in short[begin:end] if cast("int", row[3]) > low)
