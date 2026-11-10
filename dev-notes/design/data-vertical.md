@@ -3108,3 +3108,4 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-532 | 앞선 실행이 거부한 관측은 뒤 실행의 bridge에 대한 거부권으로 다시 읽힌다 | `tests/storage/test_us_symbols.py::test_an_earlier_run_s_rejected_rows_still_veto_a_later_bridge` | 구현 |
 | DV-533 | 무작위 시나리오에서 한 번의 build는 목록 순서와 무관하고, 다른 상품·다른 심볼 관측이 있는 날이나 다른 상품의 등록 claim을 덮지 않으며, 모든 claim이 등록·수용 claim에서 이어진다 | `tests/storage/test_us_symbol_invariants.py::test_batch_builds_are_order_free_and_safe` | 구현 |
 | DV-534 | 덮는 날 순서로 한 실행씩 도착한 목록으로 유지보수 identity 단계가 등록하는 claim은 한 번의 build와 같다 | `tests/storage/test_us_symbol_invariants.py::test_run_by_run_maintenance_registers_what_one_build_finds` | 구현 |
+| DV-535 | `aas-maintain-key-scope-v1`(범위 key)와 key 전체의 SHA-256은 고정된 기대값을 가진다 | `tests/storage/test_maintain_promotion.py::test_the_key_digests_are_frozen` | 구현 |

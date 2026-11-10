@@ -175,3 +175,29 @@ def test_a_scoped_key_does_not_depend_on_the_order_of_its_rows() -> None:
         return KeyMembers("s", members).scoped_sha256(day, day + timedelta(days=1))
 
     assert scoped(rows) == scoped(list(reversed(rows))) == scoped(rows[1:] + rows[:1])
+
+
+# A fixture for the frozen key digests: a long unbounded row, a long bounded row, a short
+# row inside the one-day window of 2026-09-16, a short row outside it, and a long row with
+# a start and no end; in the engine's order (token, instrument, from, to).
+_UNBOUNDED = -(2**63)
+_FROZEN: list[tuple[str, str, int, int | None]] = [
+    ("AAA.US", "ins-a", _UNBOUNDED, None),
+    ("BBB.US", "ins-b", _UNBOUNDED, 1788926400000000),  # 2026-09-09T04:00Z
+    ("CCC.US", "ins-c", 1789531200000000, 1789617600000000),  # 2026-09-16 New York day
+    ("DDD.US", "ins-d", 1789704000000000, 1789790400000000),  # 2026-09-18 New York day
+    ("EEE.US", "ins-e", 1788235200000000, None),  # from 2026-09-01T04:00Z
+]
+
+
+def test_the_key_digests_are_frozen() -> None:
+    # aas-maintain-key-scope-v1: sha256 of canonical JSON
+    # ["aas-maintain-key-scope-v1", sha256(canonical(sorted long rows)), sorted inside rows];
+    # the whole key: sha256 of canonical JSON of every row in the engine's order. The long
+    # rows are given in reverse so the scoped digest cannot depend on the caller's order.
+    scoped = KeyMembers("s", list(reversed(_FROZEN))).scoped_sha256(date(2026, 9, 16),
+                                                                    date(2026, 9, 17))  # fmt: skip
+    assert scoped == "8ce88adbad30b77cd720ed8bbeef836afef7fbcb41b7b237e23445954a9c9cd1"
+    assert KeyMembers("s", _FROZEN).sha256() == (
+        "dc93aa5cb1c7124afe9cd864d8b171151e1b5fe26f4437d048971187d8c53cd6"
+    )
