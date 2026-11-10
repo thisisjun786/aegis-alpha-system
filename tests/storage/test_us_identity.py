@@ -8,7 +8,7 @@ import json
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -27,11 +27,12 @@ from aegis_alpha.storage.identity import (
     register_identities,
     snapshot_identities,
 )
-from aegis_alpha.storage.kr_identity import UNBOUNDED
+from aegis_alpha.storage.kr_identity import UNBOUNDED, Evidence
 from aegis_alpha.storage.promotion import formats
 from aegis_alpha.storage.promotion.engine import promote
 from aegis_alpha.storage.source_identity import SourceFile
 from aegis_alpha.storage.us_identity import (
+    ListedClaim,
     UsRegistry,
     assetid_set_sha256,
     build_from_workspace,
@@ -915,3 +916,52 @@ def test_a_series_links_to_the_earliest_valid_cik_of_all_its_claims() -> None:
     assert (links["1"][0], links["1"][2]) == ("0000000001", 20)
     assert [issuer["name"] for issuer in issuers] == ["X Corp"]
     assert dict(unresolved) == {"sec_cik_differs_across_claims": ["AAA"]}
+
+
+def _listed(assetid: str, symbol: str, day: date) -> ListedClaim:
+    """A registered symbol-list claim of ``day``, known that evening in New York."""
+    start = session_start_us(day)
+    return ListedClaim(assetid, symbol, start, session_start_us(day + timedelta(days=1)),
+                       Evidence("sl:qveris-eodhd-exchange-symbols-synthetic", "0" * 64,
+                                start + 20 * 3_600_000_000))  # fmt: skip
+
+
+def test_fmp_and_sec_rows_are_judged_against_registered_symbol_list_days() -> None:
+    # The master's last session is Tuesday 2026-09-08. A dated symbol list later claims AAA
+    # and BBB for Monday 2026-09-21, the day the SEC archive (its link) and AAA's FMP profile
+    # were retrieved; BBB's profile was retrieved two days after its last list day.
+    day = date(2026, 9, 21)
+    rows = [master(1, "AAA", last_date="2026-09-08"), master(2, "BBB")]
+    inside = datetime(2026, 9, 21, 15, tzinfo=UTC)
+    fmp = [
+        fmp_rows(
+            [
+                profile("AAA", CIK_A, APPLE_LIKE, retrieved=inside),
+                profile("BBB", CIK_B, retrieved=datetime(2026, 9, 23, 15, tzinfo=UTC)),
+            ]
+        )
+    ]
+    sec = [in_memory(submissions([(CIK_A, "Synthetic A Inc", ["AAA"])]))]
+    frozen = build_us_registry(linked(rows), fmp=fmp, sec=sec)
+    assert frozen.unresolved["fmp"] == {"fmp_after_master_through": ["AAA", "BBB"]}
+    assert frozen.unresolved["issuers"]["sec_after_master_through"] == ["AAA"]
+
+    listed = [_listed("1", "AAA.US", day), _listed("2", "BBB.US", day)]
+    registry = build_us_registry(linked(rows), fmp=fmp, sec=sec, listed=listed)
+    assert registry.unresolved["fmp"] == {"fmp_after_symbol_list": ["BBB"]}
+    fmp_symbol = [row for row in _assertions(registry) if row["namespace"] == "fmp_symbol"]
+    assert [(row["token"], row["valid_from_us"], row["valid_to_us"]) for row in fmp_symbol] == [
+        ("AAA", session_start_us(day), session_start_us(day + timedelta(days=1)))
+    ]
+    issuer = mint_issuer("sec_cik", CIK_A)
+    links = [row["token"] for row in _assertions(registry) if row["namespace"] == "issuer"]
+    assert links == [issuer_link_token(issuer, _instrument(1))]
+    # The list's claims stay the registry's: the document never repeats them.
+    symbols = [row for row in _assertions(registry) if row["namespace"] == "eodhd_symbol"]
+    assert [(row["token"], row["valid_to_us"]) for row in symbols] == [
+        ("AAA.US", session_start_us(date(2026, 9, 9))),
+        ("BBB.US", session_start_us(date(2026, 9, 9))),
+    ]
+    resolved = registry.resolve([("AAA.US", day, 3), ("AAA.US", day + timedelta(days=1), 2)])
+    assert (resolved["resolved_rows"], resolved["unresolved_rows"]) == (
+        3, {"after_symbol_list": 2})  # fmt: skip

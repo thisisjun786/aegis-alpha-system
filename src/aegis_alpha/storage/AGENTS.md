@@ -255,7 +255,13 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   `kind-listings` import, is skipped as `shape`. `maintain_identity` rebuilds and registers
   the KR registry when a newer KR identity source is linked and pins the
   `maintain-<assertion set>` snapshot; it reads only `kind-listings` tables with the
-  `kind.listings@1` columns and lists the others in `skipped_sources`. See the maintenance section of `dev-notes/design/data-vertical.md`.
+  `kind.listings@1` columns and lists the others in `skipped_sources`. Its US increment is
+  `us_symbols` (`eodhd.us_symbol_list@1`): a dated EODHD US list claims a weekday for one
+  instrument only through a registered FMP ISIN and an observed or registered previous
+  weekday, for exactly that New York day; every other day stays unresolved with its reason.
+  `promote_datasets` reports `standing_unresolved` from the persisted `maintain_source@1`
+  records, and an unresolved record of a partitioned source keys its re-plan on the identity
+  rows of its own dates (`key_scope`). See the maintenance section of `dev-notes/design/data-vertical.md`.
 - `bulk_generation` publishes a staged DuckDB table as one generation: plan without
   writing, then one transaction with the marker and `INSERT … SELECT`. DuckDB encodes and
   sorts `aas-rowset-v1` rows and `rowset.RowsetStream` digests them in admitted batches and

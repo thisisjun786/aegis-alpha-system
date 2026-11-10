@@ -1500,7 +1500,8 @@ Qveris의 유료 크레딧은 실행 하나의 호출 수·크레딧 상한과, 
 실행은 이 순서로 상한이 남는 동안 묻는다. (1) 거래소(`US`는 XNYS, `KO`·`KQ`는 XKRX) 선언 달력의 열린
 session마다 일간 `prices`·`splits`·`dividends` 내려받기. 거래소의 `since`부터(관측일의 366일 전보다 이르지
 않게) 관측일 전날까지와 그 거래소의 `extra_sessions`(그 이전의 명시한 공백)이고, 날짜, 거래소, dataset 순이다. 선언 범위 밖의 날은 `undeclared_days`로 보고하고 묻지
-않는다. (2) KR 거래소 종목 목록(`KO`·`KQ`, 상장·상폐). 새 KR 상장의 identity 입력이다. (3) FX 쌍
+않는다. (2) 거래소 종목 목록: KR(`KO`·`KQ`, 상장·상폐, `symbol_list_days`마다)은 새 KR 상장의 identity 입력이고,
+`US`(상장만, 관측일마다, 시장 `US`, 원장 dataset `identity.us.eodhd`)는 US 티커 claim을 날짜별로 잇는 관측이다. (3) FX 쌍
 이력(`<PAIR>.FOREX`, 관측일의 `forex_lookback_days` 전부터). 재시도(`failed_retry`, `uncertain_retry`)는 같은 순서로
 모든 첫 묻기와 `refresh` 뒤에 오므로 상한이 남긴 만큼만 쓴다.
 
@@ -1520,8 +1521,9 @@ SystemExit) 정산하지 않는다. 그 `started` attempt는 다음 실행이 �
 
 **적재.** 완료된 일간·FX job 중 어느 `qveris-*` 원천의 lineage에도 fingerprint가 없는 것을
 [Qveris 적재](#qveris-수집과-원천-적재)로 commit한다. 가격·기업행동 행은 설정의 identity 문서가 있을 때만
-적재하고, 없으면 `waiting_for_identity`로 보고한다. 완료된 KR 종목 목록 job은 [KR 등록](#kr-등록)의
-`qveris-eodhd-exchange-symbols-*` 원천이 된다.
+적재하고, 없으면 `waiting_for_identity`로 보고한다. 완료된 KR·US 종목 목록 job은 [KR 등록](#kr-등록)의
+`qveris-eodhd-exchange-symbols-*` 원천이 된다. 행의 `exchange_code`가 `US`인 원천이 US 목록이고 KR 증분은 읽지
+않는다.
 
 **identity 증분.** commit된 KR identity 원천(EODHD KR 종목 목록, `kind.listings@1`이 읽는 열(`short_code`,
 `listed_on`, `retrieved_at_utc`)이 있는 KIND 목록, 완료된 `corp_codes` 답을 담은 OpenDART receipts 테이블) 중 `sl:` 연결이 가장 새로운 유지보수 snapshot보다 늦은 것이 있거나 유지보수 snapshot이
@@ -1529,8 +1531,31 @@ SystemExit) 정산하지 않는다. 그 `started` attempt는 다음 실행이 �
 재사용되고 충돌은 문서 전체를 거부한다. 유지보수 identity snapshot은 등록된 모든 assertion의 snapshot이고 ID는
 `maintain-`과 정렬한 assertion ID 목록의 SHA-256 앞 32자다. 그래서 registry가 그대로면 같은 snapshot이고
 assertion 집합이 바뀐 실행만 새 snapshot을 등록한다. 아무것도 등록하지 않았고 유지보수 snapshot이 없으면 승격
-template의 snapshot을 그대로 쓴다. US identity 원천(Norgate master, FMP profile, SEC archive)은 동결된 전환
-입력이라 유지보수 증분이 없다. `korea.public_response@1` legacy import가 commit한 `kind-listings-*`
+template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC archive는 동결된 전환 입력이고, US 증분은
+날짜가 있는 EODHD US 종목 목록(`eodhd.us_symbol_list@1`, `storage/us_symbols.py`)이다. 새 US 목록이 있으면 그 목록과
+가장 이른 새 목록보다 7일 안에 연결된 목록을 등록된 claim과 대조해 새 claim만의 문서를 등록하고 보고는
+`us_symbols`다(KR 보고 키는 그대로). 규칙은 이렇다.
+
+- 관측은 `EXCHANGE_CODE=US`, `delisted=0` 목록의 행이고 page receipt의 수집 시각을 갖는다. 그 행은 수집 시각의
+  뉴욕 날짜, 뉴욕 09:30 전이면 그 전날의 거래일을 덮는다.
+- 행은 ISIN으로만 상품을 가리킨다. 검사 숫자가 맞고, 정정되지 않은 등록 FMP `isin` assertion이 Norgate asset ID가
+  있는 상품 하나만 가리키며, 통화가 USD여야 한다. 티커·이름·거래소로는 상품을 정하지 않고 목록은 상품을 mint하지 않는다.
+- 평일 `d`의 `<Code>.US` claim은 `d`를 덮는 모든 관측이 같은 상품 `I`를 가리키고, 그 관측들의 다른 심볼이 `I`를
+  가리키지 않으며, 토·일을 건너뛴 바로 앞 날에 `I`가 그 심볼을 가졌음이 그 날을 덮는 관측이나 등록된 claim(master,
+  export, 앞선 목록 날)으로 보일 때만 생긴다. 오늘의 목록은 이전 날의 증거가 아니다.
+- claim은 정확히 그 하루다: `d`의 뉴욕 시작부터 다음 날의 뉴욕 시작까지(`eodhd.bars@1`이 해석하는 시각), 그 날을
+  덮는 가장 이른 관측의 수집 시각부터 알려지고 그 행을 인용한다. 등록된 claim이 이미 덮는 날은 그대로 두므로
+  구간이 겹치지 않는다.
+- 그 밖의 날은 사유와 함께 해석하지 않는다(Risk 7): `list_isin_missing`, `list_isin_invalid`,
+  `list_isin_unregistered`, `list_isin_ambiguous`, `list_currency_not_usd`, `list_symbol_repeated`,
+  `list_isin_repeated`, `list_observations_disagree`, `list_not_bracketed`(바로 앞 평일이 관측되지 않았거나 상품을
+  가리키지 않음), `list_symbol_moved`(그 날 다른 상품: 재사용·이름 변경), `list_registered_conflict`. 마지막
+  Norgate claim 뒤 첫 관측까지의 평일은 `history_gap`, 관측 사이의 빈 평일은 `observation_gaps`로 보고한다. 등록된
+  어느 원천도 그 날들을 덮지 않는다.
+
+`aas identity us-build`는 등록된 목록 claim을 다시 만들지 않고 읽어 master·export claim과 함께 FMP·SEC 행을 판정하는
+구간으로 쓴다(마지막 목록 날 뒤는 `fmp_after_symbol_list`). 그래서 `check_registered`는 그 원천을 요구하지 않고
+철회로 보고하지도 않는다. `korea.public_response@1` legacy import가 commit한 `kind-listings-*`
 `listings` 테이블은 원천 ID 접두어와 테이블 이름이 같지만 그 열이 없으므로 KR identity 원천이 아니다. 단계는
 그런 원천을 건너뛰고 보고의 `skipped_sources`(`kind`)에 원천 ID로 남긴다.
 
@@ -1581,7 +1606,13 @@ generation, 결과 `promoted`·`unchanged`)를 남긴다. 검사 ID는 (dataset,
 않는다. pin한 snapshot이 행을 `unresolved`·`ambiguous`로 남긴 원천은 결과 `unresolved`로 기록하고, 그 snapshot과
 매퍼 identity key(provider, namespace)로 그 snapshot이 해석에 쓰는 행(정정되지 않은 member의 token, instrument,
 유효 구간)의 SHA-256을 함께 남긴다. 그 원천은 실행이 pin할 snapshot의 그 행이 달라지면 다시 계획되므로 뒤에 등록된 상장이 해석하는 행이
-빠지지 않는다. 검사 ID는 그 SHA-256까지에서 나온다. 결과의 `unresolved`는 그런 원천이 있는 dataset이다. 거부되거나 막힌 단계는 아무것도 남기지 않으므로 그 원천은 다음 실행에 다시 계획된다. 단계 사이에서
+빠지지 않는다. 원천의 모든 단계에 partition이 있으면 기록은 그 범위(`key_scope`, 첫 `from`과 마지막 `to`)를
+남기고, SHA-256은 key의 긴 행과 짧은 행(유효 구간이 8일 이하, 목록의 하루 claim 같은) 중 어느 시간대에서든 그
+날짜들의 해석 시각에 성립할 수 있는 것만 덮는다(`aas-maintain-key-scope-v1`). 그래서 뒤 날짜의 claim이 등록돼도
+그 원천은 다시 계획되지 않고, 매일의 identity 증분이 기다리는 모든 원천을 다시 계획하지 않는다. 범위가 없는
+기록은 key 전체의 SHA-256을 그대로 쓴다. 검사 ID는 그 SHA-256까지에서 나온다. 결과의 `unresolved`는 이번
+실행이 그런 원천을 기록한 dataset이고, `standing_unresolved`는 이번 실행과 상관없이 원천마다 가장 늦은 기록이
+`unresolved`인 원천의 dataset별 요약(저장된 기록만 읽는다)이다. 형식은 [운영 문서](../operations.md#하루-유지보수-실행)가 소유한다. 거부되거나 막힌 단계는 아무것도 남기지 않으므로 그 원천은 다음 실행에 다시 계획된다. 단계 사이에서
 멈춘 원천은 끝난 단계가 빈 delta로 다시 계획된다. 결과를 선언한 매퍼가 `promotion_coverage@1`을 남긴 원천도
 끝난 것이다. 운영자의 승격이 pin한 원천은 첫 유지보수 실행에서 한 번 더 계획되어 `unchanged`로 기록되고, head보다
 이른 내려받기는 `stale`이라 head를 대체하지 않는다.
@@ -3031,3 +3062,11 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-511 | 색인의 403은 분기 목록이 그날 `master` 파일을 싣지 않을 때만 `NO_DATA`이고, 다른 분기·읽히지 않는 목록·목록의 403·404는 `FAILED`다 | `tests/data/test_sec_collect.py::test_a_refused_index_is_no_index_only_when_its_quarter_listing_omits_it` | 구현 |
 | DV-512 | 403을 준 휴일 색인은 분기 목록이 싣지 않으면 404처럼 이틀 뒤 덮이고 실행은 멈추지 않는다 | `tests/storage/test_us_collection.py::test_a_holiday_index_refused_with_403_is_a_day_without_an_index` | 구현 |
 | DV-513 | 분기 목록이 싣는 날의 403, 읽히지 않는 목록은 거부로 남아 실행을 멈추고 그날은 덮이지 않는다 | `tests/storage/test_us_collection.py::test_a_403_on_an_index_its_listing_names_still_stops_the_run` | 구현 |
+| DV-514 | 날짜가 있는 US 종목 목록은 Norgate claim 뒤 관측된 하루마다만 그 하루의 `eodhd_symbol` claim을 만들고 알려진 시각은 그 관측의 수집 시각이다 | `tests/storage/test_us_symbols.py::test_each_observed_day_after_the_export_continues_the_ticker_for_that_day_only` | 구현 |
+| DV-515 | 관측되지 않은 평일 뒤 날은 claim되지 않고 `history_gap`·`observation_gaps`로 보고되며 토·일은 관측이 필요 없다 | `tests/storage/test_us_symbols.py::test_an_unobserved_weekday_is_never_claimed_and_is_reported_as_a_gap` | 구현 |
+| DV-516 | 재사용·이름 변경된 티커는 같은 상품을 가리키는 앞 관측이 있는 날부터만 claim된다 | `tests/storage/test_us_symbols.py::test_a_reused_or_renamed_ticker_waits_for_a_bracketing_day` | 구현 |
+| DV-517 | ISIN 누락·무효·미등록·모호, 비 USD, 같은 날 엇갈린 관측, 반복된 심볼·ISIN은 사유와 함께 해석하지 않는다 | `tests/storage/test_us_symbols.py::test_conflicting_or_unverifiable_rows_name_no_instrument` | 구현 |
+| DV-518 | 관측은 뉴욕 09:30 기준 거래일을 덮고 claim은 DST가 바뀌어도 뉴욕 하루이며 등록된 claim과 겹치지 않는다 | `tests/storage/test_us_symbols.py::test_claims_span_one_new_york_day_across_the_dst_change` | 구현 |
+| DV-519 | 목록 claim은 새 유지보수 snapshot으로 기다리던 `unresolved` 가격 원천을 다시 승격하고, 뒤 날짜 claim은 끝난 원천을 다시 계획하지 않으며 `standing_unresolved`는 새 원천이 없는 실행에도 남는다 | `tests/storage/test_us_symbols.py::test_list_claims_reach_a_new_snapshot_and_promote_the_rows_they_waited_for` | 구현 |
+| DV-520 | `us-build`는 등록된 목록 claim 구간에서 FMP·SEC 행을 판정하고 목록 claim을 문서에 반복하지 않는다 | `tests/storage/test_us_identity.py::test_fmp_and_sec_rows_are_judged_against_registered_symbol_list_days` | 구현 |
+| DV-521 | US 종목 목록은 상장만 매일 묻고 적재되어 KR 증분이 아닌 US 증분이 읽는다 | `tests/application/test_maintain.py::test_a_us_symbol_list_is_collected_imported_and_read_by_the_identity_stage` | 구현 |

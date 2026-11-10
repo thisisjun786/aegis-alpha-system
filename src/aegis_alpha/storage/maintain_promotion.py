@@ -44,13 +44,24 @@ pin and each step's request and generation (``promoted`` or ``unchanged``). A so
 whose rows the pinned snapshot left ``unresolved`` or ``ambiguous`` is recorded
 ``unresolved`` with the snapshot and the SHA-256 of the rows that snapshot resolves the
 mapper's identity key with; it is planned again once the snapshot a run would pin
-resolves that key with other rows, so a listing registered later reaches its rows. A refused or
+resolves that key with other rows, so a listing registered later reaches its rows. When
+every step of the source has a partition, the record names that scope (``key_scope``,
+the first ``from`` and last ``to``) and the SHA-256 covers the key's long-lived rows and
+only the short ones (valid at most ``SHORT_DAYS`` days, such as a symbol list's per-day
+claims) that can hold at a resolution instant of those dates in any time zone
+(``aas-maintain-key-scope-v1``). A claim registered for a later day then leaves the
+source settled, so daily identity increments do not plan every waiting source again; a
+record without a scope keeps the whole key's SHA-256. A refused or
 blocked step records nothing, so the source is planned again on the next run; a run that
 stopped between the steps of one source plans its done steps again as empty deltas.
 Sources an operator's promotion pinned are planned once more on the first maintenance
 run and recorded as unchanged (an older download than the head is ``stale`` and never
 replaces it). A source whose outcome-declaring mapper recorded ``promotion_coverage@1`` is
 done as well.
+
+Every pass also reports ``standing_unresolved``: per dataset, the sources whose latest
+``maintain_source@1`` record is ``unresolved``, whatever this pass planned, read from those
+persisted records alone (``promote.unresolved`` stays the datasets this pass recorded).
 """
 
 from __future__ import annotations
@@ -58,8 +69,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Final, cast
 
 import duckdb
@@ -72,7 +84,7 @@ from aegis_alpha.storage.promotion.mappers import mapper
 from aegis_alpha.storage.promotion.mappers.fred import vintage_partitions
 from aegis_alpha.storage.provider_collection import committed_tables
 from aegis_alpha.storage.raw import put_raw
-from aegis_alpha.storage.source_library import list_sources
+from aegis_alpha.storage.source_library import list_sources, list_tables
 from aegis_alpha.storage.state import atomic
 
 if TYPE_CHECKING:
@@ -84,6 +96,11 @@ if TYPE_CHECKING:
 CHECK_RULE: Final = ("maintain_source", "1")
 UNRESOLVED: Final = "unresolved"
 _LINK: Final = "sl:"
+SCOPE_FORMAT: Final = "aas-maintain-key-scope-v1"
+SHORT_DAYS: Final = 8
+_DAY_US: Final = 86_400_000_000
+_ZONE_US: Final = 14 * 3_600_000_000
+"""The widest UTC offset: a date's local start lies within it of its UTC start."""
 _PIN_KEYS: Final = frozenset({"dataset_id", "version", "generation_id", "chain_hash",
                               "manifest_hash"})  # fmt: skip
 _EXCHANGE: Final = (
@@ -290,11 +307,70 @@ def candidates(  # noqa: PLR0913 -- the route and the pass's lookups
     )
 
 
-def _done(workspace: Workspace, dataset_id: str, key_sha256: str | None) -> set[tuple[str, str]]:
+_EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _utc_start_us(day: date) -> int:
+    return (datetime(day.year, day.month, day.day, tzinfo=UTC) - _EPOCH) // timedelta(
+        microseconds=1
+    )
+
+
+type Member = tuple[str, str, int, int | None]
+
+
+@dataclass(slots=True)
+class KeyMembers:
+    """The rows one snapshot resolves one identity key with, in the engine's order."""
+
+    snapshot_id: str
+    rows: list[Member]
+    _long: str | None = None
+    _short: list[Member] | None = None
+    _starts: list[int] = field(default_factory=list)
+
+    def sha256(self) -> str:
+        """SHA-256 of every row (``key_members_sha256``)."""
+        return hashlib.sha256(formats.canonical([list(row) for row in self.rows])).hexdigest()
+
+    def _split(self) -> tuple[str, list[Member]]:
+        if self._long is None or self._short is None:
+            limit = SHORT_DAYS * _DAY_US
+            short = [row for row in self.rows if row[3] is not None and row[3] - row[2] <= limit]
+            kept = set(short)
+            long = [list(row) for row in self.rows if row not in kept]
+            self._long = hashlib.sha256(formats.canonical(long)).hexdigest()
+            self._short = sorted(short, key=lambda row: row[2])
+            self._starts = [row[2] for row in self._short]
+        return self._long, self._short
+
+    def scoped_sha256(self, first: date, stop: date) -> str:
+        """SHA-256 of the long rows and the short rows that can hold on ``[first, stop)``."""
+        long, short = self._split()
+        low = _utc_start_us(first) - _ZONE_US
+        high = _utc_start_us(stop - timedelta(days=1)) + _ZONE_US
+        begin = bisect_left(self._starts, low - SHORT_DAYS * _DAY_US)
+        end = bisect_right(self._starts, high)
+        inside = sorted(list(row) for row in short[begin:end] if cast("int", row[3]) > low)
+        return hashlib.sha256(formats.canonical([SCOPE_FORMAT, long, inside])).hexdigest()
+
+    def recorded(self, scope: Mapping[str, str] | None) -> dict[str, object]:
+        """The ``identity`` a record names for a source of ``scope`` (None: unpartitioned)."""
+        if scope is None:
+            return {"snapshot_id": self.snapshot_id, "key_sha256": self.sha256()}
+        digest = self.scoped_sha256(date.fromisoformat(scope["from"]),
+                                    date.fromisoformat(scope["to"]))  # fmt: skip
+        return {"snapshot_id": self.snapshot_id, "key_sha256": digest,
+                "key_scope": dict(scope)}  # fmt: skip
+
+
+def _done(
+    workspace: Workspace, dataset_id: str, members: KeyMembers | None
+) -> set[tuple[str, str]]:
     """(source ID, table) pins a maintenance record or a coverage check already settles.
 
-    An ``unresolved`` record settles its source only while ``key_sha256``, the identity
-    members the run would resolve with, is the one it recorded.
+    An ``unresolved`` record settles its source only while the identity members the run
+    would resolve with give the SHA-256 it recorded, over its scope when it names one.
     """
     done: set[tuple[str, str]] = set()
     for rule, result, reason in workspace.state.execute(
@@ -305,7 +381,11 @@ def _done(workspace: Workspace, dataset_id: str, key_sha256: str | None) -> set[
         body = json.loads(str(reason))
         if rule == CHECK_RULE[0] and result == UNRESOLVED:
             recorded = cast("dict[str, object]", body.get("identity") or {})
-            if key_sha256 is None or recorded.get("key_sha256") != key_sha256:
+            scope = cast("dict[str, str] | None", recorded.get("key_scope"))
+            if (
+                members is None
+                or recorded.get("key_sha256") != members.recorded(scope)["key_sha256"]
+            ):
                 continue
         pins = [body["source"]] if rule == CHECK_RULE[0] else body.get("sources", [])
         done.update((str(pin["source_id"]), str(pin["table"])) for pin in pins)
@@ -315,6 +395,12 @@ def _done(workspace: Workspace, dataset_id: str, key_sha256: str | None) -> set[
 def key_members_sha256(workspace: Workspace, pin: Mapping[str, str], provider: str,
                        namespace: str) -> str:  # fmt: skip
     """SHA-256 of the rows a snapshot resolves one identity key with (the engine's view)."""
+    return key_members(workspace, pin, provider, namespace).sha256()
+
+
+def key_members(workspace: Workspace, pin: Mapping[str, str], provider: str,
+                namespace: str) -> KeyMembers:  # fmt: skip
+    """The rows a snapshot resolves one identity key with (the engine's view)."""
     snapshot = IdentityPin(pin["snapshot_id"], pin["content_hash"])
     parts = membership_parts(workspace.state, snapshot)
     names = [cast("IdentityPin", part).snapshot_id for part in parts] or [snapshot.snapshot_id]
@@ -325,7 +411,11 @@ def key_members_sha256(workspace: Workspace, pin: Mapping[str, str], provider: s
         "AND a.provider=? AND a.namespace=? ORDER BY 1, 2, 3, 4",
         (json.dumps(names), provider, namespace),
     ).fetchall()
-    return hashlib.sha256(formats.canonical([list(row) for row in rows])).hexdigest()
+    return KeyMembers(
+        snapshot.snapshot_id,
+        [(str(token), str(instrument), int(start), None if end is None else int(end))
+         for token, instrument, start, end in rows],
+    )  # fmt: skip
 
 
 def _resolution(
@@ -333,8 +423,8 @@ def _resolution(
     template: Mapping[str, object],
     mapper_name: str,
     identity: Mapping[str, str] | None,
-) -> dict[str, str] | None:
-    """The snapshot a maintenance spec of ``template`` pins and its identity-key members."""
+) -> KeyMembers | None:
+    """The identity-key members of the snapshot a maintenance spec of ``template`` pins."""
     pinned = cast("dict[str, str] | None", template.get("identity_snapshot"))
     if pinned is None:
         return None
@@ -343,8 +433,7 @@ def _resolution(
     key = mapper(mapper_name).identity(args)
     if key is None:
         return None
-    digest = key_members_sha256(workspace, snapshot, key.provider, key.namespace)
-    return {"snapshot_id": snapshot["snapshot_id"], "key_sha256": digest}
+    return key_members(workspace, snapshot, key.provider, key.namespace)
 
 
 def _template(
@@ -444,7 +533,7 @@ def _record(  # noqa: PLR0913 -- the source, its steps and the identity it resol
     pin: Mapping[str, str],
     steps: Sequence[Mapping[str, object]],
     *,
-    resolution: Mapping[str, str] | None,
+    resolution: Mapping[str, object] | None,
     now_us: int,
 ) -> str | None:
     version = workspace.state.execute(
@@ -472,7 +561,7 @@ def _record(  # noqa: PLR0913 -- the source, its steps and the identity it resol
     if unresolved:
         # Planned again under other identity-key members, so each set records once.
         reason["identity"] = None if resolution is None else dict(resolution)
-        key += "/unresolved/" + ("" if resolution is None else resolution["key_sha256"])
+        key += "/unresolved/" + ("" if resolution is None else str(resolution["key_sha256"]))
         result = UNRESOLVED
     check_id = "qc-" + hashlib.sha256(key.encode()).hexdigest()
     with atomic(workspace.state):
@@ -501,7 +590,7 @@ def _promote_source(  # noqa: PLR0913 -- one source's steps and the run's inputs
     *,
     apply: bool,
     identity: Mapping[str, str] | None,
-    resolution: Mapping[str, str] | None,
+    resolution: KeyMembers | None,
     budget: ComputeBudget | None,
     now_us: int,
     evaluate: bool = True,
@@ -538,12 +627,20 @@ def _promote_source(  # noqa: PLR0913 -- one source's steps and the run's inputs
             return {**outcome, "status": "refused", "steps": results}
     published = any(step.get("published") for step in results)
     status = "promoted" if published else "unchanged" if apply else "planned"
+    partitions = [cast("dict[str, str] | None", step.get("partition")) for step in results]
+    scope = (
+        None
+        if not partitions or any(part is None for part in partitions)
+        else {"from": min(cast("dict[str, str]", part)["from"] for part in partitions),
+              "to": max(cast("dict[str, str]", part)["to"] for part in partitions)}
+    )  # fmt: skip
+    recorded = None if resolution is None else resolution.recorded(scope)
     if any(step.get("unresolved_token_count") for step in results):
         status = UNRESOLVED if apply else status
-        outcome["identity"] = None if resolution is None else dict(resolution)
+        outcome["identity"] = recorded
     if apply:
         outcome["check_id"] = _record(workspace, run.dataset_id, item.pin, results,
-                                      resolution=resolution, now_us=now_us)  # fmt: skip
+                                      resolution=recorded, now_us=now_us)  # fmt: skip
     return {**outcome, "status": status, "steps": results}
 
 
@@ -581,9 +678,7 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
             resolution = (
                 None if found is None else _resolution(workspace, found[2], run.mapper, identity)
             )
-            done = _done(
-                workspace, dataset_id, None if resolution is None else resolution["key_sha256"]
-            )
+            done = _done(workspace, dataset_id, resolution)
             pending = candidates(workspace, route, linked, shas, run.skipped, done=done)
             if run.head is None:
                 run.status = "no_head" if pending else "current"
@@ -626,9 +721,72 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
         "datasets": [run.report() for run in runs],
         "refused": refused,
         "unresolved": unresolved,
+        "standing_unresolved": standing_unresolved(workspace),
         "unmapped": unmapped(workspace),
         "provider_calls": 0,
     }
+
+
+def standing_unresolved(workspace: Workspace) -> dict[str, dict[str, object]]:
+    """Per dataset, the sources whose latest ``maintain_source@1`` record is ``unresolved``.
+
+    Read from the persisted records alone, so a dataset that brought no new source this
+    pass is listed as long as its sources wait. ``sources`` counts them, ``rows`` sums
+    their source tables' rows (a source whose table can no longer be listed, a retired one,
+    is counted in ``rows_unavailable`` instead), ``unresolved_tokens`` sums the identity
+    tokens their latest records left unresolved, ``unpublished_sources`` counts those
+    whose latest record published nothing, and ``oldest_date`` is the earliest partition
+    date they cover (the UTC date of the first such record for an unpartitioned source).
+    A dataset without one is not listed.
+    """
+    latest: dict[tuple[str, str, str], tuple[int, bool, dict[str, object]]] = {}
+    first: dict[tuple[str, str, str], int] = {}
+    for dataset_id, result, reason, checked in workspace.state.execute(
+        "SELECT dataset_id, result, reason, checked_at_us FROM quality_checks "
+        "WHERE rule_id=? ORDER BY checked_at_us, check_id",
+        (CHECK_RULE[0],),
+    ):
+        body = cast("dict[str, object]", json.loads(str(reason)))
+        pin = cast("dict[str, str]", body["source"])
+        key = (str(dataset_id), pin["source_id"], pin["table"])
+        waiting = result == UNRESOLVED
+        prior = latest.get(key)
+        # A settled record of the same instant outranks an unresolved one.
+        if prior is None or int(checked) > prior[0] or (int(checked) == prior[0] and not waiting):
+            latest[key] = (int(checked), waiting, body)
+        if waiting:
+            first.setdefault(key, int(checked))
+    summary: dict[str, dict[str, object]] = {}
+    for (dataset_id, source_id, table), (_, waiting, body) in sorted(latest.items()):
+        if not waiting:
+            continue
+        entry = summary.setdefault(dataset_id, {
+            "sources": 0, "rows": 0, "rows_unavailable": 0, "unresolved_tokens": 0,
+            "unpublished_sources": 0, "oldest_date": None})  # fmt: skip
+        steps = cast("list[dict[str, object]]", body.get("steps") or [])
+        entry["sources"] = cast("int", entry["sources"]) + 1
+        try:
+            rows = next(int(cast("int", item["rows"])) for item in list_tables(workspace, source_id)
+                        if item["name"] == table)  # fmt: skip
+        except (ValueError, StopIteration):
+            entry["rows_unavailable"] = cast("int", entry["rows_unavailable"]) + 1
+        else:
+            entry["rows"] = cast("int", entry["rows"]) + rows
+        entry["unresolved_tokens"] = cast("int", entry["unresolved_tokens"]) + sum(
+            int(cast("int", step.get("unresolved_token_count") or 0)) for step in steps
+        )
+        if not any(step.get("published") for step in steps):
+            entry["unpublished_sources"] = cast("int", entry["unpublished_sources"]) + 1
+        days = [
+            cast("dict[str, str]", step["partition"])["from"]
+            for step in steps
+            if step.get("partition") is not None
+        ]
+        recorded_at = _EPOCH + timedelta(microseconds=first[dataset_id, source_id, table])
+        oldest = min(days) if days else recorded_at.date().isoformat()
+        if entry["oldest_date"] is None or oldest < cast("str", entry["oldest_date"]):
+            entry["oldest_date"] = oldest
+    return summary
 
 
 def unmapped(workspace: Workspace) -> dict[str, int]:

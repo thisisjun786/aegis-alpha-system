@@ -23,8 +23,9 @@ settled failure in a row (``failing`` lists requests with more than one), and on
 is ``quarantined`` is asked again the next day (``uncertain_retry``): the quarantined
 page never runs again, the request is asked as a new job. An ask of the current
 observation date, or a failure still backing off, waits (``waiting``).
-A request never asked is ``new``. Symbol lists are covered for ``symbol_list_days`` after
-the observation date of their latest completion and are then asked again (``refresh``).
+A request never asked is ``new``. KR symbol lists are covered for ``symbol_list_days`` after
+the observation date of their latest completion and are then asked again (``refresh``); the
+US list is covered only on its observation date, so it is asked every day.
 
 Requests, in the order a run asks them while its caps last:
 
@@ -33,8 +34,9 @@ Requests, in the order a run asks them while its caps last:
    from the exchange's ``since`` date (no earlier than 366 days before the observation
    date) through the day before the observation date, and the exchange's
    ``extra_sessions`` (explicit earlier gaps), by date and then exchange;
-2. KR exchange symbol lists (``KO``/``KQ``, listed and delisted), the identity input of
-   new KR listings;
+2. exchange symbol lists: ``KO``/``KQ`` listed and delisted, the identity input of new KR
+   listings, and ``US`` listed, the dated observation US ticker claims continue from
+   (``storage.us_symbols``);
 3. FX pair histories (``<PAIR>.FOREX``) from ``forex_lookback_days`` before the
    observation date.
 
@@ -93,7 +95,8 @@ if TYPE_CHECKING:
 
 PROVIDER: Final = "qveris"
 DAILY_DATASETS: Final = ("prices", "splits", "dividends")
-SYMBOL_EXCHANGES: Final = ("KO", "KQ")
+SYMBOL_EXCHANGES: Final = ("KO", "KQ", "US")
+US_SYMBOL_LIST: Final = "US"
 MAX_LOOKBACK_DAYS: Final = 366
 ATTEMPT_SCHEMA: Final = "aas-qveris-attempt-v1"
 REQUEST_SCHEMA: Final = "aas-qveris-request-v1"
@@ -149,7 +152,7 @@ class QverisPolicy:
         ):
             raise ValueError("qveris extra_sessions are dates of configured exchanges")
         if not set(self.symbol_lists) <= set(SYMBOL_EXCHANGES):
-            raise ValueError("qveris symbol lists are KR exchanges (KO, KQ)")
+            raise ValueError("qveris symbol lists are exchanges among KO, KQ and US")
         for name, value in (
             ("symbol_list_days", self.symbol_list_days),
             ("forex_lookback_days", self.forex_lookback_days),
@@ -368,7 +371,7 @@ def _ledger_dataset(job: QverisJob) -> str:
         symbol = str(job.parameters["symbol"])
         return f"fx.{symbol.removesuffix('.' + FX_EXCHANGE).lower()}.eodhd"
     if job.dataset == "universe":
-        return "identity.kr.eodhd"
+        return f"identity.{job.market.lower()}.eodhd"
     market = job.market.lower()
     return f"prices.{market}.eodhd" if job.dataset == "prices" else f"actions.{market}.eodhd"
 
@@ -378,7 +381,7 @@ def symbol_list_job(exchange: str, delisted: str, today: date) -> QverisJob:
         f"maintain-symbols-{exchange}-{delisted}",
         EOD_UNIVERSE_TOOL,
         "eodhd",
-        "KR",
+        "US" if exchange == US_SYMBOL_LIST else "KR",
         "universe",
         canonical_json_bytes({"EXCHANGE_CODE": exchange, "delisted": delisted, "fmt": "json"})
         .decode(),
@@ -448,11 +451,14 @@ def plan_requests(
         for day, exchange in sessions
         for dataset in policy.datasets
     ]
-    stale = today - timedelta(days=policy.symbol_list_days)
     candidates += [
-        (symbol_list_job(exchange, delisted, today), None, stale)
+        (
+            symbol_list_job(exchange, delisted, today),
+            None,
+            today - timedelta(days=1 if exchange == US_SYMBOL_LIST else policy.symbol_list_days),
+        )
         for exchange in policy.symbol_lists
-        for delisted in ("0", "1")
+        for delisted in (("0",) if exchange == US_SYMBOL_LIST else ("0", "1"))
     ]
     candidates += [
         (forex_job(pair, today, policy.forex_lookback_days), None, None) for pair in policy.forex
@@ -834,7 +840,7 @@ def _imported_fingerprints(workspace: Workspace) -> frozenset[str]:
 def _completed(
     asks: Mapping[Request, list[RawAsk]], imported: frozenset[str]
 ) -> tuple[list[str], list[str], list[str]]:
-    """(FX jobs, daily jobs that need the identity document, KR symbol lists) to import."""
+    """(FX jobs, daily jobs that need the identity document, symbol lists) to import."""
     ready: list[str] = []
     needs_identity: list[str] = []
     symbols: list[str] = []
@@ -843,7 +849,7 @@ def _completed(
         for ask in items:
             if ask.state not in _TERMINAL:
                 continue
-            if tool == EOD_UNIVERSE_TOOL and market == "KR":
+            if tool == EOD_UNIVERSE_TOOL and market in {"KR", "US"}:
                 symbols.append(ask.fingerprint)
             elif ask.fingerprint in imported:
                 continue
@@ -861,7 +867,7 @@ def import_completed(
     *,
     asks: Mapping[Request, list[RawAsk]] | None = None,
 ) -> dict[str, object]:
-    """Commit the completed daily, FX and KR symbol-list jobs no source holds yet."""
+    """Commit the completed daily, FX and symbol-list jobs no source holds yet."""
     from aegis_alpha.data.sec_evidence import read_bytes
     from aegis_alpha.storage import kr_identity, qveris_import
     from aegis_alpha.storage.source_library import list_sources

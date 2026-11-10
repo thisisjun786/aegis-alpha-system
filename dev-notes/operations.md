@@ -1529,8 +1529,8 @@ aas maintain receipt [--home HOME] [--lock uv.lock]
 ```
 
 `run`은 설치본을 쓰기로 한 번 열고 끝까지 저장소 잠금을 가진 채 복구, 실행 환경 대조, 선언 달력 갱신,
-수집(KIND, OpenDART, SEC, FRED/ALFRED, Qveris), Qveris·KR 종목 목록 적재, KR identity 증분, dataset chain
-승격, head·watermark 보고를 순서대로 한다. 실행 중 다른 명령은 `installation_busy`로 거부된다. 보고는 표준
+수집(KIND, OpenDART, SEC, FRED/ALFRED, Qveris), Qveris·KR·US 종목 목록 적재, KR identity 증분과 날짜가 있는
+US 종목 목록의 하루 단위 claim 증분, dataset chain 승격, head·watermark 보고를 순서대로 한다. 실행 중 다른 명령은 `installation_busy`로 거부된다. 보고는 표준
 출력과 `raw/`, `<runtime>/maintain-report.json`에 남는다. 종료 코드는 모든 단계가 끝나면 0(예산 소진 포함),
 단계 실패나 공급자 거부가 있으면 1, Qveris가 정산·격리가 필요한 유료 호출로 멈추면 2다. 종료 코드 2의 page나
 group은 [Qveris 원문 수집](#명시한-job의-수집과-적재)의 `quarantine`으로 사유와 함께 격리한다. 격리된 요청은
@@ -1557,10 +1557,38 @@ identity 증분 계획, dataset마다 새 원천과 단계를 낸다. `--promoti
                "identity": "/path/to/qveris-bulk-identity.json",
                "since": {"US": "2026-09-01", "KO": "2026-09-05", "KQ": "2026-09-05"},
                "extra_sessions": {"US": ["2026-07-28"]},
-               "symbol_lists": ["KO", "KQ"], "forex": ["USDKRW"], "max_calls": 30, "max_credits": "100"}
+               "symbol_lists": ["KO", "KQ", "US"], "forex": ["USDKRW"], "max_calls": 30, "max_credits": "100"}
   }
 }
 ```
+
+`symbol_lists`의 `US`는 상장 목록(`delisted=0`) 하나를 매일 묻는다(KR 목록은 `symbol_list_days`마다).
+identity 단계는 그 목록의 행을 등록된 FMP ISIN으로 Norgate 상품에 잇고, 앞선 평일이 같은 상품으로 관측되거나
+등록된 claim이 있을 때만 그날 하루의 `eodhd_symbol` claim을 등록한다. 보지 못한 평일로는 늘리지 않으며,
+새 상장·모호·검증 불가 행은 사유와 함께 `stages.identity.us_symbols.unresolved`에 남고, 마지막 Norgate
+claim 뒤 목록이 없는 평일은 `history_gap`, 목록 사이의 빈 평일은 `observation_gaps`로 보고된다. 규칙은
+[유지보수 실행](design/data-vertical.md#유지보수-실행)이 소유한다.
+
+**보고의 `promote` 단계.** `unresolved`는 이번 실행이 `unresolved`로 기록한 dataset 목록이다(뜻은 그대로).
+`standing_unresolved`는 새 원천이 없는 날에도 매 실행 나오는 dataset별 요약이고, 저장된 `maintain_source@1`
+품질 검사만 읽는다(새 상태·공급자 호출 없음, 종료 코드 영향 없음). 원천마다 가장 늦은 기록이 `unresolved`인
+것만 센다. 해당 원천이 없는 dataset은 키가 없고, 모두 없으면 `{}`다.
+
+| 필드 | 뜻 |
+| --- | --- |
+| `sources` | 가장 늦은 기록이 `unresolved`인 원천 수 |
+| `rows` | 그 원천 표들의 행 수 합 |
+| `rows_unavailable` | 표를 더 나열할 수 없어(은퇴 등) `rows`에 넣지 못한 원천 수 |
+| `unresolved_tokens` | 그 기록들의 단계별 `unresolved_token_count` 합 |
+| `unpublished_sources` | 가장 늦은 기록에서 어떤 단계도 게시하지 않은 원천 수 |
+| `oldest_date` | 그 원천들이 덮는 가장 이른 partition 날짜(partition이 없으면 첫 `unresolved` 기록의 UTC 날짜) |
+
+```json
+"standing_unresolved": {"prices.us.eodhd": {"sources": 44, "rows": 528400, "rows_unavailable": 0,
+  "unresolved_tokens": 528000, "unpublished_sources": 44, "oldest_date": "2026-09-09"}}
+```
+
+위 값은 형식 예시일 뿐 측정값이 아니다.
 
 유지보수는 chain을 이어 붙일 뿐 시작하지 않는다. 각 dataset의 첫 generation은 [운영 전환](#운영-전환)에서 운영자가
 `aas data promote`(또는 `data kr-prices`, `calendar refresh`)로 만들고, 그 뒤 실행이 새로 수집된 원천을 그
