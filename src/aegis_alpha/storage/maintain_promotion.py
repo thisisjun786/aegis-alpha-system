@@ -339,7 +339,14 @@ class KeyMembers:
             limit = SHORT_DAYS * _DAY_US
             short = [row for row in self.rows if row[3] is not None and row[3] - row[2] <= limit]
             kept = set(short)
-            long = [list(row) for row in self.rows if row not in kept]
+            # Sorted here, not trusted from the caller, so the hash never follows input order.
+            long = [
+                list(row)
+                for row in sorted(
+                    (row for row in self.rows if row not in kept),
+                    key=lambda row: (row[0], row[1], row[2], row[3] is None, row[3] or 0),
+                )
+            ]
             self._long = hashlib.sha256(formats.canonical(long)).hexdigest()
             self._short = sorted(short, key=lambda row: row[2])
             self._starts = [row[2] for row in self._short]

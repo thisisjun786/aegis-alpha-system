@@ -158,3 +158,20 @@ def test_a_scoped_key_covers_every_instant_of_its_dates_and_nothing_two_days_on(
     assert scoped(("NEW.KO", "ins-b", seoul, seoul + 24 * hour)) != unchanged
     assert scoped(("NEW.US", "ins-c", new_york, new_york + 24 * hour)) != unchanged
     assert scoped(("LATE.US", "ins-d", later, later + 24 * hour)) == unchanged
+
+
+def test_a_scoped_key_does_not_depend_on_the_order_of_its_rows() -> None:
+    day = date(2026, 9, 16)
+    hour = 3_600_000_000
+    start = _instant(datetime(2026, 9, 16, 4, tzinfo=UTC))
+    rows: list[tuple[str, str, int, int | None]] = [
+        ("AAA.US", "ins-a", -(2**63), None),
+        ("BBB.US", "ins-b", -(2**63), start),
+        ("CCC.US", "ins-c", start, start + 24 * hour),
+        ("DDD.US", "ins-d", start - 24 * hour, start),
+    ]
+
+    def scoped(members: list[tuple[str, str, int, int | None]]) -> str:
+        return KeyMembers("s", members).scoped_sha256(day, day + timedelta(days=1))
+
+    assert scoped(rows) == scoped(list(reversed(rows))) == scoped(rows[1:] + rows[:1])

@@ -441,7 +441,8 @@ class _Index:
     accepted: dict[str, list[tuple[date, date, str, str]]]
     """Each symbol's claims this build accepted: first day, last day, instrument, source."""
     named: dict[str, list[tuple[date, str]]]
-    """Each instrument's observed days and the symbol naming it, in day order."""
+    """Each instrument's observed days and the symbol naming it, sorted by (day, symbol):
+    ``other_symbol`` bisects it."""
 
     def before(self, symbol: str, day: date) -> _Before | None:
         """The latest earlier day a registered or accepted claim shows the symbol's holder."""
@@ -532,10 +533,12 @@ def build_symbol_claims(sources: Sequence[SourceRows], registry: Registry) -> Sy
 
 def _observe(index: _Index, days: Mapping[tuple[str, date], str]) -> None:
     """Index the instruments every observed symbol-day names (rejected days included: they
-    only ever stop a claim, never anchor one)."""
-    for (symbol, day), outcome in sorted(days.items()):
+    only ever stop a claim, never anchor one), each in (day, symbol) order for bisection."""
+    for (symbol, day), outcome in days.items():
         if not outcome.startswith("unresolved:"):
             index.named[outcome].append((day, symbol))
+    for named in index.named.values():
+        named.sort()
 
 
 def _registry_edge(claims: SymbolClaims, registry: Registry) -> None:

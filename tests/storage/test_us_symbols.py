@@ -202,6 +202,22 @@ def test_a_bridge_needs_both_ends_on_the_same_instrument_and_a_short_gap() -> No
     assert MAX_BRIDGE_DAYS == 120
 
 
+def test_another_symbol_of_the_instrument_inside_the_gap_stops_the_bridge_in_any_order() -> None:
+    # ZZZ is registered for A through 09-08. Lists name A as ZZZ on 09-07, as AAA on 09-10
+    # and as ZZZ again on 09-14. AAA sorts before ZZZ, so the observations reach the index
+    # out of day order; AAA on 09-10 must still stop the ZZZ bridge over 09-09 .. 09-14.
+    lists = [_list(_evening(date(2026, 9, 7)), [_row("ZZZ", ISIN_A)]),
+             _list(_evening(date(2026, 9, 10)), [_row("AAA", ISIN_A)]),
+             _list(_evening(date(2026, 9, 14)), [_row("ZZZ", ISIN_A)])]  # fmt: skip
+    built = build_symbol_claims(lists, _registry(_base("ZZZ.US", IA, date(2026, 9, 8))))
+    assert built.assertions == []
+    report = built.report()
+    assert report["unresolved"] == {"list_not_bracketed": ["AAA.US"],
+                                    "list_symbol_moved": ["ZZZ.US"]}  # fmt: skip
+    assert report["bridge_unresolved"] == {"list_symbol_moved": 1}
+    assert report["already_claimed"] == 1
+
+
 def test_both_ends_agreeing_still_needs_a_valid_unambiguous_isin() -> None:
     monday = date(2026, 9, 21)
     shared = isin("000000088", "US")

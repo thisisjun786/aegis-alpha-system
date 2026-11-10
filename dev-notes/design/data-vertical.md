@@ -3076,15 +3076,19 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-511 | 색인의 403은 분기 목록이 그날 `master` 파일을 싣지 않을 때만 `NO_DATA`이고, 다른 분기·읽히지 않는 목록·목록의 403·404는 `FAILED`다 | `tests/data/test_sec_collect.py::test_a_refused_index_is_no_index_only_when_its_quarter_listing_omits_it` | 구현 |
 | DV-512 | 403을 준 휴일 색인은 분기 목록이 싣지 않으면 404처럼 이틀 뒤 덮이고 실행은 멈추지 않는다 | `tests/storage/test_us_collection.py::test_a_holiday_index_refused_with_403_is_a_day_without_an_index` | 구현 |
 | DV-513 | 분기 목록이 싣는 날의 403, 읽히지 않는 목록은 거부로 남아 실행을 멈추고 그날은 덮이지 않는다 | `tests/storage/test_us_collection.py::test_a_403_on_an_index_its_listing_names_still_stops_the_run` | 구현 |
-| DV-514 | 날짜가 있는 US 종목 목록은 Norgate claim 뒤 관측된 하루마다만 그 하루의 `eodhd_symbol` claim을 만들고 알려진 시각은 그 관측의 수집 시각이다 | `tests/storage/test_us_symbols.py::test_each_observed_day_after_the_export_continues_the_ticker_for_that_day_only` | 구현 |
+| DV-514 | 날짜 있는 US 종목 목록은 앞 claim과 바로 이어지는 관측 날마다 그 뉴욕 하루의 `eodhd_symbol` claim을 만들고 알려진 시각은 그 관측의 수집 시각이다 | `tests/storage/test_us_symbols.py::test_each_observed_day_after_the_export_continues_the_ticker_for_that_day_only` | 구현 |
 | DV-515 | 주말·미국 휴장일을 포함한 공백은 양 끝이 같은 상품일 때 claim 하나로 이어지고, 다음 날은 다시 하루 claim이며, 수집 중단도 앞선 관측에서 이어진다 | `tests/storage/test_us_symbols.py::test_a_gap_with_weekends_and_a_holiday_is_bridged_by_one_claim` | 구현 |
-| DV-516 | 재사용·이름 변경된 티커는 같은 상품을 가리키는 앞 관측이 있는 날부터만 claim된다 | `tests/storage/test_us_symbols.py::test_a_reused_or_renamed_ticker_waits_for_a_bracketing_day` | 구현 |
+| DV-516 | 재사용·이름 변경·앞 보유자 없는 티커는 거부된 목록이 연달아 와도 다음 날의 앞쪽 끝이 되지 않고, 등록된 claim이 같은 상품을 보여 줄 때만 이어진다 | `tests/storage/test_us_symbols.py::test_rejected_lists_never_bootstrap_a_reused_or_renamed_ticker` | 구현 |
 | DV-517 | ISIN 누락·무효·미등록·모호, 비 USD, 같은 날 엇갈린 관측, 반복된 심볼·ISIN은 사유와 함께 해석하지 않는다 | `tests/storage/test_us_symbols.py::test_conflicting_or_unverifiable_rows_name_no_instrument` | 구현 |
 | DV-518 | 관측은 뉴욕 09:30 기준 거래일을 덮고 claim은 DST가 바뀌어도 뉴욕 하루이며 등록된 claim과 겹치지 않는다 | `tests/storage/test_us_symbols.py::test_claims_span_one_new_york_day_across_the_dst_change` | 구현 |
-| DV-519 | 목록 claim은 새 유지보수 snapshot으로 기다리던 `unresolved` 가격 원천을 다시 승격하고, 뒤 날짜 claim은 끝난 원천을 다시 계획하지 않으며 `standing_unresolved`는 새 원천이 없는 실행에도 남는다 | `tests/storage/test_us_symbols.py::test_list_claims_reach_a_new_snapshot_and_promote_the_rows_they_waited_for` | 구현 |
+| DV-519 | 목록 claim은 새 유지보수 snapshot으로 기다리던 `unresolved` 가격 원천을 다시 승격하고, 바로 다음 날의 claim은 기다리는 원천을 한 번 더 계획하며 그 뒤 날의 claim은 다시 계획하지 않고, `standing_unresolved`는 새 원천이 없는 실행에도 남는다 | `tests/storage/test_us_symbols.py::test_list_claims_reach_a_new_snapshot_and_promote_the_rows_they_waited_for` | 구현 |
 | DV-520 | `us-build`는 등록된 목록 claim 구간에서 FMP·SEC 행을 판정하고 목록 claim을 문서에 반복하지 않는다 | `tests/storage/test_us_identity.py::test_fmp_and_sec_rows_are_judged_against_registered_symbol_list_days` | 구현 |
 | DV-521 | US 종목 목록은 상장만 매일 묻고 적재되어 KR 증분이 아닌 US 증분이 읽는다 | `tests/application/test_maintain.py::test_a_us_symbol_list_is_collected_imported_and_read_by_the_identity_stage` | 구현 |
 | DV-522 | 앞 보유자 없음·재사용·이름 변경·공백 안의 다른 상품 등록 claim·120일 초과 공백은 잇지 않고 사유를 남긴다 | `tests/storage/test_us_symbols.py::test_a_bridge_needs_both_ends_on_the_same_instrument_and_a_short_gap` | 구현 |
 | DV-523 | 양 끝이 같아도 끝 행의 ISIN이 무효·모호하면 잇지 않고 `history_gap`의 남은 심볼로 보고한다 | `tests/storage/test_us_symbols.py::test_both_ends_agreeing_still_needs_a_valid_unambiguous_isin` | 구현 |
 | DV-524 | DST가 바뀌는 공백의 claim은 뉴욕 날의 시작으로 끝난다 | `tests/storage/test_us_symbols.py::test_a_bridge_across_the_dst_change_spans_new_york_days` | 구현 |
 | DV-525 | 공백 claim은 끝 관측의 수집 시각부터 알려지고, 기다리던 모든 세션을 한 번 다시 승격하며, 뒤의 하루 claim은 다시 계획하지 않는다. claim이 없는 목록은 snapshot을 pin하지 않고 계획은 아무것도 등록하지 않는다 | `tests/storage/test_us_symbols.py::test_a_bridge_promotes_every_held_session_once_and_a_later_day_replans_nothing` | 구현 |
+| DV-526 | 거부된 목록을 받은 두 번의 유지보수 실행은 아무 claim도 등록하지 않는다 | `tests/storage/test_us_symbols.py::test_two_maintenance_runs_of_rejected_lists_register_nothing` | 구현 |
+| DV-527 | 공백 안에서 같은 상품을 다른 심볼로 보인 관측은 관측 순서와 상관없이 그 bridge를 `list_symbol_moved`로 막는다 | `tests/storage/test_us_symbols.py::test_another_symbol_of_the_instrument_inside_the_gap_stops_the_bridge_in_any_order` | 구현 |
+| DV-528 | 범위 key의 SHA-256은 partition 날짜의 어느 시각(어느 시간대)에 성립하는 짧은 claim이든 바뀌고, 이틀 뒤의 claim에는 바뀌지 않는다 | `tests/storage/test_maintain_promotion.py::test_a_scoped_key_covers_every_instant_of_its_dates_and_nothing_two_days_on` | 구현 |
+| DV-529 | 범위 key의 SHA-256은 member 행의 입력 순서와 무관하다 | `tests/storage/test_maintain_promotion.py::test_a_scoped_key_does_not_depend_on_the_order_of_its_rows` | 구현 |
