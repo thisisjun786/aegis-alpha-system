@@ -918,21 +918,22 @@ def test_a_series_links_to_the_earliest_valid_cik_of_all_its_claims() -> None:
     assert dict(unresolved) == {"sec_cik_differs_across_claims": ["AAA"]}
 
 
-def _listed(assetid: str, symbol: str, day: date) -> ListedClaim:
-    """A registered symbol-list claim of ``day``, known that evening in New York."""
-    start = session_start_us(day)
-    return ListedClaim(assetid, symbol, start, session_start_us(day + timedelta(days=1)),
+def _listed(assetid: str, symbol: str, day: date, first: date | None = None) -> ListedClaim:
+    """A registered symbol-list claim from ``first`` (a bridge) or ``day`` through ``day``."""
+    end = session_start_us(day + timedelta(days=1))
+    return ListedClaim(assetid, symbol, session_start_us(first or day), end,
                        Evidence("sl:qveris-eodhd-exchange-symbols-synthetic", "0" * 64,
-                                start + 20 * 3_600_000_000))  # fmt: skip
+                                end - 4 * 3_600_000_000))  # fmt: skip
 
 
 def test_fmp_and_sec_rows_are_judged_against_registered_symbol_list_days() -> None:
-    # The master's last session is Tuesday 2026-09-08. A dated symbol list later claims AAA
-    # and BBB for Monday 2026-09-21, the day the SEC archive (its link) and AAA's FMP profile
-    # were retrieved; BBB's profile was retrieved two days after its last list day.
+    # The master's last session is Tuesday 2026-09-08. A dated symbol list later bridges AAA
+    # from 09-09 through Monday 09-21 (AAA's FMP profile was retrieved on a bridged day, the
+    # SEC archive's link on that Monday) and claims BBB for that Monday alone; BBB's profile was
+    # retrieved two days after its last list day.
     day = date(2026, 9, 21)
     rows = [master(1, "AAA", last_date="2026-09-08"), master(2, "BBB")]
-    inside = datetime(2026, 9, 21, 15, tzinfo=UTC)
+    inside = datetime(2026, 9, 15, 15, tzinfo=UTC)  # a bridged day
     fmp = [
         fmp_rows(
             [
@@ -946,12 +947,13 @@ def test_fmp_and_sec_rows_are_judged_against_registered_symbol_list_days() -> No
     assert frozen.unresolved["fmp"] == {"fmp_after_master_through": ["AAA", "BBB"]}
     assert frozen.unresolved["issuers"]["sec_after_master_through"] == ["AAA"]
 
-    listed = [_listed("1", "AAA.US", day), _listed("2", "BBB.US", day)]
+    bridge = date(2026, 9, 9)
+    listed = [_listed("1", "AAA.US", day, bridge), _listed("2", "BBB.US", day)]
     registry = build_us_registry(linked(rows), fmp=fmp, sec=sec, listed=listed)
     assert registry.unresolved["fmp"] == {"fmp_after_symbol_list": ["BBB"]}
     fmp_symbol = [row for row in _assertions(registry) if row["namespace"] == "fmp_symbol"]
     assert [(row["token"], row["valid_from_us"], row["valid_to_us"]) for row in fmp_symbol] == [
-        ("AAA", session_start_us(day), session_start_us(day + timedelta(days=1)))
+        ("AAA", session_start_us(bridge), session_start_us(day + timedelta(days=1)))
     ]
     issuer = mint_issuer("sec_cik", CIK_A)
     links = [row["token"] for row in _assertions(registry) if row["namespace"] == "issuer"]
@@ -962,6 +964,7 @@ def test_fmp_and_sec_rows_are_judged_against_registered_symbol_list_days() -> No
         ("AAA.US", session_start_us(date(2026, 9, 9))),
         ("BBB.US", session_start_us(date(2026, 9, 9))),
     ]
-    resolved = registry.resolve([("AAA.US", day, 3), ("AAA.US", day + timedelta(days=1), 2)])
+    resolved = registry.resolve([("AAA.US", bridge, 1), ("AAA.US", day, 3),
+                                 ("AAA.US", day + timedelta(days=1), 2)])  # fmt: skip
     assert (resolved["resolved_rows"], resolved["unresolved_rows"]) == (
-        3, {"after_symbol_list": 2})  # fmt: skip
+        4, {"after_symbol_list": 2})  # fmt: skip

@@ -2,8 +2,9 @@
 
 Norgate is a frozen source, so the US registry's ticker claims (``us_identity``) end at the
 New York start of the day after the last session its master or history export shows.
-This mapper adds claims only for days a dated observation shows, never across a weekday
-no observation shows:
+This mapper continues them from collection point to collection point (#99: tickers can
+change between collection points, so a link that cannot be verified at both ends stays
+unresolved):
 
 - An observation is one row of a committed ``qveris-eodhd-exchange-symbols-*`` list asked
   for ``EXCHANGE_CODE=US`` without delisted symbols, retrieved at the instant its page
@@ -11,31 +12,36 @@ no observation shows:
   its retrieval, or the day before when it was retrieved before 09:30 New York time.
 - A row names an instrument only through its ISIN: the ISIN must carry a valid check
   digit and be the registered, not superseded FMP ``isin`` of exactly one instrument with
-  a Norgate asset ID, and the row's currency must be USD. A ticker, a name or an exchange
-  never names an instrument, and a list never mints one.
-- A weekday ``d`` is claimed for ``<Code>.US`` and instrument ``I`` only when every
-  observation covering ``d`` names ``I`` for the symbol, no other symbol of those
-  observations names ``I``, and ``I`` held the symbol on the latest earlier day that is
-  not a Saturday or Sunday, shown by an observation covering that day or by a registered
-  claim (the master's, an export's or an earlier list day's). Saturdays and Sundays
-  between the two need no observation. Today's list is no evidence for an earlier day.
-- The claim is valid for exactly that day, from the New York start of ``d`` to that of
-  the next day, the instants ``eodhd.bars@1`` resolves, so a claim is never extended
-  over a day it was not observed; it is known from the retrieval instant of the earliest
-  observation covering ``d`` and cites that row. A day a registered claim of the symbol
-  already covers is left to it, so claims never overlap.
+  a Norgate asset ID, and the row's currency must be USD. A ticker, a name, an exchange or
+  a price never names an instrument, and a list never mints one.
+- A weekday ``d`` whose observations all name instrument ``I`` for ``<Code>.US`` (and no
+  other symbol of them names ``I``) is claimed when the latest earlier day anything shows
+  about the symbol (``before``: an earlier observation, or a registered claim of the
+  master, an export or an earlier list) shows ``I`` holding it, and ``I`` holds no other US
+  symbol from the day after ``before`` through ``d``. Today's list is never the earlier end.
+- With only Saturdays and Sundays between the two, the claim is the one New York day ``d``.
+  Otherwise one claim bridges the gap: from the New York start of the day after ``before``
+  to that of the day after ``d``, at most ``MAX_BRIDGE_DAYS`` calendar days. Bridged days
+  are verified at their two ends, not observed one by one; the report lists them
+  (``bridges``, ``bridged_symbols``, ``bridged_days``, ``bridge_unresolved``).
+- A claim is known from the retrieval instant of the earliest observation covering ``d``
+  (the end: no one could know it earlier) and cites that row; the earlier end is named in
+  the report. A day a registered claim of the symbol already covers is left to it, so
+  claims never overlap.
 
 Every day that cannot be claimed stays unresolved with its reason (data-vertical risk 7):
 ``list_isin_missing``, ``list_isin_invalid``, ``list_isin_unregistered`` (a new listing or
 a security the registry never tied to an ISIN), ``list_isin_ambiguous``,
 ``list_currency_not_usd``, ``list_symbol_repeated``, ``list_isin_repeated``,
-``list_observations_disagree``, ``list_not_bracketed`` (the latest earlier weekday is not
-observed, or its observation names no instrument), ``list_symbol_moved`` (the symbol
-named another instrument that day: a reused or renamed ticker) and
-``list_registered_conflict`` (a registered claim of another instrument covers the day).
-The report names the weekdays between the registry's last ticker claim and the first
-observation (``history_gap``) and the unobserved weekdays between observations
-(``observation_gaps``); no source in the registry covers them.
+``list_observations_disagree``, ``list_not_bracketed`` (nothing earlier shows the symbol,
+or the latest earlier observation names no instrument), ``list_symbol_moved`` (the symbol
+named another instrument before, or the instrument held another symbol meanwhile: a
+reused or renamed ticker), ``list_registered_conflict`` (a registered claim of another
+instrument covers the day, or sits between the instrument's earlier claim and the day) and
+``list_gap_too_long``. The report names the weekdays between the registry's last ticker
+claim and the first observation (``history_gap``, with the registry symbols bridged over it
+and those left unbridged) and the unobserved weekdays between observations
+(``observation_gaps``).
 
 The registered claims and ISIN owners come from the registry itself, so the result is a
 registry document of new assertions only, which registration validates like any other.
@@ -44,6 +50,7 @@ The contract is in dev-notes/design/data-vertical.md.
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
@@ -75,6 +82,9 @@ MAPPER: Final = "eodhd.us_symbol_list@1"
 EXCHANGE: Final = "US"
 SOURCE_PREFIX: Final = f"{EODHD_PROVIDER}-{EODHD_SHAPE}-"
 SESSION_OPEN: Final = time(9, 30)
+MAX_BRIDGE_DAYS: Final = 120
+"""The longest gap, in calendar days through the end observation, a claim may bridge."""
+_BRIDGE: Final = "bridge:"
 _COLUMNS: Final = ("exchange_code", "delisted", "code", "currency", "isin", "retrieved_at_utc")
 _WEEKEND: Final = frozenset({5, 6})
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
@@ -273,18 +283,26 @@ def map_us_symbol_lists(
 
 @dataclass(slots=True)
 class SymbolClaims:
-    """New per-day claims and why every other observed symbol-day has none."""
+    """New claims and why every other observed symbol-day has none."""
 
     assertions: list[dict[str, object]] = field(default_factory=list)
     mapper: MapperReport = field(default_factory=MapperReport)
     unresolved: dict[str, dict[str, set[date]]] = field(
         default_factory=lambda: defaultdict(lambda: defaultdict(set))
     )
+    bridges: list[dict[str, object]] = field(default_factory=list)
+    """Each gap claim: symbol, first and last day, weekdays, and the evidence of both ends."""
+    bridge_unresolved: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
+    """Symbols whose gap could not be bridged, by reason."""
     already_claimed: int = 0
     observed_days: set[date] = field(default_factory=set)
     claimed_days: set[date] = field(default_factory=set)
     registry_through: date | None = None
     first_listed: date | None = None
+    registry_symbols: set[str] = field(default_factory=set)
+    """Symbols the registry's last master or export claims end with, after its ``through``."""
+    continued: set[str] = field(default_factory=set)
+    """Those of them a claim covers on the first weekday after ``through``."""
 
     def document(self) -> dict[str, object]:
         document: dict[str, object] = {
@@ -305,6 +323,7 @@ class SymbolClaims:
             return ordered if sample is None else ordered[:sample]
 
         observed = sorted(self.observed_days)
+        bridges = sorted(self.bridges, key=lambda item: str(item["symbol"]))
         return {
             "mapper": MAPPER,
             "rows": self.mapper.json(),
@@ -315,8 +334,16 @@ class SymbolClaims:
             {"from": observed[0].isoformat(), "through": observed[-1].isoformat()},
             "registry_through": None if self.registry_through is None
             else self.registry_through.isoformat(),
-            "history_gap": self._history_gap(),
+            "history_gap": self._history_gap(sample),
             "observation_gaps": self._observation_gaps(),
+            "bridged_symbols": len({item["symbol"] for item in bridges}),
+            "bridged_days": sum(cast("int", item["weekdays"]) for item in bridges),
+            "bridge_bounds": None if not bridges else {
+                "from": min(str(item["from"]) for item in bridges),
+                "through": max(str(item["through"]) for item in bridges)},
+            "bridges": bridges if sample is None else bridges[:sample],
+            "bridge_unresolved": {reason: len(symbols)
+                                  for reason, symbols in sorted(self.bridge_unresolved.items())},
             "unresolved_days": {reason: sum(len(days) for days in symbols.values())
                                 for reason, symbols in sorted(self.unresolved.items())},
             "unresolved_symbols": {reason: len(symbols)
@@ -325,11 +352,21 @@ class SymbolClaims:
                            for reason, symbols in sorted(self.unresolved.items())},
         }  # fmt: skip
 
-    def _history_gap(self) -> dict[str, object] | None:
-        """Weekdays after the registry's last ticker claim that no symbol list observed."""
+    def _history_gap(self, sample: int | None) -> dict[str, object] | None:
+        """Weekdays after the registry's last ticker claim before the first symbol list.
+
+        The registry's symbols a claim continues over them are ``bridged_symbols``; the
+        rest stay a gap (``unbridged_symbols``, with a sample).
+        """
         if self.registry_through is None or self.first_listed is None:
             return None
-        return _span(self.registry_through + timedelta(days=1), self.first_listed)
+        gap = _span(self.registry_through + timedelta(days=1), self.first_listed)
+        if gap is None:
+            return None
+        waiting = sorted(self.registry_symbols - self.continued)
+        return {**gap, "bridged_symbols": len(self.registry_symbols & self.continued),
+                "unbridged_symbols": len(waiting),
+                "unbridged": waiting if sample is None else waiting[:sample]}  # fmt: skip
 
     def _observation_gaps(self) -> list[dict[str, object]]:
         observed = sorted(self.observed_days)
@@ -341,24 +378,31 @@ class SymbolClaims:
         return gaps
 
 
+def _weekdays(first: date, stop: date) -> list[date]:
+    """The weekdays of ``[first, stop)``."""
+    days = (first + timedelta(days=n) for n in range((stop - first).days))
+    return [day for day in days if not _weekend(day)]
+
+
 def _span(first: date, stop: date) -> dict[str, object] | None:
     """The weekdays of ``[first, stop)`` as ``{from, through, weekdays}``, or None."""
-    days = [first + timedelta(days=n) for n in range((stop - first).days)]
-    weekdays = [day for day in days if not _weekend(day)]
+    weekdays = _weekdays(first, stop)
     if not weekdays:
         return None
     return {"from": weekdays[0].isoformat(), "through": weekdays[-1].isoformat(),
             "weekdays": len(weekdays)}  # fmt: skip
 
 
-def _assertion(assetid: str, symbol: str, day: date, evidence: Evidence) -> dict[str, object]:
+def _assertion(
+    assetid: str, symbol: str, first: date, last: date, evidence: Evidence
+) -> dict[str, object]:
     return {
         "instrument": {"anchor_namespace": "norgate_assetid", "anchor_token": assetid},
         "provider": "eodhd",
         "namespace": "eodhd_symbol",
         "token": symbol,
-        "valid_from_us": session_start_us(day),
-        "valid_to_us": session_start_us(day + timedelta(days=1)),
+        "valid_from_us": session_start_us(first),
+        "valid_to_us": session_start_us(last + timedelta(days=1)),
         "known_from_us": evidence.known_from_us,
         "supersedes_assertion_id": None,
         "source_snapshot_id": evidence.source,
@@ -366,85 +410,204 @@ def _assertion(assetid: str, symbol: str, day: date, evidence: Evidence) -> dict
     }
 
 
-def _bracket(
-    symbol: str,
-    day: date,
-    instrument: str,
-    days: Mapping[tuple[str, date], str],
-    held: Sequence[Held],
-) -> str | None:
-    """None when ``instrument`` held ``symbol`` on the latest earlier weekday, else why not.
+@dataclass(frozen=True, slots=True)
+class _Before:
+    """The latest day before a symbol-day on which something is shown about the symbol."""
 
-    Saturdays and Sundays between the two days need no observation; the first other day
-    without one leaves ``day`` unbracketed.
-    """
-    previous = day - timedelta(days=1)
-    for _ in range(3):
-        named = days.get((symbol, previous))
-        if named is None:
-            holders = {item.instrument_id for item in held if item.holds(previous)}
-            named = next(iter(holders)) if len(holders) == 1 else None
-        if named == instrument:
-            return None
-        if named is not None and not named.startswith("unresolved:"):
-            return "list_symbol_moved"
-        if named is not None or not _weekend(previous):
-            return "list_not_bracketed"
-        previous -= timedelta(days=1)
-    return "list_not_bracketed"
+    day: date
+    outcome: str
+    """The instrument shown holding the symbol, or ``unresolved:<reason>``."""
+    evidence: str
+    """``registered`` or the ``sl:`` source of the observation."""
+
+
+@dataclass(slots=True)
+class _Index:
+    """What a build judges each symbol-day against."""
+
+    held: dict[str, list[Held]]
+    """Registered claims by symbol."""
+    holdings: dict[str, list[Held]]
+    """Registered claims by instrument."""
+    observed: dict[str, list[tuple[date, str]]]
+    """Each symbol's observed days and outcomes, in day order."""
+    named: dict[str, list[tuple[date, str]]]
+    """Each instrument's observed days and the symbol naming it, in day order."""
+    sources: dict[tuple[str, date], str]
+
+    def before(self, symbol: str, day: date) -> _Before | None:
+        found: _Before | None = None
+        days = self.observed.get(symbol, [])
+        position = bisect_left(days, (day, ""))
+        if position:
+            seen, outcome = days[position - 1]
+            found = _Before(seen, outcome, self.sources[symbol, seen])
+        start = session_start_us(day)
+        for item in self.held.get(symbol, []):
+            if item.start >= start:
+                continue
+            last = day - timedelta(days=1)
+            if item.end is not None and item.end <= start:
+                last = _new_york_day(item.end - 1)
+            if found is None or last >= found.day:
+                found = _Before(last, item.instrument_id, "registered")
+        return found
+
+    def held_before(self, symbol: str, instrument: str, day: date) -> bool:
+        """Whether ``instrument`` is shown holding ``symbol`` on some day before ``day``."""
+        start = session_start_us(day)
+        if any(item.instrument_id == instrument and item.start < start
+               for item in self.held.get(symbol, [])):  # fmt: skip
+            return True
+        return any(seen < day and outcome == instrument
+                   for seen, outcome in self.observed.get(symbol, []))  # fmt: skip
+
+    def other_symbol(self, instrument: str, symbol: str, first: date, last: date) -> bool:
+        """Whether ``instrument`` holds another US symbol on a day of ``[first, last]``."""
+        low, high = session_start_us(first), session_start_us(last + timedelta(days=1))
+        for item in self.holdings.get(instrument, []):
+            if item.token != symbol and item.start < high and (item.end is None or item.end > low):
+                return True
+        days = self.named.get(instrument, [])
+        position = bisect_left(days, (first, ""))
+        return any(other != symbol for seen, other in days[position:] if seen <= last)
 
 
 def build_symbol_claims(sources: Sequence[SourceRows], registry: Registry) -> SymbolClaims:
-    """The per-day ``eodhd_symbol`` claims the lists show beyond the registered ones."""
+    """The ``eodhd_symbol`` claims the lists show beyond the registered ones."""
     claims = SymbolClaims()
     observations, claims.mapper = map_us_symbol_lists(sources, registry)
-    by_symbol: dict[str, list[Held]] = defaultdict(list)
+    index = _Index(defaultdict(list), defaultdict(list), defaultdict(list), defaultdict(list), {})
     for item in registry.held:
-        by_symbol[item.token].append(item)
-    master_ends = [item.end for item in registry.held if not item.listed and item.end is not None]
-    if master_ends:
-        claims.registry_through = _new_york_day(max(master_ends) - 1)
-    listed_days = [_new_york_day(item.start) for item in registry.held if item.listed]
+        index.held[item.token].append(item)
+        index.holdings[item.instrument_id].append(item)
+    _registry_edge(claims, registry)
     grouped: dict[tuple[str, date], list[Observation]] = defaultdict(list)
     for item in observations:
         grouped[item.symbol, item.day].append(item)
         claims.observed_days.add(item.day)
+    listed_days = [_new_york_day(item.start) for item in registry.held if item.listed]
     claims.first_listed = min([*listed_days, *claims.observed_days], default=None)
     days = _outcomes(grouped)
+    _observe(index, days, grouped)
     for (symbol, day), outcome in sorted(days.items()):
         if _weekend(day):
             continue
-        held = by_symbol.get(symbol, [])
-        covering = {item.instrument_id for item in held if item.holds(day)}
-        if covering == {outcome}:
+        judged = _judge(symbol, day, outcome, index)
+        if judged is None:
             claims.already_claimed += 1
             continue
-        reason = _judge(symbol, day, outcome, days, held, covering=covering)
-        if reason is not None:
-            claims.unresolved[reason][symbol].add(day)
+        if isinstance(judged, str):
+            if judged.startswith(_BRIDGE):
+                judged = judged.removeprefix(_BRIDGE)
+                claims.bridge_unresolved[judged].add(symbol)
+            claims.unresolved[judged][symbol].add(day)
             continue
+        first, start = judged
         evidence = min((item.evidence for item in grouped[symbol, day]),
                        key=lambda item: item.order())  # fmt: skip
-        claims.assertions.append(_assertion(registry.anchors[outcome], symbol, day, evidence))
+        claims.assertions.append(
+            _assertion(registry.anchors[outcome], symbol, first, day, evidence)
+        )
         claims.claimed_days.add(day)
+        if first < day:
+            claims.bridges.append({
+                "symbol": symbol, "from": first.isoformat(), "through": day.isoformat(),
+                "weekdays": len(_weekdays(first, day + timedelta(days=1))),
+                "start": {"day": start.day.isoformat(), "evidence": start.evidence},
+                "end": {"day": day.isoformat(), "evidence": evidence.source},
+            })  # fmt: skip
+    _continued(claims, registry)
     return claims
 
 
-def _judge(  # noqa: PLR0913 -- one symbol-day and what it is judged against
-    symbol: str,
-    day: date,
-    outcome: str,
+def _observe(
+    index: _Index,
     days: Mapping[tuple[str, date], str],
-    held: Sequence[Held],
-    *,
-    covering: set[str],
-) -> str | None:
-    """Why a symbol-day gets no claim, or None when it gets one."""
+    grouped: Mapping[tuple[str, date], list[Observation]],
+) -> None:
+    """Index every observed symbol-day by symbol and the instruments it names."""
+    for (symbol, day), outcome in sorted(days.items()):
+        index.observed[symbol].append((day, outcome))
+        index.sources[symbol, day] = min(
+            (item.evidence for item in grouped[symbol, day]), key=lambda item: item.order()
+        ).source
+        if not outcome.startswith("unresolved:"):
+            index.named[outcome].append((day, symbol))
+    for named in index.named.values():
+        named.sort()
+
+
+def _registry_edge(claims: SymbolClaims, registry: Registry) -> None:
+    """The registry's ``through`` and the symbols its last master or export claims end with."""
+    ends = [item.end for item in registry.held if not item.listed and item.end is not None]
+    if not ends:
+        return
+    edge = max(ends)
+    claims.registry_through = _new_york_day(edge - 1)
+    claims.registry_symbols = {item.token for item in registry.held
+                               if not item.listed and item.end == edge}  # fmt: skip
+
+
+def _continued(claims: SymbolClaims, registry: Registry) -> None:
+    """The registry's symbols a list claim, registered or new, covers on the first weekday
+    after ``through``."""
+    if claims.registry_through is None:
+        return
+    first = claims.registry_through + timedelta(days=1)
+    while _weekend(first):
+        first += timedelta(days=1)
+    claims.continued = {item.token for item in registry.held if item.listed and item.holds(first)}
+    at = session_start_us(first)
+    for row in claims.assertions:
+        if cast("int", row["valid_from_us"]) <= at < cast("int", row["valid_to_us"]):
+            claims.continued.add(str(row["token"]))
+
+
+def _judge(
+    symbol: str, day: date, outcome: str, index: _Index
+) -> str | tuple[date, _Before] | None:
+    """Why a symbol-day gets no claim, None when a registered claim holds it already, or
+    the first day of its claim and the earlier evidence the claim continues from."""
     if outcome.startswith("unresolved:"):
         return outcome.removeprefix("unresolved:")
+    covering = {item.instrument_id for item in index.held.get(symbol, []) if item.holds(day)}
+    if covering == {outcome}:
+        return None
     if covering:
         return "list_registered_conflict"
-    return _bracket(symbol, day, outcome, days, held)
+    before = index.before(symbol, day)
+    if before is None or before.outcome.startswith("unresolved:"):
+        return "list_not_bracketed"
+    if before.outcome != outcome:
+        # The instrument held the symbol earlier and a registered claim of another one sits
+        # in between: the registry contradicts a continuation, not only today's list.
+        earlier = before.evidence == "registered" and index.held_before(symbol, outcome, day)
+        return "list_registered_conflict" if earlier else "list_symbol_moved"
+    return _continue(symbol, day, outcome, before, index)
+
+
+def _continue(
+    symbol: str, day: date, outcome: str, before: _Before, index: _Index
+) -> str | tuple[date, _Before]:
+    """The first day a claim continuing ``before`` covers through ``day``, or why none.
+
+    Weekend days alone between the two need no claim; a gap with a weekday is bridged by
+    one claim from the day after ``before`` when it is at most ``MAX_BRIDGE_DAYS`` long and
+    the instrument held no other symbol meanwhile.
+    """
+    first = before.day + timedelta(days=1)
+    bridged = bool(_weekdays(first, day))
+    reason = None
+    if not bridged:
+        first = day
+    elif (day - first).days + 1 > MAX_BRIDGE_DAYS:
+        reason = "list_gap_too_long"
+    if reason is None and index.other_symbol(outcome, symbol, first, day):
+        reason = "list_symbol_moved"
+    if reason is not None:
+        return f"{_BRIDGE}{reason}" if bridged else reason
+    return first, before
 
 
 def _outcomes(grouped: Mapping[tuple[str, date], list[Observation]]) -> dict[tuple[str, date], str]:

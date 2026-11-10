@@ -5,6 +5,7 @@ for ``US``; every ticker, asset ID and ISIN is made up, and the ISINs only carry
 digits. The registered claims a list continues are synthetic registry rows.
 """
 
+# ruff: noqa: PLR2004 -- synthetic counts are the expected values
 from __future__ import annotations
 
 import hashlib
@@ -32,6 +33,7 @@ from aegis_alpha.storage.us_identity import (
     session_start_us,
 )
 from aegis_alpha.storage.us_symbols import (
+    MAX_BRIDGE_DAYS,
     Held,
     Registry,
     build_symbol_claims,
@@ -113,20 +115,118 @@ def test_each_observed_day_after_the_export_continues_the_ticker_for_that_day_on
     assert report["unresolved_days"] == {}
 
 
-def test_an_unobserved_weekday_is_never_claimed_and_is_reported_as_a_gap() -> None:
-    # Nothing observed Wednesday: Thursday is not bracketed, Friday is (by Thursday).
-    lists = [_list(_evening(day), [_row("AAA", ISIN_A)]) for day in (THU, FRI)]
-    lists.append(_list(_evening(MON + timedelta(days=1)), [_row("AAA", ISIN_A)]))
-    built = build_symbol_claims(lists, _registry(_base("AAA.US", IA, TUE)))
-    assert _claims(built.document()) == [_day("AAA.US", A, FRI)]
+def _span_claim(token: str, assetid: str, first: date, last: date) -> tuple[str, str, int, int]:
+    return (token, assetid, session_start_us(first), session_start_us(last + timedelta(days=1)))
+
+
+def test_a_gap_with_weekends_and_a_holiday_is_bridged_by_one_claim() -> None:
+    # The registry ends after Friday 2026-11-20; the next list is Monday 11-30, after a week
+    # holding Thanksgiving (11-26) and a weekend. Both ends name A for AAA.
+    friday, monday = date(2026, 11, 20), date(2026, 11, 30)
+    lists = [_list(_evening(monday), [_row("AAA", ISIN_A)])]
+    built = build_symbol_claims(lists, _registry(_base("AAA.US", IA, friday)))
+    (row,) = cast("list[dict[str, object]]", built.document()["assertions"])
+    first = date(2026, 11, 21)
+    assert _claims(built.document()) == [_span_claim("AAA.US", A, first, monday)]
+    # It starts where the registered claim ends: no overlap, no hole.
+    assert row["valid_from_us"] == session_start_us(friday + timedelta(days=1))
+    assert row["known_from_us"] == _us(datetime(2026, 11, 30, 22, tzinfo=UTC))
     report = built.report()
-    assert report["unresolved_days"] == {"list_not_bracketed": 2}
-    assert report["history_gap"] == {"from": WED.isoformat(), "through": WED.isoformat(),
-                                     "weekdays": 1}  # fmt: skip
-    # Monday was not observed, so Tuesday after it stays unresolved too.
+    assert (report["bridged_symbols"], report["bridged_days"]) == (1, 6)
+    (bridge,) = cast("list[dict[str, object]]", report["bridges"])
+    assert (bridge["from"], bridge["through"]) == (first.isoformat(), monday.isoformat())
+    assert cast("dict[str, object]", bridge["start"])["evidence"] == "registered"
+    gap = cast("dict[str, object]", report["history_gap"])
+    assert (gap["from"], gap["through"], gap["weekdays"]) == ("2026-11-23", "2026-11-27", 5)
+    assert (gap["bridged_symbols"], gap["unbridged_symbols"]) == (1, 0)
+    # The next day continues from the registered bridge with a one-day claim.
+    tuesday = monday + timedelta(days=1)
+    bridged = Held("AAA.US", IA, session_start_us(first), session_start_us(tuesday), listed=True)
+    later = build_symbol_claims([_list(_evening(tuesday), [_row("AAA", ISIN_A)])],
+                                _registry(_base("AAA.US", IA, friday), bridged))  # fmt: skip
+    assert _claims(later.document()) == [_day("AAA.US", A, tuesday)]
+    assert later.report()["bridged_symbols"] == 0
+
+
+def test_an_outage_between_lists_is_bridged_from_the_earlier_observation() -> None:
+    # Lists Thursday and Friday, none Monday, then Tuesday: Thursday is bridged from the
+    # registry (Wednesday unseen), Friday is one day, Tuesday bridges Saturday to Tuesday.
+    tuesday = MON + timedelta(days=1)
+    lists = [_list(_evening(day), [_row("AAA", ISIN_A)]) for day in (THU, FRI, tuesday)]
+    built = build_symbol_claims(lists, _registry(_base("AAA.US", IA, TUE)))
+    assert _claims(built.document()) == [
+        _span_claim("AAA.US", A, WED, THU),
+        _day("AAA.US", A, FRI),
+        _span_claim("AAA.US", A, FRI + timedelta(days=1), tuesday),
+    ]
+    report = built.report()
+    assert report["bridged_days"] == 2 + 2  # Wednesday-Thursday, Monday-Tuesday
+    starts = [cast("dict[str, object]", item["start"])["evidence"]
+              for item in cast("list[dict[str, object]]", report["bridges"])]  # fmt: skip
+    assert starts[0] == "registered"
+    assert str(starts[1]).startswith("sl:qveris-eodhd-exchange-symbols-")
     assert report["observation_gaps"] == [
         {"from": MON.isoformat(), "through": MON.isoformat(), "weekdays": 1}
     ]
+
+
+def test_a_bridge_needs_both_ends_on_the_same_instrument_and_a_short_gap() -> None:
+    monday = date(2026, 9, 21)
+    held = [
+        _base("AAA.US", IA, TUE),  # reused at the end: AAA names B on Monday
+        _base("CCC.US", IC, TUE),  # renamed meanwhile: C held ZZZ inside the gap
+        Held("ZZZ.US", IC, session_start_us(THU), session_start_us(FRI), listed=True),
+    ]
+    rows = [_row("AAA", ISIN_B), _row("CCC", ISIN_C), _row("NEW", ISIN_A),
+            _row("BAD", bad_check_digit(ISIN_B))]  # fmt: skip
+    built = build_symbol_claims([_list(_evening(monday), rows)], _registry(*held))
+    assert built.assertions == []
+    report = built.report()
+    assert report["unresolved"] == {
+        "list_isin_invalid": ["BAD.US"],
+        "list_not_bracketed": ["NEW.US"],  # a new listing: nothing shows an earlier holder
+        "list_symbol_moved": ["AAA.US", "CCC.US"],
+    }
+    assert report["bridge_unresolved"] == {"list_symbol_moved": 1}
+    # Registered inside the gap: another instrument held EEE on Thursday.
+    conflict = build_symbol_claims([_list(_evening(monday), [_row("EEE", ISIN_B)])], _registry(
+        _base("EEE.US", IB, TUE),
+        Held("EEE.US", IC, session_start_us(THU), session_start_us(FRI), listed=True),
+    ))  # fmt: skip
+    assert conflict.assertions == []
+    assert conflict.report()["unresolved"] == {"list_registered_conflict": ["EEE.US"]}
+    long_gap = build_symbol_claims([_list(_evening(monday), [_row("DDD", ISIN_A)])],
+                                   _registry(_base("DDD.US", IA, date(2026, 5, 1))))  # fmt: skip
+    assert long_gap.assertions == []
+    assert long_gap.report()["bridge_unresolved"] == {"list_gap_too_long": 1}
+    assert MAX_BRIDGE_DAYS == 120
+
+
+def test_both_ends_agreeing_still_needs_a_valid_unambiguous_isin() -> None:
+    monday = date(2026, 9, 21)
+    shared = isin("000000088", "US")
+    lists = [_list(_evening(monday), [_row("AAA", bad_check_digit(ISIN_A)), _row("BBB", shared)])]
+    owners = {ISIN_A: {IA}, ISIN_B: {IB}, shared: {IA, IB}}
+    built = build_symbol_claims(
+        lists, _registry(_base("AAA.US", IA, TUE), _base("BBB.US", IB, TUE), owners=owners)
+    )
+    assert built.assertions == []
+    assert built.report()["unresolved"] == {
+        "list_isin_ambiguous": ["BBB.US"], "list_isin_invalid": ["AAA.US"]}  # fmt: skip
+    gap = cast("dict[str, object]", built.report()["history_gap"])
+    assert gap["unbridged"] == ["AAA.US", "BBB.US"]
+
+
+def test_a_bridge_across_the_dst_change_spans_new_york_days() -> None:
+    # 2026-11-01 ends daylight saving time: Friday 10-30 starts at 04:00 UTC, Thursday
+    # 11-05 (the day after Wednesday's list) at 05:00 UTC.
+    wednesday = date(2026, 11, 4)
+    lists = [_list(_evening(wednesday), [_row("AAA", ISIN_A)])]
+    built = build_symbol_claims(lists, _registry(_base("AAA.US", IA, date(2026, 10, 29))))
+    assert _claims(built.document()) == [
+        ("AAA.US", A, _us(datetime(2026, 10, 30, 4, tzinfo=UTC)),
+         _us(datetime(2026, 11, 5, 5, tzinfo=UTC)))
+    ]  # fmt: skip
 
 
 def test_saturday_and_sunday_need_no_observation() -> None:
@@ -351,3 +451,79 @@ def test_list_claims_reach_a_new_snapshot_and_promote_the_rows_they_waited_for(
     build = UsRegistry(empty, {}, {}, {}, frozenset({"sl:" + first["source_id"]}))
     checked = check_registered(build, ws.state)
     assert [row["token"] for row in checked.withdrawn] == ["AAA.US", ISIN_A, A]
+
+
+def _counts(ws: Workspace) -> tuple[int, int]:
+    assertions = ws.state.execute("SELECT count(*) FROM identity_assertions").fetchone()[0]
+    snapshots = ws.state.execute("SELECT count(*) FROM identity_snapshots").fetchone()[0]
+    return int(assertions), int(snapshots)
+
+
+def test_a_bridge_promotes_every_held_session_once_and_a_later_day_replans_nothing(
+    ws: Workspace,
+) -> None:
+    first = _bars(ws, TUE, "AAA.US")
+    cutover = _register_base(ws, first["source_id"])
+    template = spec([first], cutover, dataset="prices.us.eodhd", decimals=FLOATS,
+                    rules={"available_at_us": DAY_RULE, "revision_known_at_us": DAY_RULE},
+                    partition={"from": TUE.isoformat(), "to": WED.isoformat()},
+                    mapper={"name": "eodhd.bars@1", "args": {"timezone": NEW_YORK}})  # fmt: skip
+    assert promote(ws, *template, apply=True)["published"] is True
+    # Four sessions after the frozen registry's last claim wait as unresolved.
+    waiting = [_bars(ws, WED, "AAA.US", "NEW.US"), *(_bars(ws, day, "AAA.US") for day in
+                                                      (THU, FRI, MON))]  # fmt: skip
+    held = promote_datasets(ws, apply=True, now_us=10, routes=[ROUTE], identity=cutover)
+    assert cast("dict[str, dict[str, object]]", held["standing_unresolved"])[
+        "prices.us.eodhd"]["sources"] == 4  # fmt: skip
+
+    # A list with nothing to claim registers nothing and pins no snapshot.
+    friday = date(2026, 9, 18)
+    _import_list(ws, friday, [_row("NEW", isin("000000077", "US"))])
+    counts = _counts(ws)
+    quiet = maintain_identity.advance(ws, apply=True, now_us=_now())
+    assert cast("dict[str, object]", quiet["us_symbols"])["registry"] == "no_new_claims"
+    assert (quiet["snapshot"], _counts(ws)) == (None, counts)
+
+    # The first list naming AAA by its ISIN, Monday 09-21: a plan registers nothing ...
+    monday = date(2026, 9, 21)
+    _import_list(ws, monday, [_row("AAA", ISIN_A), _row("NEW", isin("000000077", "US"))])
+    planned = maintain_identity.advance(ws, apply=False, now_us=_now())
+    assert cast("dict[str, object]", planned["us_symbols"])["claims"] == 1
+    assert _counts(ws) == counts
+    # ... and a run bridges Wednesday 09-09 through Monday 09-21 with one claim.
+    advanced = maintain_identity.advance(ws, apply=True, now_us=_now())
+    us = cast("dict[str, object]", advanced["us_symbols"])
+    assert (us["claims"], us["bridged_symbols"], us["bridged_days"]) == (1, 1, 9)
+    snapshot = cast("dict[str, str]", advanced["snapshot"])
+    retrieved = _us(datetime(2026, 9, 21, 22, tzinfo=UTC))
+    # Point in time: as of an instant before Monday's list nothing claims AAA for Thursday.
+    for cutoff, expected in ((retrieved - 1, 0), (retrieved, 1)):
+        found = ws.state.execute(
+            "SELECT count(*) FROM identity_assertions WHERE token='AAA.US' AND "
+            "valid_from_us <= ? AND valid_to_us > ? AND known_from_us <= ?",
+            (session_start_us(THU), session_start_us(THU), cutoff),
+        ).fetchone()
+        assert found[0] == expected
+
+    caught_up = _run(promote_datasets(ws, apply=True, now_us=30, routes=[ROUTE],
+                                      identity=snapshot))  # fmt: skip
+    statuses = {str(item["source_id"]): item["status"]
+                for item in cast("list[dict[str, object]]", caught_up["sources"])}  # fmt: skip
+    assert statuses == {waiting[0]["source_id"]: "unresolved",
+                        **{item["source_id"]: "promoted" for item in waiting[1:]}}  # fmt: skip
+    rows = ws.market.execute(
+        "SELECT session_date FROM prices WHERE instrument_id=? ORDER BY 1", (IA,)
+    ).fetchall()
+    assert rows == [(TUE,), (WED,), (THU,), (FRI,), (MON,)]
+    # The partly resolved source published AAA and still counts NEW.
+    assert standing_unresolved(ws) == {"prices.us.eodhd": {
+        "sources": 1, "rows": 2, "rows_unavailable": 0, "unresolved_tokens": 1,
+        "unpublished_sources": 0, "oldest_date": WED.isoformat()}}  # fmt: skip
+
+    # Tuesday's one-day claim re-plans none of the finished or waiting sources.
+    _import_list(ws, monday + timedelta(days=1), [_row("AAA", ISIN_A)])
+    later = maintain_identity.advance(ws, apply=True, now_us=_now())
+    assert cast("dict[str, object]", later["us_symbols"])["bridged_symbols"] == 0
+    newer = cast("dict[str, str]", later["snapshot"])
+    settled = _run(promote_datasets(ws, apply=True, now_us=40, routes=[ROUTE], identity=newer))
+    assert (settled["status"], settled["sources"]) == ("current", [])

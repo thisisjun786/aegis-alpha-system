@@ -1563,10 +1563,14 @@ identity 증분 계획, dataset마다 새 원천과 단계를 낸다. `--promoti
 ```
 
 `symbol_lists`의 `US`는 상장 목록(`delisted=0`) 하나를 매일 묻는다(KR 목록은 `symbol_list_days`마다).
-identity 단계는 그 목록의 행을 등록된 FMP ISIN으로 Norgate 상품에 잇고, 앞선 평일이 같은 상품으로 관측되거나
-등록된 claim이 있을 때만 그날 하루의 `eodhd_symbol` claim을 등록한다. 보지 못한 평일로는 늘리지 않으며,
-새 상장·모호·검증 불가 행은 사유와 함께 `stages.identity.us_symbols.unresolved`에 남고, 마지막 Norgate
-claim 뒤 목록이 없는 평일은 `history_gap`, 목록 사이의 빈 평일은 `observation_gaps`로 보고된다. 규칙은
+identity 단계는 그 목록의 행을 등록된 FMP ISIN으로 Norgate 상품에 잇는다. 그 심볼이 바로 앞에(관측이나
+등록된 claim으로) 같은 상품에 있었으면 claim을 등록한다. 사이가 토·일뿐이면 그날 하루, 평일이 비어 있으면
+그 빈 날부터 그날까지를 claim 하나로 잇는다(최대 120일). **이은(bridged) 날은 양 끝에서 같은 상품으로
+확인된 것이지 날마다 관측된 것이 아니다.** 보고의 `bridges`(표본), `bridged_symbols`, `bridged_days`,
+`bridge_unresolved`가 그 범위를 밝힌다. 양 끝이 다르거나(재사용·이름 변경), 사이에 다른 상품의 등록 claim이
+있거나, 너무 길거나, 새 상장·모호·검증 불가인 행은 사유와 함께 `stages.identity.us_symbols.unresolved`에
+남는다. 마지막 Norgate claim 뒤 첫 목록 전의 평일은 `history_gap`(이어진 심볼 수와 남은 심볼 표본), 목록
+사이의 빈 평일은 `observation_gaps`로 보고된다. 규칙은
 [유지보수 실행](design/data-vertical.md#유지보수-실행)이 소유한다.
 
 **보고의 `promote` 단계.** `unresolved`는 이번 실행이 `unresolved`로 기록한 dataset 목록이다(뜻은 그대로).

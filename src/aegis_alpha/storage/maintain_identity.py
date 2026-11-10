@@ -22,8 +22,10 @@ cutover registry. Its increment is the dated EODHD US symbol list (an
 ``qveris-eodhd-exchange-symbols-*`` source whose rows were asked for ``US``, which the KR
 build never reads): when one is linked after the newest maintenance snapshot, the run
 builds ``eodhd.us_symbol_list@1`` claims (``us_symbols``) from the new lists and the lists
-linked up to ``US_CONTEXT_DAYS`` before the earliest of them (the earlier days a new day
-is bracketed by) against the registered claims, and registers that document. Its report
+linked up to ``US_CONTEXT_DAYS`` before the earliest of them against the registered
+claims, and registers that document. The context lists hold the earlier observations a
+claim may continue from when no registered claim shows them: a renamed or newly registered
+ticker's first day, which no claim covers, starts its continuation the next day. Its report
 is ``us_symbols``; the KR report keys are unchanged.
 """
 
