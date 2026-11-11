@@ -410,19 +410,19 @@ def test_the_new_routes_see_collected_sources_and_start_only_named_datasets(
     blocked = _runs(promote_datasets(ws, apply=True, now_us=2, routes=routes, identity=identity,
                                      start=frozenset(NEW_DATASETS)))  # fmt: skip
     assert blocked[("actions.us.eodhd", "eodhd.splits@1")]["status"] == "no_calendar"
-    assert blocked[("fx.usdkrw.eodhd", "eodhd.fx_history@1")]["status"] == "no_calendar"
+    # The FX rule ends the UTC day and needs no calendar, so it starts here.
+    assert blocked[("fx.usdkrw.eodhd", "eodhd.fx_history@1")]["status"] == "advanced"
     opens(ws, "XNYS", (EX, NEXT))
     opens(ws, "XKRX", (EX,))
     unpinned = _runs(promote_datasets(ws, apply=False, now_us=3, routes=routes, identity=None,
                                       start=frozenset(NEW_DATASETS)))  # fmt: skip
     assert unpinned[("actions.us.eodhd", "eodhd.splits@1")]["status"] == "identity_unavailable"
-    assert unpinned[("fx.usdkrw.eodhd", "eodhd.fx_history@1")]["status"] == "planned"
+    assert unpinned[("fx.usdkrw.eodhd", "eodhd.fx_history@1")]["status"] == "current"
 
     started = _runs(promote_datasets(ws, apply=True, now_us=4, routes=routes, identity=identity,
                                      start=frozenset(NEW_DATASETS)))  # fmt: skip
     for key in (("actions.us.eodhd", "eodhd.splits@1"), ("actions.us.eodhd", "eodhd.dividends@1"),
-                ("actions.kr.eodhd", "eodhd.dividends@1"), ("fx.usdkrw.eodhd",
-                                                            "eodhd.fx_history@1")):  # fmt: skip
+                ("actions.kr.eodhd", "eodhd.dividends@1")):  # fmt: skip
         run = started[key]
         assert (run["status"], run["started"]) == ("advanced", True), (key, run)
     # The dividends generation continues the chain the splits generation started.
@@ -443,10 +443,9 @@ def test_the_new_routes_see_collected_sources_and_start_only_named_datasets(
         "SELECT base_currency, quote_currency, fixing_at_us, rate, available_at_us "
         "FROM fx_rates ORDER BY fixing_at_us"
     ).fetchall()
-    close = {day: opened + 6 * HOUR for day, opened in opens_of(ws).items()}
     assert rates == [
-        ("USD", "KRW", us_at(EX, 24) - 1, Decimal("1385.25"), close[EX] + 4 * HOUR),
-        ("USD", "KRW", us_at(NEXT, 24) - 1, Decimal("1390.5"), close[NEXT] + 4 * HOUR),
+        ("USD", "KRW", us_at(EX, 24) - 1, Decimal("1385.25"), us_at(EX, 24) - 1),
+        ("USD", "KRW", us_at(NEXT, 24) - 1, Decimal("1390.5"), us_at(NEXT, 24) - 1),
     ]
     # A started chain continues from its own generation: no start needed for the next source.
     versions = tuple(ws.state.execute("SELECT count(*) FROM dataset_versions").fetchone())
@@ -459,11 +458,3 @@ def test_the_new_routes_see_collected_sources_and_start_only_named_datasets(
     run = later[("actions.us.eodhd", "eodhd.splits@1")]
     assert (run["status"], run["started"]) == ("advanced", False)
     assert dataset_head(ws, "actions.us.eodhd") is not None
-
-
-def opens_of(ws: Workspace) -> dict[date, int]:
-    """The XNYS opens the test published, read back from the calendar head."""
-    rows = ws.market.execute(
-        "SELECT session_date, open_at_us FROM calendar_sessions WHERE calendar_id='XNYS'"
-    ).fetchall()
-    return {day: int(opened) for day, opened in rows}

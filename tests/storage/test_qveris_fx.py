@@ -19,21 +19,18 @@ import pytest
 
 from aegis_alpha.data.qveris_contracts import QverisJob
 from aegis_alpha.data.qveris_native import read_completed_job
-from aegis_alpha.storage.maintain_promotion import head_pin
 from aegis_alpha.storage.promotion.engine import promote
 from aegis_alpha.storage.promotion.mappers import mapper
 from aegis_alpha.storage.qveris_import import build_unit, completions, import_unit
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
 from tests.data.qveris_support import complete, fx_job
-from tests.storage.promotion_support import publish_calendar, us
+from tests.storage.promotion_support import us
 
 # Serial: these tests take the host-wide Qveris account lease (an abstract Unix socket named by
 # the account), so every file that takes it runs in one xdist worker.
 pytestmark = pytest.mark.xdist_group("qveris-account-lease")
 
 MON, TUE, WED = date(2026, 8, 31), date(2026, 9, 1), date(2026, 9, 2)
-HOUR = 3_600 * 10**6
-LAG = 4 * HOUR
 
 
 @pytest.fixture
@@ -68,12 +65,12 @@ def _replay(ws: Workspace, raw: Path, job: QverisJob, rows: list[dict[str, objec
     }
 
 
-def _spec(pin: dict[str, str], calendar: dict[str, str], parent: str | None) -> tuple[bytes, str]:
+def _spec(pin: dict[str, str], parent: str | None) -> tuple[bytes, str]:
     rule = {
-        "rule": "session_close_plus_lag@1",
+        "rule": "local_day_end@1",
         "basis": "record",
         "input": "fixing_date",
-        "args": {"calendar": calendar, "calendar_id": "XNYS", "venue": "XNYS", "lag_us": LAG},
+        "args": {"timezone": "UTC"},
     }
     document = {
         "schema_version": "aas-promotion-v1",
@@ -103,32 +100,26 @@ def test_usdkrw_forex_history_promotes_to_fx_usdkrw_eodhd(ws: Workspace, tmp_pat
             found.check_args(bad)
     raw = tmp_path / "qveris"
     first = _replay(ws, raw, fx_job(), _closes((MON, 1385.25), (TUE, 1390.5), (WED, 1388.0)))
-    # XNYS closes at 20:00 UTC on Monday and Wednesday and does not open on Tuesday.
-    sessions = {MON: (_utc(MON, 13.5), _utc(MON, 20)), WED: (_utc(WED, 13.5), _utc(WED, 20))}
-    calendar = publish_calendar(ws, sessions, dataset="sessions.xnys", calendar_id="XNYS")
-    published = promote(ws, *_spec(first, calendar, None), apply=True)
+    published = promote(ws, *_spec(first, None), apply=True)
     assert published["published"] is True, published.get("refusals")
     rows = ws.market.execute(
         "SELECT base_currency, quote_currency, fixing_at_us, rate, value_state, available_at_us, "
         "revision_known_at_us FROM fx_rates ORDER BY fixing_at_us"
     ).fetchall()
-    # The fixing is the end of the UTC day; the rate is known at the XNYS close plus the lag,
-    # and a day the calendar does not open keeps no time a strict read could use.
+    # The fixing is the end of the UTC day and the rate is known at that same instant, whether
+    # or not XNYS opens that day (an early close cannot make it earlier).
     assert rows == [
-        ("USD", "KRW", _utc(TUE) - 1, Decimal("1385.25"), "present", _utc(MON, 20) + LAG,
-         _utc(MON, 20) + LAG),
-        ("USD", "KRW", _utc(WED) - 1, Decimal("1390.5"), "present", None, None),
+        ("USD", "KRW", _utc(TUE) - 1, Decimal("1385.25"), "present", _utc(TUE) - 1, _utc(TUE) - 1),
+        ("USD", "KRW", _utc(WED) - 1, Decimal("1390.5"), "present", _utc(WED) - 1, _utc(WED) - 1),
         ("USD", "KRW", _utc(WED + timedelta(days=1)) - 1, Decimal(1388), "present",
-         _utc(WED, 20) + LAG, _utc(WED, 20) + LAG),
+         _utc(WED + timedelta(days=1)) - 1, _utc(WED + timedelta(days=1)) - 1),
     ]  # fmt: skip
     # A later download repeats the window: an unchanged close is no revision, a changed one
     # supersedes the earlier rate.
     later = replace(fx_job(), job_id="fx-USDKRW-later", observation_date=date(2026, 9, 7))
     second = _replay(ws, raw, later, _closes((MON, 1385.25), (TUE, 1390.5), (WED, 1389.75)))
     head = str(published["generation_id"])
-    pin = head_pin(ws, "sessions.xnys")
-    assert pin is not None
-    corrected = promote(ws, *_spec(second, pin, head), apply=True)
+    corrected = promote(ws, *_spec(second, head), apply=True)
     assert corrected["published"] is True, corrected.get("refusals")
     assert corrected["operations"] == {"SUPERSEDE": 1}
     changed = ws.market.execute(

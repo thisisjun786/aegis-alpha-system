@@ -254,7 +254,7 @@ CATALOG: Final[tuple[CatalogEntry, ...]] = (
         "fx.usdkrw.fred", "fx_rates", "canonical", ("fred.fx_series@1",), ("unknown_null@1",), _TEXT
     ),
     CatalogEntry(
-        "fx.usdkrw.eodhd", "fx_rates", "canonical", ("eodhd.fx_history@1",), _DAILY, _SHORTEST
+        "fx.usdkrw.eodhd", "fx_rates", "canonical", ("eodhd.fx_history@1",), _DAY_END, _SHORTEST
     ),
     CatalogEntry(
         "classifications.us.norgate",

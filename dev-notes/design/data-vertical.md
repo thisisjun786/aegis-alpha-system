@@ -1185,7 +1185,7 @@ ASCII escape와 바이트까지 같다.
 | `macro.kr.oecd` | `macro_observations` | canonical | `oecd.observations@1` | `unknown_null@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | legacy OECD 공개 응답. vintage와 공개 시각이 없어 strict 읽기는 고르지 않는다 |
 | `fx.usdkrw.norgate` | `fx_rates` | canonical | `norgate.fx_closes@1`, `norgate.fx_history@1` | `local_day_end@1` | `decimal_text@1` | 없음 | `time_precision_day`, `volume_precision_limited` | 예 | 원천 자료실 Norgate 기준 시리즈(2026-09-08까지)와 legacy 내보내기 편입본, 시간대 `Etc/GMT+12`. 우선순위는 소비자 pin |
 | `fx.usdkrw.fred` | `fx_rates` | canonical | `fred.fx_series@1` | `unknown_null@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | FRED DEXKOUS(legacy CSV 편입본과 ALFRED 수집). H.10 발표 지연 때문에 strict 읽기는 고르지 않는다. 우선순위는 소비자 pin |
-| `fx.usdkrw.eodhd` | `fx_rates` | canonical | `eodhd.fx_history@1` | `session_close_plus_lag@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 아니오 | Qveris `USDKRW.FOREX` 일간 이력(`qveris-fx-history-bars-*`)의 종가, UTC 날짜 끝이 fixing. 시점은 `sessions.xnys` 종가에 4시간을 더한다(가격과 같은 종가 규칙). 우선순위는 소비자 pin |
+| `fx.usdkrw.eodhd` | `fx_rates` | canonical | `eodhd.fx_history@1` | `local_day_end@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage`, `time_precision_day` | 아니오 | Qveris `USDKRW.FOREX` 일간 이력(`qveris-fx-history-bars-*`)의 종가, UTC 날짜 끝이 fixing. 시점도 그 UTC 날짜 끝이다(거래소 달력을 쓰지 않으므로 조기 폐장이 fixing보다 앞서 공개 시점을 줄 수 없고, 거래소가 열지 않는 날의 행도 시점을 가진다). 우선순위는 소비자 pin |
 | `classifications.us.norgate` | `classifications` | canonical | `norgate.classification@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | Norgate 증권 유형(`norgate.security_type`)과 상장 거래소(`norgate.exchange`) snapshot, 과거로 소급하지 않음. [분류](#분류) |
 | `classifications.us.sec` | `classifications` | canonical | `sec.sic@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | SEC SIC(`sec.sic`) snapshot, issuer 주체 |
 | `classifications.kr.kind` | `classifications` | canonical | `kind.industry@1`, `kind.industry@2` | `source_column@1` | 없음 | 없음 | 없음 | 아니오 | KIND 업종(`kind.industry`) snapshot, 단축코드를 identity snapshot으로 해석, 수집 시각부터 알려짐 |
@@ -1724,7 +1724,7 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
 | `prices.kr.eodhd.ref` | `eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1` | 위 두 모양 | 위와 같음. bulk의 첫 template은 `eodhd.bars_adjusted@1`에서 파생 |
 | `actions.us.eodhd` | `eodhd.splits@1`, `eodhd.dividends@1` | `qveris-splits-*` `splits`, `qveris-dividends-*` `dividends` | 심볼이 `.US`. 시작 선언: `exdate_open@1`(`sessions.xnys`), `America/New_York` |
 | `actions.kr.eodhd` | `eodhd.splits@1`, `eodhd.dividends@1` | 위 두 모양 | 심볼이 `.KO`·`.KQ`. 시작 선언: `exdate_open@1`(`sessions.xkrx`), `Asia/Seoul` |
-| `fx.usdkrw.eodhd` | `eodhd.fx_history@1` | `qveris-fx-history-bars-*` `bars` | 쌍이 USD/KRW. 시작 선언: `session_close_plus_lag@1`(`sessions.xnys`, 4시간), `timezone` `UTC` |
+| `fx.usdkrw.eodhd` | `eodhd.fx_history@1` | `qveris-fx-history-bars-*` `bars` | 쌍이 USD/KRW. 시작 선언: `local_day_end@1`(`timezone` `UTC`, 달력 없음), `timezone` `UTC` |
 | `status.kr.kind` | `kind.status@1` | `kind-listings-*` `listings` | `short_code`·`listed_on`·`retrieved_at_utc` 열. 시작 선언: Asia/Seoul `local_day_end@1` |
 | `status.us.eodhd` | `eodhd.delisted@1` | `qveris-eodhd-exchange-symbols-*` `symbols` | 모든 행이 `exchange_code` `US`, `delisted` `1`. US price route 뒤에 돈다. 이른 New York 날짜의 같은 열 US 목록 중 마지막 상장 목록·마지막 상장폐지 목록·첫 상장폐지 목록을 새 원천 뒤에 함께 pin한다(기록은 새 원천만). 시작 선언: `America/New_York` `local_day_end@1`, 파티션 없음, `bars`는 `prices.us.eodhd`의 committed head(없으면 `no_reference`) |
 

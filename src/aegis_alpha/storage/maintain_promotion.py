@@ -264,14 +264,13 @@ def _actions(calendar: str, zone: str, numbers: Mapping[str, str]) -> Start:
     return Start({"timezone": zone}, rule, numbers)
 
 
-# EODHD's daily FOREX bars follow the UTC day; a close is known at the XNYS close of its date
-# plus four hours, the end of the UTC day under New York daylight time (later in winter).
-FX_LAG_US: Final = 4 * 3_600_000_000
+# EODHD's daily FOREX bars follow the UTC day: a close is known by the end of its UTC day, the
+# fixing itself. No exchange calendar is involved, so no session close (an early one included)
+# can put availability before the fixing, and a day the exchange does not open keeps its time.
 _FX_START: Final = Start(
     {"base": "USD", "quote": "KRW", "timezone": "UTC"},
-    {"rule": "session_close_plus_lag@1", "basis": "record", "input": "fixing_date",
-     "args": {"calendar": "sessions.xnys", "calendar_id": "XNYS", "venue": "XNYS",
-              "lag_us": FX_LAG_US}},
+    {"rule": "local_day_end@1", "basis": "record", "input": "fixing_date",
+     "args": {"timezone": "UTC"}},
     {"rate": "float_shortest@1"},
     identity=False,
 )  # fmt: skip
