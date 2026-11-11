@@ -15,7 +15,8 @@ date, so the date comes from one of two bases, named by ``reason``:
   years.
 - ``eodhd_delisted_last_bar`` (``date_basis=last_bar``, ``status_event_id``
   ``eodhd:delisted:last_bar``): the New York start of the day after the instrument's last bar
-  in the pinned ``bars`` generation (``prices.us.eodhd``) on or before today's list. It is
+  in the pinned ``bars`` chain (``prices.us.eodhd``) on or before today's list, read as of the
+  list's retrieval: each record's latest revision known by then. It is
   recorded beside an observed event too; an instrument without such a bar has none.
 
 A last-bar event without an observed one in the same promotion carries the row flag
@@ -89,7 +90,8 @@ class EodhdDelisted:
             raise ValueError(f"{_LABEL} {BARS} must pin a US prices dataset")
 
     def references(self, args: Mapping[str, object]) -> Mapping[str, Reference]:
-        return {BARS: Reference("prices", reference_pin(args[BARS], f"{_LABEL} {BARS}"))}
+        return {BARS: Reference("prices", reference_pin(args[BARS], f"{_LABEL} {BARS}"),
+                                       revisions=True)}
 
     def source_columns(self) -> Mapping[str, frozenset[str]]:
         return dict.fromkeys(
@@ -141,15 +143,20 @@ class EodhdDelisted:
             "QUALIFY row_number() OVER (PARTITION BY coalesce(_d_isin, "
             "'#' || CAST(s._aas_pin AS VARCHAR) || ':' || CAST(s._aas_ordinal AS VARCHAR)) "
             "ORDER BY s._aas_row_hash NULLS LAST, s._aas_pin, s._aas_ordinal) = 1), "
+            # The price chain as a strict reader saw it when the list was retrieved: each
+            # record's latest revision known by then, so neither a later backfill nor a later
+            # correction or deletion dates (or hides) an earlier list's event.
+            "bv AS (SELECT instrument_id, session_date FROM (SELECT *, row_number() OVER "
+            "(PARTITION BY record_id ORDER BY _aas_sequence DESC, "
+            f"revision_known_at_us DESC NULLS LAST) AS _rank FROM {bars} "
+            "WHERE greatest(available_at_us, revision_known_at_us) <= (SELECT list_at FROM t)) "
+            "WHERE _rank = 1 AND op <> 'TOMBSTONE'), "
             # The instruments the engine will resolve each row to, and their last bar.
             "m AS (SELECT d._aas_pin, d._aas_ordinal, max(b.session_date) AS last_bar "
             f"FROM d JOIN {IDENTITY_ROWS} i ON i.token = d._d_isin "
             "AND i.valid_from_us <= d._d_at AND (i.valid_to_us IS NULL OR d._d_at < i.valid_to_us) "
-            f"LEFT JOIN {bars} b ON b.instrument_id = i.instrument_id "
+            "LEFT JOIN bv b ON b.instrument_id = i.instrument_id "
             "AND b.session_date <= d._d_day "
-            # Only bars a strict reader could already know when the list was retrieved: a
-            # later backfill or correction must not date an earlier list's event.
-            "AND greatest(b.available_at_us, b.revision_known_at_us) <= d._d_at "
             "GROUP BY ALL), "
             "e AS (SELECT d.*, m._aas_pin IS NOT NULL AS _d_named, m.last_bar AS _d_last "
             "FROM d LEFT JOIN m USING (_aas_pin, _aas_ordinal))"

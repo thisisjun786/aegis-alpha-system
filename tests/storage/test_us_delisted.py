@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
 
+import duckdb
 import pytest
 
 from aegis_alpha.storage.identity import (
@@ -29,7 +30,8 @@ from aegis_alpha.storage.maintain_promotion import (
     standing_unresolved,
 )
 from aegis_alpha.storage.promotion.engine import promote
-from aegis_alpha.storage.promotion.mappers.eodhd_delisted import LAST_BAR, OBSERVED
+from aegis_alpha.storage.promotion.mappers import IDENTITY_ROWS, mapper, reference_table
+from aegis_alpha.storage.promotion.mappers.eodhd_delisted import BARS, LAST_BAR, OBSERVED
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
 from tests.storage.kr_identity_support import eodhd_job, isin, symbol
 from tests.storage.promotion_support import add_source, at, bar, spec
@@ -209,3 +211,77 @@ def test_a_last_bar_event_ignores_bars_known_only_after_its_list(ws: Workspace) 
     assert _events(ws) == [
         (IA, LAST_BAR, _start(date(2026, 9, 11)), "eodhd_delisted_last_bar"),
     ]
+
+
+def _last_bar_as_of(revisions: list[tuple[str, int, str, int | None, int | None]]) -> list[object]:
+    """The last bar the mapper reads for one instrument under hand-made price revisions.
+
+    Each revision is (session day, generation sequence, op, available_at_us, revision_known_at_us).
+    """
+    listed_us = int(datetime(2026, 9, 11, 22, tzinfo=UTC).timestamp() * 1_000_000)
+    connection = duckdb.connect()
+    connection.execute(
+        "CREATE TABLE src AS SELECT 0::INTEGER AS _aas_pin, 0::BIGINT AS _aas_ordinal, 'h' AS "
+        "_aas_row_hash, 'US' AS exchange_code, '1' AS delisted, 'AAA' AS code, "
+        f"'{ISIN_A}' AS isin, 'Common Stock' AS type, '2026-09-11T22:00:00Z' AS retrieved_at_utc"
+    )
+    connection.execute(
+        f"CREATE TABLE {IDENTITY_ROWS} (token VARCHAR, instrument_id VARCHAR, "
+        "valid_from_us BIGINT, valid_to_us BIGINT)"
+    )
+    connection.execute(f"INSERT INTO {IDENTITY_ROWS} VALUES ('{ISIN_A}', 'ins-a', 0, NULL)")
+    connection.execute(
+        f"CREATE TABLE {reference_table(BARS)} (instrument_id VARCHAR, session_date DATE, "
+        "available_at_us BIGINT, revision_known_at_us BIGINT, _aas_sequence BIGINT, "
+        "op VARCHAR, record_id VARCHAR, revision_id VARCHAR)"
+    )
+    for day, sequence, op, available, known in revisions:
+        connection.execute(
+            f"INSERT INTO {reference_table(BARS)} VALUES ('ins-a', ?, ?, ?, ?, ?, ?, ?)",
+            [day, available, known, sequence, op, f"r-{day}", f"v-{day}-{sequence}"],
+        )
+    found = mapper("eodhd.delisted@1")
+    sql = found.select("src", {"timezone": "America/New_York"})
+    return [
+        row[0]
+        for row in connection.execute(
+            f"SELECT effective_from_us FROM ({sql}) WHERE status_event_id = '{LAST_BAR}' "
+            "AND _aas_item = 1"
+        ).fetchall()
+    ]
+
+
+def test_a_last_bar_is_read_as_of_the_list_not_from_later_corrections() -> None:
+    listed_us = int(datetime(2026, 9, 11, 22, tzinfo=UTC).timestamp() * 1_000_000)
+    before, after = listed_us - 3_600_000_000, listed_us + 3_600_000_000
+    # Thursday and Friday were known before the list. Friday was corrected after it, which
+    # leaves only the later revision as the record's head: the earlier one still dates the event.
+    corrected = _last_bar_as_of([
+        ("2026-09-10", 1, "ASSERT", before, before),
+        ("2026-09-11", 1, "ASSERT", before, before),
+        ("2026-09-11", 2, "SUPERSEDE", before, after),
+    ])  # fmt: skip
+    assert corrected == [_start(date(2026, 9, 12))]
+    # A bar first known only after the list does not date it; one deleted only after it still does.
+    assert _last_bar_as_of([
+        ("2026-09-10", 1, "ASSERT", before, before),
+        ("2026-09-11", 1, "ASSERT", after, after),
+    ]) == [_start(date(2026, 9, 11))]  # fmt: skip
+    assert _last_bar_as_of([
+        ("2026-09-11", 1, "ASSERT", before, before),
+        ("2026-09-11", 2, "TOMBSTONE", None, after),
+    ]) == [_start(date(2026, 9, 12))]  # fmt: skip
+    assert _last_bar_as_of([
+        ("2026-09-11", 1, "ASSERT", before, before),
+        ("2026-09-11", 2, "TOMBSTONE", None, before),
+    ]) == []  # fmt: skip
+
+
+def test_a_list_of_rows_without_isin_is_still_an_unresolved_source(ws: Workspace) -> None:
+    identity = _bars(ws)
+    _list(ws, "2026-09-11T22:00:00Z", "1", [_row("GONE", None)])
+    run = _run(ws, identity, 10)
+    (source,) = cast("list[dict[str, object]]", run["sources"])
+    assert source["status"] == "unresolved"
+    standing = standing_unresolved(ws)["status.us.eodhd"]
+    assert standing["rows_by_reason"] == {"isin_missing": 1}
