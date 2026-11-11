@@ -155,18 +155,35 @@ def test_an_isin_registered_later_in_the_build_withdraws_a_bridge_it_contradicts
 
 
 def test_an_isin_joined_to_a_norgate_instrument_later_withdraws_a_bridge_it_contradicts() -> None:
-    # As above, but Thursday's X is carried by BBB, which Norgate's B (no ISIN) holds that
-    # day: X joins B, so Tuesday's AAA names B, not A.
+    # As above, but Thursday's X is carried by BBB, which Norgate's B (no ISIN, listed from
+    # Wednesday, so no registered claim of B contradicts Tuesday's row) holds that day: X
+    # joins B, so Tuesday's AAA names B, not A.
     w, b = isin("000000074", "US"), "900002"
     ib = mint_instrument("norgate_assetid", b)
     held = (Held("AAA.US", IA, session_start_us(date(2001, 2, 5)), session_start_us(TUE),
                  listed=False),
-            Held("BBB.US", ib, session_start_us(date(2001, 2, 5)), None, listed=False))  # fmt: skip
+            Held("BBB.US", ib, session_start_us(WED), None, listed=False))  # fmt: skip
     lists = [_list(TUE, [_row("AAA", X)]), _list(WED, [_row("AAA", w)]),
              _list(THU, [_row("BBB", X)])]  # fmt: skip
     built = build_symbol_claims(lists, Registry(held, {w: frozenset({IA})}, {IA: A, ib: b}))
     assert (built.assertions, built.attached) == ([], 1)
     assert built.report()["bridge_unresolved"] == {"list_contradicted": 1}
+
+
+def test_an_isin_whose_earlier_row_contradicts_a_registered_claim_joins_no_instrument() -> None:
+    # A (registered with ISIN W) holds AAA through Tuesday, when AAA carries the unregistered
+    # X. Thursday's BBB carries X on a day Norgate's B (no ISIN) holds BBB, but X held AAA
+    # on a day A's registered claim covers: X does not join B.
+    w, b = isin("000000074", "US"), "900002"
+    ib = mint_instrument("norgate_assetid", b)
+    held = (Held("AAA.US", IA, session_start_us(date(2001, 2, 5)), session_start_us(WED),
+                 listed=False),
+            Held("BBB.US", ib, session_start_us(date(2001, 2, 5)), None, listed=False))  # fmt: skip
+    lists = [_list(TUE, [_row("AAA", X)]), _list(THU, [_row("BBB", X)])]
+    built = build_symbol_claims(lists, Registry(held, {w: frozenset({IA})}, {IA: A, ib: b}))
+    assert (built.assertions, built.identifiers, built.attached) == ([], [], 0)
+    assert built.report()["unresolved_days"] == {"list_isin_unregistered": 1,
+                                                 "list_registered_conflict": 1}  # fmt: skip
 
 
 # --- maintenance: the registry, both orders, and the standing summary ---------------------
@@ -229,6 +246,36 @@ def test_norgate_first_then_the_isin_joins_the_norgate_instrument(ws: Workspace)
     friday = _advance(ws)
     assert (friday["claims"], friday["registered_instruments"]) == (1, 0)
     assert _one_instrument(ws) == IA
+
+
+def test_an_isin_whose_earlier_row_contradicts_a_registered_bridge_is_not_registered(
+    ws: Workspace,
+) -> None:
+    # Norgate's A holds AAA through Tuesday; Tuesday's list joins W to it. Wednesday's AAA
+    # carries the unregistered X and Thursday's AAA W again, so one run registers A's
+    # Wednesday-Thursday bridge. A later run's Friday NEW carries X: X held AAA on a day
+    # A's registered claim covers, so X is neither minted nor joined, and nothing is withdrawn.
+    rows = [master(int(A), "AAA", first_date="2001-02-05", last_date=TUE.isoformat())]
+    _register(ws, build_from_workspace(ws, master=commit(
+        ws, "norgate-master", "observations", table(rows, MASTER_SCHEMA))))  # fmt: skip
+    w = isin("000000074", "US")
+    _import_list(ws, TUE, [_row("AAA", w)])
+    _import_list(ws, WED, [_row("AAA", X)])
+    _import_list(ws, THU, [_row("AAA", w)])
+    first = _advance(ws)
+    assert (first["attached_isins"], first["claims"], first["registered_instruments"]) == (1, 1, 0)
+    bridge = _day("AAA.US", IA, WED, THU)
+    _import_list(ws, FRI, [_row("NEW", X)])
+    second = _advance(ws)
+    assert (second["claims"], second["registered_instruments"]) == (0, 0)
+    assert second["unresolved_days"] == {"list_registered_conflict": 1}
+    assert _holders(ws, "isin", X) == set()
+    assert _holders(ws, "eodhd_symbol", "NEW.US") == set()
+    claims = {(str(row[0]), str(row[1]), str(row[2]), str(row[3])) for row in ws.state.execute(
+        "SELECT token, instrument_id, valid_from_us, valid_to_us FROM identity_assertions "
+        "WHERE token = 'AAA.US' AND valid_from_us = ?", (int(bridge[2]),))}  # fmt: skip
+    assert claims == {bridge}
+    assert ws.state.execute("SELECT count(*) FROM instruments").fetchone()[0] == 1
 
 
 def test_a_list_isin_does_not_join_a_norgate_instrument_of_another_asset_type(

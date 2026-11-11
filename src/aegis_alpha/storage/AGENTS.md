@@ -273,7 +273,10 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   or, over a gap with weekdays, one bridge claim of at most `MAX_BRIDGE_DAYS` verified at
   both ends; every other day stays unresolved with its reason. An ISIN the build mints or
   joins later turns its earlier rows into vetoes; when one lands on a claim the build already
-  accepted, the build is judged again with that binding foreseen from the first day.
+  accepted, the build is judged again with that binding foreseen from the first day. An ISIN
+  whose rows (earlier lists read again for it, whatever their day) land on a registered claim
+  of another instrument, or of its instrument under another symbol, is neither minted nor
+  joined (`list_registered_conflict`): a registered claim is never withdrawn.
   `promote_datasets` reports `standing_unresolved` from the persisted `maintain_source@1`
   records (the US daily price entry adds its waiting rows by reason, symbol class and
   disposition, judged now: `us_symbols.unresolved_breakdown`), and an unresolved record of a partitioned source keys its re-plan on the identity

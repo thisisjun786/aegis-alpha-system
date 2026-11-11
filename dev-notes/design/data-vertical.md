@@ -1723,7 +1723,10 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
   만들지 않는다. 오늘 시작하는 하루 claim은 앞선 목록을 읽지 않는다. 그래서 목록이 덮는 날의 순서대로 한 실행씩
   도착하면 등록되는 claim은 모든 목록을 한 번에 만든 것과 같다(무작위 시나리오 테스트). 단, 이미 판정한 날에 대해
   다른 증거를 가진 목록이 뒤의 실행에 오면 등록된 claim은 철회되지 않는다(append-only). 그 날은 `list_registered_conflict`로
-  보고되어 운영자가 볼 일이다.
+  보고되어 운영자가 볼 일이다. 같은 이유로 build가 발급하거나 잇는 ISIN은 앞선 목록에서 그 ISIN을 실은 행을 날짜와
+  상관없이 모두 다시 읽어, 그 행이 등록 claim과 모순되면(그 심볼을 다른 상품이 갖거나 그 상품이 다른 심볼로 등록된 날)
+  발급·연결하지 않고 그날을 `list_registered_conflict`로 남긴다. 한 build 안에서는 받아들인 claim을 다시 판정해
+  거두지만, 이미 등록된 claim은 거둘 수 없으므로 ISIN 쪽을 거부한다.
 - 사이가 토·일뿐이면 claim은 뉴욕 하루 `d`다. 평일이 비어 있으면 claim 하나가 그 공백을 잇는다: `before` 다음 날의
   뉴욕 시작부터 `d` 다음 날의 뉴욕 시작까지, 최대 `MAX_BRIDGE_DAYS`(120) 역일. 이은 날은 양 끝에서 확인된 것이지
   날마다 관측된 것이 아니며, 보고의 `bridges`(심볼, 처음·끝 날, 평일 수, 양 끝의 증거, 표본 100), `bridged_symbols`,
@@ -3385,3 +3388,5 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-586 | 목록 ISIN은 자산 종류가 다른 Norgate 상품에 이어지지 않고 `list_isin_type_differs`로 남는다 | `tests/storage/test_us_isin_anchor.py::test_a_list_isin_does_not_join_a_norgate_instrument_of_another_asset_type` | 구현 |
 | DV-587 | master에서 미해결로 빠진 Norgate 목록(`isin_instrument_held`, 같은 이유로 `assetid_repeated`)의 export가 master보다 길어도 그 asset ID는 export claim도 상품도 남기지 않아 build는 등록되고 그 목록만 미해결로 남는다 | `tests/storage/test_us_isin_anchor.py::test_a_listing_left_out_of_an_isin_instrument_gives_no_export_claim` | 구현 |
 | DV-588 | ISIN 상품에 빠진 Norgate 행의 export가 보인 새 이름(`AAA`→`BBB`)도 `BBB.US` claim과 export 창을 남기지 않는다(흡수 경로를 걷어내 합쳐진 행이 없다) | `tests/storage/test_us_isin_anchor.py::test_a_listing_left_out_of_an_isin_instrument_gives_no_export_claim` | 구현 |
+| DV-589 | 늦게 알려진 ISIN의 앞선 행이 앞 실행에서 등록된 bridge의 날을 다른 상품으로 보이면, 두 실행으로 나눠도 그 ISIN은 발급되지 않고 `list_registered_conflict`로 남으며 등록된 bridge는 그대로다 | `tests/storage/test_us_isin_anchor.py::test_an_isin_whose_earlier_row_contradicts_a_registered_bridge_is_not_registered` | 구현 |
+| DV-590 | 앞선 행이 등록 claim과 모순되는 미등록 ISIN은 Norgate 상품에도 이어지지 않고 `list_registered_conflict`로 남는다 | `tests/storage/test_us_isin_anchor.py::test_an_isin_whose_earlier_row_contradicts_a_registered_claim_joins_no_instrument` | 구현 |

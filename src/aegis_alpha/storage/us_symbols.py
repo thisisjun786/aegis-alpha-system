@@ -20,7 +20,10 @@ unresolved):
   registered claim covers the day, every row is of a listing class, no claim held the
   symbol before or the one before is an instrument minted from another ISIN), mints
   ``mint_instrument('us_isin', isin)`` with the day as its first claim. After a Norgate
-  holder it stays ``list_isin_unregistered``: the two may be one security. An instrument
+  holder it stays ``list_isin_unregistered``: the two may be one security. An ISIN whose
+  rows (earlier lists included, whatever their day) land on a registered claim of another
+  instrument, or of its instrument under another symbol, is neither minted nor joined
+  (``list_registered_conflict``): a registered claim is never withdrawn. An instrument
   minted from an ISIN is named by it directly, so its day is claimed alone where a
   continuation is not possible (a new or reused ticker of that ISIN).
 - A weekday ``d`` whose observations all name instrument ``I`` for ``<Code>.US`` (and no
@@ -144,6 +147,7 @@ REGISTRABLE: Final = frozenset({"list_isin_missing", "list_isin_unregistered"})
 LISTING_CLASSES: Final = frozenset({"common_stock", "etf", "fund"})
 """Classes whose unregistered ISIN may mint a new ``us_isin`` instrument."""
 _UNREGISTERED: Final = "unresolved:list_isin_unregistered"
+_REGISTERED_CONFLICT: Final = "list_registered_conflict"
 NOT_OBSERVED: Final = "list_not_observed"
 CLAIMABLE: Final = "list_claimable"
 RESOLVED: Final = "resolved"
@@ -674,6 +678,20 @@ class _Index:
             if self._vetoes(symbol, instrument, day):
                 self.late.add((isin, instrument))
 
+    def registered_conflict(self, isin: str, instrument: str) -> bool:
+        """Whether a row carrying ``isin`` falls on a registered claim that holds its symbol
+        for another instrument or ``instrument`` under another symbol.
+
+        A registered claim is never withdrawn, so such an ISIN cannot name ``instrument``."""
+        for day, symbol in self.pending.get(isin, []):
+            if any(item.instrument_id != instrument and item.holds(day)
+                   for item in self.held.get(symbol, [])):  # fmt: skip
+                return True
+            if any(item.token != symbol and item.holds(day)
+                   for item in self.holdings.get(instrument, [])):  # fmt: skip
+                return True
+        return False
+
     def _vetoes(self, symbol: str, instrument: str, day: date) -> bool:
         """Whether an accepted claim covering ``day`` holds ``symbol`` for another instrument
         or ``instrument`` under another symbol."""
@@ -903,8 +921,16 @@ def _register(  # noqa: PLR0913 -- the build's state for one symbol-day
             anchor is not None and anchor[0] == "norgate_assetid" and not index.isins.get(owner)
         )
         kind = _asset_type(items)
-        if anchor is None or not joinable or index.asset_types.get(owner, kind) != kind:
-            return ("list_isin_type_differs" if joinable else reason), _UNREGISTERED
+        differs = index.asset_types.get(owner, kind) != kind
+        if anchor is None or not joinable or differs or index.registered_conflict(isin, owner):
+            refused = (
+                reason
+                if not joinable
+                else "list_isin_type_differs"
+                if differs
+                else _REGISTERED_CONFLICT
+            )
+            return refused, _UNREGISTERED
         claims.identifiers.append(_identifier(anchor, isin, evidence.known_from_us, evidence))
         claims.attached += 1
         index.bind(isin, owner)
@@ -916,9 +942,13 @@ def _register(  # noqa: PLR0913 -- the build's state for one symbol-day
     ):
         return reason, _UNREGISTERED
     instrument = mint_instrument(ISIN_ANCHOR, isin)
-    single = _single(symbol, day, instrument, index)
+    single = (
+        _REGISTERED_CONFLICT
+        if index.registered_conflict(isin, instrument)
+        else _single(symbol, day, instrument, index)
+    )
     if isinstance(single, str):
-        return reason, _UNREGISTERED
+        return (single if single == _REGISTERED_CONFLICT else reason), _UNREGISTERED
     anchor = (ISIN_ANCHOR, isin)
     claims.instruments.append({
         "anchor_namespace": ISIN_ANCHOR, "anchor_token": isin, "issuer": None,
@@ -1131,8 +1161,11 @@ def build_increment(
     lists (``floor``: the earliest of their link instants), then reads the earlier lists
     linked from the earliest such start up to ``floor`` (keeping only
     rows of the claims' symbols or their instruments' ISINs) and builds again, until no
-    claim needs an earlier list it has not read. A daily run whose claims start today
-    reads none. Returns the claims and the number of earlier lists read.
+    claim needs an earlier list it has not read. An ISIN the build mints or joins is
+    judged against every earlier row carrying it, whatever its day, because a registered
+    claim that row contradicts is never withdrawn (``list_registered_conflict``). A daily
+    run whose claims start today and that mints or joins nothing reads none. Returns the
+    claims and the number of earlier lists read.
     """
     if not fresh:
         return build_symbol_claims(fresh, registry), 0
@@ -1143,27 +1176,40 @@ def build_increment(
     need: int | None = None
     codes: set[str] = set()
     wanted: set[str] = set()
+    bound: set[str] = set()
     context: list[SourceRows] = []
     while True:
         built = build_symbol_claims(fresh, registry, context)
         reaching = [row for row in built.assertions if cast("int", row["valid_from_us"]) < floor]
-        if not reaching:
-            return built, len(context)
-        start = min(cast("int", row["valid_from_us"]) for row in reaching)
+        start = min((cast("int", row["valid_from_us"]) for row in reaching), default=None)
         for row in built.identifiers:
             anchor = cast("dict[str, str]", row["instrument"])
             owner = mint_instrument(anchor["anchor_namespace"], anchor["anchor_token"])
             isins[owner].add(str(row["token"]))
         more_codes = {str(row["token"]).removesuffix(f".{EXCHANGE}") for row in reaching}
         more_isins = {value for row in reaching for value in _isins_of(row, isins)}
-        if need is not None and start >= need and more_codes <= codes and more_isins <= wanted:
+        more_bound = {str(row["token"]) for row in built.identifiers}
+        if (
+            (start is None or (need is not None and start >= need))
+            and more_codes <= codes
+            and more_isins <= wanted
+            and more_bound <= bound
+        ):
             return built, len(context)
-        need = start if need is None else min(need, start)
+        if start is not None:
+            need = start if need is None else min(need, start)
         codes |= more_codes
         wanted |= more_isins
+        bound |= more_bound
 
-        keep = _keeper(frozenset(codes), frozenset(wanted))
-        context = [item.load(keep) for item in earlier if need <= item.linked_at_us < floor]
+        near = _keeper(frozenset(codes), frozenset(wanted | bound))
+        far = _keeper(frozenset(), frozenset(bound))
+        context = [
+            item.load(near if need is not None and need <= item.linked_at_us else far)
+            for item in earlier
+            if item.linked_at_us < floor
+            and (bound or (need is not None and need <= item.linked_at_us))
+        ]
 
 
 def _keeper(codes: frozenset[str], isins: frozenset[str]) -> Callable[[Mapping[str, object]], bool]:
