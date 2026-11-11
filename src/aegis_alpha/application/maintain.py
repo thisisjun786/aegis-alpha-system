@@ -13,7 +13,9 @@ run) is refused with ``installation_busy``. The stages, in order:
    checked against the account balance before every page);
 5. ``import``: completed Qveris jobs and KR symbol lists as content sources;
 6. ``identity``: new KR listings registered and the maintenance identity snapshot pinned;
-7. ``promote``: every catalog dataset chain continued with its new sources;
+7. ``promote``: every catalog dataset chain continued with its new sources, and the chains
+   ``jobs.start`` names started from their route's declared first template while they hold
+   no generation (``start`` reports each named route's outcome);
 8. ``report``: dataset heads with their watermarks and data freshness (how far each
    dataset's data reaches, how far it should, the lag and ``stale``/``frozen``), kept in
    ``raw/`` and as ``<runtime>/maintain-report.json``. Freshness never changes the exit code.
@@ -28,7 +30,8 @@ and reports what each stage would do; it reads no credential and calls no provid
 
 The exit code is 0 when every stage completed (a spent budget is a completion), 1 when a
 stage failed or a provider stopped on a refusal, and 2 when Qveris stopped on an unsettled
-paid call that needs settlement or quarantine.
+paid call that needs settlement or quarantine. A named start that waits for its calendar,
+identity snapshot or referenced generation is reported, never a failure.
 """
 
 from __future__ import annotations
@@ -413,6 +416,60 @@ def _heads(run: _Run, workspace: Workspace) -> dict[str, object]:
     return {"datasets": heads, "previous_report": state}
 
 
+_START_BLOCKS: Final = ("no_calendar", "identity_unavailable", "no_reference")
+
+
+def _start_outcomes(start: tuple[str, ...], promoted: dict[str, object]) -> dict[str, object]:
+    """What the promote stage did with each route of a dataset ``jobs.start`` names.
+
+    ``started``: its first template is the declared one and it has sources to promote;
+    ``no_source``: it would start but nothing is waiting; ``no_calendar``,
+    ``identity_unavailable``, ``no_reference``: what the declared start still waits for;
+    ``has_generation``: the chain holds a generation, so it continues and never starts.
+    """
+    routes: list[dict[str, object]] = []
+    for run in cast("list[dict[str, object]]", promoted["datasets"]):
+        if run["dataset_id"] not in start:
+            continue
+        skipped = cast("dict[str, int]", run["skipped"])
+        blocked = [reason for reason in _START_BLOCKS if reason in skipped]
+        if run["started"]:
+            outcome = "started" if run["sources"] else "no_source"
+        elif blocked and run["template_spec_sha256"] is None:
+            outcome = blocked[0]
+        else:
+            outcome = "has_generation"
+        routes.append({"dataset_id": run["dataset_id"], "mapper": run["mapper"],
+                       "outcome": outcome})  # fmt: skip
+    return {"configured": list(start), "routes": routes}
+
+
+def _promote(  # noqa: PLR0913 -- the stage's explicit inputs
+    workspace: Workspace,
+    config: MaintainConfig,
+    *,
+    apply: bool,
+    identity: object,
+    identity_failed: bool,
+    budget: ComputeBudget | None,
+    now_us: int,
+    evaluate: bool = True,
+) -> dict[str, object]:
+    from aegis_alpha.storage import maintain_promotion
+
+    promoted = maintain_promotion.promote_datasets(
+        workspace,
+        apply=apply,
+        identity=cast("dict[str, str] | None", identity),
+        identity_failed=identity_failed,
+        budget=budget,
+        now_us=now_us,
+        evaluate=evaluate,
+        start=frozenset(config.start),
+    )
+    return {**promoted, "start": _start_outcomes(config.start, promoted)}
+
+
 def _write_report(workspace: Workspace, report: dict[str, object]) -> str:
     from aegis_alpha.data.descriptor_tree import DescriptorTree
     from aegis_alpha.storage.locks import private_directory
@@ -437,7 +494,7 @@ def run_maintenance(  # noqa: PLR0913 -- the run's explicit inputs
 ) -> dict[str, object]:
     """One bounded maintenance pass over a writable workspace; see the module docstring."""
     from aegis_alpha.application.install_receipt import runtime_report
-    from aegis_alpha.storage import maintain_identity, maintain_promotion
+    from aegis_alpha.storage import maintain_identity
     from aegis_alpha.storage.publication import recover_operations
 
     policies = policies or Policies()
@@ -455,10 +512,11 @@ def run_maintenance(  # noqa: PLR0913 -- the run's explicit inputs
     pin = None if identity is None else identity.get("snapshot")
     promoted = run.local(
         "promote",
-        lambda: maintain_promotion.promote_datasets(
+        lambda: _promote(
             workspace,
+            config,
             apply=True,
-            identity=cast("dict[str, str] | None", pin),
+            identity=pin,
             identity_failed=identity is None,
             budget=budget,
             now_us=_us(clock()),
@@ -548,10 +606,11 @@ def plan_maintenance(  # noqa: PLR0913 -- the plan's explicit inputs
     snapshot = None if identity is None else identity.get("snapshot")
     run.local(
         "promote",
-        lambda: maintain_promotion.promote_datasets(
+        lambda: _promote(
             workspace,
+            config,
             apply=False,
-            identity=cast("dict[str, str] | None", snapshot),
+            identity=snapshot,
             identity_failed=identity is None,
             budget=budget,
             now_us=_us(now),
