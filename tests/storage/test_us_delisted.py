@@ -305,3 +305,22 @@ def test_a_price_revision_with_an_unknown_knowledge_time_does_not_date_an_event(
         ("2026-09-10", 1, "ASSERT", before, before),
         ("2026-09-11", 1, "ASSERT", None, before),
     ]) == [_start(date(2026, 9, 11))]  # fmt: skip
+
+
+def test_an_unknown_isin_in_the_earlier_listed_list_still_flags_the_survivorship_gap(
+    ws: Workspace,
+) -> None:
+    identity = _bars(ws)
+    # The earlier listed list holds a row without an ISIN and not OLD's: "ISIN_B IN list" is
+    # NULL there. The observed predicate must read as false, so the inferred delisting inside
+    # the unverified window keeps both flags.
+    _list(ws, "2026-09-11T21:00:00Z", "0", [_row("ZZZ", None)])
+    _list(ws, "2026-09-11T22:00:00Z", "1", [_row("OLD", ISIN_C)])
+    _run(ws, identity, 10)
+    _list(ws, "2026-09-14T21:00:00Z", "0", [])
+    _list(ws, "2026-09-14T22:00:00Z", "1", [_row("OLD", ISIN_B), _row("OLD", ISIN_C)])
+    _run(ws, identity, 20)
+    flags = _flags(ws)
+    assert (IB, LAST_BAR, "delisting_inferred") in flags
+    assert (IB, LAST_BAR, "survivorship_unverified") in flags
+    assert all(event != OBSERVED for _, event, _, _ in _events(ws))
