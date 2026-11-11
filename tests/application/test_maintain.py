@@ -686,8 +686,11 @@ def test_a_plan_skips_legacy_shaped_kind_listings(tmp_path: Path) -> None:
     assert sorted((str(item["source_id"]), item["status"]) for item in sources) == [
         (source_id, "planned") for source_id in listed
     ]
-    unmapped = cast("dict[str, int]", stages["promote"]["unmapped"])
-    assert unmapped["status.kr.kind"] == 2
+    # The status route sees both lists as candidates of a chain no run has started yet.
+    assert "status.kr.kind" not in cast("dict[str, int]", stages["promote"]["unmapped"])
+    (status,) = [item for item in runs if item["dataset_id"] == "status.kr.kind"]
+    assert status["status"] == "no_head"
+    assert cast("dict[str, int]", status["skipped"]) == {"done": 0, "shape": 1, "no_head": 2}
 
 
 def test_an_unsettled_paid_page_stops_every_run_until_its_settlement(tmp_path: Path) -> None:

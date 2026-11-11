@@ -1598,6 +1598,13 @@ identity 단계는 그 목록의 행을 등록된 FMP ISIN으로 Norgate 상품�
 `aas data promote`(또는 `data kr-prices`, `calendar refresh`)로 만들고, 그 뒤 실행이 새로 수집된 원천을 그
 명세의 규칙으로 이어 붙인다. head가 없는 dataset은 `no_head`로 보고된다.
 
+`actions.us.eodhd`, `actions.kr.eodhd`, `fx.usdkrw.eodhd`, `status.kr.kind` route는 첫 template을 코드에
+선언해 두었다(시작 선언). 그래도 지금의 `aas maintain run`은 시작할 dataset을 넘기지 않으므로 이 dataset들은
+`no_head`로 보고되고 `skipped.no_head`가 기다리는 원천 테이블 수를 센다. 시작은 운영 DB에 첫 generation을 쓰는 일이라
+켜는 시점은 운영자가 정한다. 켜진 실행에서 선언이 pin할 달력 head가 없으면 `no_calendar`, identity snapshot이
+없으면 `identity_unavailable`로 보고하고 아무것도 쓰지 않는다. 시작한 dataset 항목은 `started: true`이고
+`template_spec_sha256`은 null이다. 그 밖의 항목은 `started: false`다.
+
 KR 일간 bulk route(`eodhd.bulk_quarantine@1`, `_adjusted@1`)는 예외로, chain에 bulk generation이 없으면 같은
 chain의 이력 명세에서 template을 파생한다. 그때 그 dataset 항목의 `derived_from`이 원본 매퍼(`eodhd.bars@1`
 등)이고 `template_spec_sha256`은 그 원본 명세의 해시다. 파생이 아니면 `derived_from`은 null이다. 같은 route는

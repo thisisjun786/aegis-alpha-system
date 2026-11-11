@@ -1630,6 +1630,10 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
 | `prices.kr.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.KO`·`.KQ` |
 | `prices.kr.eodhd` | `eodhd.bulk_quarantine@1` | `qveris-bulk-quarantine-*` `quarantine` | 사유 `provider_reported_partial`, 거래소 `KO`·`KQ`, 모든 행이 값 검사 통과. 첫 template은 `eodhd.bars@1`에서 파생 |
 | `prices.kr.eodhd.ref` | `eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1` | 위 두 모양 | 위와 같음. bulk의 첫 template은 `eodhd.bars_adjusted@1`에서 파생 |
+| `actions.us.eodhd` | `eodhd.splits@1`, `eodhd.dividends@1` | `qveris-splits-*` `splits`, `qveris-dividends-*` `dividends` | 심볼이 `.US`. 시작 선언: `exdate_open@1`(`sessions.xnys`), `America/New_York` |
+| `actions.kr.eodhd` | `eodhd.splits@1`, `eodhd.dividends@1` | 위 두 모양 | 심볼이 `.KO`·`.KQ`. 시작 선언: `exdate_open@1`(`sessions.xkrx`), `Asia/Seoul` |
+| `fx.usdkrw.eodhd` | `eodhd.fx_history@1` | `qveris-fx-history-bars-*` `bars` | 쌍이 USD/KRW. 시작 선언: `session_close_plus_lag@1`(`sessions.xnys`, 4시간), `timezone` `UTC` |
+| `status.kr.kind` | `kind.status@1` | `kind-listings-*` `listings` | `short_code`·`listed_on`·`retrieved_at_utc` 열. 시작 선언: Asia/Seoul `local_day_end@1` |
 
 **KR 일간 bulk.** 경고와 함께 끝난 KR 일간 bulk 응답은 DV-294에 따라 행 전부가 `quarantine`에 남으므로, KR 일간
 가격은 bulk route로만 이어진다. route가 이 테이블을 맡으면(조건을 만족하는 행이 하나라도 있으면) 먼저 모든 행이
@@ -1645,13 +1649,19 @@ bulk 매퍼로 바꾸고 인자에 `currencies`(`kr_prices.CURRENCIES`)를 더�
 파생하지 않는다(`no_head`). 보고의 `template_spec_sha256`은 파생 원본 명세의 해시이고 `derived_from`이 원본
 매퍼를 밝힌다(파생이 아니면 null).
 
-route는 chain을 이어 붙일 뿐 시작하지 않는다. template은 그 dataset에서 route의 매퍼, 또는 route가 이어 받는
+route는 chain을 이어 붙일 뿐 시작하지 않는다(호출자가 이름 붙인 시작 선언 route만 예외, 아래). template은 그 dataset에서 route의 매퍼, 또는 route가 이어 받는
 이전 major 매퍼를 쓴 가장 늦은 committed generation의 명세(운영자의 백필이거나 앞선 유지보수 generation)이고,
 chain은 그 generation의 매퍼로 이어진다. 그래서 `classifications.kr.kind`는 가장 늦은 generation이
 `kind.industry@1`인 chain을 `@1`로 잇고, 운영자가 `kind.industry@2`로 게시한 chain(새 chain이거나 `@1` chain 위의
 `@2` generation)은 그때부터 `@2`로 잇는다. `@1`에서 `@2`로 넘어가는 것은 운영자의 `@2` 게시이고 유지보수는 chain의
 매퍼를 바꾸지 않는다. head가 없으면 `no_head`, 그 매퍼들의 generation이 없으면 `no_template`로 보고하고 아무것도
-쓰지 않는다. 보고의 `mapper`는 chain을 이은 매퍼다. 유지보수 명세는 template에서 다음만 바꾼다.
+쓰지 않는다. 보고의 `mapper`는 chain을 이은 매퍼다. 예외는 시작 선언(`start`)이 있는 route다(위 표). 수집은
+되지만 chain이 없던 dataset이므로, 호출자(`promote_datasets(start=...)`)가 그 dataset을 이름 붙인 실행에서만 그
+route 매퍼의 generation이 chain에 없을 때 선언한 template으로 시작한다. 선언의 시간 규칙이 pin하는 달력은 그
+달력 dataset의 committed head이고(없으면 `no_calendar`), identity를 해석하는 template은 실행의 snapshot을
+pin한다(없으면 `identity_unavailable`). 보고의 `started`가 참이고 `template_spec_sha256`은 null이다. 시작한 뒤에는
+그 generation의 명세가 template이다. 이름 붙이지 않으면 `no_head`로 남고 기다리는 원천 수를 센다. `aas maintain`은
+아직 이름을 넘기지 않는다(켜기는 운영 결정). 유지보수 명세는 template에서 다음만 바꾼다.
 
 - `target.parent`: dataset head.
 - `sources`: 새 원천 테이블 하나.
@@ -1685,9 +1695,8 @@ generation, 결과 `promoted`·`unchanged`)를 남긴다. 검사 ID는 (dataset,
 끝난 것이다. 운영자의 승격이 pin한 원천은 첫 유지보수 실행에서 한 번 더 계획되어 `unchanged`로 기록되고, head보다
 이른 내려받기는 `stale`이라 head를 대체하지 않는다.
 
-매퍼가 아직 없는 dataset(`actions.us.eodhd`·`actions.kr.eodhd`의 Qveris `splits`·`dividends`, `status.kr.kind`,
-identity가 해석한 US 보류 행의 `prices.us.eodhd` 재처리)의 수집 원천은 승격하지 않고 `unmapped`에 dataset별
-테이블 수로 남는다. `status.kr.kind`는 `kind.listings@1`이 읽는 열이 있는 KIND 목록만 센다.
+매퍼가 아직 없는 dataset(identity가 해석한 US 보류 행의 `prices.us.eodhd` 재처리)의 수집 원천은 승격하지 않고
+`unmapped`에 dataset별 테이블 수로 남는다.
 
 **보고와 종료 코드.** 실행 보고(`aas-maintain-report-v1`)는 단계마다의 결과, 실패한 단계, 멈춘 공급자를 담고
 정확한 bytes를 `raw/`에, 같은 bytes를 `<runtime>/maintain-report.json`에 둔다. `stage_resources`는 단계마다
@@ -3029,9 +3038,9 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-410 | 카탈로그의 시간·숫자 규칙은 등록된 규칙이고 매퍼의 시간 입력과 숫자 열 타입에 맞는다 | `tests/tools/test_dataset_catalog.py::test_rules_are_registered_and_fit_the_mappers` | 구현 |
 | DV-411 | 코드가 쓰는 dataset 이름은 모두 카탈로그 항목에 속한다 | `tests/tools/test_dataset_catalog.py::test_dataset_names_the_code_writes_are_cataloged` | 구현 |
 | DV-412 | committed dataset은 자기 항목(`.r<N>` 세대 포함) 아래 나열되고, 카탈로그 밖 이름은 게시된 채 `uncataloged`로 남는다 | `tests/storage/test_dataset_listing.py::test_published_datasets_are_listed_under_their_entry` | 구현 |
-| DV-413 | Qveris US 일간 `splits`·`dividends` 원천은 `actions.us.eodhd` generation으로 승격된다 | `tests/storage/test_qveris_actions.py::test_us_splits_and_dividends_promote_to_actions_us_eodhd` | 예정 |
-| DV-414 | Qveris KR(KO, KQ) 일간 `splits`·`dividends` 원천은 `actions.kr.eodhd` generation으로 승격된다 | `tests/storage/test_qveris_actions.py::test_kr_splits_and_dividends_promote_to_actions_kr_eodhd` | 예정 |
-| DV-415 | KIND 상장법인목록 원천은 `status.kr.kind` generation으로 승격된다 | `tests/storage/test_kind_status.py::test_kind_listings_promote_to_status_kr_kind` | 예정 |
+| DV-413 | Qveris US 일간 `splits`·`dividends` 원천은 `actions.us.eodhd` generation으로 승격된다 | `tests/storage/test_qveris_actions.py::test_us_splits_and_dividends_promote_to_actions_us_eodhd` | 구현 |
+| DV-414 | Qveris KR(KO, KQ) 일간 `splits`·`dividends` 원천은 `actions.kr.eodhd` generation으로 승격된다 | `tests/storage/test_qveris_actions.py::test_kr_splits_and_dividends_promote_to_actions_kr_eodhd` | 구현 |
+| DV-415 | KIND 상장법인목록 원천은 `status.kr.kind` generation으로 승격된다 | `tests/storage/test_kind_status.py::test_kind_listings_promote_to_status_kr_kind` | 구현 |
 | DV-416 | DART 공시 목록(`list.json`) 원천은 `dart.list` 매퍼로 `filings.kr.dart` generation에 승격된다 | `tests/storage/test_dart_promotion.py::test_list_json_filings_promote_to_filings_kr_dart` | 예정 |
 | DV-417 | 기본 verify는 원천 행을 읽지 않고 `--deep`과 같은 보고를 내며, 원천 테이블의 행 수·열·존재가 기록과 다르면 기본에서도 실패한다 | `tests/storage/test_verification.py::test_default_verify_compares_digests_and_deep_rehashes` | 구현 |
 | DV-418 | KR 가격과 선언 달력의 승격 명세는 카탈로그 항목의 매퍼·시간·숫자·품질 규칙을 쓴다 | `tests/tools/test_dataset_catalog.py::test_kr_price_specs_use_the_catalog_rules` | 구현 |
@@ -3158,3 +3167,6 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-539 | head가 없는 chain은 bulk route가 파생하지 않고 `no_head`로 남는다 | `tests/storage/test_maintain_promotion.py::test_a_chain_without_a_head_derives_nothing` | 구현 |
 | DV-540 | 값 검사(가격 0, low>high, high<max(open, close), 음수 거래량, 문자열 숫자, null, 깨진 JSON, 잘못된 날짜)를 어긴 행이 하나라도 있는 bulk 테이블은 `value_check`로 남고 승격되지 않으며, 같은 회차의 정상 테이블은 승격된다 | `tests/storage/test_maintain_promotion.py::test_one_invalid_value_keeps_its_whole_bulk_table_out` | 구현 |
 | DV-541 | 경고 KR bulk만 수집된 유지보수 실행은 이력만 있는 chain을 이어 붙이고 승격 뒤 저장소가 검증을 통과한다 | `tests/application/test_maintain.py::test_warned_kr_bulk_days_continue_a_history_only_chain_and_the_store_verifies` | 구현 |
+| DV-542 | Qveris `USDKRW.FOREX` 일간 이력 원천은 `fx.usdkrw.eodhd` generation으로 승격되고, 달력이 열지 않은 날은 시점이 null이며 바뀐 종가는 SUPERSEDE다 | `tests/storage/test_qveris_fx.py::test_usdkrw_forex_history_promotes_to_fx_usdkrw_eodhd` | 구현 |
+| DV-543 | 유지보수 route는 head 없는 `actions.*.eodhd`·`fx.usdkrw.eodhd` 원천을 `no_head` 후보로 보고, 호출자가 이름 붙인 dataset만 선언한 시작 template으로 시작하며(달력 head 없으면 `no_calendar`, snapshot 없으면 `identity_unavailable`), 시작한 chain은 자기 명세로 이어진다 | `tests/storage/test_qveris_actions.py::test_the_new_routes_see_collected_sources_and_start_only_named_datasets` | 구현 |
+| DV-544 | `status.kr.kind` route는 KIND 목록을 후보로 보고 legacy 모양을 `shape`로 건너뛰며, 이름 붙인 경우에만 수집일 partition으로 시작한다 | `tests/storage/test_kind_status.py::test_the_status_route_starts_the_kind_chain_only_when_named` | 구현 |
