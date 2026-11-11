@@ -389,7 +389,8 @@ def test_the_new_routes_see_collected_sources_and_start_only_named_datasets(
     raw = tmp_path / "qveris"
     us_splits = replay(ws, raw, bulk_job("US", "splits", EX.isoformat()),
                        [_split("AAA", "US", "2/1")])  # fmt: skip
-    replay(ws, raw, bulk_job("US", "dividends", EX.isoformat()), [_dividend("BBB", "US", "0.5", unadjustedValue="0.5")])
+    replay(ws, raw, bulk_job("US", "dividends", EX.isoformat()),
+           [_dividend("BBB", "US", "0.5", unadjustedValue="0.5")])  # fmt: skip
     replay(ws, raw, bulk_job("KO", "dividends", EX.isoformat()),
            [_dividend("123456", "KO", "100", unadjustedValue="100")])  # fmt: skip
     # An exchange day without splits is a committed, empty table.
