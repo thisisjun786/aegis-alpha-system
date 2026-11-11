@@ -19,21 +19,18 @@ import pytest
 
 from aegis_alpha.data.qveris_contracts import QverisJob
 from aegis_alpha.data.qveris_native import read_completed_job
-from aegis_alpha.storage.maintain_promotion import head_pin
 from aegis_alpha.storage.promotion.engine import promote
 from aegis_alpha.storage.promotion.mappers import mapper
 from aegis_alpha.storage.qveris_import import build_unit, completions, import_unit
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
 from tests.data.qveris_support import complete, fx_job
-from tests.storage.promotion_support import publish_calendar, us
+from tests.storage.promotion_support import us
 
 # Serial: these tests take the host-wide Qveris account lease (an abstract Unix socket named by
 # the account), so every file that takes it runs in one xdist worker.
 pytestmark = pytest.mark.xdist_group("qveris-account-lease")
 
 MON, TUE, WED = date(2026, 8, 31), date(2026, 9, 1), date(2026, 9, 2)
-HOUR = 3_600 * 10**6
-LAG = 4 * HOUR
 
 
 @pytest.fixture
