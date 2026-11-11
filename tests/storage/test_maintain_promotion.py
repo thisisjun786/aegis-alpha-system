@@ -36,6 +36,7 @@ from tests.storage.promotion_support import (
     at,
     bar,
     bulk_row,
+    full_snapshot,
     publish_calendar,
     register_symbols,
     spec,
@@ -530,6 +531,38 @@ def test_a_recent_watermark_over_weeks_old_data_is_stale_by_its_session_lag(
     fresh = _heads(ws, datetime(2026, 7, 2, 3, tzinfo=UTC))["prices.kr.eodhd"]
     assert (fresh["expected_through"], fresh["lag_sessions"], fresh["freshness"]) == (
         "2026-07-01", 0, "current")  # fmt: skip
+
+
+def test_a_tombstoned_newest_bar_does_not_count_as_data(ws: Workspace) -> None:
+    stamp = at("2026-07-27T08:00:00")
+    first = add_source(
+        ws,
+        [bar("AAA.KO", date(2026, 7, 1), 100.0, retrieved=stamp),
+         bar("AAA.KO", date(2026, 7, 27), 101.0, retrieved=stamp)],
+        tag="first",
+        linked=at("2026-07-27T09:00:00"),
+    )  # fmt: skip
+    identity = register_symbols(ws, first["source_id"])
+    head = promote(ws, *spec([first], identity), apply=True)
+    assert head["published"] is True, head.get("refusals")
+    assert _heads(ws, JULY_RUN)["prices.kr.eodhd"]["data_through"] == "2026-07-27"
+    # A full snapshot without the 07-27 bar deletes it: the readable data ends on 07-01.
+    second = add_source(
+        ws,
+        [bar("AAA.KO", date(2026, 7, 1), 100.0, retrieved=at("2026-07-27T10:00:00"))],
+        tag="second",
+        linked=at("2026-07-27T11:00:00"),
+    )  # fmt: skip
+    cleaned = promote(
+        ws,
+        *spec([second], identity, parent=str(head["generation_id"]),
+              tombstone=full_snapshot(second, "2026-07-01", "2026-07-28")),
+        apply=True,
+    )  # fmt: skip
+    assert cleaned["published"] is True, cleaned.get("refusals")
+    assert cast("dict[str, int]", cleaned["operations"]).get("TOMBSTONE") == 1
+    found = _heads(ws, JULY_RUN)["prices.kr.eodhd"]
+    assert (found["data_through"], found["freshness"]) == ("2026-07-01", "stale")
 
 
 def test_a_frozen_provider_dataset_is_frozen_not_stale(ws: Workspace) -> None:
