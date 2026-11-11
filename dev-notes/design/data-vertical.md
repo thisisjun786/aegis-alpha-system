@@ -1068,7 +1068,7 @@ ASCII escape와 바이트까지 같다.
 | `prices.kr.eodhd.ref` | `prices` | reference | `eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1` | `session_close_plus_lag@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage`, `provider_reported_partial` | 아니오 | 같은 두 원천 모양의 공급자 adjusted close. basis `total_return`, `fields='close'` |
 | `prices.us.norgate` | `prices` | canonical | `norgate.prices_none@1` | `session_close_plus_lag@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | Norgate 비조정 일봉 내보내기(`norgate-history-csv-*`의 미국 주식 `bars`). 다섯 값 모두 CSV 원문, 연도 partition마다 generation 하나 |
 | `prices.us.norgate.ref` | `prices` | reference | `norgate.prices_adjusted@1` | `session_close_plus_lag@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 아니오 | Norgate 조정 가격 part. `CAPITAL`은 `split_adjusted`, `TOTALRETURN`은 `total_return`, float32 저장값 |
-| `prices.us.eodhd` | `prices` | canonical | `eodhd.bars@1` | `session_close_plus_lag@1` | `float_shortest@1` | `cross_provider_mismatch@1` | `cross_provider_mismatch`, `decimal_rounding_tie`, `provider_float_storage` | 아니오 | EODHD US 일간 수집. 다운로드 하나가 generation 하나이고 같은 날짜의 다른 다운로드는 SUPERSEDE. 품질 규칙의 기준은 `prices.us.norgate` generation pin. identity가 해석한 US 보류 행의 재처리는 Linear AAS-69 |
+| `prices.us.eodhd` | `prices` | canonical | `eodhd.bars@1`, `eodhd.bulk_quarantine@1` | `session_close_plus_lag@1` | `float_shortest@1` | `cross_provider_mismatch@1` | `cross_provider_mismatch`, `decimal_rounding_tie`, `provider_float_storage`, `provider_reported_partial` | 아니오 | EODHD US 일간 수집과 부분 응답(경고) 일간 내려받기. 다운로드 하나가 generation 하나이고 같은 날짜의 다른 다운로드는 SUPERSEDE. 품질 규칙의 기준은 `prices.us.norgate` generation pin. import 때 identity가 없어 보류된 US 행의 재처리는 매퍼가 없다(#100) |
 | `prices.us.fmp.ref` | `prices` | reference | `fmp.eod_non_split@1` | `session_close_plus_lag@1` | `float_shortest@1`, `exact@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 예 | FMP 동결 legacy non-split 응답. 정정은 revision 번호순 generation. 원천 자료실 FMP normalized lineage(eod_full, dividend_adjusted)의 매퍼는 Linear AAS-68 |
 | `prices.ref.norgate` | `prices` | reference | `norgate.reference_closes@1`, `norgate.reference_history@1` | `local_day_end@1` | `decimal_text@1` | 없음 | `time_precision_day`, `volume_precision_limited` | 예 | Norgate 기준 시리즈 표와 지수·기타 데이터베이스 내보내기, `fields='close'`, 통화 `XXX`. 공급자가 종가 시각을 밝히지 않으므로 날짜 끝은 `Etc/GMT+12`. 음수 수준이 있는 시리즈는 `signed`로 고르지 않는다(Linear AAS-67) |
 | `sessions.xnys` | `calendar_sessions` | canonical | `calendar.declared@1` | `declared_session_end@1` | 없음 | 없음 | 없음 | 아니오 | XNYS [선언 달력](#선언-달력) 문서. 관측 거래일은 대조 보고의 근거, 임시 휴장은 SUPERSEDE |
@@ -1607,6 +1607,7 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
 | `fx.usdkrw.fred` | `fred.fx_series@1` | `fred-series-csv-*` `observations` | |
 | `classifications.kr.kind` | `kind.industry@2`, 이어 받는 `kind.industry@1` | `kind-listings-*` `listings` | `short_code`·`industry`·`retrieved_at_utc` 열 |
 | `prices.us.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.US` |
+| `prices.us.eodhd` | `eodhd.bulk_quarantine@1` | `qveris-bulk-quarantine-*` `quarantine` | 사유 `provider_reported_partial`, 거래소 `US`, 모든 행이 값 검사 통과. 첫 template은 `eodhd.bars@1`에서 파생(`currencies` `US`→`USD`) |
 | `prices.kr.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.KO`·`.KQ` |
 | `prices.kr.eodhd` | `eodhd.bulk_quarantine@1` | `qveris-bulk-quarantine-*` `quarantine` | 사유 `provider_reported_partial`, 거래소 `KO`·`KQ`, 모든 행이 값 검사 통과. 첫 template은 `eodhd.bars@1`에서 파생 |
 | `prices.kr.eodhd.ref` | `eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1` | 위 두 모양 | 위와 같음. bulk의 첫 template은 `eodhd.bars_adjusted@1`에서 파생 |
@@ -1660,14 +1661,19 @@ generation, 결과 `promoted`·`unchanged`)를 남긴다. 검사 ID는 (dataset,
 그 원천은 다시 계획되지 않고, 매일의 identity 증분이 기다리는 모든 원천을 다시 계획하지 않는다. 범위가 없는
 기록은 key 전체의 SHA-256을 그대로 쓴다. 검사 ID는 그 SHA-256까지에서 나온다. 결과의 `unresolved`는 이번
 실행이 그런 원천을 기록한 dataset이고, `standing_unresolved`는 이번 실행과 상관없이 원천마다 가장 늦은 기록이
-`unresolved`인 원천의 dataset별 요약(저장된 기록만 읽는다)이다. 형식은 [운영 문서](../operations.md#하루-유지보수-실행)가 소유한다. 거부되거나 막힌 단계는 아무것도 남기지 않으므로 그 원천은 다음 실행에 다시 계획된다. 단계 사이에서
+`unresolved`인 원천의 dataset별 요약(저장된 기록만 읽는다)이다. `prices.us.eodhd`(와 `.r<N>`) 항목은 그 원천들의
+행을 지금의 registry와 US 목록으로 다시 판정해 사유·종류·처리별 행 수도 싣는다(`us_symbols.unresolved_breakdown`,
+SELECT만, 새 상태 없음). 형식은 [운영 문서](../operations.md#하루-유지보수-실행)가 소유한다. 거부되거나 막힌 단계는 아무것도 남기지 않으므로 그 원천은 다음 실행에 다시 계획된다. 단계 사이에서
 멈춘 원천은 끝난 단계가 빈 delta로 다시 계획된다. 결과를 선언한 매퍼가 `promotion_coverage@1`을 남긴 원천도
 끝난 것이다. 운영자의 승격이 pin한 원천은 첫 유지보수 실행에서 한 번 더 계획되어 `unchanged`로 기록되고, head보다
 이른 내려받기는 `stale`이라 head를 대체하지 않는다.
 
 매퍼가 아직 없는 dataset(`actions.us.eodhd`·`actions.kr.eodhd`의 Qveris `splits`·`dividends`, `status.kr.kind`,
-identity가 해석한 US 보류 행의 `prices.us.eodhd` 재처리)의 수집 원천은 승격하지 않고 `unmapped`에 dataset별
-테이블 수로 남는다. `status.kr.kind`는 `kind.listings@1`이 읽는 열이 있는 KIND 목록만 센다.
+import 때 identity가 없거나 다르다고 보류된 US 행의 `prices.us.eodhd` 재처리)의 수집 원천은 승격하지 않고
+`unmapped`에 dataset별 테이블 수로 남는다. 그 행의 사유는 `provider_reported_partial`이 아니라서
+`eodhd.bulk_quarantine@1`에서 세션 날짜가 없고(거부됨), @1의 뜻을 바꾸면 이미 게시된 KR generation의 manifest가
+다시 계산되지 않는다. 경고와 함께 끝난 US 일간 bulk 응답은 위 US bulk route가 KR과 같은 방식(값 검사, 이력
+명세에서 파생한 template)으로 잇는다. `status.kr.kind`는 `kind.listings@1`이 읽는 열이 있는 KIND 목록만 센다.
 
 **보고와 종료 코드.** 실행 보고(`aas-maintain-report-v1`)는 단계마다의 결과, 실패한 단계, 멈춘 공급자를 담고
 정확한 bytes를 `raw/`에, 같은 bytes를 `<runtime>/maintain-report.json`에 둔다. `stage_resources`는 단계마다
@@ -3138,3 +3144,6 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-539 | head가 없는 chain은 bulk route가 파생하지 않고 `no_head`로 남는다 | `tests/storage/test_maintain_promotion.py::test_a_chain_without_a_head_derives_nothing` | 구현 |
 | DV-540 | 값 검사(가격 0, low>high, high<max(open, close), 음수 거래량, 문자열 숫자, null, 깨진 JSON, 잘못된 날짜)를 어긴 행이 하나라도 있는 bulk 테이블은 `value_check`로 남고 승격되지 않으며, 같은 회차의 정상 테이블은 승격된다 | `tests/storage/test_maintain_promotion.py::test_one_invalid_value_keeps_its_whole_bulk_table_out` | 구현 |
 | DV-541 | 경고 KR bulk만 수집된 유지보수 실행은 이력만 있는 chain을 이어 붙이고 승격 뒤 저장소가 검증을 통과한다 | `tests/application/test_maintain.py::test_warned_kr_bulk_days_continue_a_history_only_chain_and_the_store_verifies` | 구현 |
+| DV-542 | US 목록의 해석되지 않은 날은 사유마다 심볼 종류와 처리(`register`·`unresolved`·`out_of_scope`)를 보고하고, 상품을 가리키는 행은 종류와 상관없이 범위 밖이 아니며 claim은 생기지 않는다 | `tests/storage/test_us_symbols.py::test_every_unresolved_day_has_a_symbol_class_and_a_disposition` | 구현 |
+| DV-543 | `standing_unresolved`의 `prices.us.eodhd` 항목은 기다리는 행을 지금의 판정으로 사유·종류·처리별로 세고, 목록이 없는 날은 `list_not_observed`, 곧 등록될 날은 `list_claimable`, 등록된 날은 `resolved`다 | `tests/storage/test_us_symbols.py::test_the_standing_summary_counts_waiting_us_rows_by_reason_class_and_disposition` | 구현 |
+| DV-544 | 경고 US bulk 테이블은 이력 명세에서 파생한 `eodhd.bulk_quarantine@1` template(`US`→`USD`)으로 `prices.us.eodhd`를 잇고, import 때 identity가 없어 보류된 US 테이블은 route가 맡지 않고 `unmapped`에 남는다 | `tests/storage/test_maintain_promotion.py::test_a_warned_us_bulk_day_continues_the_us_chain_and_identity_held_rows_stay_out` | 구현 |

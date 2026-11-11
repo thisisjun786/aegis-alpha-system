@@ -239,6 +239,15 @@ def _statuses(report: dict[str, object]) -> dict[str, str]:
     }
 
 
+def _route_statuses(report: dict[str, object]) -> dict[tuple[str, str], str]:
+    """Each route's status by (dataset, mapper): a dataset may be continued by two routes."""
+    stage = cast("dict[str, object]", cast("dict[str, object]", report["stages"])["promote"])
+    return {
+        (str(item["dataset_id"]), str(item["mapper"])): str(item["status"])
+        for item in cast("list[dict[str, object]]", stage["datasets"])
+    }
+
+
 def _advance(world: World) -> None:
     """The next day: one new session, one new filing with facts, one new ALFRED vintage."""
     world.clock.advance(days=1)
@@ -273,10 +282,11 @@ def test_two_daily_runs_continue_every_chain_and_repeat_nothing(tmp_path: Path) 
     world = World(tmp_path)
     first = world.run()
     assert first["exit_code"] == 0, first["failed_stages"]
-    statuses = _statuses(first)
+    statuses = _route_statuses(first)
     # No dataset has a chain yet: maintenance continues chains, it never starts one.
-    for name in ("macro.us.alfred", "filings.us.sec", "prices.us.eodhd"):
-        assert statuses[name] == "no_head"
+    for route in (("macro.us.alfred", "fred.alfred@1"), ("filings.us.sec", "sec.submissions@1"),
+                  ("prices.us.eodhd", "eodhd.bars@1")):  # fmt: skip
+        assert statuses[route] == "no_head"
     collect = cast("dict[str, dict[str, object]]", first["stages"])
     assert collect["qveris"]["provider_calls"] == 2
     assert cast("dict[str, int]", collect["qveris"]["reasons"])["new"] == 2
@@ -640,7 +650,8 @@ def test_warned_kr_bulk_days_continue_a_history_only_chain_and_the_store_verifie
     assert second["exit_code"] == 0, second["failed_stages"]
     stage = cast("dict[str, object]", cast("dict[str, object]", second["stages"])["promote"])
     (bulk,) = [item for item in cast("list[dict[str, object]]", stage["datasets"])
-               if item["mapper"] == "eodhd.bulk_quarantine@1"]  # fmt: skip
+               if (item["dataset_id"], item["mapper"])
+               == ("prices.kr.eodhd", "eodhd.bulk_quarantine@1")]  # fmt: skip
     assert (bulk["status"], bulk["derived_from"]) == ("advanced", "eodhd.bars@1")
     assert [item["status"] for item in cast("list[dict[str, object]]", bulk["sources"])] == [
         "promoted"

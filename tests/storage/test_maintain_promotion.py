@@ -302,6 +302,69 @@ def test_a_chain_with_a_bulk_generation_continues_from_it_without_deriving(
     ]
 
 
+NEW_YORK = "America/New_York"
+US_RULE = {"rule": "local_day_end@1", "basis": "record", "input": "session_date",
+           "args": {"timezone": NEW_YORK}}  # fmt: skip
+US_BULK = replace(
+    next(item for item in maintain_promotion.ROUTES
+         if (item.dataset_id, item.mapper) == ("prices.us.eodhd", "eodhd.bulk_quarantine@1")),
+    prefix="synthetic-kr-bulk-",
+)  # fmt: skip
+
+
+def test_a_warned_us_bulk_day_continues_the_us_chain_and_identity_held_rows_stay_out(
+    ws: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    retrieved = at("2026-09-09T08:00:00")
+    daily = add_source(ws, [bar("AAA.US", B1, 10.0, retrieved=retrieved, currency="USD"),
+                            bar("BBB.US", B1, 20.0, retrieved=retrieved, currency="USD")],
+                       tag="us-daily", linked=retrieved)  # fmt: skip
+    pin = register_symbols(ws, daily["source_id"], {"AAA.US": "900001", "BBB.US": "900002"},
+                           name="us")  # fmt: skip
+    floats = dict.fromkeys(("open", "high", "low", "close", "volume"), "float_shortest@1")
+    history = spec([daily], pin, dataset="prices.us.eodhd", decimals=floats,
+                   rules={"available_at_us": US_RULE, "revision_known_at_us": US_RULE},
+                   partition={"from": B1.isoformat(), "to": B2.isoformat()},
+                   mapper={"name": "eodhd.bars@1", "args": {"timezone": NEW_YORK}})  # fmt: skip
+    assert promote(ws, *history, apply=True)["published"] is True
+    parent = dataset_head(ws, "prices.us.eodhd")
+    warned = add_bulk_source(ws, [bulk_row("AAA", "US", B2, 11), bulk_row("BBB", "US", B2, 21)],
+                             tag="us-warned", linked=at("2026-09-09T09:00:00"))  # fmt: skip
+    # Rows the import held for want of an import-time identity are not the route's.
+    add_bulk_source(ws, [bulk_row("CCC", "US", B2, 5,
+                                  reason="explicit instrument identity is required")],
+                    tag="us-identity", linked=at("2026-09-09T09:30:00"))  # fmt: skip
+    run = _datasets(promote_datasets(ws, apply=True, now_us=1, routes=[US_BULK]))[
+        ("prices.us.eodhd", US_BULK.mapper)
+    ]
+    assert (run["status"], run["derived_from"]) == ("advanced", "eodhd.bars@1")
+    assert run["template_spec_sha256"] == history[1]
+    (source,) = cast("list[dict[str, object]]", run["sources"])
+    assert (source["source_id"], source["status"]) == (warned["source_id"], "promoted")
+    generation = dataset_head(ws, "prices.us.eodhd")
+    name, linked, _, retained = _retained(ws, generation)
+    assert (name, linked) == ("eodhd.bulk_quarantine@1", parent)
+    assert json.loads(retained)["mapper"]["args"] == {"timezone": NEW_YORK,
+                                                      "currencies": {"US": "USD"}}  # fmt: skip
+    rows = ws.market.execute(
+        "SELECT currency, close FROM prices WHERE generation_id=? ORDER BY close", [generation]
+    ).fetchall()
+    assert [(currency, float(close)) for currency, close in rows] == [("USD", 11.0),
+                                                                      ("USD", 21.0)]  # fmt: skip
+    flags = ws.market.execute(
+        "SELECT count(*) FROM quality_flags WHERE generation_id=? AND flag=?",
+        [generation, PARTIAL],
+    ).fetchone()
+    assert flags == (2,)
+    # The identity-held table is still counted as unmapped; the warned one no longer is.
+    shipped = [(dataset, "synthetic-kr-bulk-" if table == "quarantine" else prefix, table,
+                accept, columns)
+               for dataset, prefix, table, accept, columns in maintain_promotion.UNMAPPED
+               if dataset == "prices.us.eodhd"]  # fmt: skip
+    monkeypatch.setattr(maintain_promotion, "UNMAPPED", tuple(shipped))
+    assert maintain_promotion.unmapped(ws) == {"prices.us.eodhd": 1}
+
+
 def test_a_chain_without_a_head_derives_nothing(ws: Workspace) -> None:
     _bulk_day(ws, B1, tag="b1")
     run = _datasets(promote_datasets(ws, apply=True, now_us=1, routes=[BULK]))[

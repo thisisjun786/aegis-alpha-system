@@ -8,7 +8,7 @@ it is left to the other routes of the shape; an empty table is skipped. A table 
 lacks a column the route's mapper reads (its ``source_columns``) is another shape under
 the same prefix and table name (the ``korea.public_response@1`` legacy import of
 ``kind-listings``): it is skipped and counted as ``shape``. A route may also name a value
-``check`` every row of a table it claims must pass: the KR daily bulk routes check each
+``check`` every row of a table it claims must pass: the KR and US daily bulk routes check each
 warned row as the clean response path does (``qveris_native._bar``: valid JSON, finite
 JSON numbers, prices above zero, volume not negative, consistent OHLC, an ISO date). A
 table with one failing row is not promoted and is counted as ``value_check`` (before
@@ -20,12 +20,15 @@ an earlier major it ``continues`` (an operator's backfill or an earlier maintena
 generation). That generation's mapper is the one the chain continues with, so
 ``classifications.kr.kind`` continues a chain whose latest generation used
 ``kind.industry@1`` under ``@1`` and one an operator published under ``kind.industry@2``
-under ``@2``. A route that names ``derive_from`` (the KR daily bulk routes) and finds no
+under ``@2``. A route that names ``derive_from`` (the daily bulk routes) and finds no
 such generation in a chain that has a head takes its first template from the latest
 committed spec of the ``derive_from`` mapper (the history backfill's ``eodhd.bars@1`` or
 ``eodhd.bars_adjusted@1``): only the mapper's name becomes the route's and
-``derive_args`` (the KR ``currencies``) join its arguments, so the template is the spec
-``aas data kr-prices`` writes for a bulk day. The report's ``template_spec_sha256`` is
+``derive_args`` (the exchanges' ``currencies``) join its arguments, so the KR template is
+the spec ``aas data kr-prices`` writes for a bulk day. The US route promotes only the rows
+of a warned US download (``provider_reported_partial``); rows the import held for another
+reason, such as a missing import-time identity, have no session date under
+``eodhd.bulk_quarantine@1`` and stay ``unmapped``. The report's ``template_spec_sha256`` is
 then the spec it came from and ``derived_from`` names its mapper. Once the chain holds a
 generation of the route's mapper, that spec is the template. A chain without a head is
 never derived. A maintenance spec is that spec with only these fields advanced:
@@ -129,6 +132,8 @@ _US_SYMBOL: Final = "provider_symbol LIKE '%.US'"
 _KR_SYMBOL: Final = "(provider_symbol LIKE '%.KO' OR provider_symbol LIKE '%.KQ')"
 _KR_PARTIAL: Final = f"reason = 'provider_reported_partial' AND {_EXCHANGE} IN ('KO', 'KQ')"
 _KR_BULK_ARGS: Final = {"currencies": dict(KR_CURRENCIES)}
+_US_PARTIAL: Final = f"reason = 'provider_reported_partial' AND {_EXCHANGE} = 'US'"
+_US_BULK_ARGS: Final = {"currencies": {"US": "USD"}}
 _ROW: Final = "(CASE WHEN json_valid(source_row_json) THEN source_row_json END)"
 
 
@@ -223,6 +228,9 @@ ROUTES: Final = (
     Route("classifications.kr.kind", "kind.industry@2", "kind-listings-", "listings",
           continues=("kind.industry@1",)),
     Route("prices.us.eodhd", "eodhd.bars@1", "qveris-bulk-bars-", "bars", _US_SYMBOL),
+    Route("prices.us.eodhd", "eodhd.bulk_quarantine@1", "qveris-bulk-quarantine-",
+          "quarantine", _US_PARTIAL, derive_from="eodhd.bars@1", derive_args=_US_BULK_ARGS,
+          check=_KR_VALUES),
     Route("prices.kr.eodhd", "eodhd.bars@1", "qveris-bulk-bars-", "bars", _KR_SYMBOL),
     Route("prices.kr.eodhd", "eodhd.bulk_quarantine@1", "qveris-bulk-quarantine-",
           "quarantine", _KR_PARTIAL, derive_from="eodhd.bars@1", derive_args=_KR_BULK_ARGS,
@@ -244,7 +252,7 @@ UNMAPPED: Final = (
     ("actions.kr.eodhd", "qveris-dividends-", "dividends", _KR_SYMBOL, ()),
     ("status.kr.kind", "kind-listings-", "listings", None, KIND_REQUIRED),
     ("prices.us.eodhd", "qveris-bulk-quarantine-", "quarantine",
-     f"{_EXCHANGE} = 'US'", ()),
+     f"{_EXCHANGE} = 'US' AND reason <> 'provider_reported_partial'", ()),
 )  # fmt: skip
 
 
