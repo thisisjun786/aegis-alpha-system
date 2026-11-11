@@ -40,7 +40,7 @@ new job. An ask of the current
 observation date, or a failure still backing off, waits (``waiting``).
 A request never asked is ``new``. KR symbol lists are covered for ``symbol_list_days`` after
 the observation date of their latest completion and are then asked again (``refresh``); the
-US list is covered only on its observation date, so it is asked every day.
+US lists are covered only on their observation date, so they are asked every day.
 
 Requests, in the order a run asks them while its caps last:
 
@@ -51,7 +51,8 @@ Requests, in the order a run asks them while its caps last:
    ``extra_sessions`` (explicit earlier gaps), by date and then exchange;
 2. exchange symbol lists: ``KO``/``KQ`` listed and delisted, the identity input of new KR
    listings, and ``US`` listed, the dated observation US ticker claims continue from
-   (``storage.us_symbols``);
+   (``storage.us_symbols``), and delisted, the input of US delisting events
+   (``status.us.eodhd``, ``eodhd.delisted@1``);
 3. FX pair histories (``<PAIR>.FOREX``) from ``forex_lookback_days`` before the
    observation date.
 
@@ -695,7 +696,7 @@ def plan_requests(  # noqa: C901 -- one pass deciding and reporting every candid
             today - timedelta(days=1 if exchange == US_SYMBOL_LIST else policy.symbol_list_days),
         )
         for exchange in policy.symbol_lists
-        for delisted in (("0",) if exchange == US_SYMBOL_LIST else ("0", "1"))
+        for delisted in ("0", "1")
     ]
     candidates += [
         (forex_job(pair, today, policy.forex_lookback_days), None, None) for pair in policy.forex

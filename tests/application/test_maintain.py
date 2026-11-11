@@ -360,22 +360,29 @@ def test_a_us_symbol_list_is_collected_imported_and_read_by_the_identity_stage(
     world = World(tmp_path)
     listed = json.dumps({"EXCHANGE_CODE": "US", "delisted": "0", "fmt": "json"},
                         sort_keys=True, separators=(",", ":"))  # fmt: skip
+    delisted = json.dumps({"EXCHANGE_CODE": "US", "delisted": "1", "fmt": "json"},
+                          sort_keys=True, separators=(",", ":"))  # fmt: skip
     world.qveris.rows = {**world.qveris.rows, listed: [
-        symbol("AAA", isin("000000011", "US"), exchange="NYSE", currency="USD")]}  # fmt: skip
+        symbol("AAA", isin("000000011", "US"), exchange="NYSE", currency="USD")],
+        delisted: [symbol("OLD", None, exchange="NYSE", currency="USD")]}  # fmt: skip
     qveris = cast("QverisSettings", world.config.qveris)
     policy = replace(qveris.policy, symbol_lists=("US",))
     world.config = replace(world.config, qveris=replace(qveris, policy=policy))
     report = world.run()
     assert report["exit_code"] == 0, report["failed_stages"]
     stages = cast("dict[str, dict[str, object]]", report["stages"])
-    assert stages["qveris"]["provider_calls"] == 3  # two sessions and the US list
-    (unit,) = cast("list[dict[str, object]]", stages["import"]["symbol_lists"])
-    assert str(unit["source_id"]).startswith("qveris-eodhd-exchange-symbols-")
+    # Two sessions and the US listed and delisted lists.
+    assert stages["qveris"]["provider_calls"] == 4
+    units = cast("list[dict[str, object]]", stages["import"]["symbol_lists"])
+    assert len(units) == 2
+    assert all(str(unit["source_id"]).startswith("qveris-eodhd-exchange-symbols-")
+               for unit in units)  # fmt: skip
     identity = stages["identity"]
     # The KR build never reads a US list; the US increment does.
     assert identity["new_sources"] == {"eodhd": 0, "kind": 0, "dart": 0}
     us = cast("dict[str, object]", identity["us_symbols"])
-    assert (us["new_sources"], us["claims"], us["registry"]) == (1, 0, "no_new_claims")
+    # Both lists are new sources; the delisted list's rows are skipped as no listed rows.
+    assert (us["new_sources"], us["claims"], us["registry"]) == (2, 0, "no_new_claims")
     assert us["unresolved"] == {"list_isin_unregistered": ["AAA.US"]}
     # The same day again: the list is covered until tomorrow.
     world.clock.advance(hours=1)

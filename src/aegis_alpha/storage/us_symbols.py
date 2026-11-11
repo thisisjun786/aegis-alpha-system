@@ -270,6 +270,12 @@ def _isin(value: object) -> tuple[str | None, str | None]:
     return (canonical, None) if canonical == value else (None, "list_isin_invalid")
 
 
+def isin_reason(value: object) -> str | None:
+    """Why a list row's ISIN text is no ISIN (``isin_missing``, ``isin_invalid``), or None."""
+    _, reason = _isin(value)
+    return None if reason is None else reason.removeprefix("list_")
+
+
 def _owner(
     row: Mapping[str, object], registry: Registry
 ) -> tuple[str | None, str | None, str | None]:
