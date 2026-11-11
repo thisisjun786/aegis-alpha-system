@@ -317,6 +317,117 @@ def test_a_refused_key_stops_the_run_and_keeps_the_answer(ws: Workspace) -> None
     assert receipts[0]["rows"] == 2
 
 
+def _latest_asks(fake: FakeFred) -> list[str]:
+    """The series of the unwindowed latest-vintage calls, in order."""
+    return [asked["series_id"] for asked in fake.asked("vintagedates")
+            if "realtime_start" not in asked]  # fmt: skip
+
+
+def _receipt_outcomes(ws: Workspace) -> list[tuple[str, str, str]]:
+    """(endpoint, series, outcome) of every committed FRED receipt of an ALFRED request."""
+    found = []
+    for _, row in provider_collection.receipt_rows(ws, fred.PROVIDER):
+        request = json.loads(cast("str", row[2]))
+        parameters = json.loads(request["parameters_json"])
+        if "series_id" in parameters:
+            found.append((cast("str", row[1]), parameters["series_id"], cast("str", row[3])))
+    return found
+
+
+def _quiet_day(ws: Workspace, fake: FakeFred, clock: FakeClock) -> dict[str, object]:
+    """Collect once, then run the next FRED day, on which no series has a new vintage."""
+    _fred_run(ws, fake, clock)
+    fake.today = date(2026, 9, 10)
+    fake.empty_window_500 = True
+    clock.advance(days=1)
+    return _fred_run(ws, fake, clock)
+
+
+def test_an_empty_vintage_window_answered_500_is_no_new_vintage(ws: Workspace) -> None:
+    fake = FakeFred(date(2026, 9, 9))
+    _history(fake)
+    clock = FakeClock(FRED_NOW)
+    quiet = _quiet_day(ws, fake, clock)
+    # Each 500 is checked once against the series' latest vintage, which is the known day.
+    assert _latest_asks(fake) == ["DGS10", "GDP"]
+    assert quiet["stopped"] is None
+    assert quiet["outcomes"] == {"COMPLETED": 3, "NO_DATA": 2}
+    assert quiet["incomplete_queries"] == {}
+    # The window's own receipt records NO_DATA; the first day's windows were COMPLETED.
+    assert sorted(item for item in _receipt_outcomes(ws) if item[0] != "observations") == [
+        ("latest_vintage", "DGS10", "COMPLETED"), ("latest_vintage", "GDP", "COMPLETED"),
+        ("vintage_dates", "DGS10", "COMPLETED"), ("vintage_dates", "DGS10", "NO_DATA"),
+        ("vintage_dates", "GDP", "COMPLETED"), ("vintage_dates", "GDP", "NO_DATA"),
+    ]  # fmt: skip
+    assert verify_workspace(ws)["verified"] is True
+
+
+def test_a_500_with_a_vintage_after_the_known_day_stays_failed(ws: Workspace) -> None:
+    fake = FakeFred(date(2026, 9, 9))
+    _history(fake)
+    clock = FakeClock(FRED_NOW)
+    _fred_run(ws, fake, clock)
+    # FRED has published a DGS10 vintage on 09-09, yet answers its window with 500.
+    fake.today = date(2026, 9, 10)
+    fake.publish("DGS10", date(2026, 9, 8), "4.20", date(2026, 9, 9))
+    fake.window_answers["DGS10"] = HttpAnswer(
+        500, (), b'{"error_code":500,"error_message":"Internal Server Error"}'
+    )
+    fake.empty_window_500 = True
+    clock.advance(days=1)
+    result = _fred_run(ws, fake, clock)
+    assert _latest_asks(fake) == ["DGS10", "GDP"]
+    assert result["outcomes"] == {"COMPLETED": 3, "FAILED": 1, "NO_DATA": 1}
+    assert ("vintage_dates", "DGS10", "FAILED") in _receipt_outcomes(ws)
+    assert fred_collection.load_known(ws).knowledge.vintages["DGS10"] == date(2026, 9, 1)
+    # A 502 or a maintenance page is a passing fault: FAILED, with no latest-vintage check.
+    for answer in (HttpAnswer(502, (), b"Bad Gateway"),
+                   HttpAnswer(200, (), b"<html>System maintenance</html>")):  # fmt: skip
+        fake.window_answers["DGS10"] = answer
+        before = len(_latest_asks(fake))
+        clock.advance(minutes=10)  # the same FRED day, so the CSV is not asked again
+        again = _fred_run(ws, fake, clock)
+        assert _latest_asks(fake)[before:] == ["GDP"]
+        assert again["outcomes"] == {"COMPLETED": 1, "FAILED": 1, "NO_DATA": 1}
+
+
+def test_after_a_window_without_a_vintage_the_next_run_asks_from_the_known_day(
+    ws: Workspace,
+) -> None:
+    fake = FakeFred(date(2026, 9, 9))
+    _history(fake)
+    clock = FakeClock(FRED_NOW)
+    _quiet_day(ws, fake, clock)
+    assert fred_collection.load_known(ws).knowledge.vintages == {
+        "DGS10": date(2026, 9, 1), "GDP": date(2026, 8, 28)}  # fmt: skip
+    fake.today = date(2026, 9, 11)
+    fake.publish("DGS10", date(2026, 9, 9), "4.30", date(2026, 9, 10))
+    clock.advance(days=1)
+    later = _fred_run(ws, fake, clock)
+    windows = [asked for asked in fake.asked("vintagedates") if "realtime_start" in asked]
+    assert [(asked["series_id"], asked["realtime_start"]) for asked in windows[-2:]] == [
+        ("DGS10", "2026-09-02"), ("GDP", "2026-08-29")]  # fmt: skip
+    (rows,) = _sources(later, "fred-alfred-observations-")
+    assert rows["rows"] == 1
+    assert fred_collection.load_known(ws).knowledge.vintages["DGS10"] == date(2026, 9, 10)
+
+
+@pytest.mark.parametrize("status", [401, 403, 429])
+def test_a_refused_vintage_window_still_stops_the_run_unchecked(ws: Workspace, status: int) -> None:
+    fake = FakeFred(date(2026, 9, 9))
+    _history(fake)
+    clock = FakeClock(FRED_NOW)
+    _fred_run(ws, fake, clock)
+    fake.today = date(2026, 9, 10)
+    fake.empty_window_500 = True
+    fake.window_answers["DGS10"] = HttpAnswer(status, (), b'{"error_code":0}')
+    clock.advance(days=1)
+    result = _fred_run(ws, fake, clock)
+    assert result["stopped"] == f"provider_refused:{status}"
+    assert _latest_asks(fake) == []
+    assert result["outcomes"] == {"COMPLETED": 1, "FAILED": 1}
+
+
 def test_a_legacy_alfred_table_sets_the_known_vintage_day(ws: Workspace) -> None:
     # A legacy normalization: extra columns, and a vintage of the day it was retrieved on.
     schema = pa.schema([

@@ -1451,7 +1451,9 @@ companyfacts 순으로, FRED는 CSV, 시계열별 vintage 확인과 observations
 `collection_jobs`·`collection_attempts`·`usage_events`에 기록된다. 응답은 `raw/`와 `sec-*`·`fred-*` 내용
 원천에 남는다. 출력은 공급자 호출 수, 이유별 요청 수, 결과 분포, 멈춘 이유(`budget`,
 `provider_refused:<HTTP 상태>`, `transport_failures`), commit한 원천이다. SEC는 덮인 마지막 날과 남은 계획을,
-FRED는 시계열별 알려진 vintage 날과 완결되지 않은 창을 함께 낸다. 예산을 다 쓰면 정상 종료이고, 거부나 전송
+FRED는 시계열별 알려진 vintage 날과 완결되지 않은 창을 함께 낸다. FRED가 새 vintage 없는 창에 주는 HTTP
+500은 창 없는 최신 vintage를 한 번 더 물어(`latest_vintage:vintage_recheck`) 알려진 날 뒤가 아니면 `NO_DATA`로
+세고, 그 밖의 500·502·점검 페이지는 `FAILED`로 센다. 예산을 다 쓰면 정상 종료이고, 거부나 전송
 실패로 멈추면 받은 답을 commit한 뒤 종료 코드 1이다. commit에는 `pyarrow`(legacy extra)가 필요하다.
 `--issuers registered`(기본)는 identity에 SEC 발행인으로 등록된 제출자의 문서만 묻는다. 처음 SEC 실행은
 `--since`로 legacy bulk archive 뒤의 첫 색인 날을 정한다.
