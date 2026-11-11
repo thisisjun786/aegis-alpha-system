@@ -851,6 +851,44 @@ dataset 이름은 `<domain>.<market>.<provider>[.ref][.r<N>]`다. 한 dataset의
 
 FX처럼 여러 원천이 같은 시계열을 내는 경우에도 우선순위는 같은 방식으로 소비자 pin이 정한다.
 
+### 버전 있는 원천 선택 규칙
+
+데이터 종류마다 날짜 구간별 정본 원천을 하나만 두는 규칙은 `storage/source_selection.py` 한 곳에 있다(#153).
+규칙은 `select.<종류>@<버전>` 이름을 가지고, 순서 있는 `[from, to)` 구간마다 dataset 하나를 정한다.
+요청은 규칙을 이름과 버전으로 고르고 규칙의 dataset마다 exact generation pin을 하나씩 준다(`Selection`).
+규칙은 위의 ordered-pin binding(`aas-head-binding-v1`)이 되므로 각 날짜는 한 dataset에서만 읽힌다. 선택된
+dataset에 head가 없는 날짜는 다른 공급자로 채우지 않고 누락으로 남는다(묵시적 fallback 없음).
+
+| 규칙 | 도메인 | 구간과 정본 | 겹치는 날 |
+| --- | --- | --- | --- |
+| `select.prices.us@1` | `prices` | ~2026-09-08 `prices.us.norgate`, 2026-09-09~ `prices.us.eodhd` | Norgate. 같은 구간의 `prices.us.eodhd` bar에 붙은 `cross_provider_mismatch` flag를 선택된 bar에 보인다 |
+| `select.actions.us@1` | `corporate_actions` | ex-date ~2026-07-27 `actions.us.norgate`, 2026-07-28~ `actions.us.eodhd` | 구간 밖 행위는 읽지 않는다 |
+| `select.prices.kr@1` | `prices` | 전 구간 `prices.kr.eodhd` | — |
+| `select.actions.kr@1` | `corporate_actions` | 전 구간 `actions.kr.eodhd` | — |
+| `select.fx.usdkrw@1` | `fx_rates` | 고시 UTC 날짜 ~2026-09-09 `fx.usdkrw.norgate`, 2026-09-10~ `fx.usdkrw.eodhd` | — |
+
+- 등록한 규칙은 바꾸지 않는다. cutover나 원천을 바꾸려면 다음 버전을 나란히 등록한다. 규칙 문서
+  (`aas-source-selection-rule-v1`: 규칙 이름, 도메인, 구간, witness, 드러낼 flag)의 SHA-256은 시험에 고정돼 있어
+  저장된 run의 의미가 바뀌지 않는다. 버전 없는 이름이나 등록되지 않은 버전은 거부한다(최신 버전 기본값 없음).
+- `read_selected`(작업 공간 진입점 `load_selected`)는 선택된 head를 (instrument, session) 행마다 그 행을
+  낸 dataset과 함께 돌려준다. 영수증 `aas-source-selection-read-v1`은 규칙과 그 hash, binding과 binding
+  hash, head 읽기 영수증 hash, witness 읽기 영수증 hash, 행마다 원천과 witness flag의 digest를 싣는다.
+- witness는 가격 규칙만 가진다. witness dataset은 자기가 지는 구간에서만 같은 query로 읽히고, 그 값은 쓰이지 않는다.
+  규칙이 적은 flag만 instrument·session·interval·basis·role이 같은 선택 bar의 `witness_flags`에 실린다.
+  strict 읽기에서는 cutoff까지 알려진 witness revision의 flag만 보인다.
+- 수정가는 저장하지 않고 공급자 수정 계열(`.ref`)을 잇지 않는다. `read_selected_adjusted`(`load_selected_adjusted`)가
+  선택된 무수정 bar와 선택된 기업행위로 그 읽기의 cutoff에서 `aas-adjustment-v1`을 계산한다. 영수증
+  `aas-source-selection-adjusted-v1`은 두 규칙과 hash, 두 selection 문서, 조정 읽기 영수증 hash, 행마다의 원천을 싣는다.
+- 이음매 확인은 읽기 전용 도우미가 계산한다. `overlap_close_differences`는 witness와 선택 원천이 모두 가진
+  bar의 상대 종가 차이 `|witness − 선택| / |선택|` 분포(쌍 수, 세션별 쌍 수, 최대값, nearest-rank p50·p90·p99,
+  허용치 초과 수, flag 붙은 쌍 수, witness에만 있는 bar 수)를 낸다. `seam_factor_continuity`는 가격 규칙의 cutover마다
+  양쪽에 bar가 있는 instrument의 직전·직후 bar 수정 계수 비, 그 사이에 효력이 있는 선택 행위 수, 수정 종가 변화율을
+  내고 `continuous`·`explained_step`·`unexplained_step`·`unknown_factor`로 분류한다. EODHD `adjusted_close` 검산은
+  그 열이 승격되지 않아 여기에 없다.
+- 규칙은 읽기 단계만 바꾼다. 원장 dataset, 승격, flag, 전략 요구 매핑(`strategy_registry`)은 그대로다.
+  준비 요청(`aas-prepare-request-v1`)은 이 규칙이 만드는 binding을 `heads` 참조로 받을 수 있지만, 요청과 run에
+  규칙 이름을 남기는 일은 아직 없다(예정).
+
 ## 동결 원천
 
 구독이 끝났거나 공급이 멈춘 원천은 동결 원천이다. 보존한 원문과 원천 자료실 자료로만 generation을
@@ -3129,3 +3167,8 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-539 | head가 없는 chain은 bulk route가 파생하지 않고 `no_head`로 남는다 | `tests/storage/test_maintain_promotion.py::test_a_chain_without_a_head_derives_nothing` | 구현 |
 | DV-540 | 값 검사(가격 0, low>high, high<max(open, close), 음수 거래량, 문자열 숫자, null, 깨진 JSON, 잘못된 날짜)를 어긴 행이 하나라도 있는 bulk 테이블은 `value_check`로 남고 승격되지 않으며, 같은 회차의 정상 테이블은 승격된다 | `tests/storage/test_maintain_promotion.py::test_one_invalid_value_keeps_its_whole_bulk_table_out` | 구현 |
 | DV-541 | 경고 KR bulk만 수집된 유지보수 실행은 이력만 있는 chain을 이어 붙이고 승격 뒤 저장소가 검증을 통과한다 | `tests/application/test_maintain.py::test_warned_kr_bulk_days_continue_a_history_only_chain_and_the_store_verifies` | 구현 |
+| DV-542 | `select.prices.us@1`은 Norgate에만 있는 날은 Norgate, EODHD에만 있는 cutover 뒤 날은 EODHD, 겹치는 날은 Norgate를 읽고, 선택되지 않은 원천으로 채우지 않으며 행마다 원천을 돌려준다 | `tests/storage/test_source_selection.py::test_each_session_reads_the_one_source_the_rule_selects` | 구현 |
+| DV-543 | 겹치는 날 EODHD bar의 `cross_provider_mismatch` flag는 선택된 Norgate bar의 witness flag로 보이고, 이음매 종가 차이 분포에 잡힌다 | `tests/storage/test_source_selection.py::test_a_mismatch_flag_on_the_overlap_is_visible_in_the_selected_read` | 구현 |
+| DV-544 | 선택 수정가는 선택된 무수정 bar와 선택된 행위로만 계산되고(같은 행위가 두 원천에 있어도 한 번), cutover 앞뒤 수정 계수의 변화는 그 사이 행위로 설명된다 | `tests/storage/test_source_selection.py::test_adjustment_factors_stay_continuous_across_the_source_cutover` | 구현 |
+| DV-545 | 등록한 선택 규칙 문서는 고정 digest를 갖고, 새 버전은 이전 버전의 읽기 결과와 영수증을 바꾸지 않으며, 버전 없는 이름·미등록 버전은 거부된다 | `tests/storage/test_source_selection.py::test_a_new_rule_version_leaves_the_earlier_version_and_its_reads_unchanged` | 구현 |
+| DV-546 | 규칙은 정해진 dataset과 cutover로 binding을 만들고, dataset마다 pin이 정확히 하나가 아니거나 규칙 밖 dataset의 pin이면 거부한다 | `tests/storage/test_source_selection.py::test_rules_bind_their_datasets_with_exact_cutovers` | 구현 |
