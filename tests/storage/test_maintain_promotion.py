@@ -360,9 +360,8 @@ def test_a_warned_us_bulk_day_continues_the_us_chain_and_identity_held_rows_stay
     ).fetchone()
     assert flags == (2,)
     # The identity-held table is still counted as unmapped; the warned one no longer is.
-    shipped = [(dataset, "synthetic-kr-bulk-" if table == "quarantine" else prefix, table,
-                accept, columns)
-               for dataset, prefix, table, accept, columns in maintain_promotion.UNMAPPED
+    shipped = [(dataset, "synthetic-kr-bulk-" if table == "quarantine" else prefix, table, accept)
+               for dataset, prefix, table, accept in maintain_promotion.UNMAPPED
                if dataset == "prices.us.eodhd"]  # fmt: skip
     monkeypatch.setattr(maintain_promotion, "UNMAPPED", tuple(shipped))
     assert maintain_promotion.unmapped(ws) == {"prices.us.eodhd": 1}

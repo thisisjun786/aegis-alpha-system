@@ -110,10 +110,9 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 
+from aegis_alpha.storage import us_symbols
 from aegis_alpha.storage.calendar_declaration import packaged_declaration, parse_declaration
 from aegis_alpha.storage.dataset_catalog import CATALOG, catalog_entry
-from aegis_alpha.storage import us_symbols
-from aegis_alpha.storage.kr_identity import KIND_REQUIRED
 from aegis_alpha.storage.kr_prices import CURRENCIES as KR_CURRENCIES
 from aegis_alpha.storage.market import generation_chain
 from aegis_alpha.storage.membership_pins import IdentityPin, membership_parts
