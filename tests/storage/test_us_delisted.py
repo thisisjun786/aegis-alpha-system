@@ -218,9 +218,8 @@ def _last_bar_as_of(revisions: list[tuple[str, int, str, int | None, int | None]
 
     Each revision is (session day, generation sequence, op, available_at_us, revision_known_at_us).
     """
-    listed_us = int(datetime(2026, 9, 11, 22, tzinfo=UTC).timestamp() * 1_000_000)
     connection = duckdb.connect()
-    connection.execute(
+    connection.execute(  # noqa: S608 -- fixed synthetic constants
         "CREATE TABLE src AS SELECT 0::INTEGER AS _aas_pin, 0::BIGINT AS _aas_ordinal, 'h' AS "
         "_aas_row_hash, 'US' AS exchange_code, '1' AS delisted, 'AAA' AS code, "
         f"'{ISIN_A}' AS isin, 'Common Stock' AS type, '2026-09-11T22:00:00Z' AS retrieved_at_utc"
@@ -229,14 +228,16 @@ def _last_bar_as_of(revisions: list[tuple[str, int, str, int | None, int | None]
         f"CREATE TABLE {IDENTITY_ROWS} (token VARCHAR, instrument_id VARCHAR, "
         "valid_from_us BIGINT, valid_to_us BIGINT)"
     )
-    connection.execute(f"INSERT INTO {IDENTITY_ROWS} VALUES ('{ISIN_A}', 'ins-a', 0, NULL)")
+    connection.execute(  # noqa: S608 -- fixed synthetic constants
+        f"INSERT INTO {IDENTITY_ROWS} VALUES ('{ISIN_A}', 'ins-a', 0, NULL)"
+    )
     connection.execute(
         f"CREATE TABLE {reference_table(BARS)} (instrument_id VARCHAR, session_date DATE, "
         "available_at_us BIGINT, revision_known_at_us BIGINT, _aas_sequence BIGINT, "
         "op VARCHAR, record_id VARCHAR, revision_id VARCHAR)"
     )
     for day, sequence, op, available, known in revisions:
-        connection.execute(
+        connection.execute(  # noqa: S608 -- engine-named relation, bound values
             f"INSERT INTO {reference_table(BARS)} VALUES ('ins-a', ?, ?, ?, ?, ?, ?, ?)",
             [day, available, known, sequence, op, f"r-{day}", f"v-{day}-{sequence}"],
         )
@@ -279,8 +280,12 @@ def test_a_last_bar_is_read_as_of_the_list_not_from_later_corrections() -> None:
 
 def test_a_list_of_rows_without_isin_is_still_an_unresolved_source(ws: Workspace) -> None:
     identity = _bars(ws)
-    _list(ws, "2026-09-11T22:00:00Z", "1", [_row("GONE", None)])
-    run = _run(ws, identity, 10)
+    _list(ws, "2026-09-11T22:00:00Z", "1", [_row("AAA", ISIN_A)])
+    assert _run(ws, identity, 10)["status"] == "advanced"
+    # A later list whose only unresolved row has no ISIN at all: no token is fabricated for it,
+    # yet the source is recorded as waiting and counted by its reason.
+    _list(ws, "2026-09-14T22:00:00Z", "1", [_row("GONE", None)])
+    run = _run(ws, identity, 20)
     (source,) = cast("list[dict[str, object]]", run["sources"])
     assert source["status"] == "unresolved"
     standing = standing_unresolved(ws)["status.us.eodhd"]
