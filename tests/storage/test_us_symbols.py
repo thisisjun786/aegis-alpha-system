@@ -34,10 +34,13 @@ from aegis_alpha.storage.us_identity import (
 )
 from aegis_alpha.storage.us_symbols import (
     MAX_BRIDGE_DAYS,
+    OUT_OF_SCOPE_CLASSES,
     Held,
     Registry,
     build_symbol_claims,
     covered_day,
+    disposition,
+    symbol_class,
 )
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
 from tests.storage.kr_identity_support import bad_check_digit, eodhd_job, isin, symbol
@@ -323,6 +326,93 @@ def test_conflicting_or_unverifiable_rows_name_no_instrument() -> None:
     }
 
 
+def _kind(code: str, value: str | None, kind: str) -> dict[str, object]:
+    return symbol(code, value, exchange="NYSE", kind=kind, currency="USD")
+
+
+def test_every_unresolved_day_has_a_symbol_class_and_a_disposition() -> None:
+    # AAA, BBB, CCC and KKK held instruments through Tuesday; the rest never had a claim.
+    held = [_base("AAA.US", IA, TUE), _base("BBB.US", IB, TUE), _base("CCC.US", IC, TUE),
+            _base("KKK.US", IC, date(2026, 9, 1))]  # fmt: skip
+    lists = [_list(_evening(WED), [
+        _kind("AAA", ISIN_C, "Common Stock"),  # a registered ISIN of another holder
+        _kind("BBB", None, "Common Stock"),  # a held symbol whose row lost its ISIN
+        _kind("CCC", bad_check_digit(ISIN_C), "Common Stock"),
+        _kind("DDD", isin("000000044", "US"), "Common Stock"),  # a new listing
+        _kind("EEE", None, "Mutual Fund"),
+        _kind("FFF", isin("000000066", "US"), "Warrant"),
+        _kind("HHH", ISIN_B, "Common Stock"), _kind("III", ISIN_B, "ETF"),
+        _kind("KKK", isin("000000099", "US"), "Common Stock"),  # held, ISIN unregistered
+        _kind("ZZZ", ISIN_A, "Preferred Stock"),  # names an instrument: never out of scope
+    ])]  # fmt: skip
+    report = build_symbol_claims(lists, _registry(*held)).report()
+    assert report["unresolved_classes"] == {
+        "list_isin_invalid": {"common_stock": 1},
+        "list_isin_missing": {"common_stock": 1, "mutual_fund": 1},
+        "list_isin_repeated": {"common_stock": 1, "etf": 1},
+        "list_isin_unregistered": {"common_stock": 2, "warrant": 1},
+        "list_not_bracketed": {"preferred": 1},
+        "list_symbol_moved": {"common_stock": 1},
+    }
+    assert report["unresolved_dispositions"] == {
+        "out_of_scope": {"list_isin_missing": 1, "list_isin_unregistered": 1},
+        "register": {"list_isin_missing": 1, "list_isin_unregistered": 1},
+        "unresolved": {"list_isin_invalid": 1, "list_isin_repeated": 2,
+                       "list_isin_unregistered": 1, "list_not_bracketed": 1,
+                       "list_symbol_moved": 1},
+    }  # fmt: skip
+    # The class and disposition only report: no class reaches a claim.
+    assert report["claims"] == 0
+
+
+@pytest.mark.parametrize(
+    ("label", "kind", "scope"),
+    [
+        ("Common Stock", "common_stock", True),
+        ("ETF", "etf", True),
+        ("FUND", "fund", True),
+        ("Mutual Fund", "mutual_fund", False),
+        ("Preferred Stock", "preferred", False),
+        ("Warrant", "warrant", False),
+        ("Unit", "unit", False),
+        ("Right", "right", False),
+        ("BOND", "debt", False),
+        ("Notes", "debt", False),
+        ("Something New", "other", True),
+        (None, "unknown", True),
+    ],
+)
+def test_a_list_type_label_names_a_symbol_class(
+    label: str | None, kind: str, *, scope: bool
+) -> None:
+    assert symbol_class(label) == kind
+    assert (kind not in OUT_OF_SCOPE_CLASSES) is scope
+
+
+@pytest.mark.parametrize(
+    ("reason", "kind", "names", "held", "expected"),
+    [
+        ("list_isin_missing", "common_stock", False, True, "register"),
+        ("list_isin_missing", "common_stock", False, False, "unresolved"),
+        ("list_isin_missing", "warrant", False, True, "out_of_scope"),
+        ("list_isin_unregistered", "etf", False, True, "register"),
+        ("list_isin_unregistered", "etf", False, False, "unresolved"),
+        ("list_isin_unregistered", "unit", False, False, "out_of_scope"),
+        ("list_isin_invalid", "common_stock", False, True, "unresolved"),
+        ("list_isin_invalid", "preferred", False, True, "out_of_scope"),
+        ("list_isin_repeated", "common_stock", True, True, "unresolved"),
+        ("list_isin_repeated", "preferred", True, True, "unresolved"),
+        ("list_not_bracketed", "common_stock", True, False, "unresolved"),
+        ("list_symbol_moved", "warrant", True, True, "unresolved"),
+        ("list_not_observed", "unknown", False, False, "unresolved"),
+    ],
+)
+def test_each_reason_has_one_disposition(
+    reason: str, kind: str, *, names: bool, held: bool, expected: str
+) -> None:
+    assert disposition(reason, kind, names_instrument=names, held_before=held) == expected
+
+
 @pytest.mark.parametrize(
     ("retrieved", "covered"),
     [
@@ -420,6 +510,17 @@ def _import_list(ws: Workspace, day: date, rows: list[dict[str, object]]) -> str
     return unit.content.source_id
 
 
+def _breakdown(unresolved: dict[str, tuple[str, int]], *, resolved: int = 0) -> dict[str, object]:
+    """The standing breakdown of rows that stay ``unresolved`` (reason: (class, rows))."""
+    reasons = {reason: rows for reason, (_, rows) in unresolved.items()}
+    return {
+        "rows_by_reason": dict(sorted({**reasons, **({"resolved": resolved} if resolved
+                                                     else {})}.items())),
+        "rows_by_class": {reason: {kind: rows} for reason, (kind, rows) in unresolved.items()},
+        "rows_by_disposition": {"unresolved": sum(reasons.values())},
+    }  # fmt: skip
+
+
 def _run(report: dict[str, object]) -> dict[str, object]:
     (run,) = cast("list[dict[str, object]]", report["datasets"])
     return run
@@ -441,9 +542,10 @@ def test_list_claims_reach_a_new_snapshot_and_promote_the_rows_they_waited_for(
     waiting = _bars(ws, WED, "AAA.US", "NEW.US")
     held = promote_datasets(ws, apply=True, now_us=10, routes=[ROUTE], identity=cutover)
     assert held["unresolved"] == ["prices.us.eodhd"]
+    unobserved = _breakdown({"list_not_observed": ("unknown", 2)})
     standing = {"prices.us.eodhd": {"sources": 1, "rows": 2, "rows_unavailable": 0,
                                     "unresolved_tokens": 2, "unpublished_sources": 1,
-                                    "oldest_date": WED.isoformat()}}  # fmt: skip
+                                    "oldest_date": WED.isoformat(), **unobserved}}  # fmt: skip
     assert held["standing_unresolved"] == standing
     # A pass that brings no new source still lists what waits; its own list is empty.
     quiet = promote_datasets(ws, apply=True, now_us=11, routes=[ROUTE], identity=cutover)
@@ -475,7 +577,8 @@ def test_list_claims_reach_a_new_snapshot_and_promote_the_rows_they_waited_for(
     assert rows == [(TUE,), (WED,)]
     assert standing_unresolved(ws)["prices.us.eodhd"] == {
         "sources": 1, "rows": 2, "rows_unavailable": 0, "unresolved_tokens": 1,
-        "unpublished_sources": 0, "oldest_date": WED.isoformat()}  # fmt: skip
+        "unpublished_sources": 0, "oldest_date": WED.isoformat(),
+        **_breakdown({"list_isin_unregistered": ("common_stock", 1)}, resolved=1)}  # fmt: skip
 
     # Thursday's claim starts within Wednesday's latest possible instants (14 hours past the
     # UTC day), so Wednesday's waiting source is planned once more; Friday's claim is not.
@@ -507,6 +610,53 @@ def test_list_claims_reach_a_new_snapshot_and_promote_the_rows_they_waited_for(
     build = UsRegistry(empty, {}, {}, {}, frozenset({"sl:" + first["source_id"]}))
     checked = check_registered(build, ws.state)
     assert [row["token"] for row in checked.withdrawn] == ["AAA.US", ISIN_A, A]
+
+
+def test_the_standing_summary_counts_waiting_us_rows_by_reason_class_and_disposition(
+    ws: Workspace,
+) -> None:
+    first = _bars(ws, TUE, "AAA.US")
+    cutover = _register_base(ws, first["source_id"])
+    template = spec([first], cutover, dataset="prices.us.eodhd", decimals=FLOATS,
+                    rules={"available_at_us": DAY_RULE, "revision_known_at_us": DAY_RULE},
+                    partition={"from": TUE.isoformat(), "to": WED.isoformat()},
+                    mapper={"name": "eodhd.bars@1", "args": {"timezone": NEW_YORK}})  # fmt: skip
+    assert promote(ws, *template, apply=True)["published"] is True
+    _bars(ws, WED, "AAA.US", "NEW.US", "MFX.US", "GONE.US")
+    promote_datasets(ws, apply=True, now_us=10, routes=[ROUTE], identity=cutover)
+    base = {"sources": 1, "rows": 4, "rows_unavailable": 0, "unresolved_tokens": 4,
+            "unpublished_sources": 1, "oldest_date": WED.isoformat()}  # fmt: skip
+    # No list covers Wednesday yet: every waiting row is unobserved.
+    assert standing_unresolved(ws)["prices.us.eodhd"] == {
+        **base,
+        "rows_by_reason": {"list_not_observed": 4},
+        "rows_by_class": {"list_not_observed": {"unknown": 4}},
+        "rows_by_disposition": {"unresolved": 4},
+    }
+
+    # Wednesday's list: AAA continues its registered holder, NEW is a new listing, MFX a
+    # mutual fund without an ISIN, and GONE is not listed at all.
+    _import_list(ws, WED, [_row("AAA", ISIN_A), _row("NEW", isin("000000077", "US")),
+                           _kind("MFX", None, "Mutual Fund")])  # fmt: skip
+    listed = {"list_isin_missing": 1, "list_isin_unregistered": 1, "list_not_observed": 1}
+    classes = {"list_isin_missing": {"mutual_fund": 1},
+               "list_isin_unregistered": {"common_stock": 1},
+               "list_not_observed": {"unknown": 1}}  # fmt: skip
+    # Judged now, AAA's day would be claimed: the identity stage registers it next.
+    assert standing_unresolved(ws)["prices.us.eodhd"] == {
+        **base,
+        "rows_by_reason": {"list_claimable": 1, **listed},
+        "rows_by_class": {"list_claimable": {"common_stock": 1}, **classes},
+        "rows_by_disposition": {"out_of_scope": 1, "register": 1, "unresolved": 2},
+    }
+    maintain_identity.advance(ws, apply=True, now_us=_now())
+    # Registered, AAA's row is resolved; its source waits for the next promotion.
+    assert standing_unresolved(ws)["prices.us.eodhd"] == {
+        **base,
+        "rows_by_reason": {"resolved": 1, **listed},
+        "rows_by_class": classes,
+        "rows_by_disposition": {"out_of_scope": 1, "unresolved": 2},
+    }
 
 
 def _counts(ws: Workspace) -> tuple[int, int]:
@@ -572,9 +722,11 @@ def test_a_bridge_promotes_every_held_session_once_and_a_later_day_replans_nothi
     ).fetchall()
     assert rows == [(TUE,), (WED,), (THU,), (FRI,), (MON,)]
     # The partly resolved source published AAA and still counts NEW.
+    # No list covers Wednesday: NEW's row there was never observed.
     assert standing_unresolved(ws) == {"prices.us.eodhd": {
         "sources": 1, "rows": 2, "rows_unavailable": 0, "unresolved_tokens": 1,
-        "unpublished_sources": 0, "oldest_date": WED.isoformat()}}  # fmt: skip
+        "unpublished_sources": 0, "oldest_date": WED.isoformat(),
+        **_breakdown({"list_not_observed": ("unknown", 1)}, resolved=1)}}  # fmt: skip
 
     # Tuesday's one-day claim re-plans none of the finished or waiting sources.
     _import_list(ws, monday + timedelta(days=1), [_row("AAA", ISIN_A)])

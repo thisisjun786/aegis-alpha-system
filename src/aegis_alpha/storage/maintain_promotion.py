@@ -75,7 +75,9 @@ done as well.
 
 Every pass also reports ``standing_unresolved``: per dataset, the sources whose latest
 ``maintain_source@1`` record is ``unresolved``, whatever this pass planned, read from those
-persisted records alone (``promote.unresolved`` stays the datasets this pass recorded).
+persisted records alone (``promote.unresolved`` stays the datasets this pass recorded). The
+US daily price entry also counts its waiting rows by reason, symbol class and disposition,
+judged now from the registry and the US lists (``us_symbols.unresolved_breakdown``).
 """
 
 from __future__ import annotations
@@ -90,6 +92,7 @@ from typing import TYPE_CHECKING, Final, cast
 
 import duckdb
 
+from aegis_alpha.storage import us_symbols
 from aegis_alpha.storage.kr_identity import KIND_REQUIRED
 from aegis_alpha.storage.kr_prices import CURRENCIES as KR_CURRENCIES
 from aegis_alpha.storage.membership_pins import IdentityPin, membership_parts
@@ -862,7 +865,9 @@ def standing_unresolved(workspace: Workspace) -> dict[str, dict[str, object]]:
     tokens their latest records left unresolved, ``unpublished_sources`` counts those
     whose latest record published nothing, and ``oldest_date`` is the earliest partition
     date they cover (the UTC date of the first such record for an unpartitioned source).
-    A dataset without one is not listed.
+    A dataset without one is not listed. A US daily price dataset (``us_symbols.covers``)
+    also counts those sources' rows by reason, symbol class and disposition as the current
+    registry and US lists judge them (``us_symbols.unresolved_breakdown``).
     """
     latest: dict[tuple[str, str, str], tuple[int, bool, dict[str, object]]] = {}
     first: dict[tuple[str, str, str], int] = {}
@@ -882,9 +887,11 @@ def standing_unresolved(workspace: Workspace) -> dict[str, dict[str, object]]:
         if waiting:
             first.setdefault(key, int(checked))
     summary: dict[str, dict[str, object]] = {}
+    tables: dict[str, list[tuple[str, str]]] = {}
     for (dataset_id, source_id, table), (_, waiting, body) in sorted(latest.items()):
         if not waiting:
             continue
+        tables.setdefault(dataset_id, []).append((source_id, table))
         entry = summary.setdefault(dataset_id, {
             "sources": 0, "rows": 0, "rows_unavailable": 0, "unresolved_tokens": 0,
             "unpublished_sources": 0, "oldest_date": None})  # fmt: skip
@@ -911,6 +918,7 @@ def standing_unresolved(workspace: Workspace) -> dict[str, dict[str, object]]:
         oldest = min(days) if days else recorded_at.date().isoformat()
         if entry["oldest_date"] is None or oldest < cast("str", entry["oldest_date"]):
             entry["oldest_date"] = oldest
+    us_symbols.add_breakdowns(workspace, summary, tables)
     return summary
 
 

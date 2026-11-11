@@ -1573,6 +1573,15 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
   `list_registered_conflict`(다른 상품의 등록 claim이 그날을 덮거나 상품의 앞선 claim과 그날 사이에 있음),
   `list_gap_too_long`. 마지막 Norgate claim 뒤 첫 관측까지의 평일은 `history_gap`(이어진 registry 심볼 수와
   남은 심볼 표본), 관측 사이의 빈 평일은 `observation_gaps`로 보고한다.
+- **사유별 처리(#149).** 해석되지 않은 날마다 보고에만 쓰는 심볼 종류와 처리를 붙인다. 둘 다 claim에는
+  쓰지 않는다(종류로 상품을 정하지 않는다). 종류는 목록 행의 공급자 `Type` 표기다(`Common Stock`→
+  `common_stock`, `ETF`→`etf`, `FUND`→`fund`, `Mutual Fund`→`mutual_fund`, `Preferred Stock`→`preferred`,
+  `Warrant`→`warrant`, `Unit`→`unit`, `Right`→`right`, `BOND`·`Notes`→`debt`, 모르는 표기는 `other`, 없으면
+  `unknown`). 처리는 셋이다. 그날의 어느 행도 상품을 가리키지 않고 종류가 Norgate registry에 상품 종류가
+  없는 것(`mutual_fund`, `preferred`, `warrant`, `unit`, `right`, `debt`)이면 `out_of_scope`. ISIN이 없거나
+  미등록인데 그 심볼을 앞서 등록·수용 claim이 가졌으면 `register`(그 상품의 ISIN을 주는 원천이 들어오면
+  해석된다). 나머지(새 상장, 무효·반복 ISIN, 이동·앞 보유자 없음 등)는 `unresolved`로 사유와 함께 남는다.
+  보고의 `unresolved_classes`(사유→종류→날 수)와 `unresolved_dispositions`(처리→사유→날 수)가 이를 담는다.
 - 8일보다 긴 공백을 잇는 claim은 짧은 행(8일 이하)이 아니라 긴 행이므로, 그런 claim이 생기면 기다리던 모든
   `unresolved` 원천이 한 번 다시 계획되고(보류 세션의 따라잡기), 그 뒤의 하루 claim은 다시 계획을 부르지 않는다.
 
