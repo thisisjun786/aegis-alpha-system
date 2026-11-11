@@ -98,6 +98,34 @@ def test_an_attempt_without_a_completion_is_held_not_planned(tmp_path: Path) -> 
     ]
 
 
+def test_a_settled_empty_answer_is_asked_again_on_a_later_day_and_not_held(
+    tmp_path: Path,
+) -> None:
+    raw = tmp_path / "raw"
+    asked = date(2026, 9, 15)
+    job = qveris_daily.daily_job("KO", "dividends", date(2026, 9, 14), asked)
+    client = ScriptedQveris({}, account_key(raw))
+    client.failure = "empty-result"  # Qveris's settled, uncharged empty answer
+    with pytest.raises(ValueError, match="empty_result"):
+        acquire_jobs((job,), raw, client)
+
+    def plan(observed: date) -> dict[str, object]:
+        return qveris_daily.plan_daily_jobs(raw, exchanges=["KO"], datasets=["dividends"],
+                                            start=date(2026, 9, 14), through=date(2026, 9, 14),
+                                            observation_date=observed)  # fmt: skip
+
+    same_day = plan(asked)
+    assert (same_day["planned"], same_day["held"]) == (0, [])
+    assert same_day["empty"] == [
+        {"job_id": "daily-KO-dividends-2026-09-14", "planned": False, "empty_on": "2026-09-15"}
+    ]
+    later = plan(date(2026, 9, 16))
+    assert (later["planned"], later["held"]) == (1, [])
+    assert later["empty"] == [
+        {"job_id": "daily-KO-dividends-2026-09-14", "planned": True, "empty_on": "2026-09-15"}
+    ]
+
+
 @pytest.mark.parametrize(
     ("start", "through", "observed", "match"),
     [

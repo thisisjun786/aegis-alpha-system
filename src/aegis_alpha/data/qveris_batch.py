@@ -39,22 +39,27 @@ BUDGET_STOPS = frozenset(
 WARNED = "RAW_ACQUIRED_WITH_WARNINGS"
 
 
-def budget_stop(error: BaseException, root: Path, account_key: str) -> str | None:
+def budget_stop(
+    error: BaseException, root: Path, account_key: str, tolerate: frozenset[str] = frozenset()
+) -> str | None:
     """The budget code of a refusal that left nothing unresolved, else ``None``.
 
     A budget code with a pending page or an unsettled parallel group in the store is
     not a clean stop: that evidence blocks the account until it settles or an operator
-    quarantines it, so the caller reports it as stopped.
+    quarantines it, so the caller reports it as stopped. Pages the caller ``tolerate``s
+    (an earlier run's transient errors) are reported by the caller instead.
     """
     code = str(error).split(":", 1)[0]
     if not isinstance(error, RuntimeError) or code not in BUDGET_STOPS:
         return None
     with QverisStore(root, account_key) as store:
-        unresolved = store.pending_pages() or store.pending_batches()
+        unresolved = set(store.pending_pages()) - tolerate or store.pending_batches()
     return None if unresolved else code
 
 
-def _retryable_transport(error: BaseException, root: Path, account_key: str) -> bool:
+def _retryable_transport(
+    error: BaseException, root: Path, account_key: str, tolerate: frozenset[str] = frozenset()
+) -> bool:
     errors = [error]
     seen: set[int] = set()
     while errors:
@@ -66,19 +71,21 @@ def _retryable_transport(error: BaseException, root: Path, account_key: str) -> 
             # Execute publishes an intent first. Pending evidence forbids a retry;
             # billed pages reuse their intent and never execute a second time.
             with QverisStore(root, account_key) as store:
-                return not store.pending_pages() and not store.pending_batches()
+                return not set(store.pending_pages()) - tolerate and not store.pending_batches()
         errors.extend(
             linked for linked in (current.__cause__, current.__context__) if linked is not None
         )
     return False
 
 
-def _acquire_job(
+def _acquire_job(  # noqa: PLR0913 -- one job and its run's explicit inputs
     job: QverisJob,
     root: Path,
     client: QverisPort,
     budget: InvocationBudget | None,
     pause: Callable[[], None],
+    *,
+    tolerate: frozenset[str] = frozenset(),
 ) -> dict[str, object]:
     with QverisStore(root, client.account_key) as store:
         existing = {
@@ -87,9 +94,9 @@ def _acquire_job(
             if store.exists(f"jobs/{job.fingerprint}/{number:04d}.intent.json")
         }
     try:
-        return acquire_jobs((job,), root, client, budget=budget)
+        return acquire_jobs((job,), root, client, budget=budget, tolerate=tolerate)
     except (ValueError, TypeError, RuntimeError) as error:
-        if not _retryable_transport(error, root, client.account_key):
+        if not _retryable_transport(error, root, client.account_key, tolerate):
             raise
     with QverisStore(root, client.account_key) as store:
         # Only new, settled intents were executed by the failed attempt, not an earlier run.
@@ -100,7 +107,7 @@ def _acquire_job(
             if number not in existing
         )
     pause()
-    result = acquire_jobs((job,), root, client, budget=budget)
+    result = acquire_jobs((job,), root, client, budget=budget, tolerate=tolerate)
     (item,) = cast("list[dict[str, object]]", result["jobs"])
     item["provider_calls_this_run"] = int(str(item["provider_calls_this_run"])) + calls
     result["provider_calls_this_run"] = int(str(result["provider_calls_this_run"])) + calls
@@ -112,16 +119,20 @@ class TransportRetry(TypedDict, total=False):
     retry_delay_seconds: float
 
 
-def collect_cohort(
+def collect_cohort(  # noqa: PLR0913 -- the cohort and its run's explicit inputs
     jobs: tuple[QverisJob, ...],
     root: Path,
     client: QverisPort,
     *,
     budget: InvocationBudget | None = None,
     progress: Callable[[dict[str, object]], None] | None = None,
+    tolerate: frozenset[str] = frozenset(),
     **retry: Unpack[TransportRetry],
 ) -> dict[str, object]:
     """Acquire ``jobs`` in order, one at a time, recording progress after each job.
+
+    ``tolerate`` names pending pages of earlier runs (transient errors) that do not stop
+    the cohort; they stay pending and reserved (``acquire_jobs``). Empty by default.
 
     A settled failure is recorded and the cohort continues; a provider warning is a
     completion (``warned``) and never stops it. An uncharged empty answer for an exchange
@@ -147,14 +158,16 @@ def collect_cohort(
     snapshot: dict[str, object] = {}
     for index, job in enumerate(jobs):
         try:
-            result = _acquire_job(job, root, client, budget, lambda: sleep(retry_delay_seconds))
+            result = _acquire_job(
+                job, root, client, budget, lambda: sleep(retry_delay_seconds), tolerate=tolerate
+            )
         except (ValueError, TypeError, RuntimeError) as error:
-            stop = budget_stop(error, root, client.account_key)
+            stop = budget_stop(error, root, client.account_key, tolerate)
             if stop is not None:
                 stopped = stop
             else:
                 with QverisStore(root, client.account_key) as store:
-                    unresolved = store.pending_pages()
+                    unresolved = set(store.pending_pages()) - tolerate
                     prefix = f"jobs/{job.fingerprint}/"
                     terminal = store.exists(prefix + "0000.billing.json") and not unresolved
                 if terminal and isinstance(error, QverisEmptyAnswerError):
