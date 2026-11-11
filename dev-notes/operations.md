@@ -1590,11 +1590,20 @@ identity 단계는 그 목록의 행을 등록된 FMP ISIN으로 Norgate 상품�
 | `unresolved_tokens` | 그 기록들의 단계별 `unresolved_token_count` 합 |
 | `unpublished_sources` | 가장 늦은 기록에서 어떤 단계도 게시하지 않은 원천 수 |
 | `oldest_date` | 그 원천들이 덮는 가장 이른 partition 날짜(partition이 없으면 첫 `unresolved` 기록의 UTC 날짜) |
+| `rows_by_reason` | `prices.us.eodhd`(와 `.r<N>`)에만 있다. 그 원천 행을 지금의 registry와 US 목록으로 판정한 사유별 행 수. `resolved`(이제 등록 claim이 덮음, 다음 승격을 기다림), `list_claimable`(다음 identity 단계가 등록할 날), `list_not_observed`(그날 목록에 없음), 그 밖은 목록 사유(`list_isin_missing` 등) |
+| `rows_by_class` | 같은 항목. `resolved`가 아닌 사유마다 목록 `Type`의 종류별 행 수(`common_stock`, `etf`, `mutual_fund`, `warrant`, `unknown` 등) |
+| `rows_by_disposition` | 같은 항목. `resolved`가 아닌 행의 처리별 수: `register`(그 상품의 ISIN 원천이 생기면 해석됨), `unresolved`(사유와 함께 남김), `out_of_scope`(상품이 없는 종류) |
 
 ```json
 "standing_unresolved": {"prices.us.eodhd": {"sources": 44, "rows": 528400, "rows_unavailable": 0,
-  "unresolved_tokens": 528000, "unpublished_sources": 44, "oldest_date": "2026-09-09"}}
+  "unresolved_tokens": 528000, "unpublished_sources": 44, "oldest_date": "2026-09-09",
+  "rows_by_reason": {"list_isin_missing": 300, "list_not_observed": 100, "resolved": 528000},
+  "rows_by_class": {"list_isin_missing": {"mutual_fund": 300}, "list_not_observed": {"unknown": 100}},
+  "rows_by_disposition": {"out_of_scope": 300, "unresolved": 100}}}
 ```
+
+세 필드는 읽을 때마다 계산하므로 registry와 US 목록을 읽는다(SELECT만). 목록은 가장 이른 기다리는 날의
+120일 전부터 연결된 것만, 그 심볼과 그 상품 ISIN의 행만 읽는다.
 
 위 값은 형식 예시일 뿐 측정값이 아니다.
 

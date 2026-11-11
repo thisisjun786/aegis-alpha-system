@@ -1136,7 +1136,7 @@ ASCII escape와 바이트까지 같다.
 | `prices.kr.eodhd.ref` | `prices` | reference | `eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1` | `session_close_plus_lag@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage`, `provider_reported_partial` | 아니오 | 같은 두 원천 모양의 공급자 adjusted close. basis `total_return`, `fields='close'` |
 | `prices.us.norgate` | `prices` | canonical | `norgate.prices_none@1` | `session_close_plus_lag@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | Norgate 비조정 일봉 내보내기(`norgate-history-csv-*`의 미국 주식 `bars`). 다섯 값 모두 CSV 원문, 연도 partition마다 generation 하나 |
 | `prices.us.norgate.ref` | `prices` | reference | `norgate.prices_adjusted@1` | `session_close_plus_lag@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 아니오 | Norgate 조정 가격 part. `CAPITAL`은 `split_adjusted`, `TOTALRETURN`은 `total_return`, float32 저장값 |
-| `prices.us.eodhd` | `prices` | canonical | `eodhd.bars@1` | `session_close_plus_lag@1` | `float_shortest@1` | `cross_provider_mismatch@1` | `cross_provider_mismatch`, `decimal_rounding_tie`, `provider_float_storage` | 아니오 | EODHD US 일간 수집. 다운로드 하나가 generation 하나이고 같은 날짜의 다른 다운로드는 SUPERSEDE. 품질 규칙의 기준은 `prices.us.norgate` generation pin. identity가 해석한 US 보류 행의 재처리는 Linear AAS-69 |
+| `prices.us.eodhd` | `prices` | canonical | `eodhd.bars@1`, `eodhd.bulk_quarantine@1` | `session_close_plus_lag@1` | `float_shortest@1` | `cross_provider_mismatch@1` | `cross_provider_mismatch`, `decimal_rounding_tie`, `provider_float_storage`, `provider_reported_partial` | 아니오 | EODHD US 일간 수집과 부분 응답(경고) 일간 내려받기. 다운로드 하나가 generation 하나이고 같은 날짜의 다른 다운로드는 SUPERSEDE. 품질 규칙의 기준은 `prices.us.norgate` generation pin. import 때 identity가 없어 보류된 US 행의 재처리는 매퍼가 없다(#100) |
 | `prices.us.fmp.ref` | `prices` | reference | `fmp.eod_non_split@1` | `session_close_plus_lag@1` | `float_shortest@1`, `exact@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 예 | FMP 동결 legacy non-split 응답. 정정은 revision 번호순 generation. 원천 자료실 FMP normalized lineage(eod_full, dividend_adjusted)의 매퍼는 Linear AAS-68 |
 | `prices.ref.norgate` | `prices` | reference | `norgate.reference_closes@1`, `norgate.reference_history@1` | `local_day_end@1` | `decimal_text@1` | 없음 | `time_precision_day`, `volume_precision_limited` | 예 | Norgate 기준 시리즈 표와 지수·기타 데이터베이스 내보내기, `fields='close'`, 통화 `XXX`. 공급자가 종가 시각을 밝히지 않으므로 날짜 끝은 `Etc/GMT+12`. 음수 수준이 있는 시리즈는 `signed`로 고르지 않는다(Linear AAS-67) |
 | `sessions.xnys` | `calendar_sessions` | canonical | `calendar.declared@1` | `declared_session_end@1` | 없음 | 없음 | 없음 | 아니오 | XNYS [선언 달력](#선언-달력) 문서. 관측 거래일은 대조 보고의 근거, 임시 휴장은 SUPERSEDE |
@@ -1652,6 +1652,15 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
   `list_registered_conflict`(다른 상품의 등록 claim이 그날을 덮거나 상품의 앞선 claim과 그날 사이에 있음),
   `list_gap_too_long`. 마지막 Norgate claim 뒤 첫 관측까지의 평일은 `history_gap`(이어진 registry 심볼 수와
   남은 심볼 표본), 관측 사이의 빈 평일은 `observation_gaps`로 보고한다.
+- **사유별 처리(#149).** 해석되지 않은 날마다 보고에만 쓰는 심볼 종류와 처리를 붙인다. 둘 다 claim에는
+  쓰지 않는다(종류로 상품을 정하지 않는다). 종류는 목록 행의 공급자 `Type` 표기다(`Common Stock`→
+  `common_stock`, `ETF`→`etf`, `FUND`→`fund`, `Mutual Fund`→`mutual_fund`, `Preferred Stock`→`preferred`,
+  `Warrant`→`warrant`, `Unit`→`unit`, `Right`→`right`, `BOND`·`Notes`→`debt`, 모르는 표기는 `other`, 없으면
+  `unknown`). 처리는 셋이다. 그날의 어느 행도 상품을 가리키지 않고 종류가 Norgate registry에 상품 종류가
+  없는 것(`mutual_fund`, `preferred`, `warrant`, `unit`, `right`, `debt`)이면 `out_of_scope`. ISIN이 없거나
+  미등록인데 그 심볼을 앞서 등록·수용 claim이 가졌으면 `register`(그 상품의 ISIN을 주는 원천이 들어오면
+  해석된다). 나머지(새 상장, 무효·반복 ISIN, 이동·앞 보유자 없음 등)는 `unresolved`로 사유와 함께 남는다.
+  보고의 `unresolved_classes`(사유→종류→날 수)와 `unresolved_dispositions`(처리→사유→날 수)가 이를 담는다.
 - 8일보다 긴 공백을 잇는 claim은 짧은 행(8일 이하)이 아니라 긴 행이므로, 그런 claim이 생기면 기다리던 모든
   `unresolved` 원천이 한 번 다시 계획되고(보류 세션의 따라잡기), 그 뒤의 하루 claim은 다시 계획을 부르지 않는다.
 
@@ -1677,6 +1686,7 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
 | `fx.usdkrw.fred` | `fred.fx_series@1` | `fred-series-csv-*` `observations` | |
 | `classifications.kr.kind` | `kind.industry@2`, 이어 받는 `kind.industry@1` | `kind-listings-*` `listings` | `short_code`·`industry`·`retrieved_at_utc` 열 |
 | `prices.us.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.US` |
+| `prices.us.eodhd` | `eodhd.bulk_quarantine@1` | `qveris-bulk-quarantine-*` `quarantine` | 사유 `provider_reported_partial`, 거래소 `US`, 모든 행이 값 검사 통과. 첫 template은 `eodhd.bars@1`에서 파생(`currencies` `US`→`USD`) |
 | `prices.kr.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.KO`·`.KQ` |
 | `prices.kr.eodhd` | `eodhd.bulk_quarantine@1` | `qveris-bulk-quarantine-*` `quarantine` | 사유 `provider_reported_partial`, 거래소 `KO`·`KQ`, 모든 행이 값 검사 통과. 첫 template은 `eodhd.bars@1`에서 파생 |
 | `prices.kr.eodhd.ref` | `eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1` | 위 두 모양 | 위와 같음. bulk의 첫 template은 `eodhd.bars_adjusted@1`에서 파생 |
@@ -1740,13 +1750,18 @@ generation, 결과 `promoted`·`unchanged`)를 남긴다. 검사 ID는 (dataset,
 그 원천은 다시 계획되지 않고, 매일의 identity 증분이 기다리는 모든 원천을 다시 계획하지 않는다. 범위가 없는
 기록은 key 전체의 SHA-256을 그대로 쓴다. 검사 ID는 그 SHA-256까지에서 나온다. 결과의 `unresolved`는 이번
 실행이 그런 원천을 기록한 dataset이고, `standing_unresolved`는 이번 실행과 상관없이 원천마다 가장 늦은 기록이
-`unresolved`인 원천의 dataset별 요약(저장된 기록만 읽는다)이다. 형식은 [운영 문서](../operations.md#하루-유지보수-실행)가 소유한다. 거부되거나 막힌 단계는 아무것도 남기지 않으므로 그 원천은 다음 실행에 다시 계획된다. 단계 사이에서
+`unresolved`인 원천의 dataset별 요약(저장된 기록만 읽는다)이다. `prices.us.eodhd`(와 `.r<N>`) 항목은 그 원천들의
+행을 지금의 registry와 US 목록으로 다시 판정해 사유·종류·처리별 행 수도 싣는다(`us_symbols.unresolved_breakdown`,
+SELECT만, 새 상태 없음). 형식은 [운영 문서](../operations.md#하루-유지보수-실행)가 소유한다. 거부되거나 막힌 단계는 아무것도 남기지 않으므로 그 원천은 다음 실행에 다시 계획된다. 단계 사이에서
 멈춘 원천은 끝난 단계가 빈 delta로 다시 계획된다. 결과를 선언한 매퍼가 `promotion_coverage@1`을 남긴 원천도
 끝난 것이다. 운영자의 승격이 pin한 원천은 첫 유지보수 실행에서 한 번 더 계획되어 `unchanged`로 기록되고, head보다
 이른 내려받기는 `stale`이라 head를 대체하지 않는다.
 
-매퍼가 아직 없는 dataset(identity가 해석한 US 보류 행의 `prices.us.eodhd` 재처리)의 수집 원천은 승격하지 않고
-`unmapped`에 dataset별 테이블 수로 남는다.
+매퍼가 아직 없는 dataset(import 때 identity가 없거나 다르다고 보류된 US 행의 `prices.us.eodhd` 재처리)의 수집 원천은
+승격하지 않고 `unmapped`에 dataset별 테이블 수로 남는다. 그 행의 사유는 `provider_reported_partial`이 아니라서
+`eodhd.bulk_quarantine@1`에서 세션 날짜가 없고(거부됨), @1의 뜻을 바꾸면 이미 게시된 KR generation의 manifest가
+다시 계산되지 않는다. 경고와 함께 끝난 US 일간 bulk 응답은 위 US bulk route가 KR과 같은 방식(값 검사, 이력
+명세에서 파생한 template)으로 잇는다.
 
 **보고와 종료 코드.** 실행 보고(`aas-maintain-report-v1`)는 단계마다의 결과, 실패한 단계, 멈춘 공급자를 담고
 정확한 bytes를 `raw/`에, 같은 bytes를 `<runtime>/maintain-report.json`에 둔다. `stage_resources`는 단계마다
@@ -3236,3 +3251,6 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-558 | Qveris `USDKRW.FOREX` 일간 이력 원천은 `fx.usdkrw.eodhd` generation으로 승격되고, 달력이 열지 않은 날은 시점이 null이며 바뀐 종가는 SUPERSEDE다 | `tests/storage/test_qveris_fx.py::test_usdkrw_forex_history_promotes_to_fx_usdkrw_eodhd` | 구현 |
 | DV-559 | 유지보수 route는 head 없는 `actions.*.eodhd`·`fx.usdkrw.eodhd` 원천을 `no_head` 후보로 보고, 호출자가 이름 붙인 dataset만 선언한 시작 template으로 시작하며(달력 head 없으면 `no_calendar`, snapshot 없으면 `identity_unavailable`), 시작한 chain은 자기 명세로 이어진다 | `tests/storage/test_qveris_actions.py::test_the_new_routes_see_collected_sources_and_start_only_named_datasets` | 구현 |
 | DV-560 | `status.kr.kind` route는 KIND 목록을 후보로 보고 legacy 모양을 `shape`로 건너뛰며, 이름 붙인 경우에만 수집일 partition으로 시작한다 | `tests/storage/test_kind_status.py::test_the_status_route_starts_the_kind_chain_only_when_named` | 구현 |
+| DV-561 | US 목록의 해석되지 않은 날은 사유마다 심볼 종류와 처리(`register`·`unresolved`·`out_of_scope`)를 보고하고, 상품을 가리키는 행은 종류와 상관없이 범위 밖이 아니며 claim은 생기지 않는다 | `tests/storage/test_us_symbols.py::test_every_unresolved_day_has_a_symbol_class_and_a_disposition` | 구현 |
+| DV-562 | `standing_unresolved`의 `prices.us.eodhd` 항목은 기다리는 행을 지금의 판정으로 사유·종류·처리별로 세고, 목록이 없는 날은 `list_not_observed`, 곧 등록될 날은 `list_claimable`, 등록된 날은 `resolved`다 | `tests/storage/test_us_symbols.py::test_the_standing_summary_counts_waiting_us_rows_by_reason_class_and_disposition` | 구현 |
+| DV-563 | 경고 US bulk 테이블은 이력 명세에서 파생한 `eodhd.bulk_quarantine@1` template(`US`→`USD`)으로 `prices.us.eodhd`를 잇고, import 때 identity가 없어 보류된 US 테이블은 route가 맡지 않고 `unmapped`에 남는다 | `tests/storage/test_maintain_promotion.py::test_a_warned_us_bulk_day_continues_the_us_chain_and_identity_held_rows_stay_out` | 구현 |
