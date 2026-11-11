@@ -1346,10 +1346,11 @@ fingerprint = sha256(정규 JSON ["aas-<provider>-request-v1", endpoint, paramet
 | `sec` | `submissions` | `data.sec.gov/submissions/CIK##########.json` | `cik`(10자리) |
 | `sec` | `companyfacts` | `data.sec.gov/api/xbrl/companyfacts/CIK##########.json` | `cik` |
 | `fred` | `vintage_dates` | `fred/series/vintagedates` | `series_id`, `realtime_start`, `realtime_end`, `limit=10000`, `offset`, `file_type=json` |
+| `fred` | `latest_vintage` | `fred/series/vintagedates`(창 없음) | `series_id`, `sort_order=desc`, `limit=1`, `file_type=json` |
 | `fred` | `observations` | `fred/series/observations` | `series_id`, `realtime_start`, `realtime_end`, `limit=100000`, `offset`, `file_type=json` |
 | `fred` | `series_csv` | `fredgraph.csv` | `id` |
 
-FRED 키는 `vintage_dates`·`observations`의 공급자 URL에만 실리고, SEC의 공정 접근 `User-Agent`(연락처
+FRED 키는 `vintage_dates`·`latest_vintage`·`observations`의 공급자 URL에만 실리고, SEC의 공정 접근 `User-Agent`(연락처
 포함)는 header에만 실린다. 둘 다 요청·receipt·원천에 들어가지 않으며, 답이 그 값(SEC는 `User-Agent` 전체나
 그 안의 연락처 주소)을 되돌려 주면 그 답을 보존하지 않는다. 두 명령은 commit에 쓰는 pyarrow(legacy extra)가
 없으면 정산이나 호출 전에 멈춘다. SEC는 HTTP 403·429, FRED는 401·403·429와 키를 거부하는 400이 실행을 멈춘다. 다만 SEC `daily_index`의 403은 그 분기 목록을 본 뒤에 정한다(아래 SEC 1단계). 전송 실패가
@@ -1359,7 +1360,7 @@ FRED 키는 `vintage_dates`·`observations`의 공급자 URL에만 실리고, SE
 **receipt와 batch.** 답마다 응답 bytes와 정규 receipt(`aas-<provider>-receipt-v1`: 요청, fingerprint, job과
 attempt, HTTP 상태, 보존 header, 요청·수집 시각, 결과, 공급자 상태, 선택, 응답의 크기·SHA-256)를 `raw/`에
 둔 뒤 attempt가 `succeeded`가 된다. 결과는 `COMPLETED`(읽을 수 있는 답), `NO_DATA`(SEC 404, FRED가 없다고
-답한 시계열), `FAILED`(그 밖의 답)이며 수집 경로만 정한다. 한 실행의 receipt를 수집 순서로 나열한 batch
+답한 시계열, 최신 vintage로 새 vintage가 없다고 확인된 FRED 500 창), `FAILED`(그 밖의 답)이며 수집 경로만 정한다. 한 실행의 receipt를 수집 순서로 나열한 batch
 문서(`aas-<provider>-batch-v1`)와 그 receipt·응답이 완결 단위 하나다. SEC batch는 receipt 500개
 또는 응답 256 MiB에 이르면 닫힌다. FRED batch는 receipt 500개 또는 응답
 64 MiB에 이른 질의(observations 창의 모든 page)가 끝날 때 닫혀, 그 질의의 page만큼 두 한도를 넘을 수 있다.
@@ -1414,6 +1415,12 @@ batch의 것만 읽는다.
 
 1. `vintage_dates`가 알려진 vintage 날(`known`) 다음 날부터, 알려진 날이 없으면 ALFRED 원점(1776-07-04)부터,
    끝난 FRED 날(어제)까지의 vintage 날짜를 page마다 묻는다. 날짜가 없으면 그 시계열은 최신이다.
+   FRED는 vintage가 없는 창에 빈 목록 대신 HTTP 500을 주고, 나중에야 공표한 vintage가 있는 창에도 500을
+   준 적이 있다. 그래서 `known` 다음 날부터의 창 첫 page가 500이면 그 답을 기록하기 전에 창 없는 최신
+   vintage(`latest_vintage`, 이유 `vintage_recheck`)를 한 번 묻는다. 그 답이 `COMPLETED`이고 최신 vintage가
+   `known` 뒤가 아니면 창의 답은 `NO_DATA`(새 vintage 없음), 그 밖(뒤의 vintage, 읽히지 않거나 거부된 답,
+   답 없음)이면 `FAILED`다. 원점 창, 뒤 page, 500이 아닌 답(502, 점검 페이지)은 다시 묻지 않고 `FAILED`다.
+   어느 쪽이든 행은 없고 `known`은 그대로라 다음 실행이 같은 창을 다시 묻는다.
 2. observations 창은 `known`(또는 원점)에서 그 날까지다. 창마다 vintage 날짜를 1990개까지(원점이 아닌
    시작일도 하나로 셈) 담고, 다음 창은 앞 창의 마지막 vintage 날짜에서 시작한다
    (`observation_windows`). 창마다 page를 끝까지 묻는다.
@@ -3129,3 +3136,7 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-539 | head가 없는 chain은 bulk route가 파생하지 않고 `no_head`로 남는다 | `tests/storage/test_maintain_promotion.py::test_a_chain_without_a_head_derives_nothing` | 구현 |
 | DV-540 | 값 검사(가격 0, low>high, high<max(open, close), 음수 거래량, 문자열 숫자, null, 깨진 JSON, 잘못된 날짜)를 어긴 행이 하나라도 있는 bulk 테이블은 `value_check`로 남고 승격되지 않으며, 같은 회차의 정상 테이블은 승격된다 | `tests/storage/test_maintain_promotion.py::test_one_invalid_value_keeps_its_whole_bulk_table_out` | 구현 |
 | DV-541 | 경고 KR bulk만 수집된 유지보수 실행은 이력만 있는 chain을 이어 붙이고 승격 뒤 저장소가 검증을 통과한다 | `tests/application/test_maintain.py::test_warned_kr_bulk_days_continue_a_history_only_chain_and_the_store_verifies` | 구현 |
+| DV-542 | `known` 뒤 vintage 창의 500은 창 없는 최신 vintage가 `known` 뒤가 아닐 때만 그 창의 receipt가 `NO_DATA`다 | `tests/storage/test_us_collection.py::test_an_empty_vintage_window_answered_500_is_no_new_vintage` | 구현 |
+| DV-543 | 최신 vintage가 `known` 뒤인 500, 502, 점검 페이지는 `FAILED`로 남고 `known`은 그대로다 | `tests/storage/test_us_collection.py::test_a_500_with_a_vintage_after_the_known_day_stays_failed` | 구현 |
+| DV-544 | `NO_DATA` 창 뒤의 실행은 같은 `known` 다음 날부터 다시 묻고 새 vintage를 수집한다 | `tests/storage/test_us_collection.py::test_after_a_window_without_a_vintage_the_next_run_asks_from_the_known_day` | 구현 |
+| DV-545 | vintage 창의 401·403·429는 최신 vintage를 묻지 않고 실행을 멈춘다 | `tests/storage/test_us_collection.py::test_a_refused_vintage_window_still_stops_the_run_unchecked` | 구현 |
