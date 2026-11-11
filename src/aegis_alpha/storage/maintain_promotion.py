@@ -1244,13 +1244,23 @@ def _chain(workspace: Workspace, generation_id: str) -> tuple[str, list[str]]:
     return str(chain[-1]["domain"]), [str(marker["generation_id"]) for marker in chain]
 
 
+# The rows of a chain that are still the current revision of their record: a revision a later
+# generation superseded or tombstoned no longer counts, and a tombstone is no data itself.
+_CURRENT: Final = (
+    "op<>'TOMBSTONE' AND generation_id IN (SELECT unnest($g::VARCHAR[])) "
+    "AND revision_id NOT IN (SELECT supersedes_revision_id FROM {table} "
+    "WHERE supersedes_revision_id IS NOT NULL AND op IN ('SUPERSEDE', 'TOMBSTONE') "
+    "AND generation_id IN (SELECT unnest($g::VARCHAR[])))"
+)
+
+
 def _data_through(workspace: Workspace, domain: str, generations: list[str]) -> date | None:
     column = DATA_DATES.get(domain)
     if column is None:
         return None
+    current = _CURRENT.format(table=_quote(domain))
     row = workspace.market.execute(
-        f"SELECT max({column}) FROM {_quote(domain)} WHERE op<>'TOMBSTONE' "  # noqa: S608 -- code-owned columns and tables
-        "AND generation_id IN (SELECT unnest($g::VARCHAR[]))",
+        f"SELECT max({column}) FROM {_quote(domain)} WHERE {current}",  # noqa: S608 -- code-owned columns and tables
         {"g": generations},
     ).fetchone()
     return None if row is None else cast("date | None", row[0])
@@ -1263,7 +1273,7 @@ def _series_periods(
     found: dict[str, list[date]] = {}
     for series, period in workspace.market.execute(
         f"SELECT s, d FROM (SELECT DISTINCT {key} AS s, {column} AS d FROM {_quote(domain)} "  # noqa: S608 -- code-owned columns and tables
-        "WHERE op<>'TOMBSTONE' AND generation_id IN (SELECT unnest($g::VARCHAR[]))) "
+        f"WHERE {_CURRENT.format(table=_quote(domain))}) "
         f"QUALIFY row_number() OVER (PARTITION BY s ORDER BY d DESC) <= {_SERIES_PERIODS}",
         {"g": generations},
     ).fetchall():
