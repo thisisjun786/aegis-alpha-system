@@ -290,3 +290,18 @@ def test_a_list_of_rows_without_isin_is_still_an_unresolved_source(ws: Workspace
     assert source["status"] == "unresolved"
     standing = standing_unresolved(ws)["status.us.eodhd"]
     assert standing["rows_by_reason"] == {"isin_missing": 1}
+
+
+def test_a_price_revision_with_an_unknown_knowledge_time_does_not_date_an_event() -> None:
+    listed_us = int(datetime(2026, 9, 11, 22, tzinfo=UTC).timestamp() * 1_000_000)
+    before = listed_us - 3_600_000_000
+    # Only one of the two knowledge times is set: a strict reader excludes the revision, so it
+    # must not become the last bar. Thursday's fully known bar still dates the event.
+    assert _last_bar_as_of([
+        ("2026-09-10", 1, "ASSERT", before, before),
+        ("2026-09-11", 1, "ASSERT", before, None),
+    ]) == [_start(date(2026, 9, 11))]  # fmt: skip
+    assert _last_bar_as_of([
+        ("2026-09-10", 1, "ASSERT", before, before),
+        ("2026-09-11", 1, "ASSERT", None, before),
+    ]) == [_start(date(2026, 9, 11))]  # fmt: skip

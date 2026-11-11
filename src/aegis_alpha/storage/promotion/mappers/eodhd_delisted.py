@@ -150,8 +150,9 @@ class EodhdDelisted:
             "bv AS (SELECT instrument_id, session_date FROM (SELECT *, row_number() OVER "
             "(PARTITION BY record_id ORDER BY _aas_sequence DESC, "
             f"revision_known_at_us DESC NULLS LAST) AS _rank FROM {bars} "
-            "WHERE greatest(available_at_us, revision_known_at_us) <= (SELECT list_at FROM t)) "
-            "WHERE _rank = 1 AND op <> 'TOMBSTONE'), "
+            "WHERE revision_known_at_us <= (SELECT list_at FROM t)) "
+            "WHERE _rank = 1 AND op <> 'TOMBSTONE' "
+            "AND available_at_us <= (SELECT list_at FROM t)), "
             # The instruments the engine will resolve each row to, and their last bar.
             "m AS (SELECT d._aas_pin, d._aas_ordinal, max(b.session_date) AS last_bar "
             f"FROM d JOIN {IDENTITY_ROWS} i ON i.token = d._d_isin "
