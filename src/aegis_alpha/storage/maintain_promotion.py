@@ -1111,6 +1111,7 @@ FRESHNESS: Final[Mapping[str, Expectation]] = {
     "fundamentals.kr.dart": Expectation("previous_day", "XKRX", 5, "dart"),
     "macro.us.alfred": Expectation("series", stale_after=2, collector="fred"),
     "fx.usdkrw.fred": Expectation("series", stale_after=5, collector="fred"),
+    "fx.usdkrw.eodhd": Expectation("session", "XNYS", 5, "qveris"),
     "macro.kr.bok": Expectation("series", stale_after=2),
     "macro.kr.oecd": Expectation("series", stale_after=2),
     "sessions.xnys": Expectation("none"),
