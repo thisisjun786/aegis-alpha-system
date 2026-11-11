@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -237,5 +238,33 @@ def test_documents_are_asked_per_filer_for_the_wanted_filings_and_retried_in_win
     stale, _, counts = sec.plan_documents(knowledge, late, policy, lambda _: True)
     assert stale == []
     assert counts["submissions"]["abandoned"] == 1
-    with pytest.raises(ValueError, match="registered or all"):
+    with pytest.raises(ValueError, match="registered, reporting or all"):
         sec.SecPolicy(issuers="some")
+
+
+def test_reporting_filers_are_the_filers_of_periodic_reports_and_backlog_goes_oldest_first() -> (
+    None
+):
+    policy = sec.SecPolicy(issuers="reporting")
+    knowledge = _knowledge()
+    # A filer of current reports only is not a reporting issuer.
+    event_only = "0000000050"
+    later = MONDAY + timedelta(days=1)
+    line = sec.IndexLine("", event_only, "SYNTHETIC", "8-K", later, "0000000050-26-000001")
+    knowledge.file(line, datetime(2026, 9, 16, 2, tzinfo=UTC))
+    reporting = sec.reporting_filers(knowledge, policy)
+    assert reporting == {CIK, OTHER}
+    now = datetime(2026, 9, 16, 3, tzinfo=UTC)
+    filings, facts, counts = sec.plan_documents(knowledge, now, policy, reporting.__contains__)
+    assert counts["submissions"] == {"wanted": 3, "done": 0, "outside_universe": 1,
+                                     "abandoned": 0}  # fmt: skip
+    assert counts["companyfacts"]["wanted"] == 2
+    # The earliest wanted filing orders a backlog, submissions before companyfacts on a tie.
+    key = f"{OTHER}/{B1}"
+    knowledge.filings[key] = replace(knowledge.filings[key], filed=later)
+    filings, facts, _ = sec.plan_documents(knowledge, now, policy, reporting.__contains__)
+    assert [(item.request.endpoint, item.request.parameters["cik"], item.oldest)
+            for item in sec.oldest_first([*filings, *facts])] == [
+        ("submissions", CIK, MONDAY), ("companyfacts", CIK, MONDAY),
+        ("submissions", OTHER, later), ("companyfacts", OTHER, later),
+    ]  # fmt: skip

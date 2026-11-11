@@ -236,8 +236,8 @@ def _section(
         )
     if provider == "sec":
         issuers = section.get("issuers", "registered")
-        if issuers not in {"registered", "all"}:
-            raise ValueError(f"{name}.issuers is registered or all")
+        if issuers not in {"registered", "reporting", "all"}:
+            raise ValueError(f"{name}.issuers is registered, reporting or all")
         since = section.get("since")
         return SecSettings(
             _secret(paths, _text(section, "user_agent_file", name)),

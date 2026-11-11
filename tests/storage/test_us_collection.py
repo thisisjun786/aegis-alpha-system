@@ -651,7 +651,7 @@ def test_a_run_reads_indexes_then_documents_and_the_sec_mappers_promote_them(
     assert fake.calls == [
         ("daily_index", "2026-09-14"), ("daily_index", "2026-09-15"),
         ("daily_index", "2026-09-16"),
-        ("submissions", CIK), ("submissions", OTHER), ("companyfacts", CIK),
+        ("submissions", CIK), ("companyfacts", CIK), ("submissions", OTHER),
     ]  # fmt: skip
     assert result["outcomes"] == {"COMPLETED": 5, "NO_DATA": 1}
     # The holiday's 404 was read the next morning, so that day is not covered yet.
@@ -740,7 +740,7 @@ def test_an_sec_batch_whose_receipts_did_not_commit_loses_no_filing(
     # and every document the indexes name.
     assert fake.calls[calls:] == [
         ("daily_index", "2026-09-16"),
-        ("submissions", CIK), ("submissions", OTHER), ("companyfacts", CIK),
+        ("submissions", CIK), ("companyfacts", CIK), ("submissions", OTHER),
     ]  # fmt: skip
     known = sec_collection.load_known(ws).knowledge
     assert known.listed == {Q2.accession, EVENT.accession, FOREIGN.accession}
@@ -785,6 +785,64 @@ def test_registered_issuers_limit_the_documents(ws: Workspace) -> None:
     assert pending["filings"]["submissions"]["outside_universe"] == 2
 
 
+def test_the_reporting_scope_wants_filers_of_periodic_reports_and_promotes_them(
+    ws: Workspace,
+) -> None:
+    fake = _sec_fake()
+    clock = FakeClock(SEC_NOW)
+    # No US issuer is registered: the registered scope reads indexes and wants nothing.
+    stalled = _sec_run(ws, fake, clock, sec.SecPolicy(lookback_days=3))
+    assert [call for call in fake.calls if call[0] != "daily_index"] == []
+    pending = cast("dict[str, dict[str, dict[str, int]]]", stalled["pending"])
+    assert pending["filings"]["submissions"]["wanted"] == 0
+    assert pending["filings"]["submissions"]["outside_universe"] == 3
+    assert pending["filings"]["companyfacts"]["outside_universe"] == 1
+    # The filer of the 10-Q is a reporting issuer; the 6-K filer files no periodic report.
+    policy = sec.SecPolicy(issuers="reporting", lookback_days=3)
+    plan = sec_collection.plan_sec(ws, now=clock.now, policy=policy)
+    counts = cast("dict[str, dict[str, int]]", plan["filings"])
+    assert counts["submissions"] == {"wanted": 2, "done": 0, "outside_universe": 1,
+                                     "abandoned": 0}  # fmt: skip
+    assert counts["companyfacts"]["wanted"] == 1
+    assert plan["requests"] == {
+        "companyfacts:new_filing": 1, "daily_index:index_gap": 1, "submissions:new_filing": 1,
+    }  # fmt: skip
+    calls = len(fake.calls)
+    result = _sec_run(ws, fake, clock, policy)
+    assert [call for call in fake.calls[calls:] if call[0] != "daily_index"] == [
+        ("submissions", CIK), ("companyfacts", CIK),
+    ]  # fmt: skip
+    (filings,) = _sources(result, "sec-submissions-filings-")
+    assert _rows(ws, str(filings["source_id"]), "filings", '"accessionNumber"') == [
+        (Q2.accession,), (EVENT.accession,),
+    ]  # fmt: skip
+    assert promote(ws, *_sec_spec(_pin(filings)), apply=True)["operations"] == {"ASSERT": 2}
+
+
+def test_a_backlog_over_the_call_budget_is_asked_oldest_first_over_runs(ws: Workspace) -> None:
+    fake = _sec_fake()
+    early = "0000000050"  # a lower CIK whose only filing is a day newer
+    later_q = SecFiling(early, "0000000050-26-000001", "10-Q", TUE, "2026-09-15T13:00:00.000Z")
+    fake.filings.append(later_q)
+    fake.facts[early] = [SecFact(later_q.accession, "Assets", "7", date(2026, 6, 30), TUE)]
+    clock = FakeClock(SEC_NOW)
+    # Three index asks and two document asks fit the budget.
+    first = _sec_run(ws, fake, clock, max_calls=5)
+    assert first["stopped"] == "budget"
+    assert [call for call in fake.calls if call[0] != "daily_index"] == [
+        ("submissions", CIK), ("companyfacts", CIK),
+    ]  # fmt: skip
+    clock.advance(days=1)
+    calls = len(fake.calls)
+    second = _sec_run(ws, fake, clock)
+    assert second["stopped"] is None
+    assert [call for call in fake.calls[calls:] if call[0] != "daily_index"] == [
+        ("submissions", early), ("submissions", OTHER), ("companyfacts", early),
+    ]  # fmt: skip
+    known = sec_collection.load_known(ws).knowledge
+    assert known.reported == {Q2.accession, later_q.accession}
+
+
 def test_a_refused_rate_stops_the_run_and_the_contact_is_never_retained(ws: Workspace) -> None:
     fake = _sec_fake()
     fake.refuse = 403
@@ -810,7 +868,7 @@ def test_a_holiday_index_refused_with_403_is_a_day_without_an_index(ws: Workspac
     assert fake.calls == [
         ("daily_index", "2026-09-14"), ("daily_index", "2026-09-15"),
         ("daily_index", "2026-09-16"), ("daily_index_listing", "2026/QTR3"),
-        ("submissions", CIK), ("submissions", OTHER), ("companyfacts", CIK),
+        ("submissions", CIK), ("companyfacts", CIK), ("submissions", OTHER),
     ]  # fmt: skip
     assert first["stopped"] is None
     assert first["outcomes"] == {"COMPLETED": 5, "FAILED": 1, "NO_DATA": 1}
