@@ -8,11 +8,16 @@ it is left to the other routes of the shape; an empty table is skipped. A table 
 lacks a column the route's mapper reads (its ``source_columns``) is another shape under
 the same prefix and table name (the ``korea.public_response@1`` legacy import of
 ``kind-listings``): it is skipped and counted as ``shape``. A route may also name a value
-``check`` every row of a table it claims must pass: the KR and US daily bulk routes check each
-warned row as the clean response path does (``qveris_native._bar``: valid JSON, finite
+``check`` every row of a table it claims and accepts must pass: the KR daily bulk routes check
+each warned row as the clean response path does (``qveris_native._bar``: valid JSON, finite
 JSON numbers, prices above zero, volume not negative, consistent OHLC, an ISO date). A
-table with one failing row is not promoted and is counted as ``value_check`` (before
-``mixed``), so a warned response never passes unchecked.
+table with one failing accepted row is not promoted and is counted as ``value_check`` (before
+``mixed``), so a warned response never passes unchecked. A route may also name the rows it
+``holds``: rows of a claimed table its mapper leaves held and counts as outcomes. The US
+daily bulk route (``eodhd.bulk_quarantine@2``) accepts the US rows held for a partial
+response or for want of an import-time identity and holds every other US row; its mapper
+checks each accepted row's values itself and leaves a failing one held, so no held row keeps
+the table's valid rows out.
 
 A route continues a chain; it never starts one. Its template is the spec of the latest
 committed generation of the dataset that used one of the route's mappers: its own, or
@@ -25,10 +30,10 @@ such generation in a chain that has a head takes its first template from the lat
 committed spec of the ``derive_from`` mapper (the history backfill's ``eodhd.bars@1`` or
 ``eodhd.bars_adjusted@1``): only the mapper's name becomes the route's and
 ``derive_args`` (the exchanges' ``currencies``) join its arguments, so the KR template is
-the spec ``aas data kr-prices`` writes for a bulk day. The US route promotes only the rows
-of a warned US download (``provider_reported_partial``); rows the import held for another
-reason, such as a missing import-time identity, have no session date under
-``eodhd.bulk_quarantine@1`` and stay ``unmapped``. The report's ``template_spec_sha256`` is
+the spec ``aas data kr-prices`` writes for a bulk day. The US route continues with
+``eodhd.bulk_quarantine@2`` and does not continue ``@1``: generations an earlier pass
+published under ``@1`` stay as they are and their sources stay done; a US table with no
+accepted row stays ``unmapped``. The report's ``template_spec_sha256`` is
 then the spec it came from and ``derived_from`` names its mapper. Once the chain holds a
 generation of the route's mapper, that spec is the template. A chain without a head is
 never derived.
@@ -119,6 +124,7 @@ from aegis_alpha.storage.membership_pins import IdentityPin, membership_parts
 from aegis_alpha.storage.promotion import formats
 from aegis_alpha.storage.promotion.engine import dataset_head, promote
 from aegis_alpha.storage.promotion.mappers import mapper
+from aegis_alpha.storage.promotion.mappers.eodhd import ADMITTED_V2
 from aegis_alpha.storage.promotion.mappers.fred import vintage_partitions
 from aegis_alpha.storage.promotion.spec import SPEC_SCHEMA
 from aegis_alpha.storage.promotion.time_rules import TIME_COLUMNS
@@ -151,7 +157,12 @@ _US_SYMBOL: Final = "provider_symbol LIKE '%.US'"
 _KR_SYMBOL: Final = "(provider_symbol LIKE '%.KO' OR provider_symbol LIKE '%.KQ')"
 _KR_PARTIAL: Final = f"reason = 'provider_reported_partial' AND {_EXCHANGE} IN ('KO', 'KQ')"
 _KR_BULK_ARGS: Final = {"currencies": dict(KR_CURRENCIES)}
-_US_PARTIAL: Final = f"reason = 'provider_reported_partial' AND {_EXCHANGE} = 'US'"
+_US_ADMITTED: Final = (
+    f"reason IN ({', '.join(formats.sql_literal(item) for item in ADMITTED_V2)}) "
+    f"AND {_EXCHANGE} = 'US'"
+)
+# A US row held for another reason, or one whose exchange cannot be read: left held.
+_US_HELD: Final = f"coalesce({_EXCHANGE} = 'US', true)"
 _US_BULK_ARGS: Final = {"currencies": {"US": "USD"}}
 _ROW: Final = "(CASE WHEN json_valid(source_row_json) THEN source_row_json END)"
 
@@ -208,6 +219,7 @@ _SUMMARY: Final = (
     "unresolved_token_count",
     "partition_row_count",
     "coverage_check",
+    "source_outcomes",
     "blocking",
     "refusals",
 )
@@ -244,7 +256,10 @@ class Route:
     derive_args: Mapping[str, object] | None = None
     """Arguments a derived template adds to the mapper's."""
     check: str | None = None
-    """The predicate every row of a table the route claims must satisfy (``value_check``)."""
+    """The predicate every accepted row of a claimed table must satisfy (``value_check``)."""
+    holds: str | None = None
+    """Rows of a claimed table the route's mapper leaves held and counts as outcomes: they make
+    the table neither ``mixed`` nor another route's."""
     start: Start | None = None
     """The first template of a dataset no chain holds yet, used when the caller names it."""
     context: Callable[[Workspace, Candidate], list[dict[str, str]]] | None = None
@@ -381,9 +396,10 @@ ROUTES: Final = (
     Route("classifications.kr.kind", "kind.industry@2", "kind-listings-", "listings",
           continues=("kind.industry@1",)),
     Route("prices.us.eodhd", "eodhd.bars@1", "qveris-bulk-bars-", "bars", _US_SYMBOL),
-    Route("prices.us.eodhd", "eodhd.bulk_quarantine@1", "qveris-bulk-quarantine-",
-          "quarantine", _US_PARTIAL, derive_from="eodhd.bars@1", derive_args=_US_BULK_ARGS,
-          check=_KR_VALUES),
+    # @2 checks each row's values itself and leaves a failing one held (``value_check:``).
+    Route("prices.us.eodhd", "eodhd.bulk_quarantine@2", "qveris-bulk-quarantine-",
+          "quarantine", _US_ADMITTED, derive_from="eodhd.bars@1", derive_args=_US_BULK_ARGS,
+          holds=_US_HELD),
     Route("prices.kr.eodhd", "eodhd.bars@1", "qveris-bulk-bars-", "bars", _KR_SYMBOL),
     Route("prices.kr.eodhd", "eodhd.bulk_quarantine@1", "qveris-bulk-quarantine-",
           "quarantine", _KR_PARTIAL, derive_from="eodhd.bars@1", derive_args=_KR_BULK_ARGS,
@@ -412,7 +428,7 @@ ROUTES: Final = (
 # Collected shapes whose dataset has no registered mapper yet: counted, never promoted.
 UNMAPPED: Final = (
     ("prices.us.eodhd", "qveris-bulk-quarantine-", "quarantine",
-     f"{_EXCHANGE} = 'US' AND reason <> 'provider_reported_partial'"),
+     f"{_EXCHANGE} = 'US' AND NOT coalesce(({_US_ADMITTED}), false)"),
 )  # fmt: skip
 
 
@@ -555,9 +571,14 @@ def _left(workspace: Workspace, route: Route, target: str, rows: int) -> str | N
     matched = _count(workspace, route.accept, target)
     if matched == 0:
         return ""
-    if route.check is not None and _count(workspace, f"NOT coalesce(({route.check}), false)",
-                                          target):  # fmt: skip
+    # A row the route may accept (true, or unreadable such as broken JSON) is checked; a row
+    # it clearly does not accept (another hold reason) is not.
+    failing = f"coalesce(({route.accept}), true) AND NOT coalesce(({route.check}), false)"
+    if route.check is not None and _count(workspace, failing, target):
         return "value_check"
+    if route.holds is not None:
+        held = f"NOT coalesce(({route.accept}), false) AND ({route.holds})"
+        matched += _count(workspace, held, target)
     return "mixed" if matched != rows else None
 
 

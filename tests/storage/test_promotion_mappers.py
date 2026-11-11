@@ -42,6 +42,7 @@ def test_eodhd_bars_maps_synthetic_fixture() -> None:
         "eodhd.bars_adjusted@1",
         "eodhd.bars_quarantine@1",
         "eodhd.bulk_quarantine@1",
+        "eodhd.bulk_quarantine@2",
         "eodhd.bulk_quarantine_adjusted@1",
         "eodhd.delisted@1",
         "fmp.eod_non_split@1",
@@ -270,6 +271,74 @@ def test_eodhd_bulk_quarantine_maps_synthetic_fixture() -> None:
         f"SELECT ({bulk.partition_sql}) FROM src ORDER BY _aas_ordinal"
     ).fetchall()
     assert [row[0] for row in partitions] == [session] * 8 + [None] * 3
+
+
+IDENTITY = "explicit instrument identity is required"
+# (reason, provider JSON, expected outcome): the hold reasons @2 maps once the values pass
+# the clean path's bar checks, and every hold it leaves.
+_V2_TABLE = [
+    ("provider_reported_partial", _bulk(), "mapped"),
+    (IDENTITY, _bulk(code="AAA", exchange_short_name="US"), "mapped"),
+    (IDENTITY, _bulk(volume=0), "mapped"),
+    (IDENTITY, _bulk(low=0), "value_check"),  # a price of zero
+    (IDENTITY, _bulk(close="11"), "value_check"),  # a number as text
+    (IDENTITY, _bulk(high=10), "value_check"),  # high below the close
+    (IDENTITY, _bulk(volume=2**53 + 1), "value_check"),  # too wide for binary64
+    (IDENTITY, _bulk(adjusted_close="absent"), "value_check"),
+    (IDENTITY, _bulk(date="2025-1-2"), "value_check"),
+    (IDENTITY, _bulk(date="2025-02-30"), "value_check"),
+    ("provider_reported_partial", "{not json", "value_check"),
+    ("provider identity or currency differs", _bulk(), "held"),
+    ("inconsistent_ohlc", _bulk(high=10), "held"),
+    ("invalid_price_or_volume", _bulk(), "held"),
+    ("invalid_date", _bulk(date="2025-1-2"), "held"),
+    ("missing_or_non_numeric", _bulk(close="11"), "held"),
+    ("non_finite", _bulk(), "held"),
+    ("'date'", _bulk(date="absent"), "held"),
+    (None, _bulk(), "held"),
+]
+
+
+def test_eodhd_bulk_quarantine_v2_maps_admitted_holds_and_counts_the_rest() -> None:
+    bulk = mapper("eodhd.bulk_quarantine@2")
+    args = {"timezone": "America/New_York", "currencies": {"KO": "KRW", "US": "USD"}}
+    bulk.check_args(args)
+    with pytest.raises(ValueError, match="takes exactly"):
+        bulk.check_args({"timezone": "UTC"})
+    assert bulk.identity(args) == IdentityKey("eodhd", "eodhd_symbol")
+    assert bulk.row_flags == {"provider_reported_partial": "_aas_f_provider_reported_partial"}
+    connection = duckdb.connect()
+    connection.execute("SET TimeZone='UTC'")
+    connection.execute(
+        "CREATE TABLE src (_aas_pin INTEGER, _aas_ordinal BIGINT, _aas_row_hash VARCHAR, "
+        "reason VARCHAR, source_row_json VARCHAR)"
+    )
+    connection.executemany(
+        "INSERT INTO src VALUES (0, ?, 'h', ?, ?)",
+        [(index, reason, text) for index, (reason, text, _) in enumerate(_V2_TABLE)],
+    )
+    mapped = connection.execute(
+        f"SELECT _aas_ordinal, _aas_id_token, session_date, currency, value_state, open, high, "
+        f"low, close, volume, _aas_f_provider_reported_partial "
+        f"FROM ({bulk.select('src', args)}) ORDER BY _aas_ordinal"
+    ).fetchall()
+    session = date(2025, 1, 2)
+    assert mapped == [
+        (0, "005930.KO", session, "KRW", "present", 10.0, 12.0, 9.0, 11.0, 100.0, True),
+        (1, "AAA.US", session, "USD", "present", 10.0, 12.0, 9.0, 11.0, 100.0, False),
+        (2, "005930.KO", session, "KRW", "present", 10.0, 12.0, 9.0, 11.0, 0.0, False),
+    ]
+    # Only a mapped row has a partition date; the rest stay held in every partition.
+    partitions = connection.execute(
+        f"SELECT ({bulk.partition_sql}) FROM src ORDER BY _aas_ordinal"
+    ).fetchall()
+    assert [row[0] for row in partitions] == [session] * 3 + [None] * (len(_V2_TABLE) - 3)
+    outcomes = connection.execute(
+        f"SELECT ({bulk.outcome(args)}) FROM src ORDER BY _aas_ordinal"
+    ).fetchall()
+    assert [row[0] for row in outcomes] == [
+        f"{expected}:{reason or ''}" for reason, _, expected in _V2_TABLE
+    ]
 
 
 def test_eodhd_adjusted_close_maps_close_only_reference() -> None:

@@ -129,7 +129,7 @@ CATALOG: Final[tuple[CatalogEntry, ...]] = (
         "prices.us.eodhd",
         "prices",
         "canonical",
-        ("eodhd.bars@1", "eodhd.bulk_quarantine@1"),
+        ("eodhd.bars@1", "eodhd.bulk_quarantine@1", "eodhd.bulk_quarantine@2"),
         _DAILY,
         _SHORTEST,
         ("cross_provider_mismatch@1",),

@@ -1680,7 +1680,27 @@ chain의 이력 명세에서 template을 파생한다. 그때 그 dataset 항목
 등)이고 `template_spec_sha256`은 그 원본 명세의 해시다. 파생이 아니면 `derived_from`은 null이다. 같은 route는
 경고 응답의 행을 값 검사(유한한 숫자, 가격 > 0, 거래량 >= 0, OHLC 일관성, `YYYY-MM-DD` 날짜)로 거르고, 한
 행이라도 어긴 테이블은 승격하지 않고 `skipped.value_check`에 센다. 그 수가 0이 아니면 해당 원천의 응답을 읽어
-사유를 확인한다. 테이블은 다음 실행에도 다시 세어진다.
+사유를 확인한다. 테이블은 다음 실행에도 다시 세어진다. 값 검사는 route가 받는 행(부분 응답 행)에만 하므로, 다른
+사유로 보류된 행이 섞인 KR 테이블은 `skipped.mixed`에 센다.
+
+US 일간 bulk route는 `eodhd.bulk_quarantine@2`다. 부분 응답 행과 import 때 identity가 없어 보류된 행
+(`explicit instrument identity is required`)을 받고, 다른 사유의 US 행은 남긴다. 값 검사는 매퍼가 행마다 해서
+어긴 행만 남기므로 같은 테이블의 유효한 행은 승격된다. 사유표는
+[매퍼](design/data-vertical.md#매퍼)가 소유한다. 그 dataset 항목의 `sources[].steps[]`에는 엔진 보고의
+`source_outcomes`가 실린다. 키는 `mapped:<사유>`(옮긴 행), `value_check:<사유>`(받는 사유인데 값 검사 실패),
+`held:<사유>`(남긴 사유)이고 값은 행 수다. 같은 값이 generation manifest(빈 delta면 `promotion_coverage@1`)에도
+남는다. snapshot이 해석하지 못한 행은 원천을 `unresolved`로 기록하고 `standing_unresolved`에 남는다. 앞서
+`@1`로 게시된 US generation은 그대로이고 그 원천은 다시 계획되지 않는다. 처음 `@2`로 도는 실행은 그동안
+`unmapped`로 남던 identity 보류 테이블을 모두 계획하므로 원천 테이블 수만큼 단계가 생긴다(단계 하나가 테이블
+하나).
+
+```json
+{"source_outcomes": {"mapped:explicit instrument identity is required": 20000,
+  "value_check:explicit instrument identity is required": 3,
+  "held:provider identity or currency differs": 120}}
+```
+
+위 값도 형식 예시일 뿐 측정값이 아니다.
 
 **보고의 `qveris` 단계: 부분 성공과 일시 오류.** 경고 완료(`RAW_ACQUIRED_WITH_WARNINGS`)는 완료와 따로
 센다. `partial`은 모든 행이 값 검사를 통과해(또는 행을 읽어 판정할 수 없어) 다시 묻지 않는 경고 요청 수이고,
