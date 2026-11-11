@@ -352,21 +352,36 @@ def _admitted(json: str) -> str:
     above zero, volume not negative, low at most min(open, close), high at least
     max(open, close), low at most high, and a ``YYYY-MM-DD`` date that exists.
     """
-    o, h, low, c, a, v = (_json_number(name, json) for name in (*_PRICES, "volume"))
-    text = f"json_extract_string({json}, '$.date')"
-    checks = [
-        _admitted_reason(),
+    # Each number is parsed once and bound by a lambda: repeating the parse in every check
+    # makes the expression large enough to exhaust DuckDB's memory on a few thousand rows.
+    numbers = ", ".join(_json_number(name, "j") for name in (*_PRICES, "volume"))
+    o, h, low, c, a, v = (f"n[{index}]" for index in range(1, 7))
+    text = "json_extract_string(j, '$.date')"
+    values = [
         *(f"isfinite({value})" for value in (o, h, low, c, a, v)),
         *(f"{value} > 0" for value in (o, h, low, c, a)),
         f"{v} >= 0",
         f"{low} <= least({o}, {c})",
         f"{h} >= greatest({o}, {c})",
         f"{low} <= {h}",
-        f"json_type({json}, '$.date') = 'VARCHAR'",
+    ]
+    bound = (
+        f"list_transform([[{numbers}]], lambda n: "
+        + " AND ".join(f"coalesce({check}, false)" for check in values)
+        + ")[1]"
+    )
+    checks = [
+        "json_type(j, '$.date') = 'VARCHAR'",
         f"regexp_full_match({text}, '{_DAY}')",
         f"TRY_CAST({text} AS DATE) IS NOT NULL",
+        bound,
     ]
-    return "coalesce(" + " AND ".join(f"({check})" for check in checks) + ", false)"
+    parsed = (
+        f"list_transform([{json}], lambda j: "
+        + " AND ".join(f"coalesce({check}, false)" for check in checks)
+        + ")[1]"
+    )
+    return f"coalesce(({_admitted_reason()}) AND {parsed}, false)"
 
 
 class EodhdBulkQuarantineV2:
