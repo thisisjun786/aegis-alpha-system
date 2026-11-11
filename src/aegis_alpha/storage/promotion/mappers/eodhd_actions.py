@@ -22,9 +22,10 @@ Their values have the shape of the Norgate action mappers (``norgate_actions``):
   A ratio text of another shape, or a term that is not positive, is ``invalid`` and keeps no
   ratio.
 - ``eodhd.dividends@1``: ``action_type`` is ``dividend`` and ``amount`` the cash per share as
-  paid: the provider's ``unadjusted_value`` when it states one, else its ``dividend`` (the
-  value EODHD adjusts for later splits; on a download of the ex-date itself no later split
-  exists yet), as text for ``decimal_text@1``. ``currency`` is ``dividend_currency`` when it
+  paid: the provider's ``unadjusted_value``, as text for ``decimal_text@1``. ``dividend`` alone
+  is not used: EODHD adjusts it for later splits, and a historical ex-day download may follow
+  one, so without ``unadjusted_value`` the amount is unavailable (``invalid``). ``currency`` is
+  ``dividend_currency`` when it
   is three uppercase letters; ``record_date`` and ``pay_date`` are ``record_date`` and
   ``payment_date`` when they are ``YYYY-MM-DD`` dates, else NULL. An amount that is not a
   positive decimal or a currency that is no ISO code is ``invalid`` and keeps no amount.
@@ -142,7 +143,7 @@ class EodhdDividends(_EodhdActions):
         return {"amount": "VARCHAR"}
 
     def select(self, source: str, args: Mapping[str, object]) -> str:
-        paid = "coalesce(unadjusted_value, dividend)"
+        paid = "unadjusted_value"
         present = f"({decimal_state(paid, 'positive')}) = 'present' AND {_CURRENCY}"
         return self._select(
             source,

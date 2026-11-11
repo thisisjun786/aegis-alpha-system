@@ -179,7 +179,7 @@ def test_us_splits_and_dividends_promote_to_actions_us_eodhd(ws: Workspace, tmp_
         # The amount as paid is the unadjusted value when the provider states one.
         _dividend("AAA", "US", "0.25", unadjustedValue="2.5", recordDate="2026-09-01",
                   paymentDate="2026-09-15", declarationDate="2026-08-01", period="Quarterly"),
-        # Without an unadjusted value the stated dividend is the amount; no date stays NULL.
+        # No unadjusted value: the adjusted stated dividend is never taken as the paid amount.
         _dividend("BBB", "US", 0.069, recordDate="0000-00-00"),
         # The collector holds a dividend that is no positive decimal; it never reaches here.
         _dividend("CCC", "US", "-1"),
