@@ -1584,7 +1584,8 @@ identity 단계는 그 목록의 행을 등록된 FMP ISIN으로 Norgate 상품�
 등록되지 않은 유효 USD ISIN의 새 상장(앞 보유자 없음, 보통주·ETF·펀드)은 그 ISIN을 anchor로 상품(`us_isin`)이 되어
 등록되고(`registered_instruments`), ISIN이 없는 Norgate 상품의 등록 claim이 덮는 날의 ISIN은 그 상품에 이어진다
 (`attached_isins`). ISIN이 없는 행과 앞 보유자가 Norgate 상품인 미등록 ISIN은 미해결로 남는다. `aas identity us-build`
-보고의 `merged_into_isin`은 등록된 ISIN 상품에 합쳐진 Norgate asset ID 수다. 규칙은
+보고의 `unresolved.listings.isin_instrument_held`는 등록된 ISIN 상품의 목록 claim과 겹쳐 문서에서 빠진 Norgate
+asset ID다(합치지 않는다). 규칙은
 [유지보수 실행](design/data-vertical.md#유지보수-실행)이 소유한다.
 
 **보고의 `promote` 단계.** `unresolved`는 이번 실행이 `unresolved`로 기록한 dataset 목록이다(뜻은 그대로).

@@ -2,9 +2,10 @@
 
 A new listing whose list row carries a valid, unregistered USD ISIN and whose symbol no
 registered or accepted claim held before mints ``mint_instrument('us_isin', Isin)``; a row
-without an ISIN stays unresolved. A Norgate instrument and the ISIN instrument of the same
-listing end up as one instrument whichever is registered first. Lists, masters, asset IDs
-and ISINs are synthetic; the ISINs only carry valid check digits.
+without an ISIN stays unresolved. A Norgate listing and the ISIN instrument of the same
+listing never become two instruments: a list ISIN joins a Norgate instrument registered
+first, and a Norgate listing over an ISIN instrument's list claims is left out. Lists,
+masters, asset IDs and ISINs are synthetic; the ISINs only carry valid check digits.
 """
 
 # ruff: noqa: PLR2004 -- synthetic counts are the expected values
@@ -244,58 +245,49 @@ def test_a_list_isin_does_not_join_a_norgate_instrument_of_another_asset_type(
     assert _holders(ws, "isin", X) == set()
 
 
-def test_isin_first_then_a_norgate_asset_id_joins_the_isin_instrument(ws: Workspace) -> None:
+def _isin_first(ws: Workspace) -> None:
+    """X's instrument is registered over AAA on Wednesday and claims Thursday too."""
     _import_list(ws, WED, [_row("AAA", X)])
     assert _advance(ws)["registered_instruments"] == 1
     _import_list(ws, THU, [_row("AAA", X)])
     assert _advance(ws)["claims"] == 1
-    # A later Norgate master (a renewed subscription) lists A as AAA over those days.
-    master_id = _master(ws)
-    built = build_from_workspace(ws, master=master_id)
-    assert built.report()["merged_into_isin"] == 1
-    assert _register(ws, built)["new"] == {"issuers": 0, "instruments": 0, "assertions": 3}
-    instrument = _one_instrument(ws)
-    assert instrument == _isin_instrument(X)
-    # Norgate's claim of AAA stops where the list claims begin: no overlap, no gap.
-    claims = sorted((int(row[0]), int(row[1])) for row in ws.state.execute(
-        "SELECT valid_from_us, valid_to_us FROM identity_assertions "
-        "WHERE token='AAA.US'"))  # fmt: skip
-    assert claims == [(session_start_us(date(2001, 2, 5)), session_start_us(WED)),
-                      (session_start_us(WED), session_start_us(THU)),
-                      (session_start_us(THU), session_start_us(FRI))]  # fmt: skip
-    # The build is cumulative: rebuilding registers nothing new.
-    assert _register(ws, build_from_workspace(ws, master=master_id))["new"] == {
-        "issuers": 0, "instruments": 0, "assertions": 0}  # fmt: skip
+
+
+def _isin_instrument_only(ws: Workspace) -> None:
+    """X's instrument alone holds AAA; nothing names Norgate's A."""
+    ix = _isin_instrument(X)
+    assert _holders(ws, "norgate_assetid", A) == set()
+    assert _holders(ws, "isin", X) == {ix}
+    assert _holders(ws, "eodhd_symbol", "AAA.US") == {ix}
+    assert ws.state.execute("SELECT count(*) FROM instruments").fetchone()[0] == 1
 
 
 @pytest.mark.parametrize(
     ("fmp_isin", "etf"),
-    [(Y, None), (None, True)],
-    ids=["fmp_isin_differs", "asset_type_differs"],
+    [(None, None), (X, None), (Y, None), (None, True)],
+    ids=["master_only", "fmp_isin_agrees", "fmp_isin_differs", "asset_type_differs"],
 )
-def test_a_listing_whose_independent_identifiers_differ_is_not_merged_into_an_isin_instrument(
+def test_isin_first_then_a_norgate_listing_over_its_claims_is_held_apart(
     ws: Workspace, fmp_isin: str | None, *, etf: bool | None
 ) -> None:
     # The provider's list registers X's instrument over AAA first. A later Norgate master
-    # lists A as AAA over those days, but FMP says AAA is Y, or Norgate says A is an ETF
-    # where the list's rows were common stock: A is left out, not asserted on X's instrument.
-    _import_list(ws, WED, [_row("AAA", X)])
-    _advance(ws)
-    _import_list(ws, THU, [_row("AAA", X)])
-    _advance(ws)
+    # (a renewed subscription) lists A as AAA over those days. Whatever FMP or the asset type
+    # say, A is neither merged into X's instrument nor minted beside it: it is left out.
+    _isin_first(ws)
     rows = [master(int(A), "AAA", first_date="2001-02-05", last_date=THU.isoformat(), etf=etf)]
     master_id = commit(ws, "norgate-master", "observations", table(rows, MASTER_SCHEMA))
     profiles = [profile("AAA", None, isin=fmp_isin, etf=bool(etf))]
     fmp_id = commit(ws, "fmp-profiles", "observations", table(profiles, FMP_SCHEMA))
     built = build_from_workspace(ws, master=master_id, fmp=[fmp_id])
-    report = built.report()
-    assert report["merged_into_isin"] == 0
-    unresolved = cast("dict[str, dict[str, list[str]]]", report["unresolved"])
-    assert unresolved["listings"] == {"isin_identifier_differs": [A]}
+    unresolved = cast("dict[str, dict[str, list[str]]]", built.report()["unresolved"])
+    assert unresolved["listings"] == {"isin_instrument_held": [A]}
+    assert built.document["instruments"] == []
     assert _register(ws, built)["new"] == {"issuers": 0, "instruments": 0, "assertions": 0}
-    assert _holders(ws, "norgate_assetid", A) == set()
+    _isin_instrument_only(ws)
     assert _holders(ws, "isin", Y) == set()
-    assert _holders(ws, "eodhd_symbol", "AAA.US") == {_isin_instrument(X)}
+    # The build is cumulative: rebuilding registers nothing either.
+    assert _register(ws, build_from_workspace(ws, master=master_id, fmp=[fmp_id]))["new"] == {
+        "issuers": 0, "instruments": 0, "assertions": 0}  # fmt: skip
 
 
 def _export(ws: Workspace, assetid: str, name: str, days: list[date]) -> list[str]:
@@ -312,42 +304,19 @@ def _export(ws: Workspace, assetid: str, name: str, days: list[date]) -> list[st
 
 
 def test_a_listing_left_out_of_an_isin_instrument_gives_no_export_claim(ws: Workspace) -> None:
-    # X's instrument holds AAA over Wednesday and Thursday. Norgate says A (AAA through
-    # Thursday) is an ETF, so A is left out; its export runs on to Friday, past the master.
-    _import_list(ws, WED, [_row("AAA", X)])
-    _advance(ws)
-    _import_list(ws, THU, [_row("AAA", X)])
-    _advance(ws)
-    rows = [master(int(A), "AAA", first_date="2001-02-05", last_date=THU.isoformat(), etf=True)]
-    master_id = commit(ws, "norgate-master", "observations", table(rows, MASTER_SCHEMA))
-    built = build_from_workspace(ws, master=master_id, exports=_export(ws, A, "AAA", [THU, FRI]))
+    # X's instrument holds AAA over Wednesday and Thursday, so A (AAA through Thursday) is
+    # left out. Its export runs on to Friday, past the master, and renames it BBB: neither
+    # name gives A an instrument or a claim.
+    _isin_first(ws)
+    exports = _export(ws, A, "BBB", [WED, THU, FRI])
+    built = build_from_workspace(ws, master=_master(ws), exports=exports)
     unresolved = cast("dict[str, dict[str, list[str]]]", built.report()["unresolved"])
-    assert unresolved["listings"] == {"isin_identifier_differs": [A]}
+    assert unresolved["listings"] == {"isin_instrument_held": [A]}
     assert built.windows == {}
     # Only that listing stays unresolved: the build registers, and nothing names A.
     assert _register(ws, built)["new"] == {"issuers": 0, "instruments": 0, "assertions": 0}
-    assert _holders(ws, "norgate_assetid", A) == set()
-    assert _holders(ws, "eodhd_symbol", "AAA.US") == {_isin_instrument(X)}
-
-
-def test_an_export_rename_of_a_merged_listing_keeps_its_claim_of_the_new_ticker(
-    ws: Workspace,
-) -> None:
-    # A (AAA through Thursday) joins X's instrument, which lists claim AAA from Wednesday.
-    # The export shows A renamed BBB through Friday; no list claim holds BBB.
-    _import_list(ws, WED, [_row("AAA", X)])
-    _advance(ws)
-    _import_list(ws, THU, [_row("AAA", X)])
-    _advance(ws)
-    exports = _export(ws, A, "BBB", [WED, THU, FRI])
-    built = build_from_workspace(ws, master=_master(ws), exports=exports)
-    assert built.report()["merged_into_isin"] == 1
-    ix = _isin_instrument(X)
-    friday = _day("BBB.US", ix, FRI)
-    assert friday in _symbol_claims(built.document)
-    assert built.windows == {"BBB.US": (ix, int(friday[2]), int(friday[3]))}
-    _register(ws, built)
-    assert _holders(ws, "eodhd_symbol", "BBB.US") == {ix}
+    _isin_instrument_only(ws)
+    assert _holders(ws, "eodhd_symbol", "BBB.US") == set()
 
 
 def test_the_standing_summary_moves_a_new_listing_from_claimable_to_resolved(

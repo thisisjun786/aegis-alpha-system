@@ -2061,19 +2061,13 @@ US identity는 다섯 원천을 identity 매퍼로 읽어 `aas-identity-registry
 instrument는 Norgate security master와 그보다 늦은 Norgate history 내보내기에서만 나온다(새 상장의 `us_isin`
 instrument는 [유지보수 실행](#유지보수-실행)의 목록 증분이 등록한다).
 
-**ISIN 상품과 합치기.** master 행의 티커 구간(상장 행은 아래 claim 구간, 상폐 행은 접미사를 뗀 티커의
-`first_date`~`last_date`)에 그 티커의 등록 목록 claim을 가진 `us_isin` 상품이 정확히 하나 있으면, 그 행은 그
-상품이다. Norgate instrument를 발급하지 않고 그 행의 모든 assertion(`norgate_assetid` 포함)을 ISIN 상품에
-주장하며, 그 행의 `eodhd_symbol` claim은 ISIN 상품의 그 티커 첫 목록 claim이 시작하는 곳에서 끝난다(겹침 없음,
-보고 `merged_into_isin`). 구간에 그런 상품이 둘이거나 두 행이 한 ISIN 상품에 합쳐지려 하면 그 행들은 문서에서
-빠진다(`isin_instrument_ambiguous`). ISIN 상품은 공급자 목록만으로 생긴 것이므로, 독립 식별자가 다르면
-합치지 않고 그 행도 문서에서 빠진다(`isin_identifier_differs`): Norgate 자산 종류가 ISIN 상품의 등록 자산 종류와
-다르거나, 그 행의 티커 구간 안에서 수집된 그 티커의 FMP 프로필이 다른 ISIN을 말할 때다. 그래서 검사합만 맞는
-위조 ISIN이 Norgate asset ID와 FMP `isin` assertion을 끌어오지 못한다. 그래서 Norgate를 다시 구독해 asset ID가
-들어와도 같은 증권은 상품 하나다.
-Norgate 가격 매퍼는 snapshot의 `norgate`/`norgate_assetid` 주장으로 해석하므로 합친 asset ID의 가격도 ISIN
-상품에 붙는다. 순서가 반대면(Norgate 먼저) 목록의 ISIN이 Norgate 상품에 이어진다([유지보수 실행](#유지보수-실행)).
-어느 순서든 상품은 하나지만 그 ID는 먼저 등록된 anchor의 것이다.
+**ISIN 상품이 먼저 가진 날.** master 행의 티커 구간(상장 행은 아래 claim 구간, 상폐 행은 접미사를 뗀 티커의
+`first_date`~`last_date`)이 그 티커의 등록 목록 claim을 가진 `us_isin` 상품과 겹치면, 그 행은 ISIN 상품에
+합치지도, 따로 발급하지도 않고 문서에서 뺀다(`listings.isin_instrument_held`). 그 행의 asset ID·심볼·EODHD·FMP·
+issuer 주장과 export claim은 모두 남지 않는다. Norgate는 지금 구독하지 않아 그 행을 ISIN 상품으로 옮기는
+흡수 경로는 쓰는 곳 없이 신원·export·소비자(universe, classification) 표면만 넓혔으므로 걷어냈다(G105, 결정은
+Norgate 재구독 전에 다시 정한다). 그래서 같은 증권이 두 상품이 되지 않는다. 반대 순서(Norgate 먼저)면 목록의
+ISIN이 Norgate 상품에 이어진다([유지보수 실행](#유지보수-실행)).
 
 | 매퍼 | 원천 | 만드는 행 |
 | --- | --- | --- |
@@ -3375,7 +3369,7 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-570 | 등록되지 않은 유효 USD ISIN의 새 상장(앞 보유자 없음, 상장 종류)은 `mint('us_isin', ISIN)`과 anchor assertion, 그날 claim으로 등록되고, 같은 ISIN·다른 티커는 같은 상품, 같은 티커·다른 ISIN은 다른 상품이며, ISIN 없는 행과 상장 종류가 아닌 행은 미해결로 남는다 | `tests/storage/test_us_isin_anchor.py::test_a_new_listing_is_registered_on_its_isin_and_a_row_without_one_stays_unresolved` | 구현 |
 | DV-571 | ISIN이 없는 Norgate 상품이 앞서 가진 심볼의 미등록 ISIN은 새 상품을 만들지 않고 `list_isin_unregistered`(`register`)로 남는다 | `tests/storage/test_us_isin_anchor.py::test_a_new_isin_is_not_registered_over_a_symbol_whose_holder_has_no_isin` | 구현 |
 | DV-572 | Norgate 상품이 먼저면 그 등록 claim이 덮는 날의 목록 ISIN이 그 상품에 이어지고 뒤의 날은 같은 상품으로 claim되며 상품은 하나다 | `tests/storage/test_us_isin_anchor.py::test_norgate_first_then_the_isin_joins_the_norgate_instrument` | 구현 |
-| DV-573 | `us_isin` 상품이 먼저면 뒤의 Norgate master의 asset ID와 claim이 그 상품에 주장되고, Norgate 심볼 claim은 첫 목록 claim에서 끝나며(겹침 없음), 다시 만든 문서는 새로 등록할 것이 없다 | `tests/storage/test_us_isin_anchor.py::test_isin_first_then_a_norgate_asset_id_joins_the_isin_instrument` | 구현 |
+| DV-573 | `us_isin` 상품이 먼저면 그 목록 claim과 티커 구간이 겹치는 뒤의 Norgate master 행은 합치지도 발급하지도 않고 `isin_instrument_held`로 빠지며(상품은 하나), 다시 만든 문서도 새로 등록할 것이 없다 | `tests/storage/test_us_isin_anchor.py::test_isin_first_then_a_norgate_listing_over_its_claims_is_held_apart` | 구현 |
 | DV-574 | `standing_unresolved`에서 ISIN 있는 새 상장의 행은 등록 전 `list_claimable`, 등록 뒤 `resolved`이고 ISIN 없는 행은 `list_isin_missing`으로 남는다 | `tests/storage/test_us_isin_anchor.py::test_the_standing_summary_moves_a_new_listing_from_claimable_to_resolved` | 구현 |
 | DV-575 | `eodhd.bulk_quarantine@2`는 보류 사유표대로 `provider_reported_partial`과 import identity 누락 행 중 값 검사를 통과한 행만 옮기고, 다른 사유·값 검사 실패 행은 파티션 날짜 없이 `mapped`·`value_check`·`held` 결과로 센다 | `tests/storage/test_promotion_mappers.py::test_eodhd_bulk_quarantine_v2_maps_admitted_holds_and_counts_the_rest` | 구현 |
 | DV-576 | import 때 identity가 없어 보류된 US 행은 `@2`로 snapshot이 해석하는 것만 승격되고, 해석되지 않는 행은 값 없이 `unresolved`로 기다리다 등록 뒤 승격되며, 다른 사유 행은 남고 그 사유만 있는 테이블은 `unmapped`다. 사유별 행 수는 단계의 `source_outcomes`에 남는다 | `tests/storage/test_maintain_promotion.py::test_identity_held_us_rows_promote_by_the_reason_table_and_wait_for_their_identity` | 구현 |
@@ -3387,7 +3381,7 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-582 | `jobs.start`의 알 수 없는 이름, 시작 선언이 없는 dataset, 반복과 잘못된 타입은 설정 전체를 거부한다 | `tests/application/test_maintain_start.py::test_an_unknown_or_unstartable_start_refuses_the_whole_configuration` | 구현 |
 | DV-583 | 같은 build에서 뒤에 발급된 ISIN 상품이 앞서 받아들인 bridge의 날을 가리키면 그 bridge는 문서에 남지 않고 `list_contradicted`로 세어진다 | `tests/storage/test_us_isin_anchor.py::test_an_isin_registered_later_in_the_build_withdraws_a_bridge_it_contradicts` | 구현 |
 | DV-584 | 같은 build에서 뒤에 Norgate 상품에 이어진 ISIN이 앞서 받아들인 bridge의 날을 가리켜도 그 bridge는 남지 않는다 | `tests/storage/test_us_isin_anchor.py::test_an_isin_joined_to_a_norgate_instrument_later_withdraws_a_bridge_it_contradicts` | 구현 |
-| DV-585 | 목록이 먼저 등록한 ISIN 상품에 뒤의 Norgate 행을 합치기 전에 FMP ISIN이나 자산 종류가 다르면 합치지 않고 그 행을 `isin_identifier_differs`로 빼며 아무것도 등록하지 않는다 | `tests/storage/test_us_isin_anchor.py::test_a_listing_whose_independent_identifiers_differ_is_not_merged_into_an_isin_instrument` | 구현 |
+| DV-585 | FMP ISIN이 같거나 다르거나 자산 종류가 달라도 ISIN 상품의 목록 claim과 겹치는 Norgate 행은 똑같이 `isin_instrument_held`로 빠지고, FMP의 다른 ISIN도 등록되지 않는다 | `tests/storage/test_us_isin_anchor.py::test_isin_first_then_a_norgate_listing_over_its_claims_is_held_apart` | 구현 |
 | DV-586 | 목록 ISIN은 자산 종류가 다른 Norgate 상품에 이어지지 않고 `list_isin_type_differs`로 남는다 | `tests/storage/test_us_isin_anchor.py::test_a_list_isin_does_not_join_a_norgate_instrument_of_another_asset_type` | 구현 |
-| DV-587 | master에서 미해결로 빠진 Norgate 목록(`isin_identifier_differs`, 같은 이유로 `isin_instrument_ambiguous`·`assetid_repeated`)의 export가 master보다 길어도 그 asset ID는 export claim도 상품도 남기지 않아 build는 등록되고 그 목록만 미해결로 남는다 | `tests/storage/test_us_isin_anchor.py::test_a_listing_left_out_of_an_isin_instrument_gives_no_export_claim` | 구현 |
-| DV-588 | ISIN 상품에 합쳐진 목록의 EODHD symbol claim은 그 상품의 같은 심볼 첫 list claim에서만 끊기므로, export가 보인 새 이름(`AAA`→`BBB`)의 `BBB.US` claim과 export 창은 ISIN 상품에 남는다 | `tests/storage/test_us_isin_anchor.py::test_an_export_rename_of_a_merged_listing_keeps_its_claim_of_the_new_ticker` | 구현 |
+| DV-587 | master에서 미해결로 빠진 Norgate 목록(`isin_instrument_held`, 같은 이유로 `assetid_repeated`)의 export가 master보다 길어도 그 asset ID는 export claim도 상품도 남기지 않아 build는 등록되고 그 목록만 미해결로 남는다 | `tests/storage/test_us_isin_anchor.py::test_a_listing_left_out_of_an_isin_instrument_gives_no_export_claim` | 구현 |
+| DV-588 | ISIN 상품에 빠진 Norgate 행의 export가 보인 새 이름(`AAA`→`BBB`)도 `BBB.US` claim과 export 창을 남기지 않는다(흡수 경로를 걷어내 합쳐진 행이 없다) | `tests/storage/test_us_isin_anchor.py::test_a_listing_left_out_of_an_isin_instrument_gives_no_export_claim` | 구현 |

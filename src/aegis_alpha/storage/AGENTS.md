@@ -371,12 +371,10 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   linked sources (`norgate.master@1`, `eodhd.us_symbol@1`, `fmp.profile@1`, `sec.tickers@1`,
   `norgate.export_listing@1`). Every instrument it mints is a Norgate asset ID (venue `XNYS`, or
   `XXXX` for an index or other reference series an export adds); a listing whose ticker span holds
-  the registered list claims of one `us_isin` instrument is asserted on that instrument instead,
-  each EODHD symbol claim ending at that instrument's first list claim of the same symbol (a
-  symbol it has no list claim of, such as an export rename, keeps its claim; `merged_into_isin`),
-  unless its Norgate asset type differs from that instrument's or an FMP profile retrieved in
-  its ticker span names another ISIN (left out as `isin_identifier_differs`); a listing left
-  out declares no instrument and its export series claims nothing; a listed row's ticker (class `.`
+  a registered list claim of a `us_isin` instrument of its ticker is left out, neither merged
+  into that instrument nor minted beside it (`isin_instrument_held`; Norgate is not subscribed,
+  so the merge path was removed until a renewal decides again); a listing left
+out declares no instrument and its export series claims nothing; a listed row's ticker (class `.`
   spelled `-`) reaches EODHD and FMP symbols only when one listed row has it, and an issuer
   CIK links only when SEC lists the ticker under one CIK and FMP names the same CIK. Every
   disagreement stays unresolved with its reason. A ticker's claims hold only from the
