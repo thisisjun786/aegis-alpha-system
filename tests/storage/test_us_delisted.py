@@ -197,3 +197,15 @@ def test_delisted_lists_give_inferred_then_observed_events_by_isin(ws: Workspace
     assert len(events) == 4  # noqa: PLR2004 -- two old and two new events
     # An observed delisting is not inferred and leaves no survivorship gap.
     assert [item for item in _flags(ws) if item[0] == IA] == []
+
+
+def test_a_last_bar_event_ignores_bars_known_only_after_its_list(ws: Workspace) -> None:
+    identity = _bars(ws)
+    # The Friday bar is known at the end of Friday in New York; a list retrieved on Friday
+    # evening (before that) must be dated by Thursday's bar, as a strict reader then saw it,
+    # even though the pinned price chain now also holds Friday's.
+    _list(ws, "2026-09-11T22:00:00Z", "1", [_row("AAA", ISIN_A)])
+    assert _run(ws, identity, 10)["status"] == "advanced"
+    assert _events(ws) == [
+        (IA, LAST_BAR, _start(date(2026, 9, 11)), "eodhd_delisted_last_bar"),
+    ]

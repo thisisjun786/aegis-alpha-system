@@ -377,7 +377,8 @@ def _references(workspace: Workspace, spec: PromotionSpec, budget: ComputeBudget
     """Load the head rows of each generation the mapper references into its temp table.
 
     The pin is checked like a calendar pin, and its dataset must hold the referenced
-    domain. Only the domain columns of non-TOMBSTONE heads are loaded.
+    domain. Only the domain columns of non-TOMBSTONE heads are loaded, with the two instants
+    a strict reader judges them by, ``available_at_us`` and ``revision_known_at_us``.
     """
     for name, reference in references(spec.mapper, spec.mapper_args).items():
         chain = _verify_pin(workspace, reference.pin, budget)
@@ -388,7 +389,14 @@ def _references(workspace: Workspace, spec: PromotionSpec, budget: ComputeBudget
             raise ValueError(
                 f"mapper reference {name} must pin a {reference.domain} dataset generation"
             )
-        columns = ", ".join(_q(column) for column, _ in DOMAINS[reference.domain])
+        columns = ", ".join(
+            _q(column)
+            for column in (
+                *(column for column, _ in DOMAINS[reference.domain]),
+                "available_at_us",
+                "revision_known_at_us",
+            )
+        )
         workspace.market.execute(
             f"CREATE OR REPLACE TEMP TABLE {reference_table(name)} AS SELECT {columns} "
             f"FROM ({_heads_sql(reference.domain)}) WHERE op <> 'TOMBSTONE'",

@@ -147,6 +147,9 @@ class EodhdDelisted:
             "AND i.valid_from_us <= d._d_at AND (i.valid_to_us IS NULL OR d._d_at < i.valid_to_us) "
             f"LEFT JOIN {bars} b ON b.instrument_id = i.instrument_id "
             "AND b.session_date <= d._d_day "
+            # Only bars a strict reader could already know when the list was retrieved: a
+            # later backfill or correction must not date an earlier list's event.
+            "AND greatest(b.available_at_us, b.revision_known_at_us) <= d._d_at "
             "GROUP BY ALL), "
             "e AS (SELECT d.*, m._aas_pin IS NOT NULL AS _d_named, m.last_bar AS _d_last "
             "FROM d LEFT JOIN m USING (_aas_pin, _aas_ordinal))"
