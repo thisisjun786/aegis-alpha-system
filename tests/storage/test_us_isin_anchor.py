@@ -126,6 +126,39 @@ def test_a_new_isin_is_not_registered_over_a_symbol_whose_holder_has_no_isin() -
     assert built.report()["unresolved_dispositions"] == {"register": {"list_isin_unregistered": 1}}
 
 
+def test_an_isin_registered_later_in_the_build_withdraws_a_bridge_it_contradicts() -> None:
+    # Norgate's A held AAA through Monday and is registered with ISIN W. Tuesday's AAA
+    # carries the unregistered X, Wednesday's AAA carries W, and Thursday's NEW carries X,
+    # which mints X's instrument: Tuesday's AAA then names that instrument, not A.
+    w = isin("000000074", "US")
+    held = Held("AAA.US", IA, session_start_us(date(2001, 2, 5)), session_start_us(TUE),
+                listed=False)  # fmt: skip
+    lists = [_list(TUE, [_row("AAA", X)]), _list(WED, [_row("AAA", w)]),
+             _list(THU, [_row("NEW", X)]), _list(FRI, [_row("AAA", w)])]  # fmt: skip
+    built = build_symbol_claims(lists, Registry((held,), {w: frozenset({IA})}, {IA: A}))
+    # Only Thursday's new listing is claimed; no claim of A covers Tuesday.
+    assert _symbol_claims(built.document()) == [_day("NEW.US", _isin_instrument(X), THU)]
+    report = built.report()
+    assert (report["bridges"], report["registered_instruments"]) == ([], 1)
+    assert report["bridge_unresolved"] == {"list_contradicted": 1}
+    assert report["unresolved_days"] == {"list_contradicted": 2, "list_isin_unregistered": 1}
+
+
+def test_an_isin_joined_to_a_norgate_instrument_later_withdraws_a_bridge_it_contradicts() -> None:
+    # As above, but Thursday's X is carried by BBB, which Norgate's B (no ISIN) holds that
+    # day: X joins B, so Tuesday's AAA names B, not A.
+    w, b = isin("000000074", "US"), "900002"
+    ib = mint_instrument("norgate_assetid", b)
+    held = (Held("AAA.US", IA, session_start_us(date(2001, 2, 5)), session_start_us(TUE),
+                 listed=False),
+            Held("BBB.US", ib, session_start_us(date(2001, 2, 5)), None, listed=False))  # fmt: skip
+    lists = [_list(TUE, [_row("AAA", X)]), _list(WED, [_row("AAA", w)]),
+             _list(THU, [_row("BBB", X)])]  # fmt: skip
+    built = build_symbol_claims(lists, Registry(held, {w: frozenset({IA})}, {IA: A, ib: b}))
+    assert (built.assertions, built.attached) == ([], 1)
+    assert built.report()["bridge_unresolved"] == {"list_contradicted": 1}
+
+
 # --- maintenance: the registry, both orders, and the standing summary ---------------------
 
 

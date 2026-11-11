@@ -1699,6 +1699,9 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
   상품이거나(같은 티커·다른 ISIN, 티커 재사용), 자기 claim에서 이을 수 없을 때도 그날 하루로 claim한다(같은 거부권
   아래). 같은 ISIN·다른 티커는 같은 상품, 같은 티커·다른 ISIN은 다른 상품이다. build 안에서 발급하거나 이은 ISIN은
   그 뒤 판정부터 등록된 ISIN처럼 상품을 가리키고, 그 ISIN을 실은 관측(앞선 목록 포함)은 그때부터 거부권이 된다.
+  그 거부권이 같은 build가 이미 받아들인 claim(bridge·하루 claim)의 날에 떨어지면, build는 그런 발급·연결을 처음부터
+  거부권으로 알고 다시 판정한다(그 집합은 늘기만 하므로 끝난다). 그래서 나중에 등록된 ISIN이 가리키는 다른 상품과
+  모순되는 claim은 문서에 남지 않고, 그 날은 `list_contradicted`(bridge면 `bridge_unresolved`)로 남는다.
   그래서 한 실행씩 도착한 목록도 모두를 한 번에 만든 것과 같은 claim을 등록한다(무작위 시나리오 테스트).
 - 평일 `d`의 관측이 모두 같은 상품 `I`를 가리키고(그 관측들의 다른 심볼은 `I`를 가리키지 않음), 그 심볼에 대해 무언가를
   보여 주는 바로 앞 claim(`before`: master·export·앞선 목록의 등록 claim, 또는 같은 build가 앞 날에 받아들인 claim)이
@@ -3376,3 +3379,5 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-580 | 유지보수 실행은 `jobs.start`에 적힌 dataset만 선언한 template으로 시작하고 적히지 않은 것은 `no_head`로 남으며, 선행 조건이 없어 막힌 시작은 종료 코드 0으로 보고만 하고, 같은 설정의 두 번째 실행은 아무것도 시작하지 않는다 | `tests/application/test_maintain_start.py::test_a_run_starts_only_the_configured_datasets_and_a_second_run_starts_nothing` | 구현 |
 | DV-581 | 유지보수 계획은 `jobs.start`로 시작될 route(`started`)와 막힌 사유를 보고하고 설치본의 바이트를 바꾸지 않는다 | `tests/application/test_maintain_start.py::test_a_plan_reports_what_the_configured_start_would_do_and_writes_nothing` | 구현 |
 | DV-582 | `jobs.start`의 알 수 없는 이름, 시작 선언이 없는 dataset, 반복과 잘못된 타입은 설정 전체를 거부한다 | `tests/application/test_maintain_start.py::test_an_unknown_or_unstartable_start_refuses_the_whole_configuration` | 구현 |
+| DV-583 | 같은 build에서 뒤에 발급된 ISIN 상품이 앞서 받아들인 bridge의 날을 가리키면 그 bridge는 문서에 남지 않고 `list_contradicted`로 세어진다 | `tests/storage/test_us_isin_anchor.py::test_an_isin_registered_later_in_the_build_withdraws_a_bridge_it_contradicts` | 구현 |
+| DV-584 | 같은 build에서 뒤에 Norgate 상품에 이어진 ISIN이 앞서 받아들인 bridge의 날을 가리켜도 그 bridge는 남지 않는다 | `tests/storage/test_us_isin_anchor.py::test_an_isin_joined_to_a_norgate_instrument_later_withdraws_a_bridge_it_contradicts` | 구현 |

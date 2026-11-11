@@ -594,6 +594,12 @@ class _Index:
     """ISIN -> the instrument this build minted from it or joined it to."""
     pending: dict[str, list[tuple[date, str]]] = field(default_factory=lambda: defaultdict(list))
     """Unregistered ISIN -> (day, symbol) of the observations carrying it as a candidate."""
+    foreseen: frozenset[tuple[str, str]] = frozenset()
+    """(ISIN, instrument) an earlier pass of the build bound: their candidate observations
+    are vetoes from the start (``build_symbol_claims``)."""
+    late: set[tuple[str, str]] = field(default_factory=set)
+    """(ISIN, instrument) bound after a claim this pass accepted that their observations
+    contradict."""
 
     @classmethod
     def of(cls, registry: Registry) -> _Index:
@@ -619,6 +625,10 @@ class _Index:
                 self.seen[item.symbol].append((item.day, item.names))
             elif item.candidate is not None:
                 self.pending[cast("str", item.isin)].append((item.day, item.symbol))
+        for isin, instrument in self.foreseen:
+            for day, symbol in self.pending.get(isin, []):
+                self.named[instrument].append((day, symbol))
+                self.seen[symbol].append((day, instrument))
         for found in (*self.named.values(), *self.seen.values()):
             found.sort()
 
@@ -633,12 +643,29 @@ class _Index:
 
     def bind(self, isin: str, instrument: str) -> None:
         """From now on ``isin`` names ``instrument``: its observations become vetoes, as
-        they are for a build that reads the registered ISIN."""
+        they are for a build that reads the registered ISIN.
+
+        A veto on a day a claim this pass already accepted covers makes the binding
+        ``late``: the build is judged again with it foreseen."""
         self.bound[isin] = instrument
         self.isins[instrument].add(isin)
-        for day, symbol in self.pending.pop(isin, []):
+        found = self.pending.pop(isin, [])
+        if (isin, instrument) in self.foreseen:
+            return
+        for day, symbol in found:
             insort(self.named[instrument], (day, symbol))
             insort(self.seen[symbol], (day, instrument))
+            if self._vetoes(symbol, instrument, day):
+                self.late.add((isin, instrument))
+
+    def _vetoes(self, symbol: str, instrument: str, day: date) -> bool:
+        """Whether an accepted claim covering ``day`` holds ``symbol`` for another instrument
+        or ``instrument`` under another symbol."""
+        if any(first <= day <= last and held != instrument
+               for first, last, held, _ in self.accepted.get(symbol, [])):  # fmt: skip
+            return True
+        return any(first <= day <= last and other != symbol
+                   for other, first, last in self.accepted_by.get(instrument, []))  # fmt: skip
 
     def accept(self, symbol: str, first: date, last: date, instrument: str, source: str) -> None:
         self.accepted[symbol].append((first, last, instrument, source))
@@ -701,11 +728,33 @@ def build_symbol_claims(
 
     ``context`` lists (earlier lists a maintenance run reads again) are veto evidence
     only: their rows can stop a claim, never anchor or make one.
+
+    An ISIN the build mints or joins on a later day turns its earlier candidate rows into
+    vetoes. When one of them falls on a claim the build already accepted, the build is
+    judged again with every such binding foreseen, its rows vetoes from the first day,
+    until no binding contradicts an accepted claim; the set only grows, so this ends.
     """
-    claims = SymbolClaims()
-    observations, claims.mapper = map_us_symbol_lists(sources, registry)
+    observations, mapper = map_us_symbol_lists(sources, registry)
     vetoes, _ = map_us_symbol_lists(context, registry)
+    foreseen: frozenset[tuple[str, str]] = frozenset()
+    while True:
+        claims, late = _build(observations, vetoes, registry, foreseen)
+        if not late:
+            claims.mapper = mapper
+            return claims
+        foreseen |= late
+
+
+def _build(
+    observations: Sequence[Observation],
+    vetoes: Sequence[Observation],
+    registry: Registry,
+    foreseen: frozenset[tuple[str, str]],
+) -> tuple[SymbolClaims, set[tuple[str, str]]]:
+    """One pass of ``build_symbol_claims``, and the bindings it made too late."""
+    claims = SymbolClaims()
     index = _Index.of(registry)
+    index.foreseen = foreseen
     index.observe([*observations, *vetoes])
     _registry_edge(claims, registry)
     grouped: dict[tuple[str, date], list[Observation]] = defaultdict(list)
@@ -748,7 +797,7 @@ def build_symbol_claims(
                 "end": {"day": day.isoformat(), "evidence": evidence.source},
             })  # fmt: skip
     _continued(claims, registry)
-    return claims
+    return claims, index.late - foreseen
 
 
 def _candidate(items: Sequence[Observation]) -> str | None:
