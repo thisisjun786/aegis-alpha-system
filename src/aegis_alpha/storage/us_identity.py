@@ -1550,6 +1550,27 @@ def _onto_isins(
     return found
 
 
+def _admitted(
+    series: Sequence[ExportSeries],
+    listings: Sequence[Listing],
+    accepted: Sequence[Listing],
+    unresolved: dict[str, list[str]],
+) -> list[ExportSeries]:
+    """The export series that may give instruments, names and claims.
+
+    The master lists US equities only; an export naming one of its asset IDs as a
+    reference series contradicts it, so that series gives no instrument and no name. A
+    master listing left unresolved (a repeated asset ID, or one kept apart from an ISIN
+    instrument) declares no instrument, so its export series claims nothing either.
+    """
+    known = {listing.assetid for listing in listings}
+    differing = [item.assetid for item in series if not item.equity and item.assetid in known]
+    if differing:
+        unresolved["export_database_differs_from_master"].extend(differing)
+    left_out = set(differing) | (known - {listing.assetid for listing in accepted})
+    return [item for item in series if item.assetid not in left_out]
+
+
 def build_us_registry(  # noqa: PLR0913 -- one keyword per source kind
     master: LinkedRows,
     *,
@@ -1598,13 +1619,7 @@ def build_us_registry(  # noqa: PLR0913 -- one keyword per source kind
     if exports:
         series, conflicting, mappers[EXPORT_MAPPER] = map_norgate_exports(exports)
         unresolved["exports"]["export_assetid_repeated"].extend(conflicting)
-        # The master lists US equities only; an export naming one of its asset IDs as a
-        # reference series contradicts it, so that series gives no instrument and no name.
-        known = {listing.assetid for listing in listings}
-        differing = [item.assetid for item in series if not item.equity and item.assetid in known]
-        if differing:
-            unresolved["exports"]["export_database_differs_from_master"].extend(differing)
-            series = [item for item in series if item.assetid not in set(differing)]
+        series = _admitted(series, listings, accepted, unresolved["exports"])
         _export_instruments(series, listings, exported)
         holders: dict[str, set[str]] = defaultdict(set)
         for listing in accepted:

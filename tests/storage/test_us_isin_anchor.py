@@ -25,11 +25,13 @@ from aegis_alpha.storage.identity import (
     snapshot_identities,
 )
 from aegis_alpha.storage.kr_identity import SourceRows, eodhd_unit, import_unit
+from aegis_alpha.storage.legacy_import.norgate import HISTORY
 from aegis_alpha.storage.maintain_promotion import Route, promote_datasets, standing_unresolved
 from aegis_alpha.storage.promotion.engine import promote
 from aegis_alpha.storage.us_identity import (
     UsRegistry,
     build_from_workspace,
+    export_sources,
     session_start_us,
 )
 from aegis_alpha.storage.us_symbols import Held, Registry, build_symbol_claims
@@ -293,6 +295,38 @@ def test_a_listing_whose_independent_identifiers_differ_is_not_merged_into_an_is
     assert _register(ws, built)["new"] == {"issuers": 0, "instruments": 0, "assertions": 0}
     assert _holders(ws, "norgate_assetid", A) == set()
     assert _holders(ws, "isin", Y) == set()
+    assert _holders(ws, "eodhd_symbol", "AAA.US") == {_isin_instrument(X)}
+
+
+def _export(ws: Workspace, assetid: str, name: str, days: list[date]) -> list[str]:
+    """A Norgate history export listing ``assetid`` as ``name`` on ``days``."""
+    rows: list[dict[str, object]] = [
+            {"assetid": int(assetid), "symbol": name, "database": "US Equities",
+             "security_name": f"Synthetic {name}", "csv_sha256": "a" * 64,
+             "date": day.isoformat(), **dict.fromkeys(FLOATS, "10"), "turnover": "",
+             "unadjusted_close": "10", "dividend": "0", "delivery_month": None,
+             "open_interest": None} for day in days
+    ]  # fmt: skip
+    commit(ws, "history-csv", "bars", table(rows, HISTORY.schema()), provider="norgate")
+    return export_sources(ws)
+
+
+def test_a_listing_left_out_of_an_isin_instrument_gives_no_export_claim(ws: Workspace) -> None:
+    # X's instrument holds AAA over Wednesday and Thursday. Norgate says A (AAA through
+    # Thursday) is an ETF, so A is left out; its export runs on to Friday, past the master.
+    _import_list(ws, WED, [_row("AAA", X)])
+    _advance(ws)
+    _import_list(ws, THU, [_row("AAA", X)])
+    _advance(ws)
+    rows = [master(int(A), "AAA", first_date="2001-02-05", last_date=THU.isoformat(), etf=True)]
+    master_id = commit(ws, "norgate-master", "observations", table(rows, MASTER_SCHEMA))
+    built = build_from_workspace(ws, master=master_id, exports=_export(ws, A, "AAA", [THU, FRI]))
+    unresolved = cast("dict[str, dict[str, list[str]]]", built.report()["unresolved"])
+    assert unresolved["listings"] == {"isin_identifier_differs": [A]}
+    assert built.windows == {}
+    # Only that listing stays unresolved: the build registers, and nothing names A.
+    assert _register(ws, built)["new"] == {"issuers": 0, "instruments": 0, "assertions": 0}
+    assert _holders(ws, "norgate_assetid", A) == set()
     assert _holders(ws, "eodhd_symbol", "AAA.US") == {_isin_instrument(X)}
 
 

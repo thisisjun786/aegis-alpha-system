@@ -374,7 +374,8 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   the registered list claims of one `us_isin` instrument is asserted on that instrument instead,
   its EODHD symbol claim ending at that instrument's first list claim (`merged_into_isin`),
   unless its Norgate asset type differs from that instrument's or an FMP profile retrieved in
-  its ticker span names another ISIN (left out as `isin_identifier_differs`); a listed row's ticker (class `.`
+  its ticker span names another ISIN (left out as `isin_identifier_differs`); a listing left
+  out declares no instrument and its export series claims nothing; a listed row's ticker (class `.`
   spelled `-`) reaches EODHD and FMP symbols only when one listed row has it, and an issuer
   CIK links only when SEC lists the ticker under one CIK and FMP names the same CIK. Every
   disagreement stays unresolved with its reason. A ticker's claims hold only from the
