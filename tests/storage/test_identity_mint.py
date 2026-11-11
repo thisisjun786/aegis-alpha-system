@@ -46,6 +46,8 @@ def test_ticker_anchor_is_refused(namespace: str, token: str) -> None:
         (mint_instrument, "norgate_assetid", "0131684"),
         (mint_instrument, "krx_isin", "kr7005930003"),
         (mint_instrument, "krx_isin", "KR7005930004"),
+        (mint_instrument, "us_isin", "us0000000713"),
+        (mint_instrument, "us_isin", "US0000000714"),
         (mint_issuer, "sec_cik", "320193"),
         (mint_issuer, "sec_cik", "CIK0000320193"),
         (mint_issuer, "dart_corp_code", "126380"),
@@ -75,6 +77,11 @@ def test_identity_id_formats_are_frozen() -> None:
             mint_instrument("krx_isin", "KR7005930003"),
             ("ins-", "aas-instrument-v1", "krx_isin", "KR7005930003"),
             "ins-e6cab5338c6cf4375b5bf7c1a296d8a1bb34b0c09f67ea9a8238d3fbcabff02c",
+        ),
+        (
+            mint_instrument("us_isin", "US0000000713"),
+            ("ins-", "aas-instrument-v1", "us_isin", "US0000000713"),
+            "ins-5fe1714f0e9d5de79544b5f702b9e84c2b49d64cc7ecc17b743f0e80c3876ea7",
         ),
         (
             mint_issuer("sec_cik", "0000320193"),

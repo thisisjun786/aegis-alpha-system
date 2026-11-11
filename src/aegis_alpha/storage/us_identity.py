@@ -39,6 +39,15 @@ owned by the registry: the build reads them, gives them to that judgement and ne
 rebuilds them, so ``check_registered`` neither requires their sources nor reports them
 withdrawn.
 
+A dated list may mint a new listing's instrument from its ISIN (``us_isin``, see
+``us_symbols``). A Norgate listing whose ticker span (the listed row's claim interval, or a
+delisted row's ``first_date`` through ``last_date``) holds registered list claims of its
+ticker by exactly one such instrument is that instrument: its asset ID and every claim of
+it are asserted on the ISIN instrument, no Norgate instrument is minted, and its EODHD
+symbol claim stops where the ISIN instrument's first list claim of the ticker starts
+(``merged_into_isin``). A listing whose span holds two of them is left out
+(``isin_instrument_ambiguous``), and so are listings that would join one ISIN together.
+
 Every claim cites its source as ``sl:<source_id>`` with the ``aas-source-row-v1`` hash of
 the row it came from. A Norgate or SEC claim is known from its source's ``sl:`` link
 instant (the source rows record no retrieval instant), an FMP claim from the instant its
@@ -96,6 +105,8 @@ BINDINGS_TABLE: Final = "observations"
 SEC_PREFIX: Final = "sec-submissions-zip-"
 LIST_SOURCE: Final = LINK_PREFIX + "qveris-eodhd-exchange-symbols-"
 """The ``sl:`` prefix of the dated symbol lists that support per-day claims."""
+ISIN_ANCHOR: Final = "us_isin"
+"""The anchor of an instrument a dated list mints from a new listing's ISIN."""
 VENUE: Final = "XNYS"
 REFERENCE_VENUE: Final = "XXXX"
 """ISO 10383's "no market": a reference series (an index, a rate) trades on no venue."""
@@ -717,6 +728,8 @@ class UsRegistry:
     """The exports' last observed equity session; export ticker claims end the day after it."""
     listed: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
     """Each EODHD US symbol's registered per-day symbol-list claims: (start, end)."""
+    merged: dict[str, str] = field(default_factory=dict)
+    """Asset ID -> the ISIN of the registered ``us_isin`` instrument it is asserted on."""
 
     def raw(self) -> bytes:
         return formats.canonical(self.document)
@@ -803,6 +816,7 @@ class UsRegistry:
             if self.export_through is None
             else self.export_through.isoformat(),
             "export_symbols": len(self.windows),
+            "merged_into_isin": len(self.merged),
             "assertions": dict(sorted(kinds.items())),
             "mappers": {name: report.json() for name, report in sorted(self.mappers.items())},
             "unresolved_count": {
@@ -1394,13 +1408,120 @@ def listed_claims(state: sqlite3.Connection) -> list[ListedClaim]:
     ]  # fmt: skip
 
 
-def build_us_registry(
+@dataclass(frozen=True, slots=True)
+class IsinClaim:
+    """A registered per-day list claim of an instrument minted from an ISIN."""
+
+    isin: str
+    symbol: str
+    start: int
+    end: int
+
+
+def isin_claims(state: sqlite3.Connection) -> list[IsinClaim]:
+    """The registered, not superseded list claims of ``us_isin`` instruments (SELECT only)."""
+    rows = state.execute(
+        "SELECT i.token, i.instrument_id, a.token, a.valid_from_us, a.valid_to_us "
+        "FROM identity_assertions a JOIN identity_assertions i ON i.instrument_id = "
+        "a.instrument_id AND i.provider = 'eodhd' AND i.namespace = 'isin' "
+        "WHERE a.provider = 'eodhd' AND a.namespace = 'eodhd_symbol' "
+        "AND substr(a.token, -3) = '.US' AND a.valid_to_us IS NOT NULL "
+        "AND substr(a.source_snapshot_id, 1, ?) = ? AND a.assertion_id NOT IN ("
+        "SELECT supersedes_assertion_id FROM identity_assertions "
+        "WHERE supersedes_assertion_id IS NOT NULL) ORDER BY a.token, a.valid_from_us",
+        (len(LIST_SOURCE), LIST_SOURCE),
+    )
+    return [
+        IsinClaim(str(isin), str(token), int(start), int(end))
+        for isin, instrument, token, start, end in rows
+        if mint_instrument(ISIN_ANCHOR, str(isin)) == instrument
+    ]
+
+
+def _ticker_span(listing: Listing, bounds: _Bounds) -> tuple[str, int, int] | None:
+    """The ticker a listing traded under and the interval the master shows it so."""
+    if listing.listed:
+        interval = bounds.intervals.get(listing.assetid)
+        return None if interval is None else (us_ticker(listing.symbol), *interval)
+    match = _DELISTED_SYMBOL.fullmatch(listing.symbol)
+    if match is None or listing.first_date is None or listing.last_date is None:
+        return None
+    end = session_start_us(listing.last_date + timedelta(days=1))
+    return us_ticker(match[1]), session_start_us(listing.first_date), end
+
+
+def _merged(
+    accepted: Sequence[Listing],
+    bounds: _Bounds,
+    claims: Sequence[IsinClaim],
+    unresolved: dict[str, list[str]],
+) -> tuple[dict[str, tuple[str, int]], set[str]]:
+    """Listings the list claims of one ``us_isin`` instrument show under their ticker.
+
+    Returns asset ID -> (ISIN, start of that instrument's first list claim of the ticker),
+    and the asset IDs left out: a span holding two such instruments, or an instrument two
+    listings would join.
+    """
+    by_symbol: dict[str, list[IsinClaim]] = defaultdict(list)
+    for claim in claims:
+        by_symbol[claim.symbol].append(claim)
+    found: dict[str, tuple[str, int]] = {}
+    ambiguous: set[str] = set()
+    for listing in accepted:
+        span = _ticker_span(listing, bounds)
+        if span is None:
+            continue
+        held = by_symbol.get(f"{span[0]}.US", [])
+        isins = {claim.isin for claim in held if claim.start < span[2] and span[1] < claim.end}
+        if len(isins) > 1:
+            ambiguous.add(listing.assetid)
+        elif isins:
+            isin = isins.pop()
+            found[listing.assetid] = (isin, min(c.start for c in held if c.isin == isin))
+    joining: dict[str, set[str]] = defaultdict(set)
+    for assetid, (isin, _) in found.items():
+        joining[isin].add(assetid)
+    for assetids in joining.values():
+        if len(assetids) > 1:
+            ambiguous |= assetids
+    unresolved["isin_instrument_ambiguous"].extend(sorted(ambiguous, key=int))
+    return {key: value for key, value in found.items() if key not in ambiguous}, ambiguous
+
+
+def _onto_isins(
+    assertions: Iterable[Record], merged: Mapping[str, tuple[str, int]]
+) -> list[Record]:
+    """Assert a merged listing's claims on its ISIN instrument, its EODHD symbol claims
+    only before that instrument's first list claim."""
+    found: list[Record] = []
+    for row in assertions:
+        anchor = cast("dict[str, str]", row["instrument"])
+        target = merged.get(anchor["anchor_token"])
+        if anchor["anchor_namespace"] != "norgate_assetid" or target is None:
+            found.append(row)
+            continue
+        isin, first = target
+        moved = {**row, "instrument": _anchor(ISIN_ANCHOR, isin)}
+        if (row["provider"], row["namespace"]) == ("eodhd", "eodhd_symbol"):
+            if cast("int", row["valid_from_us"]) >= first:
+                continue
+            end = cast("int | None", row["valid_to_us"])
+            moved["valid_to_us"] = first if end is None else min(end, first)
+        elif row["namespace"] == "issuer":
+            issuer = str(row["token"]).split("/", 1)[0]
+            moved["token"] = issuer_link_token(issuer, mint_instrument(ISIN_ANCHOR, isin))
+        found.append(moved)
+    return found
+
+
+def build_us_registry(  # noqa: PLR0913 -- one keyword per source kind
     master: LinkedRows,
     *,
     fmp: Sequence[SourceRows] = (),
     sec: Sequence[tuple[LinkedRows, SourceFile, ArchiveOpener]] = (),
     exports: Sequence[ExportRows] = (),
     listed: Sequence[ListedClaim] = (),
+    isin_listed: Sequence[IsinClaim] = (),
 ) -> UsRegistry:
     """Build the US ``aas-identity-registry-v1`` document from pinned source rows.
 
@@ -1410,6 +1531,8 @@ def build_us_registry(
     asset ID and assertions by provider, namespace and token, so the same sources always
     give the same bytes. ``listed`` are the registered symbol-list claims FMP and SEC rows
     are judged against beside the master's and the exports'; the document never repeats them.
+    ``isin_listed`` are the registered list claims of ``us_isin`` instruments that a
+    listing showing the same ticker over them joins (``_merged``).
     """
     unresolved: dict[str, dict[str, list[str]]] = {
         key: defaultdict(list)
@@ -1419,6 +1542,8 @@ def build_us_registry(
     listings, mappers[MASTER_MAPPER] = map_norgate_master(master)
     accepted, repeated = _accepted(listings, unresolved["listings"])
     bounds = _bounds(accepted)
+    merged, ambiguous = _merged(accepted, bounds, isin_listed, unresolved["listings"])
+    accepted = [listing for listing in accepted if listing.assetid not in ambiguous]
     tickers = _bounded(
         _tickers(
             [listing for listing in accepted if listing.symbol not in repeated],
@@ -1485,7 +1610,13 @@ def build_us_registry(
     for row in instruments:
         link = links.get(str(row["anchor_token"]))
         row["issuer"] = None if link is None else _anchor("sec_cik", link[0])
+    instruments = [row for row in instruments if str(row["anchor_token"]) not in merged]
     instruments.sort(key=lambda row: int(str(row["anchor_token"])))
+    if merged:
+        assertions = _onto_isins(assertions, merged)
+        moved = {mint_instrument("norgate_assetid", key): mint_instrument(ISIN_ANCHOR, isin)
+                 for key, (isin, _) in merged.items()}  # fmt: skip
+        symbols = {key: moved.get(value, value) for key, value in symbols.items()}
     document: dict[str, object] = {
         "schema": REGISTRY_SCHEMA,
         "issuers": issuers,
@@ -1514,6 +1645,7 @@ def build_us_registry(
         windows=exported.windows,
         export_through=exported.through,
         listed=_listed_intervals(listed),
+        merged={key: isin for key, (isin, _) in merged.items()},
     )
 
 
@@ -1689,6 +1821,7 @@ def build_from_workspace(  # noqa: PLR0913 -- one keyword per source kind
         sec=sec_inputs,
         exports=[read_export_rows(workspace, source) for source in exports],
         listed=listed_claims(state),
+        isin_listed=isin_claims(state),
     )
     if bindings is not None:
         registry.bindings = compare_bindings(

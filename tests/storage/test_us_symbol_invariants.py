@@ -16,8 +16,13 @@ On every scenario:
 - (c) safety: no claim covers a day on which an observation of its symbol names another
   instrument, or one on which its instrument is observed under another symbol, and no
   claim overlaps a registered claim of another instrument;
-- (d) every claim continues a registered or accepted claim of the same symbol and
-  instrument (never a rejected observation), across Saturdays and Sundays at most.
+- (d) every claim of a Norgate instrument continues a registered or accepted claim of the
+  same symbol and instrument (never a rejected observation), across Saturdays and Sundays
+  at most;
+- (e) a claim of an instrument minted from the unregistered ISIN (``us_isin``) never covers
+  a day on which that ISIN is observed under another symbol, ends on a day an observation
+  of its symbol carries that ISIN, and never follows a Norgate instrument's claim of its
+  symbol (the two may be one security).
 """
 
 from __future__ import annotations
@@ -50,7 +55,7 @@ RUN_BY_RUN = 8
 SATURDAY = 5
 
 type Claim = tuple[str, str, int, int, int, str]
-"""(token, Norgate asset ID, valid from, valid to, known from, source row hash)."""
+"""(token, anchor token (asset ID or ISIN), valid from, valid to, known from, row hash)."""
 
 
 @dataclass(slots=True)
@@ -137,6 +142,7 @@ def _batch(scenario: Scenario, order: list[int] | None = None) -> set[Claim]:
          cast("int", row["valid_from_us"]), cast("int", row["valid_to_us"]),
          cast("int", row["known_from_us"]), str(row["source_hash"]))
         for row in cast("list[dict[str, object]]", document["assertions"])
+        if row["namespace"] == "eodhd_symbol"
     }  # fmt: skip
 
 
@@ -147,8 +153,10 @@ def _days(claim: Claim) -> list[date]:
 
 
 def _named(scenario: Scenario) -> list[tuple[str, date, str]]:
-    """(symbol, covered day, asset ID) of every row that names a registered instrument."""
+    """(symbol, covered day, anchor token) of every USD row that names a registered
+    instrument or carries the unregistered ISIN."""
     owners = {ISINS[assetid]: assetid for assetid in scenario.assetids}
+    owners[UNREGISTERED] = UNREGISTERED
     found = []
     for retrieved, rows in scenario.lists:
         moment = datetime.fromisoformat(retrieved)
@@ -160,9 +168,32 @@ def _named(scenario: Scenario) -> list[tuple[str, date, str]]:
     return found
 
 
-def _violations(scenario: Scenario, claims: set[Claim]) -> list[str]:
+def _isin_violations(scenario: Scenario, claims: set[Claim]) -> list[str]:
+    """(e) for the claims of the instrument minted from ``UNREGISTERED``."""
     errors: list[str] = []
     named = _named(scenario)
+    edge = session_start_us(THROUGH + timedelta(days=1))
+    for claim in sorted(claim for claim in claims if claim[1] == UNREGISTERED):
+        token, _, start, _ = claim[:4]
+        days = _days(claim)
+        for seen_symbol, seen_day, owner in named:
+            if seen_day in days and owner == UNREGISTERED and seen_symbol != token:
+                errors.append(f"(e) {claim} covers {seen_day}: the ISIN named {seen_symbol}")
+        if (token, days[-1], UNREGISTERED) not in named:
+            errors.append(f"(e) {claim} ends on a day no row of {token} carries its ISIN")
+        earlier = [(other[3], other[1]) for other in claims
+                   if other[0] == token and other[3] <= start]  # fmt: skip
+        if f"{token}".removesuffix(".US") in scenario.base:
+            earlier.append((edge, "norgate"))
+        if earlier and max(earlier)[1] != UNREGISTERED:
+            errors.append(f"(e) {claim} follows a Norgate claim of {token}")
+    return errors
+
+
+def _violations(scenario: Scenario, claims: set[Claim]) -> list[str]:
+    errors = _isin_violations(scenario, claims)
+    named = [item for item in _named(scenario) if item[2] != UNREGISTERED]
+    claims = {claim for claim in claims if claim[1] != UNREGISTERED}
     edge = session_start_us(THROUGH + timedelta(days=1))
     registered = {(f"{name}.US", assetid) for name, assetid in scenario.base.items()}
     for claim in sorted(claims):
@@ -246,15 +277,17 @@ def _run_by_run(root: Path, scenario: Scenario) -> set[Claim]:
                 microseconds=1
             )
             maintain_identity.advance(ws, apply=True, now_us=now)
+    anchors = {_instrument(assetid): assetid for assetid in scenario.assetids}
+    anchors[mint_instrument("us_isin", UNREGISTERED)] = UNREGISTERED
     with open_workspace(root) as ws:
         rows_found = ws.state.execute(
-            "SELECT a.token, n.token, a.valid_from_us, a.valid_to_us, a.known_from_us, "
-            "a.source_hash FROM identity_assertions a JOIN identity_assertions n ON "
-            "n.instrument_id = a.instrument_id AND n.provider = 'norgate' AND "
-            "n.namespace = 'norgate_assetid' WHERE a.provider = 'eodhd' AND "
-            "substr(a.source_snapshot_id, 1, 33) = 'sl:qveris-eodhd-exchange-symbols-'"
+            "SELECT token, instrument_id, valid_from_us, valid_to_us, known_from_us, "
+            "source_hash FROM identity_assertions WHERE provider = 'eodhd' AND "
+            "namespace = 'eodhd_symbol' AND "
+            "substr(source_snapshot_id, 1, 33) = 'sl:qveris-eodhd-exchange-symbols-'"
         ).fetchall()
-    return {(str(a), str(b), int(c), int(d), int(e), str(f)) for a, b, c, d, e, f in rows_found}
+    return {(str(a), anchors[str(b)], int(c), int(d), int(e), str(f))
+            for a, b, c, d, e, f in rows_found}  # fmt: skip
 
 
 def _chronological(scenario: Scenario) -> Scenario:

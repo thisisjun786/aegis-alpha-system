@@ -259,7 +259,12 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   `maintain-<assertion set>` snapshot; it reads only `kind-listings` tables with the
   `kind.listings@1` columns and lists the others in `skipped_sources`. Its US increment is
   `us_symbols` (`eodhd.us_symbol_list@1`): a dated EODHD US list names an instrument only
-  through a registered FMP ISIN; a day is claimed when the symbol's previous holder (a
+  through a registered FMP or EODHD ISIN. A valid, unregistered USD ISIN of a listing class
+  whose symbol no claim held before (or an instrument minted from another ISIN did) mints
+  `mint_instrument('us_isin', isin)` with an `eodhd`/`isin` anchor assertion and a one-day
+  claim; on a day a registered claim of a Norgate instrument without an ISIN covers, the
+  ISIN joins that instrument instead; after a Norgate holder it stays unresolved. An
+  ISIN-minted instrument's day is claimed directly by its ISIN; a day is otherwise claimed when the symbol's previous holder (a
   registered claim or one this build accepted, never a rejected observation) is the same
   instrument and no observation (earlier lists read again as veto-only) shows the symbol
   naming another instrument or the instrument under another symbol on its days, as that one New York day
@@ -328,7 +333,7 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
 - `identity` owns the native identity registry. Issuer and instrument IDs are minted
   only from a permanent anchor (`mint_issuer`, `mint_instrument`: `sec_cik`,
   `dart_corp_code`, `norgate_assetid`, `krx_isin`, the ISIN of a KRX listing whatever its
-  country prefix); a ticker, symbol, path or date is
+  country prefix, and `us_isin`, the ISIN of a new US listing); a ticker, symbol, path or date is
   an assertion, never an anchor, and a non-canonical token is refused rather than
   repaired. Registration (`aas-identity-registry-v1`) appends only: identical rows are
   reused, a correction is a new assertion naming the one it supersedes, known later
@@ -360,8 +365,10 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   sources no longer give (`withdrawn`) instead of closing them.
 - `us_identity` builds the US registry document from five identity mappers over committed,
   linked sources (`norgate.master@1`, `eodhd.us_symbol@1`, `fmp.profile@1`, `sec.tickers@1`,
-  `norgate.export_listing@1`). Every instrument is a Norgate asset ID (venue `XNYS`, or `XXXX`
-  for an index or other reference series an export adds); a listed row's ticker (class `.`
+  `norgate.export_listing@1`). Every instrument it mints is a Norgate asset ID (venue `XNYS`, or
+  `XXXX` for an index or other reference series an export adds); a listing whose ticker span holds
+  the registered list claims of one `us_isin` instrument is asserted on that instrument instead,
+  its EODHD symbol claim ending at that instrument's first list claim (`merged_into_isin`); a listed row's ticker (class `.`
   spelled `-`) reaches EODHD and FMP symbols only when one listed row has it, and an issuer
   CIK links only when SEC lists the ticker under one CIK and FMP names the same CIK. Every
   disagreement stays unresolved with its reason. A ticker's claims hold only from the
