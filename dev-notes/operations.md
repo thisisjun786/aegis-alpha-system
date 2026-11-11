@@ -1662,18 +1662,41 @@ XKRX)에서 실행 시각까지 마감한 마지막 세션, OpenDART는 서울 �
 
 위 값도 형식 예시일 뿐 측정값이 아니다.
 
-유지보수는 chain을 이어 붙일 뿐 시작하지 않는다. 각 dataset의 첫 generation은 [운영 전환](#운영-전환)에서 운영자가
+유지보수는 chain을 이어 붙일 뿐 시작하지 않는다(`jobs.start`에 적은 시작 선언 dataset만 예외, 아래). 각 dataset의 첫 generation은 [운영 전환](#운영-전환)에서 운영자가
 `aas data promote`(또는 `data kr-prices`, `calendar refresh`)로 만들고, 그 뒤 실행이 새로 수집된 원천을 그
 명세의 규칙으로 이어 붙인다. head가 없는 dataset은 `no_head`로 보고된다.
 
 `actions.us.eodhd`, `actions.kr.eodhd`, `fx.usdkrw.eodhd`, `status.kr.kind`, `status.us.eodhd` route는 첫 template을 코드에
-선언해 두었다(시작 선언). 그래도 지금의 `aas maintain run`은 시작할 dataset을 넘기지 않으므로 이 dataset들은
-`no_head`로 보고되고 `skipped.no_head`가 기다리는 원천 테이블 수를 센다. 시작은 운영 DB에 첫 generation을 쓰는 일이라
-켜는 시점은 운영자가 정한다. 켜진 실행에서 선언이 pin할 달력 head가 없으면 `no_calendar`, identity snapshot이
+선언해 두었다(시작 선언). `aas maintain run`과 `plan`은 설치본 `runtime.json`의 `jobs.start`에 적힌 dataset만 시작할
+dataset으로 넘긴다. 기본은 빈 목록이라 이 dataset들은 `no_head`로 보고되고 `skipped.no_head`가 기다리는 원천 테이블
+수를 센다. 시작은 운영 DB에 첫 generation을 쓰는 일이라 켜는 시점은 운영자(카이·준 승인)가 정하고 코드에 박지
+않는다. 켜진 실행에서 선언이 pin할 달력 head가 없으면 `no_calendar`, identity snapshot이
 없으면 `identity_unavailable`, 매퍼가 참조할 generation(`status.us.eodhd`의 `prices.us.eodhd` head)이 없으면
 `no_reference`로 보고하고 아무것도 쓰지 않는다. `status.us.eodhd`의 첫 generation은 그때까지 쌓인 상장폐지 목록 중
 가장 이른 것부터 시작하고, 그 목록의 종목은 모두 `last_bar` 추정이다. 시작한 dataset 항목은 `started: true`이고
 `template_spec_sha256`은 null이다. 그 밖의 항목은 `started: false`다.
+
+```json
+"jobs": {"enabled": true, "start": ["fx.usdkrw.eodhd", "status.kr.kind"]}
+```
+
+`jobs.start`에는 위 다섯 이름만 넣을 수 있다. 카탈로그에 없는 이름은 `unknown datasets`, 시작 선언이 없는
+dataset(`prices.us.eodhd` 등)은 `no declared start`, 반복된 이름은 `repeats`로 설정 전체가 거부되고, 그 설정으로는
+어떤 단계도 돌지 않는다(조용히 무시하지 않는다). 목록에 남겨 두어도 chain에 첫 generation이 생긴 뒤에는 다시
+시작하지 않고 그 명세로 이어 붙인다. 그래서 켠 뒤 목록을 지우지 않아도 된다. 막힌 시작(`no_calendar`,
+`identity_unavailable`, `no_reference`)은 실패가 아니라 종료 코드 0이고, 그 route의 `status`가 막힌 사유,
+`skipped.<사유>`가 기다리는 원천 수다(기다리는 원천이 없으면 `status`는 `current`). 다음 실행이 선행 조건을
+갖추면 그때 시작한다. 보고의 `promote.start`는 `configured`(설정한 목록)와 `routes`(이름 붙인 dataset의 route마다
+`dataset_id`, `mapper`, `outcome`)를 낸다. `outcome`은 `started`, `no_source`(시작할 수 있지만 기다리는 원천
+없음), `no_calendar`·`identity_unavailable`·`no_reference`, `has_generation`(이미 generation이 있어 이어 붙임) 중
+하나다.
+
+**켜기 전 확인.** `jobs.start`에 이름을 넣은 뒤 다음 예약 실행 전에 `aas maintain plan --promotions`를 돌린다.
+`plan`은 같은 목록으로 읽기 전용 계획을 내고 아무것도 쓰지 않는다. `stages.promote.start.routes`에서 켜려는
+route가 `started`인지, 아니면 어떤 사유로 막혔는지 보고, `stages.promote.datasets`의 그 route 항목(`started: true`,
+`status: planned`)에서 첫 generation이 될 원천과 단계의 계획(`refusals`·`unresolved` 포함)을 확인한다. 기대와 다르면
+목록에서 이름을 빼고 다시 `plan`으로 `no_head`가 돌아온 것을 확인한다. 설정 오류는 `plan`에서도 같은 메시지로
+거부되므로 예약 실행 전에 드러난다.
 
 KR 일간 bulk route(`eodhd.bulk_quarantine@1`, `_adjusted@1`)는 예외로, chain에 bulk generation이 없으면 같은
 chain의 이력 명세에서 template을 파생한다. 그때 그 dataset 항목의 `derived_from`이 원본 매퍼(`eodhd.bars@1`

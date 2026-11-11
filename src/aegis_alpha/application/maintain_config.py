@@ -9,9 +9,14 @@ read only when the run asks that provider. Unknown fields, wrong types and missi
 required fields are refused before any stage runs, so a typo never silently disables a
 cap.
 
+``jobs.start`` names the datasets whose chains ``aas maintain`` may start from their route's
+declared first template (``maintain_promotion.Route.start``); it is empty by default, so
+no chain starts. A name that is no route dataset, or one whose routes declare no start, is
+refused like any other configuration error, never ignored.
+
 ```json
 {
-  "jobs": {"enabled": true},
+  "jobs": {"enabled": true, "start": ["fx.usdkrw.eodhd"]},
   "providers": {
     "qveris": {"enabled": true, "key_file": "qveris-api-key", "raw_root": "/abs/raw/qveris",
                "identity": "/abs/qveris-bulk-identity.json",
@@ -106,6 +111,7 @@ class QverisSettings:
 @dataclass(frozen=True, slots=True)
 class MaintainConfig:
     jobs_enabled: bool = False
+    start: tuple[str, ...] = ()
     kind: bool = False
     dart: DartSettings | None = None
     sec: SecSettings | None = None
@@ -257,16 +263,40 @@ def _section(
     return True
 
 
+def _start(jobs: Mapping[str, object]) -> tuple[str, ...]:
+    """``jobs.start``: datasets whose route declares a first template, each named once."""
+    # Loaded here: the routes bring the database drivers, which reading a setting needs not.
+    from aegis_alpha.storage.dataset_catalog import CATALOG  # noqa: PLC0415
+    from aegis_alpha.storage.maintain_promotion import ROUTES  # noqa: PLC0415
+
+    value = jobs.get("start", [])
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise TypeError("jobs.start must be a list of dataset names")
+    names = tuple(cast("list[str]", value))
+    if len(set(names)) != len(names):
+        raise ValueError("jobs.start repeats a dataset")
+    known = {entry.dataset_id for entry in CATALOG} | {route.dataset_id for route in ROUTES}
+    startable = {route.dataset_id for route in ROUTES if route.start is not None}
+    unknown = sorted(set(names) - known)
+    if unknown:
+        raise ValueError(f"jobs.start names unknown datasets {unknown}")
+    fixed = sorted(set(names) - startable)
+    if fixed:
+        raise ValueError(f"jobs.start names datasets with no declared start {fixed}")
+    return names
+
+
 def parse_config(paths: StoragePaths, runtime: Mapping[str, object]) -> MaintainConfig:
     """The maintenance settings of one ``runtime.json`` document; reads no credential."""
     jobs = _object(runtime.get("jobs", {"enabled": False}), "jobs")
-    if set(jobs) - {"enabled"} or type(jobs.get("enabled", False)) is not bool:
-        raise ValueError("jobs takes only a boolean enabled")
+    if set(jobs) - {"enabled", "start"} or type(jobs.get("enabled", False)) is not bool:
+        raise ValueError("jobs takes only a boolean enabled and a start list")
     providers = _object(runtime.get("providers", {}), "providers")
     unknown = set(providers) - set(PROVIDERS)
     if unknown:
         raise ValueError(f"providers has unknown sections {sorted(unknown)}")
-    settings: dict[str, object] = {"jobs_enabled": bool(jobs.get("enabled", False))}
+    settings: dict[str, object] = {"jobs_enabled": bool(jobs.get("enabled", False)),
+                                   "start": _start(jobs)}  # fmt: skip
     for provider, value in providers.items():
         name = f"providers.{provider}"
         section = _object(value, name)
