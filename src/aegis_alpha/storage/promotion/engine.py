@@ -56,6 +56,7 @@ from aegis_alpha.storage.membership_pins import (
 )
 from aegis_alpha.storage.promotion import decimal_rules, formats
 from aegis_alpha.storage.promotion.mappers import (
+    IDENTITY_ROWS,
     MANIFEST_ITEMS,
     reference_table,
     references,
@@ -318,7 +319,7 @@ def _identity(
     """Load the pinned snapshot's current resolution rows for the mapper's assertion key."""
     market = workspace.market
     market.execute(
-        f"CREATE OR REPLACE TEMP TABLE {_t('identity')} (token VARCHAR, instrument_id VARCHAR, "
+        f"CREATE OR REPLACE TEMP TABLE {IDENTITY_ROWS} (token VARCHAR, instrument_id VARCHAR, "
         "valid_from_us BIGINT, valid_to_us BIGINT)"
     )
     pin = spec.identity_snapshot
@@ -349,7 +350,7 @@ def _identity(
     )
     while batch := cursor.fetchmany(_BATCH):
         market.executemany(
-            f"INSERT INTO {_t('identity')} VALUES (?, ?, ?, ?)", [tuple(row) for row in batch]
+            f"INSERT INTO {IDENTITY_ROWS} VALUES (?, ?, ?, ?)", [tuple(row) for row in batch]
         )
 
 
@@ -615,7 +616,7 @@ def _resolved(workspace: Workspace, spec: PromotionSpec) -> str:
         f"CREATE OR REPLACE TEMP TABLE {_t('res')} AS SELECT m._aas_pin, m._aas_ordinal, "
         "m._aas_item, count(DISTINCT i.instrument_id) AS matches, "
         "min(i.instrument_id) AS instrument_id "
-        f"FROM {_t('map')} m JOIN {_t('identity')} i ON i.token = m._aas_id_token "
+        f"FROM {_t('map')} m JOIN {IDENTITY_ROWS} i ON i.token = m._aas_id_token "
         "AND i.valid_from_us <= m._aas_id_at_us "
         "AND (i.valid_to_us IS NULL OR m._aas_id_at_us < i.valid_to_us) GROUP BY ALL"
     )

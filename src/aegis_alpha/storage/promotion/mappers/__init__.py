@@ -47,6 +47,12 @@ A mapper may join generations of other datasets that its spec arguments pin
 ``filings`` generation. The engine verifies each pin, loads the head rows of its chain
 (no TOMBSTONE) with the referenced domain's columns into ``reference_table(name)``, and
 the mapper's SELECT reads that table as it reads the source relation.
+
+A mapper with an identity key may also read ``IDENTITY_ROWS``: one row
+``(token VARCHAR, instrument_id VARCHAR, valid_from_us BIGINT, valid_to_us BIGINT)`` per
+pinned snapshot member of its key, the rows the engine resolves ``_aas_id_token`` with, so it
+can join a referenced generation on the instrument a row will resolve to. The engine's
+resolution of the row stays the only one stored.
 """
 
 from __future__ import annotations
@@ -59,6 +65,7 @@ from aegis_alpha.storage.market_inputs import GenerationPin
 from aegis_alpha.storage.promotion.time_rules import InputKind
 
 MANIFEST_ITEMS: Final = "_aas_p_items"
+IDENTITY_ROWS: Final = "_aas_p_identity"
 _PIN_KEYS: Final = frozenset(
     {"dataset_id", "version", "generation_id", "chain_hash", "manifest_hash"}
 )
@@ -213,6 +220,9 @@ def _registry() -> dict[str, Mapper]:
         EodhdDividends,
         EodhdSplits,
     )
+    from aegis_alpha.storage.promotion.mappers.eodhd_delisted import (  # noqa: PLC0415
+        EodhdDelisted,
+    )
     from aegis_alpha.storage.promotion.mappers.fmp import (  # noqa: PLC0415
         FmpDividends,
         FmpEodNonSplit,
@@ -254,6 +264,7 @@ def _registry() -> dict[str, Mapper]:
         EodhdBulkQuarantineAdjusted(),
         EodhdDividends(),
         EodhdSplits(),
+        EodhdDelisted(),
         EodhdFxHistory(),
         FmpEodNonSplit(),
         FmpDividends(),
