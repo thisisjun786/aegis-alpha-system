@@ -1385,14 +1385,17 @@ batch의 것만 읽는다.
    목록이 읽히지 않거나 거부되거나 답이 없으면 403은 거부로 남아 실행을 멈춘다. 목록 답은 receipt로만
    남고 파생 테이블은 없다.
 2. **submissions.** 색인 공시 중 양식이 `filing_forms`(10-K·10-Q·10-KT·10-QT·8-K·20-F·40-F·6-K와 각
-   정정)에 들고 발행인 범위(`registered`: `mint_issuer('sec_cik', cik)`가 identity에 등록된 제출자, 또는
-   `all`)에 드는 공시를 원한다. 아직 나열되지 않은 공시가 있는 제출자마다 문서를 한 번 묻는다. 이유는 둘이다.
+   정정)에 들고 발행인 범위(`registered`: `mint_issuer('sec_cik', cik)`가 identity에 등록된 제출자,
+   `reporting`: 그 제출자와 읽은 색인에서 `fact_forms` 정기 보고서를 낸 모든 제출자, 또는 `all`)에 드는
+   공시를 원한다. `reporting`의 제출자 집합은 실행이 그날 색인을 읽은 뒤 정하며 identity에 쓰지 않는다. 아직 나열되지 않은 공시가 있는 제출자마다 문서를 한 번 묻는다. 이유는 둘이다.
    - `new_filing`: 그 색인을 읽은 뒤 묻지 않음.
    - `listing_retry`: 마지막으로 물은 지 하루가 지났고, 색인을 읽은 지 `listing_days`(7일) 안.
 3. **companyfacts.** 양식이 `fact_forms`(정기 재무 보고서와 그 정정)인 원하는 공시에 사실이 아직 없는
    제출자마다 같은 규칙으로 묻는다(재시도 이유 `fact_retry`, 기간 `fact_days` 14일). XBRL 처리가 접수보다
    늦을 수 있기 때문이다.
 
+문서 요청은 원하는 공시 중 가장 이른 공시일 순으로 묻고, 같은 날이면 submissions가 먼저다. 실행은
+`max_calls`에서 정상 종료하므로 한 실행보다 큰 밀린 요청은 다음 실행들이 가장 오래된 것부터 잇는다.
 창이 지난 공시는 `abandoned`로 센다. 답을 보존하지 못한 attempt도 물은 것으로 보아 하루 뒤 다시 묻는다.
 문서는 그 제출자의 이전 공시를 모두 다시 싣는다. 그래서 문서 요청의 receipt는 원한 accession 목록을
 `selection`(`{"accessions": [...]}`)으로 싣고, 그 공시의 행만 테이블에 옮긴다. bytes는 `raw/`에 그대로 있다.
@@ -1473,7 +1476,7 @@ commit된 것으로 계속한다. 공급자 하나의 거부나 실패가 다른
 | --- | --- | --- |
 | `kind` | 없음 | 없음(quota 없음) |
 | `dart` | `key_file` | `max_calls`(2,000), `daily_quota`(19,000) |
-| `sec` | `user_agent_file` | `max_calls`(2,000), `issuers`(`registered`·`all`), `since` |
+| `sec` | `user_agent_file` | `max_calls`(2,000), `issuers`(`registered`·`reporting`·`all`), `since` |
 | `fred` | `key_file` | `max_calls`(500) |
 | `qveris` | `key_file`, `raw_root`(절대 경로), `since`(거래소마다 첫 날), `max_calls`, `max_credits`(십진 문자열) | `extra_sessions`(거래소마다 `since` 이전에 따로 물을 session 날짜), `identity`(절대 경로의 identity 문서), `exchanges`, `datasets`, `symbol_lists`, `symbol_list_days`(7), `forex`, `forex_lookback_days`(10), `max_http_requests`, `time_limit_seconds`(3600), `request_interval`, `timeout_seconds`(45) |
 
@@ -3129,3 +3132,5 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-539 | head가 없는 chain은 bulk route가 파생하지 않고 `no_head`로 남는다 | `tests/storage/test_maintain_promotion.py::test_a_chain_without_a_head_derives_nothing` | 구현 |
 | DV-540 | 값 검사(가격 0, low>high, high<max(open, close), 음수 거래량, 문자열 숫자, null, 깨진 JSON, 잘못된 날짜)를 어긴 행이 하나라도 있는 bulk 테이블은 `value_check`로 남고 승격되지 않으며, 같은 회차의 정상 테이블은 승격된다 | `tests/storage/test_maintain_promotion.py::test_one_invalid_value_keeps_its_whole_bulk_table_out` | 구현 |
 | DV-541 | 경고 KR bulk만 수집된 유지보수 실행은 이력만 있는 chain을 이어 붙이고 승격 뒤 저장소가 검증을 통과한다 | `tests/application/test_maintain.py::test_warned_kr_bulk_days_continue_a_history_only_chain_and_the_store_verifies` | 구현 |
+| DV-542 | `reporting` 범위는 등록된 발행인이 없어도 읽은 색인에서 정기 보고서를 낸 제출자의 공시를 원하고 그 문서를 묻어 승격하며, 정기 보고서가 없는 제출자는 범위 밖으로 센다 | `tests/storage/test_us_collection.py::test_the_reporting_scope_wants_filers_of_periodic_reports_and_promotes_them` | 구현 |
+| DV-543 | 호출 상한을 넘는 문서 요청은 가장 이른 공시일 순으로 묻고 남은 요청은 다음 실행이 잇는다 | `tests/storage/test_us_collection.py::test_a_backlog_over_the_call_budget_is_asked_oldest_first_over_runs` | 구현 |

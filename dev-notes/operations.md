@@ -1432,8 +1432,8 @@ commit에는 `pyarrow`(legacy extra)가 필요하다.
 ## US 공시·거시 수집
 
 ```bash
-aas collect sec plan [--home HOME] [--today YYYY-MM-DD] [--since YYYY-MM-DD] [--issuers registered|all]
-aas collect sec run --user-agent-file SEC_USER_AGENT_FILE [--since YYYY-MM-DD] [--issuers registered|all] [--max-calls 2000] [--home HOME]
+aas collect sec plan [--home HOME] [--today YYYY-MM-DD] [--since YYYY-MM-DD] [--issuers registered|reporting|all]
+aas collect sec run --user-agent-file SEC_USER_AGENT_FILE [--since YYYY-MM-DD] [--issuers registered|reporting|all] [--max-calls 2000] [--home HOME]
 aas collect fred plan [--home HOME] [--today YYYY-MM-DD]
 aas collect fred run --key-file FRED_KEY_FILE [--max-calls 500] [--home HOME]
 ```
@@ -1453,7 +1453,11 @@ companyfacts 순으로, FRED는 CSV, 시계열별 vintage 확인과 observations
 `provider_refused:<HTTP 상태>`, `transport_failures`), commit한 원천이다. SEC는 덮인 마지막 날과 남은 계획을,
 FRED는 시계열별 알려진 vintage 날과 완결되지 않은 창을 함께 낸다. 예산을 다 쓰면 정상 종료이고, 거부나 전송
 실패로 멈추면 받은 답을 commit한 뒤 종료 코드 1이다. commit에는 `pyarrow`(legacy extra)가 필요하다.
-`--issuers registered`(기본)는 identity에 SEC 발행인으로 등록된 제출자의 문서만 묻는다. 처음 SEC 실행은
+`--issuers registered`(기본)는 identity에 SEC 발행인으로 등록된 제출자의 문서만 묻는다. US 발행인이
+identity에 없으면 색인만 받고 `wanted`가 0이다. `--issuers reporting`은 거기에 읽은 색인에서 정기
+보고서(10-K·10-Q·20-F·40-F와 정정)를 낸 제출자를 더하며 identity에 쓰지 않는다. 문서는 가장 이른 공시일
+순으로 묻고, `--max-calls`(예약 실행은 `sec.max_calls`)에서 멈춘 나머지는 다음 실행이 잇는다. 범위를 바꾸면
+`pending.requests`의 남은 요청 수가 그 밀린 양이다. 처음 SEC 실행은
 `--since`로 legacy bulk archive 뒤의 첫 색인 날을 정한다.
 
 수집한 원천의 승격은 [원천 자료의 승격과 은퇴](#원천-자료의-승격과-은퇴)의 명세로 한다.
