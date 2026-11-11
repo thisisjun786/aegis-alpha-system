@@ -458,5 +458,3 @@ def test_the_new_routes_see_collected_sources_and_start_only_named_datasets(
     run = later[("actions.us.eodhd", "eodhd.splits@1")]
     assert (run["status"], run["started"]) == ("advanced", False)
     assert dataset_head(ws, "actions.us.eodhd") is not None
-
-
