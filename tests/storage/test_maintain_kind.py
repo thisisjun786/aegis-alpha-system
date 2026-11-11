@@ -165,4 +165,9 @@ def test_legacy_shaped_kind_listings_are_skipped_and_reported(ws: Workspace) -> 
     assert run["status"] == "planned"
     assert cast("dict[str, int]", run["skipped"])["shape"] == 1
     assert _sources(run) == [(first["source_id"], "planned"), (second["source_id"], "planned")]
-    assert unmapped(ws) == {"status.kr.kind": 2}
+    # The status route reads the same lists: they wait as candidates of a chain not yet started.
+    assert unmapped(ws) == {}
+    status = next(route for route in ROUTES if route.dataset_id == "status.kr.kind")
+    waiting = _run(promote_datasets(ws, apply=False, now_us=4, routes=[status]))
+    assert waiting["status"] == "no_head"
+    assert cast("dict[str, int]", waiting["skipped"]) == {"done": 0, "shape": 1, "no_head": 2}

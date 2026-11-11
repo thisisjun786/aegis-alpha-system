@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 from datetime import date, timedelta
+from decimal import Decimal
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -22,7 +24,13 @@ from aegis_alpha.application.maintain_qveris import (
     symbol_list_job,
 )
 from aegis_alpha.application.qveris_daily import daily_job
-from aegis_alpha.data.qveris_contracts import QverisJob
+from aegis_alpha.data.qveris_acquisition import acquire_jobs
+from aegis_alpha.data.qveris_contracts import QverisJob, object_value
+from tests.data.qveris_support import ScriptedQveris, account_key, bar
+
+# Serial: the warned replays acquire through the scripted gateway, which takes the host-wide
+# Qveris account lease (an abstract Unix socket named by the account).
+pytestmark = pytest.mark.xdist_group("qveris-account-lease")
 
 TODAY = date(2026, 9, 17)
 MON, TUE, WED = date(2026, 9, 14), date(2026, 9, 15), date(2026, 9, 16)
@@ -58,7 +66,7 @@ def _prices(day: date, observed: date) -> QverisJob:
 
 def test_each_ask_state_decides_its_request(tmp_path: Path) -> None:
     root = tmp_path / "raw"
-    _ask(root, _prices(MON, TUE), "warned")  # a provider warning is a completion
+    _ask(root, _prices(MON, TUE), "warned")  # a partial success whose rows cannot be read
     _ask(root, _prices(TUE, WED), "failed")  # answered, kept, unusable: asked again
     _ask(root, _prices(WED, TODAY), "unsettled")  # settles before anything else
     _write(root, "parallel-batches/b1/quarantine.json", {"reason": "synthetic"})
@@ -68,7 +76,8 @@ def test_each_ask_state_decides_its_request(tmp_path: Path) -> None:
     assert sorted(states.values()) == [["failed"], ["unsettled"], ["warned"]]
     plan = plan_requests(root, POLICY, today=TODAY)
     assert [(item.day, item.reason) for item in plan.planned] == [(TUE, "failed_retry")]
-    assert plan.covered == 1
+    # Counted apart from a completion; unjudged, so the cheaper choice: not asked again.
+    assert (plan.covered, plan.partial) == (0, 1)
     assert [held["job_id"] for held in plan.held] == ["maintain-US-prices-2026-09-16"]
     # Both the unsettled ask and the billed one without a completion are finished on their
     # own jobs first, which executes nothing.
@@ -221,3 +230,147 @@ def test_settled_failures_back_off_and_retry_after_the_first_asks(tmp_path: Path
         (date(2026, 9, 10), "failed_retry"),
         (MON, "failed_retry"),
     ]
+
+
+# --- warned asks: partial successes, judged row by row ---------------------------------------
+
+KO = QverisPolicy(exchanges=("KO",), datasets=("prices",), since={"KO": MON})
+
+
+class WarnedQveris(ScriptedQveris):
+    """Every execute answered with a gateway warning; its usage carries recorded counts."""
+
+    def __init__(self, rows: dict[str, object], key: str, counts: dict[str, object]) -> None:
+        super().__init__(rows, key)
+        self.price = Decimal(0)
+        self.failure = "included"  # usage outcome partial_success, reason_code provider.error
+        self.counts = counts
+
+    def _execute(self, body: dict[str, object], query: dict[str, str | int]) -> dict[str, object]:
+        document = super()._execute(body, query)
+        data = object_value(document["result"])["data"]
+        rows = len(data) if isinstance(data, list) else 0
+        self.usage[-1].update({"raw_result_count": rows, "valid_result_count": rows, **self.counts})
+        return document
+
+
+def _ko(code: str, day: date, **values: object) -> dict[str, object]:
+    return {"code": code, "exchange_short_name": "KO", **bar(day.isoformat(), **values)}
+
+
+def _warned(root: Path, day: date, observed: date, rows: list[object], **counts: object) -> None:
+    """Replay one warned KO bulk download of ``day`` asked on ``observed``."""
+    job = daily_job("KO", "prices", day, observed)
+    acquire_jobs((job,), root, WarnedQveris({job.parameters_json: rows}, account_key(root),
+                                            counts))  # fmt: skip
+
+
+def test_a_warned_ask_with_held_rows_is_asked_again_and_its_reasons_are_counted(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "raw"
+    # Monday: every row passes its value checks; Tuesday: one row has low above the open.
+    _warned(root, MON, TUE, [_ko("000101", MON)], provider_status_code=118000)
+    _warned(root, TUE, WED, [_ko("000101", TUE), _ko("000202", TUE, low=13)],
+            provider_status_code=60310)  # fmt: skip
+    assert [ask.state for asks in raw_asks(root).values() for ask in asks] == ["warned"] * 2
+    plan = plan_requests(root, KO, today=TODAY)
+    # Tuesday's ask held a row: asked again the day after it, like a first settled failure,
+    # and after every first ask, so it only spends what the caps leave.
+    assert [(item.day, item.reason) for item in plan.planned] == [
+        (WED, "new"),
+        (TUE, "partial_retry"),
+    ]
+    assert (plan.covered, plan.partial) == (0, 1)  # Monday: all rows passed, not asked again
+    report = plan.report()
+    assert cast("dict[str, int]", report["reasons"])["partial_retry"] == 1
+    assert report["warnings"] == {
+        "asks": 2,
+        "decisions": {"partial": 1, "partial_retry": 1},
+        "held_rows": 1,
+        "unjudged": 0,
+        "by_reason": [
+            {"reason_code": "provider.error", "provider_status_code": "118000", "pages": 1,
+             "counts_equal": 1, "counts_differ": 0, "counts_unknown": 0},
+            {"reason_code": "provider.error", "provider_status_code": "60310", "pages": 1,
+             "counts_equal": 1, "counts_differ": 0, "counts_unknown": 0},
+        ],
+    }  # fmt: skip
+
+
+def test_differing_result_counts_ask_again_and_back_off_like_failures(tmp_path: Path) -> None:
+    root = tmp_path / "raw"
+    # Monday's rows all pass, but the provider counted fewer valid rows than it returned.
+    _warned(root, MON, TUE, [_ko("000101", MON)], raw_result_count=3, valid_result_count=2)
+    # Tuesday's request warned twice in a row with a held row: it waits two days.
+    for observed in (TUE, WED):
+        _warned(root, TUE, observed, [_ko("000101", TUE, volume=-1)])
+    # Wednesday's ask is unreadable for judging and has no recorded warning: not asked again.
+    _ask(root, daily_job("KO", "prices", WED, TODAY), "warned")
+    plan = plan_requests(root, KO, today=TODAY)
+    assert [(item.day, item.reason) for item in plan.planned] == [(MON, "partial_retry")]
+    assert (plan.waiting, plan.partial) == (1, 1)
+    assert plan.failing == [{"job_id": "maintain-KO-prices-2026-09-15", "failed_asks": 2,
+                             "retry_on": "2026-09-18"}]  # fmt: skip
+    summary = cast("dict[str, object]", plan.report()["warnings"])
+    assert summary["decisions"] == {"backoff": 1, "partial": 1, "partial_retry": 1}
+    assert (summary["held_rows"], summary["unjudged"]) == (1, 1)
+    later = plan_requests(root, KO, today=date(2026, 9, 18))
+    # Thursday is a new session; both warned requests are due again.
+    assert [item.reason for item in later.planned] == ["new", "partial_retry", "partial_retry"]
+
+
+def test_an_unjudged_warned_ask_is_counted_unclassified_and_not_asked_again(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "raw"
+    _ask(root, daily_job("KO", "prices", MON, TUE), "warned")
+    plan = plan_requests(root, KO, today=TODAY)
+    assert [item.day for item in plan.planned] == [TUE, WED]
+    assert plan.partial == 1
+    summary = cast("dict[str, object]", plan.report()["warnings"])
+    assert (summary["unjudged"], summary["held_rows"]) == (1, 0)
+    assert summary["by_reason"] == [
+        {"reason_code": "unclassified", "provider_status_code": "unclassified", "pages": 1,
+         "counts_equal": 0, "counts_differ": 0, "counts_unknown": 1}
+    ]  # fmt: skip
+
+
+# --- transient errors: 5xx, no execution ID, no usage event -----------------------------------
+
+
+def _unsettled(root: Path, job: QverisJob, search: str, status: int | None) -> str:
+    page = f"jobs/{job.fingerprint}/0000"
+    _write(root, f"{page}.intent.json", {"job": job.document(), "search_id": search})
+    if status is not None:
+        _write(root, f"{page}.response.json", {"status": status, "execution_id": None})
+    return page
+
+
+def _settlement_read(root: Path, name: str, search: str, total: int) -> None:
+    _write(root, f"audits/{name}.json", {
+        "path": "/auth/usage/history/v2", "query": {"search_id": search, "page": 1},
+        "response": {"status": "success", "data": {"total": total, "items": [{}] * total,
+                                                     "page": 1}},
+    })  # fmt: skip
+
+
+def test_a_5xx_page_without_usage_is_reported_as_a_quarantine_candidate(tmp_path: Path) -> None:
+    root = tmp_path / "raw"
+    maintenance = _unsettled(root, _prices(MON, TUE), "s-502", 502)
+    _settlement_read(root, "a", "s-502", 0)
+    _settlement_read(root, "b", "s-502", 0)
+    _unsettled(root, _prices(TUE, WED), "s-unread", 503)  # no settlement read retained
+    _unsettled(root, _prices(WED, TODAY), "s-used", 502)
+    _settlement_read(root, "c", "s-used", 1)  # a usage event exists: not transient
+    report = plan_requests(root, POLICY, today=TODAY).report()
+    held = cast("list[dict[str, object]]", report["held"])
+    # Still held: nothing is quarantined.
+    assert [item["job_id"] for item in held] == [
+        f"maintain-US-prices-2026-09-{day}" for day in (14, 15, 16)
+    ]
+    assert report["quarantine_candidates"] == [
+        {"job_id": "daily-US-prices-2026-09-14", "page": maintenance, "http_status": 502,
+         "settlement_reads_without_usage": 2}
+    ]  # fmt: skip
+    assert not any(path.name.endswith("quarantine.json") for path in root.rglob("*"))

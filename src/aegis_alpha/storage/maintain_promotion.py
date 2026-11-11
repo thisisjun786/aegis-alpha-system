@@ -8,7 +8,7 @@ it is left to the other routes of the shape; an empty table is skipped. A table 
 lacks a column the route's mapper reads (its ``source_columns``) is another shape under
 the same prefix and table name (the ``korea.public_response@1`` legacy import of
 ``kind-listings``): it is skipped and counted as ``shape``. A route may also name a value
-``check`` every row of a table it claims must pass: the KR daily bulk routes check each
+``check`` every row of a table it claims must pass: the KR and US daily bulk routes check each
 warned row as the clean response path does (``qveris_native._bar``: valid JSON, finite
 JSON numbers, prices above zero, volume not negative, consistent OHLC, an ISO date). A
 table with one failing row is not promoted and is counted as ``value_check`` (before
@@ -20,15 +20,29 @@ an earlier major it ``continues`` (an operator's backfill or an earlier maintena
 generation). That generation's mapper is the one the chain continues with, so
 ``classifications.kr.kind`` continues a chain whose latest generation used
 ``kind.industry@1`` under ``@1`` and one an operator published under ``kind.industry@2``
-under ``@2``. A route that names ``derive_from`` (the KR daily bulk routes) and finds no
+under ``@2``. A route that names ``derive_from`` (the daily bulk routes) and finds no
 such generation in a chain that has a head takes its first template from the latest
 committed spec of the ``derive_from`` mapper (the history backfill's ``eodhd.bars@1`` or
 ``eodhd.bars_adjusted@1``): only the mapper's name becomes the route's and
-``derive_args`` (the KR ``currencies``) join its arguments, so the template is the spec
-``aas data kr-prices`` writes for a bulk day. The report's ``template_spec_sha256`` is
+``derive_args`` (the exchanges' ``currencies``) join its arguments, so the KR template is
+the spec ``aas data kr-prices`` writes for a bulk day. The US route promotes only the rows
+of a warned US download (``provider_reported_partial``); rows the import held for another
+reason, such as a missing import-time identity, have no session date under
+``eodhd.bulk_quarantine@1`` and stay ``unmapped``. The report's ``template_spec_sha256`` is
 then the spec it came from and ``derived_from`` names its mapper. Once the chain holds a
 generation of the route's mapper, that spec is the template. A chain without a head is
-never derived. A maintenance spec is that spec with only these fields advanced:
+never derived.
+
+A route may also declare a ``start``: the mapper arguments, time rule and numeric rules of the
+first generation of a dataset collected before any chain existed (``actions.*.eodhd``,
+``fx.usdkrw.eodhd``, ``status.kr.kind``). It is used only for a dataset the caller names in
+``start``, and only while the chain holds no generation of the route's mappers (with or
+without a head: the dividends route of a chain its splits route started starts as well). The
+declared calendar dataset's committed head is the time rule's calendar pin (none:
+``no_calendar``) and a template that resolves identities pins the run's snapshot (none:
+``identity_unavailable``); the report says ``started``. Once a started generation exists,
+its spec is the template like any other. Without ``start`` such a dataset reports ``no_head``
+with its waiting sources. A maintenance spec is that spec with only these fields advanced:
 
 - ``target.parent``: the dataset head;
 - ``sources``: the one new source table;
@@ -75,7 +89,9 @@ done as well.
 
 Every pass also reports ``standing_unresolved``: per dataset, the sources whose latest
 ``maintain_source@1`` record is ``unresolved``, whatever this pass planned, read from those
-persisted records alone (``promote.unresolved`` stays the datasets this pass recorded).
+persisted records alone (``promote.unresolved`` stays the datasets this pass recorded). The
+US daily price entry also counts its waiting rows by reason, symbol class and disposition,
+judged now from the registry and the US lists (``us_symbols.unresolved_breakdown``).
 """
 
 from __future__ import annotations
@@ -84,26 +100,35 @@ import hashlib
 import json
 import re
 from bisect import bisect_left, bisect_right
+from calendar import monthrange
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
-from typing import TYPE_CHECKING, Final, cast
+from functools import cache
+from itertools import pairwise
+from typing import TYPE_CHECKING, Final, Literal, cast
+from zoneinfo import ZoneInfo
 
 import duckdb
 
-from aegis_alpha.storage.kr_identity import KIND_REQUIRED
+from aegis_alpha.storage import us_symbols
+from aegis_alpha.storage.calendar_declaration import packaged_declaration, parse_declaration
+from aegis_alpha.storage.dataset_catalog import CATALOG, catalog_entry
 from aegis_alpha.storage.kr_prices import CURRENCIES as KR_CURRENCIES
+from aegis_alpha.storage.market import generation_chain
 from aegis_alpha.storage.membership_pins import IdentityPin, membership_parts
 from aegis_alpha.storage.promotion import formats
 from aegis_alpha.storage.promotion.engine import dataset_head, promote
 from aegis_alpha.storage.promotion.mappers import mapper
 from aegis_alpha.storage.promotion.mappers.fred import vintage_partitions
+from aegis_alpha.storage.promotion.spec import SPEC_SCHEMA
+from aegis_alpha.storage.promotion.time_rules import TIME_COLUMNS
 from aegis_alpha.storage.provider_collection import committed_tables
 from aegis_alpha.storage.raw import put_raw
 from aegis_alpha.storage.source_library import list_sources, list_tables
 from aegis_alpha.storage.state import atomic
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Collection, Mapping, Sequence
 
     from aegis_alpha.compute_resources import ComputeBudget
     from aegis_alpha.storage.workspace import Workspace
@@ -126,6 +151,8 @@ _US_SYMBOL: Final = "provider_symbol LIKE '%.US'"
 _KR_SYMBOL: Final = "(provider_symbol LIKE '%.KO' OR provider_symbol LIKE '%.KQ')"
 _KR_PARTIAL: Final = f"reason = 'provider_reported_partial' AND {_EXCHANGE} IN ('KO', 'KQ')"
 _KR_BULK_ARGS: Final = {"currencies": dict(KR_CURRENCIES)}
+_US_PARTIAL: Final = f"reason = 'provider_reported_partial' AND {_EXCHANGE} = 'US'"
+_US_BULK_ARGS: Final = {"currencies": {"US": "USD"}}
 _ROW: Final = "(CASE WHEN json_valid(source_row_json) THEN source_row_json END)"
 
 
@@ -187,6 +214,22 @@ _SUMMARY: Final = (
 
 
 @dataclass(frozen=True, slots=True)
+class Start:
+    """The first template of a route's dataset: what an operator's first spec would declare.
+
+    ``time_rule`` is the rule document both time columns use; a ``calendar`` argument names
+    the calendar dataset whose committed head it pins. ``identity`` says whether the template
+    pins the run's identity snapshot; ``partitioned`` whether each step has a partition.
+    """
+
+    args: Mapping[str, object]
+    time_rule: Mapping[str, object]
+    decimal_rule: Mapping[str, str]
+    identity: bool = True
+    partitioned: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class Route:
     """One dataset built by one mapper from one collected source shape."""
 
@@ -202,12 +245,40 @@ class Route:
     """Arguments a derived template adds to the mapper's."""
     check: str | None = None
     """The predicate every row of a table the route claims must satisfy (``value_check``)."""
+    start: Start | None = None
+    """The first template of a dataset no chain holds yet, used when the caller names it."""
 
     @property
     def mappers(self) -> tuple[str, ...]:
         """The route's mapper and the earlier majors whose chains it continues."""
         return (self.mapper, *self.continues)
 
+
+def _actions(calendar: str, zone: str, numbers: Mapping[str, str]) -> Start:
+    """An EODHD action chain's first template: known at the ex-date's open on ``calendar``."""
+    venue = calendar.rsplit(".", 1)[1].upper()
+    rule = {"rule": "exdate_open@1", "basis": "record", "input": "ex_date",
+            "args": {"calendar": calendar, "calendar_id": venue, "venue": venue}}  # fmt: skip
+    return Start({"timezone": zone}, rule, numbers)
+
+
+# EODHD's daily FOREX bars follow the UTC day: a close is known by the end of its UTC day, the
+# fixing itself. No exchange calendar is involved, so no session close (an early one included)
+# can put availability before the fixing, and a day the exchange does not open keeps its time.
+_FX_START: Final = Start(
+    {"base": "USD", "quote": "KRW", "timezone": "UTC"},
+    {"rule": "local_day_end@1", "basis": "record", "input": "fixing_date",
+     "args": {"timezone": "UTC"}},
+    {"rate": "float_shortest@1"},
+    identity=False,
+)  # fmt: skip
+# A KIND listing is known by the end of its Seoul listing day, as a Norgate first date is.
+_STATUS_START: Final = Start(
+    {},
+    {"rule": "local_day_end@1", "basis": "record", "input": "status_date",
+     "args": {"timezone": "Asia/Seoul"}},
+    {},
+)  # fmt: skip
 
 # In dependency order: SEC facts take each filing's acceptance from the filings head.
 ROUTES: Final = (
@@ -220,6 +291,9 @@ ROUTES: Final = (
     Route("classifications.kr.kind", "kind.industry@2", "kind-listings-", "listings",
           continues=("kind.industry@1",)),
     Route("prices.us.eodhd", "eodhd.bars@1", "qveris-bulk-bars-", "bars", _US_SYMBOL),
+    Route("prices.us.eodhd", "eodhd.bulk_quarantine@1", "qveris-bulk-quarantine-",
+          "quarantine", _US_PARTIAL, derive_from="eodhd.bars@1", derive_args=_US_BULK_ARGS,
+          check=_KR_VALUES),
     Route("prices.kr.eodhd", "eodhd.bars@1", "qveris-bulk-bars-", "bars", _KR_SYMBOL),
     Route("prices.kr.eodhd", "eodhd.bulk_quarantine@1", "qveris-bulk-quarantine-",
           "quarantine", _KR_PARTIAL, derive_from="eodhd.bars@1", derive_args=_KR_BULK_ARGS,
@@ -229,19 +303,23 @@ ROUTES: Final = (
     Route("prices.kr.eodhd.ref", "eodhd.bulk_quarantine_adjusted@1", "qveris-bulk-quarantine-",
           "quarantine", _KR_PARTIAL, derive_from="eodhd.bars_adjusted@1",
           derive_args=_KR_BULK_ARGS, check=_KR_VALUES),
+    Route("actions.us.eodhd", "eodhd.splits@1", "qveris-splits-", "splits", _US_SYMBOL,
+          start=_actions("sessions.xnys", "America/New_York", {"ratio": "float_shortest@1"})),
+    Route("actions.us.eodhd", "eodhd.dividends@1", "qveris-dividends-", "dividends", _US_SYMBOL,
+          start=_actions("sessions.xnys", "America/New_York", {"amount": "decimal_text@1"})),
+    Route("actions.kr.eodhd", "eodhd.splits@1", "qveris-splits-", "splits", _KR_SYMBOL,
+          start=_actions("sessions.xkrx", "Asia/Seoul", {"ratio": "float_shortest@1"})),
+    Route("actions.kr.eodhd", "eodhd.dividends@1", "qveris-dividends-", "dividends", _KR_SYMBOL,
+          start=_actions("sessions.xkrx", "Asia/Seoul", {"amount": "decimal_text@1"})),
+    Route("fx.usdkrw.eodhd", "eodhd.fx_history@1", "qveris-fx-history-bars-", "bars",
+          "base_currency = 'USD' AND quote_currency = 'KRW'", start=_FX_START),
+    Route("status.kr.kind", "kind.status@1", "kind-listings-", "listings", start=_STATUS_START),
 )  # fmt: skip
 
 # Collected shapes whose dataset has no registered mapper yet: counted, never promoted.
-# The last field names the columns a table of the shape has (the KIND listings that
-# ``aas collect kind`` and ``aas identity kr-import`` commit, not the legacy import).
 UNMAPPED: Final = (
-    ("actions.us.eodhd", "qveris-splits-", "splits", "provider_symbol LIKE '%.US'", ()),
-    ("actions.us.eodhd", "qveris-dividends-", "dividends", "provider_symbol LIKE '%.US'", ()),
-    ("actions.kr.eodhd", "qveris-splits-", "splits", _KR_SYMBOL, ()),
-    ("actions.kr.eodhd", "qveris-dividends-", "dividends", _KR_SYMBOL, ()),
-    ("status.kr.kind", "kind-listings-", "listings", None, KIND_REQUIRED),
     ("prices.us.eodhd", "qveris-bulk-quarantine-", "quarantine",
-     f"{_EXCHANGE} = 'US'", ()),
+     f"{_EXCHANGE} = 'US' AND reason <> 'provider_reported_partial'"),
 )  # fmt: skip
 
 
@@ -268,6 +346,7 @@ class DatasetRun:
     head: str | None = None
     template: str | None = None
     derived_from: str | None = None
+    started: bool = False
     sources: list[dict[str, object]] = field(default_factory=list)
     skipped: dict[str, int] = field(default_factory=dict)
 
@@ -279,6 +358,7 @@ class DatasetRun:
             "head": self.head,
             "template_spec_sha256": self.template,
             "derived_from": self.derived_from,
+            "started": self.started,
             "sources": self.sources,
             "skipped": self.skipped,
         }
@@ -583,6 +663,61 @@ def _chain_template(
     return found
 
 
+def _started(
+    workspace: Workspace, dataset_id: str, route: Route, identity: Mapping[str, str] | None
+) -> tuple[str, str, dict] | str:
+    """The route's declared first template, or why it cannot start (the run's skip reason).
+
+    The hash is that of the declared template; it is retained only as part of the specs
+    built from it.
+    """
+    declared = cast("Start", route.start)
+    args = dict(cast("Mapping[str, object]", declared.time_rule["args"]))
+    if "calendar" in args:
+        calendar = head_pin(workspace, str(args["calendar"]))
+        if calendar is None:
+            return "no_calendar"
+        args["calendar"] = calendar
+    if declared.identity and identity is None:
+        return "identity_unavailable"
+    rule = {**declared.time_rule, "args": args}
+    # The partition only says the template is partitioned; each step sets its own.
+    partition = {"from": "1970-01-01", "to": "1970-01-02"} if declared.partitioned else None
+    template = {
+        "schema_version": SPEC_SCHEMA,
+        "target": {"domain": mapper(route.mapper).domain, "dataset_id": dataset_id,
+                   "parent": None},
+        "sources": [],
+        "mapper": {"name": route.mapper, "args": dict(declared.args)},
+        "partition": partition,
+        "time_rules": dict.fromkeys(TIME_COLUMNS, rule),
+        "decimal_rule": dict(declared.decimal_rule),
+        "quality_rules": [],
+        "tombstone_policy": {"mode": "never"},
+        "identity_snapshot": dict(identity) if declared.identity and identity else None,
+    }  # fmt: skip
+    raw = formats.canonical(template)
+    return hashlib.sha256(raw).hexdigest(), route.mapper, json.loads(raw)
+
+
+def _run_template(
+    workspace: Workspace,
+    run: DatasetRun,
+    route: Route,
+    identity: Mapping[str, str] | None,
+    start: Collection[str],
+) -> tuple[tuple[str, str, dict] | None, str | None]:
+    """The run's template (continued, derived or started) and why a named start is blocked."""
+    found = _chain_template(workspace, run, route)
+    if found is not None or route.start is None or run.dataset_id not in start:
+        return found, None
+    declared = _started(workspace, run.dataset_id, route, identity)
+    if isinstance(declared, str):
+        return None, declared
+    run.started = True
+    return declared, None
+
+
 def head_pin(workspace: Workspace, dataset_id: str) -> dict[str, str] | None:
     row = workspace.state.execute(
         "SELECT version, generation_id, chain_hash, manifest_hash FROM dataset_versions "
@@ -779,12 +914,15 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
     now_us: int,
     routes: Sequence[Route] = ROUTES,
     evaluate: bool = True,
+    start: Collection[str] = (),
 ) -> dict[str, object]:
     """Plan, or apply in order, every route's new sources as the next generations.
 
     A plan with ``evaluate`` false lists each new source's steps and specs without
     planning their promotions. With ``identity_failed`` (the run's identity stage did not
-    complete), a route whose template pins an identity snapshot promotes nothing.
+    complete), a route whose template pins an identity snapshot promotes nothing. A
+    dataset named in ``start`` whose chain holds no generation of a route's mappers starts
+    from the route's declared ``start`` template.
     """
     if apply and not evaluate:
         raise ValueError("an applied maintenance promotion evaluates every step")
@@ -797,7 +935,7 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
             runs.append(run)
             run.skipped["done"] = 0
             run.head = dataset_head(workspace, dataset_id)
-            found = _chain_template(workspace, run, route)
+            found, blocked = _run_template(workspace, run, route, identity, start)
             # The chain continues with the mapper its latest generation used.
             run.mapper = route.mapper if found is None else found[1]
             resolution = (
@@ -805,15 +943,13 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
             )
             done = _done(workspace, dataset_id, resolution)
             pending = candidates(workspace, route, linked, shas, run.skipped, done=done)
-            if run.head is None:
-                run.status = "no_head" if pending else "current"
-                run.skipped["no_head"] = len(pending)
-                continue
             if found is None:
-                run.status = "no_template" if pending else "current"
-                run.skipped["no_template"] = len(pending)
+                reason = blocked or ("no_head" if run.head is None else "no_template")
+                run.status = reason if pending else "current"
+                run.skipped[reason] = len(pending)
                 continue
-            run.template, _, template = found
+            digest, _, template = found
+            run.template = None if run.started else digest
             if identity_failed and template.get("identity_snapshot") is not None:
                 # Without this run's snapshot, new listings would resolve against an older one.
                 run.status = "identity_unavailable" if pending else "current"
@@ -862,7 +998,9 @@ def standing_unresolved(workspace: Workspace) -> dict[str, dict[str, object]]:
     tokens their latest records left unresolved, ``unpublished_sources`` counts those
     whose latest record published nothing, and ``oldest_date`` is the earliest partition
     date they cover (the UTC date of the first such record for an unpartitioned source).
-    A dataset without one is not listed.
+    A dataset without one is not listed. A US daily price dataset (``us_symbols.covers``)
+    also counts those sources' rows by reason, symbol class and disposition as the current
+    registry and US lists judge them (``us_symbols.unresolved_breakdown``).
     """
     latest: dict[tuple[str, str, str], tuple[int, bool, dict[str, object]]] = {}
     first: dict[tuple[str, str, str], int] = {}
@@ -882,9 +1020,11 @@ def standing_unresolved(workspace: Workspace) -> dict[str, dict[str, object]]:
         if waiting:
             first.setdefault(key, int(checked))
     summary: dict[str, dict[str, object]] = {}
+    tables: dict[str, list[tuple[str, str]]] = {}
     for (dataset_id, source_id, table), (_, waiting, body) in sorted(latest.items()):
         if not waiting:
             continue
+        tables.setdefault(dataset_id, []).append((source_id, table))
         entry = summary.setdefault(dataset_id, {
             "sources": 0, "rows": 0, "rows_unavailable": 0, "unresolved_tokens": 0,
             "unpublished_sources": 0, "oldest_date": None})  # fmt: skip
@@ -911,18 +1051,17 @@ def standing_unresolved(workspace: Workspace) -> dict[str, dict[str, object]]:
         oldest = min(days) if days else recorded_at.date().isoformat()
         if entry["oldest_date"] is None or oldest < cast("str", entry["oldest_date"]):
             entry["oldest_date"] = oldest
+    us_symbols.add_breakdowns(workspace, summary, tables)
     return summary
 
 
 def unmapped(workspace: Workspace) -> dict[str, int]:
     """Nonempty collected tables of each dataset that no registered mapper promotes yet."""
     counts: dict[str, int] = {}
-    for dataset_id, prefix, name, accept, columns in UNMAPPED:
+    for dataset_id, prefix, name, accept in UNMAPPED:
         for table in committed_tables(workspace, prefix):
             entry = table.entry
             if table.store != "market" or entry["name"] != name or not entry["rows"]:
-                continue
-            if columns and not set(columns) <= set(table.columns):
                 continue
             if accept is not None:
                 target = _quote(str(entry["target"]))
@@ -935,14 +1074,280 @@ def unmapped(workspace: Workspace) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def dataset_heads(workspace: Workspace) -> list[dict[str, object]]:
-    """Every committed dataset's head version and its watermarks: the run's closing state."""
+# --- data freshness ---------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Expectation:
+    """How far a dataset's data should reach at a run, and when it is stale.
+
+    ``session``: the venue's last session closed by the run; ``previous_day``: the day
+    before the run's date at the venue (OpenDART answers a day's filings the next day).
+    Both count the lag in the venue's sessions. ``series``: each series' own period,
+    inferred from its latest observation periods, is expected once one further period has
+    passed after it ends; the lag counts periods and the dataset's is its worst series.
+    ``none``: no date the data must reach (declared calendars, event domains).
+    ``stale_after`` is the lag above which the dataset is stale; ``collector`` is the
+    maintenance stage that collects its sources.
+    """
+
+    kind: Literal["session", "previous_day", "series", "none"]
+    calendar: str | None = None
+    stale_after: int | None = None
+    collector: str | None = None
+
+
+# The one place freshness thresholds live. A catalog dataset that is not frozen has an entry.
+FRESHNESS: Final[Mapping[str, Expectation]] = {
+    "prices.kr.eodhd": Expectation("session", "XKRX", 2, "qveris"),
+    "prices.kr.eodhd.ref": Expectation("session", "XKRX", 2, "qveris"),
+    "prices.us.eodhd": Expectation("session", "XNYS", 2, "qveris"),
+    "actions.us.eodhd": Expectation("session", "XNYS", 5, "qveris"),
+    "actions.kr.eodhd": Expectation("session", "XKRX", 20, "qveris"),
+    "filings.us.sec": Expectation("session", "XNYS", 2, "sec"),
+    "fundamentals.us.sec": Expectation("session", "XNYS", 5, "sec"),
+    "filings.kr.dart": Expectation("previous_day", "XKRX", 2, "dart"),
+    "fundamentals.kr.dart": Expectation("previous_day", "XKRX", 5, "dart"),
+    "macro.us.alfred": Expectation("series", stale_after=2, collector="fred"),
+    "fx.usdkrw.fred": Expectation("series", stale_after=5, collector="fred"),
+    "fx.usdkrw.eodhd": Expectation("session", "XNYS", 5, "qveris"),
+    "macro.kr.bok": Expectation("series", stale_after=2),
+    "macro.kr.oecd": Expectation("series", stale_after=2),
+    "sessions.xnys": Expectation("none"),
+    "sessions.xkrx": Expectation("none"),
+    "status.kr.kind": Expectation("none", collector="kind"),
+    "classifications.us.sec": Expectation("none"),
+    "classifications.kr.kind": Expectation("none", collector="kind"),
+}
+# Consecutive runs whose collector succeeded while the head did not advance and the data
+# was behind (or had no expected date) before a dataset is stale.
+STALE_AFTER_ZERO_PROMOTION_RUNS: Final = 5
+# Providers whose subscription ended: every dataset of theirs is frozen. The catalog's own
+# ``frozen`` flag marks only the datasets it promotes from retained exports.
+FROZEN_PROVIDERS: Final = frozenset({"norgate", "fmp"})
+_SERIES_PERIODS: Final = 12
+_UTC_DAY: Final = "(DATE '1970-01-01' + CAST(floor({} / 86400000000.0) AS INTEGER))"
+# The column (or UTC date of an instant) that says how far each domain's data reaches.
+DATA_DATES: Final[Mapping[str, str]] = {
+    "prices": '"session_date"',
+    "corporate_actions": '"ex_date"',
+    "instrument_status": _UTC_DAY.format('"effective_from_us"'),
+    "fundamentals": _UTC_DAY.format('"available_at_us"'),
+    "macro_observations": '"observation_period"',
+    "fx_rates": _UTC_DAY.format('"fixing_at_us"'),
+    "filings": '"filed_date"',
+    "classifications": '"effective_from"',
+    "calendar_sessions": '"session_date"',
+    "estimates": '"target_period"',
+    "feature_values": _UTC_DAY.format('"feature_at_us"'),
+}
+_SERIES_KEYS: Final = {"macro_observations": '"series_id"',
+                       "fx_rates": '("base_currency" || \'/\' || "quote_currency")'}  # fmt: skip
+
+
+def _base(dataset_id: str) -> str:
+    entry = catalog_entry(dataset_id)
+    return dataset_id if entry is None else entry.dataset_id
+
+
+def frozen(dataset_id: str) -> bool:
+    """Whether the dataset's provider stopped: the catalog's flag or a frozen provider."""
+    entry = catalog_entry(dataset_id)
+    return (entry is not None and entry.frozen) or bool(
+        FROZEN_PROVIDERS & set(_base(dataset_id).split("."))
+    )
+
+
+def collector(dataset_id: str) -> str | None:
+    """The maintenance stage that collects the dataset's sources, if any."""
+    found = FRESHNESS.get(_base(dataset_id))
+    return None if found is None else found.collector
+
+
+@cache
+def _sessions(calendar: str) -> tuple[ZoneInfo, list[date], list[datetime]]:
+    """The packaged declaration's open sessions with their close instants, in order."""
+    raw = packaged_declaration(calendar)
+    declaration = parse_declaration(raw, hashlib.sha256(raw).hexdigest())
+    zone = ZoneInfo(declaration.timezone)
+    days, closes = [], []
+    for item in declaration.days():
+        if item.close_local is not None:
+            days.append(item.session_date)
+            closes.append(item.close_local.replace(tzinfo=zone))
+    return zone, days, closes
+
+
+def _expected_day(expectation: Expectation, now: datetime) -> date | None:
+    """The date the data should reach at ``now``; None past the packaged declaration."""
+    zone, days, closes = _sessions(cast("str", expectation.calendar))
+    if expectation.kind == "previous_day":
+        day = now.astimezone(zone).date() - timedelta(days=1)
+        return day if days and days[0] <= day < days[-1] else None
+    closed = bisect_right(closes, now)
+    if closed == 0 or closed == len(closes):
+        return None
+    return days[closed - 1]
+
+
+def _session_lag(calendar: str, data: date, expected: date) -> int:
+    _, days, _ = _sessions(calendar)
+    return max(0, bisect_right(days, expected) - bisect_right(days, data))
+
+
+# Month counts by the day gaps they span: monthly, quarterly, half-yearly, yearly.
+_MONTHLY: Final = {1: (28, 31), 3: (89, 92), 6: (181, 184), 12: (365, 366)}
+
+
+def _shift(day: date, cadence: int, steps: int) -> date:
+    """``day`` moved by ``steps`` periods: weekdays, or calendar months for monthly cadences."""
+    if cadence == 1:
+        moved = day
+        for _ in range(abs(steps)):
+            moved += timedelta(days=1 if steps > 0 else -1)
+            while moved.weekday() >= 5:  # noqa: PLR2004 -- Saturday and Sunday
+                moved += timedelta(days=1 if steps > 0 else -1)
+        return moved
+    months = next((m for m, (low, high) in _MONTHLY.items() if low <= cadence <= high), None)
+    if months is None:
+        return day + timedelta(days=cadence * steps)
+    index = day.year * 12 + day.month - 1 + months * steps
+    year, month = divmod(index, 12)
+    return date(year, month + 1, min(day.day, monthrange(year, month + 1)[1]))
+
+
+def _series_lag(periods: Sequence[date], today: date) -> tuple[date, int] | None:
+    """The latest expected period and the periods the series is behind it.
+
+    A period is expected once one further period has passed after it ends, so a daily
+    series' Monday is due on Wednesday and a month's on the first of the month after next.
+    A series with one period has no cadence and no lag.
+    """
+    ordered = sorted(set(periods))
+    gaps = [(later - earlier).days for earlier, later in pairwise(ordered)]
+    if not gaps:
+        return None
+    cadence = 1 if min(gaps) <= 3 else min(gaps)  # noqa: PLR2004 -- a weekend between weekdays
+    expected, lag = ordered[-1], 0
+    # Data ahead of the expectation: step back to the latest period already due.
+    while _shift(expected, cadence, 2) > today:
+        expected = _shift(expected, cadence, -1)
+    # Data behind it: every further period already due is one period of lag.
+    while _shift(_shift(expected, cadence, 1), cadence, 2) <= today:
+        expected = _shift(expected, cadence, 1)
+        lag += 1
+    return expected, lag
+
+
+def _chain(workspace: Workspace, generation_id: str) -> tuple[str, list[str]]:
+    chain = generation_chain(workspace.market, generation_id)
+    return str(chain[-1]["domain"]), [str(marker["generation_id"]) for marker in chain]
+
+
+# The rows of a chain that are still the current revision of their record: a revision a later
+# generation superseded or tombstoned no longer counts, and a tombstone is no data itself.
+_CURRENT: Final = (
+    "op<>'TOMBSTONE' AND generation_id IN (SELECT unnest($g::VARCHAR[])) "
+    "AND revision_id NOT IN (SELECT supersedes_revision_id FROM {table} "
+    "WHERE supersedes_revision_id IS NOT NULL AND op IN ('SUPERSEDE', 'TOMBSTONE') "
+    "AND generation_id IN (SELECT unnest($g::VARCHAR[])))"
+)
+
+
+def _data_through(workspace: Workspace, domain: str, generations: list[str]) -> date | None:
+    column = DATA_DATES.get(domain)
+    if column is None:
+        return None
+    current = _CURRENT.format(table=_quote(domain))
+    row = workspace.market.execute(
+        f"SELECT max({column}) FROM {_quote(domain)} WHERE {current}",  # noqa: S608 -- code-owned columns and tables
+        {"g": generations},
+    ).fetchone()
+    return None if row is None else cast("date | None", row[0])
+
+
+def _series_periods(
+    workspace: Workspace, domain: str, generations: list[str]
+) -> dict[str, list[date]]:
+    key, column = _SERIES_KEYS[domain], DATA_DATES[domain]
+    found: dict[str, list[date]] = {}
+    for series, period in workspace.market.execute(
+        f"SELECT s, d FROM (SELECT DISTINCT {key} AS s, {column} AS d FROM {_quote(domain)} "  # noqa: S608 -- code-owned columns and tables
+        f"WHERE {_CURRENT.format(table=_quote(domain))}) "
+        f"QUALIFY row_number() OVER (PARTITION BY s ORDER BY d DESC) <= {_SERIES_PERIODS}",
+        {"g": generations},
+    ).fetchall():
+        found.setdefault(str(series), []).append(cast("date", period))
+    return found
+
+
+def freshness(
+    workspace: Workspace, dataset_id: str, generation_id: str | None, now: datetime
+) -> dict[str, object]:
+    """How far the dataset's data reaches, how far it should, and its freshness state.
+
+    Read-only: the market rows of the head's chain and the packaged session calendars.
+    """
+    result: dict[str, object] = {
+        "data_through": None, "expected_through": None, "lag_sessions": None,
+        "lag_unit": None, "stale_after": None, "freshness": "no_head",
+        "stale_reasons": [], "stale_series": [], "zero_promotion_runs": None,
+    }  # fmt: skip
+    if generation_id is None:
+        return result
+    domain, generations = _chain(workspace, generation_id)
+    data = _data_through(workspace, domain, generations)
+    result["data_through"] = None if data is None else data.isoformat()
+    expectation = FRESHNESS.get(_base(dataset_id), Expectation("none"))
+    if frozen(dataset_id):
+        result["freshness"] = "frozen"
+        return result
+    if data is None:
+        result["freshness"] = "no_data"
+        return result
+    result["freshness"] = "untracked"
+    expected: date | None = None
+    lag: int | None = None
+    if expectation.kind in {"session", "previous_day"}:
+        expected = _expected_day(expectation, now)
+        if expected is not None:
+            lag = _session_lag(cast("str", expectation.calendar), data, expected)
+            result["lag_unit"] = "sessions"
+    elif expectation.kind == "series" and domain in _SERIES_KEYS:
+        today = now.astimezone(UTC).date()
+        lags = {series: found for series, periods in
+                _series_periods(workspace, domain, generations).items()
+                if (found := _series_lag(periods, today)) is not None}  # fmt: skip
+        if lags:
+            expected = max(found[0] for found in lags.values())
+            lag = max(found[1] for found in lags.values())
+            result["lag_unit"] = "periods"
+            result["stale_series"] = sorted(
+                series for series, found in lags.items()
+                if found[1] > cast("int", expectation.stale_after)
+            )  # fmt: skip
+    if lag is None:
+        return result
+    result.update(expected_through=cast("date", expected).isoformat(), lag_sessions=lag,
+                  stale_after=expectation.stale_after)  # fmt: skip
+    stale = lag > cast("int", expectation.stale_after)
+    result["freshness"] = "stale" if stale else "current"
+    result["stale_reasons"] = ["lag"] if stale else []
+    return result
+
+
+def dataset_heads(workspace: Workspace, *, now: datetime) -> list[dict[str, object]]:
+    """Every committed dataset's head, watermarks and data freshness at ``now``.
+
+    A watermark is the latest ingestion time, not how far the data reaches; ``freshness``
+    reports that. A catalog dataset without a committed version is listed as ``no_head``.
+    """
     heads: list[dict[str, object]] = []
-    for dataset_id, version, sequence, rows in workspace.state.execute(
-        "SELECT dataset_id, version, sequence, row_count FROM dataset_versions v "
+    for dataset_id, version, sequence, rows, generation_id in workspace.state.execute(
+        "SELECT dataset_id, version, sequence, row_count, generation_id FROM dataset_versions v "
         "WHERE status='committed' AND sequence=(SELECT max(sequence) FROM dataset_versions w "
         "WHERE w.dataset_id=v.dataset_id AND w.status='committed') ORDER BY dataset_id"
-    ):
+    ).fetchall():
         watermarks = {
             f"{provider}/{partition}": {"through_us": int(through), "version": str(committed)}
             for provider, partition, through, committed in workspace.state.execute(
@@ -958,6 +1363,14 @@ def dataset_heads(workspace: Workspace) -> list[dict[str, object]]:
                 "sequence": int(sequence),
                 "rows": int(rows),
                 "watermarks": watermarks,
+                **freshness(workspace, str(dataset_id), str(generation_id), now),
             }
         )
+    listed = {str(item["dataset_id"]) for item in heads}
+    heads.extend(
+        {"dataset_id": entry.dataset_id, "version": None, "sequence": None, "rows": 0,
+         "watermarks": {}, **freshness(workspace, entry.dataset_id, None, now)}
+        for entry in CATALOG if entry.dataset_id not in listed
+    )  # fmt: skip
+    heads.sort(key=lambda item: str(item["dataset_id"]))
     return heads

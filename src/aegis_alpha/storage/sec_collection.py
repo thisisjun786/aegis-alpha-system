@@ -10,7 +10,8 @@
    and the filings companyfacts answers reported facts of;
 3. read every uncovered weekday's daily index up to yesterday (New York), then ask each
    filer's submissions document for its wanted filings that are not listed yet, and its
-   companyfacts for its wanted reports that have no facts yet (``data.sec_collect``). A
+   companyfacts for its wanted reports that have no facts yet (``data.sec_collect``),
+   oldest wanted filing first, so a backlog over the call budget continues next run. A
    daily index answering 403 is checked against its quarter listing: a listing without
    the day's index makes the day one without an index, as a 404 does; any other answer
    leaves the refusal standing and stops the run;
@@ -281,16 +282,25 @@ def load_known(workspace: Workspace) -> Known:
     return known
 
 
-def universe(workspace: Workspace, policy: sec.SecPolicy) -> Callable[[str], bool]:
-    """Whether a CIK is collected: every CIK, or those whose SEC issuer is registered."""
+def universe(
+    workspace: Workspace, policy: sec.SecPolicy, knowledge: sec.SecKnowledge
+) -> Callable[[str], bool]:
+    """Whether a CIK is collected: every CIK, or those whose SEC issuer is registered.
+
+    The ``reporting`` scope adds every filer the read indexes show filing a periodic
+    report (``sec.reporting_filers``), so it is taken after the run's indexes are read.
+    """
     if policy.issuers == "all":
         return lambda _: True
     registered = {str(row[0]) for row in workspace.state.execute("SELECT issuer_id FROM issuers")}
+    reporting = (
+        sec.reporting_filers(knowledge, policy) if policy.issuers == "reporting" else frozenset()
+    )
     cache: dict[str, bool] = {}
 
     def contains(cik: str) -> bool:
         if cik not in cache:
-            cache[cik] = mint_issuer("sec_cik", cik) in registered
+            cache[cik] = cik in reporting or mint_issuer("sec_cik", cik) in registered
         return cache[cik]
 
     return contains
@@ -405,9 +415,10 @@ def collect_sec(  # noqa: PLR0913 -- every bound of one run is explicit
     today = sec.edgar_day(now)
     for planned in sec.plan_indexes(run.knowledge, today, policy, since):
         run.ask(planned)
-    contains = universe(workspace, policy)
+    contains = universe(workspace, policy, run.knowledge)
     filings, facts, _ = sec.plan_documents(run.knowledge, clock(), policy, contains)
-    for planned in (*filings, *facts):
+    # Oldest first: a backlog over the call budget continues in the next runs.
+    for planned in sec.oldest_first([*filings, *facts]):
         if caller.stopped is not None:
             break
         run.ask(planned)
@@ -483,7 +494,7 @@ def plan_sec(
         for digest in ledger.charged_receipts(workspace.state, PROVIDER)
         if digest not in known.committed_receipts
     ]
-    contains = universe(workspace, policy)
+    contains = universe(workspace, policy, known.knowledge)
     return {
         "mode": "plan",
         "provider_calls": 0,

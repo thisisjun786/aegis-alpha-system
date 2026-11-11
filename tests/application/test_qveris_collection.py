@@ -12,6 +12,7 @@ from aegis_alpha.application.daily_collection import run_daily
 from aegis_alpha.application.provider_config import CollectionConfig, ProviderProfile
 from aegis_alpha.application.qveris_collection import run_qveris_profile
 from aegis_alpha.data.serialization import canonical_json_bytes
+from tests.data.qveris_support import bulk_job
 
 # Serial: these tests take the host-wide Qveris account lease (an abstract Unix socket named by
 # the synthetic account), so every file that takes it runs in one xdist worker.
@@ -133,3 +134,26 @@ def test_missing_option_fails_before_file_or_provider_access(
     assert result["error_type"] == "ValueError"
     assert result["result"] == {"provider_calls": 0, "http_requests": 0}
     assert client.calls == []
+
+
+@pytest.mark.parametrize(
+    ("failure", "outcome"),
+    [("empty-result", "empty_result"), ("settlement-down", "held"), ("schema", "failed")],
+)
+def test_a_failed_profile_says_whether_it_was_empty_or_held(
+    tmp_path: Path, failure: str, outcome: str
+) -> None:
+    base = profile(tmp_path)
+    jobs = tmp_path / "dividends.json"
+    document = {"schema_version": 1, "jobs": [bulk_job("US", "dividends").document()]}
+    jobs.write_bytes(canonical_json_bytes(document))
+    digest = hashlib.sha256(jobs.read_bytes()).hexdigest()
+    selected = replace(base, options={**base.options, "jobs": str(jobs), "jobs_sha256": digest})
+    client = FakeQveris()
+    if failure == "settlement-down":
+        client.usage_ready = False
+    else:
+        client.failure = failure
+    report = run_qveris_profile(selected, client=client)
+    # Fail-fast stays: the exit code is 1 for all three, the outcome tells them apart.
+    assert (report["status"], report["exit_code"], report["outcome"]) == ("failed", 1, outcome)

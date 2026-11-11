@@ -247,8 +247,10 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   new source becomes the head's child under the latest committed spec that used one of those
   mappers, continued with that spec's mapper, with only parent, sources, partition, generation
   pins (to current heads), the maintenance identity snapshot and a `never` tombstone advanced,
-  and a `maintain_source@1` quality check marks the source done. It never starts a chain and
-  never changes a chain's rules or mapper: `classifications.kr.kind` continues a chain whose
+  and a `maintain_source@1` quality check marks the source done. It starts a chain only from a
+  route's declared `start` template for a dataset the caller names in `start` (`actions.*.eodhd`,
+  `fx.usdkrw.eodhd`, `status.kr.kind`; `aas maintain` names none yet), and never changes a
+  chain's rules or mapper: `classifications.kr.kind` continues a chain whose
   latest generation used `kind.industry@1` under `@1`, and moves to `kind.industry@2` only
   after an operator publishes an `@2` generation. A table under a route's prefix that lacks a
   column its mapper reads (`source_columns`), such as the legacy `korea.public_response@1`
@@ -264,7 +266,8 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   or, over a gap with weekdays, one bridge claim of at most `MAX_BRIDGE_DAYS` verified at
   both ends; every other day stays unresolved with its reason.
   `promote_datasets` reports `standing_unresolved` from the persisted `maintain_source@1`
-  records, and an unresolved record of a partitioned source keys its re-plan on the identity
+  records (the US daily price entry adds its waiting rows by reason, symbol class and
+  disposition, judged now: `us_symbols.unresolved_breakdown`), and an unresolved record of a partitioned source keys its re-plan on the identity
   rows that can hold at any instant of its own dates (`key_scope`). See the maintenance section of `dev-notes/design/data-vertical.md`.
 - `bulk_generation` publishes a staged DuckDB table as one generation: plan without
   writing, then one transaction with the marker and `INSERT … SELECT`. DuckDB encodes and
@@ -340,7 +343,9 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   when it has rows, the held `quarantine` table first, both under the hex of the job's
   `complete.json` and its four page files. The identity document its rows used is lineage
   (`identity_sha256`), so a grown identity document never re-imports a job. A warned
-  download is held whole with `provider_reported_partial` and never blocks the import; a
+  download is held whole, each row with `provider_reported_partial` when its values pass
+  `qveris_native.warned_value_reason` and with that check's reason otherwise, and never
+  blocks the import; a
   committed rows source makes the unit `reused`. It never calls a provider.
 - `kr_identity` builds the KR registry document from three identity mappers
   (`eodhd.kr_symbol@1`, `kind.listings@1`, `dart.corp_codes@1`) over committed sources and

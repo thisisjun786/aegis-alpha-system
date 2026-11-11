@@ -22,7 +22,13 @@ from typing import cast
 import duckdb
 import pytest
 
-from aegis_alpha.application.maintain import Policies, Ports, plan_maintenance, run_maintenance
+from aegis_alpha.application.maintain import (
+    Policies,
+    Ports,
+    plan_maintenance,
+    promotion_streaks,
+    run_maintenance,
+)
 from aegis_alpha.application.maintain_config import (
     DartSettings,
     FredSettings,
@@ -38,6 +44,7 @@ from aegis_alpha.data.opendart_cohort import CohortPolicy
 from aegis_alpha.data.qveris_client import QverisResponse, QverisTransportError
 from aegis_alpha.storage import maintain_identity, maintain_promotion
 from aegis_alpha.storage.identity import mint_instrument
+from aegis_alpha.storage.maintain_promotion import STALE_AFTER_ZERO_PROMOTION_RUNS
 from aegis_alpha.storage.promotion.engine import promote
 from aegis_alpha.storage.provider_collection import committed_tables
 from aegis_alpha.storage.verification import verify_workspace
@@ -239,6 +246,15 @@ def _statuses(report: dict[str, object]) -> dict[str, str]:
     }
 
 
+def _route_statuses(report: dict[str, object]) -> dict[tuple[str, str], str]:
+    """Each route's status by (dataset, mapper): a dataset may be continued by two routes."""
+    stage = cast("dict[str, object]", cast("dict[str, object]", report["stages"])["promote"])
+    return {
+        (str(item["dataset_id"]), str(item["mapper"])): str(item["status"])
+        for item in cast("list[dict[str, object]]", stage["datasets"])
+    }
+
+
 def _advance(world: World) -> None:
     """The next day: one new session, one new filing with facts, one new ALFRED vintage."""
     world.clock.advance(days=1)
@@ -273,10 +289,11 @@ def test_two_daily_runs_continue_every_chain_and_repeat_nothing(tmp_path: Path) 
     world = World(tmp_path)
     first = world.run()
     assert first["exit_code"] == 0, first["failed_stages"]
-    statuses = _statuses(first)
+    statuses = _route_statuses(first)
     # No dataset has a chain yet: maintenance continues chains, it never starts one.
-    for name in ("macro.us.alfred", "filings.us.sec", "prices.us.eodhd"):
-        assert statuses[name] == "no_head"
+    for route in (("macro.us.alfred", "fred.alfred@1"), ("filings.us.sec", "sec.submissions@1"),
+                  ("prices.us.eodhd", "eodhd.bars@1")):  # fmt: skip
+        assert statuses[route] == "no_head"
     collect = cast("dict[str, dict[str, object]]", first["stages"])
     assert collect["qveris"]["provider_calls"] == 2
     assert cast("dict[str, int]", collect["qveris"]["reasons"])["new"] == 2
@@ -640,7 +657,8 @@ def test_warned_kr_bulk_days_continue_a_history_only_chain_and_the_store_verifie
     assert second["exit_code"] == 0, second["failed_stages"]
     stage = cast("dict[str, object]", cast("dict[str, object]", second["stages"])["promote"])
     (bulk,) = [item for item in cast("list[dict[str, object]]", stage["datasets"])
-               if item["mapper"] == "eodhd.bulk_quarantine@1"]  # fmt: skip
+               if (item["dataset_id"], item["mapper"])
+               == ("prices.kr.eodhd", "eodhd.bulk_quarantine@1")]  # fmt: skip
     assert (bulk["status"], bulk["derived_from"]) == ("advanced", "eodhd.bars@1")
     assert [item["status"] for item in cast("list[dict[str, object]]", bulk["sources"])] == [
         "promoted"
@@ -656,6 +674,87 @@ def test_warned_kr_bulk_days_continue_a_history_only_chain_and_the_store_verifie
         ).fetchone()
         assert flagged == (3,)
         assert verify_workspace(ws)["verified"] is True
+
+
+def _held_reasons(ws: Workspace, day: date) -> list[str]:
+    found: list[str] = []
+    for table in committed_tables(ws, "qveris-bulk-quarantine-"):
+        rows = ws.market.execute(
+            f'SELECT reason, source_row_json FROM "{table.entry["target"]}" ORDER BY ordinal'  # noqa: S608 -- quoted
+        ).fetchall()
+        found += [str(reason) for reason, row in rows if json.loads(row)["date"] == str(day)]
+    return found
+
+
+def test_a_warned_day_with_a_bad_row_is_partial_held_by_reason_and_asked_again_within_caps(
+    tmp_path: Path,
+) -> None:
+    world = KrWorld(tmp_path)
+    bad = {"code": "000202", "exchange_short_name": "KO",
+           **bar(TUE.isoformat(), open=52100, high=52500, low=52600, close=52300)}  # fmt: skip
+    (tuesday,) = _kr_rows([TUE], ["000101"])
+    world.qveris.rows = {**world.qveris.rows, tuesday: [
+        *cast("list[object]", _kr_rows([TUE], ["000101"])[tuesday]), bad]}  # fmt: skip
+    first = world.run()
+    assert first["exit_code"] == 0, first["failed_stages"]
+    stages = cast("dict[str, dict[str, object]]", first["stages"])
+    assert cast("dict[str, object]", stages["qveris"]["cohort"])["warned"] == 4
+    snapshot = cast("dict[str, str]", stages["identity"]["snapshot"])
+    friday = MON - timedelta(days=3)
+    with open_workspace(world.home, writable=True, strategy_write=True) as ws:
+        # Only Tuesday's low-above-open row carries its own reason; the others stay partial.
+        assert _held_reasons(ws, TUE) == ["provider_reported_partial", "inconsistent_ohlc"]
+        assert _held_reasons(ws, MON) == ["provider_reported_partial"]
+        history = add_source(ws, [kr_bar("000101.KO", friday, 52000.0, retrieved=SEOUL_DAY1)],
+                             tag="history")  # fmt: skip
+        rules = {"available_at_us": KR_PARTIAL_RULE, "revision_known_at_us": KR_PARTIAL_RULE}
+        backfill = price_spec([history], snapshot, rules=rules,
+                              partition={"from": "2026-01-01", "to": "2027-01-01"},
+                              decimals=KRW)  # fmt: skip
+        assert promote(ws, *backfill, apply=True)["published"] is True
+
+    # The next day the caps cover Wednesday and the two symbol lists, not Tuesday's retry.
+    world.clock.advance(days=1)
+    world.qveris.rows = {**world.qveris.rows, **_kr_rows([WED], ["000101"])}
+    qveris = cast("QverisSettings", world.config.qveris)
+    world.config = replace(world.config, qveris=replace(
+        qveris, caps=replace(qveris.caps, max_calls=3)))  # fmt: skip
+    executed = world.qveris.execute_count
+    second = world.run()
+    assert second["exit_code"] == 0, second["failed_stages"]
+    stage = cast("dict[str, dict[str, object]]", second["stages"])["qveris"]
+    assert cast("dict[str, int]", stage["reasons"])["partial_retry"] == 1
+    assert stage["partial"] == 1  # Monday: every row passed, so it is not asked again
+    warnings = cast("dict[str, object]", stage["warnings"])
+    # The two warned KR symbol lists have no value checks: unjudged, refreshed by their rule.
+    assert (warnings["held_rows"], warnings["unjudged"]) == (1, 2)
+    assert world.qveris.execute_count - executed == 3
+    assert cast("dict[str, int]", stage["settled_after"])["released"] == 1
+    listed = mint_instrument("krx_isin", isin("000010101"))
+    with open_workspace(world.home) as ws:
+        days = ws.market.execute(
+            "SELECT session_date FROM prices WHERE instrument_id=? ORDER BY 1", (listed,)
+        ).fetchall()
+        # Tuesday's table holds a failing row, so the maintenance route keeps it whole.
+        assert days == [(friday,), (MON,), (WED,)]
+
+    # With room under the caps, Tuesday is asked again; its clean answer is promoted.
+    world.clock.advance(days=1)
+    thursday = WED + timedelta(days=1)
+    world.qveris.rows = {**world.qveris.rows, **_kr_rows([TUE, thursday], ["000101"])}
+    world.config = replace(world.config, qveris=qveris)
+    third = world.run()
+    assert third["exit_code"] == 0, third["failed_stages"]
+    stage = cast("dict[str, dict[str, object]]", third["stages"])["qveris"]
+    assert cast("dict[str, int]", stage["reasons"])["partial_retry"] == 1
+    with open_workspace(world.home) as ws:
+        days = ws.market.execute(
+            "SELECT session_date FROM prices WHERE instrument_id=? ORDER BY 1", (listed,)
+        ).fetchall()
+        assert days == [(friday,), (MON,), (TUE,), (WED,), (thursday,)]
+        assert verify_workspace(ws)["verified"] is True
+    planned = cast("dict[str, dict[str, object]]", world.run()["stages"])["qveris"]
+    assert cast("dict[str, int]", planned["reasons"])["partial_retry"] == 0
 
 
 def test_a_plan_skips_legacy_shaped_kind_listings(tmp_path: Path) -> None:
@@ -686,8 +785,11 @@ def test_a_plan_skips_legacy_shaped_kind_listings(tmp_path: Path) -> None:
     assert sorted((str(item["source_id"]), item["status"]) for item in sources) == [
         (source_id, "planned") for source_id in listed
     ]
-    unmapped = cast("dict[str, int]", stages["promote"]["unmapped"])
-    assert unmapped["status.kr.kind"] == 2
+    # The status route sees both lists as candidates of a chain no run has started yet.
+    assert "status.kr.kind" not in cast("dict[str, int]", stages["promote"]["unmapped"])
+    (status,) = [item for item in runs if item["dataset_id"] == "status.kr.kind"]
+    assert status["status"] == "no_head"
+    assert cast("dict[str, int]", status["skipped"]) == {"done": 0, "shape": 1, "no_head": 2}
 
 
 def test_an_unsettled_paid_page_stops_every_run_until_its_settlement(tmp_path: Path) -> None:
@@ -761,6 +863,52 @@ def test_every_stage_reports_its_elapsed_time_and_memory(tmp_path: Path) -> None
         assert cast("float", numbers["elapsed_seconds"]) >= 0
     stored = json.loads((world.home / "runtime" / "maintain-report.json").read_text())
     assert stored["stage_resources"] == resources
+
+
+def test_the_heads_stage_reads_the_previous_report_for_its_streaks(tmp_path: Path) -> None:
+    world = World(tmp_path)
+    world.config = replace(world.config, jobs_enabled=False)
+    stages = cast("dict[str, dict[str, object]]", world.run()["stages"])
+    assert stages["heads"]["previous_report"] == "missing"
+    heads = cast("list[dict[str, object]]", stages["heads"]["datasets"])
+    # Every catalog dataset is listed; none has a head in this installation.
+    assert {item["freshness"] for item in heads} == {"no_head"}
+    again = cast("dict[str, dict[str, object]]", world.run()["stages"])
+    assert again["heads"]["previous_report"] == "read"
+
+
+def _streak_head(sequence: int, *, lag: int | None = 1) -> dict[str, object]:
+    return {"dataset_id": "prices.kr.eodhd", "sequence": sequence, "lag_sessions": lag,
+            "freshness": "current", "stale_reasons": [], "zero_promotion_runs": None}  # fmt: skip
+
+
+def _streak(
+    previous: dict[str, object] | None, head: dict[str, object], collected: frozenset[str]
+) -> dict[str, object]:
+    known = {} if previous is None else {"prices.kr.eodhd": previous}
+    promotion_streaks([head], known, collected)
+    return head
+
+
+def test_runs_that_collect_but_never_promote_a_lagging_head_mark_it_stale() -> None:
+    qveris = frozenset({"qveris"})
+    head = _streak(None, _streak_head(3), qveris)  # nothing to compare with: no count
+    counts = [head["zero_promotion_runs"]]
+    for _ in range(STALE_AFTER_ZERO_PROMOTION_RUNS):
+        assert head["freshness"] == "current"
+        head = _streak(head, _streak_head(3), qveris)
+        counts.append(head["zero_promotion_runs"])
+    assert counts == list(range(STALE_AFTER_ZERO_PROMOTION_RUNS + 1))
+    assert (head["freshness"], head["stale_reasons"]) == ("stale", ["zero_promotion"])
+    # A run that collected nothing for it carries the count; a promotion resets it.
+    carried = _streak(head, _streak_head(3), frozenset({"fred"}))
+    assert (carried["zero_promotion_runs"], carried["freshness"]) == (
+        STALE_AFTER_ZERO_PROMOTION_RUNS, "stale")  # fmt: skip
+    advanced = _streak(head, _streak_head(4), qveris)
+    assert (advanced["zero_promotion_runs"], advanced["freshness"]) == (0, "current")
+    # Data already current needs no promotion: the count resets.
+    current = _streak(head, _streak_head(3, lag=0), qveris)
+    assert (current["zero_promotion_runs"], current["freshness"]) == (0, "current")
 
 
 def _kr_new_listing(world: KrWorld, *, symbol_list: bool) -> None:

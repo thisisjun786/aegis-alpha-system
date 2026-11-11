@@ -261,8 +261,10 @@ instrument_type, currency, ...}}}`)의 SHA-256은 적재 코드·변환 해시�
 - 행 테이블은 비어 있어도 commit한다(분할이 없는 거래일도 사실이다). 보류 테이블은 행이 있을 때만,
   행 테이블보다 먼저 commit하므로 행 원천이 있으면 단위가 완결이다. 다시 적재하면 행 원천이 있는 단위는
   다시 만들지 않고 `reused`로 센다.
-- 공급자 경고는 기록만 한다. 경고가 붙은 내려받기의 모든 행은 `provider_reported_partial` 사유로 보류되고
-  적재는 계속된다. 승격은 그 행에 같은 flag를 단다([KR 가격](#kr-가격)).
+- 공급자 경고는 기록만 한다. 경고가 붙은 내려받기의 모든 행은 보류되고 적재는 계속된다. 깨끗한 응답 경로와
+  같은 값 검사(`YYYY-MM-DD` 날짜, 가격·거래량은 `_bar`, 분할·배당은 `_action`의 값 검사, identity는 보지
+  않음)를 통과한 행은 `provider_reported_partial` 사유, 어긴 행은 그 검사의 사유(`inconsistent_ohlc` 등)로
+  보류된다. 승격은 `provider_reported_partial` 행에 같은 flag를 단다([KR 가격](#kr-가격)).
 - 분할 비율, 배당 금액·통화·날짜·주기는 공급자 텍스트 그대로(숫자는 가장 짧은 십진 표기) 남긴다.
   identity가 없는 종목, 양수 십진수가 아닌 비율·금액은 그 사유로 보류하고 고치지 않는다. 통화쌍
   이력은 instrument가 아니므로 identity 문서 없이 쌍·기준 통화·호가 통화를 남긴다.
@@ -514,8 +516,14 @@ microsecond, 시간 입력은 `session_date` 하나다. 값 일부만 있는 bar
 `sec.submissions@1`과 `sec.companyfacts@1`은 [SEC 공시와 재무](#sec-공시와-재무)를 발행인 단위
 `filings`와 `fundamentals`로 옮기며, 재무 매퍼는 pin한 공시 generation을 참조로 조인한다.
 
-예정된 매퍼(Linear AAS-77, 대응표 DV-413~416): `actions.us.eodhd`·`actions.kr.eodhd`를 만드는 Qveris
-일간 `splits`·`dividends` 매퍼, `status.kr.kind`를 만드는 KIND 상장 상태 매퍼, `filings.kr.dart`에
+Qveris 일간 `splits`·`dividends`(`eodhd.splits@1`, `eodhd.dividends@1`)와 KIND 상장 상태(`kind.status@1`)
+매퍼도 [기업행동과 상장 상태 매퍼](#기업행동과-상장-상태-매퍼)가 소유한다. `eodhd.fx_history@1`은 Qveris
+`<PAIR>.FOREX` 일간 이력(`qveris-fx-history-bars-*` `bars`)의 `base_currency`·`quote_currency`·`date`·binary64
+`close`·`retrieved_at`을 읽어 명세의 `base`/`quote` 쌍 행만 `fx_rates`로 옮긴다. `rate`는 `close`를
+`float_shortest@1`에 넘기고(유한한 양수면 `present`, 없으면 `missing`, 그 밖은 `invalid`), `fixing_at_us`는
+명세 `timezone`(유지보수 시작 선언은 `UTC`)에서 `date`의 마지막 마이크로초, 시간 입력 `fixing_date`는 그 날짜,
+수집 시각은 `retrieved_at`이다. 수집기가 값이 맞지 않거나 경고된 내려받기의 bar를 `quarantine`에 두므로 이 매퍼는
+행 테이블만 읽는다. 예정된 매퍼(Linear AAS-77, 대응표 DV-416): `filings.kr.dart`에
 공시 목록(`list.json`)을 더하는 `dart.list`. identity 원천을 읽는 매퍼는 typed generation이
 아니라 등록 문서를 만든다. `eodhd.kr_symbol`, `kind.listings`, `dart.corp_codes`는
 [KR 등록](#kr-등록)이, `norgate.master`, `eodhd.us_symbol`, `fmp.profile`, `sec.tickers`는
@@ -635,6 +643,28 @@ part를 함께 pin한다. `CAPITAL` close는 비조정 close를 그 뒤 모든 �
   `-`를 `_`로 쓴 그 이름, 없거나 빈 유형은 `unspecified_split`이다. 분할의 `action_id`는 유형과 관계없이
   `split:<ex-date>`이므로 유형을 고친 revision은 앞선 행동을 SUPERSEDE한다. FMP 배당 통화는 US registry가 해석한 US
   상장 심볼의 거래 통화인 `USD`다.
+- `eodhd.splits@1`과 `eodhd.dividends@1`은 `aas collect qveris import`가 거래소 하루의 EODHD bulk 내려받기마다
+  commit하는 행 테이블(`qveris-splits-*` `splits`, `qveris-dividends-*` `dividends`)을 읽는다. 열은
+  `provider_symbol`(`<code>.<exchange>`), ex-date `date`, 공급자 값 텍스트, 수집 시각 `retrieved_at`이다. 경고된
+  내려받기의 행, 명시 identity가 없는 행, 양의 십진수가 아닌 값은 수집기가 이미 `quarantine`에 두었고, 한 심볼을
+  두 번 싣은 내려받기는 수집기가 거부하므로 행 테이블에는 심볼마다 행동이 하나다. instrument는 (`eodhd`,
+  `eodhd_symbol`, `provider_symbol`)로 명세 `timezone`의 ex-date 0시에 해석하고(일봉과 같은 key), 수집 시각은
+  `retrieved_at`이다. 분할은 `split`의 `<new>/<old>`에서 `action_type` `split`, `ratio` `new / old`(binary64,
+  `float_shortest@1`)이며, 모양이 다르거나 항이 양수가 아니면 `invalid`다. 배당은 `action_type` `dividend`,
+  `amount`는 지급한 그대로의 주당 현금이다. 공급자가 `unadjusted_value`를 밝히면 그 값, 아니면 `dividend`(EODHD가
+  뒤 분할로 조정하는 값이지만 ex-date 당일 내려받기에는 뒤 분할이 아직 없다)를 텍스트 그대로 `decimal_text@1`에
+  넘긴다. `currency`는 `dividend_currency`가 대문자 세 글자일 때 그 값, `record_date`·`pay_date`는 `YYYY-MM-DD`일 때만
+  남는다. 금액이 양의 십진수가 아니거나 통화가 ISO 코드가 아니면 `invalid`다. 달력은 US가 `sessions.xnys`,
+  KR이 `sessions.xkrx`다.
+
+`kind.status@1`은 KIND 목록(`kind-listings-*` `listings`의 `short_code`, `listed_on`, `retrieved_at_utc`,
+`kind.listings@1`이 읽는 열)을 `instrument_status`의 `listed` 사건(`status_event_id` `kind:listed`, `reason`
+`kind_listed_on`)으로 옮긴다. 시작은 `listed_on`의 Asia/Seoul 0시이고 끝은 없다(목록은 상장폐지를 말하지
+않는다). instrument는 (`kind`, `krx_short_code`)로 수집 시각에 해석하므로 단축코드는 KR 등록이 EODHD ISIN으로
+묶은 경우에만 상품에 닿는다. 수집 시각이 ingestion이고 partition 날짜는 그 Seoul 날짜다. 시간 입력
+`status_date`는 `listed_on`(1970-01-01 이전은 그 날로 올림)이며 명세는 Asia/Seoul `local_day_end@1`을 쓴다.
+지역만 다른 반복 행은 (`short_code`, `listed_on`, `retrieved_at_utc`)마다 한 번만 옮기고, 한 코드에 상장일이
+둘이면 자연키 반복으로 거부한다.
 
 `norgate.status@1`은 Norgate security master(`assetid`, `is_delisted`, `first_date`·`last_date` 텍스트)를
 `instrument_status`로 옮긴다. 인자 `event`가 master 행마다 사건 하나를 고른다. `listed`(모든 행)는
@@ -850,6 +880,44 @@ dataset 이름은 `<domain>.<market>.<provider>[.ref][.r<N>]`다. 한 dataset의
 - cutover 날짜와 pin 목록은 binding hash에 포함된다. 공급자를 바꾸려면 새 binding을 만든다.
 
 FX처럼 여러 원천이 같은 시계열을 내는 경우에도 우선순위는 같은 방식으로 소비자 pin이 정한다.
+
+### 버전 있는 원천 선택 규칙
+
+데이터 종류마다 날짜 구간별 정본 원천을 하나만 두는 규칙은 `storage/source_selection.py` 한 곳에 있다(#153).
+규칙은 `select.<종류>@<버전>` 이름을 가지고, 순서 있는 `[from, to)` 구간마다 dataset 하나를 정한다.
+요청은 규칙을 이름과 버전으로 고르고 규칙의 dataset마다 exact generation pin을 하나씩 준다(`Selection`).
+규칙은 위의 ordered-pin binding(`aas-head-binding-v1`)이 되므로 각 날짜는 한 dataset에서만 읽힌다. 선택된
+dataset에 head가 없는 날짜는 다른 공급자로 채우지 않고 누락으로 남는다(묵시적 fallback 없음).
+
+| 규칙 | 도메인 | 구간과 정본 | 겹치는 날 |
+| --- | --- | --- | --- |
+| `select.prices.us@1` | `prices` | ~2026-09-08 `prices.us.norgate`, 2026-09-09~ `prices.us.eodhd` | Norgate. 같은 구간의 `prices.us.eodhd` bar에 붙은 `cross_provider_mismatch` flag를 선택된 bar에 보인다 |
+| `select.actions.us@1` | `corporate_actions` | ex-date ~2026-07-27 `actions.us.norgate`, 2026-07-28~ `actions.us.eodhd` | 구간 밖 행위는 읽지 않는다 |
+| `select.prices.kr@1` | `prices` | 전 구간 `prices.kr.eodhd` | — |
+| `select.actions.kr@1` | `corporate_actions` | 전 구간 `actions.kr.eodhd` | — |
+| `select.fx.usdkrw@1` | `fx_rates` | 고시 UTC 날짜 ~2026-09-09 `fx.usdkrw.norgate`, 2026-09-10~ `fx.usdkrw.eodhd` | — |
+
+- 등록한 규칙은 바꾸지 않는다. cutover나 원천을 바꾸려면 다음 버전을 나란히 등록한다. 규칙 문서
+  (`aas-source-selection-rule-v1`: 규칙 이름, 도메인, 구간, witness, 드러낼 flag)의 SHA-256은 시험에 고정돼 있어
+  저장된 run의 의미가 바뀌지 않는다. 버전 없는 이름이나 등록되지 않은 버전은 거부한다(최신 버전 기본값 없음).
+- `read_selected`(작업 공간 진입점 `load_selected`)는 선택된 head를 (instrument, session) 행마다 그 행을
+  낸 dataset과 함께 돌려준다. 영수증 `aas-source-selection-read-v1`은 규칙과 그 hash, binding과 binding
+  hash, head 읽기 영수증 hash, witness 읽기 영수증 hash, 행마다 원천과 witness flag의 digest를 싣는다.
+- witness는 가격 규칙만 가진다. witness dataset은 자기가 지는 구간에서만 같은 query로 읽히고, 그 값은 쓰이지 않는다.
+  규칙이 적은 flag만 instrument·session·interval·basis·role이 같은 선택 bar의 `witness_flags`에 실린다.
+  strict 읽기에서는 cutoff까지 알려진 witness revision의 flag만 보인다.
+- 수정가는 저장하지 않고 공급자 수정 계열(`.ref`)을 잇지 않는다. `read_selected_adjusted`(`load_selected_adjusted`)가
+  선택된 무수정 bar와 선택된 기업행위로 그 읽기의 cutoff에서 `aas-adjustment-v1`을 계산한다. 영수증
+  `aas-source-selection-adjusted-v1`은 두 규칙과 hash, 두 selection 문서, 조정 읽기 영수증 hash, 행마다의 원천을 싣는다.
+- 이음매 확인은 읽기 전용 도우미가 계산한다. `overlap_close_differences`는 witness와 선택 원천이 모두 가진
+  bar의 상대 종가 차이 `|witness − 선택| / |선택|` 분포(쌍 수, 세션별 쌍 수, 최대값, nearest-rank p50·p90·p99,
+  허용치 초과 수, flag 붙은 쌍 수, witness에만 있는 bar 수)를 낸다. `seam_factor_continuity`는 가격 규칙의 cutover마다
+  양쪽에 bar가 있는 instrument의 직전·직후 bar 수정 계수 비, 그 사이에 효력이 있는 선택 행위 수, 수정 종가 변화율을
+  내고 `continuous`·`explained_step`·`unexplained_step`·`unknown_factor`로 분류한다. EODHD `adjusted_close` 검산은
+  그 열이 승격되지 않아 여기에 없다.
+- 규칙은 읽기 단계만 바꾼다. 원장 dataset, 승격, flag, 전략 요구 매핑(`strategy_registry`)은 그대로다.
+  준비 요청(`aas-prepare-request-v1`)은 이 규칙이 만드는 binding을 `heads` 참조로 받을 수 있지만, 요청과 run에
+  규칙 이름을 남기는 일은 아직 없다(예정).
 
 ## 동결 원천
 
@@ -1068,17 +1136,17 @@ ASCII escape와 바이트까지 같다.
 | `prices.kr.eodhd.ref` | `prices` | reference | `eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1` | `session_close_plus_lag@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage`, `provider_reported_partial` | 아니오 | 같은 두 원천 모양의 공급자 adjusted close. basis `total_return`, `fields='close'` |
 | `prices.us.norgate` | `prices` | canonical | `norgate.prices_none@1` | `session_close_plus_lag@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | Norgate 비조정 일봉 내보내기(`norgate-history-csv-*`의 미국 주식 `bars`). 다섯 값 모두 CSV 원문, 연도 partition마다 generation 하나 |
 | `prices.us.norgate.ref` | `prices` | reference | `norgate.prices_adjusted@1` | `session_close_plus_lag@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 아니오 | Norgate 조정 가격 part. `CAPITAL`은 `split_adjusted`, `TOTALRETURN`은 `total_return`, float32 저장값 |
-| `prices.us.eodhd` | `prices` | canonical | `eodhd.bars@1` | `session_close_plus_lag@1` | `float_shortest@1` | `cross_provider_mismatch@1` | `cross_provider_mismatch`, `decimal_rounding_tie`, `provider_float_storage` | 아니오 | EODHD US 일간 수집. 다운로드 하나가 generation 하나이고 같은 날짜의 다른 다운로드는 SUPERSEDE. 품질 규칙의 기준은 `prices.us.norgate` generation pin. identity가 해석한 US 보류 행의 재처리는 Linear AAS-69 |
+| `prices.us.eodhd` | `prices` | canonical | `eodhd.bars@1`, `eodhd.bulk_quarantine@1` | `session_close_plus_lag@1` | `float_shortest@1` | `cross_provider_mismatch@1` | `cross_provider_mismatch`, `decimal_rounding_tie`, `provider_float_storage`, `provider_reported_partial` | 아니오 | EODHD US 일간 수집과 부분 응답(경고) 일간 내려받기. 다운로드 하나가 generation 하나이고 같은 날짜의 다른 다운로드는 SUPERSEDE. 품질 규칙의 기준은 `prices.us.norgate` generation pin. import 때 identity가 없어 보류된 US 행의 재처리는 매퍼가 없다(#100) |
 | `prices.us.fmp.ref` | `prices` | reference | `fmp.eod_non_split@1` | `session_close_plus_lag@1` | `float_shortest@1`, `exact@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 예 | FMP 동결 legacy non-split 응답. 정정은 revision 번호순 generation. 원천 자료실 FMP normalized lineage(eod_full, dividend_adjusted)의 매퍼는 Linear AAS-68 |
 | `prices.ref.norgate` | `prices` | reference | `norgate.reference_closes@1`, `norgate.reference_history@1` | `local_day_end@1` | `decimal_text@1` | 없음 | `time_precision_day`, `volume_precision_limited` | 예 | Norgate 기준 시리즈 표와 지수·기타 데이터베이스 내보내기, `fields='close'`, 통화 `XXX`. 공급자가 종가 시각을 밝히지 않으므로 날짜 끝은 `Etc/GMT+12`. 음수 수준이 있는 시리즈는 `signed`로 고르지 않는다(Linear AAS-67) |
 | `sessions.xnys` | `calendar_sessions` | canonical | `calendar.declared@1` | `declared_session_end@1` | 없음 | 없음 | 없음 | 아니오 | XNYS [선언 달력](#선언-달력) 문서. 관측 거래일은 대조 보고의 근거, 임시 휴장은 SUPERSEDE |
 | `sessions.xkrx` | `calendar_sessions` | canonical | `calendar.declared@1` | `declared_session_end@1` | 없음 | 없음 | 없음 | 아니오 | XKRX [선언 달력](#선언-달력) 문서. 관측 거래일은 대조 보고의 근거, 임시 휴장은 SUPERSEDE |
 | `actions.us.norgate` | `corporate_actions` | canonical | `norgate.dividends@1`, `norgate.capital_adjustments@1` | `exdate_open@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 예 | Norgate 조정 가격 part의 `CAPITAL` 행 전체. 배당이 첫 generation, 자본 사건이 그 child이고 파티션 없이 이력 전체가 한 generation이다. 달력은 `sessions.xnys` |
 | `actions.us.fmp.ref` | `corporate_actions` | reference | `fmp.dividends@1`, `fmp.splits@1` | `exdate_open@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 예 | FMP 동결 배당·분할 응답. 정정은 revision 번호순 generation. 달력은 `sessions.xnys` |
-| `actions.us.eodhd` | `corporate_actions` | canonical | 없음 | `exdate_open@1` | 없음 | 없음 | 없음 | 아니오 | Qveris 거래소 일간 `splits`·`dividends` 수집 원천([Qveris 수집과 원천 적재](#qveris-수집과-원천-적재)). 매퍼는 Linear AAS-77 |
-| `actions.kr.eodhd` | `corporate_actions` | canonical | 없음 | `exdate_open@1` | 없음 | 없음 | 없음 | 아니오 | Qveris 거래소 일간 `splits`·`dividends` 수집 원천(KO, KQ). 매퍼는 Linear AAS-77 |
+| `actions.us.eodhd` | `corporate_actions` | canonical | `eodhd.dividends@1`, `eodhd.splits@1` | `exdate_open@1` | `decimal_text@1`, `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage`, `volume_precision_limited` | 아니오 | Qveris 거래소 일간 `splits`·`dividends` 수집 원천([Qveris 수집과 원천 적재](#qveris-수집과-원천-적재))의 `US` 행. 배당 금액은 원문 텍스트, 분할 비율은 binary64. 달력은 `sessions.xnys`. [기업행동과 상장 상태 매퍼](#기업행동과-상장-상태-매퍼) |
+| `actions.kr.eodhd` | `corporate_actions` | canonical | `eodhd.dividends@1`, `eodhd.splits@1` | `exdate_open@1` | `decimal_text@1`, `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage`, `volume_precision_limited` | 아니오 | 같은 수집 원천의 `KO`·`KQ` 행. 달력은 `sessions.xkrx` |
 | `status.us.norgate` | `instrument_status` | canonical | `norgate.status@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | Norgate master의 상장(`event` `listed`)이 첫 generation, 상장폐지(`delisted`)가 그 child. `America/New_York`, 근거 `record` |
-| `status.kr.kind` | `instrument_status` | canonical | 없음 | 없음 | 없음 | 없음 | 없음 | 아니오 | KIND 상장법인목록 수집 원천(`kind-listings-*`). 상장 이력은 [KR 등록](#kr-등록)의 identity 구간으로 들어간다. 상태 매퍼는 Linear AAS-77 |
+| `status.kr.kind` | `instrument_status` | canonical | `kind.status@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | KIND 상장법인목록 수집 원천(`kind-listings-*`)의 상장(`listed`) 사건, 상장일 기준 Asia/Seoul. 단축코드는 [KR 등록](#kr-등록)의 identity snapshot으로 해석. 목록은 상장폐지를 말하지 않는다 |
 | `filings.us.sec` | `filings` | canonical | `sec.submissions@1` | `source_column@1` | 없음 | 없음 | 없음 | 아니오 | SEC submissions의 접수 시각 `acceptanceDateTime`. [SEC 공시와 재무](#sec-공시와-재무) |
 | `filings.kr.dart` | `filings` | canonical | `dart.fnltt_filings@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | DART 재무제표 응답의 접수번호, 접수일 기준 Asia/Seoul. 공시 목록(`list.json`) 수집 원천의 매퍼(`dart.list`)는 레지스트리에 없다(Linear AAS-77) |
 | `fundamentals.us.sec` | `fundamentals` | canonical | `sec.companyfacts@1` | `source_column@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | companyfacts. 공시마다 자기 record(accession은 dimensions). 시점은 pin한 `filings.us.sec` generation에서 accession으로 조인한 `accepted_at_us`이고 조인되지 않은 사실은 null. 같은 accession의 값이 바뀌면 SUPERSEDE |
@@ -1088,6 +1156,7 @@ ASCII escape와 바이트까지 같다.
 | `macro.kr.oecd` | `macro_observations` | canonical | `oecd.observations@1` | `unknown_null@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | legacy OECD 공개 응답. vintage와 공개 시각이 없어 strict 읽기는 고르지 않는다 |
 | `fx.usdkrw.norgate` | `fx_rates` | canonical | `norgate.fx_closes@1`, `norgate.fx_history@1` | `local_day_end@1` | `decimal_text@1` | 없음 | `time_precision_day`, `volume_precision_limited` | 예 | 원천 자료실 Norgate 기준 시리즈(2026-09-08까지)와 legacy 내보내기 편입본, 시간대 `Etc/GMT+12`. 우선순위는 소비자 pin |
 | `fx.usdkrw.fred` | `fx_rates` | canonical | `fred.fx_series@1` | `unknown_null@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | FRED DEXKOUS(legacy CSV 편입본과 ALFRED 수집). H.10 발표 지연 때문에 strict 읽기는 고르지 않는다. 우선순위는 소비자 pin |
+| `fx.usdkrw.eodhd` | `fx_rates` | canonical | `eodhd.fx_history@1` | `local_day_end@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage`, `time_precision_day` | 아니오 | Qveris `USDKRW.FOREX` 일간 이력(`qveris-fx-history-bars-*`)의 종가, UTC 날짜 끝이 fixing. 시점도 그 UTC 날짜 끝이다(거래소 달력을 쓰지 않으므로 조기 폐장이 fixing보다 앞서 공개 시점을 줄 수 없고, 거래소가 열지 않는 날의 행도 시점을 가진다). 우선순위는 소비자 pin |
 | `classifications.us.norgate` | `classifications` | canonical | `norgate.classification@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | Norgate 증권 유형(`norgate.security_type`)과 상장 거래소(`norgate.exchange`) snapshot, 과거로 소급하지 않음. [분류](#분류) |
 | `classifications.us.sec` | `classifications` | canonical | `sec.sic@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | SEC SIC(`sec.sic`) snapshot, issuer 주체 |
 | `classifications.kr.kind` | `classifications` | canonical | `kind.industry@1`, `kind.industry@2` | `source_column@1` | 없음 | 없음 | 없음 | 아니오 | KIND 업종(`kind.industry`) snapshot, 단축코드를 identity snapshot으로 해석, 수집 시각부터 알려짐 |
@@ -1346,10 +1415,11 @@ fingerprint = sha256(정규 JSON ["aas-<provider>-request-v1", endpoint, paramet
 | `sec` | `submissions` | `data.sec.gov/submissions/CIK##########.json` | `cik`(10자리) |
 | `sec` | `companyfacts` | `data.sec.gov/api/xbrl/companyfacts/CIK##########.json` | `cik` |
 | `fred` | `vintage_dates` | `fred/series/vintagedates` | `series_id`, `realtime_start`, `realtime_end`, `limit=10000`, `offset`, `file_type=json` |
+| `fred` | `latest_vintage` | `fred/series/vintagedates`(창 없음) | `series_id`, `sort_order=desc`, `limit=1`, `file_type=json` |
 | `fred` | `observations` | `fred/series/observations` | `series_id`, `realtime_start`, `realtime_end`, `limit=100000`, `offset`, `file_type=json` |
 | `fred` | `series_csv` | `fredgraph.csv` | `id` |
 
-FRED 키는 `vintage_dates`·`observations`의 공급자 URL에만 실리고, SEC의 공정 접근 `User-Agent`(연락처
+FRED 키는 `vintage_dates`·`latest_vintage`·`observations`의 공급자 URL에만 실리고, SEC의 공정 접근 `User-Agent`(연락처
 포함)는 header에만 실린다. 둘 다 요청·receipt·원천에 들어가지 않으며, 답이 그 값(SEC는 `User-Agent` 전체나
 그 안의 연락처 주소)을 되돌려 주면 그 답을 보존하지 않는다. 두 명령은 commit에 쓰는 pyarrow(legacy extra)가
 없으면 정산이나 호출 전에 멈춘다. SEC는 HTTP 403·429, FRED는 401·403·429와 키를 거부하는 400이 실행을 멈춘다. 다만 SEC `daily_index`의 403은 그 분기 목록을 본 뒤에 정한다(아래 SEC 1단계). 전송 실패가
@@ -1359,7 +1429,7 @@ FRED 키는 `vintage_dates`·`observations`의 공급자 URL에만 실리고, SE
 **receipt와 batch.** 답마다 응답 bytes와 정규 receipt(`aas-<provider>-receipt-v1`: 요청, fingerprint, job과
 attempt, HTTP 상태, 보존 header, 요청·수집 시각, 결과, 공급자 상태, 선택, 응답의 크기·SHA-256)를 `raw/`에
 둔 뒤 attempt가 `succeeded`가 된다. 결과는 `COMPLETED`(읽을 수 있는 답), `NO_DATA`(SEC 404, FRED가 없다고
-답한 시계열), `FAILED`(그 밖의 답)이며 수집 경로만 정한다. 한 실행의 receipt를 수집 순서로 나열한 batch
+답한 시계열, 최신 vintage로 새 vintage가 없다고 확인된 FRED 500 창), `FAILED`(그 밖의 답)이며 수집 경로만 정한다. 한 실행의 receipt를 수집 순서로 나열한 batch
 문서(`aas-<provider>-batch-v1`)와 그 receipt·응답이 완결 단위 하나다. SEC batch는 receipt 500개
 또는 응답 256 MiB에 이르면 닫힌다. FRED batch는 receipt 500개 또는 응답
 64 MiB에 이른 질의(observations 창의 모든 page)가 끝날 때 닫혀, 그 질의의 page만큼 두 한도를 넘을 수 있다.
@@ -1385,14 +1455,17 @@ batch의 것만 읽는다.
    목록이 읽히지 않거나 거부되거나 답이 없으면 403은 거부로 남아 실행을 멈춘다. 목록 답은 receipt로만
    남고 파생 테이블은 없다.
 2. **submissions.** 색인 공시 중 양식이 `filing_forms`(10-K·10-Q·10-KT·10-QT·8-K·20-F·40-F·6-K와 각
-   정정)에 들고 발행인 범위(`registered`: `mint_issuer('sec_cik', cik)`가 identity에 등록된 제출자, 또는
-   `all`)에 드는 공시를 원한다. 아직 나열되지 않은 공시가 있는 제출자마다 문서를 한 번 묻는다. 이유는 둘이다.
+   정정)에 들고 발행인 범위(`registered`: `mint_issuer('sec_cik', cik)`가 identity에 등록된 제출자,
+   `reporting`: 그 제출자와 읽은 색인에서 `fact_forms` 정기 보고서를 낸 모든 제출자, 또는 `all`)에 드는
+   공시를 원한다. `reporting`의 제출자 집합은 실행이 그날 색인을 읽은 뒤 정하며 identity에 쓰지 않는다. 아직 나열되지 않은 공시가 있는 제출자마다 문서를 한 번 묻는다. 이유는 둘이다.
    - `new_filing`: 그 색인을 읽은 뒤 묻지 않음.
    - `listing_retry`: 마지막으로 물은 지 하루가 지났고, 색인을 읽은 지 `listing_days`(7일) 안.
 3. **companyfacts.** 양식이 `fact_forms`(정기 재무 보고서와 그 정정)인 원하는 공시에 사실이 아직 없는
    제출자마다 같은 규칙으로 묻는다(재시도 이유 `fact_retry`, 기간 `fact_days` 14일). XBRL 처리가 접수보다
    늦을 수 있기 때문이다.
 
+문서 요청은 원하는 공시 중 가장 이른 공시일 순으로 묻고, 같은 날이면 submissions가 먼저다. 실행은
+`max_calls`에서 정상 종료하므로 한 실행보다 큰 밀린 요청은 다음 실행들이 가장 오래된 것부터 잇는다.
 창이 지난 공시는 `abandoned`로 센다. 답을 보존하지 못한 attempt도 물은 것으로 보아 하루 뒤 다시 묻는다.
 문서는 그 제출자의 이전 공시를 모두 다시 싣는다. 그래서 문서 요청의 receipt는 원한 accession 목록을
 `selection`(`{"accessions": [...]}`)으로 싣고, 그 공시의 행만 테이블에 옮긴다. bytes는 `raw/`에 그대로 있다.
@@ -1414,6 +1487,12 @@ batch의 것만 읽는다.
 
 1. `vintage_dates`가 알려진 vintage 날(`known`) 다음 날부터, 알려진 날이 없으면 ALFRED 원점(1776-07-04)부터,
    끝난 FRED 날(어제)까지의 vintage 날짜를 page마다 묻는다. 날짜가 없으면 그 시계열은 최신이다.
+   FRED는 vintage가 없는 창에 빈 목록 대신 HTTP 500을 주고, 나중에야 공표한 vintage가 있는 창에도 500을
+   준 적이 있다. 그래서 `known` 다음 날부터의 창 첫 page가 500이면 그 답을 기록하기 전에 창 없는 최신
+   vintage(`latest_vintage`, 이유 `vintage_recheck`)를 한 번 묻는다. 그 답이 `COMPLETED`이고 최신 vintage가
+   `known` 뒤가 아니면 창의 답은 `NO_DATA`(새 vintage 없음), 그 밖(뒤의 vintage, 읽히지 않거나 거부된 답,
+   답 없음)이면 `FAILED`다. 원점 창, 뒤 page, 500이 아닌 답(502, 점검 페이지)은 다시 묻지 않고 `FAILED`다.
+   어느 쪽이든 행은 없고 `known`은 그대로라 다음 실행이 같은 창을 다시 묻는다.
 2. observations 창은 `known`(또는 원점)에서 그 날까지다. 창마다 vintage 날짜를 1990개까지(원점이 아닌
    시작일도 하나로 셈) 담고, 다음 창은 앞 창의 마지막 vintage 날짜에서 시작한다
    (`observation_windows`). 창마다 page를 끝까지 묻는다.
@@ -1473,9 +1552,9 @@ commit된 것으로 계속한다. 공급자 하나의 거부나 실패가 다른
 | --- | --- | --- |
 | `kind` | 없음 | 없음(quota 없음) |
 | `dart` | `key_file` | `max_calls`(2,000), `daily_quota`(19,000) |
-| `sec` | `user_agent_file` | `max_calls`(2,000), `issuers`(`registered`·`all`), `since` |
+| `sec` | `user_agent_file` | `max_calls`(2,000), `issuers`(`registered`·`reporting`·`all`), `since` |
 | `fred` | `key_file` | `max_calls`(500) |
-| `qveris` | `key_file`, `raw_root`(절대 경로), `since`(거래소마다 첫 날), `max_calls`, `max_credits`(십진 문자열) | `extra_sessions`(거래소마다 `since` 이전에 따로 물을 session 날짜), `identity`(절대 경로의 identity 문서), `exchanges`, `datasets`, `symbol_lists`, `symbol_list_days`(7), `forex`, `forex_lookback_days`(10), `max_http_requests`, `time_limit_seconds`(3600), `request_interval`, `timeout_seconds`(45) |
+| `qveris` | `key_file`, `raw_root`(절대 경로), `since`(거래소마다 첫 날), `max_calls`, `max_credits`(십진 문자열) | `extra_sessions`(거래소마다 `since` 이전에 따로 물을 session 날짜), `identity`(절대 경로의 identity 문서), `exchanges`, `datasets`, `symbol_lists`, `symbol_list_days`(7), `forex`, `forex_lookback_days`(10), `max_http_requests`, `time_limit_seconds`(3600), `request_interval`, `timeout_seconds`(45), `continue_past_transient`(false) |
 
 Qveris의 유료 크레딧은 실행 하나의 호출 수·크레딧 상한과, page마다 다시 확인하는 계정 잔액(다른 예약을 뺀 값)
 안에서만 쓴다. 상한이 막은 요청은 묻지 않은 채 다음 실행으로 남는다.
@@ -1486,12 +1565,15 @@ Qveris의 유료 크레딧은 실행 하나의 호출 수·크레딧 상한과, 
 
 | 묻기 상태 | 증거 |
 | --- | --- |
-| `completed`·`warned` | `complete.json`(`RAW_ACQUIRED`·`RAW_ACQUIRED_WITH_WARNINGS`). 공급자 경고도 완료다 |
+| `completed`·`warned` | `complete.json`(`RAW_ACQUIRED`·`RAW_ACQUIRED_WITH_WARNINGS`). `warned`는 완료와 따로 세는 부분 성공이다 |
 | `failed` | intent가 있는 모든 page에 정산된 billing이 있고 완료가 없음. 답은 보존됐지만 쓸 수 없다 |
 | `quarantined` | billing 없는 page를 운영자가 page나 병렬 group 단위로 격리함. 결과는 알 수 없고 격리가 최악의 예약을 남겼다 |
 | `unsettled` | 격리되지 않은 billing 없는 page |
 
-덮이지 않은 요청에서 `unsettled` 묻기는 그 요청을 잡아 둔다(`held`). 그 밖에는 가장 늦은 묻기가 정한다. 이전
+`warned` 묻기는 보류된 행(값 검사를 어긴 행)이 있거나 page의 usage `raw_result_count`와 `valid_result_count`가
+다르면 덮지 않고 다시 묻는다(`partial_retry`). 간격은 `failed_retry`와 같고 그런 묻기도 연속 실패로 센다. 그 밖의
+`warned`는 요청을 `partial`로 덮는다. 행을 읽어 판정할 수 없는 `warned`(`unjudged`)도 다시 묻지 않는다(비용이 적은
+쪽). 덮이지 않은 요청에서 `unsettled` 묻기는 그 요청을 잡아 둔다(`held`). 그 밖에는 가장 늦은 묻기가 정한다. 이전
 관측일의 `failed`는 그 관측일 뒤 1, 2, 4, …, 최대 32일이 지나면 다시 묻는다(`failed_retry`). 간격은 연속한 정산된
 실패마다 두 배이고, 둘 이상 연속 실패한 요청은 다음 시도일과 함께 `failing`에 남는다. `quarantined`는 다음 날
 다시 묻는다(`uncertain_retry`). 격리된 page는 다시 실행되지 않고 요청이 새 job으로 물린다. 오늘 관측일의 묻기와
@@ -1573,6 +1655,15 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
   `list_registered_conflict`(다른 상품의 등록 claim이 그날을 덮거나 상품의 앞선 claim과 그날 사이에 있음),
   `list_gap_too_long`. 마지막 Norgate claim 뒤 첫 관측까지의 평일은 `history_gap`(이어진 registry 심볼 수와
   남은 심볼 표본), 관측 사이의 빈 평일은 `observation_gaps`로 보고한다.
+- **사유별 처리(#149).** 해석되지 않은 날마다 보고에만 쓰는 심볼 종류와 처리를 붙인다. 둘 다 claim에는
+  쓰지 않는다(종류로 상품을 정하지 않는다). 종류는 목록 행의 공급자 `Type` 표기다(`Common Stock`→
+  `common_stock`, `ETF`→`etf`, `FUND`→`fund`, `Mutual Fund`→`mutual_fund`, `Preferred Stock`→`preferred`,
+  `Warrant`→`warrant`, `Unit`→`unit`, `Right`→`right`, `BOND`·`Notes`→`debt`, 모르는 표기는 `other`, 없으면
+  `unknown`). 처리는 셋이다. 그날의 어느 행도 상품을 가리키지 않고 종류가 Norgate registry에 상품 종류가
+  없는 것(`mutual_fund`, `preferred`, `warrant`, `unit`, `right`, `debt`)이면 `out_of_scope`. ISIN이 없거나
+  미등록인데 그 심볼을 앞서 등록·수용 claim이 가졌으면 `register`(그 상품의 ISIN을 주는 원천이 들어오면
+  해석된다). 나머지(새 상장, 무효·반복 ISIN, 이동·앞 보유자 없음 등)는 `unresolved`로 사유와 함께 남는다.
+  보고의 `unresolved_classes`(사유→종류→날 수)와 `unresolved_dispositions`(처리→사유→날 수)가 이를 담는다.
 - 8일보다 긴 공백을 잇는 claim은 짧은 행(8일 이하)이 아니라 긴 행이므로, 그런 claim이 생기면 기다리던 모든
   `unresolved` 원천이 한 번 다시 계획되고(보류 세션의 따라잡기), 그 뒤의 하루 claim은 다시 계획을 부르지 않는다.
 
@@ -1598,9 +1689,14 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
 | `fx.usdkrw.fred` | `fred.fx_series@1` | `fred-series-csv-*` `observations` | |
 | `classifications.kr.kind` | `kind.industry@2`, 이어 받는 `kind.industry@1` | `kind-listings-*` `listings` | `short_code`·`industry`·`retrieved_at_utc` 열 |
 | `prices.us.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.US` |
+| `prices.us.eodhd` | `eodhd.bulk_quarantine@1` | `qveris-bulk-quarantine-*` `quarantine` | 사유 `provider_reported_partial`, 거래소 `US`, 모든 행이 값 검사 통과. 첫 template은 `eodhd.bars@1`에서 파생(`currencies` `US`→`USD`) |
 | `prices.kr.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.KO`·`.KQ` |
 | `prices.kr.eodhd` | `eodhd.bulk_quarantine@1` | `qveris-bulk-quarantine-*` `quarantine` | 사유 `provider_reported_partial`, 거래소 `KO`·`KQ`, 모든 행이 값 검사 통과. 첫 template은 `eodhd.bars@1`에서 파생 |
 | `prices.kr.eodhd.ref` | `eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1` | 위 두 모양 | 위와 같음. bulk의 첫 template은 `eodhd.bars_adjusted@1`에서 파생 |
+| `actions.us.eodhd` | `eodhd.splits@1`, `eodhd.dividends@1` | `qveris-splits-*` `splits`, `qveris-dividends-*` `dividends` | 심볼이 `.US`. 시작 선언: `exdate_open@1`(`sessions.xnys`), `America/New_York` |
+| `actions.kr.eodhd` | `eodhd.splits@1`, `eodhd.dividends@1` | 위 두 모양 | 심볼이 `.KO`·`.KQ`. 시작 선언: `exdate_open@1`(`sessions.xkrx`), `Asia/Seoul` |
+| `fx.usdkrw.eodhd` | `eodhd.fx_history@1` | `qveris-fx-history-bars-*` `bars` | 쌍이 USD/KRW. 시작 선언: `local_day_end@1`(`timezone` `UTC`, 달력 없음), `timezone` `UTC` |
+| `status.kr.kind` | `kind.status@1` | `kind-listings-*` `listings` | `short_code`·`listed_on`·`retrieved_at_utc` 열. 시작 선언: Asia/Seoul `local_day_end@1` |
 
 **KR 일간 bulk.** 경고와 함께 끝난 KR 일간 bulk 응답은 DV-294에 따라 행 전부가 `quarantine`에 남으므로, KR 일간
 가격은 bulk route로만 이어진다. route가 이 테이블을 맡으면(조건을 만족하는 행이 하나라도 있으면) 먼저 모든 행이
@@ -1616,13 +1712,19 @@ bulk 매퍼로 바꾸고 인자에 `currencies`(`kr_prices.CURRENCIES`)를 더�
 파생하지 않는다(`no_head`). 보고의 `template_spec_sha256`은 파생 원본 명세의 해시이고 `derived_from`이 원본
 매퍼를 밝힌다(파생이 아니면 null).
 
-route는 chain을 이어 붙일 뿐 시작하지 않는다. template은 그 dataset에서 route의 매퍼, 또는 route가 이어 받는
+route는 chain을 이어 붙일 뿐 시작하지 않는다(호출자가 이름 붙인 시작 선언 route만 예외, 아래). template은 그 dataset에서 route의 매퍼, 또는 route가 이어 받는
 이전 major 매퍼를 쓴 가장 늦은 committed generation의 명세(운영자의 백필이거나 앞선 유지보수 generation)이고,
 chain은 그 generation의 매퍼로 이어진다. 그래서 `classifications.kr.kind`는 가장 늦은 generation이
 `kind.industry@1`인 chain을 `@1`로 잇고, 운영자가 `kind.industry@2`로 게시한 chain(새 chain이거나 `@1` chain 위의
 `@2` generation)은 그때부터 `@2`로 잇는다. `@1`에서 `@2`로 넘어가는 것은 운영자의 `@2` 게시이고 유지보수는 chain의
 매퍼를 바꾸지 않는다. head가 없으면 `no_head`, 그 매퍼들의 generation이 없으면 `no_template`로 보고하고 아무것도
-쓰지 않는다. 보고의 `mapper`는 chain을 이은 매퍼다. 유지보수 명세는 template에서 다음만 바꾼다.
+쓰지 않는다. 보고의 `mapper`는 chain을 이은 매퍼다. 예외는 시작 선언(`start`)이 있는 route다(위 표). 수집은
+되지만 chain이 없던 dataset이므로, 호출자(`promote_datasets(start=...)`)가 그 dataset을 이름 붙인 실행에서만 그
+route 매퍼의 generation이 chain에 없을 때 선언한 template으로 시작한다. 선언의 시간 규칙이 pin하는 달력은 그
+달력 dataset의 committed head이고(없으면 `no_calendar`), identity를 해석하는 template은 실행의 snapshot을
+pin한다(없으면 `identity_unavailable`). 보고의 `started`가 참이고 `template_spec_sha256`은 null이다. 시작한 뒤에는
+그 generation의 명세가 template이다. 이름 붙이지 않으면 `no_head`로 남고 기다리는 원천 수를 센다. `aas maintain`은
+아직 이름을 넘기지 않는다(켜기는 운영 결정). 유지보수 명세는 template에서 다음만 바꾼다.
 
 - `target.parent`: dataset head.
 - `sources`: 새 원천 테이블 하나.
@@ -1651,14 +1753,18 @@ generation, 결과 `promoted`·`unchanged`)를 남긴다. 검사 ID는 (dataset,
 그 원천은 다시 계획되지 않고, 매일의 identity 증분이 기다리는 모든 원천을 다시 계획하지 않는다. 범위가 없는
 기록은 key 전체의 SHA-256을 그대로 쓴다. 검사 ID는 그 SHA-256까지에서 나온다. 결과의 `unresolved`는 이번
 실행이 그런 원천을 기록한 dataset이고, `standing_unresolved`는 이번 실행과 상관없이 원천마다 가장 늦은 기록이
-`unresolved`인 원천의 dataset별 요약(저장된 기록만 읽는다)이다. 형식은 [운영 문서](../operations.md#하루-유지보수-실행)가 소유한다. 거부되거나 막힌 단계는 아무것도 남기지 않으므로 그 원천은 다음 실행에 다시 계획된다. 단계 사이에서
+`unresolved`인 원천의 dataset별 요약(저장된 기록만 읽는다)이다. `prices.us.eodhd`(와 `.r<N>`) 항목은 그 원천들의
+행을 지금의 registry와 US 목록으로 다시 판정해 사유·종류·처리별 행 수도 싣는다(`us_symbols.unresolved_breakdown`,
+SELECT만, 새 상태 없음). 형식은 [운영 문서](../operations.md#하루-유지보수-실행)가 소유한다. 거부되거나 막힌 단계는 아무것도 남기지 않으므로 그 원천은 다음 실행에 다시 계획된다. 단계 사이에서
 멈춘 원천은 끝난 단계가 빈 delta로 다시 계획된다. 결과를 선언한 매퍼가 `promotion_coverage@1`을 남긴 원천도
 끝난 것이다. 운영자의 승격이 pin한 원천은 첫 유지보수 실행에서 한 번 더 계획되어 `unchanged`로 기록되고, head보다
 이른 내려받기는 `stale`이라 head를 대체하지 않는다.
 
-매퍼가 아직 없는 dataset(`actions.us.eodhd`·`actions.kr.eodhd`의 Qveris `splits`·`dividends`, `status.kr.kind`,
-identity가 해석한 US 보류 행의 `prices.us.eodhd` 재처리)의 수집 원천은 승격하지 않고 `unmapped`에 dataset별
-테이블 수로 남는다. `status.kr.kind`는 `kind.listings@1`이 읽는 열이 있는 KIND 목록만 센다.
+매퍼가 아직 없는 dataset(import 때 identity가 없거나 다르다고 보류된 US 행의 `prices.us.eodhd` 재처리)의 수집 원천은
+승격하지 않고 `unmapped`에 dataset별 테이블 수로 남는다. 그 행의 사유는 `provider_reported_partial`이 아니라서
+`eodhd.bulk_quarantine@1`에서 세션 날짜가 없고(거부됨), @1의 뜻을 바꾸면 이미 게시된 KR generation의 manifest가
+다시 계산되지 않는다. 경고와 함께 끝난 US 일간 bulk 응답은 위 US bulk route가 KR과 같은 방식(값 검사, 이력
+명세에서 파생한 template)으로 잇는다.
 
 **보고와 종료 코드.** 실행 보고(`aas-maintain-report-v1`)는 단계마다의 결과, 실패한 단계, 멈춘 공급자를 담고
 정확한 bytes를 `raw/`에, 같은 bytes를 `<runtime>/maintain-report.json`에 둔다. `stage_resources`는 단계마다
@@ -2881,7 +2987,7 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-291 | 완료된 Qveris job 하나는 행 원천과 보류 원천으로 commit되고 둘은 원본 bytes의 `hex`를 공유하며 매퍼가 lineage 접두어와 테이블 이름으로 찾는다 | `tests/storage/test_qveris_import.py::test_one_job_commits_its_rows_and_held_rows_under_one_content_hex` | 구현 |
 | DV-292 | 같은 job을 다시 적재하면 재사용하고 적재 코드만 바뀌어도 같은 원천 ID다 | `tests/storage/test_qveris_import.py::test_reimport_reuses_and_a_code_change_keeps_the_id` | 구현 |
 | DV-293 | identity 문서가 커지거나 바뀌어도 적재된 job은 같은 원천으로 재사용되고 identity 해시는 lineage에 남는다 | `tests/storage/test_qveris_import.py::test_an_identity_document_that_grows_keeps_every_imported_source` | 구현 |
-| DV-294 | 경고가 붙은 내려받기는 빈 행 테이블과 `provider_reported_partial` 보류 행으로 적재되고 적재를 막지 않는다 | `tests/storage/test_qveris_import.py::test_a_warned_download_commits_an_empty_rows_table_and_its_held_rows` | 구현 |
+| DV-294 | 경고가 붙은 내려받기는 빈 행 테이블과 보류 행으로 적재되고 적재를 막지 않는다. 값 검사를 통과한 행은 `provider_reported_partial`, 어긴 행은 그 사유로 보류된다(DV-542) | `tests/storage/test_qveris_import.py::test_a_warned_download_commits_an_empty_rows_table_and_its_held_rows` | 구현 |
 | DV-295 | 읽을 수 없는 job은 기록되고 나머지 job은 적재된다 | `tests/storage/test_qveris_import.py::test_unreadable_jobs_are_recorded_and_the_run_continues` | 구현 |
 | DV-296 | 일간 요청은 선언 달력의 열린 세션에서 나오고 관측일과 무관하게 완료된 요청은 빠진다 | `tests/application/test_qveris_cli.py::test_daily_jobs_follow_declared_sessions_and_skip_completed_requests` | 구현 |
 | DV-297 | 완료 없이 시도만 있는 요청은 `held`로 보고되고 계획되지 않는다 | `tests/application/test_qveris_cli.py::test_an_attempt_without_a_completion_is_held_not_planned` | 구현 |
@@ -3000,9 +3106,9 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-410 | 카탈로그의 시간·숫자 규칙은 등록된 규칙이고 매퍼의 시간 입력과 숫자 열 타입에 맞는다 | `tests/tools/test_dataset_catalog.py::test_rules_are_registered_and_fit_the_mappers` | 구현 |
 | DV-411 | 코드가 쓰는 dataset 이름은 모두 카탈로그 항목에 속한다 | `tests/tools/test_dataset_catalog.py::test_dataset_names_the_code_writes_are_cataloged` | 구현 |
 | DV-412 | committed dataset은 자기 항목(`.r<N>` 세대 포함) 아래 나열되고, 카탈로그 밖 이름은 게시된 채 `uncataloged`로 남는다 | `tests/storage/test_dataset_listing.py::test_published_datasets_are_listed_under_their_entry` | 구현 |
-| DV-413 | Qveris US 일간 `splits`·`dividends` 원천은 `actions.us.eodhd` generation으로 승격된다 | `tests/storage/test_qveris_actions.py::test_us_splits_and_dividends_promote_to_actions_us_eodhd` | 예정 |
-| DV-414 | Qveris KR(KO, KQ) 일간 `splits`·`dividends` 원천은 `actions.kr.eodhd` generation으로 승격된다 | `tests/storage/test_qveris_actions.py::test_kr_splits_and_dividends_promote_to_actions_kr_eodhd` | 예정 |
-| DV-415 | KIND 상장법인목록 원천은 `status.kr.kind` generation으로 승격된다 | `tests/storage/test_kind_status.py::test_kind_listings_promote_to_status_kr_kind` | 예정 |
+| DV-413 | Qveris US 일간 `splits`·`dividends` 원천은 `actions.us.eodhd` generation으로 승격된다 | `tests/storage/test_qveris_actions.py::test_us_splits_and_dividends_promote_to_actions_us_eodhd` | 구현 |
+| DV-414 | Qveris KR(KO, KQ) 일간 `splits`·`dividends` 원천은 `actions.kr.eodhd` generation으로 승격된다 | `tests/storage/test_qveris_actions.py::test_kr_splits_and_dividends_promote_to_actions_kr_eodhd` | 구현 |
+| DV-415 | KIND 상장법인목록 원천은 `status.kr.kind` generation으로 승격된다 | `tests/storage/test_kind_status.py::test_kind_listings_promote_to_status_kr_kind` | 구현 |
 | DV-416 | DART 공시 목록(`list.json`) 원천은 `dart.list` 매퍼로 `filings.kr.dart` generation에 승격된다 | `tests/storage/test_dart_promotion.py::test_list_json_filings_promote_to_filings_kr_dart` | 예정 |
 | DV-417 | 기본 verify는 원천 행을 읽지 않고 `--deep`과 같은 보고를 내며, 원천 테이블의 행 수·열·존재가 기록과 다르면 기본에서도 실패한다 | `tests/storage/test_verification.py::test_default_verify_compares_digests_and_deep_rehashes` | 구현 |
 | DV-418 | KR 가격과 선언 달력의 승격 명세는 카탈로그 항목의 매퍼·시간·숫자·품질 규칙을 쓴다 | `tests/tools/test_dataset_catalog.py::test_kr_price_specs_use_the_catalog_rules` | 구현 |
@@ -3024,7 +3130,7 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-434 | 두 날의 유지보수 실행은 모든 chain을 head의 자식으로 이어 붙이고, 같은 날 다시 실행하면 답한 요청을 다시 묻지 않고 아무 generation도 게시하지 않는다 | `tests/application/test_maintain.py::test_two_daily_runs_continue_every_chain_and_repeat_nothing` | 구현 |
 | DV-435 | 유료 호출 뒤나 승격 게시 뒤에 중단된 실행은 다음 실행이 공급자를 다시 부르지 않고 끝내며 원장에 증거와 어긋나는 attempt가 남지 않는다 | `tests/application/test_maintain.py::test_a_killed_run_is_recovered_without_asking_any_answered_request_again` | 구현 |
 | DV-436 | 새 KR 상장은 identity 증분과 새 유지보수 snapshot으로 등록되고 같은 실행의 KR 가격·분류 generation에서 해석된다 | `tests/application/test_maintain.py::test_new_kr_listings_advance_identity_and_every_kr_chain` | 구현 |
-| DV-437 | Qveris 요청은 묻기의 raw 증거로 정해진다: 경고 완료는 덮이고, 정산된 실패는 다음 날 새 job으로, 미정산은 보류되며 자기 job으로 먼저 끝낸다 | `tests/application/test_maintain_qveris.py::test_each_ask_state_decides_its_request` | 구현 |
+| DV-437 | Qveris 요청은 묻기의 raw 증거로 정해진다: 판정할 수 없는 경고 완료는 `partial`로 덮이고, 정산된 실패는 다음 날 새 job으로, 미정산은 보류되며 자기 job으로 먼저 끝낸다 | `tests/application/test_maintain_qveris.py::test_each_ask_state_decides_its_request` | 구현 |
 | DV-438 | 격리된 Qveris 묻기는 다음 관측일에 새 job으로 다시 묻고 같은 날에는 기다린다 | `tests/application/test_maintain_qveris.py::test_a_quarantined_ask_is_asked_again_the_next_day_and_not_the_same_day` | 구현 |
 | DV-439 | 유지보수 명세는 template에서 parent·원천·partition만 바꾸고 tombstone은 `never`이며, 끝난 원천은 `maintain_source@1`로 다시 계획되지 않는다 | `tests/storage/test_maintain_promotion.py::test_new_sources_continue_the_chain_from_the_template` | 구현 |
 | DV-440 | head나 route 매퍼의 template이 없는 dataset은 유지보수가 시작하지 않고 보고한다 | `tests/storage/test_maintain_promotion.py::test_a_route_without_a_head_or_template_reports_and_starts_nothing` | 구현 |
@@ -3129,3 +3235,27 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-539 | head가 없는 chain은 bulk route가 파생하지 않고 `no_head`로 남는다 | `tests/storage/test_maintain_promotion.py::test_a_chain_without_a_head_derives_nothing` | 구현 |
 | DV-540 | 값 검사(가격 0, low>high, high<max(open, close), 음수 거래량, 문자열 숫자, null, 깨진 JSON, 잘못된 날짜)를 어긴 행이 하나라도 있는 bulk 테이블은 `value_check`로 남고 승격되지 않으며, 같은 회차의 정상 테이블은 승격된다 | `tests/storage/test_maintain_promotion.py::test_one_invalid_value_keeps_its_whole_bulk_table_out` | 구현 |
 | DV-541 | 경고 KR bulk만 수집된 유지보수 실행은 이력만 있는 chain을 이어 붙이고 승격 뒤 저장소가 검증을 통과한다 | `tests/application/test_maintain.py::test_warned_kr_bulk_days_continue_a_history_only_chain_and_the_store_verifies` | 구현 |
+| DV-542 | `known` 뒤 vintage 창의 500은 창 없는 최신 vintage가 `known` 뒤가 아닐 때만 그 창의 receipt가 `NO_DATA`다 | `tests/storage/test_us_collection.py::test_an_empty_vintage_window_answered_500_is_no_new_vintage` | 구현 |
+| DV-543 | 최신 vintage가 `known` 뒤인 500, 502, 점검 페이지는 `FAILED`로 남고 `known`은 그대로다 | `tests/storage/test_us_collection.py::test_a_500_with_a_vintage_after_the_known_day_stays_failed` | 구현 |
+| DV-544 | `NO_DATA` 창 뒤의 실행은 같은 `known` 다음 날부터 다시 묻고 새 vintage를 수집한다 | `tests/storage/test_us_collection.py::test_after_a_window_without_a_vintage_the_next_run_asks_from_the_known_day` | 구현 |
+| DV-545 | vintage 창의 401·403·429는 최신 vintage를 묻지 않고 실행을 멈춘다 | `tests/storage/test_us_collection.py::test_a_refused_vintage_window_still_stops_the_run_unchecked` | 구현 |
+| DV-546 | 경고 내려받기(가격·분할·배당·FX)의 행 중 값 검사를 어긴 행만 그 사유로, 나머지는 `provider_reported_partial`로 보류된다 | `tests/storage/test_qveris_import.py::test_warned_rows_failing_their_value_checks_are_held_with_their_own_reason` | 구현 |
+| DV-547 | 보류 행이 있는 경고 묻기는 `partial_retry`로 다시 묻고, 모든 행이 통과한 경고 묻기는 `partial`로 덮이며, 보고는 경고 page를 `reason_code`·`provider_status_code`별로 센다 | `tests/application/test_maintain_qveris.py::test_a_warned_ask_with_held_rows_is_asked_again_and_its_reasons_are_counted` | 구현 |
+| DV-548 | page의 `raw_result_count`와 `valid_result_count`가 다른 경고 묻기는 다시 묻고, 연속한 재질문은 `failed_retry`와 같은 간격으로 늦춘다 | `tests/application/test_maintain_qveris.py::test_differing_result_counts_ask_again_and_back_off_like_failures` | 구현 |
+| DV-549 | 값 검사 실패 행이 있는 KR 경고 날은 부분 성공으로 세고, 유효 테이블은 승격되며, 재질문은 상한 안에서만 묻고, 다시 받은 깨끗한 답이 승격된다 | `tests/application/test_maintain.py::test_a_warned_day_with_a_bad_row_is_partial_held_by_reason_and_asked_again_within_caps` | 구현 |
+| DV-550 | execute가 5xx이고 `execution_id`가 없으며 남은 정산 조회가 모두 사용 이벤트를 찾지 못한 미정산 page는 격리 없이 `quarantine_candidates`로 보고된다 | `tests/application/test_maintain_qveris.py::test_a_5xx_page_without_usage_is_reported_as_a_quarantine_candidate` | 구현 |
+| DV-551 | `continue_past_transient`(기본 꺼짐)가 켜지면 일시 오류 page를 넘어 다음 job을 묻고 그 page의 견적을 예약으로 남긴다. 꺼져 있으면 지금처럼 멈춘다 | `tests/data/test_qveris_transient.py::test_the_page_stops_later_jobs_unless_tolerated_and_stays_reserved` | 구현 |
+| DV-552 | `daily-jobs`는 정산된 빈 응답(`empty_result`)을 `held`가 아닌 `empty`로 보고하고 더 늦은 관측일에 다시 계획한다 | `tests/application/test_qveris_cli.py::test_a_settled_empty_answer_is_asked_again_on_a_later_day_and_not_held` | 구현 |
+| DV-553 | `select.prices.us@1`은 Norgate에만 있는 날은 Norgate, EODHD에만 있는 cutover 뒤 날은 EODHD, 겹치는 날은 Norgate를 읽고, 선택되지 않은 원천으로 채우지 않으며 행마다 원천을 돌려준다 | `tests/storage/test_source_selection.py::test_each_session_reads_the_one_source_the_rule_selects` | 구현 |
+| DV-554 | 겹치는 날 EODHD bar의 `cross_provider_mismatch` flag는 선택된 Norgate bar의 witness flag로 보이고, 이음매 종가 차이 분포에 잡힌다 | `tests/storage/test_source_selection.py::test_a_mismatch_flag_on_the_overlap_is_visible_in_the_selected_read` | 구현 |
+| DV-555 | 선택 수정가는 선택된 무수정 bar와 선택된 행위로만 계산되고(같은 행위가 두 원천에 있어도 한 번), cutover 앞뒤 수정 계수의 변화는 그 사이 행위로 설명된다 | `tests/storage/test_source_selection.py::test_adjustment_factors_stay_continuous_across_the_source_cutover` | 구현 |
+| DV-556 | 등록한 선택 규칙 문서는 고정 digest를 갖고, 새 버전은 이전 버전의 읽기 결과와 영수증을 바꾸지 않으며, 버전 없는 이름·미등록 버전은 거부된다 | `tests/storage/test_source_selection.py::test_a_new_rule_version_leaves_the_earlier_version_and_its_reads_unchanged` | 구현 |
+| DV-557 | 규칙은 정해진 dataset과 cutover로 binding을 만들고, dataset마다 pin이 정확히 하나가 아니거나 규칙 밖 dataset의 pin이면 거부한다 | `tests/storage/test_source_selection.py::test_rules_bind_their_datasets_with_exact_cutovers` | 구현 |
+| DV-558 | Qveris `USDKRW.FOREX` 일간 이력 원천은 `fx.usdkrw.eodhd` generation으로 승격되고, 달력이 열지 않은 날은 시점이 null이며 바뀐 종가는 SUPERSEDE다 | `tests/storage/test_qveris_fx.py::test_usdkrw_forex_history_promotes_to_fx_usdkrw_eodhd` | 구현 |
+| DV-559 | 유지보수 route는 head 없는 `actions.*.eodhd`·`fx.usdkrw.eodhd` 원천을 `no_head` 후보로 보고, 호출자가 이름 붙인 dataset만 선언한 시작 template으로 시작하며(달력 head 없으면 `no_calendar`, snapshot 없으면 `identity_unavailable`), 시작한 chain은 자기 명세로 이어진다 | `tests/storage/test_qveris_actions.py::test_the_new_routes_see_collected_sources_and_start_only_named_datasets` | 구현 |
+| DV-560 | `status.kr.kind` route는 KIND 목록을 후보로 보고 legacy 모양을 `shape`로 건너뛰며, 이름 붙인 경우에만 수집일 partition으로 시작한다 | `tests/storage/test_kind_status.py::test_the_status_route_starts_the_kind_chain_only_when_named` | 구현 |
+| DV-561 | US 목록의 해석되지 않은 날은 사유마다 심볼 종류와 처리(`register`·`unresolved`·`out_of_scope`)를 보고하고, 상품을 가리키는 행은 종류와 상관없이 범위 밖이 아니며 claim은 생기지 않는다 | `tests/storage/test_us_symbols.py::test_every_unresolved_day_has_a_symbol_class_and_a_disposition` | 구현 |
+| DV-562 | `standing_unresolved`의 `prices.us.eodhd` 항목은 기다리는 행을 지금의 판정으로 사유·종류·처리별로 세고, 목록이 없는 날은 `list_not_observed`, 곧 등록될 날은 `list_claimable`, 등록된 날은 `resolved`다 | `tests/storage/test_us_symbols.py::test_the_standing_summary_counts_waiting_us_rows_by_reason_class_and_disposition` | 구현 |
+| DV-563 | 경고 US bulk 테이블은 이력 명세에서 파생한 `eodhd.bulk_quarantine@1` template(`US`→`USD`)으로 `prices.us.eodhd`를 잇고, import 때 identity가 없어 보류된 US 테이블은 route가 맡지 않고 `unmapped`에 남는다 | `tests/storage/test_maintain_promotion.py::test_a_warned_us_bulk_day_continues_the_us_chain_and_identity_held_rows_stay_out` | 구현 |
+| DV-564 | `reporting` 범위는 등록된 발행인이 없어도 읽은 색인에서 정기 보고서를 낸 제출자의 공시를 원하고 그 문서를 묻어 승격하며, 정기 보고서가 없는 제출자는 범위 밖으로 센다 | `tests/storage/test_us_collection.py::test_the_reporting_scope_wants_filers_of_periodic_reports_and_promotes_them` | 구현 |
+| DV-565 | 호출 상한을 넘는 문서 요청은 가장 이른 공시일 순으로 묻고 남은 요청은 다음 실행이 잇는다 | `tests/storage/test_us_collection.py::test_a_backlog_over_the_call_budget_is_asked_oldest_first_over_runs` | 구현 |

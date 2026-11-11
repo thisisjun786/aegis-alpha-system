@@ -42,9 +42,10 @@ def add_commands(actions: argparse._SubParsersAction) -> None:
         parser.add_argument("--since", type=_day, help="First index day to read (YYYY-MM-DD)")
         parser.add_argument(
             "--issuers",
-            choices=("registered", "all"),
+            choices=("registered", "reporting", "all"),
             default="registered",
-            help="Collect documents of registered SEC issuers only (default) or of every filer",
+            help="Collect documents of registered SEC issuers only (default), of those and "
+            "every filer of a periodic report in the read indexes, or of every filer",
         )
         if name == "plan":
             parser.add_argument("--today", type=_day, help="EDGAR (New York) date to plan for")

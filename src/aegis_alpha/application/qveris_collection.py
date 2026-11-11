@@ -11,6 +11,7 @@ from aegis_alpha.data.qveris import InvocationBudget, RequestBudgetPort
 from aegis_alpha.data.qveris_acquisition import acquire_jobs
 from aegis_alpha.data.qveris_client import QverisClient
 from aegis_alpha.data.qveris_contracts import load_jobs
+from aegis_alpha.data.qveris_payloads import QverisEmptyAnswerError
 from aegis_alpha.data.sec_evidence import read_bytes
 
 if TYPE_CHECKING:
@@ -19,6 +20,21 @@ if TYPE_CHECKING:
 
 
 _REQUEST_ADMISSION_SECONDS = 900
+
+
+def _outcome(error: BaseException) -> str:
+    """Why a fail-fast profile run stopped (``empty_result``, ``held`` or ``failed``).
+
+    An uncharged empty answer is not a page held for settlement; the exit code stays 1 for
+    all three, and the profile's other jobs are not asked (#109 keeps fail-fast).
+    """
+    if isinstance(error, QverisEmptyAnswerError):
+        return "empty_result"
+    if str(error).startswith("PENDING_SETTLEMENT"):
+        return "held"
+    return "failed"
+
+
 _AUDIT_REQUESTS_PER_EXECUTION = 16
 _MIN_HTTP_REQUESTS = 32
 
@@ -55,6 +71,7 @@ def run_qveris_profile(
             "status": "failed",
             "exit_code": 1,
             "execution_started": port is not None,
+            "outcome": _outcome(error),
             "error_type": type(error).__name__,
             "message": "collection stopped; inspect durable Qveris page evidence",
             "result": {

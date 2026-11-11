@@ -115,6 +115,35 @@ def test_answers_are_classified_and_a_refused_key_stops_the_run() -> None:
     assert fred.classify(csv, Response(200, (), b"DATE,DEXKOUS\n", moment, moment))[0] == FAILED
 
 
+def test_only_a_500_window_after_a_known_day_is_read_against_the_latest_vintage() -> None:
+    fake = FakeFred(TODAY)
+    fake.publish("DGS10", date(2026, 9, 1), "4.10", date(2026, 9, 2))
+    latest = fred.latest_vintage("DGS10")
+    assert latest.parameters == {"file_type": "json", "limit": "1", "series_id": "DGS10",
+                                 "sort_order": "desc"}  # fmt: skip
+    answered = _answer(fake, latest)
+    assert fake.calls[-1][0] == "vintagedates"
+    assert fred.classify(latest, answered) == (COMPLETED, None)
+    assert fred.parse_latest_vintage(latest, answered.body) == date(2026, 9, 2)
+    moment = datetime(2026, 9, 10, tzinfo=UTC)
+    unreadable = Response(200, (), b"<html>maintenance</html>", moment, moment)
+    assert fred.classify(latest, unreadable)[0] == FAILED
+    with pytest.raises(ValueError, match="not canonical"):
+        fred.check(fred.Request.of("fred", "latest_vintage", {"series_id": "DGS10"}))
+    after = fred.vintage_dates("DGS10", date(2026, 9, 2), date(2026, 9, 9))
+    error = b'{"error_code":500,"error_message":"Internal Server Error"}'
+    assert fred.classify(after, Response(500, (), error, moment, moment))[0] == FAILED
+    assert fred.rechecks(after, Response(500, (), error, moment, moment))
+    assert fred.no_new_vintage(after, date(2026, 9, 1))
+    assert fred.no_new_vintage(after, None)
+    assert not fred.no_new_vintage(after, date(2026, 9, 2))
+    # No known day to compare with, a later page, or another fault is not read again.
+    origin = fred.vintage_dates("DGS10", fred.ORIGIN, date(2026, 9, 9))
+    page = fred.vintage_dates("DGS10", date(2026, 9, 2), date(2026, 9, 9), fred.VINTAGE_LIMIT)
+    for request, status in ((origin, 500), (page, 500), (after, 502), (after, 200)):
+        assert not fred.rechecks(request, Response(status, (), error, moment, moment))
+
+
 def test_windows_span_at_most_1990_vintages_and_chain_on_their_last_vintage() -> None:
     days = [date(2000, 1, 1) + timedelta(days=index) for index in range(4500)]
     end = days[-1] + timedelta(days=3)

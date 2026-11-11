@@ -1432,8 +1432,8 @@ commit에는 `pyarrow`(legacy extra)가 필요하다.
 ## US 공시·거시 수집
 
 ```bash
-aas collect sec plan [--home HOME] [--today YYYY-MM-DD] [--since YYYY-MM-DD] [--issuers registered|all]
-aas collect sec run --user-agent-file SEC_USER_AGENT_FILE [--since YYYY-MM-DD] [--issuers registered|all] [--max-calls 2000] [--home HOME]
+aas collect sec plan [--home HOME] [--today YYYY-MM-DD] [--since YYYY-MM-DD] [--issuers registered|reporting|all]
+aas collect sec run --user-agent-file SEC_USER_AGENT_FILE [--since YYYY-MM-DD] [--issuers registered|reporting|all] [--max-calls 2000] [--home HOME]
 aas collect fred plan [--home HOME] [--today YYYY-MM-DD]
 aas collect fred run --key-file FRED_KEY_FILE [--max-calls 500] [--home HOME]
 ```
@@ -1451,9 +1451,15 @@ companyfacts 순으로, FRED는 CSV, 시계열별 vintage 확인과 observations
 `collection_jobs`·`collection_attempts`·`usage_events`에 기록된다. 응답은 `raw/`와 `sec-*`·`fred-*` 내용
 원천에 남는다. 출력은 공급자 호출 수, 이유별 요청 수, 결과 분포, 멈춘 이유(`budget`,
 `provider_refused:<HTTP 상태>`, `transport_failures`), commit한 원천이다. SEC는 덮인 마지막 날과 남은 계획을,
-FRED는 시계열별 알려진 vintage 날과 완결되지 않은 창을 함께 낸다. 예산을 다 쓰면 정상 종료이고, 거부나 전송
+FRED는 시계열별 알려진 vintage 날과 완결되지 않은 창을 함께 낸다. FRED가 새 vintage 없는 창에 주는 HTTP
+500은 창 없는 최신 vintage를 한 번 더 물어(`latest_vintage:vintage_recheck`) 알려진 날 뒤가 아니면 `NO_DATA`로
+세고, 그 밖의 500·502·점검 페이지는 `FAILED`로 센다. 예산을 다 쓰면 정상 종료이고, 거부나 전송
 실패로 멈추면 받은 답을 commit한 뒤 종료 코드 1이다. commit에는 `pyarrow`(legacy extra)가 필요하다.
-`--issuers registered`(기본)는 identity에 SEC 발행인으로 등록된 제출자의 문서만 묻는다. 처음 SEC 실행은
+`--issuers registered`(기본)는 identity에 SEC 발행인으로 등록된 제출자의 문서만 묻는다. US 발행인이
+identity에 없으면 색인만 받고 `wanted`가 0이다. `--issuers reporting`은 거기에 읽은 색인에서 정기
+보고서(10-K·10-Q·20-F·40-F와 정정)를 낸 제출자를 더하며 identity에 쓰지 않는다. 문서는 가장 이른 공시일
+순으로 묻고, `--max-calls`(예약 실행은 `sec.max_calls`)에서 멈춘 나머지는 다음 실행이 잇는다. 범위를 바꾸면
+`pending.requests`의 남은 요청 수가 그 밀린 양이다. 처음 SEC 실행은
 `--since`로 legacy bulk archive 뒤의 첫 색인 날을 정한다.
 
 수집한 원천의 승격은 [원천 자료의 승격과 은퇴](#원천-자료의-승격과-은퇴)의 명세로 한다.
@@ -1499,7 +1505,9 @@ aas collect qveris import --raw-root RAW --identity IDENTITY.json [--market KR] 
 ```
 
 - `daily-jobs`는 선언 달력에서 관측일(기본 UTC 오늘) 이전의 열린 세션마다 일간 내려받기 요청을 만들고,
-  raw root에 이미 완료된 요청은 빼며 완료 없이 시도만 있는 요청은 `held`로 보고한다. 새 요청이 있을
+  raw root에 이미 완료된 요청은 빼며 완료 없이 시도만 있는 요청은 `held`로 보고한다. 정산된 과금 없는
+  빈 응답(`empty_result`)만 있는 요청은 `held`가 아니라 `empty`로 보고하고, 관측일이 그 응답보다 늦으면
+  다시 계획한다(`planned: true`). 새 요청이 있을
   때만 `--output`을 새로 만들고 그 SHA-256을 출력한다. 키를 읽지 않고 요청하지 않는다.
 - `plan`은 job 문서를 검증하고 문서마다 `completed`(같은 fingerprint가 완료돼 `run`이 HTTP 없이 재사용),
   `held`(같은 fingerprint의 시도를 `run`이 정산), `equivalent`(같은 요청이 관측일이나 job ID가 다른 job으로
@@ -1586,17 +1594,74 @@ identity 단계는 그 목록의 행을 등록된 FMP ISIN으로 Norgate 상품�
 | `unresolved_tokens` | 그 기록들의 단계별 `unresolved_token_count` 합 |
 | `unpublished_sources` | 가장 늦은 기록에서 어떤 단계도 게시하지 않은 원천 수 |
 | `oldest_date` | 그 원천들이 덮는 가장 이른 partition 날짜(partition이 없으면 첫 `unresolved` 기록의 UTC 날짜) |
+| `rows_by_reason` | `prices.us.eodhd`(와 `.r<N>`)에만 있다. 그 원천 행을 지금의 registry와 US 목록으로 판정한 사유별 행 수. `resolved`(이제 등록 claim이 덮음, 다음 승격을 기다림), `list_claimable`(다음 identity 단계가 등록할 날), `list_not_observed`(그날 목록에 없음), 그 밖은 목록 사유(`list_isin_missing` 등) |
+| `rows_by_class` | 같은 항목. `resolved`가 아닌 사유마다 목록 `Type`의 종류별 행 수(`common_stock`, `etf`, `mutual_fund`, `warrant`, `unknown` 등) |
+| `rows_by_disposition` | 같은 항목. `resolved`가 아닌 행의 처리별 수: `register`(그 상품의 ISIN 원천이 생기면 해석됨), `unresolved`(사유와 함께 남김), `out_of_scope`(상품이 없는 종류) |
 
 ```json
 "standing_unresolved": {"prices.us.eodhd": {"sources": 44, "rows": 528400, "rows_unavailable": 0,
-  "unresolved_tokens": 528000, "unpublished_sources": 44, "oldest_date": "2026-09-09"}}
+  "unresolved_tokens": 528000, "unpublished_sources": 44, "oldest_date": "2026-09-09",
+  "rows_by_reason": {"list_isin_missing": 300, "list_not_observed": 100, "resolved": 528000},
+  "rows_by_class": {"list_isin_missing": {"mutual_fund": 300}, "list_not_observed": {"unknown": 100}},
+  "rows_by_disposition": {"out_of_scope": 300, "unresolved": 100}}}
 ```
 
+세 필드는 읽을 때마다 계산하므로 registry와 US 목록을 읽는다(SELECT만). 목록은 가장 이른 기다리는 날의
+120일 전부터 연결된 것만, 그 심볼과 그 상품 ISIN의 행만 읽는다.
+
 위 값은 형식 예시일 뿐 측정값이 아니다.
+
+**보고의 `heads` 단계.** `datasets`는 dataset마다 head와 watermark에 더해 데이터 신선도를 싣는다. watermark의
+`through_us`는 가장 늦은 수집(ingestion) 시각이지 데이터가 어디까지 왔는지가 아니므로, 정체된 dataset도 최신처럼
+보인다. 신선도 필드가 그 차이를 드러낸다. 카탈로그 dataset 중 committed 버전이 없는 것도 `version`·`sequence`가
+`null`, `rows` 0, `freshness` `no_head`로 나열된다(카탈로그 밖 dataset은 head가 있을 때만 나온다). 값은 그
+head chain의 market 행과 패키지 선언 달력만 읽어 구하며 새 상태를 쓰거나 공급자를 부르지 않는다. 신선도는 종료
+코드에 영향이 없다(종료 코드 반영은 운영과 따로 정한다). `heads.previous_report`는 직전 실행 보고를 읽은 결과
+(`read`, `missing`, `unreadable`, `other_installation`, `no_heads`)다. `plan`의 `heads`도 같은 필드를 내지만 직전
+보고를 읽지 않으므로 `zero_promotion_runs`는 `null`이다.
+
+| 필드 | 뜻 |
+| --- | --- |
+| `data_through` | head chain에서 TOMBSTONE이 아닌 행의 가장 늦은 날짜(아래 도메인별 열). 날짜 있는 행이 없으면 `null` |
+| `expected_through` | 이 실행 시각에 데이터가 닿아야 할 날짜. 기대가 없거나 동결이면 `null` |
+| `lag_sessions` | `data_through` 뒤로 `expected_through`까지 빠진 수. 단위는 `lag_unit` |
+| `lag_unit` | `sessions`(해당 거래소 세션 수) 또는 `periods`(시리즈 주기 수) |
+| `stale_after` | 이 lag를 넘으면 `stale`인 임계값 |
+| `freshness` | `current`, `stale`, `frozen`(구독이 끝난 Norgate·FMP), `untracked`(기대 날짜 없음), `no_data`(날짜 있는 행 없음), `no_head` |
+| `stale_reasons` | `lag`(lag가 임계값 초과), `zero_promotion`(아래 연속 실행 수가 기준 이상) |
+| `stale_series` | 시리즈 기대(`periods`)에서 임계값을 넘은 시리즈 ID |
+| `zero_promotion_runs` | 수집 단계가 성공했는데 head가 그대로이고 데이터가 뒤처진(또는 기대 날짜가 없는) 연속 실행 수. 직전 보고의 `sequence`와 이 값을 이어 센다 |
+
+도메인별 `data_through` 열은 `prices`·`calendar_sessions` `session_date`, `corporate_actions` `ex_date`,
+`instrument_status` `effective_from_us`의 UTC 날짜, `fundamentals` `available_at_us`의 UTC 날짜,
+`macro_observations` `observation_period`, `fx_rates` `fixing_at_us`의 UTC 날짜, `filings` `filed_date`,
+`classifications` `effective_from`이다. 기대는 dataset마다 하나다. US·KR 일봉·기업행동과 SEC는 그 거래소(XNYS,
+XKRX)에서 실행 시각까지 마감한 마지막 세션, OpenDART는 서울 날짜의 전일(lag는 XKRX 세션 수), ALFRED·FRED·BOK·OECD는
+시리즈마다 최근 관측 기간에서 추정한 주기(평일·주·월·분기·반기·년)로 한 주기가 더 지난 기간까지(dataset의 lag는
+가장 뒤처진 시리즈)이고, 선언 달력·KIND 상장상태·분류는 기대가 없다. 임계값, 연속 실행 기준(5회)과 동결 공급자는
+`storage/maintain_promotion.py`의 `FRESHNESS`, `STALE_AFTER_ZERO_PROMOTION_RUNS`, `FROZEN_PROVIDERS` 한 곳에 있다.
+이 필드는 추가된 것이라 보고 스키마 이름은 `aas-maintain-report-v1` 그대로다.
+
+```json
+{"dataset_id": "prices.kr.eodhd", "version": "12", "sequence": 12, "rows": 1000,
+ "watermarks": {"qveris/all": {"through_us": 1785139200000000, "version": "12"}},
+ "data_through": "2026-07-01", "expected_through": "2026-07-27", "lag_sessions": 17,
+ "lag_unit": "sessions", "stale_after": 2, "freshness": "stale", "stale_reasons": ["lag"],
+ "stale_series": [], "zero_promotion_runs": 3}
+```
+
+위 값도 형식 예시일 뿐 측정값이 아니다.
 
 유지보수는 chain을 이어 붙일 뿐 시작하지 않는다. 각 dataset의 첫 generation은 [운영 전환](#운영-전환)에서 운영자가
 `aas data promote`(또는 `data kr-prices`, `calendar refresh`)로 만들고, 그 뒤 실행이 새로 수집된 원천을 그
 명세의 규칙으로 이어 붙인다. head가 없는 dataset은 `no_head`로 보고된다.
+
+`actions.us.eodhd`, `actions.kr.eodhd`, `fx.usdkrw.eodhd`, `status.kr.kind` route는 첫 template을 코드에
+선언해 두었다(시작 선언). 그래도 지금의 `aas maintain run`은 시작할 dataset을 넘기지 않으므로 이 dataset들은
+`no_head`로 보고되고 `skipped.no_head`가 기다리는 원천 테이블 수를 센다. 시작은 운영 DB에 첫 generation을 쓰는 일이라
+켜는 시점은 운영자가 정한다. 켜진 실행에서 선언이 pin할 달력 head가 없으면 `no_calendar`, identity snapshot이
+없으면 `identity_unavailable`로 보고하고 아무것도 쓰지 않는다. 시작한 dataset 항목은 `started: true`이고
+`template_spec_sha256`은 null이다. 그 밖의 항목은 `started: false`다.
 
 KR 일간 bulk route(`eodhd.bulk_quarantine@1`, `_adjusted@1`)는 예외로, chain에 bulk generation이 없으면 같은
 chain의 이력 명세에서 template을 파생한다. 그때 그 dataset 항목의 `derived_from`이 원본 매퍼(`eodhd.bars@1`
@@ -1604,6 +1669,27 @@ chain의 이력 명세에서 template을 파생한다. 그때 그 dataset 항목
 경고 응답의 행을 값 검사(유한한 숫자, 가격 > 0, 거래량 >= 0, OHLC 일관성, `YYYY-MM-DD` 날짜)로 거르고, 한
 행이라도 어긴 테이블은 승격하지 않고 `skipped.value_check`에 센다. 그 수가 0이 아니면 해당 원천의 응답을 읽어
 사유를 확인한다. 테이블은 다음 실행에도 다시 세어진다.
+
+**보고의 `qveris` 단계: 부분 성공과 일시 오류.** 경고 완료(`RAW_ACQUIRED_WITH_WARNINGS`)는 완료와 따로
+센다. `partial`은 모든 행이 값 검사를 통과해(또는 행을 읽어 판정할 수 없어) 다시 묻지 않는 경고 요청 수이고,
+`reasons.partial_retry`는 보류된 행이 있거나 page의 `raw_result_count`와 `valid_result_count`가 다른 경고 요청을
+다시 묻는 수다. 재질문은 `failed_retry`와 같은 간격(1, 2, 4, …, 최대 32일)이고 모든 첫 묻기 뒤에 오므로
+`max_calls`·`max_credits`가 남긴 만큼만 쓴다. `warnings`는 요청을 정하는 경고 묻기의 집계다.
+
+| 필드 | 뜻 |
+| --- | --- |
+| `asks` | 집계한 경고 묻기 수 |
+| `decisions` | 그 묻기들의 계획 결정별 수(`partial`, `partial_retry`, `backoff`, `waiting`, `refresh`) |
+| `held_rows` | 값 검사를 어겨 그 사유로 보류된 행 수 합 |
+| `unjudged` | 행을 읽어 판정할 수 없었던 묻기 수(종목 목록 등). 다시 묻지 않는다 |
+| `by_reason` | 경고 page를 기록된 `reason_code`·`provider_status_code`별로 센 것과 raw·valid 행 수가 같은(`counts_equal`)·다른(`counts_differ`)·알 수 없는(`counts_unknown`) page 수. 값이 없거나 문자열·정수가 아니면 `unclassified`이고 코드의 뜻은 해석하지 않는다 |
+
+`quarantine_candidates`는 execute가 5xx이고 `execution_id`가 없으며 raw root에 남은 정산 조회(`audits/`)가 모두
+사용 이벤트를 찾지 못한 미정산 page다(`job_id`, `page`, `http_status`, `settlement_reads_without_usage`). 후보는
+`held`에도 그대로 있고 자동으로 격리하지 않는다. 격리는 운영자가 그 `page`로
+`aas collect qveris quarantine --page`를 실행할 때만 일어난다. 설정 `continue_past_transient`(기본 `false`)를
+켜면 후보 page만 남은 실행도 계획된 요청을 묻는다. 그 page의 견적 전체는 잔액 확인에서 예약으로 남고 상태는
+그대로 `stopped`(종료 코드 2)다. 끄면 지금처럼 미정산 page가 다음 job을 막는다.
 
 설치와 예약은 [운영 전환](#운영-전환)의 일이다. 태그된 dev 커밋을 정확한 CPython 경로로 설치하고 receipt를 남긴다.
 

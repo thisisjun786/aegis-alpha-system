@@ -94,6 +94,8 @@ _DAILY: Final = ("session_close_plus_lag@1",)
 _DAY_END: Final = ("local_day_end@1",)
 _TEXT: Final = ("decimal_text@1",)
 _SHORTEST: Final = ("float_shortest@1",)
+_EODHD_ACTIONS: Final = ("eodhd.dividends@1", "eodhd.splits@1")
+_ACTION_NUMBERS: Final = ("decimal_text@1", "float_shortest@1")
 
 CATALOG: Final[tuple[CatalogEntry, ...]] = (
     CatalogEntry(
@@ -127,7 +129,7 @@ CATALOG: Final[tuple[CatalogEntry, ...]] = (
         "prices.us.eodhd",
         "prices",
         "canonical",
-        ("eodhd.bars@1",),
+        ("eodhd.bars@1", "eodhd.bulk_quarantine@1"),
         _DAILY,
         _SHORTEST,
         ("cross_provider_mismatch@1",),
@@ -182,12 +184,26 @@ CATALOG: Final[tuple[CatalogEntry, ...]] = (
         _SHORTEST,
         frozen=True,
     ),
-    CatalogEntry("actions.us.eodhd", "corporate_actions", "canonical", (), ("exdate_open@1",)),
-    CatalogEntry("actions.kr.eodhd", "corporate_actions", "canonical", (), ("exdate_open@1",)),
+    CatalogEntry(
+        "actions.us.eodhd",
+        "corporate_actions",
+        "canonical",
+        _EODHD_ACTIONS,
+        ("exdate_open@1",),
+        _ACTION_NUMBERS,
+    ),
+    CatalogEntry(
+        "actions.kr.eodhd",
+        "corporate_actions",
+        "canonical",
+        _EODHD_ACTIONS,
+        ("exdate_open@1",),
+        _ACTION_NUMBERS,
+    ),
     CatalogEntry(
         "status.us.norgate", "instrument_status", "canonical", ("norgate.status@1",), _DAY_END
     ),
-    CatalogEntry("status.kr.kind", "instrument_status", "canonical", (), ()),
+    CatalogEntry("status.kr.kind", "instrument_status", "canonical", ("kind.status@1",), _DAY_END),
     CatalogEntry(
         "filings.us.sec", "filings", "canonical", ("sec.submissions@1",), ("source_column@1",)
     ),
@@ -233,6 +249,9 @@ CATALOG: Final[tuple[CatalogEntry, ...]] = (
     ),
     CatalogEntry(
         "fx.usdkrw.fred", "fx_rates", "canonical", ("fred.fx_series@1",), ("unknown_null@1",), _TEXT
+    ),
+    CatalogEntry(
+        "fx.usdkrw.eodhd", "fx_rates", "canonical", ("eodhd.fx_history@1",), _DAY_END, _SHORTEST
     ),
     CatalogEntry(
         "classifications.us.norgate",

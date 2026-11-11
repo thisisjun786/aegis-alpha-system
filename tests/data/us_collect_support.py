@@ -43,10 +43,19 @@ def _fred_error(code: int, message: str) -> HttpAnswer:
 
 @dataclass(slots=True)
 class FakeFred:
-    """ALFRED histories per series; ``today`` is FRED's (Chicago) date."""
+    """ALFRED histories per series; ``today`` is FRED's (Chicago) date.
+
+    FRED answers a ``vintagedates`` window that holds no vintage with HTTP 500 instead of an
+    empty list; a fake with ``empty_window_500`` does the same. ``window_answers`` answers
+    every windowed ``vintagedates`` call of a series with its fixed answer, whatever the
+    window holds. A ``vintagedates`` call without a window (``sort_order=desc``, ``limit=1``)
+    answers the series' latest published vintage.
+    """
 
     today: date
     history: dict[str, list[Period]] = field(default_factory=dict)
+    empty_window_500: bool = False
+    window_answers: dict[str, HttpAnswer] = field(default_factory=dict)
     fail: set[str] = field(default_factory=set)
     # Observations windows (by realtime_start) whose calls fail in transport.
     fail_starts: set[str] = field(default_factory=set)
@@ -88,14 +97,13 @@ class FakeFred:
         series = parameters["series_id"]
         if series not in self.history:
             return _fred_error(400, "Bad Request.  The series does not exist.")
+        if endpoint == "vintagedates":
+            return self._vintage_dates(parameters, series)
         start = date.fromisoformat(parameters["realtime_start"])
         end = date.fromisoformat(parameters["realtime_end"])
         if end > self.today and end != OPEN:
             return _fred_error(400, "Bad Request.  Variable realtime_end can not be after today.")
         limit, offset = int(parameters["limit"]), int(parameters["offset"])
-        if endpoint == "vintagedates":
-            days = [day.isoformat() for day in self.vintages(series) if start <= day <= end]
-            return self._page(parameters, "vintage_dates", days, limit, offset)
         inside = [day for day in self.vintages(series) if start <= day <= end]
         if len(inside) > 1990:  # noqa: PLR2004 -- the collector's margin below FRED's 2000
             return _fred_error(400, f"Bad Request.  There are {len(inside)} vintage dates.")
@@ -125,6 +133,36 @@ class FakeFred:
             "offset": offset,
             "limit": limit,
             key: list(items[offset : offset + limit]),
+        }
+        return HttpAnswer(200, JSON, json.dumps(document).encode())
+
+    def _vintage_dates(self, parameters: Mapping[str, str], series: str) -> HttpAnswer:
+        if "realtime_start" not in parameters:
+            return self._latest(parameters)
+        if series in self.window_answers:
+            return self.window_answers[series]
+        start = date.fromisoformat(parameters["realtime_start"])
+        end = date.fromisoformat(parameters["realtime_end"])
+        if end > self.today and end != OPEN:
+            return _fred_error(400, "Bad Request.  Variable realtime_end can not be after today.")
+        days = [day.isoformat() for day in self.vintages(series) if start <= day <= end]
+        if not days and self.empty_window_500:
+            return _fred_error(500, "Internal Server Error")
+        limit, offset = int(parameters["limit"]), int(parameters["offset"])
+        return self._page(parameters, "vintage_dates", days, limit, offset)
+
+    def _latest(self, parameters: Mapping[str, str]) -> HttpAnswer:
+        assert (parameters["sort_order"], parameters["limit"]) == ("desc", "1")
+        published = [day for day in self.vintages(parameters["series_id"]) if day <= self.today]
+        document = {
+            "realtime_start": ORIGIN.isoformat(),
+            "realtime_end": OPEN.isoformat(),
+            "order_by": "vintage_date",
+            "sort_order": "desc",
+            "count": len(published),
+            "offset": 0,
+            "limit": 1,
+            "vintage_dates": [day.isoformat() for day in published[::-1][:1]],
         }
         return HttpAnswer(200, JSON, json.dumps(document).encode())
 

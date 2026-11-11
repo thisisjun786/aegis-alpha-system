@@ -14,8 +14,9 @@ run) is refused with ``installation_busy``. The stages, in order:
 5. ``import``: completed Qveris jobs and KR symbol lists as content sources;
 6. ``identity``: new KR listings registered and the maintenance identity snapshot pinned;
 7. ``promote``: every catalog dataset chain continued with its new sources;
-8. ``report``: dataset heads with their watermarks, kept in ``raw/`` and as
-   ``<runtime>/maintain-report.json``.
+8. ``report``: dataset heads with their watermarks and data freshness (how far each
+   dataset's data reaches, how far it should, the lag and ``stale``/``frozen``), kept in
+   ``raw/`` and as ``<runtime>/maintain-report.json``. Freshness never changes the exit code.
 
 A failing stage (a database error included) is recorded and the later stages still run
 on what is committed; a provider refusal or failure never stops the other providers. When
@@ -55,6 +56,8 @@ if TYPE_CHECKING:
 
 REPORT_SCHEMA: Final = "aas-maintain-report-v1"
 REPORT_NAME: Final = "maintain-report.json"
+COLLECTORS: Final = ("kind", "dart", "sec", "fred", "qveris")
+_PREVIOUS_REPORT_BYTES: Final = 64 * 1024 * 1024
 _LOCAL_ERRORS: Final = (ValueError, TypeError, OSError, RuntimeError, KeyError)
 
 type Clock = Callable[[], datetime]
@@ -329,6 +332,87 @@ def _import(workspace: Workspace, config: MaintainConfig) -> dict[str, object]:
     return result
 
 
+def _previous_heads(workspace: Workspace) -> tuple[str, dict[str, dict[str, object]]]:
+    """The last run's heads by dataset, read from its report, and how that read went."""
+    import json
+
+    from aegis_alpha.data.descriptor_tree import DescriptorTree
+
+    runtime = workspace.paths.runtime
+    try:
+        with DescriptorTree.open_path(runtime) as tree:
+            if not tree.exists(REPORT_NAME):
+                return "missing", {}
+            report = json.loads(tree.read_bytes(REPORT_NAME, max_bytes=_PREVIOUS_REPORT_BYTES))
+    except (OSError, ValueError):  # DescriptorTreeError and JSON errors are ValueErrors
+        return ("unreadable" if runtime.exists() else "missing"), {}
+    if not isinstance(report, dict) or report.get("schema") != REPORT_SCHEMA:
+        return "unreadable", {}
+    if report.get("installation_id") != workspace.installation_id:
+        return "other_installation", {}
+    heads = cast("dict[str, object]", report.get("stages") or {}).get("heads")
+    datasets = heads.get("datasets") if isinstance(heads, dict) else None
+    if not isinstance(datasets, list):
+        return "no_heads", {}
+    return "read", {
+        str(item["dataset_id"]): item
+        for item in datasets
+        if isinstance(item, dict) and "dataset_id" in item
+    }
+
+
+def promotion_streaks(
+    heads: list[dict[str, object]],
+    previous: dict[str, dict[str, object]],
+    collected: frozenset[str],
+) -> None:
+    """Count, per dataset, the runs that collected but did not advance a lagging head.
+
+    A run counts when the dataset's collector stage succeeded, the head's sequence equals
+    the previous report's and the data is behind (or has no expected date). An advanced
+    head or data that is current resets the count; a run that did not collect carries it.
+    At ``STALE_AFTER_ZERO_PROMOTION_RUNS`` the dataset is ``stale`` (``zero_promotion``).
+    Frozen datasets and catalog datasets without a head are not counted.
+    """
+    from aegis_alpha.storage.maintain_promotion import STALE_AFTER_ZERO_PROMOTION_RUNS, collector
+
+    for head in heads:
+        if head["freshness"] in {"frozen", "no_head"}:
+            continue
+        prior = previous.get(str(head["dataset_id"]))
+        prior_runs = prior.get("zero_promotion_runs") if prior is not None else None
+        carried = prior_runs if isinstance(prior_runs, int) else 0
+        name = collector(str(head["dataset_id"]))
+        if prior is None or prior.get("sequence") != head["sequence"] or head["lag_sessions"] == 0:
+            runs = 0
+        elif name is not None and name in collected:
+            runs = carried + 1
+        else:
+            runs = carried
+        head["zero_promotion_runs"] = runs
+        if runs >= STALE_AFTER_ZERO_PROMOTION_RUNS:
+            head["freshness"] = "stale"
+            head["stale_reasons"] = [*cast("list[str]", head["stale_reasons"]), "zero_promotion"]
+
+
+def _heads(run: _Run, workspace: Workspace) -> dict[str, object]:
+    """The closing heads with their freshness; reads the store and the last report only."""
+    from aegis_alpha.storage import maintain_promotion
+
+    heads = maintain_promotion.dataset_heads(workspace, now=run.clock())
+    state, previous = _previous_heads(workspace)
+    collected = frozenset(
+        name
+        for name in COLLECTORS
+        if name in run.stages
+        and cast("dict[str, object]", run.stages[name]).get("status") != "failed"
+        and name not in run.stopped
+        and name not in run.uncertain
+    )
+    promotion_streaks(heads, previous, collected)
+    return {"datasets": heads, "previous_report": state}
+
+
 def _write_report(workspace: Workspace, report: dict[str, object]) -> str:
     from aegis_alpha.data.descriptor_tree import DescriptorTree
     from aegis_alpha.storage.locks import private_directory
@@ -382,7 +466,7 @@ def run_maintenance(  # noqa: PLR0913 -- the run's explicit inputs
     )
     if promoted is not None and promoted["refused"]:
         run.failed.append("promote")
-    run.local("heads", lambda: {"datasets": maintain_promotion.dataset_heads(workspace)})
+    run.local("heads", lambda: _heads(run, workspace))
     code = 2 if run.uncertain else 1 if run.failed or run.stopped else 0
     report: dict[str, object] = {
         "schema": REPORT_SCHEMA,
@@ -474,7 +558,7 @@ def plan_maintenance(  # noqa: PLR0913 -- the plan's explicit inputs
             evaluate=promotions,
         ),
     )
-    run.local("heads", lambda: {"datasets": maintain_promotion.dataset_heads(workspace)})
+    run.local("heads", lambda: {"datasets": maintain_promotion.dataset_heads(workspace, now=now)})
     return {
         "schema": REPORT_SCHEMA,
         "mode": "plan",

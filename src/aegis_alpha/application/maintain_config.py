@@ -54,7 +54,7 @@ _QVERIS: Final = {
     "extra_sessions",
     "symbol_lists", "symbol_list_days", "forex", "forex_lookback_days", "max_calls",
     "max_credits", "max_http_requests", "time_limit_seconds", "request_interval",
-    "timeout_seconds",
+    "timeout_seconds", "continue_past_transient",
 }  # fmt: skip
 _FIELDS: Final = {
     "kind": {"enabled"},
@@ -202,6 +202,9 @@ def _qveris(paths: StoragePaths, section: Mapping[str, object]) -> QverisSetting
     if http is not None and (type(http) is not int or http < 1):
         raise ValueError(f"{name}.max_http_requests must be a positive integer")
     interval = section.get("request_interval")
+    tolerate = section.get("continue_past_transient", False)
+    if type(tolerate) is not bool:
+        raise TypeError(f"{name}.continue_past_transient must be true or false")
     caps = QverisCaps(
         max_calls=_integer(section, "max_calls", 0, name),
         max_credits=max_credits,
@@ -209,6 +212,7 @@ def _qveris(paths: StoragePaths, section: Mapping[str, object]) -> QverisSetting
         time_limit_seconds=_seconds(section, "time_limit_seconds", 3600.0, name),
         request_interval=None if interval is None else _seconds(section, "request_interval",
                                                                 None, name),
+        continue_past_transient=tolerate,
     )  # fmt: skip
     identity = section.get("identity")
     return QverisSettings(
@@ -236,8 +240,8 @@ def _section(
         )
     if provider == "sec":
         issuers = section.get("issuers", "registered")
-        if issuers not in {"registered", "all"}:
-            raise ValueError(f"{name}.issuers is registered or all")
+        if issuers not in {"registered", "reporting", "all"}:
+            raise ValueError(f"{name}.issuers is registered, reporting or all")
         since = section.get("since")
         return SecSettings(
             _secret(paths, _text(section, "user_agent_file", name)),

@@ -46,6 +46,17 @@ claim and the first observation (``history_gap``, with the registry symbols brid
 and those left unbridged) and the unobserved weekdays between observations
 (``observation_gaps``).
 
+Every unresolved day also gets a symbol class and a disposition, for the report only (they
+never reach a claim). The class is the list row's provider ``Type`` label
+(``symbol_class``); the disposition (``disposition``) is ``out_of_scope`` when the class has
+no instrument in the Norgate-anchored registry (preferred shares, warrants, units, rights,
+debt, mutual funds) and no row of the day names an instrument, ``register`` when the ISIN
+is missing or unregistered for a symbol a registered or accepted claim held before (an
+ISIN-bearing source for that instrument would resolve it), and ``unresolved`` otherwise
+(``unresolved_classes``, ``unresolved_dispositions``). ``unresolved_breakdown`` counts the
+rows of waiting US bar sources the same way, judged against the current registry, for the
+maintenance report's ``standing_unresolved``.
+
 The registered claims and ISIN owners come from the registry itself, so the result is a
 registry document of new assertions only, which registration validates like any other.
 The contract is in dev-notes/design/data-vertical.md.
@@ -53,6 +64,7 @@ The contract is in dev-notes/design/data-vertical.md.
 
 from __future__ import annotations
 
+import re
 from bisect import bisect_left
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -92,6 +104,30 @@ _COLUMNS: Final = ("exchange_code", "delisted", "code", "currency", "isin", "ret
 _WEEKEND: Final = frozenset({5, 6})
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 _SAMPLE: Final = 100
+BAR_DATASET: Final = "prices.us.eodhd"
+"""The dataset whose waiting rows ``unresolved_breakdown`` counts (and its ``.r<N>``)."""
+CLASSES: Final[Mapping[str, str]] = {
+    "Common Stock": "common_stock",
+    "ETF": "etf",
+    "FUND": "fund",
+    "Mutual Fund": "mutual_fund",
+    "Preferred Stock": "preferred",
+    "Warrant": "warrant",
+    "Unit": "unit",
+    "Right": "right",
+    "BOND": "debt",
+    "Notes": "debt",
+}
+"""EODHD list ``Type`` labels by symbol class; any other label is ``other``."""
+OUT_OF_SCOPE_CLASSES: Final = frozenset(
+    {"mutual_fund", "preferred", "warrant", "unit", "right", "debt"}
+)
+"""Classes the Norgate-anchored US registry holds no instrument kind for."""
+REGISTRABLE: Final = frozenset({"list_isin_missing", "list_isin_unregistered"})
+"""Reasons an ISIN-bearing source for an already registered instrument would resolve."""
+NOT_OBSERVED: Final = "list_not_observed"
+CLAIMABLE: Final = "list_claimable"
+RESOLVED: Final = "resolved"
 
 _HELD: Final = (
     "SELECT token, instrument_id, valid_from_us, valid_to_us, source_snapshot_id "
@@ -187,9 +223,35 @@ class Observation:
     """The instrument the row's ISIN names (a valid, registered, unambiguous ISIN in USD),
     even when the row is refused for repeating a symbol or an ISIN: such a row contradicts a
     claim of another instrument. A row naming no instrument contradicts nothing."""
+    kind: str = "unknown"
+    """The row's symbol class (``symbol_class``), for the report only."""
 
     def outcome(self) -> str:
         return self.instrument_id or f"unresolved:{self.reason}"
+
+
+def symbol_class(label: object) -> str:
+    """The class of a list row's ``Type`` label: ``unknown`` when absent, ``other`` when new."""
+    if not isinstance(label, str) or not label:
+        return "unknown"
+    return CLASSES.get(label, "other")
+
+
+def disposition(reason: str, kind: str, *, names_instrument: bool, held_before: bool) -> str:
+    """How an unresolved symbol-day is handled: ``register``, ``unresolved`` or
+    ``out_of_scope``.
+
+    A day no row of which names an instrument is out of scope when its class has no
+    instrument kind in the registry. A missing or unregistered ISIN of a symbol some claim
+    held before can be registered by an ISIN-bearing source for that instrument. Everything
+    else (a new listing, an invalid or repeated ISIN, a moved or unbracketed symbol) stays
+    unresolved with its reason: nothing here infers an instrument.
+    """
+    if kind in OUT_OF_SCOPE_CLASSES and not names_instrument:
+        return "out_of_scope"
+    if reason in REGISTRABLE and held_before:
+        return "register"
+    return "unresolved"
 
 
 def _text(value: object) -> str | None:
@@ -247,7 +309,8 @@ def _observations(
         isin, instrument, reason = _owner(row, registry)
         evidence = Evidence(source.snapshot_id, row_hash, retrieved)
         listed.append(Observation(f"{code}.{EXCHANGE}", covered_day(retrieved), instrument,
-                                  reason, isin, evidence, instrument))  # fmt: skip
+                                  reason, isin, evidence, instrument,
+                                  symbol_class(row.get("type"))))  # fmt: skip
     return listed
 
 
@@ -281,7 +344,7 @@ def map_us_symbol_lists(
             else:
                 report.refuse(reason)
                 found.append(Observation(item.symbol, item.day, None, reason, item.isin,
-                                         item.evidence, item.names))  # fmt: skip
+                                         item.evidence, item.names, item.kind))  # fmt: skip
     return found, report
 
 
@@ -310,6 +373,10 @@ class SymbolClaims:
     """Symbols the registry's last master or export claims end with, after its ``through``."""
     continued: set[str] = field(default_factory=set)
     """Those of them a claim covers on the first weekday after ``through``."""
+    judged: dict[tuple[str, date], tuple[str, str, str]] = field(default_factory=dict)
+    """Each unresolved symbol-day's reason, symbol class and disposition."""
+    claimed_kinds: list[str] = field(default_factory=list)
+    """The symbol class of each assertion's end observation, in ``assertions`` order."""
 
     def document(self) -> dict[str, object]:
         document: dict[str, object] = {
@@ -357,6 +424,10 @@ class SymbolClaims:
                                    for reason, symbols in sorted(self.unresolved.items())},
             "unresolved": {reason: cut(symbols)
                            for reason, symbols in sorted(self.unresolved.items())},
+            "unresolved_classes": _tally((reason, kind, 1)
+                                         for reason, kind, _ in self.judged.values()),
+            "unresolved_dispositions": _tally((handled, reason, 1)
+                                              for reason, _, handled in self.judged.values()),
         }  # fmt: skip
 
     def _history_gap(self, sample: int | None) -> dict[str, object] | None:
@@ -383,6 +454,14 @@ class SymbolClaims:
             if gap is not None:
                 gaps.append(gap)
         return gaps
+
+
+def _tally(items: Iterable[tuple[str, str, int]]) -> dict[str, dict[str, int]]:
+    """``{outer: {inner: sum of counts}}`` of ``(outer, inner, count)`` items, sorted."""
+    counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for outer, inner, count in items:
+        counts[outer][inner] += count
+    return {outer: dict(sorted(inner.items())) for outer, inner in sorted(counts.items())}
 
 
 def _weekdays(first: date, stop: date) -> list[date]:
@@ -558,6 +637,9 @@ def build_symbol_claims(
                 judged = judged.removeprefix(_BRIDGE)
                 claims.bridge_unresolved[judged].add(symbol)
             claims.unresolved[judged][symbol].add(day)
+            claims.judged[symbol, day] = _classified(
+                judged, grouped[symbol, day], held_before=index.before(symbol, day) is not None
+            )
             continue
         first, start = judged
         evidence = min((item.evidence for item in grouped[symbol, day]),
@@ -565,6 +647,7 @@ def build_symbol_claims(
         claims.assertions.append(
             _assertion(registry.anchors[outcome], symbol, first, day, evidence)
         )
+        claims.claimed_kinds.append(_classified("", grouped[symbol, day], held_before=True)[1])
         claims.claimed_days.add(day)
         index.accept(symbol, first, day, outcome, evidence.source)
         if first < day:
@@ -576,6 +659,17 @@ def build_symbol_claims(
             })  # fmt: skip
     _continued(claims, registry)
     return claims
+
+
+def _classified(
+    reason: str, items: Sequence[Observation], *, held_before: bool
+) -> tuple[str, str, str]:
+    """(reason, symbol class, disposition) of an unresolved symbol-day's observations."""
+    kinds = {item.kind for item in items}
+    kind = kinds.pop() if len(kinds) == 1 else "mixed"
+    names = any(item.names is not None for item in items)
+    return reason, kind, disposition(reason, kind, names_instrument=names,
+                                     held_before=held_before)  # fmt: skip
 
 
 def _registry_edge(claims: SymbolClaims, registry: Registry) -> None:
@@ -781,3 +875,160 @@ def build_from_workspace(
     older = [Earlier(at, loader(source)) for source, at in sorted((earlier or {}).items())]
     floor = min(fresh.values(), default=0)
     return build_increment(sources, read_registry(workspace.state), older, floor)
+
+
+# --- the waiting rows of the maintenance report ------------------------------------------
+
+_JSON_ROW: Final = "(CASE WHEN json_valid(source_row_json) THEN source_row_json END)"
+_UNREADABLE: Final = "unreadable_row"
+
+
+def covers(dataset_id: str) -> bool:
+    """Whether ``unresolved_breakdown`` counts a dataset's waiting rows."""
+    return (
+        dataset_id == BAR_DATASET
+        or re.fullmatch(re.escape(BAR_DATASET) + r"\.r[0-9]+", dataset_id) is not None
+    )
+
+
+def _waiting_rows(
+    workspace: Workspace, tables: Iterable[tuple[str, str]]
+) -> dict[tuple[str | None, date | None], int]:
+    """Rows by (symbol, session date) of each (source ID, table) still listed.
+
+    A bar table names them in ``provider_symbol`` and ``date``; a held bulk table in its
+    provider JSON (``code`` and ``exchange_short_name``, ``date``). A table of another
+    shape, or a retired one, is not read.
+    """
+    from aegis_alpha.storage.promotion.formats import quote_identifier  # noqa: PLC0415
+    from aegis_alpha.storage.source_library import list_tables  # noqa: PLC0415
+
+    counts: dict[tuple[str | None, date | None], int] = defaultdict(int)
+    for source_id, name in tables:
+        try:
+            described = next(item for item in list_tables(workspace, source_id)
+                             if item["name"] == name)  # fmt: skip
+        except (ValueError, StopIteration):
+            continue
+        columns = set(cast("list[str]", described["columns"]))
+        target = quote_identifier(str(described["target"]))
+        if {"provider_symbol", "date"} <= columns:
+            query = f'SELECT provider_symbol, "date", count(*) FROM {target} GROUP BY ALL'  # noqa: S608 -- quoted manifest identifier
+        elif {"reason", "source_row_json"} <= columns:
+            text = "json_extract_string(j, '$.{}')".format
+            query = (
+                f"SELECT {text('code')} || '.' || {text('exchange_short_name')}, "  # noqa: S608 -- quoted manifest identifier
+                f"TRY_CAST({text('date')} AS DATE), count(*) "
+                f"FROM (SELECT {_JSON_ROW} AS j FROM {target}) GROUP BY ALL"
+            )
+        else:
+            continue
+        for symbol, day, count in workspace.market.execute(query).fetchall():
+            counts[symbol, day] += int(count)
+    return counts
+
+
+def _judge_now(
+    workspace: Workspace, registry: Registry, waiting: Iterable[tuple[str, date]]
+) -> SymbolClaims:
+    """One build of the US lists over the waiting symbol-days, against ``registry``.
+
+    Only the rows of the waiting symbols and of the ISINs their rows' instruments carry are
+    read, from the lists linked since ``MAX_BRIDGE_DAYS`` before the earliest waiting day.
+    """
+    pairs = list(waiting)
+    codes = frozenset(symbol.removesuffix(f".{EXCHANGE}") for symbol, _ in pairs)
+    floor = session_start_us(min(day for _, day in pairs) - timedelta(days=MAX_BRIDGE_DAYS))
+    lists = sorted(source for source, at in list_sources(workspace).items() if at >= floor)
+
+    def read(keep: Callable[[Mapping[str, object]], bool]) -> list[SourceRows]:
+        return [pinned_rows(workspace, source, EODHD_TABLE, keep) for source in lists]
+
+    named = read(_keeper(codes, frozenset()))
+    carried: dict[str, set[str]] = defaultdict(set)
+    for value, owners in registry.owners.items():
+        for owner in owners:
+            carried[owner].add(value)
+    isins: set[str] = set()
+    for source in named:
+        position = source.columns.index("isin")
+        for row in source.rows:
+            for owner in registry.owners.get(cast("str", row[position]), ()):
+                isins |= carried[owner]
+    sources = read(_keeper(codes, frozenset(isins))) if isins else named
+    return build_symbol_claims(sources, registry)
+
+
+def _judged_rows(
+    workspace: Workspace, registry: Registry, waiting: Mapping[tuple[str, date], int]
+) -> list[tuple[str, str, str, int]]:
+    """(reason, symbol class, disposition, rows) of each waiting symbol-day, judged now."""
+    built = _judge_now(workspace, registry, waiting)
+    claimed: dict[str, list[tuple[int, int, str]]] = defaultdict(list)
+    for row, kind in zip(built.assertions, built.claimed_kinds, strict=True):
+        claimed[str(row["token"])].append(
+            (cast("int", row["valid_from_us"]), cast("int", row["valid_to_us"]), kind)
+        )
+    found: list[tuple[str, str, str, int]] = []
+    for (symbol, day), count in waiting.items():
+        at = session_start_us(day)
+        judged = built.judged.get((symbol, day))
+        kinds = [kind for start, end, kind in claimed.get(symbol, ()) if start <= at < end]
+        if judged is not None:
+            found.append((*judged, count))
+        elif kinds:
+            found.append((CLAIMABLE, kinds[0], "register", count))
+        else:
+            found.append((NOT_OBSERVED, "unknown", "unresolved", count))
+    return found
+
+
+def add_breakdowns(
+    workspace: Workspace,
+    summary: Mapping[str, dict[str, object]],
+    tables: Mapping[str, Sequence[tuple[str, str]]],
+) -> None:
+    """Add ``unresolved_breakdown`` to each standing entry of a dataset it ``covers``."""
+    for dataset_id, entry in summary.items():
+        if covers(dataset_id):
+            entry.update(unresolved_breakdown(workspace, tables[dataset_id]))
+
+
+def unresolved_breakdown(
+    workspace: Workspace, tables: Iterable[tuple[str, str]]
+) -> dict[str, object]:
+    """The rows of waiting US bar sources by reason, symbol class and disposition.
+
+    Judged now, not when the rows were recorded: a row whose symbol a registered claim
+    holds at the New York start of its date is ``resolved`` (its source waits for the next
+    promotion). Every other row takes the reason one build of the US lists gives its
+    symbol-day today (``list_claimable`` when that build would claim it, so the identity
+    stage registers it next; ``list_not_observed`` when no list row covers it), with the
+    symbol class and disposition of ``disposition``. SELECT only.
+    """
+    rows = _waiting_rows(workspace, tables)
+    registry = read_registry(workspace.state)
+    held: dict[str, list[Held]] = defaultdict(list)
+    for item in registry.held:
+        held[item.token].append(item)
+    reasons: dict[str, int] = defaultdict(int)
+    found: list[tuple[str, str, str, int]] = []
+    waiting: dict[tuple[str, date], int] = {}
+    for (symbol, day), count in rows.items():
+        if symbol is None or day is None:
+            found.append((_UNREADABLE, "unknown", "unresolved", count))
+        elif any(item.holds(day) for item in held.get(symbol, ())):
+            reasons[RESOLVED] += count
+        else:
+            waiting[symbol, day] = count
+    if waiting:
+        found.extend(_judged_rows(workspace, registry, waiting))
+    dispositions: dict[str, int] = defaultdict(int)
+    for reason, _, handled, count in found:
+        reasons[reason] += count
+        dispositions[handled] += count
+    return {
+        "rows_by_reason": dict(sorted(reasons.items())),
+        "rows_by_class": _tally((reason, kind, count) for reason, kind, _, count in found),
+        "rows_by_disposition": dict(sorted(dispositions.items())),
+    }

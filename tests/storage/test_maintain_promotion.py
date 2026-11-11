@@ -18,13 +18,16 @@ from typing import cast
 import pytest
 
 from aegis_alpha.storage import kr_prices, maintain_promotion
+from aegis_alpha.storage.dataset_catalog import CATALOG
 from aegis_alpha.storage.maintain_promotion import (
     KeyMembers,
     Route,
     maintenance_spec,
     promote_datasets,
 )
+from aegis_alpha.storage.market import publish_generation
 from aegis_alpha.storage.promotion.engine import dataset_head, promote
+from aegis_alpha.storage.state import atomic
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
 from tests.storage.promotion_support import (
     PARTIAL,
@@ -33,6 +36,7 @@ from tests.storage.promotion_support import (
     at,
     bar,
     bulk_row,
+    full_snapshot,
     publish_calendar,
     register_symbols,
     spec,
@@ -302,6 +306,68 @@ def test_a_chain_with_a_bulk_generation_continues_from_it_without_deriving(
     ]
 
 
+NEW_YORK = "America/New_York"
+US_RULE = {"rule": "local_day_end@1", "basis": "record", "input": "session_date",
+           "args": {"timezone": NEW_YORK}}  # fmt: skip
+US_BULK = replace(
+    next(item for item in maintain_promotion.ROUTES
+         if (item.dataset_id, item.mapper) == ("prices.us.eodhd", "eodhd.bulk_quarantine@1")),
+    prefix="synthetic-kr-bulk-",
+)  # fmt: skip
+
+
+def test_a_warned_us_bulk_day_continues_the_us_chain_and_identity_held_rows_stay_out(
+    ws: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    retrieved = at("2026-09-09T08:00:00")
+    daily = add_source(ws, [bar("AAA.US", B1, 10.0, retrieved=retrieved, currency="USD"),
+                            bar("BBB.US", B1, 20.0, retrieved=retrieved, currency="USD")],
+                       tag="us-daily", linked=retrieved)  # fmt: skip
+    pin = register_symbols(ws, daily["source_id"], {"AAA.US": "900001", "BBB.US": "900002"},
+                           name="us")  # fmt: skip
+    floats = dict.fromkeys(("open", "high", "low", "close", "volume"), "float_shortest@1")
+    history = spec([daily], pin, dataset="prices.us.eodhd", decimals=floats,
+                   rules={"available_at_us": US_RULE, "revision_known_at_us": US_RULE},
+                   partition={"from": B1.isoformat(), "to": B2.isoformat()},
+                   mapper={"name": "eodhd.bars@1", "args": {"timezone": NEW_YORK}})  # fmt: skip
+    assert promote(ws, *history, apply=True)["published"] is True
+    parent = dataset_head(ws, "prices.us.eodhd")
+    warned = add_bulk_source(ws, [bulk_row("AAA", "US", B2, 11), bulk_row("BBB", "US", B2, 21)],
+                             tag="us-warned", linked=at("2026-09-09T09:00:00"))  # fmt: skip
+    # Rows the import held for want of an import-time identity are not the route's.
+    add_bulk_source(ws, [bulk_row("CCC", "US", B2, 5,
+                                  reason="explicit instrument identity is required")],
+                    tag="us-identity", linked=at("2026-09-09T09:30:00"))  # fmt: skip
+    run = _datasets(promote_datasets(ws, apply=True, now_us=1, routes=[US_BULK]))[
+        ("prices.us.eodhd", US_BULK.mapper)
+    ]
+    assert (run["status"], run["derived_from"]) == ("advanced", "eodhd.bars@1")
+    assert run["template_spec_sha256"] == history[1]
+    (source,) = cast("list[dict[str, object]]", run["sources"])
+    assert (source["source_id"], source["status"]) == (warned["source_id"], "promoted")
+    generation = dataset_head(ws, "prices.us.eodhd")
+    name, linked, _, retained = _retained(ws, generation)
+    assert (name, linked) == ("eodhd.bulk_quarantine@1", parent)
+    assert json.loads(retained)["mapper"]["args"] == {"timezone": NEW_YORK,
+                                                      "currencies": {"US": "USD"}}  # fmt: skip
+    rows = ws.market.execute(
+        "SELECT currency, close FROM prices WHERE generation_id=? ORDER BY close", [generation]
+    ).fetchall()
+    assert [(currency, float(close)) for currency, close in rows] == [("USD", 11.0),
+                                                                      ("USD", 21.0)]  # fmt: skip
+    flags = ws.market.execute(
+        "SELECT count(*) FROM quality_flags WHERE generation_id=? AND flag=?",
+        [generation, PARTIAL],
+    ).fetchone()
+    assert flags == (2,)
+    # The identity-held table is still counted as unmapped; the warned one no longer is.
+    shipped = [(dataset, "synthetic-kr-bulk-" if table == "quarantine" else prefix, table, accept)
+               for dataset, prefix, table, accept in maintain_promotion.UNMAPPED
+               if dataset == "prices.us.eodhd"]  # fmt: skip
+    monkeypatch.setattr(maintain_promotion, "UNMAPPED", tuple(shipped))
+    assert maintain_promotion.unmapped(ws) == {"prices.us.eodhd": 1}
+
+
 def test_a_chain_without_a_head_derives_nothing(ws: Workspace) -> None:
     _bulk_day(ws, B1, tag="b1")
     run = _datasets(promote_datasets(ws, apply=True, now_us=1, routes=[BULK]))[
@@ -421,3 +487,166 @@ def test_the_key_digests_are_frozen() -> None:
     assert KeyMembers("s", _FROZEN).sha256() == (
         "dc93aa5cb1c7124afe9cd864d8b171151e1b5fe26f4437d048971187d8c53cd6"
     )
+
+
+# Tuesday 2026-07-28, 12:00 in Seoul: that day's XKRX session is still open, so the latest
+# session a run can expect is Monday 07-27.
+JULY_RUN = datetime(2026, 7, 28, 3, tzinfo=UTC)
+_FRESHNESS = ("data_through", "expected_through", "lag_sessions", "lag_unit", "stale_after",
+              "freshness", "stale_reasons")  # fmt: skip
+
+
+def _bars_downloaded_late(ws: Workspace, dataset: str) -> None:
+    """A chain whose only bar is for 2026-07-01 but whose source was collected on 07-27."""
+    pin = add_source(ws, [bar("AAA.KO", date(2026, 7, 1), 100.0,
+                              retrieved=at("2026-07-27T08:00:00"))],
+                     tag=dataset, linked=at("2026-07-27T09:00:00"))  # fmt: skip
+    promote(ws, *spec([pin], register_symbols(ws, pin["source_id"]), dataset=dataset), apply=True)
+
+
+def _heads(ws: Workspace, now: datetime) -> dict[str, dict[str, object]]:
+    return {str(item["dataset_id"]): item for item in maintain_promotion.dataset_heads(ws, now=now)}
+
+
+def test_a_recent_watermark_over_weeks_old_data_is_stale_by_its_session_lag(
+    ws: Workspace,
+) -> None:
+    _bars_downloaded_late(ws, "prices.kr.eodhd")
+    head = _heads(ws, JULY_RUN)["prices.kr.eodhd"]
+    # The watermark is the collection time and looks current...
+    (watermark,) = cast("dict[str, dict[str, int]]", head["watermarks"]).values()
+    assert watermark["through_us"] == us(at("2026-07-27T08:00:00"))
+    # ...but the data ends on 07-01: XKRX sessions 07-02..03, 06..10, 13..16, 20..24 and 27
+    # (07-17, Constitution Day, is closed from 2026) are 17 sessions behind.
+    assert {key: head[key] for key in _FRESHNESS} == {
+        "data_through": "2026-07-01",
+        "expected_through": "2026-07-27",
+        "lag_sessions": 17,
+        "lag_unit": "sessions",
+        "stale_after": maintain_promotion.FRESHNESS["prices.kr.eodhd"].stale_after,
+        "freshness": "stale",
+        "stale_reasons": ["lag"],
+    }
+    # The next morning in Seoul the same chain is current: 07-01 is the last closed session.
+    fresh = _heads(ws, datetime(2026, 7, 2, 3, tzinfo=UTC))["prices.kr.eodhd"]
+    assert (fresh["expected_through"], fresh["lag_sessions"], fresh["freshness"]) == (
+        "2026-07-01", 0, "current")  # fmt: skip
+
+
+def test_a_tombstoned_newest_bar_does_not_count_as_data(ws: Workspace) -> None:
+    stamp = at("2026-07-27T08:00:00")
+    first = add_source(
+        ws,
+        [bar("AAA.KO", date(2026, 7, 1), 100.0, retrieved=stamp),
+         bar("AAA.KO", date(2026, 7, 27), 101.0, retrieved=stamp)],
+        tag="first",
+        linked=at("2026-07-27T09:00:00"),
+    )  # fmt: skip
+    identity = register_symbols(ws, first["source_id"])
+    head = promote(ws, *spec([first], identity), apply=True)
+    assert head["published"] is True, head.get("refusals")
+    assert _heads(ws, JULY_RUN)["prices.kr.eodhd"]["data_through"] == "2026-07-27"
+    # A full snapshot without the 07-27 bar deletes it: the readable data ends on 07-01.
+    second = add_source(
+        ws,
+        [bar("AAA.KO", date(2026, 7, 1), 100.0, retrieved=at("2026-07-27T10:00:00"))],
+        tag="second",
+        linked=at("2026-07-27T11:00:00"),
+    )  # fmt: skip
+    cleaned = promote(
+        ws,
+        *spec([second], identity, parent=str(head["generation_id"]),
+              tombstone=full_snapshot(second, "2026-07-01", "2026-07-28")),
+        apply=True,
+    )  # fmt: skip
+    assert cleaned["published"] is True, cleaned.get("refusals")
+    assert cast("dict[str, int]", cleaned["operations"]).get("TOMBSTONE") == 1
+    found = _heads(ws, JULY_RUN)["prices.kr.eodhd"]
+    assert (found["data_through"], found["freshness"]) == ("2026-07-01", "stale")
+
+
+def test_a_frozen_provider_dataset_is_frozen_not_stale(ws: Workspace) -> None:
+    _bars_downloaded_late(ws, "prices.us.norgate")
+    head = _heads(ws, JULY_RUN)["prices.us.norgate"]
+    assert {key: head[key] for key in _FRESHNESS} == {
+        "data_through": "2026-07-01",
+        "expected_through": None,
+        "lag_sessions": None,
+        "lag_unit": None,
+        "stale_after": None,
+        "freshness": "frozen",
+        "stale_reasons": [],
+    }
+
+
+def test_every_catalog_dataset_reports_its_freshness_fields(ws: Workspace) -> None:
+    _bars_downloaded_late(ws, "prices.kr.eodhd")
+    heads = _heads(ws, JULY_RUN)
+    assert {entry.dataset_id for entry in CATALOG} <= set(heads)
+    for entry in CATALOG:
+        head = heads[entry.dataset_id]
+        assert set(_FRESHNESS) | {"stale_series", "zero_promotion_runs"} <= set(head)
+        if entry.dataset_id != "prices.kr.eodhd":
+            # No generation yet: listed, never silently absent.
+            assert (head["version"], head["freshness"]) == (None, "no_head"), entry.dataset_id
+        # Every catalog dataset is frozen or has an expectation (none counts) of its own.
+        frozen = maintain_promotion.frozen(entry.dataset_id)
+        assert frozen or entry.dataset_id in maintain_promotion.FRESHNESS, entry.dataset_id
+    # Norgate and FMP stopped; the catalog's own flag marks only some of their datasets.
+    stopped = {entry.dataset_id for entry in CATALOG if maintain_promotion.frozen(entry.dataset_id)}
+    assert stopped == {
+        "prices.us.norgate", "prices.us.norgate.ref", "prices.us.fmp.ref", "prices.ref.norgate",
+        "actions.us.norgate", "actions.us.fmp.ref", "status.us.norgate", "fx.usdkrw.norgate",
+        "classifications.us.norgate"}  # fmt: skip
+
+
+def _publish_macro(ws: Workspace, dataset: str, series: dict[str, list[date]]) -> None:
+    """One committed macro generation holding ``series``' observation periods."""
+    rows: list[dict[str, object]] = [
+        {"revision_id": f"{name}-{day}", "supersedes_revision_id": None, "op": "ASSERT",
+         "available_at_us": 1, "revision_known_at_us": 1, "ingested_at_us": 2,
+         "source_snapshot_id": "synthetic",
+         "source_row_hash": hashlib.sha256(f"{name}-{day}".encode()).hexdigest(),
+         "series_id": name, "observation_period": day, "unit": "pct",
+         "source_vintage_start": None, "source_vintage_end": None, "value": "1",
+         "value_state": "present"}
+        for name, days in series.items() for day in days
+    ]  # fmt: skip
+    marker = publish_generation(ws.market, dataset_id=dataset, version="1", generation_id="m-1",
+                                operation_id="op-m-1", request_hash="0" * 64, parent_id=None,
+                                domain="macro_observations", rows=rows)  # fmt: skip
+    with atomic(ws.state):
+        ws.state.execute("INSERT INTO datasets VALUES (?,'macro_observations',?,'test')",
+                         (dataset, "aas-market-rowset-v1"))  # fmt: skip
+        ws.state.execute(
+            "INSERT INTO dataset_versions VALUES (?,'1','m-1',NULL,1,?,?,?,'synthetic',?,NULL,"
+            "NULL,?,'all','committed')",
+            (dataset, marker["chain_hash"], "0" * 64, "aas-market-rowset-v1", "0" * 64,
+             marker["row_count"]),
+        )  # fmt: skip
+
+
+def _weekdays(first: date, last: date) -> list[date]:
+    days = [first + timedelta(days=offset) for offset in range((last - first).days + 1)]
+    return [day for day in days if day.weekday() < 5]
+
+
+def test_macro_series_lag_by_their_own_publication_period(ws: Workspace) -> None:
+    # A daily series through Monday 11-09 and a monthly one whose last period is 2026-06.
+    _publish_macro(ws, "macro.us.alfred", {
+        "SYNDAILY": _weekdays(date(2026, 10, 1), date(2026, 11, 9)),
+        "SYNMONTHLY": [date(2026, month, 1) for month in range(1, 7)]})  # fmt: skip
+    head = _heads(ws, datetime(2026, 11, 11, 3, tzinfo=UTC))["macro.us.alfred"]
+    # On Wednesday 11-11 a daily period is expected once two weekdays have passed it
+    # (11-09); a month once the month after it has passed (09-01). The monthly series misses
+    # 07, 08 and 09: three periods, above the threshold of two.
+    assert {key: head[key] for key in (*_FRESHNESS, "stale_series")} == {
+        "data_through": "2026-11-09",
+        "expected_through": "2026-11-09",
+        "lag_sessions": 3,
+        "lag_unit": "periods",
+        "stale_after": 2,
+        "freshness": "stale",
+        "stale_reasons": ["lag"],
+        "stale_series": ["SYNMONTHLY"],
+    }

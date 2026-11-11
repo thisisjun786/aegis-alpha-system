@@ -8,6 +8,9 @@ Endpoints (``Request.provider`` is ``fred``):
 - ``vintage_dates`` (``fred/series/vintagedates``): the vintage dates of a series inside a
   real-time window, ``series_id``, ``realtime_start``, ``realtime_end``, ``limit`` (10000),
   ``offset`` and ``file_type=json``.
+- ``latest_vintage`` (``fred/series/vintagedates`` without a window): the latest vintage date
+  of a series, ``series_id``, ``sort_order=desc``, ``limit=1`` and ``file_type=json``. It is
+  asked only to read a ``vintage_dates`` window FRED answered with HTTP 500 (``rechecks``).
 - ``series_csv`` (``fredgraph.csv``): the current values of one series as the
   ``observation_date,<SERIES>`` download, parameter ``id``. It needs no key.
 
@@ -21,7 +24,11 @@ that start. So, for each series:
 1. ``vintage_dates`` lists the vintage dates after the latest vintage day already collected
    (``known``), or all of them from the ALFRED origin (1776-07-04) when nothing is known, up
    to the last ended FRED (St. Louis, ``America/Chicago``) day. None means the series is
-   current.
+   current. FRED answers a window that holds no vintage date with HTTP 500 instead of an
+   empty list, and also answers 500 for a window whose vintage it publishes only later; so
+   the collector asks ``latest_vintage`` once, and the window is ``NO_DATA`` when that
+   latest vintage is not after the known day, otherwise it stays ``FAILED``. Either way
+   nothing is collected and the next run asks the same window again.
 2. The observations windows run from ``known`` (or the origin) to that day, each spanning at
    most 1990 vintage dates and each starting on the last vintage date of the window before
    it (``observation_windows``).
@@ -54,13 +61,16 @@ from aegis_alpha.data.provider_request import COMPLETED, FAILED, NO_DATA, Reques
 PROVIDER: Final = "fred"
 OBSERVATIONS: Final = "observations"
 VINTAGE_DATES: Final = "vintage_dates"
+LATEST_VINTAGE: Final = "latest_vintage"
 SERIES_CSV: Final = "series_csv"
 URLS: Final[Mapping[str, str]] = {
     OBSERVATIONS: "https://api.stlouisfed.org/fred/series/observations",
     VINTAGE_DATES: "https://api.stlouisfed.org/fred/series/vintagedates",
+    LATEST_VINTAGE: "https://api.stlouisfed.org/fred/series/vintagedates",
     SERIES_CSV: "https://fred.stlouisfed.org/graph/fredgraph.csv",
 }
-KEYED: Final = frozenset({OBSERVATIONS, VINTAGE_DATES})
+WINDOWED: Final = frozenset({OBSERVATIONS, VINTAGE_DATES})
+KEYED: Final = WINDOWED | {LATEST_VINTAGE}
 FRED_ZONE: Final = ZoneInfo("America/Chicago")
 ORIGIN: Final = date(1776, 7, 4)
 PAGE_LIMIT: Final = 100_000
@@ -81,6 +91,8 @@ _KEY: Final = re.compile(r"[a-z0-9]{32}")
 _OBSERVATION_KEYS: Final = frozenset({"realtime_start", "realtime_end", "date", "value"})
 _HTTP_OK: Final = 200
 _HTTP_BAD_REQUEST: Final = 400
+# FRED's answer to a vintage_dates window that holds no vintage date.
+_HTTP_SERVER_ERROR: Final = 500
 
 
 def _day(text: object, name: str) -> date:
@@ -129,6 +141,13 @@ def vintage_dates(series: str, start: date, end: date, offset: int = 0) -> Reque
     return Request.of(PROVIDER, VINTAGE_DATES, _window(series, start, end, VINTAGE_LIMIT, offset))
 
 
+def latest_vintage(series: str) -> Request:
+    """The latest vintage date of a series, asked without a real-time window."""
+    parameters = {"file_type": "json", "limit": "1", "series_id": series_id(series),
+                  "sort_order": "desc"}  # fmt: skip
+    return Request.of(PROVIDER, LATEST_VINTAGE, parameters)
+
+
 def series_csv(series: str) -> Request:
     return Request.of(PROVIDER, SERIES_CSV, {"id": series_id(series)})
 
@@ -151,7 +170,7 @@ class Window:
 
 def window(request: Request) -> Window:
     """The checked window of a keyed request; a request of another shape is refused."""
-    if request.provider != PROVIDER or request.endpoint not in KEYED:
+    if request.provider != PROVIDER or request.endpoint not in WINDOWED:
         raise ValueError("only ALFRED requests have a real-time window")
     parameters = request.parameters
     limit = PAGE_LIMIT if request.endpoint == OBSERVATIONS else VINTAGE_LIMIT
@@ -180,8 +199,11 @@ def check(request: Request) -> None:
     """Refuse a request the collector does not make."""
     if request.provider != PROVIDER or request.endpoint not in URLS:
         raise ValueError(f"unsupported FRED request {request.endpoint!r}")
-    if request.endpoint in KEYED:
+    if request.endpoint in WINDOWED:
         window(request)
+    elif request.endpoint == LATEST_VINTAGE:
+        if request != latest_vintage(request.parameters.get("series_id", "")):
+            raise ValueError("FRED latest_vintage request parameters are not canonical")
     elif set(request.parameters) != {"id"}:
         raise ValueError("series_csv takes exactly id")
     else:
@@ -271,6 +293,46 @@ def parse_vintage_dates(request: Request, body: bytes) -> tuple[int, tuple[date,
     return count, days
 
 
+def parse_latest_vintage(request: Request, body: bytes) -> date | None:
+    """The latest vintage date of an answered ``latest_vintage`` call; None when it has none."""
+    check(request)
+    if request.endpoint != LATEST_VINTAGE:
+        raise ValueError("not a latest_vintage request")
+    document = _json(body)
+    count, offset, limit = document.get("count"), document.get("offset"), document.get("limit")
+    for value in (count, offset, limit):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("FRED answer count, offset and limit are counts")
+    if (offset, limit) != (0, 1):
+        raise ValueError("FRED answer is not the asked page")
+    items = document.get("vintage_dates")
+    if not isinstance(items, list) or len(items) != min(1, cast("int", count)):
+        raise ValueError("FRED latest vintage answer does not hold its share of the count")
+    return _day(items[0], "vintage date") if items else None
+
+
+def rechecks(request: Request, response: Response) -> bool:
+    """Whether a failed answer is read against the series' latest vintage.
+
+    Only the first page of a ``vintage_dates`` window after a known day answered HTTP 500:
+    FRED's answer for a window that holds no vintage date. A window from the origin has no
+    known day to compare with, and any other status (502, a maintenance page) is a fault.
+    """
+    if request.endpoint != VINTAGE_DATES or response.status != _HTTP_SERVER_ERROR:
+        return False
+    asked = window(request)
+    return asked.offset == 0 and asked.start != ORIGIN
+
+
+def no_new_vintage(request: Request, latest: date | None) -> bool:
+    """Whether a rechecked window's series has no vintage after the known day.
+
+    The window starts on the day after the known vintage day, so a latest vintage before
+    the window's start is not after the known day.
+    """
+    return latest is None or latest < window(request).start
+
+
 def csv_header(request: Request) -> bytes:
     return f"observation_date,{request.parameters['id']}".encode()
 
@@ -279,7 +341,9 @@ def classify(request: Request, response: Response) -> tuple[str, str | None]:
     """The outcome and FRED's error text: the outcome only routes the collector.
 
     A checked answer is ``COMPLETED``; a series FRED says does not exist is ``NO_DATA``;
-    anything else (an error answer, an unexpected shape) is ``FAILED``.
+    anything else (an error answer, an unexpected shape) is ``FAILED``. A ``vintage_dates``
+    window answered HTTP 500 is ``FAILED`` here; the collector reads it against the series'
+    latest vintage (``rechecks``, ``no_new_vintage``) before it records the answer.
     """
     if request.endpoint == SERIES_CSV:
         first = response.body.split(b"\n", 1)[0].removesuffix(b"\r")
@@ -293,6 +357,8 @@ def classify(request: Request, response: Response) -> tuple[str, str | None]:
     try:
         if request.endpoint == OBSERVATIONS:
             parse_page(request, response.body)
+        elif request.endpoint == LATEST_VINTAGE:
+            parse_latest_vintage(request, response.body)
         else:
             parse_vintage_dates(request, response.body)
     except ValueError as error:

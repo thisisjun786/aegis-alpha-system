@@ -20,7 +20,8 @@ Every held table is named ``quarantine``. The rows table is always committed, ev
 empty (an exchange-day without splits is a fact); the held table is committed only when
 it has rows, and before the rows table, so a committed rows table means the unit is
 complete. Provider warnings are recorded, never block: every row of a warned download is
-held with the reason ``provider_reported_partial`` and the import continues. The
+held, with the reason ``provider_reported_partial`` when its values pass the clean path's
+value checks and with the failed check's reason otherwise, and the import continues. The
 history and bulk tables keep the columns the ``eodhd.*`` mappers read.
 
 Nothing here calls a provider. Code, transform and identity hashes are commit ``lineage``

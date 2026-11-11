@@ -12,7 +12,10 @@
 3. download each CSV series once a FRED day (``series_csv``), then for each ALFRED series
    ask from the origin when nothing is known, or ask ``vintage_dates`` after the known day
    and, when a vintage exists, every page of the observations query from the known day
-   to the last ended FRED day (``data.fred_collect``);
+   to the last ended FRED day (``data.fred_collect``). A window after the known day that
+   FRED answers with HTTP 500 is read against the series' latest vintage, asked once
+   (``latest_vintage``) before the window's answer is recorded: ``NO_DATA`` when that
+   vintage is not after the known day, ``FAILED`` otherwise;
 4. commit each batch: a ``fred-alfred-observations`` table of the rows of every complete
    query that are vintages as FRED dated them; each completed CSV download as a
    ``fred-series-csv`` source of its bytes alone, the shape ``fred.series_csv@1`` imports
@@ -39,7 +42,7 @@ from datetime import date
 from typing import TYPE_CHECKING, Final, cast
 
 from aegis_alpha.data import fred_collect as fred
-from aegis_alpha.data.provider_request import COMPLETED, FAILED, Request, Response
+from aegis_alpha.data.provider_request import COMPLETED, FAILED, NO_DATA, Request, Response
 from aegis_alpha.storage import collection_ledger as ledger
 from aegis_alpha.storage import provider_collection as collection
 from aegis_alpha.storage import source_library_schema as schema
@@ -299,6 +302,29 @@ class Run:
             self.pending = []
             self.committed.extend(commit_fred_batch(self.workspace, batch))
 
+    def classify(self, request: Request, response: Response) -> tuple[str, str | None]:
+        """``classify``, and a window answered 500 is read against the latest vintage first."""
+        outcome, status = classify(request, response)
+        if outcome == FAILED and fred.rechecks(request, response) and self._no_new_vintage(request):
+            return NO_DATA, status
+        return outcome, status
+
+    def _no_new_vintage(self, request: Request) -> bool:
+        """Ask the window's series for its latest vintage, a call kept like any other.
+
+        The window's own call is still open, so this receipt comes before the window's. No
+        answer, or one that is not ``COMPLETED``, leaves the window ``FAILED``.
+        """
+        latest = fred.latest_vintage(fred.window(request).series_id)
+        answered = self.caller.ask(latest, "vintage_recheck")
+        if answered is None:
+            return False
+        retained, outcome, response = answered
+        self.pending.append(retained)
+        return outcome == COMPLETED and fred.no_new_vintage(
+            request, fred.parse_latest_vintage(latest, response.body)
+        )
+
     def _answer(self, request: Request, reason: str) -> bytes | None:
         """One call's body when it answered ``COMPLETED``; every answer is kept for commit."""
         answered = self.caller.ask(request, reason)
@@ -376,6 +402,7 @@ def collect_fred(  # noqa: PLR0913 -- every bound of one run is explicit
         _dataset(policy), clock, sleep, max_calls, min_interval,
     )  # fmt: skip
     run = Run(workspace, caller, known.knowledge, batch_size, committed=committed)
+    caller.classify = run.classify  # a window answered 500 asks through the run's caller
     today = fred.fred_day(now)
     for planned in fred.plan_csv(run.knowledge, today, policy):
         answered = caller.ask(planned.request, planned.reason)
