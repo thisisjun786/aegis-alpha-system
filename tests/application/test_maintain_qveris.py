@@ -135,24 +135,28 @@ def test_symbol_lists_refresh_and_forex_asks_daily(tmp_path: Path) -> None:
     assert fx.parameters["from"] == (TODAY - timedelta(days=10)).isoformat()
 
 
-def test_the_us_symbol_list_is_asked_listed_only_and_every_day(tmp_path: Path) -> None:
+def test_the_us_symbol_lists_are_asked_listed_and_delisted_every_day(tmp_path: Path) -> None:
     root = tmp_path / "raw"
     policy = QverisPolicy(exchanges=("US",), datasets=("prices",), since={"US": WED},
                           symbol_lists=("KO", "US"), symbol_list_days=7)  # fmt: skip
     yesterday = TODAY - timedelta(days=1)
-    for exchange, delisted in (("KO", "0"), ("KO", "1"), ("US", "0")):
+    for exchange, delisted in (("KO", "0"), ("KO", "1"), ("US", "0"), ("US", "1")):
         _ask(root, symbol_list_job(exchange, delisted, yesterday), "completed")
     plan = plan_requests(root, policy, today=TODAY)
     planned = [(item.job.job_id, item.reason, item.dataset_id) for item in plan.planned]
-    # The KR lists stay covered for a week; yesterday's US list is asked again today.
+    # The KR lists stay covered for a week; yesterday's US lists are asked again today.
     assert planned == [
         ("maintain-US-prices-2026-09-16", "new", "prices.us.eodhd"),
         ("maintain-symbols-US-0", "refresh", "identity.us.eodhd"),
+        ("maintain-symbols-US-1", "refresh", "identity.us.eodhd"),
     ]
-    (job,) = [item.job for item in plan.planned if item.job.dataset == "universe"]
-    assert (job.market, job.parameters) == (
-        "US", {"EXCHANGE_CODE": "US", "delisted": "0", "fmt": "json"})  # fmt: skip
+    jobs = [item.job for item in plan.planned if item.job.dataset == "universe"]
+    assert [(job.market, job.parameters) for job in jobs] == [
+        ("US", {"EXCHANGE_CODE": "US", "delisted": "0", "fmt": "json"}),
+        ("US", {"EXCHANGE_CODE": "US", "delisted": "1", "fmt": "json"}),
+    ]
     _ask(root, symbol_list_job("US", "0", TODAY), "completed")
+    _ask(root, symbol_list_job("US", "1", TODAY), "completed")
     assert [item.job.job_id for item in plan_requests(root, policy, today=TODAY).planned] == [
         "maintain-US-prices-2026-09-16"
     ]

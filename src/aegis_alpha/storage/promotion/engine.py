@@ -56,6 +56,7 @@ from aegis_alpha.storage.membership_pins import (
 )
 from aegis_alpha.storage.promotion import decimal_rules, formats
 from aegis_alpha.storage.promotion.mappers import (
+    IDENTITY_ROWS,
     MANIFEST_ITEMS,
     reference_table,
     references,
@@ -318,7 +319,7 @@ def _identity(
     """Load the pinned snapshot's current resolution rows for the mapper's assertion key."""
     market = workspace.market
     market.execute(
-        f"CREATE OR REPLACE TEMP TABLE {_t('identity')} (token VARCHAR, instrument_id VARCHAR, "
+        f"CREATE OR REPLACE TEMP TABLE {IDENTITY_ROWS} (token VARCHAR, instrument_id VARCHAR, "
         "valid_from_us BIGINT, valid_to_us BIGINT)"
     )
     pin = spec.identity_snapshot
@@ -349,7 +350,7 @@ def _identity(
     )
     while batch := cursor.fetchmany(_BATCH):
         market.executemany(
-            f"INSERT INTO {_t('identity')} VALUES (?, ?, ?, ?)", [tuple(row) for row in batch]
+            f"INSERT INTO {IDENTITY_ROWS} VALUES (?, ?, ?, ?)", [tuple(row) for row in batch]
         )
 
 
@@ -376,7 +377,9 @@ def _references(workspace: Workspace, spec: PromotionSpec, budget: ComputeBudget
     """Load the head rows of each generation the mapper references into its temp table.
 
     The pin is checked like a calendar pin, and its dataset must hold the referenced
-    domain. Only the domain columns of non-TOMBSTONE heads are loaded.
+    domain. Only the domain columns of non-TOMBSTONE heads are loaded, with the two instants
+    a strict reader judges them by, ``available_at_us`` and ``revision_known_at_us``; a
+    reference declared with ``revisions`` loads every revision of the chain instead.
     """
     for name, reference in references(spec.mapper, spec.mapper_args).items():
         chain = _verify_pin(workspace, reference.pin, budget)
@@ -387,7 +390,25 @@ def _references(workspace: Workspace, spec: PromotionSpec, budget: ComputeBudget
             raise ValueError(
                 f"mapper reference {name} must pin a {reference.domain} dataset generation"
             )
-        columns = ", ".join(_q(column) for column, _ in DOMAINS[reference.domain])
+        columns = ", ".join(
+            _q(column)
+            for column in (
+                *(column for column, _ in DOMAINS[reference.domain]),
+                "available_at_us",
+                "revision_known_at_us",
+            )
+        )
+        if reference.revisions:
+            workspace.market.execute(
+                f"CREATE OR REPLACE TEMP TABLE {reference_table(name)} AS SELECT "
+                f"{', '.join('p.' + column for column in columns.split(', '))}, "
+                "g.sequence AS _aas_sequence, p.op, p.record_id, p.revision_id "
+                f"FROM {_q(reference.domain)} p JOIN market_generations g "
+                "ON g.generation_id = p.generation_id "
+                "WHERE p.generation_id IN (SELECT unnest(?::JSON::VARCHAR[]))",
+                [json.dumps(chain)],
+            )
+            continue
         workspace.market.execute(
             f"CREATE OR REPLACE TEMP TABLE {reference_table(name)} AS SELECT {columns} "
             f"FROM ({_heads_sql(reference.domain)}) WHERE op <> 'TOMBSTONE'",
@@ -615,7 +636,7 @@ def _resolved(workspace: Workspace, spec: PromotionSpec) -> str:
         f"CREATE OR REPLACE TEMP TABLE {_t('res')} AS SELECT m._aas_pin, m._aas_ordinal, "
         "m._aas_item, count(DISTINCT i.instrument_id) AS matches, "
         "min(i.instrument_id) AS instrument_id "
-        f"FROM {_t('map')} m JOIN {_t('identity')} i ON i.token = m._aas_id_token "
+        f"FROM {_t('map')} m JOIN {IDENTITY_ROWS} i ON i.token = m._aas_id_token "
         "AND i.valid_from_us <= m._aas_id_at_us "
         "AND (i.valid_to_us IS NULL OR m._aas_id_at_us < i.valid_to_us) GROUP BY ALL"
     )
@@ -1324,13 +1345,13 @@ def _report(
         plan.report["unresolved_tokens"] = [
             str(row[0])
             for row in market.execute(
-                f"SELECT DISTINCT _aas_token FROM {_t('rows')} WHERE _aas_status IN "
+                f"SELECT DISTINCT coalesce(_aas_token, '') FROM {_t('rows')} WHERE _aas_status IN "
                 f"('unresolved', 'ambiguous') ORDER BY 1 LIMIT {_SAMPLE}"
             ).fetchall()
         ]
         plan.report["unresolved_token_count"] = _count(
             market,
-            f"SELECT count(DISTINCT _aas_token) FROM {_t('rows')} "
+            f"SELECT count(DISTINCT coalesce(_aas_token, '')) FROM {_t('rows')} "
             "WHERE _aas_status IN ('unresolved', 'ambiguous')",
         )
     mapped: dict[str, int] = {}

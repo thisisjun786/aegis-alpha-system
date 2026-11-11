@@ -676,6 +676,34 @@ instrument는 그 날짜의 현지 0시에 해석한다. `YYYY-MM-DD`가 아닌 
 마지막 표현 가능 날짜(`9999-12-31`)의 상장폐지는 사건의 시작이 없어 거부된다.
 master는 snapshot 하나라 파티션 날짜가 없다.
 
+`eodhd.delisted@1`은 EODHD US 상장폐지 목록(`qveris-eodhd-exchange-symbols-*` `symbols` 중
+`EXCHANGE_CODE=US`, `delisted=1`; `exchange_code`, `delisted`, `code`, `isin`, `type`, `retrieved_at_utc`
+열)을 `instrument_status`의 `delisted` 사건으로 옮긴다. 목록에는 상장폐지 날짜가 없으므로 날짜의 근거
+(`date_basis`)를 `reason`으로 밝힌다.
+
+- `observed`(`status_event_id` `eodhd:delisted:observed`, `reason` `eodhd_delisted_observed`): 오늘 목록보다
+  이른 New York 날짜의 마지막 상장 목록에 있었고, 이른 날짜의 마지막 상장폐지 목록에는 없었으며, 오늘
+  상장폐지 목록에 있는 ISIN이다. 시작은 오늘 목록을 받은 New York 날짜의 0시다. 이른 상장폐지 목록이 하나도
+  없으면(첫 목록) 관측은 없다. 첫 목록에 이미 있는 종목은 언제 빠졌는지 알 수 없다.
+- `last_bar`(`eodhd:delisted:last_bar`, `eodhd_delisted_last_bar`): 인자 `bars`가 pin한 `prices.us.*`
+  generation에서 그 상품의 오늘 목록 날짜 이하 마지막 bar 다음 날의 New York 0시. 관측 사건이 있어도 함께
+  기록하고, 그런 bar가 없는 상품에는 없다.
+
+같은 승격에서 관측 사건이 없는 `last_bar` 사건은 row flag `delisting_inferred`를 단다. 그중 상장폐지일(마지막
+bar 다음 날)이 `[2026-07-29, 첫 관측일)`에 드는 것만 `survivorship_unverified`도 단다. 2026-07-29는
+`status.us.norgate`가 끝난 다음 날(`eodhd_delisted.UNVERIFIED_FROM`)이고, 첫 관측일은 pin된 첫 상장폐지 목록의
+New York 날짜다. 그 밖의 구간에는 이 flag가 없다.
+
+오늘 목록은 pin된 상장폐지 목록 중 가장 늦게 받은 것이고, 나머지(유지보수가 함께 pin하는 이른 날짜의 마지막
+상장 목록, 마지막 상장폐지 목록, 첫 상장폐지 목록)는 비교에만 쓰고 행을 만들지 않는다. 상품은 ISIN을 그 행의
+수집 시각에 등록된 FMP `isin`으로 해석해서만 닿는다. 같은 티커라도 ISIN이 다르면 다른 상품이고, ISIN이 없거나
+snapshot에 없는 행은 미해결로 남는다(위험 7). 코드·이름에서 아무것도 끌어내지 않는다. 그런 행은 엔진이
+미해결로 세도록 관측일을 시작으로 한 `last_bar` 사건 하나로만 옮기고, 미해결 행은 저장되지 않는다. 오늘
+목록에서 반복된 ISIN은 source row hash가 가장 작은 행 하나만 옮긴다. 시간 입력 `status_date`는 두 사건 모두
+관측일이며 명세는 `America/New_York` `local_day_end@1`을 쓰므로 시점은 목록 수집 시각으로 낮춰진다(그 목록 전에는
+상장폐지를 알 수 없다). 매퍼는 엔진의 `IDENTITY_ROWS`(snapshot의 `fmp`/`isin` 행)로 해석될 상품을 찾아 bar에
+잇는다. 저장되는 해석은 엔진의 해석뿐이다. 목록끼리 비교하므로 파티션 날짜가 없다.
+
 ## 결정적 공통 열
 
 공통 열은 원천과 공개된 규칙만으로 재현된다. 값을 꾸며내지 않는다.
@@ -1146,6 +1174,7 @@ ASCII escape와 바이트까지 같다.
 | `actions.us.eodhd` | `corporate_actions` | canonical | `eodhd.dividends@1`, `eodhd.splits@1` | `exdate_open@1` | `decimal_text@1`, `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage`, `volume_precision_limited` | 아니오 | Qveris 거래소 일간 `splits`·`dividends` 수집 원천([Qveris 수집과 원천 적재](#qveris-수집과-원천-적재))의 `US` 행. 배당 금액은 원문 텍스트, 분할 비율은 binary64. 달력은 `sessions.xnys`. [기업행동과 상장 상태 매퍼](#기업행동과-상장-상태-매퍼) |
 | `actions.kr.eodhd` | `corporate_actions` | canonical | `eodhd.dividends@1`, `eodhd.splits@1` | `exdate_open@1` | `decimal_text@1`, `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage`, `volume_precision_limited` | 아니오 | 같은 수집 원천의 `KO`·`KQ` 행. 달력은 `sessions.xkrx` |
 | `status.us.norgate` | `instrument_status` | canonical | `norgate.status@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | Norgate master의 상장(`event` `listed`)이 첫 generation, 상장폐지(`delisted`)가 그 child. `America/New_York`, 근거 `record` |
+| `status.us.eodhd` | `instrument_status` | canonical | `eodhd.delisted@1` | `local_day_end@1` | 없음 | 없음 | `delisting_inferred`, `survivorship_unverified`, `time_precision_day` | 아니오 | Qveris EODHD US 상장폐지 목록(`delisted=1`)의 `delisted` 사건. 날짜 근거는 `reason`의 `observed`(전날 상장 → 오늘 상장폐지)와 `last_bar`(`prices.us.eodhd` 마지막 bar 다음 날). [기업행동과 상장 상태 매퍼](#기업행동과-상장-상태-매퍼) |
 | `status.kr.kind` | `instrument_status` | canonical | `kind.status@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | KIND 상장법인목록 수집 원천(`kind-listings-*`)의 상장(`listed`) 사건, 상장일 기준 Asia/Seoul. 단축코드는 [KR 등록](#kr-등록)의 identity snapshot으로 해석. 목록은 상장폐지를 말하지 않는다 |
 | `filings.us.sec` | `filings` | canonical | `sec.submissions@1` | `source_column@1` | 없음 | 없음 | 없음 | 아니오 | SEC submissions의 접수 시각 `acceptanceDateTime`. [SEC 공시와 재무](#sec-공시와-재무) |
 | `filings.kr.dart` | `filings` | canonical | `dart.fnltt_filings@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | DART 재무제표 응답의 접수번호, 접수일 기준 Asia/Seoul. 공시 목록(`list.json`) 수집 원천의 매퍼(`dart.list`)는 레지스트리에 없다(Linear AAS-77) |
@@ -1697,6 +1726,7 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
 | `actions.kr.eodhd` | `eodhd.splits@1`, `eodhd.dividends@1` | 위 두 모양 | 심볼이 `.KO`·`.KQ`. 시작 선언: `exdate_open@1`(`sessions.xkrx`), `Asia/Seoul` |
 | `fx.usdkrw.eodhd` | `eodhd.fx_history@1` | `qveris-fx-history-bars-*` `bars` | 쌍이 USD/KRW. 시작 선언: `local_day_end@1`(`timezone` `UTC`, 달력 없음), `timezone` `UTC` |
 | `status.kr.kind` | `kind.status@1` | `kind-listings-*` `listings` | `short_code`·`listed_on`·`retrieved_at_utc` 열. 시작 선언: Asia/Seoul `local_day_end@1` |
+| `status.us.eodhd` | `eodhd.delisted@1` | `qveris-eodhd-exchange-symbols-*` `symbols` | 모든 행이 `exchange_code` `US`, `delisted` `1`. US price route 뒤에 돈다. 이른 New York 날짜의 같은 열 US 목록 중 마지막 상장 목록·마지막 상장폐지 목록·첫 상장폐지 목록을 새 원천 뒤에 함께 pin한다(기록은 새 원천만). 시작 선언: `America/New_York` `local_day_end@1`, 파티션 없음, `bars`는 `prices.us.eodhd`의 committed head(없으면 `no_reference`) |
 
 **KR 일간 bulk.** 경고와 함께 끝난 KR 일간 bulk 응답은 DV-294에 따라 행 전부가 `quarantine`에 남으므로, KR 일간
 가격은 bulk route로만 이어진다. route가 이 테이블을 맡으면(조건을 만족하는 행이 하나라도 있으면) 먼저 모든 행이
@@ -3259,3 +3289,6 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-563 | 경고 US bulk 테이블은 이력 명세에서 파생한 `eodhd.bulk_quarantine@1` template(`US`→`USD`)으로 `prices.us.eodhd`를 잇고, import 때 identity가 없어 보류된 US 테이블은 route가 맡지 않고 `unmapped`에 남는다 | `tests/storage/test_maintain_promotion.py::test_a_warned_us_bulk_day_continues_the_us_chain_and_identity_held_rows_stay_out` | 구현 |
 | DV-564 | `reporting` 범위는 등록된 발행인이 없어도 읽은 색인에서 정기 보고서를 낸 제출자의 공시를 원하고 그 문서를 묻어 승격하며, 정기 보고서가 없는 제출자는 범위 밖으로 센다 | `tests/storage/test_us_collection.py::test_the_reporting_scope_wants_filers_of_periodic_reports_and_promotes_them` | 구현 |
 | DV-565 | 호출 상한을 넘는 문서 요청은 가장 이른 공시일 순으로 묻고 남은 요청은 다음 실행이 잇는다 | `tests/storage/test_us_collection.py::test_a_backlog_over_the_call_budget_is_asked_oldest_first_over_runs` | 구현 |
+| DV-566 | 유지보수 Qveris 계획은 US 종목 목록을 상장(`delisted=0`)과 상장폐지(`delisted=1`) 둘 다 관측일마다 묻는다 | `tests/application/test_maintain_qveris.py::test_the_us_symbol_lists_are_asked_listed_and_delisted_every_day` | 구현 |
+| DV-567 | `status.us.eodhd`는 첫 상장폐지 목록의 상품을 모두 `last_bar` 추정(`delisting_inferred`)으로 두고 2026-07-29~첫 관측일 구간만 `survivorship_unverified`를 달며, 다음 목록에서 전날 상장 목록에 있던 ISIN은 `observed`와 `last_bar` 사건을 함께 얻는다 | `tests/storage/test_us_delisted.py::test_delisted_lists_give_inferred_then_observed_events_by_isin` | 구현 |
+| DV-568 | 같은 티커의 다른 ISIN은 다른 상품의 사건이고, ISIN이 없거나 등록되지 않은 행은 미해결로 남아 `standing_unresolved`의 `status.us.eodhd` 항목에 사유·종류별로 세어진다 | `tests/storage/test_us_delisted.py::test_delisted_lists_give_inferred_then_observed_events_by_isin` | 구현 |

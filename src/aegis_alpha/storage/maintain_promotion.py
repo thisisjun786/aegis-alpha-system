@@ -128,7 +128,7 @@ from aegis_alpha.storage.source_library import list_sources, list_tables
 from aegis_alpha.storage.state import atomic
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Mapping, Sequence
+    from collections.abc import Callable, Collection, Mapping, Sequence
 
     from aegis_alpha.compute_resources import ComputeBudget
     from aegis_alpha.storage.workspace import Workspace
@@ -247,6 +247,8 @@ class Route:
     """The predicate every row of a table the route claims must satisfy (``value_check``)."""
     start: Start | None = None
     """The first template of a dataset no chain holds yet, used when the caller names it."""
+    context: Callable[[Workspace, Candidate], list[dict[str, str]]] | None = None
+    """The earlier tables of the shape a step pins after the new one (read, never recorded)."""
 
     @property
     def mappers(self) -> tuple[str, ...]:
@@ -279,6 +281,94 @@ _STATUS_START: Final = Start(
      "args": {"timezone": "Asia/Seoul"}},
     {},
 )  # fmt: skip
+_NO_GENERATION: Final = ""
+# A US delisting is known by the end of the New York day its delisted list was retrieved;
+# the last bars are read from the US price head this pass advanced.
+_DELISTED_START: Final = Start(
+    {"timezone": "America/New_York",
+     "bars": {"dataset_id": "prices.us.eodhd", "version": _NO_GENERATION,
+              "generation_id": _NO_GENERATION, "chain_hash": _NO_GENERATION,
+              "manifest_hash": _NO_GENERATION}},
+    {"rule": "local_day_end@1", "basis": "record", "input": "status_date",
+     "args": {"timezone": "America/New_York"}},
+    {},
+    partitioned=False,
+)  # fmt: skip
+_US_DELISTED: Final = "exchange_code = 'US' AND delisted = '1'"
+_US_LIST: Final = "exchange_code = 'US' AND delisted IN ('0', '1')"
+
+
+def _new_york_date(text: object) -> date | None:
+    """The New York date of a list's ``...Z`` retrieval text; None when it is no instant."""
+    try:
+        moment = datetime.fromisoformat(str(text))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        return None
+    return moment.astimezone(ZoneInfo("America/New_York")).date()
+
+
+def us_list_context(workspace: Workspace, item: Candidate) -> list[dict[str, str]]:
+    """The US lists ``eodhd.delisted@1`` compares a delisted list with.
+
+    Of the committed US lists of the candidate's columns retrieved on an earlier New York
+    date (a run asks today's listed list just before today's delisted one): the latest
+    listed list, the latest delisted list and the first delisted list, in that order and
+    each once. Each list is one table whose rows share one request and retrieval.
+    """
+    found = workspace.market.execute(
+        f"SELECT max(retrieved_at_utc) FROM {_quote(item.target)}"  # noqa: S608 -- a quoted table
+    ).fetchone()
+    at = None if found is None else _new_york_date(found[0])
+    columns: tuple[str, ...] | None = None
+    lists: list[tuple[str, str, dict[str, str]]] = []
+    shas = {str(row["source_id"]): str(row["sha256"]) for row in list_sources(workspace)}
+    tables = list(committed_tables(workspace, us_symbols.SOURCE_PREFIX))
+    for table in tables:
+        if table.source_id == item.pin["source_id"]:
+            columns = tuple(table.columns)
+    for table in tables:
+        entry = table.entry
+        if (
+            table.store != "market"
+            or entry["name"] != item.pin["table"]
+            or entry["format"] != "arrow"
+            or not entry["rows"]
+            or table.source_id == item.pin["source_id"]
+            or tuple(table.columns) != columns
+        ):
+            continue  # fmt: skip
+        target = _quote(str(entry["target"]))
+        row = workspace.market.execute(
+            f"SELECT bool_and(coalesce(({_US_LIST}), false)), min(delisted), max(delisted), "  # noqa: S608 -- a fixed predicate over a quoted table
+            f"max(retrieved_at_utc) FROM {target}"
+        ).fetchone()
+        day = None if row is None else _new_york_date(row[3])
+        if (
+            row is None
+            or row[0] is not True
+            or row[1] != row[2]
+            or None in (at, day)
+            or not (cast("date", day) < cast("date", at))
+        ):
+            continue
+        pin = {"source_id": table.source_id, "source_sha256": shas[table.source_id],
+               "table": item.pin["table"], "digest": str(entry["digest"])}  # fmt: skip
+        lists.append((str(row[1]), str(row[3]), pin))
+    listed = [one for one in lists if one[0] == "0"]
+    delisted = [one for one in lists if one[0] == "1"]
+    chosen = [
+        *([max(listed, key=lambda one: (one[1], one[2]["source_id"]))] if listed else []),
+        *([max(delisted, key=lambda one: (one[1], one[2]["source_id"]))] if delisted else []),
+        *([min(delisted, key=lambda one: (one[1], one[2]["source_id"]))] if delisted else []),
+    ]
+    pins: list[dict[str, str]] = []
+    for _, _, pin in chosen:
+        if pin not in pins:
+            pins.append(pin)
+    return pins
+
 
 # In dependency order: SEC facts take each filing's acceptance from the filings head.
 ROUTES: Final = (
@@ -314,6 +404,9 @@ ROUTES: Final = (
     Route("fx.usdkrw.eodhd", "eodhd.fx_history@1", "qveris-fx-history-bars-", "bars",
           "base_currency = 'USD' AND quote_currency = 'KRW'", start=_FX_START),
     Route("status.kr.kind", "kind.status@1", "kind-listings-", "listings", start=_STATUS_START),
+    # After the US price routes: the last bars come from the head they advanced.
+    Route("status.us.eodhd", "eodhd.delisted@1", us_symbols.SOURCE_PREFIX, "symbols",
+          _US_DELISTED, start=_DELISTED_START, context=us_list_context),
 )  # fmt: skip
 
 # Collected shapes whose dataset has no registered mapper yet: counted, never promoted.
@@ -680,6 +773,11 @@ def _started(
         args["calendar"] = calendar
     if declared.identity and identity is None:
         return "identity_unavailable"
+    # A generation the mapper references is pinned at that dataset's committed head.
+    mapper_args = cast("dict[str, object]", _refreshed(workspace, dict(declared.args)))
+    if any(isinstance(value, dict) and value.get("generation_id") == _NO_GENERATION
+           for value in mapper_args.values()):  # fmt: skip
+        return "no_reference"
     rule = {**declared.time_rule, "args": args}
     # The partition only says the template is partitioned; each step sets its own.
     partition = {"from": "1970-01-01", "to": "1970-01-02"} if declared.partitioned else None
@@ -688,7 +786,7 @@ def _started(
         "target": {"domain": mapper(route.mapper).domain, "dataset_id": dataset_id,
                    "parent": None},
         "sources": [],
-        "mapper": {"name": route.mapper, "args": dict(declared.args)},
+        "mapper": {"name": route.mapper, "args": mapper_args},
         "partition": partition,
         "time_rules": dict.fromkeys(TIME_COLUMNS, rule),
         "decimal_rule": dict(declared.decimal_rule),
@@ -768,12 +866,16 @@ def maintenance_spec(  # noqa: PLR0913 -- the template and every field maintenan
     pin: Mapping[str, str],
     step: Step,
     identity: Mapping[str, str] | None,
+    context: Sequence[Mapping[str, str]] = (),
 ) -> bytes:
-    """The template's canonical spec with only the maintenance fields advanced."""
+    """The template's canonical spec with only the maintenance fields advanced.
+
+    ``context`` is the route's earlier tables, pinned after the new one.
+    """
     spec = cast("dict[str, object]", json.loads(json.dumps(template)))
     target = cast("dict[str, object]", spec["target"])
     target["parent"] = parent
-    spec["sources"] = [dict(pin)]
+    spec["sources"] = [dict(pin), *(dict(item) for item in context)]
     spec["partition"] = (
         None
         if step.partition is None
@@ -854,14 +956,14 @@ def _promote_source(  # noqa: PLR0913 -- one source's steps and the run's inputs
     budget: ComputeBudget | None,
     now_us: int,
     evaluate: bool = True,
+    context: Sequence[Mapping[str, str]] = (),
 ) -> dict[str, object]:
     results: list[dict[str, object]] = []
     outcome: dict[str, object] = {"source_id": item.pin["source_id"], "rows": item.rows}
     for step in _steps(workspace, template, run.mapper, item):
         parent = dataset_head(workspace, run.dataset_id)
-        raw = maintenance_spec(
-            workspace, template, parent=parent, pin=item.pin, step=step, identity=identity
-        )
+        raw = maintenance_spec(workspace, template, parent=parent, pin=item.pin, step=step,
+                               identity=identity, context=context)  # fmt: skip
         sha256 = hashlib.sha256(raw).hexdigest()
         partition = (
             None
@@ -967,6 +1069,7 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
                     budget=budget,
                     now_us=now_us,
                     evaluate=evaluate,
+                    context=() if route.context is None else route.context(workspace, item),
                 )
                 run.sources.append(result)
                 if result["status"] == "refused":
@@ -1052,7 +1155,64 @@ def standing_unresolved(workspace: Workspace) -> dict[str, dict[str, object]]:
         if entry["oldest_date"] is None or oldest < cast("str", entry["oldest_date"]):
             entry["oldest_date"] = oldest
     us_symbols.add_breakdowns(workspace, summary, tables)
+    _add_delisted_breakdowns(workspace, summary, tables)
     return summary
+
+
+DELISTED_DATASET: Final = "status.us.eodhd"
+
+
+def _add_delisted_breakdowns(
+    workspace: Workspace,
+    summary: dict[str, dict[str, object]],
+    tables: Mapping[str, list[tuple[str, str]]],
+) -> None:
+    for dataset_id, entry in summary.items():
+        if _base(dataset_id) == DELISTED_DATASET:
+            entry.update(delisted_breakdown(workspace, tables[dataset_id]))
+
+
+def delisted_breakdown(
+    workspace: Workspace, tables: Sequence[tuple[str, str]]
+) -> dict[str, object]:
+    """The rows of waiting US delisted lists by why their ISIN names no instrument now.
+
+    Judged against the registry's current FMP ``isin`` owners, as the engine resolves:
+    ``isin_missing`` (no ISIN: never derived, risk 7), ``isin_invalid``,
+    ``isin_unregistered``, ``isin_ambiguous`` (several instruments) or ``resolved`` (the
+    source waits for the next promotion), and the same by symbol class. SELECT only.
+    """
+    owners = us_symbols.read_registry(workspace.state).owners
+    targets = {
+        (table.source_id, str(table.entry["name"])): str(table.entry["target"])
+        for table in committed_tables(workspace, us_symbols.SOURCE_PREFIX)
+        if table.store == "market"
+    }
+    found: list[tuple[str, str, int]] = []
+    for key in tables:
+        if key not in targets:
+            continue
+        for value, label, count in workspace.market.execute(
+            f"SELECT isin, type, count(*) FROM {_quote(targets[key])} "  # noqa: S608 -- a quoted table
+            f"WHERE {_US_DELISTED} GROUP BY ALL ORDER BY ALL"
+        ).fetchall():
+            reason = us_symbols.isin_reason(value)
+            if reason is None:
+                named = owners.get(str(value), frozenset())
+                reason = ("isin_unregistered" if not named else
+                          "isin_ambiguous" if len(named) > 1 else us_symbols.RESOLVED)  # fmt: skip
+            found.append((reason, us_symbols.symbol_class(label), int(count)))
+    reasons: dict[str, int] = {}
+    classes: dict[str, dict[str, int]] = {}
+    for reason, kind, count in found:
+        reasons[reason] = reasons.get(reason, 0) + count
+        within = classes.setdefault(reason, {})
+        within[kind] = within.get(kind, 0) + count
+    return {
+        "rows_by_reason": dict(sorted(reasons.items())),
+        "rows_by_class": {reason: dict(sorted(kinds.items()))
+                          for reason, kinds in sorted(classes.items())},
+    }  # fmt: skip
 
 
 def unmapped(workspace: Workspace) -> dict[str, int]:
@@ -1116,6 +1276,7 @@ FRESHNESS: Final[Mapping[str, Expectation]] = {
     "sessions.xnys": Expectation("none"),
     "sessions.xkrx": Expectation("none"),
     "status.kr.kind": Expectation("none", collector="kind"),
+    "status.us.eodhd": Expectation("none", collector="qveris"),
     "classifications.us.sec": Expectation("none"),
     "classifications.kr.kind": Expectation("none", collector="kind"),
 }

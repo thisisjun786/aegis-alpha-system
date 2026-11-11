@@ -203,6 +203,9 @@ CATALOG: Final[tuple[CatalogEntry, ...]] = (
     CatalogEntry(
         "status.us.norgate", "instrument_status", "canonical", ("norgate.status@1",), _DAY_END
     ),
+    CatalogEntry(
+        "status.us.eodhd", "instrument_status", "canonical", ("eodhd.delisted@1",), _DAY_END
+    ),
     CatalogEntry("status.kr.kind", "instrument_status", "canonical", ("kind.status@1",), _DAY_END),
     CatalogEntry(
         "filings.us.sec", "filings", "canonical", ("sec.submissions@1",), ("source_column@1",)

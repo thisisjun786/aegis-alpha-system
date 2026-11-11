@@ -43,6 +43,7 @@ def test_eodhd_bars_maps_synthetic_fixture() -> None:
         "eodhd.bars_quarantine@1",
         "eodhd.bulk_quarantine@1",
         "eodhd.bulk_quarantine_adjusted@1",
+        "eodhd.delisted@1",
         "fmp.eod_non_split@1",
         "fmp.dividends@1",
         "fmp.splits@1",

@@ -1570,7 +1570,9 @@ identity 증분 계획, dataset마다 새 원천과 단계를 낸다. `--promoti
 }
 ```
 
-`symbol_lists`의 `US`는 상장 목록(`delisted=0`) 하나를 매일 묻는다(KR 목록은 `symbol_list_days`마다).
+`symbol_lists`의 `US`는 상장 목록(`delisted=0`)과 상장폐지 목록(`delisted=1`)을 매일 묻는다(KR 목록은
+`symbol_list_days`마다). 상장폐지 목록이 더해져 US 목록 요청은 하루 1회 늘었다. 상장폐지 목록은
+`status.us.eodhd`(`eodhd.delisted@1`)의 입력이고 identity 단계는 그 행을 상장 행이 아니라며 건너뛴다.
 identity 단계는 그 목록의 행을 등록된 FMP ISIN으로 Norgate 상품에 잇는다. 그 심볼이 바로 앞에(등록된 claim이나
 같은 실행이 받아들인 claim으로, 거부된 관측은 아님) 같은 상품에 있었으면 claim을 등록한다. 사이가 토·일뿐이면 그날 하루, 평일이 비어 있으면
 그 빈 날부터 그날까지를 claim 하나로 잇는다(최대 120일). **이은(bridged) 날은 양 끝에서 같은 상품으로
@@ -1597,6 +1599,10 @@ identity 단계는 그 목록의 행을 등록된 FMP ISIN으로 Norgate 상품�
 | `rows_by_reason` | `prices.us.eodhd`(와 `.r<N>`)에만 있다. 그 원천 행을 지금의 registry와 US 목록으로 판정한 사유별 행 수. `resolved`(이제 등록 claim이 덮음, 다음 승격을 기다림), `list_claimable`(다음 identity 단계가 등록할 날), `list_not_observed`(그날 목록에 없음), 그 밖은 목록 사유(`list_isin_missing` 등) |
 | `rows_by_class` | 같은 항목. `resolved`가 아닌 사유마다 목록 `Type`의 종류별 행 수(`common_stock`, `etf`, `mutual_fund`, `warrant`, `unknown` 등) |
 | `rows_by_disposition` | 같은 항목. `resolved`가 아닌 행의 처리별 수: `register`(그 상품의 ISIN 원천이 생기면 해석됨), `unresolved`(사유와 함께 남김), `out_of_scope`(상품이 없는 종류) |
+
+`status.us.eodhd`(와 `.r<N>`) 항목에도 `rows_by_reason`·`rows_by_class`가 있다. 기다리는 US 상장폐지 목록의 행을
+지금 registry의 FMP `isin` 소유자로 판정한 수다: `isin_missing`(ISIN 없음, 끌어내지 않음), `isin_invalid`,
+`isin_unregistered`, `isin_ambiguous`(상품 여럿), `resolved`(다음 승격을 기다림). `rows_by_disposition`은 없다.
 
 ```json
 "standing_unresolved": {"prices.us.eodhd": {"sources": 44, "rows": 528400, "rows_unavailable": 0,
@@ -1656,11 +1662,13 @@ XKRX)에서 실행 시각까지 마감한 마지막 세션, OpenDART는 서울 �
 `aas data promote`(또는 `data kr-prices`, `calendar refresh`)로 만들고, 그 뒤 실행이 새로 수집된 원천을 그
 명세의 규칙으로 이어 붙인다. head가 없는 dataset은 `no_head`로 보고된다.
 
-`actions.us.eodhd`, `actions.kr.eodhd`, `fx.usdkrw.eodhd`, `status.kr.kind` route는 첫 template을 코드에
+`actions.us.eodhd`, `actions.kr.eodhd`, `fx.usdkrw.eodhd`, `status.kr.kind`, `status.us.eodhd` route는 첫 template을 코드에
 선언해 두었다(시작 선언). 그래도 지금의 `aas maintain run`은 시작할 dataset을 넘기지 않으므로 이 dataset들은
 `no_head`로 보고되고 `skipped.no_head`가 기다리는 원천 테이블 수를 센다. 시작은 운영 DB에 첫 generation을 쓰는 일이라
 켜는 시점은 운영자가 정한다. 켜진 실행에서 선언이 pin할 달력 head가 없으면 `no_calendar`, identity snapshot이
-없으면 `identity_unavailable`로 보고하고 아무것도 쓰지 않는다. 시작한 dataset 항목은 `started: true`이고
+없으면 `identity_unavailable`, 매퍼가 참조할 generation(`status.us.eodhd`의 `prices.us.eodhd` head)이 없으면
+`no_reference`로 보고하고 아무것도 쓰지 않는다. `status.us.eodhd`의 첫 generation은 그때까지 쌓인 상장폐지 목록 중
+가장 이른 것부터 시작하고, 그 목록의 종목은 모두 `last_bar` 추정이다. 시작한 dataset 항목은 `started: true`이고
 `template_spec_sha256`은 null이다. 그 밖의 항목은 `started: false`다.
 
 KR 일간 bulk route(`eodhd.bulk_quarantine@1`, `_adjusted@1`)는 예외로, chain에 bulk generation이 없으면 같은
