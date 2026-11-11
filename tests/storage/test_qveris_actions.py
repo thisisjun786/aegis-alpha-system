@@ -225,7 +225,7 @@ def test_us_splits_and_dividends_promote_to_actions_us_eodhd(ws: Workspace, tmp_
         (instrument("AAA.US"), "dividend:2026-08-31", "dividend", EX, date(2026, 9, 1),
          date(2026, 9, 15), EX, Decimal("2.5"), None, "USD", "present", *known),
         (instrument("BBB.US"), "dividend:2026-08-31", "dividend", EX, None, None, EX,
-         Decimal("0.069"), None, "USD", "present", *known),
+         None, None, "USD", "invalid", *known),
     ])  # fmt: skip
     # The adjusted-price reader applies both action types.
     assert {"split"} <= RATIO_ACTIONS
@@ -330,8 +330,11 @@ def test_eodhd_action_mappers_read_the_qveris_columns() -> None:
     day = {"provider_symbol": "AAA.US", "date": EX}
     dividends = _mapped(
         [
-            {**day, "dividend": "0.25", "unadjusted_value": None, "dividend_currency": "USD",
+            {**day, "dividend": "0.05", "unadjusted_value": "0.25", "dividend_currency": "USD",
              "record_date": "2026-09-01", "payment_date": "2026-9-15"},
+            # Only the split-adjusted dividend: no paid amount is known.
+            {**day, "provider_symbol": "DDD.US", "dividend": "0.25", "unadjusted_value": None,
+             "dividend_currency": "USD"},
             # A currency that is no ISO code, and an amount that is no positive decimal.
             {**day, "provider_symbol": "BBB.US", "dividend": "0.25", "dividend_currency": "usd"},
             {**day, "provider_symbol": "CCC.US", "dividend": "0", "dividend_currency": "USD"},
@@ -342,6 +345,7 @@ def test_eodhd_action_mappers_read_the_qveris_columns() -> None:
     )  # fmt: skip
     assert dividends == [
         ("AAA.US", "dividend:2026-08-31", date(2026, 9, 1), None, "0.25", "USD", "present"),
+        ("DDD.US", "dividend:2026-08-31", None, None, None, "USD", "invalid"),
         ("BBB.US", "dividend:2026-08-31", None, None, None, None, "invalid"),
         ("CCC.US", "dividend:2026-08-31", None, None, None, "USD", "invalid"),
     ]
@@ -387,7 +391,7 @@ def test_the_new_routes_see_collected_sources_and_start_only_named_datasets(
                        [_split("AAA", "US", "2/1")])  # fmt: skip
     replay(ws, raw, bulk_job("US", "dividends", EX.isoformat()), [_dividend("BBB", "US", "0.5")])
     replay(ws, raw, bulk_job("KO", "dividends", EX.isoformat()),
-           [_dividend("123456", "KO", "100")])  # fmt: skip
+           [_dividend("123456", "KO", "100", unadjustedValue="100")])  # fmt: skip
     # An exchange day without splits is a committed, empty table.
     replay(ws, raw, bulk_job("KQ", "splits", EX.isoformat()), [])
     replay(ws, raw, fx_job(), _fx_rows(("2026-08-31", 1385.25), ("2026-09-01", 1390.5)))
