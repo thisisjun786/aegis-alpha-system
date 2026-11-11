@@ -63,6 +63,7 @@ def _prepare_intent(  # noqa: PLR0913 -- explicit page and invocation admission
     page: str,
     *,
     budget: InvocationBudget | None = None,
+    held: Decimal = Decimal(0),
 ) -> dict[str, object]:
     if job.tool_id == EOD_HISTORY_TOOL:
         raise ValueError("CSV history route is disabled; use the reviewed JSON history tool")
@@ -114,7 +115,7 @@ def _prepare_intent(  # noqa: PLR0913 -- explicit page and invocation admission
     ledger_after = ledger_items(client, store, started_date)
     if balance != balance_after or ledger != ledger_after:
         raise RuntimeError("ACCOUNT_CHANGED: retry preflight before creating an intent")
-    reserved = store.reserved_credits()
+    reserved = store.reserved_credits() + held
     if balance - reserved < amount:
         raise RuntimeError("INSUFFICIENT_CREDITS: execute was not attempted")
     if budget is not None:
@@ -261,6 +262,7 @@ def _finish_job(  # noqa: C901, PLR0912, PLR0913, PLR0915 -- sequential durable 
     completed_at: str | None = None,
     allow_execute: bool = True,
     budget: InvocationBudget | None = None,
+    held: Decimal = Decimal(0),
 ) -> dict[str, object]:
     parameters = job.parameters
     files: list[dict[str, object]] = []
@@ -284,7 +286,7 @@ def _finish_job(  # noqa: C901, PLR0912, PLR0913, PLR0915 -- sequential durable 
         else:
             if not allow_execute:
                 raise ValueError("completed Qveris page intent is missing")
-            intent = _prepare_intent(client, store, job, parameters, page, budget=budget)
+            intent = _prepare_intent(client, store, job, parameters, page, budget=budget, held=held)
             _execute_once(client, store, page, intent)
             calls += 1
         if not allow_execute and not store.exists(f"{page}.billing.json"):
@@ -369,7 +371,14 @@ def acquire_jobs(
     client: QverisPort,
     *,
     budget: InvocationBudget | None = None,
+    tolerate: frozenset[str] = frozenset(),
 ) -> dict[str, object]:
+    """Acquire ``jobs`` in order; every other pending page is settled before each new job.
+
+    A page in ``tolerate`` (an earlier run's transient error the caller chose to step past)
+    is not settled here and does not stop the jobs, but its full quote stays reserved
+    against the account balance of every new page, as a quarantine's would.
+    """
     acquisition_plan(jobs, root)
     outcomes: list[dict[str, object]] = []
     with QverisStore(root, client.account_key) as store:
@@ -382,11 +391,15 @@ def acquire_jobs(
                 outcomes.append(reused)
                 continue
             # Uncertain charged responses retain reservations across restarts until audited.
+            held = Decimal(0)
             for pending in store.pending_pages():
+                if pending in tolerate:
+                    held += credit_value(store.document(f"{pending}.intent.json")["quoted_credits"])
+                    continue
                 billing = reconcile_page(client, store, pending)
                 if billing.get("over_quote") is not False:
                     raise RuntimeError("QUOTE_EXCEEDED: reconcile account before new execution")
-            outcomes.append(_finish_job(client, store, job, budget=budget))
+            outcomes.append(_finish_job(client, store, job, budget=budget, held=held))
     return {
         "status": "RAW_ACQUIRED_WITH_WARNINGS"
         if any(item["status"] != "RAW_ACQUIRED" for item in outcomes)

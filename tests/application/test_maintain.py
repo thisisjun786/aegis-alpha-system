@@ -658,6 +658,87 @@ def test_warned_kr_bulk_days_continue_a_history_only_chain_and_the_store_verifie
         assert verify_workspace(ws)["verified"] is True
 
 
+def _held_reasons(ws: Workspace, day: date) -> list[str]:
+    found: list[str] = []
+    for table in committed_tables(ws, "qveris-bulk-quarantine-"):
+        rows = ws.market.execute(
+            f'SELECT reason, source_row_json FROM "{table.entry["target"]}" ORDER BY ordinal'  # noqa: S608 -- quoted
+        ).fetchall()
+        found += [str(reason) for reason, row in rows if json.loads(row)["date"] == str(day)]
+    return found
+
+
+def test_a_warned_day_with_a_bad_row_is_partial_held_by_reason_and_asked_again_within_caps(
+    tmp_path: Path,
+) -> None:
+    world = KrWorld(tmp_path)
+    bad = {"code": "000202", "exchange_short_name": "KO",
+           **bar(TUE.isoformat(), open=52100, high=52500, low=52600, close=52300)}  # fmt: skip
+    (tuesday,) = _kr_rows([TUE], ["000101"])
+    world.qveris.rows = {**world.qveris.rows, tuesday: [
+        *cast("list[object]", _kr_rows([TUE], ["000101"])[tuesday]), bad]}  # fmt: skip
+    first = world.run()
+    assert first["exit_code"] == 0, first["failed_stages"]
+    stages = cast("dict[str, dict[str, object]]", first["stages"])
+    assert cast("dict[str, object]", stages["qveris"]["cohort"])["warned"] == 4
+    snapshot = cast("dict[str, str]", stages["identity"]["snapshot"])
+    friday = MON - timedelta(days=3)
+    with open_workspace(world.home, writable=True, strategy_write=True) as ws:
+        # Only Tuesday's low-above-open row carries its own reason; the others stay partial.
+        assert _held_reasons(ws, TUE) == ["provider_reported_partial", "inconsistent_ohlc"]
+        assert _held_reasons(ws, MON) == ["provider_reported_partial"]
+        history = add_source(ws, [kr_bar("000101.KO", friday, 52000.0, retrieved=SEOUL_DAY1)],
+                             tag="history")  # fmt: skip
+        rules = {"available_at_us": KR_PARTIAL_RULE, "revision_known_at_us": KR_PARTIAL_RULE}
+        backfill = price_spec([history], snapshot, rules=rules,
+                              partition={"from": "2026-01-01", "to": "2027-01-01"},
+                              decimals=KRW)  # fmt: skip
+        assert promote(ws, *backfill, apply=True)["published"] is True
+
+    # The next day the caps cover Wednesday and the two symbol lists, not Tuesday's retry.
+    world.clock.advance(days=1)
+    world.qveris.rows = {**world.qveris.rows, **_kr_rows([WED], ["000101"])}
+    qveris = cast("QverisSettings", world.config.qveris)
+    world.config = replace(world.config, qveris=replace(
+        qveris, caps=replace(qveris.caps, max_calls=3)))  # fmt: skip
+    executed = world.qveris.execute_count
+    second = world.run()
+    assert second["exit_code"] == 0, second["failed_stages"]
+    stage = cast("dict[str, dict[str, object]]", second["stages"])["qveris"]
+    assert cast("dict[str, int]", stage["reasons"])["partial_retry"] == 1
+    assert stage["partial"] == 1  # Monday: every row passed, so it is not asked again
+    warnings = cast("dict[str, object]", stage["warnings"])
+    # The two warned KR symbol lists have no value checks: unjudged, refreshed by their rule.
+    assert (warnings["held_rows"], warnings["unjudged"]) == (1, 2)
+    assert world.qveris.execute_count - executed == 3
+    assert cast("dict[str, int]", stage["settled_after"])["released"] == 1
+    listed = mint_instrument("krx_isin", isin("000010101"))
+    with open_workspace(world.home) as ws:
+        days = ws.market.execute(
+            "SELECT session_date FROM prices WHERE instrument_id=? ORDER BY 1", (listed,)
+        ).fetchall()
+        # Tuesday's table holds a failing row, so the maintenance route keeps it whole.
+        assert days == [(friday,), (MON,), (WED,)]
+
+    # With room under the caps, Tuesday is asked again; its clean answer is promoted.
+    world.clock.advance(days=1)
+    thursday = WED + timedelta(days=1)
+    world.qveris.rows = {**world.qveris.rows, **_kr_rows([TUE, thursday], ["000101"])}
+    world.config = replace(world.config, qveris=qveris)
+    third = world.run()
+    assert third["exit_code"] == 0, third["failed_stages"]
+    stage = cast("dict[str, dict[str, object]]", third["stages"])["qveris"]
+    assert cast("dict[str, int]", stage["reasons"])["partial_retry"] == 1
+    with open_workspace(world.home) as ws:
+        days = ws.market.execute(
+            "SELECT session_date FROM prices WHERE instrument_id=? ORDER BY 1", (listed,)
+        ).fetchall()
+        assert days == [(friday,), (MON,), (TUE,), (WED,), (thursday,)]
+        assert verify_workspace(ws)["verified"] is True
+    planned = cast("dict[str, dict[str, object]]", world.run()["stages"])["qveris"]
+    assert cast("dict[str, int]", planned["reasons"])["partial_retry"] == 0
+
+
 def test_a_plan_skips_legacy_shaped_kind_listings(tmp_path: Path) -> None:
     world = KrWorld(tmp_path)
     first = world.run()

@@ -61,6 +61,8 @@ def test_the_runtime_configuration_names_providers_caps_and_secrets(tmp_path: Pa
     assert qveris.policy.since["US"] == date(2026, 7, 28)
     assert qveris.policy.datasets == ("prices", "splits", "dividends")
     assert (qveris.caps.max_calls, qveris.caps.max_credits) == (30, "100")
+    # Off by default: an unsettled transient page still stops the cohort.
+    assert qveris.caps.continue_past_transient is False
 
 
 @pytest.mark.parametrize(
@@ -71,6 +73,7 @@ def test_the_runtime_configuration_names_providers_caps_and_secrets(tmp_path: Pa
         ({"fred": {"enabled": "yes", "key_file": "k"}}, "boolean enabled"),
         ({"fmp": {"enabled": True}}, "unknown sections"),
         ({"qveris": {**PROVIDERS["qveris"], "raw_root": "relative"}}, "absolute"),
+        ({"qveris": {**PROVIDERS["qveris"], "continue_past_transient": "yes"}}, "true or false"),
         ({"sec": {"enabled": True, "user_agent_file": "u", "issuers": "some"}}, "registered"),
     ],
 )

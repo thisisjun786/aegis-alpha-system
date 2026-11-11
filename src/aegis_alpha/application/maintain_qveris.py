@@ -7,7 +7,11 @@ observation date. The raw collection root is the record of every ask; each ask's
 is read from its evidence:
 
 - ``completed`` (``RAW_ACQUIRED``) or ``warned`` (``RAW_ACQUIRED_WITH_WARNINGS``): a
-  ``complete.json`` exists. The request is covered; a provider warning is a completion.
+  ``complete.json`` exists. A warned ask is a partial success, counted apart from a
+  completion: its ``gateway_warnings`` and each warned page's settled usage
+  (``provider_status_code``, ``raw_result_count``, ``valid_result_count``) are read as
+  recorded, never interpreted, and its rows are judged by the clean response path's value
+  checks (``qveris_native.warned_value_failures``).
 - ``failed``: every page that has an intent also has a settled billing record and the job
   has no completion. The provider answered and the answer is kept, but it was not usable.
 - ``quarantined``: a page without billing that the operator quarantined (the page itself
@@ -16,12 +20,23 @@ is read from its evidence:
 - ``unsettled``: a page without billing that is not quarantined. The next Qveris run
   settles it before any new call, or the operator quarantines it.
 
+A warned ask is asked again (``partial_retry``) only when it held rows (a row failed its
+value checks) or a page's ``raw_result_count`` differs from its ``valid_result_count``;
+any other warned ask covers its request as ``partial``, so a warned answer whose rows all
+pass is not asked again forever. A warned ask whose rows cannot be read for judging
+(``unjudged``) is not asked again either, the cheaper choice, and the report counts it.
+
 Planning, for a request that is not covered: an ``unsettled`` ask holds it (``held``);
-otherwise the latest ask decides. An ask of an earlier observation date that ``failed``
-is asked again (``failed_retry``) 1, 2, 4, ... up to 32 days after it, doubling with each
-settled failure in a row (``failing`` lists requests with more than one), and one that
-is ``quarantined`` is asked again the next day (``uncertain_retry``): the quarantined
-page never runs again, the request is asked as a new job. An ask of the current
+otherwise the latest ask decides. A held ask's page whose execute answered a 5xx status
+without an ``execution_id``, and whose retained settlement reads (``audits/``) found no
+usage event for its search, is a transient error: it is reported as a quarantine
+candidate (job and page) and is never quarantined here. An ask of an earlier observation
+date that ``failed`` is asked again (``failed_retry``) 1, 2, 4, ... up to 32 days after
+it, doubling with each settled failure in a row (``failing`` lists requests with more
+than one); a ``partial_retry`` waits the same way, a warned ask to ask again counting as
+one of that row, and one that is ``quarantined`` is asked again the next day
+(``uncertain_retry``): the quarantined page never runs again, the request is asked as a
+new job. An ask of the current
 observation date, or a failure still backing off, waits (``waiting``).
 A request never asked is ``new``. KR symbol lists are covered for ``symbol_list_days`` after
 the observation date of their latest completion and are then asked again (``refresh``); the
@@ -40,8 +55,12 @@ Requests, in the order a run asks them while its caps last:
 3. FX pair histories (``<PAIR>.FOREX``) from ``forex_lookback_days`` before the
    observation date.
 
-Retries (``failed_retry``, ``uncertain_retry``) come after every first ask and refresh,
-in the same order, so they spend only what the caps leave.
+Retries (``failed_retry``, ``partial_retry``, ``uncertain_retry``) come after every first
+ask and refresh, in the same order, so they spend only what the caps leave.
+
+With ``continue_past_transient`` (off by default) a run whose only unsettled pages are
+quarantine candidates still asks its planned requests: those pages are resumed last,
+their quotes stay reserved against the balance, and the run still reports ``stopped``.
 
 Every ask of a run is a ledger attempt (provider ``qveris``) of the request's job
 (``qveris:<request SHA-256>``): ``reserved`` with the ask's job fingerprint as the
@@ -63,7 +82,7 @@ from __future__ import annotations
 import hashlib
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -78,6 +97,7 @@ from aegis_alpha.data.qveris_contracts import (
     FX_DATASET,
     FX_EXCHANGE,
     FX_MARKET,
+    MAX_PAGES,
     QverisJob,
     load_json,
     object_value,
@@ -100,11 +120,17 @@ US_SYMBOL_LIST: Final = "US"
 MAX_LOOKBACK_DAYS: Final = 366
 ATTEMPT_SCHEMA: Final = "aas-qveris-attempt-v1"
 REQUEST_SCHEMA: Final = "aas-qveris-request-v1"
-REASONS: Final = ("new", "failed_retry", "uncertain_retry", "refresh")
+REASONS: Final = ("new", "failed_retry", "partial_retry", "uncertain_retry", "refresh")
 _MAX_DOCUMENT: Final = 1024 * 1024
 _TERMINAL: Final = frozenset({"completed", "warned"})
 RETRY_DOUBLINGS: Final = 5
-_RETRIES: Final = frozenset({"failed_retry", "uncertain_retry"})
+_RETRIES: Final = frozenset({"failed_retry", "partial_retry", "uncertain_retry"})
+UNCLASSIFIED: Final = "unclassified"
+_SETTLEMENT_READ: Final = "/auth/usage/history/v2"
+# A settlement read that found nothing for one search is a few hundred bytes; larger audits
+# hold other answers and are not read when looking for those.
+_MAX_EMPTY_READ: Final = 64 * 1024
+_SERVER_ERRORS: Final = range(500, 600)
 
 type Request = tuple[str, str, str, str, str]
 
@@ -187,12 +213,52 @@ class QverisPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class PageWarning:
+    """One warned page as recorded: the gateway's warning and the page's settled usage.
+
+    Values are kept as the raw root holds them; nothing here says what a code means.
+    """
+
+    page: object
+    reason_code: object
+    provider_status_code: object
+    raw_result_count: object
+    valid_result_count: object
+
+    @property
+    def counts(self) -> str:
+        """``equal``/``differ`` for the page's raw and valid result counts, else ``unknown``."""
+        raw, valid = self.raw_result_count, self.valid_result_count
+        if type(raw) is not int or type(valid) is not int:
+            return "unknown"
+        return "equal" if raw == valid else "differ"
+
+
+@dataclass(frozen=True, slots=True)
+class TransientPage:
+    """An unsettled page whose execute answered 5xx without an execution ID."""
+
+    page: str
+    http_status: int
+    search_id: str
+    empty_reads: int = 0  # retained settlement reads that found no usage event
+    other_reads: int = 0  # retained settlement reads that found one or more
+
+    @property
+    def candidate(self) -> bool:
+        """A quarantine candidate: every retained settlement read found no usage event."""
+        return self.empty_reads > 0 and self.other_reads == 0
+
+
+@dataclass(frozen=True, slots=True)
 class RawAsk:
     """One ask (job directory) of a request in the raw root and its evidence state."""
 
     job: QverisJob
     state: str
     evidence: tuple[tuple[str, str], ...]  # (relative path, SHA-256) of the deciding files
+    warnings: tuple[PageWarning, ...] = ()  # a warned ask's pages, as recorded
+    transient: tuple[TransientPage, ...] = ()  # an unsettled ask's 5xx pages
 
     @property
     def fingerprint(self) -> str:
@@ -222,6 +288,74 @@ def _quarantined_batches(tree: DescriptorTree) -> frozenset[str]:
     )
 
 
+def _page_warnings(
+    tree: DescriptorTree, base: str, body: Mapping[str, object]
+) -> tuple[PageWarning, ...]:
+    """Each ``gateway_warnings`` entry of a warned completion with its page's usage."""
+    listed = body.get("gateway_warnings")
+    entries = (
+        [item for item in listed if isinstance(item, dict)] if isinstance(listed, list) else []
+    )
+    if not entries:
+        return (PageWarning(None, None, None, None, None),)
+    found = []
+    for entry in entries:
+        page = entry.get("page")
+        usage: object = None
+        if type(page) is int and 0 <= page < MAX_PAGES:
+            billing = f"{base}/{page:04d}.billing.json"
+            if tree.exists(billing):
+                usage = _document(tree, billing).get("usage")
+        recorded = cast("dict[str, object]", usage) if isinstance(usage, dict) else {}
+        found.append(
+            PageWarning(
+                page,
+                entry.get("reason_code"),
+                recorded.get("provider_status_code"),
+                recorded.get("raw_result_count"),
+                recorded.get("valid_result_count"),
+            )
+        )
+    return tuple(found)
+
+
+def _transient(tree: DescriptorTree, page: str) -> TransientPage | None:
+    """The page when its execute answered 5xx without an execution ID, else ``None``."""
+    if not tree.exists(f"{page}.response.json"):
+        return None
+    response = _document(tree, f"{page}.response.json")
+    status, execution = response.get("status"), response.get("execution_id")
+    if (
+        type(status) is not int
+        or status not in _SERVER_ERRORS
+        or (isinstance(execution, str) and execution)
+    ):
+        return None
+    search = _document(tree, f"{page}.intent.json").get("search_id")
+    return TransientPage(page, status, search) if isinstance(search, str) and search else None
+
+
+def _settlement_reads(tree: DescriptorTree, searches: set[str]) -> dict[str, tuple[int, int]]:
+    """(reads without, reads with a usage event) the raw root retains for each search."""
+    counts = {search: [0, 0] for search in searches}
+    if not searches or not tree.exists("audits"):
+        return {}
+    for name in tree.listdir("audits"):
+        path = f"audits/{name}"
+        if not name.endswith(".json") or tree.stat(path).st_size > _MAX_EMPTY_READ:
+            continue
+        document = _document(tree, path)
+        query, response = document.get("query"), document.get("response")
+        if document.get("path") != _SETTLEMENT_READ or not isinstance(query, dict):
+            continue
+        search = query.get("search_id")
+        data = response.get("data") if isinstance(response, dict) else None
+        total = data.get("total") if isinstance(data, dict) else None
+        if search in counts and type(total) is int:
+            counts[search][0 if total == 0 else 1] += 1
+    return {search: (empty, other) for search, (empty, other) in counts.items()}
+
+
 def _ask(tree: DescriptorTree, name: str, batches: frozenset[str]) -> tuple[QverisJob, RawAsk]:
     base = f"jobs/{name}"
     if tree.exists(f"{base}/complete.json"):
@@ -229,13 +363,15 @@ def _ask(tree: DescriptorTree, name: str, batches: frozenset[str]) -> tuple[Qver
         job = QverisJob.from_document(body.get("job"))
         state = "warned" if body.get("status") == "RAW_ACQUIRED_WITH_WARNINGS" else "completed"
         evidence = ((f"{base}/complete.json", _sha(tree, f"{base}/complete.json")),)
-        return job, RawAsk(job, state, evidence)
+        warnings = _page_warnings(tree, base, body) if state == "warned" else ()
+        return job, RawAsk(job, state, evidence, warnings)
     intents = sorted(item for item in tree.listdir(base) if item.endswith(".intent.json"))
     if not intents:
         raise ValueError(f"Qveris job {name} has neither a completion nor an intent")
     job = QverisJob.from_document(_document(tree, f"{base}/{intents[0]}").get("job"))
     states: list[str] = []
     evidence: list[tuple[str, str]] = []
+    transient: list[TransientPage] = []
     for intent in intents:
         page = f"{base}/{intent.removesuffix('.intent.json')}"
         billing = f"{page}.billing.json"
@@ -249,6 +385,9 @@ def _ask(tree: DescriptorTree, name: str, batches: frozenset[str]) -> tuple[Qver
             states.append("quarantined")
         else:
             states.append("unsettled")
+            found = _transient(tree, page)
+            if found is not None:
+                transient.append(found)
     state = (
         "unsettled"
         if "unsettled" in states
@@ -256,7 +395,7 @@ def _ask(tree: DescriptorTree, name: str, batches: frozenset[str]) -> tuple[Qver
         if "quarantined" in states
         else "failed"
     )
-    return job, RawAsk(job, state, tuple(evidence))
+    return job, RawAsk(job, state, tuple(evidence), transient=tuple(transient))
 
 
 def raw_asks(raw_root: Path | None) -> dict[Request, list[RawAsk]]:
@@ -273,6 +412,19 @@ def raw_asks(raw_root: Path | None) -> dict[Request, list[RawAsk]]:
                 if job.fingerprint != name:
                     raise ValueError(f"Qveris job {name} is filed under another fingerprint")
                 found.setdefault(request_of(job), []).append(ask)
+            searches = {page.search_id for asks in found.values() for ask in asks
+                        for page in ask.transient}  # fmt: skip
+            if searches:
+                reads = _settlement_reads(tree, searches)
+                for asks in found.values():
+                    asks[:] = [
+                        replace(ask, transient=tuple(
+                            replace(page, empty_reads=reads[page.search_id][0],
+                                    other_reads=reads[page.search_id][1])
+                            for page in ask.transient))
+                        if ask.transient and reads else ask
+                        for ask in asks
+                    ]  # fmt: skip
     except (OSError, DescriptorTreeError) as error:
         raise ValueError("cannot read the Qveris raw collection root") from error
     for asks in found.values():
@@ -300,7 +452,10 @@ class QverisPlan:
     planned: list[Planned] = field(default_factory=list)
     resumable: list[QverisJob] = field(default_factory=list)
     covered: int = 0
+    partial: int = 0
     held: list[dict[str, object]] = field(default_factory=list)
+    candidates: list[dict[str, object]] = field(default_factory=list)
+    warned: list[tuple[RawAsk, str, int | None]] = field(default_factory=list)
     waiting: int = 0
     failing: list[dict[str, object]] = field(default_factory=list)
     calendars: dict[str, str] = field(default_factory=dict)
@@ -321,7 +476,10 @@ class QverisPlan:
             "reasons": reasons,
             "by_dataset": dict(sorted(by_dataset.items())),
             "covered": self.covered,
+            "partial": self.partial,
+            "warnings": warning_summary(self.warned),
             "held": self.held,
+            "quarantine_candidates": self.candidates,
             "waiting": self.waiting,
             "failing": self.failing,
             "calendars": self.calendars,
@@ -330,13 +488,63 @@ class QverisPlan:
         }
 
 
-def _decide(
-    asks: Sequence[RawAsk], today: date, *, fresh_after: date | None = None
+def _label(value: object) -> str:
+    """A recorded code as report text: text or an integer as given, anything else unclassified."""
+    if isinstance(value, str) and value:
+        return value
+    return str(value) if type(value) is int else UNCLASSIFIED
+
+
+def warning_summary(warned: Sequence[tuple[RawAsk, str, int | None]]) -> dict[str, object]:
+    """Warned asks that decide their request: decisions, held rows and pages by recorded code.
+
+    Pages are counted by (``reason_code``, ``provider_status_code``) as recorded, a missing
+    or non-scalar code as ``unclassified``, with whether the page's raw and valid result
+    counts are equal, differ or are unknown. ``unjudged`` asks are those whose rows could
+    not be read for the value checks.
+    """
+    pages: dict[tuple[str, str], dict[str, int]] = {}
+    decisions: dict[str, int] = {}
+    for ask, decision, _ in warned:
+        decisions[decision] = decisions.get(decision, 0) + 1
+        for warning in ask.warnings:
+            key = (_label(warning.reason_code), _label(warning.provider_status_code))
+            counts = pages.setdefault(
+                key, {"pages": 0, "counts_equal": 0, "counts_differ": 0, "counts_unknown": 0}
+            )
+            counts["pages"] += 1
+            counts["counts_" + warning.counts] += 1
+    return {
+        "asks": len(warned),
+        "decisions": dict(sorted(decisions.items())),
+        "held_rows": sum(held or 0 for _, _, held in warned),
+        "unjudged": sum(held is None for _, _, held in warned),
+        "by_reason": [
+            {"reason_code": reason, "provider_status_code": code, **counts}
+            for (reason, code), counts in sorted(pages.items())
+        ],
+    }
+
+
+def _never(ask: RawAsk) -> bool:
+    del ask
+    return False
+
+
+def _decide(  # noqa: PLR0911 -- one decision per evidence state
+    asks: Sequence[RawAsk],
+    today: date,
+    *,
+    fresh_after: date | None = None,
+    again: Callable[[RawAsk], bool] = _never,
 ) -> tuple[str, RawAsk | None]:
-    """(``covered``/``held``/``waiting``/a planning reason, the deciding ask)."""
-    done = [ask for ask in asks if ask.state in _TERMINAL]
+    """(``covered``/``partial``/``held``/``waiting``/a planning reason, the deciding ask).
+
+    ``again`` tells a warned ask to ask again: it covers nothing and waits like a failure.
+    """
+    done = [ask for ask in asks if ask.state in _TERMINAL and not again(ask)]
     if done and (fresh_after is None or done[-1].observation_date > fresh_after):
-        return "covered", done[-1]
+        return ("partial" if done[-1].state == "warned" else "covered"), done[-1]
     unsettled = [ask for ask in asks if ask.state == "unsettled"]
     if unsettled:
         return "held", unsettled[-1]
@@ -345,25 +553,41 @@ def _decide(
     latest = asks[-1]
     if latest.observation_date >= today:
         return "waiting", latest
+    if latest.state in _TERMINAL and again(latest):
+        due = latest.observation_date + timedelta(days=retry_after(asks, again))
+        return ("backoff" if today < due else "partial_retry"), latest
     if latest.state in _TERMINAL or latest.state == "quarantined":
         return ("refresh" if latest.state in _TERMINAL else "uncertain_retry"), latest
-    due = latest.observation_date + timedelta(days=retry_after(asks))
+    due = latest.observation_date + timedelta(days=retry_after(asks, again))
     return ("backoff" if today < due else "failed_retry"), latest
 
 
-def failed_streak(asks: Sequence[RawAsk]) -> int:
-    """The number of settled failures that end the request's asks."""
+def failed_streak(asks: Sequence[RawAsk], again: Callable[[RawAsk], bool] = _never) -> int:
+    """The number of settled failures (and warned asks to ask again) that end the asks."""
     count = 0
     for ask in reversed(asks):
-        if ask.state != "failed":
+        if ask.state != "failed" and not (ask.state == "warned" and again(ask)):
             break
         count += 1
     return count
 
 
-def retry_after(asks: Sequence[RawAsk]) -> int:
+def retry_after(asks: Sequence[RawAsk], again: Callable[[RawAsk], bool] = _never) -> int:
     """Days after the latest settled failure before a paid retry: 1, 2, 4, ... up to 32."""
-    return 2 ** min(max(failed_streak(asks) - 1, 0), RETRY_DOUBLINGS)
+    return 2 ** min(max(failed_streak(asks, again) - 1, 0), RETRY_DOUBLINGS)
+
+
+def held_rows(raw_root: Path | None, ask: RawAsk) -> int | None:
+    """Rows of a warned ask that fail their value checks, or ``None`` when unreadable."""
+    from aegis_alpha.data.qveris_native import read_completed_job, warned_value_failures
+
+    if raw_root is None or ask.state != "warned" or not ask.evidence:
+        return None
+    try:
+        history = read_completed_job(raw_root, ask.fingerprint, ask.evidence[0][1])
+    except (ValueError, TypeError, KeyError, OSError, RuntimeError, DescriptorTreeError):
+        return None  # reported as unjudged, never asked again on its account
+    return len(warned_value_failures(history))
 
 
 def _ledger_dataset(job: QverisJob) -> str:
@@ -433,7 +657,7 @@ def _sessions(
     return sorted(found, key=lambda item: (item[0], order[item[1]]))
 
 
-def plan_requests(
+def plan_requests(  # noqa: C901 -- one pass deciding and reporting every candidate request
     raw_root: Path | None,
     policy: QverisPolicy,
     *,
@@ -445,6 +669,19 @@ def plan_requests(
     asks = raw_asks(raw_root) if asks is None else asks
     overrides = {item.calendar_id: item for item in declarations}
     plan = QverisPlan()
+    verdicts: dict[str, int | None] = {}
+
+    def held(ask: RawAsk) -> int | None:
+        if ask.fingerprint not in verdicts:
+            verdicts[ask.fingerprint] = held_rows(raw_root, ask)
+        return verdicts[ask.fingerprint]
+
+    def again(ask: RawAsk) -> bool:
+        """A warned ask is asked again when it held rows or its result counts differ."""
+        if ask.state != "warned":
+            return False
+        return any(item.counts == "differ" for item in ask.warnings) or (held(ask) or 0) > 0
+
     sessions = _sessions(policy, today, overrides, plan)
     candidates: list[tuple[QverisJob, date | None, date | None]] = [
         (_rename(daily_job(exchange, dataset, day, today)), day, None)
@@ -467,19 +704,30 @@ def plan_requests(
         found = asks.get(request_of(job), [])
         if found and found[-1].state in {"unsettled", "failed"}:
             plan.resumable.append(found[-1].job)
-        decision, ask = _decide(found, today, fresh_after=fresh_after)
-        streak = failed_streak(found)
-        if streak > 1 and decision in {"backoff", "failed_retry"}:
+        decision, ask = _decide(found, today, fresh_after=fresh_after, again=again)
+        streak = failed_streak(found, again)
+        if streak > 1 and decision in {"backoff", "failed_retry", "partial_retry"}:
             plan.failing.append({
                 "job_id": job.job_id, "failed_asks": streak,
                 "retry_on": (cast("RawAsk", ask).observation_date
-                             + timedelta(days=retry_after(found))).isoformat(),
+                             + timedelta(days=retry_after(found, again))).isoformat(),
             })  # fmt: skip
+        if ask is not None and ask.state == "warned":
+            plan.warned.append((ask, decision, held(ask)))
         if decision == "covered":
             plan.covered += 1
+        elif decision == "partial":
+            plan.partial += 1
         elif decision == "held":
-            plan.held.append({"job_id": job.job_id, "unsettled_fingerprint": cast("RawAsk", ask)
+            unsettled = cast("RawAsk", ask)
+            plan.held.append({"job_id": job.job_id, "unsettled_fingerprint": unsettled
                               .fingerprint})  # fmt: skip
+            plan.candidates.extend(
+                {"job_id": unsettled.job.job_id, "page": page.page,
+                 "http_status": page.http_status, "settlement_reads_without_usage":
+                 page.empty_reads}
+                for page in unsettled.transient if page.candidate
+            )  # fmt: skip
         elif decision in {"waiting", "backoff"}:
             plan.waiting += 1
         else:
@@ -623,12 +871,16 @@ class QverisCaps:
     max_http_requests: int | None = None
     time_limit_seconds: float = 3600.0
     request_interval: float | None = None
+    continue_past_transient: bool = False
+    """Ask the planned requests next to unsettled pages that are only quarantine candidates."""
 
     def __post_init__(self) -> None:
         from aegis_alpha.data.qveris_contracts import credit_value
 
         if type(self.max_calls) is not int or self.max_calls < 0:
             raise ValueError("qveris max_calls must be a nonnegative integer")
+        if type(self.continue_past_transient) is not bool:
+            raise TypeError("qveris continue_past_transient must be true or false")
         credit_value(self.max_credits)
 
 
@@ -721,6 +973,18 @@ class _Session:
         }
 
 
+def _tolerated(asks: Mapping[Request, list[RawAsk]]) -> frozenset[str]:
+    """The unsettled pages that are quarantine candidates (``continue_past_transient``)."""
+    return frozenset(
+        page.page
+        for items in asks.values()
+        for ask in items
+        if ask.state == "unsettled"
+        for page in ask.transient
+        if page.candidate
+    )
+
+
 def _status(cohort: Mapping[str, object]) -> str:
     from aegis_alpha.data.qveris_batch import BUDGET_STOPS
 
@@ -756,12 +1020,19 @@ def collect(  # noqa: PLR0913 -- the run's explicit inputs
     resumable = plan_requests(
         raw_root, policy, today=today, declarations=declarations, asks=asks
     ).resumable
+    tolerate = _tolerated(asks) if caps.continue_past_transient else frozenset()
+    # Tolerated pages' jobs are resumed last, so the others are settled first.
+    resumable.sort(key=lambda job: any(page.split("/")[1] == job.fingerprint
+                                       for page in tolerate))  # fmt: skip
     resumed: dict[str, object] | None = None
     if resumable:
         resumed = collect_cohort(
-            tuple(resumable), raw_root, session.client(), budget=_resume_budget(), sleep=sleep
-        )
+            tuple(resumable), raw_root, session.client(), budget=_resume_budget(), sleep=sleep,
+            tolerate=tolerate,
+        )  # fmt: skip
         asks = raw_asks(raw_root)
+        if tolerate:
+            tolerate = _tolerated(asks)
     before = settle(workspace, asks, clock=clock)
     plan = plan_requests(raw_root, policy, today=today, declarations=declarations, asks=asks)
     report: dict[str, object] = {
@@ -769,8 +1040,10 @@ def collect(  # noqa: PLR0913 -- the run's explicit inputs
         "resumed": None
         if resumed is None
         else {
-            key: resumed[key] for key in ("requested", "completed", "failed", "empty", "stopped")
+            key: resumed[key]
+            for key in ("requested", "completed", "warned", "failed", "empty", "stopped")
         },
+        "continue_past_transient": caps.continue_past_transient,
         **plan.report(),
     }
     # A paid page still unsettled after the resume needs settlement or quarantine.
@@ -789,6 +1062,7 @@ def collect(  # noqa: PLR0913 -- the run's explicit inputs
             session.client(),
             budget=budget,
             sleep=sleep,
+            tolerate=tolerate,
         )
     except Exception:
         session.finish()

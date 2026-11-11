@@ -1499,7 +1499,9 @@ aas collect qveris import --raw-root RAW --identity IDENTITY.json [--market KR] 
 ```
 
 - `daily-jobs`는 선언 달력에서 관측일(기본 UTC 오늘) 이전의 열린 세션마다 일간 내려받기 요청을 만들고,
-  raw root에 이미 완료된 요청은 빼며 완료 없이 시도만 있는 요청은 `held`로 보고한다. 새 요청이 있을
+  raw root에 이미 완료된 요청은 빼며 완료 없이 시도만 있는 요청은 `held`로 보고한다. 정산된 과금 없는
+  빈 응답(`empty_result`)만 있는 요청은 `held`가 아니라 `empty`로 보고하고, 관측일이 그 응답보다 늦으면
+  다시 계획한다(`planned: true`). 새 요청이 있을
   때만 `--output`을 새로 만들고 그 SHA-256을 출력한다. 키를 읽지 않고 요청하지 않는다.
 - `plan`은 job 문서를 검증하고 문서마다 `completed`(같은 fingerprint가 완료돼 `run`이 HTTP 없이 재사용),
   `held`(같은 fingerprint의 시도를 `run`이 정산), `equivalent`(같은 요청이 관측일이나 job ID가 다른 job으로
@@ -1604,6 +1606,27 @@ chain의 이력 명세에서 template을 파생한다. 그때 그 dataset 항목
 경고 응답의 행을 값 검사(유한한 숫자, 가격 > 0, 거래량 >= 0, OHLC 일관성, `YYYY-MM-DD` 날짜)로 거르고, 한
 행이라도 어긴 테이블은 승격하지 않고 `skipped.value_check`에 센다. 그 수가 0이 아니면 해당 원천의 응답을 읽어
 사유를 확인한다. 테이블은 다음 실행에도 다시 세어진다.
+
+**보고의 `qveris` 단계: 부분 성공과 일시 오류.** 경고 완료(`RAW_ACQUIRED_WITH_WARNINGS`)는 완료와 따로
+센다. `partial`은 모든 행이 값 검사를 통과해(또는 행을 읽어 판정할 수 없어) 다시 묻지 않는 경고 요청 수이고,
+`reasons.partial_retry`는 보류된 행이 있거나 page의 `raw_result_count`와 `valid_result_count`가 다른 경고 요청을
+다시 묻는 수다. 재질문은 `failed_retry`와 같은 간격(1, 2, 4, …, 최대 32일)이고 모든 첫 묻기 뒤에 오므로
+`max_calls`·`max_credits`가 남긴 만큼만 쓴다. `warnings`는 요청을 정하는 경고 묻기의 집계다.
+
+| 필드 | 뜻 |
+| --- | --- |
+| `asks` | 집계한 경고 묻기 수 |
+| `decisions` | 그 묻기들의 계획 결정별 수(`partial`, `partial_retry`, `backoff`, `waiting`, `refresh`) |
+| `held_rows` | 값 검사를 어겨 그 사유로 보류된 행 수 합 |
+| `unjudged` | 행을 읽어 판정할 수 없었던 묻기 수(종목 목록 등). 다시 묻지 않는다 |
+| `by_reason` | 경고 page를 기록된 `reason_code`·`provider_status_code`별로 센 것과 raw·valid 행 수가 같은(`counts_equal`)·다른(`counts_differ`)·알 수 없는(`counts_unknown`) page 수. 값이 없거나 문자열·정수가 아니면 `unclassified`이고 코드의 뜻은 해석하지 않는다 |
+
+`quarantine_candidates`는 execute가 5xx이고 `execution_id`가 없으며 raw root에 남은 정산 조회(`audits/`)가 모두
+사용 이벤트를 찾지 못한 미정산 page다(`job_id`, `page`, `http_status`, `settlement_reads_without_usage`). 후보는
+`held`에도 그대로 있고 자동으로 격리하지 않는다. 격리는 운영자가 그 `page`로
+`aas collect qveris quarantine --page`를 실행할 때만 일어난다. 설정 `continue_past_transient`(기본 `false`)를
+켜면 후보 page만 남은 실행도 계획된 요청을 묻는다. 그 page의 견적 전체는 잔액 확인에서 예약으로 남고 상태는
+그대로 `stopped`(종료 코드 2)다. 끄면 지금처럼 미정산 page가 다음 job을 막는다.
 
 설치와 예약은 [운영 전환](#운영-전환)의 일이다. 태그된 dev 커밋을 정확한 CPython 경로로 설치하고 receipt를 남긴다.
 

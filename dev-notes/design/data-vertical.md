@@ -261,8 +261,10 @@ instrument_type, currency, ...}}}`)의 SHA-256은 적재 코드·변환 해시�
 - 행 테이블은 비어 있어도 commit한다(분할이 없는 거래일도 사실이다). 보류 테이블은 행이 있을 때만,
   행 테이블보다 먼저 commit하므로 행 원천이 있으면 단위가 완결이다. 다시 적재하면 행 원천이 있는 단위는
   다시 만들지 않고 `reused`로 센다.
-- 공급자 경고는 기록만 한다. 경고가 붙은 내려받기의 모든 행은 `provider_reported_partial` 사유로 보류되고
-  적재는 계속된다. 승격은 그 행에 같은 flag를 단다([KR 가격](#kr-가격)).
+- 공급자 경고는 기록만 한다. 경고가 붙은 내려받기의 모든 행은 보류되고 적재는 계속된다. 깨끗한 응답 경로와
+  같은 값 검사(`YYYY-MM-DD` 날짜, 가격·거래량은 `_bar`, 분할·배당은 `_action`의 값 검사, identity는 보지
+  않음)를 통과한 행은 `provider_reported_partial` 사유, 어긴 행은 그 검사의 사유(`inconsistent_ohlc` 등)로
+  보류된다. 승격은 `provider_reported_partial` 행에 같은 flag를 단다([KR 가격](#kr-가격)).
 - 분할 비율, 배당 금액·통화·날짜·주기는 공급자 텍스트 그대로(숫자는 가장 짧은 십진 표기) 남긴다.
   identity가 없는 종목, 양수 십진수가 아닌 비율·금액은 그 사유로 보류하고 고치지 않는다. 통화쌍
   이력은 instrument가 아니므로 identity 문서 없이 쌍·기준 통화·호가 통화를 남긴다.
@@ -1475,7 +1477,7 @@ commit된 것으로 계속한다. 공급자 하나의 거부나 실패가 다른
 | `dart` | `key_file` | `max_calls`(2,000), `daily_quota`(19,000) |
 | `sec` | `user_agent_file` | `max_calls`(2,000), `issuers`(`registered`·`all`), `since` |
 | `fred` | `key_file` | `max_calls`(500) |
-| `qveris` | `key_file`, `raw_root`(절대 경로), `since`(거래소마다 첫 날), `max_calls`, `max_credits`(십진 문자열) | `extra_sessions`(거래소마다 `since` 이전에 따로 물을 session 날짜), `identity`(절대 경로의 identity 문서), `exchanges`, `datasets`, `symbol_lists`, `symbol_list_days`(7), `forex`, `forex_lookback_days`(10), `max_http_requests`, `time_limit_seconds`(3600), `request_interval`, `timeout_seconds`(45) |
+| `qveris` | `key_file`, `raw_root`(절대 경로), `since`(거래소마다 첫 날), `max_calls`, `max_credits`(십진 문자열) | `extra_sessions`(거래소마다 `since` 이전에 따로 물을 session 날짜), `identity`(절대 경로의 identity 문서), `exchanges`, `datasets`, `symbol_lists`, `symbol_list_days`(7), `forex`, `forex_lookback_days`(10), `max_http_requests`, `time_limit_seconds`(3600), `request_interval`, `timeout_seconds`(45), `continue_past_transient`(false) |
 
 Qveris의 유료 크레딧은 실행 하나의 호출 수·크레딧 상한과, page마다 다시 확인하는 계정 잔액(다른 예약을 뺀 값)
 안에서만 쓴다. 상한이 막은 요청은 묻지 않은 채 다음 실행으로 남는다.
@@ -1486,12 +1488,15 @@ Qveris의 유료 크레딧은 실행 하나의 호출 수·크레딧 상한과, 
 
 | 묻기 상태 | 증거 |
 | --- | --- |
-| `completed`·`warned` | `complete.json`(`RAW_ACQUIRED`·`RAW_ACQUIRED_WITH_WARNINGS`). 공급자 경고도 완료다 |
+| `completed`·`warned` | `complete.json`(`RAW_ACQUIRED`·`RAW_ACQUIRED_WITH_WARNINGS`). `warned`는 완료와 따로 세는 부분 성공이다 |
 | `failed` | intent가 있는 모든 page에 정산된 billing이 있고 완료가 없음. 답은 보존됐지만 쓸 수 없다 |
 | `quarantined` | billing 없는 page를 운영자가 page나 병렬 group 단위로 격리함. 결과는 알 수 없고 격리가 최악의 예약을 남겼다 |
 | `unsettled` | 격리되지 않은 billing 없는 page |
 
-덮이지 않은 요청에서 `unsettled` 묻기는 그 요청을 잡아 둔다(`held`). 그 밖에는 가장 늦은 묻기가 정한다. 이전
+`warned` 묻기는 보류된 행(값 검사를 어긴 행)이 있거나 page의 usage `raw_result_count`와 `valid_result_count`가
+다르면 덮지 않고 다시 묻는다(`partial_retry`). 간격은 `failed_retry`와 같고 그런 묻기도 연속 실패로 센다. 그 밖의
+`warned`는 요청을 `partial`로 덮는다. 행을 읽어 판정할 수 없는 `warned`(`unjudged`)도 다시 묻지 않는다(비용이 적은
+쪽). 덮이지 않은 요청에서 `unsettled` 묻기는 그 요청을 잡아 둔다(`held`). 그 밖에는 가장 늦은 묻기가 정한다. 이전
 관측일의 `failed`는 그 관측일 뒤 1, 2, 4, …, 최대 32일이 지나면 다시 묻는다(`failed_retry`). 간격은 연속한 정산된
 실패마다 두 배이고, 둘 이상 연속 실패한 요청은 다음 시도일과 함께 `failing`에 남는다. `quarantined`는 다음 날
 다시 묻는다(`uncertain_retry`). 격리된 page는 다시 실행되지 않고 요청이 새 job으로 물린다. 오늘 관측일의 묻기와
@@ -2881,7 +2886,7 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-291 | 완료된 Qveris job 하나는 행 원천과 보류 원천으로 commit되고 둘은 원본 bytes의 `hex`를 공유하며 매퍼가 lineage 접두어와 테이블 이름으로 찾는다 | `tests/storage/test_qveris_import.py::test_one_job_commits_its_rows_and_held_rows_under_one_content_hex` | 구현 |
 | DV-292 | 같은 job을 다시 적재하면 재사용하고 적재 코드만 바뀌어도 같은 원천 ID다 | `tests/storage/test_qveris_import.py::test_reimport_reuses_and_a_code_change_keeps_the_id` | 구현 |
 | DV-293 | identity 문서가 커지거나 바뀌어도 적재된 job은 같은 원천으로 재사용되고 identity 해시는 lineage에 남는다 | `tests/storage/test_qveris_import.py::test_an_identity_document_that_grows_keeps_every_imported_source` | 구현 |
-| DV-294 | 경고가 붙은 내려받기는 빈 행 테이블과 `provider_reported_partial` 보류 행으로 적재되고 적재를 막지 않는다 | `tests/storage/test_qveris_import.py::test_a_warned_download_commits_an_empty_rows_table_and_its_held_rows` | 구현 |
+| DV-294 | 경고가 붙은 내려받기는 빈 행 테이블과 보류 행으로 적재되고 적재를 막지 않는다. 값 검사를 통과한 행은 `provider_reported_partial`, 어긴 행은 그 사유로 보류된다(DV-542) | `tests/storage/test_qveris_import.py::test_a_warned_download_commits_an_empty_rows_table_and_its_held_rows` | 구현 |
 | DV-295 | 읽을 수 없는 job은 기록되고 나머지 job은 적재된다 | `tests/storage/test_qveris_import.py::test_unreadable_jobs_are_recorded_and_the_run_continues` | 구현 |
 | DV-296 | 일간 요청은 선언 달력의 열린 세션에서 나오고 관측일과 무관하게 완료된 요청은 빠진다 | `tests/application/test_qveris_cli.py::test_daily_jobs_follow_declared_sessions_and_skip_completed_requests` | 구현 |
 | DV-297 | 완료 없이 시도만 있는 요청은 `held`로 보고되고 계획되지 않는다 | `tests/application/test_qveris_cli.py::test_an_attempt_without_a_completion_is_held_not_planned` | 구현 |
@@ -3024,7 +3029,7 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-434 | 두 날의 유지보수 실행은 모든 chain을 head의 자식으로 이어 붙이고, 같은 날 다시 실행하면 답한 요청을 다시 묻지 않고 아무 generation도 게시하지 않는다 | `tests/application/test_maintain.py::test_two_daily_runs_continue_every_chain_and_repeat_nothing` | 구현 |
 | DV-435 | 유료 호출 뒤나 승격 게시 뒤에 중단된 실행은 다음 실행이 공급자를 다시 부르지 않고 끝내며 원장에 증거와 어긋나는 attempt가 남지 않는다 | `tests/application/test_maintain.py::test_a_killed_run_is_recovered_without_asking_any_answered_request_again` | 구현 |
 | DV-436 | 새 KR 상장은 identity 증분과 새 유지보수 snapshot으로 등록되고 같은 실행의 KR 가격·분류 generation에서 해석된다 | `tests/application/test_maintain.py::test_new_kr_listings_advance_identity_and_every_kr_chain` | 구현 |
-| DV-437 | Qveris 요청은 묻기의 raw 증거로 정해진다: 경고 완료는 덮이고, 정산된 실패는 다음 날 새 job으로, 미정산은 보류되며 자기 job으로 먼저 끝낸다 | `tests/application/test_maintain_qveris.py::test_each_ask_state_decides_its_request` | 구현 |
+| DV-437 | Qveris 요청은 묻기의 raw 증거로 정해진다: 판정할 수 없는 경고 완료는 `partial`로 덮이고, 정산된 실패는 다음 날 새 job으로, 미정산은 보류되며 자기 job으로 먼저 끝낸다 | `tests/application/test_maintain_qveris.py::test_each_ask_state_decides_its_request` | 구현 |
 | DV-438 | 격리된 Qveris 묻기는 다음 관측일에 새 job으로 다시 묻고 같은 날에는 기다린다 | `tests/application/test_maintain_qveris.py::test_a_quarantined_ask_is_asked_again_the_next_day_and_not_the_same_day` | 구현 |
 | DV-439 | 유지보수 명세는 template에서 parent·원천·partition만 바꾸고 tombstone은 `never`이며, 끝난 원천은 `maintain_source@1`로 다시 계획되지 않는다 | `tests/storage/test_maintain_promotion.py::test_new_sources_continue_the_chain_from_the_template` | 구현 |
 | DV-440 | head나 route 매퍼의 template이 없는 dataset은 유지보수가 시작하지 않고 보고한다 | `tests/storage/test_maintain_promotion.py::test_a_route_without_a_head_or_template_reports_and_starts_nothing` | 구현 |
@@ -3129,3 +3134,10 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-539 | head가 없는 chain은 bulk route가 파생하지 않고 `no_head`로 남는다 | `tests/storage/test_maintain_promotion.py::test_a_chain_without_a_head_derives_nothing` | 구현 |
 | DV-540 | 값 검사(가격 0, low>high, high<max(open, close), 음수 거래량, 문자열 숫자, null, 깨진 JSON, 잘못된 날짜)를 어긴 행이 하나라도 있는 bulk 테이블은 `value_check`로 남고 승격되지 않으며, 같은 회차의 정상 테이블은 승격된다 | `tests/storage/test_maintain_promotion.py::test_one_invalid_value_keeps_its_whole_bulk_table_out` | 구현 |
 | DV-541 | 경고 KR bulk만 수집된 유지보수 실행은 이력만 있는 chain을 이어 붙이고 승격 뒤 저장소가 검증을 통과한다 | `tests/application/test_maintain.py::test_warned_kr_bulk_days_continue_a_history_only_chain_and_the_store_verifies` | 구현 |
+| DV-542 | 경고 내려받기(가격·분할·배당·FX)의 행 중 값 검사를 어긴 행만 그 사유로, 나머지는 `provider_reported_partial`로 보류된다 | `tests/storage/test_qveris_import.py::test_warned_rows_failing_their_value_checks_are_held_with_their_own_reason` | 구현 |
+| DV-543 | 보류 행이 있는 경고 묻기는 `partial_retry`로 다시 묻고, 모든 행이 통과한 경고 묻기는 `partial`로 덮이며, 보고는 경고 page를 `reason_code`·`provider_status_code`별로 센다 | `tests/application/test_maintain_qveris.py::test_a_warned_ask_with_held_rows_is_asked_again_and_its_reasons_are_counted` | 구현 |
+| DV-544 | page의 `raw_result_count`와 `valid_result_count`가 다른 경고 묻기는 다시 묻고, 연속한 재질문은 `failed_retry`와 같은 간격으로 늦춘다 | `tests/application/test_maintain_qveris.py::test_differing_result_counts_ask_again_and_back_off_like_failures` | 구현 |
+| DV-545 | 값 검사 실패 행이 있는 KR 경고 날은 부분 성공으로 세고, 유효 테이블은 승격되며, 재질문은 상한 안에서만 묻고, 다시 받은 깨끗한 답이 승격된다 | `tests/application/test_maintain.py::test_a_warned_day_with_a_bad_row_is_partial_held_by_reason_and_asked_again_within_caps` | 구현 |
+| DV-546 | execute가 5xx이고 `execution_id`가 없으며 남은 정산 조회가 모두 사용 이벤트를 찾지 못한 미정산 page는 격리 없이 `quarantine_candidates`로 보고된다 | `tests/application/test_maintain_qveris.py::test_a_5xx_page_without_usage_is_reported_as_a_quarantine_candidate` | 구현 |
+| DV-547 | `continue_past_transient`(기본 꺼짐)가 켜지면 일시 오류 page를 넘어 다음 job을 묻고 그 page의 견적을 예약으로 남긴다. 꺼져 있으면 지금처럼 멈춘다 | `tests/data/test_qveris_transient.py::test_the_page_stops_later_jobs_unless_tolerated_and_stays_reserved` | 구현 |
+| DV-548 | `daily-jobs`는 정산된 빈 응답(`empty_result`)을 `held`가 아닌 `empty`로 보고하고 더 늦은 관측일에 다시 계획한다 | `tests/application/test_qveris_cli.py::test_a_settled_empty_answer_is_asked_again_on_a_later_day_and_not_held` | 구현 |
