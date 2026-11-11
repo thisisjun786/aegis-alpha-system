@@ -1577,8 +1577,21 @@ commit된 것으로 계속한다. 공급자 하나의 거부나 실패가 다른
 필드는 어느 단계보다 먼저 설정 전체를 거부하므로 오타가 상한을 조용히 끄지 않는다. 자격 증명 파일은 그 공급자를
 부를 때만 읽는다.
 
+`jobs.start`는 유지보수가 시작 선언(`Route.start`)으로 첫 generation을 만들어도 되는 dataset 이름 목록이다(기본 `[]`,
+곧 아무것도 시작하지 않음). `run`과 `plan`은 이 목록을 `promote_datasets(start=...)`에 넘긴다. 카탈로그에도 route에도
+없는 이름(`.r<N>` 포함)은 `unknown datasets`, route가 시작을 선언하지 않은 이름(`prices.us.eodhd` 등)은
+`no declared start`, 같은 이름의 반복과 문자열 목록이 아닌 값도 설정 전체를 거부한다. 지금 넣을 수 있는 이름은
+`actions.us.eodhd`, `actions.kr.eodhd`, `fx.usdkrw.eodhd`, `status.kr.kind`, `status.us.eodhd`다. 목록에 있어도
+chain에 그 route 매퍼의 generation이 이미 있으면 시작하지 않고 그 명세로 잇는다. 그래서 같은 설정으로 두 번째
+실행은 아무것도 시작하지 않는다. 선행 조건이 없어 막힌 시작(`no_calendar`, `identity_unavailable`,
+`no_reference`)은 아무것도 쓰지 않고 보고만 하며 실패가 아니다(종료 코드에 영향 없음). `promote` 단계 보고의
+`start`는 `configured`(설정한 목록)와 `routes`(이름 붙인 dataset의 route마다 `dataset_id`, `mapper`, `outcome`)다.
+`outcome`은 `started`(선언 template으로 새 원천을 승격·계획), `no_source`(시작할 수 있지만 기다리는 원천 없음),
+막힌 사유 셋 중 하나, `has_generation`(chain에 generation이 있어 이어 붙이기만 함)이다.
+
 | 절 | 필수 | 상한과 선택 |
 | --- | --- | --- |
+| `jobs` | 없음 | `enabled`(false), `start`(`[]`, 시작할 dataset 이름) |
 | `kind` | 없음 | 없음(quota 없음) |
 | `dart` | `key_file` | `max_calls`(2,000), `daily_quota`(19,000) |
 | `sec` | `user_agent_file` | `max_calls`(2,000), `issuers`(`registered`·`reporting`·`all`), `since` |
@@ -1754,7 +1767,8 @@ route 매퍼의 generation이 chain에 없을 때 선언한 template으로 시�
 달력 dataset의 committed head이고(없으면 `no_calendar`), identity를 해석하는 template은 실행의 snapshot을
 pin한다(없으면 `identity_unavailable`). 보고의 `started`가 참이고 `template_spec_sha256`은 null이다. 시작한 뒤에는
 그 generation의 명세가 template이다. 이름 붙이지 않으면 `no_head`로 남고 기다리는 원천 수를 센다. `aas maintain`은
-아직 이름을 넘기지 않는다(켜기는 운영 결정). 유지보수 명세는 template에서 다음만 바꾼다.
+설치본 `runtime.json`의 `jobs.start`(아래 설정, 기본 빈 목록)에 적힌 dataset만 이름 붙여 넘긴다(켜기는 운영
+결정이라 코드에 박지 않는다). 유지보수 명세는 template에서 다음만 바꾼다.
 
 - `target.parent`: dataset head.
 - `sources`: 새 원천 테이블 하나.
@@ -3292,3 +3306,6 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-566 | 유지보수 Qveris 계획은 US 종목 목록을 상장(`delisted=0`)과 상장폐지(`delisted=1`) 둘 다 관측일마다 묻는다 | `tests/application/test_maintain_qveris.py::test_the_us_symbol_lists_are_asked_listed_and_delisted_every_day` | 구현 |
 | DV-567 | `status.us.eodhd`는 첫 상장폐지 목록의 상품을 모두 `last_bar` 추정(`delisting_inferred`)으로 두고 2026-07-29~첫 관측일 구간만 `survivorship_unverified`를 달며, 다음 목록에서 전날 상장 목록에 있던 ISIN은 `observed`와 `last_bar` 사건을 함께 얻는다 | `tests/storage/test_us_delisted.py::test_delisted_lists_give_inferred_then_observed_events_by_isin` | 구현 |
 | DV-568 | 같은 티커의 다른 ISIN은 다른 상품의 사건이고, ISIN이 없거나 등록되지 않은 행은 미해결로 남아 `standing_unresolved`의 `status.us.eodhd` 항목에 사유·종류별로 세어진다 | `tests/storage/test_us_delisted.py::test_delisted_lists_give_inferred_then_observed_events_by_isin` | 구현 |
+| DV-590 | 유지보수 실행은 `jobs.start`에 적힌 dataset만 선언한 template으로 시작하고 적히지 않은 것은 `no_head`로 남으며, 선행 조건이 없어 막힌 시작은 종료 코드 0으로 보고만 하고, 같은 설정의 두 번째 실행은 아무것도 시작하지 않는다 | `tests/application/test_maintain_start.py::test_a_run_starts_only_the_configured_datasets_and_a_second_run_starts_nothing` | 구현 |
+| DV-591 | 유지보수 계획은 `jobs.start`로 시작될 route(`started`)와 막힌 사유를 보고하고 설치본의 바이트를 바꾸지 않는다 | `tests/application/test_maintain_start.py::test_a_plan_reports_what_the_configured_start_would_do_and_writes_nothing` | 구현 |
+| DV-592 | `jobs.start`의 알 수 없는 이름, 시작 선언이 없는 dataset, 반복과 잘못된 타입은 설정 전체를 거부한다 | `tests/application/test_maintain_start.py::test_an_unknown_or_unstartable_start_refuses_the_whole_configuration` | 구현 |
