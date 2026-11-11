@@ -1594,6 +1594,47 @@ identity 단계는 그 목록의 행을 등록된 FMP ISIN으로 Norgate 상품�
 
 위 값은 형식 예시일 뿐 측정값이 아니다.
 
+**보고의 `heads` 단계.** `datasets`는 dataset마다 head와 watermark에 더해 데이터 신선도를 싣는다. watermark의
+`through_us`는 가장 늦은 수집(ingestion) 시각이지 데이터가 어디까지 왔는지가 아니므로, 정체된 dataset도 최신처럼
+보인다. 신선도 필드가 그 차이를 드러낸다. 카탈로그 dataset 중 committed 버전이 없는 것도 `version`·`sequence`가
+`null`, `rows` 0, `freshness` `no_head`로 나열된다(카탈로그 밖 dataset은 head가 있을 때만 나온다). 값은 그
+head chain의 market 행과 패키지 선언 달력만 읽어 구하며 새 상태를 쓰거나 공급자를 부르지 않는다. 신선도는 종료
+코드에 영향이 없다(종료 코드 반영은 운영과 따로 정한다). `heads.previous_report`는 직전 실행 보고를 읽은 결과
+(`read`, `missing`, `unreadable`, `other_installation`, `no_heads`)다. `plan`의 `heads`도 같은 필드를 내지만 직전
+보고를 읽지 않으므로 `zero_promotion_runs`는 `null`이다.
+
+| 필드 | 뜻 |
+| --- | --- |
+| `data_through` | head chain에서 TOMBSTONE이 아닌 행의 가장 늦은 날짜(아래 도메인별 열). 날짜 있는 행이 없으면 `null` |
+| `expected_through` | 이 실행 시각에 데이터가 닿아야 할 날짜. 기대가 없거나 동결이면 `null` |
+| `lag_sessions` | `data_through` 뒤로 `expected_through`까지 빠진 수. 단위는 `lag_unit` |
+| `lag_unit` | `sessions`(해당 거래소 세션 수) 또는 `periods`(시리즈 주기 수) |
+| `stale_after` | 이 lag를 넘으면 `stale`인 임계값 |
+| `freshness` | `current`, `stale`, `frozen`(구독이 끝난 Norgate·FMP), `untracked`(기대 날짜 없음), `no_data`(날짜 있는 행 없음), `no_head` |
+| `stale_reasons` | `lag`(lag가 임계값 초과), `zero_promotion`(아래 연속 실행 수가 기준 이상) |
+| `stale_series` | 시리즈 기대(`periods`)에서 임계값을 넘은 시리즈 ID |
+| `zero_promotion_runs` | 수집 단계가 성공했는데 head가 그대로이고 데이터가 뒤처진(또는 기대 날짜가 없는) 연속 실행 수. 직전 보고의 `sequence`와 이 값을 이어 센다 |
+
+도메인별 `data_through` 열은 `prices`·`calendar_sessions` `session_date`, `corporate_actions` `ex_date`,
+`instrument_status` `effective_from_us`의 UTC 날짜, `fundamentals` `available_at_us`의 UTC 날짜,
+`macro_observations` `observation_period`, `fx_rates` `fixing_at_us`의 UTC 날짜, `filings` `filed_date`,
+`classifications` `effective_from`이다. 기대는 dataset마다 하나다. US·KR 일봉·기업행동과 SEC는 그 거래소(XNYS,
+XKRX)에서 실행 시각까지 마감한 마지막 세션, OpenDART는 서울 날짜의 전일(lag는 XKRX 세션 수), ALFRED·FRED·BOK·OECD는
+시리즈마다 최근 관측 기간에서 추정한 주기(평일·주·월·분기·반기·년)로 한 주기가 더 지난 기간까지(dataset의 lag는
+가장 뒤처진 시리즈)이고, 선언 달력·KIND 상장상태·분류는 기대가 없다. 임계값, 연속 실행 기준(5회)과 동결 공급자는
+`storage/maintain_promotion.py`의 `FRESHNESS`, `STALE_AFTER_ZERO_PROMOTION_RUNS`, `FROZEN_PROVIDERS` 한 곳에 있다.
+이 필드는 추가된 것이라 보고 스키마 이름은 `aas-maintain-report-v1` 그대로다.
+
+```json
+{"dataset_id": "prices.kr.eodhd", "version": "12", "sequence": 12, "rows": 1000,
+ "watermarks": {"qveris/all": {"through_us": 1785139200000000, "version": "12"}},
+ "data_through": "2026-07-01", "expected_through": "2026-07-27", "lag_sessions": 17,
+ "lag_unit": "sessions", "stale_after": 2, "freshness": "stale", "stale_reasons": ["lag"],
+ "stale_series": [], "zero_promotion_runs": 3}
+```
+
+위 값도 형식 예시일 뿐 측정값이 아니다.
+
 유지보수는 chain을 이어 붙일 뿐 시작하지 않는다. 각 dataset의 첫 generation은 [운영 전환](#운영-전환)에서 운영자가
 `aas data promote`(또는 `data kr-prices`, `calendar refresh`)로 만들고, 그 뒤 실행이 새로 수집된 원천을 그
 명세의 규칙으로 이어 붙인다. head가 없는 dataset은 `no_head`로 보고된다.
