@@ -330,6 +330,26 @@ def test_a_listing_left_out_of_an_isin_instrument_gives_no_export_claim(ws: Work
     assert _holders(ws, "eodhd_symbol", "AAA.US") == {_isin_instrument(X)}
 
 
+def test_an_export_rename_of_a_merged_listing_keeps_its_claim_of_the_new_ticker(
+    ws: Workspace,
+) -> None:
+    # A (AAA through Thursday) joins X's instrument, which lists claim AAA from Wednesday.
+    # The export shows A renamed BBB through Friday; no list claim holds BBB.
+    _import_list(ws, WED, [_row("AAA", X)])
+    _advance(ws)
+    _import_list(ws, THU, [_row("AAA", X)])
+    _advance(ws)
+    exports = _export(ws, A, "BBB", [WED, THU, FRI])
+    built = build_from_workspace(ws, master=_master(ws), exports=exports)
+    assert built.report()["merged_into_isin"] == 1
+    ix = _isin_instrument(X)
+    friday = _day("BBB.US", ix, FRI)
+    assert friday in _symbol_claims(built.document)
+    assert built.windows == {"BBB.US": (ix, int(friday[2]), int(friday[3]))}
+    _register(ws, built)
+    assert _holders(ws, "eodhd_symbol", "BBB.US") == {ix}
+
+
 def test_the_standing_summary_moves_a_new_listing_from_claimable_to_resolved(
     ws: Workspace,
 ) -> None:

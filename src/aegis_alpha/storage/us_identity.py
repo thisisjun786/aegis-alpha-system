@@ -1461,17 +1461,20 @@ def _merged(
     bounds: _Bounds,
     claims: Sequence[IsinClaim],
     unresolved: dict[str, list[str]],
-) -> tuple[dict[str, tuple[str, int]], set[str]]:
+) -> tuple[dict[str, tuple[str, dict[str, int]]], set[str]]:
     """Listings the list claims of one ``us_isin`` instrument show under their ticker.
 
-    Returns asset ID -> (ISIN, start of that instrument's first list claim of the ticker),
+    Returns asset ID -> (ISIN, start of that instrument's first list claim of each symbol),
     and the asset IDs left out: a span holding two such instruments, or an instrument two
     listings would join.
     """
     by_symbol: dict[str, list[IsinClaim]] = defaultdict(list)
+    firsts: dict[str, dict[str, int]] = defaultdict(dict)
     for claim in claims:
         by_symbol[claim.symbol].append(claim)
-    found: dict[str, tuple[str, int]] = {}
+        held = firsts[claim.isin]
+        held[claim.symbol] = min(claim.start, held.get(claim.symbol, claim.start))
+    found: dict[str, tuple[str, dict[str, int]]] = {}
     ambiguous: set[str] = set()
     for listing in accepted:
         span = _ticker_span(listing, bounds)
@@ -1483,7 +1486,7 @@ def _merged(
             ambiguous.add(listing.assetid)
         elif isins:
             isin = isins.pop()
-            found[listing.assetid] = (isin, min(c.start for c in held if c.isin == isin))
+            found[listing.assetid] = (isin, firsts[isin])
     joining: dict[str, set[str]] = defaultdict(set)
     for assetid, (isin, _) in found.items():
         joining[isin].add(assetid)
@@ -1497,7 +1500,7 @@ def _merged(
 def _differing(
     accepted: Sequence[Listing],
     bounds: _Bounds,
-    merged: Mapping[str, tuple[str, int]],
+    merged: Mapping[str, tuple[str, dict[str, int]]],
     claims: Sequence[IsinClaim],
     profiles: Mapping[str, list[Profile]],
 ) -> set[str]:
@@ -1525,10 +1528,11 @@ def _differing(
 
 
 def _onto_isins(
-    assertions: Iterable[Record], merged: Mapping[str, tuple[str, int]]
+    assertions: Iterable[Record], merged: Mapping[str, tuple[str, dict[str, int]]]
 ) -> list[Record]:
     """Assert a merged listing's claims on its ISIN instrument, its EODHD symbol claims
-    only before that instrument's first list claim."""
+    only before that instrument's first list claim of the same symbol; a symbol the
+    instrument has no list claim of keeps its claim whole."""
     found: list[Record] = []
     for row in assertions:
         anchor = cast("dict[str, str]", row["instrument"])
@@ -1536,9 +1540,10 @@ def _onto_isins(
         if anchor["anchor_namespace"] != "norgate_assetid" or target is None:
             found.append(row)
             continue
-        isin, first = target
+        isin, firsts = target
         moved = {**row, "instrument": _anchor(ISIN_ANCHOR, isin)}
-        if (row["provider"], row["namespace"]) == ("eodhd", "eodhd_symbol"):
+        first = firsts.get(str(row["token"]))
+        if (row["provider"], row["namespace"]) == ("eodhd", "eodhd_symbol") and first is not None:
             if cast("int", row["valid_from_us"]) >= first:
                 continue
             end = cast("int | None", row["valid_to_us"])
@@ -1667,10 +1672,10 @@ def build_us_registry(  # noqa: PLR0913 -- one keyword per source kind
         row["issuer"] = None if link is None else _anchor("sec_cik", link[0])
     instruments = [row for row in instruments if str(row["anchor_token"]) not in merged]
     instruments.sort(key=lambda row: int(str(row["anchor_token"])))
+    moved = {mint_instrument("norgate_assetid", key): mint_instrument(ISIN_ANCHOR, isin)
+             for key, (isin, _) in merged.items()}  # fmt: skip
     if merged:
         assertions = _onto_isins(assertions, merged)
-        moved = {mint_instrument("norgate_assetid", key): mint_instrument(ISIN_ANCHOR, isin)
-                 for key, (isin, _) in merged.items()}  # fmt: skip
         symbols = {key: moved.get(value, value) for key, value in symbols.items()}
     document: dict[str, object] = {
         "schema": REGISTRY_SCHEMA,
@@ -1697,7 +1702,10 @@ def build_us_registry(  # noqa: PLR0913 -- one keyword per source kind
         ),
         intervals=intervals,
         through=bounds.through,
-        windows=exported.windows,
+        windows={
+            key: (moved.get(value[0], value[0]), *value[1:])
+            for key, value in exported.windows.items()
+        },
         export_through=exported.through,
         listed=_listed_intervals(listed),
         merged={key: isin for key, (isin, _) in merged.items()},
