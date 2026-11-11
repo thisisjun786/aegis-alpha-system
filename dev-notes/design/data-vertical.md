@@ -1689,6 +1689,8 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
   - **Norgate 상품에 잇기.** ISIN이 하나도 등록되지 않은 Norgate 상품 `N`의 등록 claim이 그 심볼의 그날을 덮으면
     같은 날 두 공급자의 같은 심볼은 한 증권이므로(master의 EODHD 심볼과 같은 근거) `X`는 `N`의
     `eodhd`/`isin` assertion(행 수집 시각부터 유효·알려짐)이 되고 새 상품은 생기지 않는다(보고 `attached_isins`).
+    단, 행의 종류(발급한다면 받을 `etf`/`unclassified`)가 `N`의 등록 자산 종류와 다르면 잇지 않고
+    `list_isin_type_differs`로 남는다.
   - **새 상장.** 그날을 덮는 등록 claim이 없고, 행이 모두 상장 종류(`common_stock`, `etf`, `fund`)이며, 그 심볼의
     앞 보유자(`before`)가 없거나 다른 ISIN에서 발급한 `us_isin` 상품이면 instrument `mint('us_isin', X)`(venue
     `XNYS`, 모두 `etf`면 `etf` 아니면 `unclassified`, issuer 없음)와 anchor assertion `eodhd`/`isin`(항상 유효,
@@ -2064,7 +2066,11 @@ instrument는 [유지보수 실행](#유지보수-실행)의 목록 증분이 �
 상품이다. Norgate instrument를 발급하지 않고 그 행의 모든 assertion(`norgate_assetid` 포함)을 ISIN 상품에
 주장하며, 그 행의 `eodhd_symbol` claim은 ISIN 상품의 그 티커 첫 목록 claim이 시작하는 곳에서 끝난다(겹침 없음,
 보고 `merged_into_isin`). 구간에 그런 상품이 둘이거나 두 행이 한 ISIN 상품에 합쳐지려 하면 그 행들은 문서에서
-빠진다(`isin_instrument_ambiguous`). 그래서 Norgate를 다시 구독해 asset ID가 들어와도 같은 증권은 상품 하나다.
+빠진다(`isin_instrument_ambiguous`). ISIN 상품은 공급자 목록만으로 생긴 것이므로, 독립 식별자가 다르면
+합치지 않고 그 행도 문서에서 빠진다(`isin_identifier_differs`): Norgate 자산 종류가 ISIN 상품의 등록 자산 종류와
+다르거나, 그 행의 티커 구간 안에서 수집된 그 티커의 FMP 프로필이 다른 ISIN을 말할 때다. 그래서 검사합만 맞는
+위조 ISIN이 Norgate asset ID와 FMP `isin` assertion을 끌어오지 못한다. 그래서 Norgate를 다시 구독해 asset ID가
+들어와도 같은 증권은 상품 하나다.
 Norgate 가격 매퍼는 snapshot의 `norgate`/`norgate_assetid` 주장으로 해석하므로 합친 asset ID의 가격도 ISIN
 상품에 붙는다. 순서가 반대면(Norgate 먼저) 목록의 ISIN이 Norgate 상품에 이어진다([유지보수 실행](#유지보수-실행)).
 어느 순서든 상품은 하나지만 그 ID는 먼저 등록된 anchor의 것이다.
@@ -3381,3 +3387,5 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-582 | `jobs.start`의 알 수 없는 이름, 시작 선언이 없는 dataset, 반복과 잘못된 타입은 설정 전체를 거부한다 | `tests/application/test_maintain_start.py::test_an_unknown_or_unstartable_start_refuses_the_whole_configuration` | 구현 |
 | DV-583 | 같은 build에서 뒤에 발급된 ISIN 상품이 앞서 받아들인 bridge의 날을 가리키면 그 bridge는 문서에 남지 않고 `list_contradicted`로 세어진다 | `tests/storage/test_us_isin_anchor.py::test_an_isin_registered_later_in_the_build_withdraws_a_bridge_it_contradicts` | 구현 |
 | DV-584 | 같은 build에서 뒤에 Norgate 상품에 이어진 ISIN이 앞서 받아들인 bridge의 날을 가리켜도 그 bridge는 남지 않는다 | `tests/storage/test_us_isin_anchor.py::test_an_isin_joined_to_a_norgate_instrument_later_withdraws_a_bridge_it_contradicts` | 구현 |
+| DV-585 | 목록이 먼저 등록한 ISIN 상품에 뒤의 Norgate 행을 합치기 전에 FMP ISIN이나 자산 종류가 다르면 합치지 않고 그 행을 `isin_identifier_differs`로 빼며 아무것도 등록하지 않는다 | `tests/storage/test_us_isin_anchor.py::test_a_listing_whose_independent_identifiers_differ_is_not_merged_into_an_isin_instrument` | 구현 |
+| DV-586 | 목록 ISIN은 자산 종류가 다른 Norgate 상품에 이어지지 않고 `list_isin_type_differs`로 남는다 | `tests/storage/test_us_isin_anchor.py::test_a_list_isin_does_not_join_a_norgate_instrument_of_another_asset_type` | 구현 |

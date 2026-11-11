@@ -36,7 +36,14 @@ from aegis_alpha.storage.us_symbols import Held, Registry, build_symbol_claims
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
 from tests.storage.kr_identity_support import eodhd_job, isin, symbol
 from tests.storage.promotion_support import add_source, at, bar, spec, us
-from tests.storage.us_identity_support import MASTER_SCHEMA, commit, master, table
+from tests.storage.us_identity_support import (
+    FMP_SCHEMA,
+    MASTER_SCHEMA,
+    commit,
+    master,
+    profile,
+    table,
+)
 
 TUE, WED, THU, FRI = date(2026, 9, 8), date(2026, 9, 9), date(2026, 9, 10), date(2026, 9, 11)
 X, Y, Z = isin("000000071", "US"), isin("000000072", "US"), isin("000000073", "US")
@@ -221,6 +228,20 @@ def test_norgate_first_then_the_isin_joins_the_norgate_instrument(ws: Workspace)
     assert _one_instrument(ws) == IA
 
 
+def test_a_list_isin_does_not_join_a_norgate_instrument_of_another_asset_type(
+    ws: Workspace,
+) -> None:
+    # Norgate says A is an ETF; Wednesday's AAA row carrying X is common stock.
+    rows = [master(int(A), "AAA", first_date="2001-02-05", last_date=THU.isoformat(), etf=True)]
+    _register(ws, build_from_workspace(ws, master=commit(
+        ws, "norgate-master", "observations", table(rows, MASTER_SCHEMA))))  # fmt: skip
+    _import_list(ws, WED, [_row("AAA", X)])
+    wednesday = _advance(ws)
+    assert (wednesday["attached_isins"], wednesday["registered_instruments"]) == (0, 0)
+    assert wednesday["unresolved_days"] == {"list_isin_type_differs": 1}
+    assert _holders(ws, "isin", X) == set()
+
+
 def test_isin_first_then_a_norgate_asset_id_joins_the_isin_instrument(ws: Workspace) -> None:
     _import_list(ws, WED, [_row("AAA", X)])
     assert _advance(ws)["registered_instruments"] == 1
@@ -243,6 +264,36 @@ def test_isin_first_then_a_norgate_asset_id_joins_the_isin_instrument(ws: Worksp
     # The build is cumulative: rebuilding registers nothing new.
     assert _register(ws, build_from_workspace(ws, master=master_id))["new"] == {
         "issuers": 0, "instruments": 0, "assertions": 0}  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("fmp_isin", "etf"),
+    [(Y, None), (None, True)],
+    ids=["fmp_isin_differs", "asset_type_differs"],
+)
+def test_a_listing_whose_independent_identifiers_differ_is_not_merged_into_an_isin_instrument(
+    ws: Workspace, fmp_isin: str | None, *, etf: bool | None
+) -> None:
+    # The provider's list registers X's instrument over AAA first. A later Norgate master
+    # lists A as AAA over those days, but FMP says AAA is Y, or Norgate says A is an ETF
+    # where the list's rows were common stock: A is left out, not asserted on X's instrument.
+    _import_list(ws, WED, [_row("AAA", X)])
+    _advance(ws)
+    _import_list(ws, THU, [_row("AAA", X)])
+    _advance(ws)
+    rows = [master(int(A), "AAA", first_date="2001-02-05", last_date=THU.isoformat(), etf=etf)]
+    master_id = commit(ws, "norgate-master", "observations", table(rows, MASTER_SCHEMA))
+    profiles = [profile("AAA", None, isin=fmp_isin, etf=bool(etf))]
+    fmp_id = commit(ws, "fmp-profiles", "observations", table(profiles, FMP_SCHEMA))
+    built = build_from_workspace(ws, master=master_id, fmp=[fmp_id])
+    report = built.report()
+    assert report["merged_into_isin"] == 0
+    unresolved = cast("dict[str, dict[str, list[str]]]", report["unresolved"])
+    assert unresolved["listings"] == {"isin_identifier_differs": [A]}
+    assert _register(ws, built)["new"] == {"issuers": 0, "instruments": 0, "assertions": 0}
+    assert _holders(ws, "norgate_assetid", A) == set()
+    assert _holders(ws, "isin", Y) == set()
+    assert _holders(ws, "eodhd_symbol", "AAA.US") == {_isin_instrument(X)}
 
 
 def test_the_standing_summary_moves_a_new_listing_from_claimable_to_resolved(

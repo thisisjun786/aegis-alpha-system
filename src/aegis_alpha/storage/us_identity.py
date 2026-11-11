@@ -47,6 +47,9 @@ it are asserted on the ISIN instrument, no Norgate instrument is minted, and its
 symbol claim stops where the ISIN instrument's first list claim of the ticker starts
 (``merged_into_isin``). A listing whose span holds two of them is left out
 (``isin_instrument_ambiguous``), and so are listings that would join one ISIN together.
+The ISIN instrument rests on the provider's list alone, so a listing whose Norgate asset
+type differs from it, or whose ticker's FMP profile names another ISIN within the span, is
+left out as well (``isin_identifier_differs``).
 
 Every claim cites its source as ``sl:<source_id>`` with the ``aas-source-row-v1`` hash of
 the row it came from. A Norgate or SEC claim is known from its source's ``sl:`` link
@@ -1416,14 +1419,17 @@ class IsinClaim:
     symbol: str
     start: int
     end: int
+    asset_type: str
+    """The asset type the ISIN instrument was registered with."""
 
 
 def isin_claims(state: sqlite3.Connection) -> list[IsinClaim]:
     """The registered, not superseded list claims of ``us_isin`` instruments (SELECT only)."""
     rows = state.execute(
-        "SELECT i.token, i.instrument_id, a.token, a.valid_from_us, a.valid_to_us "
+        "SELECT i.token, i.instrument_id, a.token, a.valid_from_us, a.valid_to_us, t.asset_type "
         "FROM identity_assertions a JOIN identity_assertions i ON i.instrument_id = "
         "a.instrument_id AND i.provider = 'eodhd' AND i.namespace = 'isin' "
+        "JOIN instruments t ON t.instrument_id = a.instrument_id "
         "WHERE a.provider = 'eodhd' AND a.namespace = 'eodhd_symbol' "
         "AND substr(a.token, -3) = '.US' AND a.valid_to_us IS NOT NULL "
         "AND substr(a.source_snapshot_id, 1, ?) = ? AND a.assertion_id NOT IN ("
@@ -1432,8 +1438,8 @@ def isin_claims(state: sqlite3.Connection) -> list[IsinClaim]:
         (len(LIST_SOURCE), LIST_SOURCE),
     )
     return [
-        IsinClaim(str(isin), str(token), int(start), int(end))
-        for isin, instrument, token, start, end in rows
+        IsinClaim(str(isin), str(token), int(start), int(end), str(asset_type))
+        for isin, instrument, token, start, end, asset_type in rows
         if mint_instrument(ISIN_ANCHOR, str(isin)) == instrument
     ]
 
@@ -1486,6 +1492,36 @@ def _merged(
             ambiguous |= assetids
     unresolved["isin_instrument_ambiguous"].extend(sorted(ambiguous, key=int))
     return {key: value for key, value in found.items() if key not in ambiguous}, ambiguous
+
+
+def _differing(
+    accepted: Sequence[Listing],
+    bounds: _Bounds,
+    merged: Mapping[str, tuple[str, int]],
+    claims: Sequence[IsinClaim],
+    profiles: Mapping[str, list[Profile]],
+) -> set[str]:
+    """The merged asset IDs an independent identifier separates from their ISIN instrument.
+
+    The ISIN instrument rests on the provider's list alone; a listing joins it only when
+    Norgate's asset type equals the type it was registered with and no FMP profile of the
+    ticker retrieved inside the listing's ticker span names another ISIN.
+    """
+    types: dict[str, set[str]] = defaultdict(set)
+    for claim in claims:
+        types[claim.isin].add(claim.asset_type)
+    differing: set[str] = set()
+    for listing in accepted:
+        target = merged.get(listing.assetid)
+        span = _ticker_span(listing, bounds)
+        if target is None or span is None:
+            continue
+        ticker, start, end = span
+        stated = {profile.isin for profile in profiles.get(ticker, [])
+                  if profile.isin and start <= profile.evidence.known_from_us < end}  # fmt: skip
+        if stated - {target[0]} or types[target[0]] != {listing.asset_type}:
+            differing.add(listing.assetid)
+    return differing
 
 
 def _onto_isins(
@@ -1543,6 +1579,11 @@ def build_us_registry(  # noqa: PLR0913 -- one keyword per source kind
     accepted, repeated = _accepted(listings, unresolved["listings"])
     bounds = _bounds(accepted)
     merged, ambiguous = _merged(accepted, bounds, isin_listed, unresolved["listings"])
+    profiles, refused, mappers[FMP_MAPPER] = map_fmp_profiles(fmp)
+    differing = _differing(accepted, bounds, merged, isin_listed, profiles)
+    unresolved["listings"]["isin_identifier_differs"].extend(sorted(differing, key=int))
+    merged = {key: value for key, value in merged.items() if key not in differing}
+    ambiguous |= differing
     accepted = [listing for listing in accepted if listing.assetid not in ambiguous]
     tickers = _bounded(
         _tickers(
@@ -1587,7 +1628,6 @@ def build_us_registry(  # noqa: PLR0913 -- one keyword per source kind
         )  # fmt: skip
     for held in claims.values():
         held.sort(key=lambda claim: claim.start)
-    profiles, refused, mappers[FMP_MAPPER] = map_fmp_profiles(fmp)
     agreed = _profiles(profiles, refused, claims, unresolved["fmp"])
     filers, mappers[SEC_MAPPER] = _sec_filers(sec)
     issuers, links = _issuers(filers, agreed, claims, unresolved["issuers"]) if sec else ([], {})

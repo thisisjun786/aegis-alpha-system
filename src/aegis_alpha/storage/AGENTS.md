@@ -264,7 +264,8 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   whose symbol no claim held before (or an instrument minted from another ISIN did) mints
   `mint_instrument('us_isin', isin)` with an `eodhd`/`isin` anchor assertion and a one-day
   claim; on a day a registered claim of a Norgate instrument without an ISIN covers, the
-  ISIN joins that instrument instead; after a Norgate holder it stays unresolved. An
+  ISIN joins that instrument instead (not when the rows' type differs from its registered
+  asset type: `list_isin_type_differs`); after a Norgate holder it stays unresolved. An
   ISIN-minted instrument's day is claimed directly by its ISIN; a day is otherwise claimed when the symbol's previous holder (a
   registered claim or one this build accepted, never a rejected observation) is the same
   instrument and no observation (earlier lists read again as veto-only) shows the symbol
@@ -371,7 +372,9 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   `norgate.export_listing@1`). Every instrument it mints is a Norgate asset ID (venue `XNYS`, or
   `XXXX` for an index or other reference series an export adds); a listing whose ticker span holds
   the registered list claims of one `us_isin` instrument is asserted on that instrument instead,
-  its EODHD symbol claim ending at that instrument's first list claim (`merged_into_isin`); a listed row's ticker (class `.`
+  its EODHD symbol claim ending at that instrument's first list claim (`merged_into_isin`),
+  unless its Norgate asset type differs from that instrument's or an FMP profile retrieved in
+  its ticker span names another ISIN (left out as `isin_identifier_differs`); a listed row's ticker (class `.`
   spelled `-`) reaches EODHD and FMP symbols only when one listed row has it, and an issuer
   CIK links only when SEC lists the ticker under one CIK and FMP names the same CIK. Every
   disagreement stays unresolved with its reason. A ticker's claims hold only from the

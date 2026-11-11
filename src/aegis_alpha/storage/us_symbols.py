@@ -15,7 +15,8 @@ unresolved):
   instrument with a Norgate asset ID or minted from that ISIN, and the row's currency must
   be USD. A ticker, a name, an exchange or a price never names an instrument.
 - A valid, unregistered USD ISIN (``_register``) joins the one Norgate instrument without
-  an ISIN whose registered claim covers the row's symbol and day, or, for a new listing (no
+  an ISIN whose registered claim covers the row's symbol and day (unless the rows' type
+  differs from its registered asset type: ``list_isin_type_differs``), or, for a new listing (no
   registered claim covers the day, every row is of a listing class, no claim held the
   symbol before or the one before is an instrument minted from another ISIN), mints
   ``mint_instrument('us_isin', isin)`` with the day as its first claim. After a Norgate
@@ -203,6 +204,8 @@ class Registry:
     """Instrument ID -> its Norgate asset ID."""
     isin_anchors: Mapping[str, str] = field(default_factory=dict)
     """Instrument ID -> the ISIN it was minted from (``us_isin``)."""
+    asset_types: Mapping[str, str] = field(default_factory=dict)
+    """Norgate instrument ID -> the asset type it was registered with."""
 
 
 def read_registry(state: sqlite3.Connection) -> Registry:
@@ -226,8 +229,19 @@ def read_registry(state: sqlite3.Connection) -> Registry:
         )
         if mint_instrument("norgate_assetid", str(token)) == instrument
     }
+    asset_types = {
+        str(instrument): str(asset_type)
+        for instrument, asset_type in state.execute(
+            "SELECT instrument_id, asset_type FROM instruments"
+        )
+        if instrument in anchors
+    }
     return Registry(
-        held, {key: frozenset(value) for key, value in owners.items()}, anchors, isin_anchors
+        held,
+        {key: frozenset(value) for key, value in owners.items()},
+        anchors,
+        isin_anchors,
+        asset_types,
     )
 
 
@@ -594,6 +608,8 @@ class _Index:
     """ISIN -> the instrument this build minted from it or joined it to."""
     pending: dict[str, list[tuple[date, str]]] = field(default_factory=lambda: defaultdict(list))
     """Unregistered ISIN -> (day, symbol) of the observations carrying it as a candidate."""
+    asset_types: Mapping[str, str] = field(default_factory=dict)
+    """Norgate instrument -> its registered asset type."""
     foreseen: frozenset[tuple[str, str]] = frozenset()
     """(ISIN, instrument) an earlier pass of the build bound: their candidate observations
     are vetoes from the start (``build_symbol_claims``)."""
@@ -604,7 +620,7 @@ class _Index:
     @classmethod
     def of(cls, registry: Registry) -> _Index:
         """The registry's claims, anchors and ISINs, before any observation."""
-        index = cls(defaultdict(list), defaultdict(list))
+        index = cls(defaultdict(list), defaultdict(list), asset_types=registry.asset_types)
         for item in registry.held:
             index.held[item.token].append(item)
             index.holdings[item.instrument_id].append(item)
@@ -866,7 +882,8 @@ def _register(  # noqa: PLR0913 -- the build's state for one symbol-day
     - A registered claim of one Norgate instrument without an ISIN covers the day: the
       same symbol on the same day at two providers is one security (as the master's EODHD
       symbols are), so the ISIN joins that instrument (``eodhd``/``isin``) and the day is
-      already claimed.
+      already claimed, unless the rows' type (as a mint would register it) differs from
+      the instrument's registered asset type (``list_isin_type_differs``).
     - No registered claim covers the day, every row is of a listing class and no claim
       held the symbol before, or the one before is an instrument minted from another ISIN:
       a new listing. ``mint_instrument('us_isin', isin)`` is registered with the ISIN as
@@ -882,8 +899,12 @@ def _register(  # noqa: PLR0913 -- the build's state for one symbol-day
     if covering:
         (owner,) = covering if len(covering) == 1 else ("",)
         anchor = index.anchors.get(owner)
-        if anchor is None or anchor[0] != "norgate_assetid" or index.isins.get(owner):
-            return reason, _UNREGISTERED
+        joinable = (
+            anchor is not None and anchor[0] == "norgate_assetid" and not index.isins.get(owner)
+        )
+        kind = _asset_type(items)
+        if anchor is None or not joinable or index.asset_types.get(owner, kind) != kind:
+            return ("list_isin_type_differs" if joinable else reason), _UNREGISTERED
         claims.identifiers.append(_identifier(anchor, isin, evidence.known_from_us, evidence))
         claims.attached += 1
         index.bind(isin, owner)
@@ -901,12 +922,17 @@ def _register(  # noqa: PLR0913 -- the build's state for one symbol-day
     anchor = (ISIN_ANCHOR, isin)
     claims.instruments.append({
         "anchor_namespace": ISIN_ANCHOR, "anchor_token": isin, "issuer": None,
-        "asset_type": "etf" if kinds == {"etf"} else "unclassified", "venue": VENUE,
+        "asset_type": _asset_type(items), "venue": VENUE,
     })  # fmt: skip
     claims.identifiers.append(_identifier(anchor, isin, UNBOUNDED, evidence))
     index.anchors[instrument] = anchor
     index.bind(isin, instrument)
     return single, instrument
+
+
+def _asset_type(items: Sequence[Observation]) -> str:
+    """The asset type a symbol-day's rows give an instrument minted from their ISIN."""
+    return "etf" if {item.kind for item in items} == {"etf"} else "unclassified"
 
 
 def _single(symbol: str, day: date, outcome: str, index: _Index) -> str | tuple[date, None]:
