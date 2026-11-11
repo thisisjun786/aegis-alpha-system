@@ -90,8 +90,9 @@ class EodhdDelisted:
             raise ValueError(f"{_LABEL} {BARS} must pin a US prices dataset")
 
     def references(self, args: Mapping[str, object]) -> Mapping[str, Reference]:
-        return {BARS: Reference("prices", reference_pin(args[BARS], f"{_LABEL} {BARS}"),
-                                       revisions=True)}
+        return {
+            BARS: Reference("prices", reference_pin(args[BARS], f"{_LABEL} {BARS}"), revisions=True)
+        }
 
     def source_columns(self) -> Mapping[str, frozenset[str]]:
         return dict.fromkeys(

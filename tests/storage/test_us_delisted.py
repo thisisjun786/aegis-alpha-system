@@ -219,7 +219,7 @@ def _last_bar_as_of(revisions: list[tuple[str, int, str, int | None, int | None]
     Each revision is (session day, generation sequence, op, available_at_us, revision_known_at_us).
     """
     connection = duckdb.connect()
-    connection.execute(  # noqa: S608 -- fixed synthetic constants
+    connection.execute(
         "CREATE TABLE src AS SELECT 0::INTEGER AS _aas_pin, 0::BIGINT AS _aas_ordinal, 'h' AS "
         "_aas_row_hash, 'US' AS exchange_code, '1' AS delisted, 'AAA' AS code, "
         f"'{ISIN_A}' AS isin, 'Common Stock' AS type, '2026-09-11T22:00:00Z' AS retrieved_at_utc"
@@ -228,8 +228,8 @@ def _last_bar_as_of(revisions: list[tuple[str, int, str, int | None, int | None]
         f"CREATE TABLE {IDENTITY_ROWS} (token VARCHAR, instrument_id VARCHAR, "
         "valid_from_us BIGINT, valid_to_us BIGINT)"
     )
-    connection.execute(  # noqa: S608 -- fixed synthetic constants
-        f"INSERT INTO {IDENTITY_ROWS} VALUES ('{ISIN_A}', 'ins-a', 0, NULL)"
+    connection.execute(
+        f"INSERT INTO {IDENTITY_ROWS} VALUES ('{ISIN_A}', 'ins-a', 0, NULL)"  # noqa: S608 -- fixed synthetic constants, engine-named relations
     )
     connection.execute(
         f"CREATE TABLE {reference_table(BARS)} (instrument_id VARCHAR, session_date DATE, "
@@ -237,8 +237,8 @@ def _last_bar_as_of(revisions: list[tuple[str, int, str, int | None, int | None]
         "op VARCHAR, record_id VARCHAR, revision_id VARCHAR)"
     )
     for day, sequence, op, available, known in revisions:
-        connection.execute(  # noqa: S608 -- engine-named relation, bound values
-            f"INSERT INTO {reference_table(BARS)} VALUES ('ins-a', ?, ?, ?, ?, ?, ?, ?)",
+        connection.execute(
+            f"INSERT INTO {reference_table(BARS)} VALUES ('ins-a', ?, ?, ?, ?, ?, ?, ?)",  # noqa: S608 -- fixed synthetic constants, engine-named relations
             [day, available, known, sequence, op, f"r-{day}", f"v-{day}-{sequence}"],
         )
     found = mapper("eodhd.delisted@1")
@@ -246,7 +246,7 @@ def _last_bar_as_of(revisions: list[tuple[str, int, str, int | None, int | None]
     return [
         row[0]
         for row in connection.execute(
-            f"SELECT effective_from_us FROM ({sql}) WHERE status_event_id = '{LAST_BAR}' "
+            f"SELECT effective_from_us FROM ({sql}) WHERE status_event_id = '{LAST_BAR}' "  # noqa: S608 -- fixed synthetic constants, engine-named relations
             "AND _aas_item = 1"
         ).fetchall()
     ]
