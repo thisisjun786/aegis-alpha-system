@@ -439,6 +439,24 @@ source_row_hash = sha256(정규 JSON ["aas-source-row-v1", [[열 이름, 값], .
 원천의 `sl:` 연결 시각이다. JSON 숫자는 binary64로 읽고, 2^53을 넘는 정수나 숫자가 아닌 JSON 값은
 `invalid`다. 나머지(해석, `bar_end_us`, 값 상태, 시간 입력)는 `eodhd.bars@1`과 같다.
 
+`eodhd.bulk_quarantine@2`는 `@1`과 같은 원천 모양·인자·token·통화·수집 시각·행 flag로 같은 `prices`를
+내되, 옮기는 행이 다르다(`@1`은 그대로다). 보류 사유가 아래 표에서 "승격"이고 값이 깨끗한 응답 경로의 bar
+검사(`qveris_native._bar_values`: open·high·low·close·adjusted_close·volume이 유한한 JSON 숫자이고 2^53을 넘는
+정수가 아님, 가격 > 0, 거래량 >= 0, low <= min(open, close), high >= max(open, close), low <= high, 실재하는
+`YYYY-MM-DD` 날짜)를 통과한 행만 세션 날짜와 매핑 행을 가지며 모두 `present`다. 나머지 행은 보류된 채
+남는다. 파티션 날짜도 매핑 행도 없고, 매퍼가 선언한 결과(`outcome`)로 모든 파티션에서 세어져 generation의
+`source_outcomes`에 `mapped:<사유>`, `value_check:<사유>`(승격 사유인데 값 검사 실패), `held:<사유>`(그 밖의
+사유)별 행 수로 남는다. 그래서 그런 행은 단계를 거부시키지도, 세어지지 않고 빠지지도 않는다. instrument는
+pin한 snapshot의 token 해석뿐이고, 해석되지 않는 행은 `unresolved`로 남아 값이 만들어지지 않는다.
+
+| 보류 사유 | `@2` | 이유 |
+| --- | --- | --- |
+| `provider_reported_partial` | 승격(값 검사 통과 시, flag `provider_reported_partial`) | 경고 응답의 행. 값은 import가 검사했지만 그 전 import의 행도 있어 다시 검사한다 |
+| `explicit instrument identity is required` | 승격(값 검사 통과 시, flag 없음) | 깨끗한 응답에서 import 때 identity 문서에 심볼이 없어 값 검사 전에 보류된 행. 승격 때 snapshot이 해석한다 |
+| `provider identity or currency differs` | 보류 | import 때 identity 문서가 거래소·통화·종류(ETF·보통주만)를 어긋난다고 판정했다. 승격이 그 판정을 뒤집지 않는다 |
+| `invalid_date`, `missing_or_non_numeric`, `non_finite`, `invalid_price_or_volume`, `inconsistent_ohlc` | 보류 | 값 검사를 어겨 그 사유로 보류된 행(DV-546) |
+| 그 밖의 사유, 사유 없음 | 보류 | 모르는 보류는 승격하지 않는다 |
+
 `eodhd.bars_quarantine@1`은 EODHD 일봉 이력 내려받기에서 수집기가 보류한 행(내려받기 하나의
 테이블, 수집 작업 `source_fingerprint`, `reason`, 심볼 없는 공급자 행 JSON `source_row_json`)을 같은
 canonical unadjusted `prices`로 옮긴다. 심볼과 작업 완료 시각은 그 원천 manifest의 `jobs` 목록
@@ -1164,7 +1182,7 @@ ASCII escape와 바이트까지 같다.
 | `prices.kr.eodhd.ref` | `prices` | reference | `eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1` | `session_close_plus_lag@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage`, `provider_reported_partial` | 아니오 | 같은 두 원천 모양의 공급자 adjusted close. basis `total_return`, `fields='close'` |
 | `prices.us.norgate` | `prices` | canonical | `norgate.prices_none@1` | `session_close_plus_lag@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | Norgate 비조정 일봉 내보내기(`norgate-history-csv-*`의 미국 주식 `bars`). 다섯 값 모두 CSV 원문, 연도 partition마다 generation 하나 |
 | `prices.us.norgate.ref` | `prices` | reference | `norgate.prices_adjusted@1` | `session_close_plus_lag@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 아니오 | Norgate 조정 가격 part. `CAPITAL`은 `split_adjusted`, `TOTALRETURN`은 `total_return`, float32 저장값 |
-| `prices.us.eodhd` | `prices` | canonical | `eodhd.bars@1`, `eodhd.bulk_quarantine@1` | `session_close_plus_lag@1` | `float_shortest@1` | `cross_provider_mismatch@1` | `cross_provider_mismatch`, `decimal_rounding_tie`, `provider_float_storage`, `provider_reported_partial` | 아니오 | EODHD US 일간 수집과 부분 응답(경고) 일간 내려받기. 다운로드 하나가 generation 하나이고 같은 날짜의 다른 다운로드는 SUPERSEDE. 품질 규칙의 기준은 `prices.us.norgate` generation pin. import 때 identity가 없어 보류된 US 행의 재처리는 매퍼가 없다(#100) |
+| `prices.us.eodhd` | `prices` | canonical | `eodhd.bars@1`, `eodhd.bulk_quarantine@1`, `eodhd.bulk_quarantine@2` | `session_close_plus_lag@1` | `float_shortest@1` | `cross_provider_mismatch@1` | `cross_provider_mismatch`, `decimal_rounding_tie`, `provider_float_storage`, `provider_reported_partial` | 아니오 | EODHD US 일간 수집과 부분 응답(경고) 일간 내려받기. 다운로드 하나가 generation 하나이고 같은 날짜의 다른 다운로드는 SUPERSEDE. 품질 규칙의 기준은 `prices.us.norgate` generation pin. import 때 identity가 없어 보류된 US 행은 `eodhd.bulk_quarantine@2`가 승격한다(#100). 앞선 `@1` generation은 그대로 |
 | `prices.us.fmp.ref` | `prices` | reference | `fmp.eod_non_split@1` | `session_close_plus_lag@1` | `float_shortest@1`, `exact@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 예 | FMP 동결 legacy non-split 응답. 정정은 revision 번호순 generation. 원천 자료실 FMP normalized lineage(eod_full, dividend_adjusted)의 매퍼는 Linear AAS-68 |
 | `prices.ref.norgate` | `prices` | reference | `norgate.reference_closes@1`, `norgate.reference_history@1` | `local_day_end@1` | `decimal_text@1` | 없음 | `time_precision_day`, `volume_precision_limited` | 예 | Norgate 기준 시리즈 표와 지수·기타 데이터베이스 내보내기, `fields='close'`, 통화 `XXX`. 공급자가 종가 시각을 밝히지 않으므로 날짜 끝은 `Etc/GMT+12`. 음수 수준이 있는 시리즈는 `signed`로 고르지 않는다(Linear AAS-67) |
 | `sessions.xnys` | `calendar_sessions` | canonical | `calendar.declared@1` | `declared_session_end@1` | 없음 | 없음 | 없음 | 아니오 | XNYS [선언 달력](#선언-달력) 문서. 관측 거래일은 대조 보고의 근거, 임시 휴장은 SUPERSEDE |
@@ -1718,7 +1736,7 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
 | `fx.usdkrw.fred` | `fred.fx_series@1` | `fred-series-csv-*` `observations` | |
 | `classifications.kr.kind` | `kind.industry@2`, 이어 받는 `kind.industry@1` | `kind-listings-*` `listings` | `short_code`·`industry`·`retrieved_at_utc` 열 |
 | `prices.us.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.US` |
-| `prices.us.eodhd` | `eodhd.bulk_quarantine@1` | `qveris-bulk-quarantine-*` `quarantine` | 사유 `provider_reported_partial`, 거래소 `US`, 모든 행이 값 검사 통과. 첫 template은 `eodhd.bars@1`에서 파생(`currencies` `US`→`USD`) |
+| `prices.us.eodhd` | `eodhd.bulk_quarantine@2` | `qveris-bulk-quarantine-*` `quarantine` | 받는 행: 사유가 `@2` 승격 사유이고 거래소 `US`. 남기는 행(`holds`): 다른 사유의 US 행과 거래소를 읽을 수 없는 행. 값 검사는 매퍼가 행마다 한다. `@1`을 이어 받지 않는다. 첫 template은 `eodhd.bars@1`에서 파생(`currencies` `US`→`USD`) |
 | `prices.kr.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.KO`·`.KQ` |
 | `prices.kr.eodhd` | `eodhd.bulk_quarantine@1` | `qveris-bulk-quarantine-*` `quarantine` | 사유 `provider_reported_partial`, 거래소 `KO`·`KQ`, 모든 행이 값 검사 통과. 첫 template은 `eodhd.bars@1`에서 파생 |
 | `prices.kr.eodhd.ref` | `eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1` | 위 두 모양 | 위와 같음. bulk의 첫 template은 `eodhd.bars_adjusted@1`에서 파생 |
@@ -1730,9 +1748,9 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
 
 **KR 일간 bulk.** 경고와 함께 끝난 KR 일간 bulk 응답은 DV-294에 따라 행 전부가 `quarantine`에 남으므로, KR 일간
 가격은 bulk route로만 이어진다. route가 이 테이블을 맡으면(조건을 만족하는 행이 하나라도 있으면) 먼저 모든 행이
-깨끗한 응답 경로(`qveris_native._bar`)와 같은 값 검사를 통과하는지 센다. 유효한 JSON, open·high·low·close·
+깨끗한 응답 경로(`qveris_native._bar`)와 같은 값 검사를, 조건을 만족하는(받는) 행에만, 통과하는지 센다. 유효한 JSON, open·high·low·close·
 adjusted_close·volume이 모두 유한한 JSON 숫자(문자열·null·불리언 아님), 가격 > 0, 거래량 >= 0,
-low <= min(open, close), high >= max(open, close), low <= high, `YYYY-MM-DD` 날짜다. 한 행이라도 어기면 그
+low <= min(open, close), high >= max(open, close), low <= high, `YYYY-MM-DD` 날짜다. 받는 행이 한 행이라도 어기면 그
 테이블 전체를 승격하지 않고 `value_check`로 센다(`mixed`보다 먼저 본다). 경고 응답을 값 검사 없이 통과시키지
 않기 위해서다. chain에 bulk 매퍼의 generation이 아직 없으면(운영자가 `aas data kr-prices`로 이력만 올린 chain)
 같은 dataset의 이력 매퍼(`eodhd.bars@1`, `.ref`는 `eodhd.bars_adjusted@1`) 최신 committed 명세에서 매퍼 이름만
@@ -1790,11 +1808,17 @@ SELECT만, 새 상태 없음). 형식은 [운영 문서](../operations.md#하루
 끝난 것이다. 운영자의 승격이 pin한 원천은 첫 유지보수 실행에서 한 번 더 계획되어 `unchanged`로 기록되고, head보다
 이른 내려받기는 `stale`이라 head를 대체하지 않는다.
 
-매퍼가 아직 없는 dataset(import 때 identity가 없거나 다르다고 보류된 US 행의 `prices.us.eodhd` 재처리)의 수집 원천은
-승격하지 않고 `unmapped`에 dataset별 테이블 수로 남는다. 그 행의 사유는 `provider_reported_partial`이 아니라서
-`eodhd.bulk_quarantine@1`에서 세션 날짜가 없고(거부됨), @1의 뜻을 바꾸면 이미 게시된 KR generation의 manifest가
-다시 계산되지 않는다. 경고와 함께 끝난 US 일간 bulk 응답은 위 US bulk route가 KR과 같은 방식(값 검사, 이력
-명세에서 파생한 template)으로 잇는다.
+US 일간 bulk route는 `eodhd.bulk_quarantine@2`로 잇는다. `@1`은 `provider_reported_partial`만 세션 날짜를
+주는 계약(DV-153)이라 import 때 identity가 없어 보류된 행을 승격할 수 없고, `@1`의 뜻을 바꾸면 이미 게시된
+generation의 manifest가 다시 계산되지 않으므로 새 major를 둔다. route는 `@1`을 이어 받지 않으므로(`continues`
+없음) chain에 `@2` generation이 없으면 `eodhd.bars@1` 명세에서 template을 파생하고, 앞서 `@1`로 게시된
+generation과 그 원천의 `maintain_source@1` 기록은 그대로다. route가 받는 행은 `@2` 승격 사유의 US 행이고, 다른
+사유의 US 행과 거래소를 읽을 수 없는 행은 `holds`로 남겨 테이블을 `mixed`로 만들지 않는다. 값 검사는 매퍼가
+행마다 하므로 값이 나쁜 행(받는 행이든 다른 사유로 보류된 행이든)이 섞여도 같은 테이블의 유효한 행은 승격된다.
+보류 사유별 행 수는 단계 보고의 `source_outcomes`(generation manifest와 빈 delta의 `promotion_coverage@1`에도
+같은 값)에 남는다. 받는 행이 없는 US 테이블(모든 행이 `@2`가 남기는 사유)은 승격하지 않고 `unmapped`에
+dataset별 테이블 수로 남는다. KR route는 `@1` 그대로이고, 받는 행이 아닌 다른 사유 행이 섞인 KR 테이블은
+`mixed`로 건너뛴다(`@1`은 행을 남길 수 없다).
 
 **보고와 종료 코드.** 실행 보고(`aas-maintain-report-v1`)는 단계마다의 결과, 실패한 단계, 멈춘 공급자를 담고
 정확한 bytes를 `raw/`에, 같은 bytes를 `<runtime>/maintain-report.json`에 둔다. `stage_resources`는 단계마다
@@ -3286,9 +3310,14 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-560 | `status.kr.kind` route는 KIND 목록을 후보로 보고 legacy 모양을 `shape`로 건너뛰며, 이름 붙인 경우에만 수집일 partition으로 시작한다 | `tests/storage/test_kind_status.py::test_the_status_route_starts_the_kind_chain_only_when_named` | 구현 |
 | DV-561 | US 목록의 해석되지 않은 날은 사유마다 심볼 종류와 처리(`register`·`unresolved`·`out_of_scope`)를 보고하고, 상품을 가리키는 행은 종류와 상관없이 범위 밖이 아니며 claim은 생기지 않는다 | `tests/storage/test_us_symbols.py::test_every_unresolved_day_has_a_symbol_class_and_a_disposition` | 구현 |
 | DV-562 | `standing_unresolved`의 `prices.us.eodhd` 항목은 기다리는 행을 지금의 판정으로 사유·종류·처리별로 세고, 목록이 없는 날은 `list_not_observed`, 곧 등록될 날은 `list_claimable`, 등록된 날은 `resolved`다 | `tests/storage/test_us_symbols.py::test_the_standing_summary_counts_waiting_us_rows_by_reason_class_and_disposition` | 구현 |
-| DV-563 | 경고 US bulk 테이블은 이력 명세에서 파생한 `eodhd.bulk_quarantine@1` template(`US`→`USD`)으로 `prices.us.eodhd`를 잇고, import 때 identity가 없어 보류된 US 테이블은 route가 맡지 않고 `unmapped`에 남는다 | `tests/storage/test_maintain_promotion.py::test_a_warned_us_bulk_day_continues_the_us_chain_and_identity_held_rows_stay_out` | 구현 |
+| DV-563 | 경고 US bulk 테이블은 이력 명세에서 파생한 `eodhd.bulk_quarantine@2` template(`US`→`USD`)으로 `prices.us.eodhd`를 잇는다 | `tests/storage/test_maintain_promotion.py::test_a_warned_us_bulk_day_continues_the_us_chain_with_the_v2_mapper` | 구현 |
 | DV-564 | `reporting` 범위는 등록된 발행인이 없어도 읽은 색인에서 정기 보고서를 낸 제출자의 공시를 원하고 그 문서를 묻어 승격하며, 정기 보고서가 없는 제출자는 범위 밖으로 센다 | `tests/storage/test_us_collection.py::test_the_reporting_scope_wants_filers_of_periodic_reports_and_promotes_them` | 구현 |
 | DV-565 | 호출 상한을 넘는 문서 요청은 가장 이른 공시일 순으로 묻고 남은 요청은 다음 실행이 잇는다 | `tests/storage/test_us_collection.py::test_a_backlog_over_the_call_budget_is_asked_oldest_first_over_runs` | 구현 |
 | DV-566 | 유지보수 Qveris 계획은 US 종목 목록을 상장(`delisted=0`)과 상장폐지(`delisted=1`) 둘 다 관측일마다 묻는다 | `tests/application/test_maintain_qveris.py::test_the_us_symbol_lists_are_asked_listed_and_delisted_every_day` | 구현 |
 | DV-567 | `status.us.eodhd`는 첫 상장폐지 목록의 상품을 모두 `last_bar` 추정(`delisting_inferred`)으로 두고 2026-07-29~첫 관측일 구간만 `survivorship_unverified`를 달며, 다음 목록에서 전날 상장 목록에 있던 ISIN은 `observed`와 `last_bar` 사건을 함께 얻는다 | `tests/storage/test_us_delisted.py::test_delisted_lists_give_inferred_then_observed_events_by_isin` | 구현 |
 | DV-568 | 같은 티커의 다른 ISIN은 다른 상품의 사건이고, ISIN이 없거나 등록되지 않은 행은 미해결로 남아 `standing_unresolved`의 `status.us.eodhd` 항목에 사유·종류별로 세어진다 | `tests/storage/test_us_delisted.py::test_delisted_lists_give_inferred_then_observed_events_by_isin` | 구현 |
+| DV-569 | `eodhd.bulk_quarantine@2`는 보류 사유표대로 `provider_reported_partial`과 import identity 누락 행 중 값 검사를 통과한 행만 옮기고, 다른 사유·값 검사 실패 행은 파티션 날짜 없이 `mapped`·`value_check`·`held` 결과로 센다 | `tests/storage/test_promotion_mappers.py::test_eodhd_bulk_quarantine_v2_maps_admitted_holds_and_counts_the_rest` | 구현 |
+| DV-570 | import 때 identity가 없어 보류된 US 행은 `@2`로 snapshot이 해석하는 것만 승격되고, 해석되지 않는 행은 값 없이 `unresolved`로 기다리다 등록 뒤 승격되며, 다른 사유 행은 남고 그 사유만 있는 테이블은 `unmapped`다. 사유별 행 수는 단계의 `source_outcomes`에 남는다 | `tests/storage/test_maintain_promotion.py::test_identity_held_us_rows_promote_by_the_reason_table_and_wait_for_their_identity` | 구현 |
+| DV-571 | 경고 US 테이블에 값 검사를 어긴 행(그 사유로 보류된 행, 값이 나쁜 부분 응답 행)이 섞여도 유효한 행은 승격되고 나머지는 사유별로 세어진다 | `tests/storage/test_maintain_promotion.py::test_rows_held_for_their_values_keep_no_valid_row_of_a_warned_us_table_out` | 구현 |
+| DV-572 | `@2`를 더해도 `eodhd.bulk_quarantine@1` KR bulk generation의 manifest SHA-256은 기록된 값 그대로다 | `tests/storage/test_maintain_promotion.py::test_a_bulk_quarantine_v1_generation_keeps_its_manifest` | 구현 |
+| DV-573 | route의 값 검사는 받는 행에만 적용되므로 다른 사유로 보류된 행이 섞인 KR `@1` 테이블은 `value_check`가 아니라 `mixed`로 건너뛴다 | `tests/storage/test_maintain_promotion.py::test_the_kr_check_judges_only_accepted_rows_and_leaves_other_holds_mixed` | 구현 |

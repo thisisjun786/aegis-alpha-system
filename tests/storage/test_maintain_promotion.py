@@ -19,6 +19,7 @@ import pytest
 
 from aegis_alpha.storage import kr_prices, maintain_promotion
 from aegis_alpha.storage.dataset_catalog import CATALOG
+from aegis_alpha.storage.identity import mint_instrument
 from aegis_alpha.storage.maintain_promotion import (
     KeyMembers,
     Route,
@@ -306,19 +307,36 @@ def test_a_chain_with_a_bulk_generation_continues_from_it_without_deriving(
     ]
 
 
+# The manifest SHA-256 of one KR bulk day promoted with ``eodhd.bulk_quarantine@1`` after the
+# history year, recorded on the code before ``eodhd.bulk_quarantine@2`` existed.
+V1_BULK_MANIFEST = "63edbc92f9443f124918bddb5c16b15f48a76343e7eb0dca7918eac8fe921242"
+
+
+def test_a_bulk_quarantine_v1_generation_keeps_its_manifest(ws: Workspace) -> None:
+    pins, _ = _kr_history(ws, kr_prices.DATASET)
+    held = _bulk_day(ws, B1, tag="b1")
+    _kr_promote(ws, kr_prices.DATASET, _kr_step("bulk", B1, BULK.mapper, held), pins)
+    generation = dataset_head(ws, kr_prices.DATASET)
+    recorded = ws.state.execute(
+        "SELECT normalizer_version, manifest_hash FROM dataset_versions WHERE generation_id=?",
+        (generation,),
+    ).fetchone()
+    assert tuple(recorded) == ("eodhd.bulk_quarantine@1", V1_BULK_MANIFEST)
+
+
 NEW_YORK = "America/New_York"
 US_RULE = {"rule": "local_day_end@1", "basis": "record", "input": "session_date",
            "args": {"timezone": NEW_YORK}}  # fmt: skip
 US_BULK = replace(
     next(item for item in maintain_promotion.ROUTES
-         if (item.dataset_id, item.mapper) == ("prices.us.eodhd", "eodhd.bulk_quarantine@1")),
+         if (item.dataset_id, item.mapper) == ("prices.us.eodhd", "eodhd.bulk_quarantine@2")),
     prefix="synthetic-kr-bulk-",
 )  # fmt: skip
+IDENTITY = "explicit instrument identity is required"
 
 
-def test_a_warned_us_bulk_day_continues_the_us_chain_and_identity_held_rows_stay_out(
-    ws: Workspace, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def _us_chain(ws: Workspace) -> tuple[dict[str, str], tuple[bytes, str]]:
+    """A ``prices.us.eodhd`` chain one US history day built, AAA.US and BBB.US registered."""
     retrieved = at("2026-09-09T08:00:00")
     daily = add_source(ws, [bar("AAA.US", B1, 10.0, retrieved=retrieved, currency="USD"),
                             bar("BBB.US", B1, 20.0, retrieved=retrieved, currency="USD")],
@@ -331,23 +349,44 @@ def test_a_warned_us_bulk_day_continues_the_us_chain_and_identity_held_rows_stay
                    partition={"from": B1.isoformat(), "to": B2.isoformat()},
                    mapper={"name": "eodhd.bars@1", "args": {"timezone": NEW_YORK}})  # fmt: skip
     assert promote(ws, *history, apply=True)["published"] is True
+    return daily, history
+
+
+def _us_row(code: str, close: float, reason: str = PARTIAL, **fields: object) -> tuple[str, str]:
+    """A held US row on B2 whose JSON fields ``fields`` replace."""
+    _, text = bulk_row(code, "US", B2, close)
+    return reason, json.dumps({**json.loads(text), **fields}, sort_keys=True)
+
+
+def _us_run(ws: Workspace, identity: dict[str, str] | None = None) -> dict[str, object]:
+    report = promote_datasets(ws, apply=True, now_us=1, routes=[US_BULK], identity=identity)
+    return _datasets(report)[("prices.us.eodhd", US_BULK.mapper)]
+
+
+def _closes(ws: Workspace, generation: str | None) -> list[tuple[str, float]]:
+    """(Norgate asset ID, close) of a generation's rows; the IDs are minted from the anchor."""
+    anchors = {mint_instrument("norgate_assetid", token): token
+               for token in ("900001", "900002", "900003")}  # fmt: skip
+    rows = ws.market.execute(
+        "SELECT instrument_id, close FROM prices WHERE generation_id=? ORDER BY close",
+        [generation],
+    ).fetchall()
+    return [(anchors[str(instrument)], float(close)) for instrument, close in rows]
+
+
+def test_a_warned_us_bulk_day_continues_the_us_chain_with_the_v2_mapper(ws: Workspace) -> None:
+    _, history = _us_chain(ws)
     parent = dataset_head(ws, "prices.us.eodhd")
-    warned = add_bulk_source(ws, [bulk_row("AAA", "US", B2, 11), bulk_row("BBB", "US", B2, 21)],
+    warned = add_bulk_source(ws, [_us_row("AAA", 11), _us_row("BBB", 21)],
                              tag="us-warned", linked=at("2026-09-09T09:00:00"))  # fmt: skip
-    # Rows the import held for want of an import-time identity are not the route's.
-    add_bulk_source(ws, [bulk_row("CCC", "US", B2, 5,
-                                  reason="explicit instrument identity is required")],
-                    tag="us-identity", linked=at("2026-09-09T09:30:00"))  # fmt: skip
-    run = _datasets(promote_datasets(ws, apply=True, now_us=1, routes=[US_BULK]))[
-        ("prices.us.eodhd", US_BULK.mapper)
-    ]
+    run = _us_run(ws)
     assert (run["status"], run["derived_from"]) == ("advanced", "eodhd.bars@1")
     assert run["template_spec_sha256"] == history[1]
     (source,) = cast("list[dict[str, object]]", run["sources"])
     assert (source["source_id"], source["status"]) == (warned["source_id"], "promoted")
     generation = dataset_head(ws, "prices.us.eodhd")
     name, linked, _, retained = _retained(ws, generation)
-    assert (name, linked) == ("eodhd.bulk_quarantine@1", parent)
+    assert (name, linked) == ("eodhd.bulk_quarantine@2", parent)
     assert json.loads(retained)["mapper"]["args"] == {"timezone": NEW_YORK,
                                                       "currencies": {"US": "USD"}}  # fmt: skip
     rows = ws.market.execute(
@@ -360,12 +399,88 @@ def test_a_warned_us_bulk_day_continues_the_us_chain_and_identity_held_rows_stay
         [generation, PARTIAL],
     ).fetchone()
     assert flags == (2,)
-    # The identity-held table is still counted as unmapped; the warned one no longer is.
+
+
+def test_identity_held_us_rows_promote_by_the_reason_table_and_wait_for_their_identity(
+    ws: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    daily, _ = _us_chain(ws)
+    held = add_bulk_source(
+        ws,
+        [_us_row("AAA", 11, IDENTITY),
+         _us_row("ZZZ", 31, IDENTITY),  # no registered identity yet
+         _us_row("BBB", 21, IDENTITY, low=0),  # values fail the bar checks
+         _us_row("BBB", 22, "provider identity or currency differs"),
+         _us_row("BBB", 23, "inconsistent_ohlc")],
+        tag="us-identity", linked=at("2026-09-09T09:30:00"),
+    )  # fmt: skip
+    # A table whose every row is held for a reason @2 does not map stays unmapped.
+    add_bulk_source(ws, [_us_row("BBB", 24, "provider identity or currency differs")],
+                    tag="us-differs", linked=at("2026-09-09T09:45:00"))  # fmt: skip
+    run = _us_run(ws)
+    assert cast("dict[str, int]", run["skipped"]) == {"done": 0}
+    (source,) = cast("list[dict[str, object]]", run["sources"])
+    assert (source["source_id"], source["status"]) == (
+        held["source_id"],
+        maintain_promotion.UNRESOLVED,
+    )
+    (step,) = cast("list[dict[str, object]]", source["steps"])
+    assert step["source_outcomes"] == {
+        f"mapped:{IDENTITY}": 2,
+        f"value_check:{IDENTITY}": 1,
+        "held:provider identity or currency differs": 1,
+        "held:inconsistent_ohlc": 1,
+    }
+    assert step["unresolved_token_count"] == 1
+    # Only the row the pinned snapshot resolves is promoted; nothing is made up for ZZZ.US.
+    first = dataset_head(ws, "prices.us.eodhd")
+    assert _closes(ws, first) == [("900001", 11.0)]
+    # A clean response row held for its identity carries no partial-response flag.
+    assert ws.market.execute(
+        "SELECT count(*) FROM quality_flags WHERE generation_id=? AND flag=?", [first, PARTIAL]
+    ).fetchone() == (0,)
+    standing = maintain_promotion.standing_unresolved(ws)["prices.us.eodhd"]
+    assert (standing["sources"], standing["unresolved_tokens"]) == (1, 1)
     shipped = [(dataset, "synthetic-kr-bulk-" if table == "quarantine" else prefix, table, accept)
                for dataset, prefix, table, accept in maintain_promotion.UNMAPPED
                if dataset == "prices.us.eodhd"]  # fmt: skip
     monkeypatch.setattr(maintain_promotion, "UNMAPPED", tuple(shipped))
     assert maintain_promotion.unmapped(ws) == {"prices.us.eodhd": 1}
+    # Once ZZZ.US is registered, the waiting source is planned again and its row promoted.
+    later = register_symbols(ws, daily["source_id"],
+                             {"AAA.US": "900001", "BBB.US": "900002", "ZZZ.US": "900003"},
+                             name="us-later")  # fmt: skip
+    again = _us_run(ws, identity=later)
+    (source,) = cast("list[dict[str, object]]", again["sources"])
+    assert source["status"] == "promoted"
+    assert _closes(ws, dataset_head(ws, "prices.us.eodhd")) == [("900003", 31.0)]
+
+
+def test_rows_held_for_their_values_keep_no_valid_row_of_a_warned_us_table_out(
+    ws: Workspace,
+) -> None:
+    _us_chain(ws)
+    warned = add_bulk_source(
+        ws,
+        [_us_row("AAA", 11),
+         _us_row("BBB", 21, "inconsistent_ohlc", high=20),
+         _us_row("BBB", 21, "invalid_date", date="2026-9-8"),
+         (PARTIAL, '{"code": "BBB", "exchange_short_name": "US", "close": '),
+         _us_row("BBB", 21, PARTIAL, volume=-1)],
+        tag="us-warned-mixed", linked=at("2026-09-09T09:00:00"),
+    )  # fmt: skip
+    run = _us_run(ws)
+    assert cast("dict[str, int]", run["skipped"]) == {"done": 0}
+    (source,) = cast("list[dict[str, object]]", run["sources"])
+    assert (source["source_id"], source["status"]) == (warned["source_id"], "promoted")
+    (step,) = cast("list[dict[str, object]]", source["steps"])
+    assert step["source_outcomes"] == {
+        f"mapped:{PARTIAL}": 1,
+        f"value_check:{PARTIAL}": 2,
+        "held:inconsistent_ohlc": 1,
+        "held:invalid_date": 1,
+    }
+    assert _closes(ws, dataset_head(ws, "prices.us.eodhd")) == [("900001", 11.0)]
 
 
 def test_a_chain_without_a_head_derives_nothing(ws: Workspace) -> None:
@@ -419,6 +534,20 @@ def test_one_invalid_value_keeps_its_whole_bulk_table_out(
         (f"%{held['source_id']}%",),
     ).fetchone()
     assert recorded[0] == 0
+
+
+def test_the_kr_check_judges_only_accepted_rows_and_leaves_other_holds_mixed(
+    ws: Workspace,
+) -> None:
+    # A row the import held for its own failing values is not checked as a partial row: the
+    # @1 route cannot leave it, so the table stays out as mixed, not as a failed value check.
+    _kr_history(ws, kr_prices.DATASET)
+    _, text = _held({"low": 0})
+    _bulk_day(ws, B2, ("invalid_price_or_volume", text), tag="own-reason")
+    run = _datasets(promote_datasets(ws, apply=True, now_us=1, routes=[BULK]))[
+        (kr_prices.DATASET, BULK.mapper)
+    ]
+    assert (run["skipped"], run["sources"]) == ({"done": 0, "mixed": 1}, [])
 
 
 def _instant(moment: datetime) -> int:
