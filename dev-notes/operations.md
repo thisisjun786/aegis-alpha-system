@@ -1598,6 +1598,13 @@ identity 단계는 그 목록의 행을 등록된 FMP ISIN으로 Norgate 상품�
 `aas data promote`(또는 `data kr-prices`, `calendar refresh`)로 만들고, 그 뒤 실행이 새로 수집된 원천을 그
 명세의 규칙으로 이어 붙인다. head가 없는 dataset은 `no_head`로 보고된다.
 
+KR 일간 bulk route(`eodhd.bulk_quarantine@1`, `_adjusted@1`)는 예외로, chain에 bulk generation이 없으면 같은
+chain의 이력 명세에서 template을 파생한다. 그때 그 dataset 항목의 `derived_from`이 원본 매퍼(`eodhd.bars@1`
+등)이고 `template_spec_sha256`은 그 원본 명세의 해시다. 파생이 아니면 `derived_from`은 null이다. 같은 route는
+경고 응답의 행을 값 검사(유한한 숫자, 가격 > 0, 거래량 >= 0, OHLC 일관성, `YYYY-MM-DD` 날짜)로 거르고, 한
+행이라도 어긴 테이블은 승격하지 않고 `skipped.value_check`에 센다. 그 수가 0이 아니면 해당 원천의 응답을 읽어
+사유를 확인한다. 테이블은 다음 실행에도 다시 세어진다.
+
 설치와 예약은 [운영 전환](#운영-전환)의 일이다. 태그된 dev 커밋을 정확한 CPython 경로로 설치하고 receipt를 남긴다.
 
 ```bash

@@ -7,15 +7,17 @@ a test route; every symbol and value is made up.
 # ruff: noqa: PLR2004 -- synthetic counts are the expected values
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
 import pytest
 
-from aegis_alpha.storage import maintain_promotion
+from aegis_alpha.storage import kr_prices, maintain_promotion
 from aegis_alpha.storage.maintain_promotion import (
     KeyMembers,
     Route,
@@ -24,7 +26,18 @@ from aegis_alpha.storage.maintain_promotion import (
 )
 from aegis_alpha.storage.promotion.engine import dataset_head, promote
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
-from tests.storage.promotion_support import add_source, at, bar, register_symbols, spec
+from tests.storage.promotion_support import (
+    PARTIAL,
+    add_bulk_source,
+    add_source,
+    at,
+    bar,
+    bulk_row,
+    publish_calendar,
+    register_symbols,
+    spec,
+    us,
+)
 
 DAY1, DAY2, DAY3 = date(2026, 9, 14), date(2026, 9, 15), date(2026, 9, 16)
 KR = "(provider_symbol LIKE '%.KO' OR provider_symbol LIKE '%.KQ')"
@@ -133,6 +146,213 @@ def test_generation_pins_advance_and_the_identity_replaces_only_a_pinned_snapsho
                                            step=maintain_promotion.Step(None),
                                            identity=other))  # fmt: skip
     assert unpinned["identity_snapshot"] is None
+
+
+# --- KR daily bulk: the first template derived from the history, and the value check ----
+
+H1, B1, B2 = date(2026, 9, 4), date(2026, 9, 7), date(2026, 9, 8)
+LAG = 3_600_000_000
+
+
+def _kr_route(dataset: str, name: str) -> Route:
+    """The shipped route with the synthetic bulk lineage's prefix."""
+    (found,) = [
+        item
+        for item in maintain_promotion.ROUTES
+        if (item.dataset_id, item.mapper) == (dataset, name)
+    ]
+    return replace(found, prefix="synthetic-kr-bulk-")
+
+
+BULK = _kr_route(kr_prices.DATASET, "eodhd.bulk_quarantine@1")
+BULK_REF = _kr_route(kr_prices.REFERENCE_DATASET, "eodhd.bulk_quarantine_adjusted@1")
+KR_CHAINS = pytest.mark.parametrize(
+    ("dataset", "route"),
+    [(kr_prices.DATASET, BULK), (kr_prices.REFERENCE_DATASET, BULK_REF)],
+    ids=["canonical", "reference"],
+)
+
+
+def _kr_step(kind: str, day: date, name: str, pin: dict[str, str]) -> kr_prices.Step:
+    if kind == "history":
+        return kr_prices.Step(kind, date(day.year, 1, 1), date(day.year + 1, 1, 1), name, (pin,))
+    return kr_prices.Step(kind, day, day + timedelta(days=1), name, (pin,))
+
+
+def _kr_promote(ws: Workspace, dataset: str, step: kr_prices.Step,
+                pins: dict[str, dict[str, str]]) -> bytes:  # fmt: skip
+    """Promote one ``aas data kr-prices`` step as an operator would; return its spec."""
+    raw = kr_prices.step_spec(step, dataset=dataset, parent=dataset_head(ws, dataset),
+                              identity=pins["identity"], calendar=pins["calendar"],
+                              lag_us=LAG)  # fmt: skip
+    assert promote(ws, raw, hashlib.sha256(raw).hexdigest(), apply=True)["published"] is True
+    return raw
+
+
+def _kr_history(ws: Workspace, dataset: str) -> tuple[dict[str, dict[str, str]], bytes]:
+    """A chain the history backfill alone built, as ``aas data kr-prices`` writes it."""
+    retrieved = at("2026-09-04T08:00:00")
+    history = add_source(
+        ws,
+        [bar("AAA.KO", H1, 100.0, retrieved=retrieved),
+         bar("BBB.KQ", H1, 50.0, retrieved=retrieved),
+         bar("CCC.KO", H1, 7.0, retrieved=retrieved)],
+        tag="history", linked=at("2026-09-04T09:00:00"),
+    )  # fmt: skip
+    sessions = {day: (us(at(f"{day}T00:00:00")), us(at(f"{day}T06:30:00")))
+                for day in (H1, B1, B2)}  # fmt: skip
+    pins = {"identity": register_symbols(ws, history["source_id"]),
+            "calendar": publish_calendar(ws, sessions)}  # fmt: skip
+    name = "eodhd.bars_adjusted@1" if dataset == kr_prices.REFERENCE_DATASET else "eodhd.bars@1"
+    return pins, _kr_promote(ws, dataset, _kr_step("history", H1, name, history), pins)
+
+
+def _bulk_day(ws: Workspace, day: date, *extra: tuple[str, str], tag: str) -> dict[str, str]:
+    rows = [bulk_row("AAA", "KO", day, 101), bulk_row("BBB", "KQ", day, 51), *extra]
+    return add_bulk_source(ws, rows, tag=tag, linked=at(f"{day}T09:00:00"))
+
+
+def _retained(ws: Workspace, generation: str | None) -> tuple[str, str, str, bytes]:
+    """(mapper, parent, transform hash, retained spec) of one committed generation."""
+    name, parent, digest = ws.state.execute(
+        "SELECT normalizer_version, parent_generation_id, transform_hash FROM dataset_versions "
+        "WHERE generation_id=?",
+        (generation,),
+    ).fetchone()
+    return name, parent, digest, (ws.paths.raw / digest[:2] / digest).read_bytes()
+
+
+@KR_CHAINS
+def test_a_warned_kr_bulk_day_continues_a_chain_only_the_history_built(
+    ws: Workspace, dataset: str, route: Route
+) -> None:
+    _, history = _kr_history(ws, dataset)
+    parent = dataset_head(ws, dataset)
+    pin = _bulk_day(ws, B1, tag="b1")
+    report = promote_datasets(ws, apply=True, now_us=1, routes=[route])
+    run = _datasets(report)[(dataset, route.mapper)]
+    assert (run["status"], run["derived_from"]) == ("advanced", route.derive_from)
+    # The template is the history's spec, which the derived one came from.
+    assert run["template_spec_sha256"] == hashlib.sha256(history).hexdigest()
+    (source,) = cast("list[dict[str, object]]", run["sources"])
+    assert (source["source_id"], source["status"]) == (pin["source_id"], "promoted")
+    (step,) = cast("list[dict[str, object]]", source["steps"])
+    assert step["partition"] == {"from": B1.isoformat(), "to": B2.isoformat()}
+    generation = dataset_head(ws, dataset)
+    name, linked, _, _ = _retained(ws, generation)
+    assert (name, linked) == (route.mapper, parent)
+    flags = ws.market.execute(
+        "SELECT count(*) FROM quality_flags WHERE generation_id=? AND flag=?",
+        [generation, PARTIAL],
+    ).fetchone()
+    assert flags == (2,)  # both warned rows, each a new revision
+    # Two rows against the three of the complete history date.
+    check = cast("dict[str, object]", step["partition_row_count"])
+    assert check["result"] == "below_reference"
+    recorded = ws.state.execute(
+        "SELECT result FROM quality_checks WHERE dataset_id=? AND rule_id='partition_row_count'",
+        (dataset,),
+    ).fetchall()
+    assert [tuple(row) for row in recorded] == [("below_reference",)]
+    versions = tuple(ws.state.execute("SELECT count(*) FROM dataset_versions").fetchone())
+    again = _datasets(promote_datasets(ws, apply=True, now_us=2, routes=[route]))
+    repeated = again[(dataset, route.mapper)]
+    assert (repeated["status"], repeated["sources"]) == ("current", [])
+    assert cast("dict[str, int]", repeated["skipped"])["done"] == 1
+    assert tuple(ws.state.execute("SELECT count(*) FROM dataset_versions").fetchone()) == versions
+
+
+@KR_CHAINS
+def test_a_derived_bulk_spec_is_the_one_kr_prices_writes_for_that_day(
+    ws: Workspace, dataset: str, route: Route
+) -> None:
+    pins, _ = _kr_history(ws, dataset)
+    parent = dataset_head(ws, dataset)
+    pin = _bulk_day(ws, B1, tag="b1")
+    promote_datasets(ws, apply=True, now_us=1, routes=[route])
+    _, _, _, retained = _retained(ws, dataset_head(ws, dataset))
+    expected = kr_prices.step_spec(_kr_step("bulk", B1, route.mapper, pin), dataset=dataset,
+                                   parent=parent, identity=pins["identity"],
+                                   calendar=pins["calendar"], lag_us=LAG)  # fmt: skip
+    derived, written = json.loads(retained), json.loads(expected)
+    for key in ("mapper", "decimal_rule", "time_rules", "quality_rules", "identity_snapshot"):
+        assert derived[key] == written[key], key
+    assert derived["mapper"]["args"]["currencies"] == {"KO": "KRW", "KQ": "KRW"}
+    # Every other field the maintenance spec advances lands where the backfill puts it.
+    assert retained == expected
+
+
+@KR_CHAINS
+def test_a_chain_with_a_bulk_generation_continues_from_it_without_deriving(
+    ws: Workspace, dataset: str, route: Route
+) -> None:
+    pins, _ = _kr_history(ws, dataset)
+    first = _bulk_day(ws, B1, tag="b1")
+    bulk = _kr_promote(ws, dataset, _kr_step("bulk", B1, route.mapper, first), pins)
+    second = _bulk_day(ws, B2, tag="b2")
+    run = _datasets(promote_datasets(ws, apply=True, now_us=1, routes=[route]))[
+        (dataset, route.mapper)
+    ]
+    assert run["derived_from"] is None
+    assert run["template_spec_sha256"] == hashlib.sha256(bulk).hexdigest()
+    sources = cast("list[dict[str, object]]", run["sources"])
+    assert [(item["source_id"], item["status"]) for item in sources] == [
+        (first["source_id"], "unchanged"),
+        (second["source_id"], "promoted"),
+    ]
+
+
+def test_a_chain_without_a_head_derives_nothing(ws: Workspace) -> None:
+    _bulk_day(ws, B1, tag="b1")
+    run = _datasets(promote_datasets(ws, apply=True, now_us=1, routes=[BULK]))[
+        (kr_prices.DATASET, BULK.mapper)
+    ]
+    assert (run["status"], run["derived_from"]) == ("no_head", None)
+    assert ws.state.execute("SELECT count(*) FROM dataset_versions").fetchone()[0] == 0
+
+
+def _held(fields: dict[str, object]) -> tuple[str, str]:
+    """A warned KO row of CCC on B2 whose JSON fields ``fields`` replace."""
+    reason, text = bulk_row("CCC", "KO", B2, 7)
+    return reason, json.dumps({**json.loads(text), **fields}, sort_keys=True)
+
+
+_INVALID = {
+    "zero_price": _held({"low": 0}),
+    "low_above_high": _held({"open": 7, "close": 7, "low": 7, "high": 6}),
+    "high_below_close": _held({"close": 8}),
+    "negative_volume": _held({"volume": -1}),
+    "text_number": _held({"close": "7"}),
+    "null_value": _held({"adjusted_close": None}),
+    "broken_json": (PARTIAL, '{"code": "CCC", "exchange_short_name": "KO", "close": '),
+    "bad_date": _held({"date": "2026-09-31"}),
+}
+
+
+@pytest.mark.parametrize("invalid", list(_INVALID.values()), ids=list(_INVALID))
+@KR_CHAINS
+def test_one_invalid_value_keeps_its_whole_bulk_table_out(
+    ws: Workspace, dataset: str, route: Route, invalid: tuple[str, str]
+) -> None:
+    _kr_history(ws, dataset)
+    clean = _bulk_day(ws, B1, tag="clean")
+    held = _bulk_day(ws, B2, invalid, tag="invalid")
+    run = _datasets(promote_datasets(ws, apply=True, now_us=1, routes=[route]))[
+        (dataset, route.mapper)
+    ]
+    assert run["skipped"] == {"done": 0, "value_check": 1}
+    sources = cast("list[dict[str, object]]", run["sources"])
+    assert [(item["source_id"], item["status"]) for item in sources] == [
+        (clean["source_id"], "promoted")
+    ]
+    # Nothing of the held table reached the chain, not even its valid rows.
+    days = ws.market.execute("SELECT DISTINCT session_date FROM prices ORDER BY 1").fetchall()
+    assert days == [(H1,), (B1,)]
+    recorded = ws.state.execute(
+        "SELECT count(*) FROM quality_checks WHERE rule_id='maintain_source' AND reason LIKE ?",
+        (f"%{held['source_id']}%",),
+    ).fetchone()
+    assert recorded[0] == 0
 
 
 def _instant(moment: datetime) -> int:

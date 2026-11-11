@@ -1599,8 +1599,22 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
 | `classifications.kr.kind` | `kind.industry@2`, 이어 받는 `kind.industry@1` | `kind-listings-*` `listings` | `short_code`·`industry`·`retrieved_at_utc` 열 |
 | `prices.us.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.US` |
 | `prices.kr.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.KO`·`.KQ` |
-| `prices.kr.eodhd` | `eodhd.bulk_quarantine@1` | `qveris-bulk-quarantine-*` `quarantine` | 사유 `provider_reported_partial`, 거래소 `KO`·`KQ` |
-| `prices.kr.eodhd.ref` | `eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1` | 위 두 모양 | 위와 같음 |
+| `prices.kr.eodhd` | `eodhd.bulk_quarantine@1` | `qveris-bulk-quarantine-*` `quarantine` | 사유 `provider_reported_partial`, 거래소 `KO`·`KQ`, 모든 행이 값 검사 통과. 첫 template은 `eodhd.bars@1`에서 파생 |
+| `prices.kr.eodhd.ref` | `eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1` | 위 두 모양 | 위와 같음. bulk의 첫 template은 `eodhd.bars_adjusted@1`에서 파생 |
+
+**KR 일간 bulk.** 경고와 함께 끝난 KR 일간 bulk 응답은 DV-294에 따라 행 전부가 `quarantine`에 남으므로, KR 일간
+가격은 bulk route로만 이어진다. route가 이 테이블을 맡으면(조건을 만족하는 행이 하나라도 있으면) 먼저 모든 행이
+깨끗한 응답 경로(`qveris_native._bar`)와 같은 값 검사를 통과하는지 센다. 유효한 JSON, open·high·low·close·
+adjusted_close·volume이 모두 유한한 JSON 숫자(문자열·null·불리언 아님), 가격 > 0, 거래량 >= 0,
+low <= min(open, close), high >= max(open, close), low <= high, `YYYY-MM-DD` 날짜다. 한 행이라도 어기면 그
+테이블 전체를 승격하지 않고 `value_check`로 센다(`mixed`보다 먼저 본다). 경고 응답을 값 검사 없이 통과시키지
+않기 위해서다. chain에 bulk 매퍼의 generation이 아직 없으면(운영자가 `aas data kr-prices`로 이력만 올린 chain)
+같은 dataset의 이력 매퍼(`eodhd.bars@1`, `.ref`는 `eodhd.bars_adjusted@1`) 최신 committed 명세에서 매퍼 이름만
+bulk 매퍼로 바꾸고 인자에 `currencies`(`kr_prices.CURRENCIES`)를 더한 명세를 template으로 쓴다. 시간·숫자·품질
+규칙과 identity pin은 그대로이므로 그 날의 유지보수 명세는 `aas data kr-prices`가 같은 날 bulk 단계에 쓰는 명세와
+같다. 파생은 bulk generation이 없을 때만 하고, 한 번 생기면 그 최신 명세가 template이다. head가 없는 chain은
+파생하지 않는다(`no_head`). 보고의 `template_spec_sha256`은 파생 원본 명세의 해시이고 `derived_from`이 원본
+매퍼를 밝힌다(파생이 아니면 null).
 
 route는 chain을 이어 붙일 뿐 시작하지 않는다. template은 그 dataset에서 route의 매퍼, 또는 route가 이어 받는
 이전 major 매퍼를 쓴 가장 늦은 committed generation의 명세(운영자의 백필이거나 앞선 유지보수 generation)이고,
@@ -3109,3 +3123,9 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-533 | 무작위 시나리오에서 한 번의 build는 목록 순서와 무관하고, 다른 상품·다른 심볼 관측이 있는 날이나 다른 상품의 등록 claim을 덮지 않으며, 모든 claim이 등록·수용 claim에서 이어진다 | `tests/storage/test_us_symbol_invariants.py::test_batch_builds_are_order_free_and_safe` | 구현 |
 | DV-534 | 덮는 날 순서로 한 실행씩 도착한 목록으로 유지보수 identity 단계가 등록하는 claim은 한 번의 build와 같다 | `tests/storage/test_us_symbol_invariants.py::test_run_by_run_maintenance_registers_what_one_build_finds` | 구현 |
 | DV-535 | `aas-maintain-key-scope-v1`(범위 key)와 key 전체의 SHA-256은 고정된 기대값을 가진다 | `tests/storage/test_maintain_promotion.py::test_the_key_digests_are_frozen` | 구현 |
+| DV-536 | 이력만 있는 KR chain의 경고 bulk 테이블은 유지보수가 이력 명세에서 파생한 template으로 `provider_reported_partial` flag와 `partition_row_count@1`을 남기며 승격하고, 다시 실행하면 아무것도 쓰지 않는다(`.ref` 포함) | `tests/storage/test_maintain_promotion.py::test_a_warned_kr_bulk_day_continues_a_chain_only_the_history_built` | 구현 |
+| DV-537 | 파생 template으로 만든 KR bulk 유지보수 명세는 `aas data kr-prices`가 같은 날 bulk 단계에 쓰는 명세와 같다 | `tests/storage/test_maintain_promotion.py::test_a_derived_bulk_spec_is_the_one_kr_prices_writes_for_that_day` | 구현 |
+| DV-538 | chain에 bulk generation이 있으면 파생하지 않고 그 명세를 template으로 쓴다 | `tests/storage/test_maintain_promotion.py::test_a_chain_with_a_bulk_generation_continues_from_it_without_deriving` | 구현 |
+| DV-539 | head가 없는 chain은 bulk route가 파생하지 않고 `no_head`로 남는다 | `tests/storage/test_maintain_promotion.py::test_a_chain_without_a_head_derives_nothing` | 구현 |
+| DV-540 | 값 검사(가격 0, low>high, high<max(open, close), 음수 거래량, 문자열 숫자, null, 깨진 JSON, 잘못된 날짜)를 어긴 행이 하나라도 있는 bulk 테이블은 `value_check`로 남고 승격되지 않으며, 같은 회차의 정상 테이블은 승격된다 | `tests/storage/test_maintain_promotion.py::test_one_invalid_value_keeps_its_whole_bulk_table_out` | 구현 |
+| DV-541 | 경고 KR bulk만 수집된 유지보수 실행은 이력만 있는 chain을 이어 붙이고 승격 뒤 저장소가 검증을 통과한다 | `tests/application/test_maintain.py::test_warned_kr_bulk_days_continue_a_history_only_chain_and_the_store_verifies` | 구현 |

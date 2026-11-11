@@ -7,7 +7,12 @@ symbols, partial-response rows of a KR exchange). A table whose rows do not all 
 it is left to the other routes of the shape; an empty table is skipped. A table that
 lacks a column the route's mapper reads (its ``source_columns``) is another shape under
 the same prefix and table name (the ``korea.public_response@1`` legacy import of
-``kind-listings``): it is skipped and counted as ``shape``.
+``kind-listings``): it is skipped and counted as ``shape``. A route may also name a value
+``check`` every row of a table it claims must pass: the KR daily bulk routes check each
+warned row as the clean response path does (``qveris_native._bar``: valid JSON, finite
+JSON numbers, prices above zero, volume not negative, consistent OHLC, an ISO date). A
+table with one failing row is not promoted and is counted as ``value_check`` (before
+``mixed``), so a warned response never passes unchecked.
 
 A route continues a chain; it never starts one. Its template is the spec of the latest
 committed generation of the dataset that used one of the route's mappers: its own, or
@@ -15,7 +20,15 @@ an earlier major it ``continues`` (an operator's backfill or an earlier maintena
 generation). That generation's mapper is the one the chain continues with, so
 ``classifications.kr.kind`` continues a chain whose latest generation used
 ``kind.industry@1`` under ``@1`` and one an operator published under ``kind.industry@2``
-under ``@2``. A maintenance spec is that spec with only these fields advanced:
+under ``@2``. A route that names ``derive_from`` (the KR daily bulk routes) and finds no
+such generation in a chain that has a head takes its first template from the latest
+committed spec of the ``derive_from`` mapper (the history backfill's ``eodhd.bars@1`` or
+``eodhd.bars_adjusted@1``): only the mapper's name becomes the route's and
+``derive_args`` (the KR ``currencies``) join its arguments, so the template is the spec
+``aas data kr-prices`` writes for a bulk day. The report's ``template_spec_sha256`` is
+then the spec it came from and ``derived_from`` names its mapper. Once the chain holds a
+generation of the route's mapper, that spec is the template. A chain without a head is
+never derived. A maintenance spec is that spec with only these fields advanced:
 
 - ``target.parent``: the dataset head;
 - ``sources``: the one new source table;
@@ -78,6 +91,7 @@ from typing import TYPE_CHECKING, Final, cast
 import duckdb
 
 from aegis_alpha.storage.kr_identity import KIND_REQUIRED
+from aegis_alpha.storage.kr_prices import CURRENCIES as KR_CURRENCIES
 from aegis_alpha.storage.membership_pins import IdentityPin, membership_parts
 from aegis_alpha.storage.promotion import formats
 from aegis_alpha.storage.promotion.engine import dataset_head, promote
@@ -111,6 +125,47 @@ _EXCHANGE: Final = (
 _US_SYMBOL: Final = "provider_symbol LIKE '%.US'"
 _KR_SYMBOL: Final = "(provider_symbol LIKE '%.KO' OR provider_symbol LIKE '%.KQ')"
 _KR_PARTIAL: Final = f"reason = 'provider_reported_partial' AND {_EXCHANGE} IN ('KO', 'KQ')"
+_KR_BULK_ARGS: Final = {"currencies": dict(KR_CURRENCIES)}
+_ROW: Final = "(CASE WHEN json_valid(source_row_json) THEN source_row_json END)"
+
+
+def _row_number(name: str) -> str:
+    """A provider row's field as DOUBLE when it is a JSON number; NULL otherwise."""
+    path = f"'$.{name}'"
+    return (
+        f"(CASE WHEN json_type({_ROW}, {path}) IN ('UBIGINT', 'BIGINT', 'DOUBLE') "
+        f"THEN TRY_CAST(json_extract_string({_ROW}, {path}) AS DOUBLE) END)"
+    )
+
+
+def _bar_values() -> str:
+    """A held bulk row's values pass the clean response path's bar checks.
+
+    Those of ``qveris_native._bar``: valid JSON; open, high, low, close, adjusted close and
+    volume finite JSON numbers (no text, null or boolean); prices above zero, volume not
+    negative; low at most min(open, close), high at least max(open, close), low at most
+    high; an ISO ``YYYY-MM-DD`` date.
+    """
+    o, h, low, c, a, v = map(
+        _row_number, ("open", "high", "low", "close", "adjusted_close", "volume")
+    )
+    day = f"json_extract_string({_ROW}, '$.date')"
+    return " AND ".join(
+        [
+            *(f"isfinite({value})" for value in (o, h, low, c, a, v)),
+            *(f"{value} > 0" for value in (o, h, low, c, a)),
+            f"{v} >= 0",
+            f"{low} <= least({o}, {c})",
+            f"{h} >= greatest({o}, {c})",
+            f"{low} <= {h}",
+            f"json_type({_ROW}, '$.date') = 'VARCHAR'",
+            f"regexp_full_match({day}, '[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}')",
+            f"TRY_CAST({day} AS DATE) IS NOT NULL",
+        ]
+    )
+
+
+_KR_VALUES: Final = _bar_values()
 _SUMMARY: Final = (
     "generation_id",
     "published",
@@ -141,6 +196,12 @@ class Route:
     table: str
     accept: str | None = None
     continues: tuple[str, ...] = ()
+    derive_from: str | None = None
+    """The mapper whose latest spec is the first template when the chain has none of its own."""
+    derive_args: Mapping[str, object] | None = None
+    """Arguments a derived template adds to the mapper's."""
+    check: str | None = None
+    """The predicate every row of a table the route claims must satisfy (``value_check``)."""
 
     @property
     def mappers(self) -> tuple[str, ...]:
@@ -161,11 +222,13 @@ ROUTES: Final = (
     Route("prices.us.eodhd", "eodhd.bars@1", "qveris-bulk-bars-", "bars", _US_SYMBOL),
     Route("prices.kr.eodhd", "eodhd.bars@1", "qveris-bulk-bars-", "bars", _KR_SYMBOL),
     Route("prices.kr.eodhd", "eodhd.bulk_quarantine@1", "qveris-bulk-quarantine-",
-          "quarantine", _KR_PARTIAL),
+          "quarantine", _KR_PARTIAL, derive_from="eodhd.bars@1", derive_args=_KR_BULK_ARGS,
+          check=_KR_VALUES),
     Route("prices.kr.eodhd.ref", "eodhd.bars_adjusted@1", "qveris-bulk-bars-", "bars",
           _KR_SYMBOL),
     Route("prices.kr.eodhd.ref", "eodhd.bulk_quarantine_adjusted@1", "qveris-bulk-quarantine-",
-          "quarantine", _KR_PARTIAL),
+          "quarantine", _KR_PARTIAL, derive_from="eodhd.bars_adjusted@1",
+          derive_args=_KR_BULK_ARGS, check=_KR_VALUES),
 )  # fmt: skip
 
 # Collected shapes whose dataset has no registered mapper yet: counted, never promoted.
@@ -204,6 +267,7 @@ class DatasetRun:
     status: str = "current"
     head: str | None = None
     template: str | None = None
+    derived_from: str | None = None
     sources: list[dict[str, object]] = field(default_factory=list)
     skipped: dict[str, int] = field(default_factory=dict)
 
@@ -214,6 +278,7 @@ class DatasetRun:
             "status": self.status,
             "head": self.head,
             "template_spec_sha256": self.template,
+            "derived_from": self.derived_from,
             "sources": self.sources,
             "skipped": self.skipped,
         }
@@ -280,17 +345,11 @@ def candidates(  # noqa: PLR0913 -- the route and the pass's lookups
             skipped["empty"] = skipped.get("empty", 0) + 1
             continue
         target = str(entry["target"])
-        if route.accept is not None:
-            accepted = workspace.market.execute(
-                f"SELECT count(*) FILTER (WHERE coalesce(({route.accept}), false)) "  # noqa: S608 -- fixed route predicates over a quoted table
-                f"FROM {_quote(target)}"
-            ).fetchone()
-            matched = 0 if accepted is None else int(accepted[0])
-            if matched == 0:
-                continue
-            if matched != rows:
-                skipped["mixed"] = skipped.get("mixed", 0) + 1
-                continue
+        reason = _left(workspace, route, target, rows)
+        if reason is not None:
+            if reason:
+                skipped[reason] = skipped.get(reason, 0) + 1
+            continue
         pin = {
             "source_id": table.source_id,
             "source_sha256": shas[table.source_id],
@@ -306,6 +365,27 @@ def candidates(  # noqa: PLR0913 -- the route and the pass's lookups
             item.pin["source_id"],
         ),
     )
+
+
+def _count(workspace: Workspace, predicate: str, target: str) -> int:
+    found = workspace.market.execute(
+        f"SELECT count(*) FILTER (WHERE coalesce(({predicate}), false)) "  # noqa: S608 -- fixed route predicates over a quoted table
+        f"FROM {_quote(target)}"
+    ).fetchone()
+    return 0 if found is None else int(found[0])
+
+
+def _left(workspace: Workspace, route: Route, target: str, rows: int) -> str | None:
+    """Why the route leaves a nonempty table: ``""`` (another route's), the skip, or None."""
+    if route.accept is None:
+        return None
+    matched = _count(workspace, route.accept, target)
+    if matched == 0:
+        return ""
+    if route.check is not None and _count(workspace, f"NOT coalesce(({route.check}), false)",
+                                          target):  # fmt: skip
+        return "value_check"
+    return "mixed" if matched != rows else None
 
 
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
@@ -467,6 +547,40 @@ def _template(
     if hashlib.sha256(raw).hexdigest() != digest:
         raise ValueError(f"the retained spec of {dataset_id} differs from its transform hash")
     return digest, name, cast("dict", json.loads(raw))
+
+
+def _derived(workspace: Workspace, dataset_id: str, route: Route) -> tuple[str, str, dict] | None:
+    """The route's first template: the latest ``derive_from`` spec under the route's mapper.
+
+    Only the mapper's name changes and ``derive_args`` join its arguments; the hash is the
+    spec it was derived from.
+    """
+    if route.derive_from is None:
+        return None
+    found = _template(workspace, dataset_id, (route.derive_from,))
+    if found is None:
+        return None
+    digest, _, spec = found
+    named = cast("dict[str, object]", spec["mapper"])
+    args = {
+        **cast("dict[str, object]", named.get("args", {})),
+        **json.loads(json.dumps(dict(route.derive_args or {}))),
+    }
+    return digest, route.mapper, {**spec, "mapper": {**named, "name": route.mapper, "args": args}}
+
+
+def _chain_template(
+    workspace: Workspace, run: DatasetRun, route: Route
+) -> tuple[str, str, dict] | None:
+    """The template a chain with a head continues from, derived when it has none."""
+    if run.head is None:
+        return None
+    found = _template(workspace, run.dataset_id, route.mappers)
+    if found is None:
+        # The chain's first generation of this mapper starts from a sibling's spec.
+        found = _derived(workspace, run.dataset_id, route)
+        run.derived_from = None if found is None else route.derive_from
+    return found
 
 
 def head_pin(workspace: Workspace, dataset_id: str) -> dict[str, str] | None:
@@ -683,7 +797,7 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
             runs.append(run)
             run.skipped["done"] = 0
             run.head = dataset_head(workspace, dataset_id)
-            found = None if run.head is None else _template(workspace, dataset_id, route.mappers)
+            found = _chain_template(workspace, run, route)
             # The chain continues with the mapper its latest generation used.
             run.mapper = route.mapper if found is None else found[1]
             resolution = (
