@@ -31,6 +31,8 @@ from aegis_alpha.data.qveris_payloads import validate_payload
 _SHA = re.compile(r"[0-9a-f]{64}")
 _RATIO = re.compile(r"(?P<new>[0-9]+(?:\.[0-9]+)?)/(?P<old>[0-9]+(?:\.[0-9]+)?)")
 _PAGE_FILES = ("intent.json", "raw", "response.json", "billing.json")
+_ISO_DAY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+PARTIAL = "provider_reported_partial"
 SUPPORTED_COMPLETIONS = frozenset(
     {
         ("KR", "price_history", EOD_HISTORY_JSON_TOOL),
@@ -229,16 +231,7 @@ def _bar(  # noqa: PLR0913 -- one provider row and its resolved context
     fingerprint: str,
 ) -> Mapping[str, object]:
     observed = date.fromisoformat(str(raw["date"]))
-    prices = {
-        name: _number(raw.get(name)) for name in ("open", "high", "low", "close", "adjusted_close")
-    }
-    volume = _number(raw.get("volume"), positive=False)
-    if (
-        prices["low"] > min(prices["open"], prices["close"])
-        or prices["high"] < max(prices["open"], prices["close"])
-        or prices["low"] > prices["high"]
-    ):
-        raise ValueError("inconsistent_ohlc")
+    prices, volume = _bar_values(raw)
     return MappingProxyType(
         {
             **identity,
@@ -256,6 +249,61 @@ def _bar(  # noqa: PLR0913 -- one provider row and its resolved context
     )
 
 
+def _bar_values(raw: Mapping[str, object]) -> tuple[dict[str, float], float]:
+    """A bar's prices and volume: finite JSON numbers, prices above zero, consistent OHLC."""
+    prices = {
+        name: _number(raw.get(name)) for name in ("open", "high", "low", "close", "adjusted_close")
+    }
+    volume = _number(raw.get("volume"), positive=False)
+    if (
+        prices["low"] > min(prices["open"], prices["close"])
+        or prices["high"] < max(prices["open"], prices["close"])
+        or prices["low"] > prices["high"]
+    ):
+        raise ValueError("inconsistent_ohlc")
+    return prices, volume
+
+
+def warned_value_reason(dataset: str, raw: Mapping[str, object]) -> str | None:
+    """Why one row of a warned download fails the clean path's value checks, else ``None``.
+
+    Only the row's own values are judged, never its identity (the promotion resolves that
+    with its pinned snapshot): an ISO ``YYYY-MM-DD`` date and, for bars, the checks of
+    ``_bar``; for splits and dividends, those of ``_action``.
+    """
+    day = raw.get("date")
+    if not isinstance(day, str) or _ISO_DAY.fullmatch(day) is None:
+        return "invalid_date"
+    try:
+        date.fromisoformat(day)
+    except ValueError:
+        return "invalid_date"
+    try:
+        if dataset in ACTION_DATASETS:
+            _action_values(dataset, raw)
+        else:
+            _bar_values(raw)
+    except (ValueError, TypeError) as error:
+        return str(error)
+    return None
+
+
+def warned_value_failures(history: CompletedHistory) -> tuple[tuple[int, str], ...]:
+    """(ordinal, reason) of every row of a warned download that fails its value checks."""
+    if not history.provider_warning:
+        return ()
+    dataset = history.job.dataset
+    found = ((ordinal, warned_value_reason(dataset, raw)) for ordinal, raw in
+             enumerate(history.rows))  # fmt: skip
+    return tuple((ordinal, reason) for ordinal, reason in found if reason is not None)
+
+
+def _warned(ordinal: int, raw: Mapping[str, object], dataset: str) -> Mapping[str, object]:
+    """A warned row, held as partial when its values pass and with its failure otherwise."""
+    reason = warned_value_reason(dataset, raw)
+    return _held(ordinal, PARTIAL if reason is None else reason, raw)
+
+
 def _normalize(
     history: CompletedHistory, identities: Mapping[str, Mapping[str, str]], fixed_symbol: str | None
 ) -> NormalizedHistory:
@@ -263,15 +311,7 @@ def _normalize(
     fingerprint = history.job.fingerprint
     for ordinal, raw in enumerate(history.rows):
         if history.provider_warning:
-            rejected.append(
-                MappingProxyType(
-                    {
-                        "ordinal": ordinal,
-                        "reason": "provider_reported_partial",
-                        "source_row": dict(raw),
-                    }
-                )
-            )
+            rejected.append(_warned(ordinal, raw, history.job.dataset))
             continue
         symbol = fixed_symbol or str(raw.get("code")) + "." + str(raw.get("exchange_short_name"))
         try:
@@ -342,7 +382,25 @@ def _action(
     symbol = str(raw.get("code")) + "." + str(raw.get("exchange"))
     identity = _identity(symbol, identities)
     observed = date.fromisoformat(str(raw["date"]))
-    if history.job.dataset == "splits":
+    values = _action_values(history.job.dataset, raw)
+    return MappingProxyType(
+        {
+            **identity,
+            "provider_symbol": symbol,
+            "date": observed,
+            **values,
+            "source_fingerprint": fingerprint,
+            "raw_sha256": history.raw_sha256,
+            "retrieved_at": history.retrieved_at,
+            "source_row": ordinal,
+            "independent_identity_verified": False,
+        }
+    )
+
+
+def _action_values(dataset: str, raw: Mapping[str, object]) -> dict[str, object]:
+    """A split ratio or dividend as the provider's text; nothing is repaired."""
+    if dataset == "splits":
         ratio = _text(raw, "split", required=True)
         match = _RATIO.fullmatch(ratio or "")
         if match is None:
@@ -365,19 +423,7 @@ def _action(
             "payment_date": _text(raw, "paymentDate"),
             "period": _text(raw, "period"),
         }
-    return MappingProxyType(
-        {
-            **identity,
-            "provider_symbol": symbol,
-            "date": observed,
-            **values,
-            "source_fingerprint": fingerprint,
-            "raw_sha256": history.raw_sha256,
-            "retrieved_at": history.retrieved_at,
-            "source_row": ordinal,
-            "independent_identity_verified": False,
-        }
-    )
+    return values
 
 
 def normalize_bulk_actions(
@@ -385,8 +431,9 @@ def normalize_bulk_actions(
 ) -> NormalizedHistory:
     """One exchange-day of splits or dividends, values kept as the provider's text.
 
-    Rows of a download the gateway reported as partial are all held with the reason
-    ``provider_reported_partial``; rows without an explicit identity or with a value
+    Rows of a download the gateway reported as partial are all held: with the reason
+    ``provider_reported_partial`` when their values pass, otherwise with the value's
+    failure (``warned_value_reason``); rows without an explicit identity or with a value
     that is not a positive decimal are held with that reason. Nothing is repaired.
     """
     if history.job.tool_id != EOD_TOOL or history.job.dataset not in ACTION_DATASETS:
@@ -395,7 +442,7 @@ def normalize_bulk_actions(
     fingerprint = history.job.fingerprint
     for ordinal, raw in enumerate(history.rows):
         if history.provider_warning:
-            rejected.append(_held(ordinal, "provider_reported_partial", raw))
+            rejected.append(_warned(ordinal, raw, history.job.dataset))
             continue
         try:
             accepted.append(_action(history, raw, ordinal, identities, fingerprint))
@@ -419,7 +466,7 @@ def normalize_fx_history(history: CompletedHistory) -> NormalizedHistory:
     fingerprint = history.job.fingerprint
     for ordinal, raw in enumerate(history.rows):
         if history.provider_warning:
-            rejected.append(_held(ordinal, "provider_reported_partial", raw))
+            rejected.append(_warned(ordinal, raw, history.job.dataset))
             continue
         try:
             bar = dict(_bar(history, raw, ordinal, symbol, currencies, fingerprint=fingerprint))

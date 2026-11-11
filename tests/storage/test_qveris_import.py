@@ -190,6 +190,42 @@ def test_a_warned_download_commits_an_empty_rows_table_and_its_held_rows(
     assert reasons == [("provider_reported_partial",)]
 
 
+def test_warned_rows_failing_their_value_checks_are_held_with_their_own_reason(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    root = tmp_path / "warned"
+    good = {"code": "123456", "exchange_short_name": "KO", **bar("2026-08-31")}
+    bad = {"code": "654321", "exchange_short_name": "KO", **bar("2026-08-31", low=13)}
+    complete(root, bulk_job("KO", "prices"), [good, bad], warning=True)
+    split = {"code": "123456", "exchange": "KO", "date": "2026-08-31"}
+    complete(root, bulk_job("KO", "splits"), [{**split, "split": "2/1"},
+                                              {**split, "code": "654321", "split": "0/1"}],
+             warning=True)  # fmt: skip
+    dividend = {"code": "123456", "exchange": "KO", "date": "2026-08-31", "currency": "KRW"}
+    complete(root, bulk_job("KO", "dividends"), [{**dividend, "dividend": "150"},
+                                                 {**dividend, "code": "1", "dividend": "-1"}],
+             warning=True)  # fmt: skip
+    complete(root, fx_job(), [bar("2026-08-03"), bar("2026-08-04", volume=-1)], warning=True)
+    result = import_completions(
+        root, _selected(root), parse_identity(identity_bytes()), workspace=ws
+    )
+    # Every warned row is still held; only rows failing the clean path's value checks
+    # carry their own reason, the others stay promotable as a partial response.
+    assert (result["rows"], result["held_rows"], result["provider_warnings"]) == (0, 8, 4)
+    reasons = {}
+    for unit in cast("list[dict[str, object]]", result["units"]):
+        (held,) = list_tables(ws, str(unit["held_source_id"]))
+        found = ws.market.execute(f'SELECT reason FROM "{held["target"]}" ORDER BY ordinal')  # noqa: S608 -- quoted
+        reasons[str(unit["kind"])] = [row[0] for row in found.fetchall()]
+    partial = "provider_reported_partial"
+    assert reasons == {
+        "bulk_prices": [partial, "inconsistent_ohlc"],
+        "splits": [partial, "invalid_split_ratio"],
+        "dividends": [partial, "invalid_dividend"],
+        "fx_history": [partial, "invalid_price_or_volume"],
+    }
+
+
 def test_actions_and_forex_commit_their_own_shapes(ws: Workspace, tmp_path: Path) -> None:
     root = tmp_path / "mixed"
     complete(

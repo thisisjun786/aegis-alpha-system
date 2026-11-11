@@ -340,7 +340,9 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   when it has rows, the held `quarantine` table first, both under the hex of the job's
   `complete.json` and its four page files. The identity document its rows used is lineage
   (`identity_sha256`), so a grown identity document never re-imports a job. A warned
-  download is held whole with `provider_reported_partial` and never blocks the import; a
+  download is held whole, each row with `provider_reported_partial` when its values pass
+  `qveris_native.warned_value_reason` and with that check's reason otherwise, and never
+  blocks the import; a
   committed rows source makes the unit `reused`. It never calls a provider.
 - `kr_identity` builds the KR registry document from three identity mappers
   (`eodhd.kr_symbol@1`, `kind.listings@1`, `dart.corp_codes@1`) over committed sources and
