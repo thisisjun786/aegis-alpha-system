@@ -74,6 +74,7 @@ DEFAULT_FACT_FORMS: Final = frozenset(
         "20-F", "20-F/A", "40-F", "40-F/A",
     }
 )  # fmt: skip
+ISSUER_SCOPES: Final = frozenset({"registered", "reporting", "all"})
 _CIK: Final = re.compile(r"[0-9]{10}")
 _DAY: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _ACCESSION: Final = re.compile(r"[0-9]{10}-[0-9]{2}-[0-9]{6}")
@@ -472,7 +473,9 @@ class SecPolicy:
     """What a run collects and how long it waits; its hash is the jobs' ``policy_hash``.
 
     ``issuers`` is ``registered`` (only filers whose ``mint_issuer('sec_cik', cik)`` the
-    installation's identity holds) or ``all``. ``lookback_days`` is how far before the
+    installation's identity holds), ``reporting`` (those and every filer a read index shows
+    filing a ``fact_forms`` periodic report, see ``reporting_filers``) or ``all``.
+    ``lookback_days`` is how far before the
     collection day the first run starts reading indexes. A wanted filing a filer's
     document does not list yet is asked again a day later, for ``listing_days`` after its
     index was read; its facts, which reach companyfacts after XBRL processing, for
@@ -487,8 +490,8 @@ class SecPolicy:
     fact_days: int = 14
 
     def __post_init__(self) -> None:
-        if self.issuers not in {"registered", "all"}:
-            raise ValueError("SEC issuers are registered or all")
+        if self.issuers not in ISSUER_SCOPES:
+            raise ValueError("SEC issuers are registered, reporting or all")
         if not self.fact_forms <= self.filing_forms:
             raise ValueError("fact forms are filing forms")
         for value in (self.lookback_days, self.listing_days, self.fact_days):
@@ -555,6 +558,30 @@ class Planned:
     request: Request
     reason: str
     wanted: tuple[str, ...] = ()
+    # The earliest filing date among the wanted filings of a document request.
+    oldest: date | None = None
+
+
+def reporting_filers(knowledge: SecKnowledge, policy: SecPolicy) -> frozenset[str]:
+    """The CIKs a read index shows filing a ``fact_forms`` report: SEC's reporting issuers.
+
+    A periodic report (10-K, 10-Q, 20-F, 40-F and their transition and amended forms) is
+    filed by an issuer with registered securities, so these filers are the issuers whose
+    filings and statements the ``reporting`` scope collects. The set grows with every
+    index the collector reads and never needs a registry write.
+    """
+    return frozenset(
+        filing.cik for filing in knowledge.filings.values() if filing.form in policy.fact_forms
+    )
+
+
+def oldest_first(planned: Sequence[Planned]) -> list[Planned]:
+    """Document requests by the earliest filing each wants, in their given order on a tie.
+
+    A run stops at its call budget, so a backlog larger than one run is asked over later
+    runs from its oldest filing on, submissions and companyfacts alike.
+    """
+    return sorted(planned, key=lambda item: item.oldest or date.min)
 
 
 def weekdays(first: date, last: date) -> Iterator[date]:
@@ -644,7 +671,14 @@ def _plan_documents(  # noqa: PLR0913 -- one planner for both document endpoints
             continue
         request = submissions(cik) if endpoint == SUBMISSIONS else companyfacts(cik)
         reason = "new_filing" if "new_filing" in reasons else min(cast("set[str]", reasons))
-        planned.append(Planned(request, reason, tuple(sorted(f.accession for f in filings))))
+        planned.append(
+            Planned(
+                request,
+                reason,
+                tuple(sorted(f.accession for f in filings)),
+                min(f.filed for f in filings),
+            )
+        )
     return planned, counts
 
 
