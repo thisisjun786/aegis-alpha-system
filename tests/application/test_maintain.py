@@ -22,7 +22,13 @@ from typing import cast
 import duckdb
 import pytest
 
-from aegis_alpha.application.maintain import Policies, Ports, plan_maintenance, run_maintenance
+from aegis_alpha.application.maintain import (
+    Policies,
+    Ports,
+    plan_maintenance,
+    promotion_streaks,
+    run_maintenance,
+)
 from aegis_alpha.application.maintain_config import (
     DartSettings,
     FredSettings,
@@ -38,6 +44,7 @@ from aegis_alpha.data.opendart_cohort import CohortPolicy
 from aegis_alpha.data.qveris_client import QverisResponse, QverisTransportError
 from aegis_alpha.storage import maintain_identity, maintain_promotion
 from aegis_alpha.storage.identity import mint_instrument
+from aegis_alpha.storage.maintain_promotion import STALE_AFTER_ZERO_PROMOTION_RUNS
 from aegis_alpha.storage.promotion.engine import promote
 from aegis_alpha.storage.provider_collection import committed_tables
 from aegis_alpha.storage.verification import verify_workspace
@@ -761,6 +768,52 @@ def test_every_stage_reports_its_elapsed_time_and_memory(tmp_path: Path) -> None
         assert cast("float", numbers["elapsed_seconds"]) >= 0
     stored = json.loads((world.home / "runtime" / "maintain-report.json").read_text())
     assert stored["stage_resources"] == resources
+
+
+def test_the_heads_stage_reads_the_previous_report_for_its_streaks(tmp_path: Path) -> None:
+    world = World(tmp_path)
+    world.config = replace(world.config, jobs_enabled=False)
+    stages = cast("dict[str, dict[str, object]]", world.run()["stages"])
+    assert stages["heads"]["previous_report"] == "missing"
+    heads = cast("list[dict[str, object]]", stages["heads"]["datasets"])
+    # Every catalog dataset is listed; none has a head in this installation.
+    assert {item["freshness"] for item in heads} == {"no_head"}
+    again = cast("dict[str, dict[str, object]]", world.run()["stages"])
+    assert again["heads"]["previous_report"] == "read"
+
+
+def _streak_head(sequence: int, *, lag: int | None = 1) -> dict[str, object]:
+    return {"dataset_id": "prices.kr.eodhd", "sequence": sequence, "lag_sessions": lag,
+            "freshness": "current", "stale_reasons": [], "zero_promotion_runs": None}  # fmt: skip
+
+
+def _streak(
+    previous: dict[str, object] | None, head: dict[str, object], collected: frozenset[str]
+) -> dict[str, object]:
+    known = {} if previous is None else {"prices.kr.eodhd": previous}
+    promotion_streaks([head], known, collected)
+    return head
+
+
+def test_runs_that_collect_but_never_promote_a_lagging_head_mark_it_stale() -> None:
+    qveris = frozenset({"qveris"})
+    head = _streak(None, _streak_head(3), qveris)  # nothing to compare with: no count
+    counts = [head["zero_promotion_runs"]]
+    for _ in range(STALE_AFTER_ZERO_PROMOTION_RUNS):
+        assert head["freshness"] == "current"
+        head = _streak(head, _streak_head(3), qveris)
+        counts.append(head["zero_promotion_runs"])
+    assert counts == list(range(STALE_AFTER_ZERO_PROMOTION_RUNS + 1))
+    assert (head["freshness"], head["stale_reasons"]) == ("stale", ["zero_promotion"])
+    # A run that collected nothing for it carries the count; a promotion resets it.
+    carried = _streak(head, _streak_head(3), frozenset({"fred"}))
+    assert (carried["zero_promotion_runs"], carried["freshness"]) == (
+        STALE_AFTER_ZERO_PROMOTION_RUNS, "stale")  # fmt: skip
+    advanced = _streak(head, _streak_head(4), qveris)
+    assert (advanced["zero_promotion_runs"], advanced["freshness"]) == (0, "current")
+    # Data already current needs no promotion: the count resets.
+    current = _streak(head, _streak_head(3, lag=0), qveris)
+    assert (current["zero_promotion_runs"], current["freshness"]) == (0, "current")
 
 
 def _kr_new_listing(world: KrWorld, *, symbol_list: bool) -> None:

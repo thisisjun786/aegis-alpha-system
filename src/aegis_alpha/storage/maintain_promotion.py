@@ -84,14 +84,21 @@ import hashlib
 import json
 import re
 from bisect import bisect_left, bisect_right
+from calendar import monthrange
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
-from typing import TYPE_CHECKING, Final, cast
+from functools import cache
+from itertools import pairwise
+from typing import TYPE_CHECKING, Final, Literal, cast
+from zoneinfo import ZoneInfo
 
 import duckdb
 
+from aegis_alpha.storage.calendar_declaration import packaged_declaration, parse_declaration
+from aegis_alpha.storage.dataset_catalog import CATALOG, catalog_entry
 from aegis_alpha.storage.kr_identity import KIND_REQUIRED
 from aegis_alpha.storage.kr_prices import CURRENCIES as KR_CURRENCIES
+from aegis_alpha.storage.market import generation_chain
 from aegis_alpha.storage.membership_pins import IdentityPin, membership_parts
 from aegis_alpha.storage.promotion import formats
 from aegis_alpha.storage.promotion.engine import dataset_head, promote
@@ -935,14 +942,269 @@ def unmapped(workspace: Workspace) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def dataset_heads(workspace: Workspace) -> list[dict[str, object]]:
-    """Every committed dataset's head version and its watermarks: the run's closing state."""
+# --- data freshness ---------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Expectation:
+    """How far a dataset's data should reach at a run, and when it is stale.
+
+    ``session``: the venue's last session closed by the run; ``previous_day``: the day
+    before the run's date at the venue (OpenDART answers a day's filings the next day).
+    Both count the lag in the venue's sessions. ``series``: each series' own period,
+    inferred from its latest observation periods, is expected once one further period has
+    passed after it ends; the lag counts periods and the dataset's is its worst series.
+    ``none``: no date the data must reach (declared calendars, event domains).
+    ``stale_after`` is the lag above which the dataset is stale; ``collector`` is the
+    maintenance stage that collects its sources.
+    """
+
+    kind: Literal["session", "previous_day", "series", "none"]
+    calendar: str | None = None
+    stale_after: int | None = None
+    collector: str | None = None
+
+
+# The one place freshness thresholds live. A catalog dataset that is not frozen has an entry.
+FRESHNESS: Final[Mapping[str, Expectation]] = {
+    "prices.kr.eodhd": Expectation("session", "XKRX", 2, "qveris"),
+    "prices.kr.eodhd.ref": Expectation("session", "XKRX", 2, "qveris"),
+    "prices.us.eodhd": Expectation("session", "XNYS", 2, "qveris"),
+    "actions.us.eodhd": Expectation("session", "XNYS", 5, "qveris"),
+    "actions.kr.eodhd": Expectation("session", "XKRX", 20, "qveris"),
+    "filings.us.sec": Expectation("session", "XNYS", 2, "sec"),
+    "fundamentals.us.sec": Expectation("session", "XNYS", 5, "sec"),
+    "filings.kr.dart": Expectation("previous_day", "XKRX", 2, "dart"),
+    "fundamentals.kr.dart": Expectation("previous_day", "XKRX", 5, "dart"),
+    "macro.us.alfred": Expectation("series", stale_after=2, collector="fred"),
+    "fx.usdkrw.fred": Expectation("series", stale_after=5, collector="fred"),
+    "macro.kr.bok": Expectation("series", stale_after=2),
+    "macro.kr.oecd": Expectation("series", stale_after=2),
+    "sessions.xnys": Expectation("none"),
+    "sessions.xkrx": Expectation("none"),
+    "status.kr.kind": Expectation("none", collector="kind"),
+    "classifications.us.sec": Expectation("none"),
+    "classifications.kr.kind": Expectation("none", collector="kind"),
+}
+# Consecutive runs whose collector succeeded while the head did not advance and the data
+# was behind (or had no expected date) before a dataset is stale.
+STALE_AFTER_ZERO_PROMOTION_RUNS: Final = 5
+# Providers whose subscription ended: every dataset of theirs is frozen. The catalog's own
+# ``frozen`` flag marks only the datasets it promotes from retained exports.
+FROZEN_PROVIDERS: Final = frozenset({"norgate", "fmp"})
+_SERIES_PERIODS: Final = 12
+_UTC_DAY: Final = "(DATE '1970-01-01' + CAST(floor({} / 86400000000.0) AS INTEGER))"
+# The column (or UTC date of an instant) that says how far each domain's data reaches.
+DATA_DATES: Final[Mapping[str, str]] = {
+    "prices": '"session_date"',
+    "corporate_actions": '"ex_date"',
+    "instrument_status": _UTC_DAY.format('"effective_from_us"'),
+    "fundamentals": _UTC_DAY.format('"available_at_us"'),
+    "macro_observations": '"observation_period"',
+    "fx_rates": _UTC_DAY.format('"fixing_at_us"'),
+    "filings": '"filed_date"',
+    "classifications": '"effective_from"',
+    "calendar_sessions": '"session_date"',
+    "estimates": '"target_period"',
+    "feature_values": _UTC_DAY.format('"feature_at_us"'),
+}
+_SERIES_KEYS: Final = {"macro_observations": '"series_id"',
+                       "fx_rates": '("base_currency" || \'/\' || "quote_currency")'}  # fmt: skip
+
+
+def _base(dataset_id: str) -> str:
+    entry = catalog_entry(dataset_id)
+    return dataset_id if entry is None else entry.dataset_id
+
+
+def frozen(dataset_id: str) -> bool:
+    """Whether the dataset's provider stopped: the catalog's flag or a frozen provider."""
+    entry = catalog_entry(dataset_id)
+    return (entry is not None and entry.frozen) or bool(
+        FROZEN_PROVIDERS & set(_base(dataset_id).split("."))
+    )
+
+
+def collector(dataset_id: str) -> str | None:
+    """The maintenance stage that collects the dataset's sources, if any."""
+    found = FRESHNESS.get(_base(dataset_id))
+    return None if found is None else found.collector
+
+
+@cache
+def _sessions(calendar: str) -> tuple[ZoneInfo, list[date], list[datetime]]:
+    """The packaged declaration's open sessions with their close instants, in order."""
+    raw = packaged_declaration(calendar)
+    declaration = parse_declaration(raw, hashlib.sha256(raw).hexdigest())
+    zone = ZoneInfo(declaration.timezone)
+    days, closes = [], []
+    for item in declaration.days():
+        if item.close_local is not None:
+            days.append(item.session_date)
+            closes.append(item.close_local.replace(tzinfo=zone))
+    return zone, days, closes
+
+
+def _expected_day(expectation: Expectation, now: datetime) -> date | None:
+    """The date the data should reach at ``now``; None past the packaged declaration."""
+    zone, days, closes = _sessions(cast("str", expectation.calendar))
+    if expectation.kind == "previous_day":
+        day = now.astimezone(zone).date() - timedelta(days=1)
+        return day if days and days[0] <= day < days[-1] else None
+    closed = bisect_right(closes, now)
+    if closed == 0 or closed == len(closes):
+        return None
+    return days[closed - 1]
+
+
+def _session_lag(calendar: str, data: date, expected: date) -> int:
+    _, days, _ = _sessions(calendar)
+    return max(0, bisect_right(days, expected) - bisect_right(days, data))
+
+
+# Month counts by the day gaps they span: monthly, quarterly, half-yearly, yearly.
+_MONTHLY: Final = {1: (28, 31), 3: (89, 92), 6: (181, 184), 12: (365, 366)}
+
+
+def _shift(day: date, cadence: int, steps: int) -> date:
+    """``day`` moved by ``steps`` periods: weekdays, or calendar months for monthly cadences."""
+    if cadence == 1:
+        moved = day
+        for _ in range(abs(steps)):
+            moved += timedelta(days=1 if steps > 0 else -1)
+            while moved.weekday() >= 5:  # noqa: PLR2004 -- Saturday and Sunday
+                moved += timedelta(days=1 if steps > 0 else -1)
+        return moved
+    months = next((m for m, (low, high) in _MONTHLY.items() if low <= cadence <= high), None)
+    if months is None:
+        return day + timedelta(days=cadence * steps)
+    index = day.year * 12 + day.month - 1 + months * steps
+    year, month = divmod(index, 12)
+    return date(year, month + 1, min(day.day, monthrange(year, month + 1)[1]))
+
+
+def _series_lag(periods: Sequence[date], today: date) -> tuple[date, int] | None:
+    """The latest expected period and the periods the series is behind it.
+
+    A period is expected once one further period has passed after it ends, so a daily
+    series' Monday is due on Wednesday and a month's on the first of the month after next.
+    A series with one period has no cadence and no lag.
+    """
+    ordered = sorted(set(periods))
+    gaps = [(later - earlier).days for earlier, later in pairwise(ordered)]
+    if not gaps:
+        return None
+    cadence = 1 if min(gaps) <= 3 else min(gaps)  # noqa: PLR2004 -- a weekend between weekdays
+    expected, lag = ordered[-1], 0
+    # Data ahead of the expectation: step back to the latest period already due.
+    while _shift(expected, cadence, 2) > today:
+        expected = _shift(expected, cadence, -1)
+    # Data behind it: every further period already due is one period of lag.
+    while _shift(_shift(expected, cadence, 1), cadence, 2) <= today:
+        expected = _shift(expected, cadence, 1)
+        lag += 1
+    return expected, lag
+
+
+def _chain(workspace: Workspace, generation_id: str) -> tuple[str, list[str]]:
+    chain = generation_chain(workspace.market, generation_id)
+    return str(chain[-1]["domain"]), [str(marker["generation_id"]) for marker in chain]
+
+
+def _data_through(workspace: Workspace, domain: str, generations: list[str]) -> date | None:
+    column = DATA_DATES.get(domain)
+    if column is None:
+        return None
+    row = workspace.market.execute(
+        f"SELECT max({column}) FROM {_quote(domain)} WHERE op<>'TOMBSTONE' "  # noqa: S608 -- code-owned columns and tables
+        "AND generation_id IN (SELECT unnest($g::VARCHAR[]))",
+        {"g": generations},
+    ).fetchone()
+    return None if row is None else cast("date | None", row[0])
+
+
+def _series_periods(
+    workspace: Workspace, domain: str, generations: list[str]
+) -> dict[str, list[date]]:
+    key, column = _SERIES_KEYS[domain], DATA_DATES[domain]
+    found: dict[str, list[date]] = {}
+    for series, period in workspace.market.execute(
+        f"SELECT s, d FROM (SELECT DISTINCT {key} AS s, {column} AS d FROM {_quote(domain)} "  # noqa: S608 -- code-owned columns and tables
+        "WHERE op<>'TOMBSTONE' AND generation_id IN (SELECT unnest($g::VARCHAR[]))) "
+        f"QUALIFY row_number() OVER (PARTITION BY s ORDER BY d DESC) <= {_SERIES_PERIODS}",
+        {"g": generations},
+    ).fetchall():
+        found.setdefault(str(series), []).append(cast("date", period))
+    return found
+
+
+def freshness(
+    workspace: Workspace, dataset_id: str, generation_id: str | None, now: datetime
+) -> dict[str, object]:
+    """How far the dataset's data reaches, how far it should, and its freshness state.
+
+    Read-only: the market rows of the head's chain and the packaged session calendars.
+    """
+    result: dict[str, object] = {
+        "data_through": None, "expected_through": None, "lag_sessions": None,
+        "lag_unit": None, "stale_after": None, "freshness": "no_head",
+        "stale_reasons": [], "stale_series": [], "zero_promotion_runs": None,
+    }  # fmt: skip
+    if generation_id is None:
+        return result
+    domain, generations = _chain(workspace, generation_id)
+    data = _data_through(workspace, domain, generations)
+    result["data_through"] = None if data is None else data.isoformat()
+    expectation = FRESHNESS.get(_base(dataset_id), Expectation("none"))
+    if frozen(dataset_id):
+        result["freshness"] = "frozen"
+        return result
+    if data is None:
+        result["freshness"] = "no_data"
+        return result
+    result["freshness"] = "untracked"
+    expected: date | None = None
+    lag: int | None = None
+    if expectation.kind in {"session", "previous_day"}:
+        expected = _expected_day(expectation, now)
+        if expected is not None:
+            lag = _session_lag(cast("str", expectation.calendar), data, expected)
+            result["lag_unit"] = "sessions"
+    elif expectation.kind == "series" and domain in _SERIES_KEYS:
+        today = now.astimezone(UTC).date()
+        lags = {series: found for series, periods in
+                _series_periods(workspace, domain, generations).items()
+                if (found := _series_lag(periods, today)) is not None}  # fmt: skip
+        if lags:
+            expected = max(found[0] for found in lags.values())
+            lag = max(found[1] for found in lags.values())
+            result["lag_unit"] = "periods"
+            result["stale_series"] = sorted(
+                series for series, found in lags.items()
+                if found[1] > cast("int", expectation.stale_after)
+            )  # fmt: skip
+    if lag is None:
+        return result
+    result.update(expected_through=cast("date", expected).isoformat(), lag_sessions=lag,
+                  stale_after=expectation.stale_after)  # fmt: skip
+    stale = lag > cast("int", expectation.stale_after)
+    result["freshness"] = "stale" if stale else "current"
+    result["stale_reasons"] = ["lag"] if stale else []
+    return result
+
+
+def dataset_heads(workspace: Workspace, *, now: datetime) -> list[dict[str, object]]:
+    """Every committed dataset's head, watermarks and data freshness at ``now``.
+
+    A watermark is the latest ingestion time, not how far the data reaches; ``freshness``
+    reports that. A catalog dataset without a committed version is listed as ``no_head``.
+    """
     heads: list[dict[str, object]] = []
-    for dataset_id, version, sequence, rows in workspace.state.execute(
-        "SELECT dataset_id, version, sequence, row_count FROM dataset_versions v "
+    for dataset_id, version, sequence, rows, generation_id in workspace.state.execute(
+        "SELECT dataset_id, version, sequence, row_count, generation_id FROM dataset_versions v "
         "WHERE status='committed' AND sequence=(SELECT max(sequence) FROM dataset_versions w "
         "WHERE w.dataset_id=v.dataset_id AND w.status='committed') ORDER BY dataset_id"
-    ):
+    ).fetchall():
         watermarks = {
             f"{provider}/{partition}": {"through_us": int(through), "version": str(committed)}
             for provider, partition, through, committed in workspace.state.execute(
@@ -958,6 +1220,14 @@ def dataset_heads(workspace: Workspace) -> list[dict[str, object]]:
                 "sequence": int(sequence),
                 "rows": int(rows),
                 "watermarks": watermarks,
+                **freshness(workspace, str(dataset_id), str(generation_id), now),
             }
         )
+    listed = {str(item["dataset_id"]) for item in heads}
+    heads.extend(
+        {"dataset_id": entry.dataset_id, "version": None, "sequence": None, "rows": 0,
+         "watermarks": {}, **freshness(workspace, entry.dataset_id, None, now)}
+        for entry in CATALOG if entry.dataset_id not in listed
+    )  # fmt: skip
+    heads.sort(key=lambda item: str(item["dataset_id"]))
     return heads
