@@ -59,7 +59,8 @@ from tests.storage.kr_identity_support import (
     kind_listing,
     symbol,
 )
-from tests.storage.promotion_support import register_symbols
+from tests.storage.promotion_support import add_source, register_symbols
+from tests.storage.promotion_support import bar as kr_bar
 from tests.storage.promotion_support import spec as price_spec
 from tests.storage.test_macro_fx import _rule, _spec
 from tests.storage.test_us_collection import POLICY, _history, _promote_alfred, _sec_spec
@@ -614,6 +615,47 @@ def test_new_kr_listings_advance_identity_and_every_kr_chain(tmp_path: Path) -> 
     assert world.qveris.execute_count == executed
     with open_workspace(world.home) as ws:
         assert {name: _head(ws, name) for name in heads} == state
+
+
+def test_warned_kr_bulk_days_continue_a_history_only_chain_and_the_store_verifies(
+    tmp_path: Path,
+) -> None:
+    world = KrWorld(tmp_path)
+    first = world.run()
+    assert first["exit_code"] == 0, first["failed_stages"]
+    snapshot = cast("dict[str, dict[str, object]]", first["stages"])["identity"]["snapshot"]
+    friday = MON - timedelta(days=3)
+    with open_workspace(world.home, writable=True, strategy_write=True) as ws:
+        # The operator's history backfill: bars only, no bulk generation in the chain.
+        history = add_source(ws, [kr_bar("000101.KO", friday, 52000.0, retrieved=SEOUL_DAY1)],
+                             tag="history")  # fmt: skip
+        rules = {"available_at_us": KR_PARTIAL_RULE, "revision_known_at_us": KR_PARTIAL_RULE}
+        backfill = price_spec([history], cast("dict[str, str]", snapshot), rules=rules,
+                              partition={"from": "2026-01-01", "to": "2027-01-01"},
+                              decimals=KRW)  # fmt: skip
+        assert promote(ws, *backfill, apply=True)["published"] is True
+    world.clock.advance(days=1)
+    world.qveris.rows = {**world.qveris.rows, **_kr_rows([WED], ["000101"])}
+    second = world.run()
+    assert second["exit_code"] == 0, second["failed_stages"]
+    stage = cast("dict[str, object]", cast("dict[str, object]", second["stages"])["promote"])
+    (bulk,) = [item for item in cast("list[dict[str, object]]", stage["datasets"])
+               if item["mapper"] == "eodhd.bulk_quarantine@1"]  # fmt: skip
+    assert (bulk["status"], bulk["derived_from"]) == ("advanced", "eodhd.bars@1")
+    assert [item["status"] for item in cast("list[dict[str, object]]", bulk["sources"])] == [
+        "promoted"
+    ] * 3  # Monday's, Tuesday's and Wednesday's warned downloads
+    listed = mint_instrument("krx_isin", isin("000010101"))
+    with open_workspace(world.home) as ws:
+        days = ws.market.execute(
+            "SELECT session_date FROM prices WHERE instrument_id=? ORDER BY 1", (listed,)
+        ).fetchall()
+        assert days == [(friday,), (MON,), (TUE,), (WED,)]
+        flagged = ws.market.execute(
+            "SELECT count(*) FROM quality_flags WHERE flag='provider_reported_partial'"
+        ).fetchone()
+        assert flagged == (3,)
+        assert verify_workspace(ws)["verified"] is True
 
 
 def test_a_plan_skips_legacy_shaped_kind_listings(tmp_path: Path) -> None:
