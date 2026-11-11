@@ -28,7 +28,18 @@ committed spec of the ``derive_from`` mapper (the history backfill's ``eodhd.bar
 ``aas data kr-prices`` writes for a bulk day. The report's ``template_spec_sha256`` is
 then the spec it came from and ``derived_from`` names its mapper. Once the chain holds a
 generation of the route's mapper, that spec is the template. A chain without a head is
-never derived. A maintenance spec is that spec with only these fields advanced:
+never derived.
+
+A route may also declare a ``start``: the mapper arguments, time rule and numeric rules of the
+first generation of a dataset collected before any chain existed (``actions.*.eodhd``,
+``fx.usdkrw.eodhd``, ``status.kr.kind``). It is used only for a dataset the caller names in
+``start``, and only while the chain holds no generation of the route's mappers (with or
+without a head: the dividends route of a chain its splits route started starts as well). The
+declared calendar dataset's committed head is the time rule's calendar pin (none:
+``no_calendar``) and a template that resolves identities pins the run's snapshot (none:
+``identity_unavailable``); the report says ``started``. Once a started generation exists,
+its spec is the template like any other. Without ``start`` such a dataset reports ``no_head``
+with its waiting sources. A maintenance spec is that spec with only these fields advanced:
 
 - ``target.parent``: the dataset head;
 - ``sources``: the one new source table;
@@ -104,13 +115,15 @@ from aegis_alpha.storage.promotion import formats
 from aegis_alpha.storage.promotion.engine import dataset_head, promote
 from aegis_alpha.storage.promotion.mappers import mapper
 from aegis_alpha.storage.promotion.mappers.fred import vintage_partitions
+from aegis_alpha.storage.promotion.spec import SPEC_SCHEMA
+from aegis_alpha.storage.promotion.time_rules import TIME_COLUMNS
 from aegis_alpha.storage.provider_collection import committed_tables
 from aegis_alpha.storage.raw import put_raw
 from aegis_alpha.storage.source_library import list_sources, list_tables
 from aegis_alpha.storage.state import atomic
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Collection, Mapping, Sequence
 
     from aegis_alpha.compute_resources import ComputeBudget
     from aegis_alpha.storage.workspace import Workspace
@@ -194,6 +207,22 @@ _SUMMARY: Final = (
 
 
 @dataclass(frozen=True, slots=True)
+class Start:
+    """The first template of a route's dataset: what an operator's first spec would declare.
+
+    ``time_rule`` is the rule document both time columns use; a ``calendar`` argument names
+    the calendar dataset whose committed head it pins. ``identity`` says whether the template
+    pins the run's identity snapshot; ``partitioned`` whether each step has a partition.
+    """
+
+    args: Mapping[str, object]
+    time_rule: Mapping[str, object]
+    decimal_rule: Mapping[str, str]
+    identity: bool = True
+    partitioned: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class Route:
     """One dataset built by one mapper from one collected source shape."""
 
@@ -209,12 +238,41 @@ class Route:
     """Arguments a derived template adds to the mapper's."""
     check: str | None = None
     """The predicate every row of a table the route claims must satisfy (``value_check``)."""
+    start: Start | None = None
+    """The first template of a dataset no chain holds yet, used when the caller names it."""
 
     @property
     def mappers(self) -> tuple[str, ...]:
         """The route's mapper and the earlier majors whose chains it continues."""
         return (self.mapper, *self.continues)
 
+
+def _actions(calendar: str, zone: str, numbers: Mapping[str, str]) -> Start:
+    """An EODHD action chain's first template: known at the ex-date's open on ``calendar``."""
+    venue = calendar.rsplit(".", 1)[1].upper()
+    rule = {"rule": "exdate_open@1", "basis": "record", "input": "ex_date",
+            "args": {"calendar": calendar, "calendar_id": venue, "venue": venue}}  # fmt: skip
+    return Start({"timezone": zone}, rule, numbers)
+
+
+# EODHD's daily FOREX bars follow the UTC day; a close is known at the XNYS close of its date
+# plus four hours, the end of the UTC day under New York daylight time (later in winter).
+FX_LAG_US: Final = 4 * 3_600_000_000
+_FX_START: Final = Start(
+    {"base": "USD", "quote": "KRW", "timezone": "UTC"},
+    {"rule": "session_close_plus_lag@1", "basis": "record", "input": "fixing_date",
+     "args": {"calendar": "sessions.xnys", "calendar_id": "XNYS", "venue": "XNYS",
+              "lag_us": FX_LAG_US}},
+    {"rate": "float_shortest@1"},
+    identity=False,
+)  # fmt: skip
+# A KIND listing is known by the end of its Seoul listing day, as a Norgate first date is.
+_STATUS_START: Final = Start(
+    {},
+    {"rule": "local_day_end@1", "basis": "record", "input": "status_date",
+     "args": {"timezone": "Asia/Seoul"}},
+    {},
+)  # fmt: skip
 
 # In dependency order: SEC facts take each filing's acceptance from the filings head.
 ROUTES: Final = (
@@ -236,19 +294,22 @@ ROUTES: Final = (
     Route("prices.kr.eodhd.ref", "eodhd.bulk_quarantine_adjusted@1", "qveris-bulk-quarantine-",
           "quarantine", _KR_PARTIAL, derive_from="eodhd.bars_adjusted@1",
           derive_args=_KR_BULK_ARGS, check=_KR_VALUES),
+    Route("actions.us.eodhd", "eodhd.splits@1", "qveris-splits-", "splits", _US_SYMBOL,
+          start=_actions("sessions.xnys", "America/New_York", {"ratio": "float_shortest@1"})),
+    Route("actions.us.eodhd", "eodhd.dividends@1", "qveris-dividends-", "dividends", _US_SYMBOL,
+          start=_actions("sessions.xnys", "America/New_York", {"amount": "decimal_text@1"})),
+    Route("actions.kr.eodhd", "eodhd.splits@1", "qveris-splits-", "splits", _KR_SYMBOL,
+          start=_actions("sessions.xkrx", "Asia/Seoul", {"ratio": "float_shortest@1"})),
+    Route("actions.kr.eodhd", "eodhd.dividends@1", "qveris-dividends-", "dividends", _KR_SYMBOL,
+          start=_actions("sessions.xkrx", "Asia/Seoul", {"amount": "decimal_text@1"})),
+    Route("fx.usdkrw.eodhd", "eodhd.fx_history@1", "qveris-fx-history-bars-", "bars",
+          "base_currency = 'USD' AND quote_currency = 'KRW'", start=_FX_START),
+    Route("status.kr.kind", "kind.status@1", "kind-listings-", "listings", start=_STATUS_START),
 )  # fmt: skip
 
 # Collected shapes whose dataset has no registered mapper yet: counted, never promoted.
-# The last field names the columns a table of the shape has (the KIND listings that
-# ``aas collect kind`` and ``aas identity kr-import`` commit, not the legacy import).
 UNMAPPED: Final = (
-    ("actions.us.eodhd", "qveris-splits-", "splits", "provider_symbol LIKE '%.US'", ()),
-    ("actions.us.eodhd", "qveris-dividends-", "dividends", "provider_symbol LIKE '%.US'", ()),
-    ("actions.kr.eodhd", "qveris-splits-", "splits", _KR_SYMBOL, ()),
-    ("actions.kr.eodhd", "qveris-dividends-", "dividends", _KR_SYMBOL, ()),
-    ("status.kr.kind", "kind-listings-", "listings", None, KIND_REQUIRED),
-    ("prices.us.eodhd", "qveris-bulk-quarantine-", "quarantine",
-     f"{_EXCHANGE} = 'US'", ()),
+    ("prices.us.eodhd", "qveris-bulk-quarantine-", "quarantine", f"{_EXCHANGE} = 'US'"),
 )  # fmt: skip
 
 
@@ -275,6 +336,7 @@ class DatasetRun:
     head: str | None = None
     template: str | None = None
     derived_from: str | None = None
+    started: bool = False
     sources: list[dict[str, object]] = field(default_factory=list)
     skipped: dict[str, int] = field(default_factory=dict)
 
@@ -286,6 +348,7 @@ class DatasetRun:
             "head": self.head,
             "template_spec_sha256": self.template,
             "derived_from": self.derived_from,
+            "started": self.started,
             "sources": self.sources,
             "skipped": self.skipped,
         }
@@ -590,6 +653,61 @@ def _chain_template(
     return found
 
 
+def _started(
+    workspace: Workspace, dataset_id: str, route: Route, identity: Mapping[str, str] | None
+) -> tuple[str, str, dict] | str:
+    """The route's declared first template, or why it cannot start (the run's skip reason).
+
+    The hash is that of the declared template; it is retained only as part of the specs
+    built from it.
+    """
+    declared = cast("Start", route.start)
+    args = dict(cast("Mapping[str, object]", declared.time_rule["args"]))
+    if "calendar" in args:
+        calendar = head_pin(workspace, str(args["calendar"]))
+        if calendar is None:
+            return "no_calendar"
+        args["calendar"] = calendar
+    if declared.identity and identity is None:
+        return "identity_unavailable"
+    rule = {**declared.time_rule, "args": args}
+    # The partition only says the template is partitioned; each step sets its own.
+    partition = {"from": "1970-01-01", "to": "1970-01-02"} if declared.partitioned else None
+    template = {
+        "schema_version": SPEC_SCHEMA,
+        "target": {"domain": mapper(route.mapper).domain, "dataset_id": dataset_id,
+                   "parent": None},
+        "sources": [],
+        "mapper": {"name": route.mapper, "args": dict(declared.args)},
+        "partition": partition,
+        "time_rules": dict.fromkeys(TIME_COLUMNS, rule),
+        "decimal_rule": dict(declared.decimal_rule),
+        "quality_rules": [],
+        "tombstone_policy": {"mode": "never"},
+        "identity_snapshot": dict(identity) if declared.identity and identity else None,
+    }  # fmt: skip
+    raw = formats.canonical(template)
+    return hashlib.sha256(raw).hexdigest(), route.mapper, json.loads(raw)
+
+
+def _run_template(
+    workspace: Workspace,
+    run: DatasetRun,
+    route: Route,
+    identity: Mapping[str, str] | None,
+    start: Collection[str],
+) -> tuple[tuple[str, str, dict] | None, str | None]:
+    """The run's template (continued, derived or started) and why a named start is blocked."""
+    found = _chain_template(workspace, run, route)
+    if found is not None or route.start is None or run.dataset_id not in start:
+        return found, None
+    declared = _started(workspace, run.dataset_id, route, identity)
+    if isinstance(declared, str):
+        return None, declared
+    run.started = True
+    return declared, None
+
+
 def head_pin(workspace: Workspace, dataset_id: str) -> dict[str, str] | None:
     row = workspace.state.execute(
         "SELECT version, generation_id, chain_hash, manifest_hash FROM dataset_versions "
@@ -786,12 +904,15 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
     now_us: int,
     routes: Sequence[Route] = ROUTES,
     evaluate: bool = True,
+    start: Collection[str] = (),
 ) -> dict[str, object]:
     """Plan, or apply in order, every route's new sources as the next generations.
 
     A plan with ``evaluate`` false lists each new source's steps and specs without
     planning their promotions. With ``identity_failed`` (the run's identity stage did not
-    complete), a route whose template pins an identity snapshot promotes nothing.
+    complete), a route whose template pins an identity snapshot promotes nothing. A
+    dataset named in ``start`` whose chain holds no generation of a route's mappers starts
+    from the route's declared ``start`` template.
     """
     if apply and not evaluate:
         raise ValueError("an applied maintenance promotion evaluates every step")
@@ -804,7 +925,7 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
             runs.append(run)
             run.skipped["done"] = 0
             run.head = dataset_head(workspace, dataset_id)
-            found = _chain_template(workspace, run, route)
+            found, blocked = _run_template(workspace, run, route, identity, start)
             # The chain continues with the mapper its latest generation used.
             run.mapper = route.mapper if found is None else found[1]
             resolution = (
@@ -812,15 +933,13 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
             )
             done = _done(workspace, dataset_id, resolution)
             pending = candidates(workspace, route, linked, shas, run.skipped, done=done)
-            if run.head is None:
-                run.status = "no_head" if pending else "current"
-                run.skipped["no_head"] = len(pending)
-                continue
             if found is None:
-                run.status = "no_template" if pending else "current"
-                run.skipped["no_template"] = len(pending)
+                reason = blocked or ("no_head" if run.head is None else "no_template")
+                run.status = reason if pending else "current"
+                run.skipped[reason] = len(pending)
                 continue
-            run.template, _, template = found
+            digest, _, template = found
+            run.template = None if run.started else digest
             if identity_failed and template.get("identity_snapshot") is not None:
                 # Without this run's snapshot, new listings would resolve against an older one.
                 run.status = "identity_unavailable" if pending else "current"
@@ -924,12 +1043,10 @@ def standing_unresolved(workspace: Workspace) -> dict[str, dict[str, object]]:
 def unmapped(workspace: Workspace) -> dict[str, int]:
     """Nonempty collected tables of each dataset that no registered mapper promotes yet."""
     counts: dict[str, int] = {}
-    for dataset_id, prefix, name, accept, columns in UNMAPPED:
+    for dataset_id, prefix, name, accept in UNMAPPED:
         for table in committed_tables(workspace, prefix):
             entry = table.entry
             if table.store != "market" or entry["name"] != name or not entry["rows"]:
-                continue
-            if columns and not set(columns) <= set(table.columns):
                 continue
             if accept is not None:
                 target = _quote(str(entry["target"]))

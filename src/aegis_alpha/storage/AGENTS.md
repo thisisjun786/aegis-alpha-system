@@ -247,8 +247,10 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   new source becomes the head's child under the latest committed spec that used one of those
   mappers, continued with that spec's mapper, with only parent, sources, partition, generation
   pins (to current heads), the maintenance identity snapshot and a `never` tombstone advanced,
-  and a `maintain_source@1` quality check marks the source done. It never starts a chain and
-  never changes a chain's rules or mapper: `classifications.kr.kind` continues a chain whose
+  and a `maintain_source@1` quality check marks the source done. It starts a chain only from a
+  route's declared `start` template for a dataset the caller names in `start` (`actions.*.eodhd`,
+  `fx.usdkrw.eodhd`, `status.kr.kind`; `aas maintain` names none yet), and never changes a
+  chain's rules or mapper: `classifications.kr.kind` continues a chain whose
   latest generation used `kind.industry@1` under `@1`, and moves to `kind.industry@2` only
   after an operator publishes an `@2` generation. A table under a route's prefix that lacks a
   column its mapper reads (`source_columns`), such as the legacy `korea.public_response@1`
