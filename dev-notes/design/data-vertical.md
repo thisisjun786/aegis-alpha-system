@@ -514,8 +514,14 @@ microsecond, 시간 입력은 `session_date` 하나다. 값 일부만 있는 bar
 `sec.submissions@1`과 `sec.companyfacts@1`은 [SEC 공시와 재무](#sec-공시와-재무)를 발행인 단위
 `filings`와 `fundamentals`로 옮기며, 재무 매퍼는 pin한 공시 generation을 참조로 조인한다.
 
-예정된 매퍼(Linear AAS-77, 대응표 DV-413~416): `actions.us.eodhd`·`actions.kr.eodhd`를 만드는 Qveris
-일간 `splits`·`dividends` 매퍼, `status.kr.kind`를 만드는 KIND 상장 상태 매퍼, `filings.kr.dart`에
+Qveris 일간 `splits`·`dividends`(`eodhd.splits@1`, `eodhd.dividends@1`)와 KIND 상장 상태(`kind.status@1`)
+매퍼도 [기업행동과 상장 상태 매퍼](#기업행동과-상장-상태-매퍼)가 소유한다. `eodhd.fx_history@1`은 Qveris
+`<PAIR>.FOREX` 일간 이력(`qveris-fx-history-bars-*` `bars`)의 `base_currency`·`quote_currency`·`date`·binary64
+`close`·`retrieved_at`을 읽어 명세의 `base`/`quote` 쌍 행만 `fx_rates`로 옮긴다. `rate`는 `close`를
+`float_shortest@1`에 넘기고(유한한 양수면 `present`, 없으면 `missing`, 그 밖은 `invalid`), `fixing_at_us`는
+명세 `timezone`(유지보수 시작 선언은 `UTC`)에서 `date`의 마지막 마이크로초, 시간 입력 `fixing_date`는 그 날짜,
+수집 시각은 `retrieved_at`이다. 수집기가 값이 맞지 않거나 경고된 내려받기의 bar를 `quarantine`에 두므로 이 매퍼는
+행 테이블만 읽는다. 예정된 매퍼(Linear AAS-77, 대응표 DV-416): `filings.kr.dart`에
 공시 목록(`list.json`)을 더하는 `dart.list`. identity 원천을 읽는 매퍼는 typed generation이
 아니라 등록 문서를 만든다. `eodhd.kr_symbol`, `kind.listings`, `dart.corp_codes`는
 [KR 등록](#kr-등록)이, `norgate.master`, `eodhd.us_symbol`, `fmp.profile`, `sec.tickers`는
@@ -635,6 +641,28 @@ part를 함께 pin한다. `CAPITAL` close는 비조정 close를 그 뒤 모든 �
   `-`를 `_`로 쓴 그 이름, 없거나 빈 유형은 `unspecified_split`이다. 분할의 `action_id`는 유형과 관계없이
   `split:<ex-date>`이므로 유형을 고친 revision은 앞선 행동을 SUPERSEDE한다. FMP 배당 통화는 US registry가 해석한 US
   상장 심볼의 거래 통화인 `USD`다.
+- `eodhd.splits@1`과 `eodhd.dividends@1`은 `aas collect qveris import`가 거래소 하루의 EODHD bulk 내려받기마다
+  commit하는 행 테이블(`qveris-splits-*` `splits`, `qveris-dividends-*` `dividends`)을 읽는다. 열은
+  `provider_symbol`(`<code>.<exchange>`), ex-date `date`, 공급자 값 텍스트, 수집 시각 `retrieved_at`이다. 경고된
+  내려받기의 행, 명시 identity가 없는 행, 양의 십진수가 아닌 값은 수집기가 이미 `quarantine`에 두었고, 한 심볼을
+  두 번 싣은 내려받기는 수집기가 거부하므로 행 테이블에는 심볼마다 행동이 하나다. instrument는 (`eodhd`,
+  `eodhd_symbol`, `provider_symbol`)로 명세 `timezone`의 ex-date 0시에 해석하고(일봉과 같은 key), 수집 시각은
+  `retrieved_at`이다. 분할은 `split`의 `<new>/<old>`에서 `action_type` `split`, `ratio` `new / old`(binary64,
+  `float_shortest@1`)이며, 모양이 다르거나 항이 양수가 아니면 `invalid`다. 배당은 `action_type` `dividend`,
+  `amount`는 지급한 그대로의 주당 현금이다. 공급자가 `unadjusted_value`를 밝히면 그 값, 아니면 `dividend`(EODHD가
+  뒤 분할로 조정하는 값이지만 ex-date 당일 내려받기에는 뒤 분할이 아직 없다)를 텍스트 그대로 `decimal_text@1`에
+  넘긴다. `currency`는 `dividend_currency`가 대문자 세 글자일 때 그 값, `record_date`·`pay_date`는 `YYYY-MM-DD`일 때만
+  남는다. 금액이 양의 십진수가 아니거나 통화가 ISO 코드가 아니면 `invalid`다. 달력은 US가 `sessions.xnys`,
+  KR이 `sessions.xkrx`다.
+
+`kind.status@1`은 KIND 목록(`kind-listings-*` `listings`의 `short_code`, `listed_on`, `retrieved_at_utc`,
+`kind.listings@1`이 읽는 열)을 `instrument_status`의 `listed` 사건(`status_event_id` `kind:listed`, `reason`
+`kind_listed_on`)으로 옮긴다. 시작은 `listed_on`의 Asia/Seoul 0시이고 끝은 없다(목록은 상장폐지를 말하지
+않는다). instrument는 (`kind`, `krx_short_code`)로 수집 시각에 해석하므로 단축코드는 KR 등록이 EODHD ISIN으로
+묶은 경우에만 상품에 닿는다. 수집 시각이 ingestion이고 partition 날짜는 그 Seoul 날짜다. 시간 입력
+`status_date`는 `listed_on`(1970-01-01 이전은 그 날로 올림)이며 명세는 Asia/Seoul `local_day_end@1`을 쓴다.
+지역만 다른 반복 행은 (`short_code`, `listed_on`, `retrieved_at_utc`)마다 한 번만 옮기고, 한 코드에 상장일이
+둘이면 자연키 반복으로 거부한다.
 
 `norgate.status@1`은 Norgate security master(`assetid`, `is_delisted`, `first_date`·`last_date` 텍스트)를
 `instrument_status`로 옮긴다. 인자 `event`가 master 행마다 사건 하나를 고른다. `listed`(모든 행)는
@@ -1075,10 +1103,10 @@ ASCII escape와 바이트까지 같다.
 | `sessions.xkrx` | `calendar_sessions` | canonical | `calendar.declared@1` | `declared_session_end@1` | 없음 | 없음 | 없음 | 아니오 | XKRX [선언 달력](#선언-달력) 문서. 관측 거래일은 대조 보고의 근거, 임시 휴장은 SUPERSEDE |
 | `actions.us.norgate` | `corporate_actions` | canonical | `norgate.dividends@1`, `norgate.capital_adjustments@1` | `exdate_open@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 예 | Norgate 조정 가격 part의 `CAPITAL` 행 전체. 배당이 첫 generation, 자본 사건이 그 child이고 파티션 없이 이력 전체가 한 generation이다. 달력은 `sessions.xnys` |
 | `actions.us.fmp.ref` | `corporate_actions` | reference | `fmp.dividends@1`, `fmp.splits@1` | `exdate_open@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 예 | FMP 동결 배당·분할 응답. 정정은 revision 번호순 generation. 달력은 `sessions.xnys` |
-| `actions.us.eodhd` | `corporate_actions` | canonical | 없음 | `exdate_open@1` | 없음 | 없음 | 없음 | 아니오 | Qveris 거래소 일간 `splits`·`dividends` 수집 원천([Qveris 수집과 원천 적재](#qveris-수집과-원천-적재)). 매퍼는 Linear AAS-77 |
-| `actions.kr.eodhd` | `corporate_actions` | canonical | 없음 | `exdate_open@1` | 없음 | 없음 | 없음 | 아니오 | Qveris 거래소 일간 `splits`·`dividends` 수집 원천(KO, KQ). 매퍼는 Linear AAS-77 |
+| `actions.us.eodhd` | `corporate_actions` | canonical | `eodhd.dividends@1`, `eodhd.splits@1` | `exdate_open@1` | `decimal_text@1`, `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage`, `volume_precision_limited` | 아니오 | Qveris 거래소 일간 `splits`·`dividends` 수집 원천([Qveris 수집과 원천 적재](#qveris-수집과-원천-적재))의 `US` 행. 배당 금액은 원문 텍스트, 분할 비율은 binary64. 달력은 `sessions.xnys`. [기업행동과 상장 상태 매퍼](#기업행동과-상장-상태-매퍼) |
+| `actions.kr.eodhd` | `corporate_actions` | canonical | `eodhd.dividends@1`, `eodhd.splits@1` | `exdate_open@1` | `decimal_text@1`, `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage`, `volume_precision_limited` | 아니오 | 같은 수집 원천의 `KO`·`KQ` 행. 달력은 `sessions.xkrx` |
 | `status.us.norgate` | `instrument_status` | canonical | `norgate.status@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | Norgate master의 상장(`event` `listed`)이 첫 generation, 상장폐지(`delisted`)가 그 child. `America/New_York`, 근거 `record` |
-| `status.kr.kind` | `instrument_status` | canonical | 없음 | 없음 | 없음 | 없음 | 없음 | 아니오 | KIND 상장법인목록 수집 원천(`kind-listings-*`). 상장 이력은 [KR 등록](#kr-등록)의 identity 구간으로 들어간다. 상태 매퍼는 Linear AAS-77 |
+| `status.kr.kind` | `instrument_status` | canonical | `kind.status@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | KIND 상장법인목록 수집 원천(`kind-listings-*`)의 상장(`listed`) 사건, 상장일 기준 Asia/Seoul. 단축코드는 [KR 등록](#kr-등록)의 identity snapshot으로 해석. 목록은 상장폐지를 말하지 않는다 |
 | `filings.us.sec` | `filings` | canonical | `sec.submissions@1` | `source_column@1` | 없음 | 없음 | 없음 | 아니오 | SEC submissions의 접수 시각 `acceptanceDateTime`. [SEC 공시와 재무](#sec-공시와-재무) |
 | `filings.kr.dart` | `filings` | canonical | `dart.fnltt_filings@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | DART 재무제표 응답의 접수번호, 접수일 기준 Asia/Seoul. 공시 목록(`list.json`) 수집 원천의 매퍼(`dart.list`)는 레지스트리에 없다(Linear AAS-77) |
 | `fundamentals.us.sec` | `fundamentals` | canonical | `sec.companyfacts@1` | `source_column@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | companyfacts. 공시마다 자기 record(accession은 dimensions). 시점은 pin한 `filings.us.sec` generation에서 accession으로 조인한 `accepted_at_us`이고 조인되지 않은 사실은 null. 같은 accession의 값이 바뀌면 SUPERSEDE |
@@ -1088,6 +1116,7 @@ ASCII escape와 바이트까지 같다.
 | `macro.kr.oecd` | `macro_observations` | canonical | `oecd.observations@1` | `unknown_null@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | legacy OECD 공개 응답. vintage와 공개 시각이 없어 strict 읽기는 고르지 않는다 |
 | `fx.usdkrw.norgate` | `fx_rates` | canonical | `norgate.fx_closes@1`, `norgate.fx_history@1` | `local_day_end@1` | `decimal_text@1` | 없음 | `time_precision_day`, `volume_precision_limited` | 예 | 원천 자료실 Norgate 기준 시리즈(2026-09-08까지)와 legacy 내보내기 편입본, 시간대 `Etc/GMT+12`. 우선순위는 소비자 pin |
 | `fx.usdkrw.fred` | `fx_rates` | canonical | `fred.fx_series@1` | `unknown_null@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | FRED DEXKOUS(legacy CSV 편입본과 ALFRED 수집). H.10 발표 지연 때문에 strict 읽기는 고르지 않는다. 우선순위는 소비자 pin |
+| `fx.usdkrw.eodhd` | `fx_rates` | canonical | `eodhd.fx_history@1` | `session_close_plus_lag@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 아니오 | Qveris `USDKRW.FOREX` 일간 이력(`qveris-fx-history-bars-*`)의 종가, UTC 날짜 끝이 fixing. 시점은 `sessions.xnys` 종가에 4시간을 더한다(가격과 같은 종가 규칙). 우선순위는 소비자 pin |
 | `classifications.us.norgate` | `classifications` | canonical | `norgate.classification@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | Norgate 증권 유형(`norgate.security_type`)과 상장 거래소(`norgate.exchange`) snapshot, 과거로 소급하지 않음. [분류](#분류) |
 | `classifications.us.sec` | `classifications` | canonical | `sec.sic@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | SEC SIC(`sec.sic`) snapshot, issuer 주체 |
 | `classifications.kr.kind` | `classifications` | canonical | `kind.industry@1`, `kind.industry@2` | `source_column@1` | 없음 | 없음 | 없음 | 아니오 | KIND 업종(`kind.industry`) snapshot, 단축코드를 identity snapshot으로 해석, 수집 시각부터 알려짐 |
