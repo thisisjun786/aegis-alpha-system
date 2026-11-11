@@ -410,19 +410,19 @@ def test_the_new_routes_see_collected_sources_and_start_only_named_datasets(
     blocked = _runs(promote_datasets(ws, apply=True, now_us=2, routes=routes, identity=identity,
                                      start=frozenset(NEW_DATASETS)))  # fmt: skip
     assert blocked[("actions.us.eodhd", "eodhd.splits@1")]["status"] == "no_calendar"
-    assert blocked[("fx.usdkrw.eodhd", "eodhd.fx_history@1")]["status"] == "no_calendar"
+    # The FX rule ends the UTC day and needs no calendar, so it starts here.
+    assert blocked[("fx.usdkrw.eodhd", "eodhd.fx_history@1")]["status"] == "advanced"
     opens(ws, "XNYS", (EX, NEXT))
     opens(ws, "XKRX", (EX,))
     unpinned = _runs(promote_datasets(ws, apply=False, now_us=3, routes=routes, identity=None,
                                       start=frozenset(NEW_DATASETS)))  # fmt: skip
     assert unpinned[("actions.us.eodhd", "eodhd.splits@1")]["status"] == "identity_unavailable"
-    assert unpinned[("fx.usdkrw.eodhd", "eodhd.fx_history@1")]["status"] == "planned"
+    assert unpinned[("fx.usdkrw.eodhd", "eodhd.fx_history@1")]["status"] == "current"
 
     started = _runs(promote_datasets(ws, apply=True, now_us=4, routes=routes, identity=identity,
                                      start=frozenset(NEW_DATASETS)))  # fmt: skip
     for key in (("actions.us.eodhd", "eodhd.splits@1"), ("actions.us.eodhd", "eodhd.dividends@1"),
-                ("actions.kr.eodhd", "eodhd.dividends@1"), ("fx.usdkrw.eodhd",
-                                                            "eodhd.fx_history@1")):  # fmt: skip
+                ("actions.kr.eodhd", "eodhd.dividends@1")):  # fmt: skip
         run = started[key]
         assert (run["status"], run["started"]) == ("advanced", True), (key, run)
     # The dividends generation continues the chain the splits generation started.
