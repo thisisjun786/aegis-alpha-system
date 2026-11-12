@@ -11,9 +11,21 @@ unresolved):
   receipt records. It covers the New York trading day it follows: the New York date of
   its retrieval, or the day before when it was retrieved before 09:30 New York time.
 - A row names an instrument only through its ISIN: the ISIN must carry a valid check
-  digit and be the registered, not superseded FMP ``isin`` of exactly one instrument with
-  a Norgate asset ID, and the row's currency must be USD. A ticker, a name, an exchange or
-  a price never names an instrument, and a list never mints one.
+  digit and be the registered, not superseded FMP or EODHD ``isin`` of exactly one
+  instrument with a Norgate asset ID or minted from that ISIN, and the row's currency must
+  be USD. A ticker, a name, an exchange or a price never names an instrument.
+- A valid, unregistered USD ISIN (``_register``) joins the one Norgate instrument without
+  an ISIN whose registered claim covers the row's symbol and day (unless the rows' type
+  differs from its registered asset type: ``list_isin_type_differs``), or, for a new listing (no
+  registered claim covers the day, every row is of a listing class, no claim held the
+  symbol before or the one before is an instrument minted from another ISIN), mints
+  ``mint_instrument('us_isin', isin)`` with the day as its first claim. After a Norgate
+  holder it stays ``list_isin_unregistered``: the two may be one security. An ISIN whose
+  rows (earlier lists included, whatever their day) land on a registered claim of another
+  instrument, or of its instrument under another symbol, is neither minted nor joined
+  (``list_registered_conflict``): a registered claim is never withdrawn. An instrument
+  minted from an ISIN is named by it directly, so its day is claimed alone where a
+  continuation is not possible (a new or reused ticker of that ISIN).
 - A weekday ``d`` whose observations all name instrument ``I`` for ``<Code>.US`` (and no
   other symbol of them names ``I``) is claimed when the latest earlier claim of the symbol
   (``before``: a registered claim of the master, an export or an earlier list, or a claim
@@ -33,8 +45,8 @@ unresolved):
   claims never overlap.
 
 Every day that cannot be claimed stays unresolved with its reason (data-vertical risk 7):
-``list_isin_missing``, ``list_isin_invalid``, ``list_isin_unregistered`` (a new listing or
-a security the registry never tied to an ISIN), ``list_isin_ambiguous``,
+``list_isin_missing``, ``list_isin_invalid``, ``list_isin_unregistered`` (a security the
+registry never tied to an ISIN that no rule above registers), ``list_isin_ambiguous``,
 ``list_currency_not_usd``, ``list_symbol_repeated``, ``list_isin_repeated``,
 ``list_observations_disagree``, ``list_not_bracketed`` (no registered or accepted claim
 shows the symbol earlier: a new or renamed listing), ``list_symbol_moved`` (the symbol
@@ -65,7 +77,7 @@ The contract is in dev-notes/design/data-vertical.md.
 from __future__ import annotations
 
 import re
-from bisect import bisect_left
+from bisect import bisect_left, insort
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
@@ -78,6 +90,7 @@ from aegis_alpha.storage.kr_identity import (
     EODHD_PROVIDER,
     EODHD_SHAPE,
     EODHD_TABLE,
+    UNBOUNDED,
     Evidence,
     MapperReport,
     SourceRows,
@@ -85,7 +98,13 @@ from aegis_alpha.storage.kr_identity import (
     pinned_rows,
 )
 from aegis_alpha.storage.source_identity import LINK_PREFIX
-from aegis_alpha.storage.us_identity import LIST_SOURCE, NEW_YORK, session_start_us
+from aegis_alpha.storage.us_identity import (
+    ISIN_ANCHOR,
+    LIST_SOURCE,
+    NEW_YORK,
+    VENUE,
+    session_start_us,
+)
 
 if TYPE_CHECKING:
     import sqlite3
@@ -125,6 +144,10 @@ OUT_OF_SCOPE_CLASSES: Final = frozenset(
 """Classes the Norgate-anchored US registry holds no instrument kind for."""
 REGISTRABLE: Final = frozenset({"list_isin_missing", "list_isin_unregistered"})
 """Reasons an ISIN-bearing source for an already registered instrument would resolve."""
+LISTING_CLASSES: Final = frozenset({"common_stock", "etf", "fund"})
+"""Classes whose unregistered ISIN may mint a new ``us_isin`` instrument."""
+_UNREGISTERED: Final = "unresolved:list_isin_unregistered"
+_REGISTERED_CONFLICT: Final = "list_registered_conflict"
 NOT_OBSERVED: Final = "list_not_observed"
 CLAIMABLE: Final = "list_claimable"
 RESOLVED: Final = "resolved"
@@ -137,9 +160,9 @@ _HELD: Final = (
     "ORDER BY token, valid_from_us"
 )
 _OWNERS: Final = (
-    "SELECT token, instrument_id FROM identity_assertions WHERE provider='fmp' "
-    "AND namespace='isin' AND assertion_id NOT IN (SELECT supersedes_assertion_id "
-    "FROM identity_assertions WHERE supersedes_assertion_id IS NOT NULL)"
+    "SELECT token, instrument_id, provider FROM identity_assertions WHERE provider IN "
+    "('fmp', 'eodhd') AND namespace='isin' AND assertion_id NOT IN (SELECT "
+    "supersedes_assertion_id FROM identity_assertions WHERE supersedes_assertion_id IS NOT NULL)"
 )
 
 
@@ -180,21 +203,28 @@ class Registry:
 
     held: tuple[Held, ...]
     owners: Mapping[str, frozenset[str]]
-    """ISIN -> instruments a registered FMP ``isin`` assertion names."""
+    """ISIN -> instruments a registered FMP or EODHD ``isin`` assertion names."""
     anchors: Mapping[str, str]
     """Instrument ID -> its Norgate asset ID."""
+    isin_anchors: Mapping[str, str] = field(default_factory=dict)
+    """Instrument ID -> the ISIN it was minted from (``us_isin``)."""
+    asset_types: Mapping[str, str] = field(default_factory=dict)
+    """Norgate instrument ID -> the asset type it was registered with."""
 
 
 def read_registry(state: sqlite3.Connection) -> Registry:
-    """The registered US symbol claims, FMP ISIN owners and Norgate anchors (SELECT only)."""
+    """The registered US symbol claims, ISIN owners and anchors (SELECT only)."""
     held = tuple(
         Held(str(token), str(instrument), int(start), None if end is None else int(end),
              str(source).startswith(LIST_SOURCE))
         for token, instrument, start, end, source in state.execute(_HELD)
     )  # fmt: skip
     owners: dict[str, set[str]] = defaultdict(set)
-    for token, instrument in state.execute(_OWNERS):
+    isin_anchors: dict[str, str] = {}
+    for token, instrument, provider in state.execute(_OWNERS):
         owners[str(token)].add(str(instrument))
+        if provider == "eodhd" and mint_instrument(ISIN_ANCHOR, str(token)) == instrument:
+            isin_anchors[str(instrument)] = str(token)
     anchors = {
         str(instrument): str(token)
         for instrument, token in state.execute(
@@ -203,7 +233,20 @@ def read_registry(state: sqlite3.Connection) -> Registry:
         )
         if mint_instrument("norgate_assetid", str(token)) == instrument
     }
-    return Registry(held, {key: frozenset(value) for key, value in owners.items()}, anchors)
+    asset_types = {
+        str(instrument): str(asset_type)
+        for instrument, asset_type in state.execute(
+            "SELECT instrument_id, asset_type FROM instruments"
+        )
+        if instrument in anchors
+    }
+    return Registry(
+        held,
+        {key: frozenset(value) for key, value in owners.items()},
+        anchors,
+        isin_anchors,
+        asset_types,
+    )
 
 
 # --- observations -------------------------------------------------------------------------
@@ -225,6 +268,9 @@ class Observation:
     claim of another instrument. A row naming no instrument contradicts nothing."""
     kind: str = "unknown"
     """The row's symbol class (``symbol_class``), for the report only."""
+    candidate: str | None = None
+    """The ``us_isin`` instrument a valid, unregistered USD ISIN would anchor. It names
+    nothing until a row of a listing class (``LISTING_CLASSES``) mints it."""
 
     def outcome(self) -> str:
         return self.instrument_id or f"unresolved:{self.reason}"
@@ -286,7 +332,9 @@ def _owner(
     if row["currency"] != "USD":
         return isin, None, "list_currency_not_usd"
     owners = {
-        item for item in registry.owners.get(cast("str", isin), ()) if item in registry.anchors
+        item
+        for item in registry.owners.get(cast("str", isin), ())
+        if item in registry.anchors or item in registry.isin_anchors
     }
     if not owners:
         return isin, None, "list_isin_unregistered"
@@ -314,9 +362,13 @@ def _observations(
         retrieved = instant_us(row["retrieved_at_utc"])
         isin, instrument, reason = _owner(row, registry)
         evidence = Evidence(source.snapshot_id, row_hash, retrieved)
+        kind = symbol_class(row.get("type"))
+        candidate = None
+        if reason == "list_isin_unregistered":
+            candidate = mint_instrument(ISIN_ANCHOR, cast("str", isin))
         listed.append(Observation(f"{code}.{EXCHANGE}", covered_day(retrieved), instrument,
-                                  reason, isin, evidence, instrument,
-                                  symbol_class(row.get("type"))))  # fmt: skip
+                                  reason, isin, evidence, instrument, kind,
+                                  candidate))  # fmt: skip
     return listed
 
 
@@ -350,7 +402,8 @@ def map_us_symbol_lists(
             else:
                 report.refuse(reason)
                 found.append(Observation(item.symbol, item.day, None, reason, item.isin,
-                                         item.evidence, item.names, item.kind))  # fmt: skip
+                                         item.evidence, item.names, item.kind,
+                                         item.candidate))  # fmt: skip
     return found, report
 
 
@@ -383,14 +436,20 @@ class SymbolClaims:
     """Each unresolved symbol-day's reason, symbol class and disposition."""
     claimed_kinds: list[str] = field(default_factory=list)
     """The symbol class of each assertion's end observation, in ``assertions`` order."""
+    instruments: list[dict[str, object]] = field(default_factory=list)
+    """The ``us_isin`` instruments new listings minted."""
+    identifiers: list[dict[str, object]] = field(default_factory=list)
+    """Their ``eodhd``/``isin`` anchors, and the ISINs joined to Norgate instruments."""
+    attached: int = 0
+    """ISINs joined to a Norgate instrument whose registered claim covered their day."""
 
     def document(self) -> dict[str, object]:
         document: dict[str, object] = {
             "schema": REGISTRY_SCHEMA,
             "issuers": [],
-            "instruments": [],
+            "instruments": sorted(self.instruments, key=lambda row: str(row["anchor_token"])),
             "assertions": sorted(
-                self.assertions,
+                [*self.assertions, *self.identifiers],
                 key=lambda row: (str(row["token"]), cast("int", row["valid_from_us"])),
             ),
         }  # fmt: skip
@@ -408,6 +467,8 @@ class SymbolClaims:
             "mapper": MAPPER,
             "rows": self.mapper.json(),
             "claims": len(self.assertions),
+            "registered_instruments": len(self.instruments),
+            "attached_isins": self.attached,
             "claimed_days": [day.isoformat() for day in sorted(self.claimed_days)],
             "already_claimed": self.already_claimed,
             "observed_days": None if not observed else
@@ -486,10 +547,10 @@ def _span(first: date, stop: date) -> dict[str, object] | None:
 
 
 def _assertion(
-    assetid: str, symbol: str, first: date, last: date, evidence: Evidence
+    anchor: tuple[str, str], symbol: str, first: date, last: date, evidence: Evidence
 ) -> dict[str, object]:
     return {
-        "instrument": {"anchor_namespace": "norgate_assetid", "anchor_token": assetid},
+        "instrument": {"anchor_namespace": anchor[0], "anchor_token": anchor[1]},
         "provider": "eodhd",
         "namespace": "eodhd_symbol",
         "token": symbol,
@@ -543,6 +604,38 @@ class _Index:
     """Each instrument's observed days and the symbol naming it, sorted by (day, symbol)."""
     seen: dict[str, list[tuple[date, str]]] = field(default_factory=lambda: defaultdict(list))
     """Each symbol's observed days and the instrument named, sorted by (day, instrument)."""
+    anchors: dict[str, tuple[str, str]] = field(default_factory=dict)
+    """Instrument -> its anchor (``norgate_assetid`` or ``us_isin``) and token."""
+    isins: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
+    """Instrument -> the ISINs registered for it or joined to it by this build."""
+    bound: dict[str, str] = field(default_factory=dict)
+    """ISIN -> the instrument this build minted from it or joined it to."""
+    pending: dict[str, list[tuple[date, str]]] = field(default_factory=lambda: defaultdict(list))
+    """Unregistered ISIN -> (day, symbol) of the observations carrying it as a candidate."""
+    asset_types: Mapping[str, str] = field(default_factory=dict)
+    """Norgate instrument -> its registered asset type."""
+    foreseen: frozenset[tuple[str, str]] = frozenset()
+    """(ISIN, instrument) an earlier pass of the build bound: their candidate observations
+    are vetoes from the start (``build_symbol_claims``)."""
+    late: set[tuple[str, str]] = field(default_factory=set)
+    """(ISIN, instrument) bound after a claim this pass accepted that their observations
+    contradict."""
+
+    @classmethod
+    def of(cls, registry: Registry) -> _Index:
+        """The registry's claims, anchors and ISINs, before any observation."""
+        index = cls(defaultdict(list), defaultdict(list), asset_types=registry.asset_types)
+        for item in registry.held:
+            index.held[item.token].append(item)
+            index.holdings[item.instrument_id].append(item)
+        index.anchors.update({key: ("norgate_assetid", value)
+                              for key, value in registry.anchors.items()})  # fmt: skip
+        index.anchors.update({key: (ISIN_ANCHOR, value)
+                              for key, value in registry.isin_anchors.items()})  # fmt: skip
+        for value, owners in registry.owners.items():
+            for owner in owners:
+                index.isins[owner].add(value)
+        return index
 
     def observe(self, observations: Iterable[Observation]) -> None:
         """Index every observation that names an instrument, each list in day order."""
@@ -550,8 +643,63 @@ class _Index:
             if item.names is not None:
                 self.named[item.names].append((item.day, item.symbol))
                 self.seen[item.symbol].append((item.day, item.names))
+            elif item.candidate is not None:
+                self.pending[cast("str", item.isin)].append((item.day, item.symbol))
+        for isin, instrument in self.foreseen:
+            for day, symbol in self.pending.get(isin, []):
+                self.named[instrument].append((day, symbol))
+                self.seen[symbol].append((day, instrument))
         for found in (*self.named.values(), *self.seen.values()):
             found.sort()
+
+    def isin_anchor(self, instrument: str) -> str | None:
+        anchor = self.anchors.get(instrument)
+        return anchor[1] if anchor is not None and anchor[0] == ISIN_ANCHOR else None
+
+    def other_security(self, instrument: str, isin: str) -> bool:
+        """Whether ``instrument`` is minted from an ISIN other than ``isin``."""
+        anchored = self.isin_anchor(instrument)
+        return anchored is not None and anchored != isin
+
+    def bind(self, isin: str, instrument: str) -> None:
+        """From now on ``isin`` names ``instrument``: its observations become vetoes, as
+        they are for a build that reads the registered ISIN.
+
+        A veto on a day a claim this pass already accepted covers makes the binding
+        ``late``: the build is judged again with it foreseen."""
+        self.bound[isin] = instrument
+        self.isins[instrument].add(isin)
+        found = self.pending.pop(isin, [])
+        if (isin, instrument) in self.foreseen:
+            return
+        for day, symbol in found:
+            insort(self.named[instrument], (day, symbol))
+            insort(self.seen[symbol], (day, instrument))
+            if self._vetoes(symbol, instrument, day):
+                self.late.add((isin, instrument))
+
+    def registered_conflict(self, isin: str, instrument: str) -> bool:
+        """Whether a row carrying ``isin`` falls on a registered claim that holds its symbol
+        for another instrument or ``instrument`` under another symbol.
+
+        A registered claim is never withdrawn, so such an ISIN cannot name ``instrument``."""
+        for day, symbol in self.pending.get(isin, []):
+            if any(item.instrument_id != instrument and item.holds(day)
+                   for item in self.held.get(symbol, [])):  # fmt: skip
+                return True
+            if any(item.token != symbol and item.holds(day)
+                   for item in self.holdings.get(instrument, [])):  # fmt: skip
+                return True
+        return False
+
+    def _vetoes(self, symbol: str, instrument: str, day: date) -> bool:
+        """Whether an accepted claim covering ``day`` holds ``symbol`` for another instrument
+        or ``instrument`` under another symbol."""
+        if any(first <= day <= last and held != instrument
+               for first, last, held, _ in self.accepted.get(symbol, [])):  # fmt: skip
+            return True
+        return any(first <= day <= last and other != symbol
+                   for other, first, last in self.accepted_by.get(instrument, []))  # fmt: skip
 
     def accept(self, symbol: str, first: date, last: date, instrument: str, source: str) -> None:
         self.accepted[symbol].append((first, last, instrument, source))
@@ -614,14 +762,33 @@ def build_symbol_claims(
 
     ``context`` lists (earlier lists a maintenance run reads again) are veto evidence
     only: their rows can stop a claim, never anchor or make one.
+
+    An ISIN the build mints or joins on a later day turns its earlier candidate rows into
+    vetoes. When one of them falls on a claim the build already accepted, the build is
+    judged again with every such binding foreseen, its rows vetoes from the first day,
+    until no binding contradicts an accepted claim; the set only grows, so this ends.
     """
-    claims = SymbolClaims()
-    observations, claims.mapper = map_us_symbol_lists(sources, registry)
+    observations, mapper = map_us_symbol_lists(sources, registry)
     vetoes, _ = map_us_symbol_lists(context, registry)
-    index = _Index(defaultdict(list), defaultdict(list))
-    for item in registry.held:
-        index.held[item.token].append(item)
-        index.holdings[item.instrument_id].append(item)
+    foreseen: frozenset[tuple[str, str]] = frozenset()
+    while True:
+        claims, late = _build(observations, vetoes, registry, foreseen)
+        if not late:
+            claims.mapper = mapper
+            return claims
+        foreseen |= late
+
+
+def _build(
+    observations: Sequence[Observation],
+    vetoes: Sequence[Observation],
+    registry: Registry,
+    foreseen: frozenset[tuple[str, str]],
+) -> tuple[SymbolClaims, set[tuple[str, str]]]:
+    """One pass of ``build_symbol_claims``, and the bindings it made too late."""
+    claims = SymbolClaims()
+    index = _Index.of(registry)
+    index.foreseen = foreseen
     index.observe([*observations, *vetoes])
     _registry_edge(claims, registry)
     grouped: dict[tuple[str, date], list[Observation]] = defaultdict(list)
@@ -634,7 +801,8 @@ def build_symbol_claims(
     for (symbol, day), outcome in sorted(days.items(), key=lambda item: (item[0][1], item[0][0])):
         if _weekend(day):
             continue
-        judged = _judge(symbol, day, outcome, index)
+        judged, named = _settle(claims, index, symbol, day, outcome=outcome,
+                                items=grouped[symbol, day])  # fmt: skip
         if judged is None:
             claims.already_claimed += 1
             continue
@@ -650,21 +818,160 @@ def build_symbol_claims(
         first, start = judged
         evidence = min((item.evidence for item in grouped[symbol, day]),
                        key=lambda item: item.order())  # fmt: skip
-        claims.assertions.append(
-            _assertion(registry.anchors[outcome], symbol, first, day, evidence)
-        )
+        claims.assertions.append(_assertion(index.anchors[named], symbol, first, day, evidence))
         claims.claimed_kinds.append(_classified("", grouped[symbol, day], held_before=True)[1])
         claims.claimed_days.add(day)
-        index.accept(symbol, first, day, outcome, evidence.source)
+        index.accept(symbol, first, day, named, evidence.source)
         if first < day:
             claims.bridges.append({
                 "symbol": symbol, "from": first.isoformat(), "through": day.isoformat(),
                 "weekdays": len(_weekdays(first, day + timedelta(days=1))),
-                "start": {"day": start.day.isoformat(), "evidence": start.evidence},
+                "start": {"day": cast("_Before", start).day.isoformat(),
+                          "evidence": cast("_Before", start).evidence},
                 "end": {"day": day.isoformat(), "evidence": evidence.source},
             })  # fmt: skip
     _continued(claims, registry)
-    return claims
+    return claims, index.late - foreseen
+
+
+def _candidate(items: Sequence[Observation]) -> str | None:
+    """The one unregistered ISIN every observation of a symbol-day carries, or None."""
+    isins = {item.isin if item.candidate is not None else None for item in items}
+    return isins.pop() if len(isins) == 1 else None
+
+
+def _identifier(
+    anchor: tuple[str, str], isin: str, valid_from: int, evidence: Evidence
+) -> dict[str, object]:
+    return {
+        "instrument": {"anchor_namespace": anchor[0], "anchor_token": anchor[1]},
+        "provider": "eodhd",
+        "namespace": "isin",
+        "token": isin,
+        "valid_from_us": valid_from,
+        "valid_to_us": None,
+        "known_from_us": evidence.known_from_us,
+        "supersedes_assertion_id": None,
+        "source_snapshot_id": evidence.source,
+        "source_hash": evidence.source_hash,
+    }
+
+
+type _Judged = str | tuple[date, _Before | None] | None
+"""Why a symbol-day gets no claim, None when it is claimed already, or its claim's first
+day and the earlier claim it continues (None for a day claimed alone)."""
+
+
+def _settle(  # noqa: PLR0913 -- the build's state for one symbol-day
+    claims: SymbolClaims,
+    index: _Index,
+    symbol: str,
+    day: date,
+    *,
+    outcome: str,
+    items: Sequence[Observation],
+) -> tuple[_Judged, str]:
+    """Judge a symbol-day, reading an ISIN this build minted or joined as registered and
+    registering what an unregistered one shows. Returns the judgement and the instrument."""
+    value = _candidate(items) if outcome == _UNREGISTERED else None
+    if value is not None and value in index.bound:
+        outcome = index.bound[value]
+    judged = _judge(symbol, day, outcome, index)
+    if isinstance(judged, str) and value is not None and value not in index.bound:
+        return _register(claims, index, symbol, day, isin=value, items=items, reason=judged)
+    return judged, outcome
+
+
+def _register(  # noqa: PLR0913 -- the build's state for one symbol-day
+    claims: SymbolClaims,
+    index: _Index,
+    symbol: str,
+    day: date,
+    *,
+    isin: str,
+    items: Sequence[Observation],
+    reason: str,
+) -> tuple[_Judged, str]:
+    """Register what an unregistered ISIN shows on its symbol-day, or keep ``reason``.
+
+    Returns the day's judgement and the instrument it names. The ISIN must not be seen
+    under another symbol that day.
+
+    - A registered claim of one Norgate instrument without an ISIN covers the day: the
+      same symbol on the same day at two providers is one security (as the master's EODHD
+      symbols are), so the ISIN joins that instrument (``eodhd``/``isin``) and the day is
+      already claimed, unless the rows' type (as a mint would register it) differs from
+      the instrument's registered asset type (``list_isin_type_differs``).
+    - No registered claim covers the day, every row is of a listing class and no claim
+      held the symbol before, or the one before is an instrument minted from another ISIN:
+      a new listing. ``mint_instrument('us_isin', isin)`` is registered with the ISIN as
+      its anchor assertion and the day as its first claim.
+
+    Anything else, a symbol a Norgate instrument held before above all, stays
+    ``list_isin_unregistered``: the two may be one security, and a list cannot tell.
+    """
+    evidence = min((item.evidence for item in items), key=lambda item: item.order())
+    if any(seen == day and other != symbol for seen, other in index.pending.get(isin, [])):
+        return reason, _UNREGISTERED
+    covering = {item.instrument_id for item in index.held.get(symbol, []) if item.holds(day)}
+    if covering:
+        (owner,) = covering if len(covering) == 1 else ("",)
+        anchor = index.anchors.get(owner)
+        joinable = (
+            anchor is not None and anchor[0] == "norgate_assetid" and not index.isins.get(owner)
+        )
+        kind = _asset_type(items)
+        differs = index.asset_types.get(owner, kind) != kind
+        if anchor is None or not joinable or differs or index.registered_conflict(isin, owner):
+            refused = (
+                reason
+                if not joinable
+                else "list_isin_type_differs"
+                if differs
+                else _REGISTERED_CONFLICT
+            )
+            return refused, _UNREGISTERED
+        claims.identifiers.append(_identifier(anchor, isin, evidence.known_from_us, evidence))
+        claims.attached += 1
+        index.bind(isin, owner)
+        return None, owner
+    kinds = {item.kind for item in items}
+    before = index.before(symbol, day)
+    if not kinds <= LISTING_CLASSES or (
+        before is not None and not index.other_security(before.outcome, isin)
+    ):
+        return reason, _UNREGISTERED
+    instrument = mint_instrument(ISIN_ANCHOR, isin)
+    single = (
+        _REGISTERED_CONFLICT
+        if index.registered_conflict(isin, instrument)
+        else _single(symbol, day, instrument, index)
+    )
+    if isinstance(single, str):
+        return (single if single == _REGISTERED_CONFLICT else reason), _UNREGISTERED
+    anchor = (ISIN_ANCHOR, isin)
+    claims.instruments.append({
+        "anchor_namespace": ISIN_ANCHOR, "anchor_token": isin, "issuer": None,
+        "asset_type": _asset_type(items), "venue": VENUE,
+    })  # fmt: skip
+    claims.identifiers.append(_identifier(anchor, isin, UNBOUNDED, evidence))
+    index.anchors[instrument] = anchor
+    index.bind(isin, instrument)
+    return single, instrument
+
+
+def _asset_type(items: Sequence[Observation]) -> str:
+    """The asset type a symbol-day's rows give an instrument minted from their ISIN."""
+    return "etf" if {item.kind for item in items} == {"etf"} else "unclassified"
+
+
+def _single(symbol: str, day: date, outcome: str, index: _Index) -> str | tuple[date, None]:
+    """A claim of ``day`` alone, which the ISIN of its observations names directly."""
+    if index.contradicted(symbol, outcome, day, day):
+        return "list_contradicted"
+    if index.other_symbol(outcome, symbol, day, day):
+        return "list_symbol_moved"
+    return day, None
 
 
 def _classified(
@@ -704,9 +1011,7 @@ def _continued(claims: SymbolClaims, registry: Registry) -> None:
             claims.continued.add(str(row["token"]))
 
 
-def _judge(
-    symbol: str, day: date, outcome: str, index: _Index
-) -> str | tuple[date, _Before] | None:
+def _judge(symbol: str, day: date, outcome: str, index: _Index) -> _Judged:
     """Why a symbol-day gets no claim, None when a registered claim holds it already, or
     the first day of its claim and the earlier evidence the claim continues from."""
     if outcome.startswith("unresolved:"):
@@ -717,6 +1022,15 @@ def _judge(
     if covering:
         return "list_registered_conflict"
     before = index.before(symbol, day)
+    if index.isin_anchor(outcome) is not None:
+        return _judge_anchored(symbol, day, outcome, before, index)
+    return _judge_held(symbol, day, outcome, before, index)
+
+
+def _judge_held(
+    symbol: str, day: date, outcome: str, before: _Before | None, index: _Index
+) -> _Judged:
+    """A day continues the earlier claim of the same instrument, or gets the reason why not."""
     if before is None or before.outcome.startswith("unresolved:"):
         return "list_not_bracketed"
     if before.outcome != outcome:
@@ -725,6 +1039,26 @@ def _judge(
         earlier = before.evidence == "registered" and index.held_before(symbol, outcome, day)
         return "list_registered_conflict" if earlier else "list_symbol_moved"
     return _continue(symbol, day, outcome, before, index)
+
+
+def _judge_anchored(
+    symbol: str, day: date, outcome: str, before: _Before | None, index: _Index
+) -> _Judged:
+    """A day of an instrument minted from an ISIN, which that ISIN names directly.
+
+    The day is claimed alone when no claim held the symbol before, when the one before is
+    an instrument minted from another ISIN (a renamed or reused ticker), or when a
+    continuation from its own earlier claim cannot be bridged. A symbol a Norgate
+    instrument held before is judged as any other instrument's.
+    """
+    isin = cast("str", index.isin_anchor(outcome))
+    if before is None or index.other_security(before.outcome, isin):
+        return _single(symbol, day, outcome, index)
+    continued = _judge_held(symbol, day, outcome, before, index)
+    if before.outcome == outcome and isinstance(continued, str):
+        single = _single(symbol, day, outcome, index)
+        return continued if isinstance(single, str) else single
+    return continued
 
 
 def _continue(
@@ -827,8 +1161,11 @@ def build_increment(
     lists (``floor``: the earliest of their link instants), then reads the earlier lists
     linked from the earliest such start up to ``floor`` (keeping only
     rows of the claims' symbols or their instruments' ISINs) and builds again, until no
-    claim needs an earlier list it has not read. A daily run whose claims start today
-    reads none. Returns the claims and the number of earlier lists read.
+    claim needs an earlier list it has not read. An ISIN the build mints or joins is
+    judged against every earlier row carrying it, whatever its day, because a registered
+    claim that row contradicts is never withdrawn (``list_registered_conflict``). A daily
+    run whose claims start today and that mints or joins nothing reads none. Returns the
+    claims and the number of earlier lists read.
     """
     if not fresh:
         return build_symbol_claims(fresh, registry), 0
@@ -839,23 +1176,40 @@ def build_increment(
     need: int | None = None
     codes: set[str] = set()
     wanted: set[str] = set()
+    bound: set[str] = set()
     context: list[SourceRows] = []
     while True:
         built = build_symbol_claims(fresh, registry, context)
         reaching = [row for row in built.assertions if cast("int", row["valid_from_us"]) < floor]
-        if not reaching:
-            return built, len(context)
-        start = min(cast("int", row["valid_from_us"]) for row in reaching)
+        start = min((cast("int", row["valid_from_us"]) for row in reaching), default=None)
+        for row in built.identifiers:
+            anchor = cast("dict[str, str]", row["instrument"])
+            owner = mint_instrument(anchor["anchor_namespace"], anchor["anchor_token"])
+            isins[owner].add(str(row["token"]))
         more_codes = {str(row["token"]).removesuffix(f".{EXCHANGE}") for row in reaching}
-        more_isins = {value for row in reaching for value in isins[_owner_of(row, registry)]}
-        if need is not None and start >= need and more_codes <= codes and more_isins <= wanted:
+        more_isins = {value for row in reaching for value in _isins_of(row, isins)}
+        more_bound = {str(row["token"]) for row in built.identifiers}
+        if (
+            (start is None or (need is not None and start >= need))
+            and more_codes <= codes
+            and more_isins <= wanted
+            and more_bound <= bound
+        ):
             return built, len(context)
-        need = start if need is None else min(need, start)
+        if start is not None:
+            need = start if need is None else min(need, start)
         codes |= more_codes
         wanted |= more_isins
+        bound |= more_bound
 
-        keep = _keeper(frozenset(codes), frozenset(wanted))
-        context = [item.load(keep) for item in earlier if need <= item.linked_at_us < floor]
+        near = _keeper(frozenset(codes), frozenset(wanted | bound))
+        far = _keeper(frozenset(), frozenset(bound))
+        context = [
+            item.load(near if need is not None and need <= item.linked_at_us else far)
+            for item in earlier
+            if item.linked_at_us < floor
+            and (bound or (need is not None and need <= item.linked_at_us))
+        ]
 
 
 def _keeper(codes: frozenset[str], isins: frozenset[str]) -> Callable[[Mapping[str, object]], bool]:
@@ -863,9 +1217,12 @@ def _keeper(codes: frozenset[str], isins: frozenset[str]) -> Callable[[Mapping[s
     return lambda row: row.get("code") in codes or row.get("isin") in isins
 
 
-def _owner_of(row: Mapping[str, object], registry: Registry) -> str:
-    anchor = cast("dict[str, str]", row["instrument"])["anchor_token"]
-    return next(key for key, value in registry.anchors.items() if value == anchor)
+def _isins_of(row: Mapping[str, object], isins: Mapping[str, set[str]]) -> set[str]:
+    """The registered ISINs of a claim's instrument, and the one it is minted from."""
+    anchor = cast("dict[str, str]", row["instrument"])
+    namespace, token = anchor["anchor_namespace"], anchor["anchor_token"]
+    found = set(isins.get(mint_instrument(namespace, token), ()))
+    return found | {token} if namespace == ISIN_ANCHOR else found
 
 
 def build_from_workspace(

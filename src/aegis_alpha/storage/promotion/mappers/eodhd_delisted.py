@@ -28,7 +28,10 @@ the first day a delisting could be observed, so only that interval has no observ
 Today's list is the pinned delisted list retrieved last; the others (the latest earlier listed
 and delisted lists and the first delisted list, which maintenance pins beside it) are read only
 for the comparisons above and map no row. A row names an instrument only through its ISIN,
-resolved as the registered FMP ``isin`` at its retrieval instant: a reused ticker with another
+resolved as the registered FMP or EODHD ``isin`` at its retrieval instant (``us_symbols``
+registers an ISIN-minted instrument's anchor, and an ISIN a list joins to a Norgate
+instrument, at EODHD): an ISIN both name for one instrument names it once, one they name for
+two instruments is ambiguous and stays unresolved. A reused ticker with another
 ISIN is another instrument, and a row without an ISIN, or with one the snapshot does not hold,
 stays unresolved (data-vertical risk 7); nothing is derived from a code or a name. Such a row is
 mapped once as a last-bar event dated by the observation day, only so the engine counts it
@@ -105,7 +108,7 @@ class EodhdDelisted:
 
     def identity(self, args: Mapping[str, object]) -> IdentityKey:
         del args
-        return IdentityKey("fmp", "isin")
+        return IdentityKey("fmp", "isin", also=(("eodhd", "isin"),))
 
     def outcome(self, args: Mapping[str, object]) -> None:
         del args

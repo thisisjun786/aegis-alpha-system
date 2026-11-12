@@ -439,6 +439,24 @@ source_row_hash = sha256(정규 JSON ["aas-source-row-v1", [[열 이름, 값], .
 원천의 `sl:` 연결 시각이다. JSON 숫자는 binary64로 읽고, 2^53을 넘는 정수나 숫자가 아닌 JSON 값은
 `invalid`다. 나머지(해석, `bar_end_us`, 값 상태, 시간 입력)는 `eodhd.bars@1`과 같다.
 
+`eodhd.bulk_quarantine@2`는 `@1`과 같은 원천 모양·인자·token·통화·수집 시각·행 flag로 같은 `prices`를
+내되, 옮기는 행이 다르다(`@1`은 그대로다). 보류 사유가 아래 표에서 "승격"이고 값이 깨끗한 응답 경로의 bar
+검사(`qveris_native._bar_values`: open·high·low·close·adjusted_close·volume이 유한한 JSON 숫자이고 2^53을 넘는
+정수가 아님, 가격 > 0, 거래량 >= 0, low <= min(open, close), high >= max(open, close), low <= high, 실재하는
+`YYYY-MM-DD` 날짜)를 통과한 행만 세션 날짜와 매핑 행을 가지며 모두 `present`다. 나머지 행은 보류된 채
+남는다. 파티션 날짜도 매핑 행도 없고, 매퍼가 선언한 결과(`outcome`)로 모든 파티션에서 세어져 generation의
+`source_outcomes`에 `mapped:<사유>`, `value_check:<사유>`(승격 사유인데 값 검사 실패), `held:<사유>`(그 밖의
+사유)별 행 수로 남는다. 그래서 그런 행은 단계를 거부시키지도, 세어지지 않고 빠지지도 않는다. instrument는
+pin한 snapshot의 token 해석뿐이고, 해석되지 않는 행은 `unresolved`로 남아 값이 만들어지지 않는다.
+
+| 보류 사유 | `@2` | 이유 |
+| --- | --- | --- |
+| `provider_reported_partial` | 승격(값 검사 통과 시, flag `provider_reported_partial`) | 경고 응답의 행. 값은 import가 검사했지만 그 전 import의 행도 있어 다시 검사한다 |
+| `explicit instrument identity is required` | 승격(값 검사 통과 시, flag 없음) | 깨끗한 응답에서 import 때 identity 문서에 심볼이 없어 값 검사 전에 보류된 행. 승격 때 snapshot이 해석한다 |
+| `provider identity or currency differs` | 보류 | import 때 identity 문서가 거래소·통화·종류(ETF·보통주만)를 어긋난다고 판정했다. 승격이 그 판정을 뒤집지 않는다 |
+| `invalid_date`, `missing_or_non_numeric`, `non_finite`, `invalid_price_or_volume`, `inconsistent_ohlc` | 보류 | 값 검사를 어겨 그 사유로 보류된 행(DV-546) |
+| 그 밖의 사유, 사유 없음 | 보류 | 모르는 보류는 승격하지 않는다 |
+
 `eodhd.bars_quarantine@1`은 EODHD 일봉 이력 내려받기에서 수집기가 보류한 행(내려받기 하나의
 테이블, 수집 작업 `source_fingerprint`, `reason`, 심볼 없는 공급자 행 JSON `source_row_json`)을 같은
 canonical unadjusted `prices`로 옮긴다. 심볼과 작업 완료 시각은 그 원천 manifest의 `jobs` 목록
@@ -696,12 +714,14 @@ New York 날짜다. 그 밖의 구간에는 이 flag가 없다.
 
 오늘 목록은 pin된 상장폐지 목록 중 가장 늦게 받은 것이고, 나머지(유지보수가 함께 pin하는 이른 날짜의 마지막
 상장 목록, 마지막 상장폐지 목록, 첫 상장폐지 목록)는 비교에만 쓰고 행을 만들지 않는다. 상품은 ISIN을 그 행의
-수집 시각에 등록된 FMP `isin`으로 해석해서만 닿는다. 같은 티커라도 ISIN이 다르면 다른 상품이고, ISIN이 없거나
+수집 시각에 등록된 FMP 또는 EODHD `isin`으로 해석해서만 닿는다(`us_symbols`는 ISIN으로 발급한 상품의 anchor와
+목록이 Norgate 상품에 처음 잇는 ISIN을 `eodhd`/`isin`으로 등록한다). 두 공급자가 한 ISIN을 같은 상품에 주면 그
+상품 하나이고, 다른 상품에 주면 어느 쪽도 고르지 않고 모호함(`ambiguous`)으로 미해결이다. 같은 티커라도 ISIN이 다르면 다른 상품이고, ISIN이 없거나
 snapshot에 없는 행은 미해결로 남는다(위험 7). 코드·이름에서 아무것도 끌어내지 않는다. 그런 행은 엔진이
 미해결로 세도록 관측일을 시작으로 한 `last_bar` 사건 하나로만 옮기고, 미해결 행은 저장되지 않는다. 오늘
 목록에서 반복된 ISIN은 source row hash가 가장 작은 행 하나만 옮긴다. 시간 입력 `status_date`는 두 사건 모두
 관측일이며 명세는 `America/New_York` `local_day_end@1`을 쓰므로 시점은 목록 수집 시각으로 낮춰진다(그 목록 전에는
-상장폐지를 알 수 없다). 매퍼는 엔진의 `IDENTITY_ROWS`(snapshot의 `fmp`/`isin` 행)로 해석될 상품을 찾아 bar에
+상장폐지를 알 수 없다). 매퍼는 엔진의 `IDENTITY_ROWS`(snapshot의 `fmp`/`isin`과 `eodhd`/`isin` 행)로 해석될 상품을 찾아 bar에
 잇는다. 저장되는 해석은 엔진의 해석뿐이다. 목록끼리 비교하므로 파티션 날짜가 없다.
 
 ## 결정적 공통 열
@@ -1164,7 +1184,7 @@ ASCII escape와 바이트까지 같다.
 | `prices.kr.eodhd.ref` | `prices` | reference | `eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1` | `session_close_plus_lag@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage`, `provider_reported_partial` | 아니오 | 같은 두 원천 모양의 공급자 adjusted close. basis `total_return`, `fields='close'` |
 | `prices.us.norgate` | `prices` | canonical | `norgate.prices_none@1` | `session_close_plus_lag@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | Norgate 비조정 일봉 내보내기(`norgate-history-csv-*`의 미국 주식 `bars`). 다섯 값 모두 CSV 원문, 연도 partition마다 generation 하나 |
 | `prices.us.norgate.ref` | `prices` | reference | `norgate.prices_adjusted@1` | `session_close_plus_lag@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 아니오 | Norgate 조정 가격 part. `CAPITAL`은 `split_adjusted`, `TOTALRETURN`은 `total_return`, float32 저장값 |
-| `prices.us.eodhd` | `prices` | canonical | `eodhd.bars@1`, `eodhd.bulk_quarantine@1` | `session_close_plus_lag@1` | `float_shortest@1` | `cross_provider_mismatch@1` | `cross_provider_mismatch`, `decimal_rounding_tie`, `provider_float_storage`, `provider_reported_partial` | 아니오 | EODHD US 일간 수집과 부분 응답(경고) 일간 내려받기. 다운로드 하나가 generation 하나이고 같은 날짜의 다른 다운로드는 SUPERSEDE. 품질 규칙의 기준은 `prices.us.norgate` generation pin. import 때 identity가 없어 보류된 US 행의 재처리는 매퍼가 없다(#100) |
+| `prices.us.eodhd` | `prices` | canonical | `eodhd.bars@1`, `eodhd.bulk_quarantine@1`, `eodhd.bulk_quarantine@2` | `session_close_plus_lag@1` | `float_shortest@1` | `cross_provider_mismatch@1` | `cross_provider_mismatch`, `decimal_rounding_tie`, `provider_float_storage`, `provider_reported_partial` | 아니오 | EODHD US 일간 수집과 부분 응답(경고) 일간 내려받기. 다운로드 하나가 generation 하나이고 같은 날짜의 다른 다운로드는 SUPERSEDE. 품질 규칙의 기준은 `prices.us.norgate` generation pin. import 때 identity가 없어 보류된 US 행은 `eodhd.bulk_quarantine@2`가 승격한다(#100). 앞선 `@1` generation은 그대로 |
 | `prices.us.fmp.ref` | `prices` | reference | `fmp.eod_non_split@1` | `session_close_plus_lag@1` | `float_shortest@1`, `exact@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 예 | FMP 동결 legacy non-split 응답. 정정은 revision 번호순 generation. 원천 자료실 FMP normalized lineage(eod_full, dividend_adjusted)의 매퍼는 Linear AAS-68 |
 | `prices.ref.norgate` | `prices` | reference | `norgate.reference_closes@1`, `norgate.reference_history@1` | `local_day_end@1` | `decimal_text@1` | 없음 | `time_precision_day`, `volume_precision_limited` | 예 | Norgate 기준 시리즈 표와 지수·기타 데이터베이스 내보내기, `fields='close'`, 통화 `XXX`. 공급자가 종가 시각을 밝히지 않으므로 날짜 끝은 `Etc/GMT+12`. 음수 수준이 있는 시리즈는 `signed`로 고르지 않는다(Linear AAS-67) |
 | `sessions.xnys` | `calendar_sessions` | canonical | `calendar.declared@1` | `declared_session_end@1` | 없음 | 없음 | 없음 | 아니오 | XNYS [선언 달력](#선언-달력) 문서. 관측 거래일은 대조 보고의 근거, 임시 휴장은 SUPERSEDE |
@@ -1577,8 +1597,21 @@ commit된 것으로 계속한다. 공급자 하나의 거부나 실패가 다른
 필드는 어느 단계보다 먼저 설정 전체를 거부하므로 오타가 상한을 조용히 끄지 않는다. 자격 증명 파일은 그 공급자를
 부를 때만 읽는다.
 
+`jobs.start`는 유지보수가 시작 선언(`Route.start`)으로 첫 generation을 만들어도 되는 dataset 이름 목록이다(기본 `[]`,
+곧 아무것도 시작하지 않음). `run`과 `plan`은 이 목록을 `promote_datasets(start=...)`에 넘긴다. 카탈로그에도 route에도
+없는 이름(`.r<N>` 포함)은 `unknown datasets`, route가 시작을 선언하지 않은 이름(`prices.us.eodhd` 등)은
+`no declared start`, 같은 이름의 반복과 문자열 목록이 아닌 값도 설정 전체를 거부한다. 지금 넣을 수 있는 이름은
+`actions.us.eodhd`, `actions.kr.eodhd`, `fx.usdkrw.eodhd`, `status.kr.kind`, `status.us.eodhd`다. 목록에 있어도
+chain에 그 route 매퍼의 generation이 이미 있으면 시작하지 않고 그 명세로 잇는다. 그래서 같은 설정으로 두 번째
+실행은 아무것도 시작하지 않는다. 선행 조건이 없어 막힌 시작(`no_calendar`, `identity_unavailable`,
+`no_reference`)은 아무것도 쓰지 않고 보고만 하며 실패가 아니다(종료 코드에 영향 없음). `promote` 단계 보고의
+`start`는 `configured`(설정한 목록)와 `routes`(이름 붙인 dataset의 route마다 `dataset_id`, `mapper`, `outcome`)다.
+`outcome`은 `started`(선언 template으로 새 원천을 승격·계획), `no_source`(시작할 수 있지만 기다리는 원천 없음),
+막힌 사유 셋 중 하나, `has_generation`(chain에 generation이 있어 이어 붙이기만 함)이다.
+
 | 절 | 필수 | 상한과 선택 |
 | --- | --- | --- |
+| `jobs` | 없음 | `enabled`(false), `start`(`[]`, 시작할 dataset 이름) |
 | `kind` | 없음 | 없음(quota 없음) |
 | `dart` | `key_file` | `max_calls`(2,000), `daily_quota`(19,000) |
 | `sec` | `user_agent_file` | `max_calls`(2,000), `issuers`(`registered`·`reporting`·`all`), `since` |
@@ -1649,8 +1682,31 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
 
 - 관측은 `EXCHANGE_CODE=US`, `delisted=0` 목록의 행이고 page receipt의 수집 시각을 갖는다. 그 행은 수집 시각의
   뉴욕 날짜, 뉴욕 09:30 전이면 그 전날의 거래일을 덮는다.
-- 행은 ISIN으로만 상품을 가리킨다. 검사 숫자가 맞고, 정정되지 않은 등록 FMP `isin` assertion이 Norgate asset ID가
-  있는 상품 하나만 가리키며, 통화가 USD여야 한다. 티커·이름·거래소로는 상품을 정하지 않고 목록은 상품을 mint하지 않는다.
+- 행은 ISIN으로만 상품을 가리킨다. 검사 숫자가 맞고, 정정되지 않은 등록 FMP·EODHD `isin` assertion이 Norgate asset
+  ID가 있는 상품이나 그 ISIN에서 발급한 `us_isin` 상품 하나만 가리키며, 통화가 USD여야 한다. 티커·이름·거래소로는
+  상품을 정하지 않는다. 목록은 아래 **ISIN anchor** 규칙의 새 상장만 mint한다.
+- **ISIN anchor(#149, #100).** 결정(카이 11-12, 준 11-11 '일관된 데이터 우선')대로 US 새 상장의 instrument는
+  ISIN을 anchor로 발급한다. 추론·계산한 ISIN은 쓰지 않는다(Risk 7). 검사 숫자가 맞고 등록되지 않은 USD ISIN
+  `X`를 실은 행의 그날(그날 다른 심볼이 `X`를 싣지 않음)은 셋 중 하나다.
+  - **Norgate 상품에 잇기.** ISIN이 하나도 등록되지 않은 Norgate 상품 `N`의 등록 claim이 그 심볼의 그날을 덮으면
+    같은 날 두 공급자의 같은 심볼은 한 증권이므로(master의 EODHD 심볼과 같은 근거) `X`는 `N`의
+    `eodhd`/`isin` assertion(행 수집 시각부터 유효·알려짐)이 되고 새 상품은 생기지 않는다(보고 `attached_isins`).
+    단, 행의 종류(발급한다면 받을 `etf`/`unclassified`)가 `N`의 등록 자산 종류와 다르면 잇지 않고
+    `list_isin_type_differs`로 남는다.
+  - **새 상장.** 그날을 덮는 등록 claim이 없고, 행이 모두 상장 종류(`common_stock`, `etf`, `fund`)이며, 그 심볼의
+    앞 보유자(`before`)가 없거나 다른 ISIN에서 발급한 `us_isin` 상품이면 instrument `mint('us_isin', X)`(venue
+    `XNYS`, 모두 `etf`면 `etf` 아니면 `unclassified`, issuer 없음)와 anchor assertion `eodhd`/`isin`(항상 유효,
+    행 수집 시각부터 알려짐), 그날 하루의 `eodhd_symbol` claim을 등록한다(보고 `registered_instruments`).
+  - 그 밖은 `list_isin_unregistered`로 남는다. 특히 앞 보유자가 Norgate 상품이면 둘이 한 증권일 수 있고 목록으로는
+    가릴 수 없으므로 mint하지 않는다(중복 방지). 우선주·워런트 등 상장 종류가 아닌 행도 mint하지 않는다.
+  `us_isin` 상품은 ISIN이 곧 정체성이므로 그 ISIN을 실은 날은 앞 보유자가 없거나(티커 변경), 다른 ISIN의 `us_isin`
+  상품이거나(같은 티커·다른 ISIN, 티커 재사용), 자기 claim에서 이을 수 없을 때도 그날 하루로 claim한다(같은 거부권
+  아래). 같은 ISIN·다른 티커는 같은 상품, 같은 티커·다른 ISIN은 다른 상품이다. build 안에서 발급하거나 이은 ISIN은
+  그 뒤 판정부터 등록된 ISIN처럼 상품을 가리키고, 그 ISIN을 실은 관측(앞선 목록 포함)은 그때부터 거부권이 된다.
+  그 거부권이 같은 build가 이미 받아들인 claim(bridge·하루 claim)의 날에 떨어지면, build는 그런 발급·연결을 처음부터
+  거부권으로 알고 다시 판정한다(그 집합은 늘기만 하므로 끝난다). 그래서 나중에 등록된 ISIN이 가리키는 다른 상품과
+  모순되는 claim은 문서에 남지 않고, 그 날은 `list_contradicted`(bridge면 `bridge_unresolved`)로 남는다.
+  그래서 한 실행씩 도착한 목록도 모두를 한 번에 만든 것과 같은 claim을 등록한다(무작위 시나리오 테스트).
 - 평일 `d`의 관측이 모두 같은 상품 `I`를 가리키고(그 관측들의 다른 심볼은 `I`를 가리키지 않음), 그 심볼에 대해 무언가를
   보여 주는 바로 앞 claim(`before`: master·export·앞선 목록의 등록 claim, 또는 같은 build가 앞 날에 받아들인 claim)이
   `I`를 보이며, `before` 다음 날부터 `d`까지 `I`가 다른 US 심볼을 갖지 않을 때 claim을 만든다. 오늘의 목록은 앞쪽 끝이
@@ -1661,7 +1717,7 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
 - **거부권(veto).** 상품을 가리키는 관측은 판정됐든 아니든, 거부됐든 아니든(반복된 심볼·ISIN 행 포함) 모두 claim을
   막을 수 있다. claim은 그 심볼이 다른 상품을 가리키는 관측이 있는 날(`list_contradicted`), 그 상품이 다른 심볼로
   관측되거나 다른 심볼의 등록·수용 claim이 있는 날(`list_symbol_moved`)을 덮지 않는다. 상품을 가리키지 않는 행(ISIN
-  없음·무효·미등록·모호, USD 아님)은 아무것도 반박하지 않는다(앞쪽 끝도 거부권도 아니다). 토·일만 사이에 있는 하루
+  없음·무효·모호, USD 아님, 아직 발급·연결되지 않은 미등록 ISIN)은 아무것도 반박하지 않는다(앞쪽 끝도 거부권도 아니다). 토·일만 사이에 있는 하루
   claim의 창은 그날뿐이라 주말 관측은 막지 않는다.
 - **판정 순서와 앞선 목록.** 날들은 날짜 순으로 판정되므로 claim은 앞 날들의 claim에만 달려 있다. identity 단계는 새
   목록을 판정하고, 새 claim이 새 목록보다 이른 날을 덮으면 그 날부터 연결된 앞선 목록을 그 claim의 심볼과 상품 ISIN
@@ -1669,7 +1725,10 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
   만들지 않는다. 오늘 시작하는 하루 claim은 앞선 목록을 읽지 않는다. 그래서 목록이 덮는 날의 순서대로 한 실행씩
   도착하면 등록되는 claim은 모든 목록을 한 번에 만든 것과 같다(무작위 시나리오 테스트). 단, 이미 판정한 날에 대해
   다른 증거를 가진 목록이 뒤의 실행에 오면 등록된 claim은 철회되지 않는다(append-only). 그 날은 `list_registered_conflict`로
-  보고되어 운영자가 볼 일이다.
+  보고되어 운영자가 볼 일이다. 같은 이유로 build가 발급하거나 잇는 ISIN은 앞선 목록에서 그 ISIN을 실은 행을 날짜와
+  상관없이 모두 다시 읽어, 그 행이 등록 claim과 모순되면(그 심볼을 다른 상품이 갖거나 그 상품이 다른 심볼로 등록된 날)
+  발급·연결하지 않고 그날을 `list_registered_conflict`로 남긴다. 한 build 안에서는 받아들인 claim을 다시 판정해
+  거두지만, 이미 등록된 claim은 거둘 수 없으므로 ISIN 쪽을 거부한다.
 - 사이가 토·일뿐이면 claim은 뉴욕 하루 `d`다. 평일이 비어 있으면 claim 하나가 그 공백을 잇는다: `before` 다음 날의
   뉴욕 시작부터 `d` 다음 날의 뉴욕 시작까지, 최대 `MAX_BRIDGE_DAYS`(120) 역일. 이은 날은 양 끝에서 확인된 것이지
   날마다 관측된 것이 아니며, 보고의 `bridges`(심볼, 처음·끝 날, 평일 수, 양 끝의 증거, 표본 100), `bridged_symbols`,
@@ -1691,7 +1750,8 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
   `unknown`). 처리는 셋이다. 그날의 어느 행도 상품을 가리키지 않고 종류가 Norgate registry에 상품 종류가
   없는 것(`mutual_fund`, `preferred`, `warrant`, `unit`, `right`, `debt`)이면 `out_of_scope`. ISIN이 없거나
   미등록인데 그 심볼을 앞서 등록·수용 claim이 가졌으면 `register`(그 상품의 ISIN을 주는 원천이 들어오면
-  해석된다). 나머지(새 상장, 무효·반복 ISIN, 이동·앞 보유자 없음 등)는 `unresolved`로 사유와 함께 남는다.
+  해석된다). 나머지(ISIN 없는 새 상장, 무효·반복 ISIN, 이동·앞 보유자 없음 등)는 `unresolved`로 사유와 함께
+  남는다. ISIN이 있는 새 상장은 위 ISIN anchor 규칙으로 등록되므로 미해결 사유에 남지 않는다.
   보고의 `unresolved_classes`(사유→종류→날 수)와 `unresolved_dispositions`(처리→사유→날 수)가 이를 담는다.
 - 8일보다 긴 공백을 잇는 claim은 짧은 행(8일 이하)이 아니라 긴 행이므로, 그런 claim이 생기면 기다리던 모든
   `unresolved` 원천이 한 번 다시 계획되고(보류 세션의 따라잡기), 그 뒤의 하루 claim은 다시 계획을 부르지 않는다.
@@ -1718,7 +1778,7 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
 | `fx.usdkrw.fred` | `fred.fx_series@1` | `fred-series-csv-*` `observations` | |
 | `classifications.kr.kind` | `kind.industry@2`, 이어 받는 `kind.industry@1` | `kind-listings-*` `listings` | `short_code`·`industry`·`retrieved_at_utc` 열 |
 | `prices.us.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.US` |
-| `prices.us.eodhd` | `eodhd.bulk_quarantine@1` | `qveris-bulk-quarantine-*` `quarantine` | 사유 `provider_reported_partial`, 거래소 `US`, 모든 행이 값 검사 통과. 첫 template은 `eodhd.bars@1`에서 파생(`currencies` `US`→`USD`) |
+| `prices.us.eodhd` | `eodhd.bulk_quarantine@2` | `qveris-bulk-quarantine-*` `quarantine` | 받는 행: 사유가 `@2` 승격 사유이고 거래소 `US`. 남기는 행(`holds`): 다른 사유의 US 행과 거래소를 읽을 수 없는 행. 값 검사는 매퍼가 행마다 한다. `@1`을 이어 받지 않는다. 첫 template은 `eodhd.bars@1`에서 파생(`currencies` `US`→`USD`) |
 | `prices.kr.eodhd` | `eodhd.bars@1` | `qveris-bulk-bars-*` `bars` | 심볼이 `.KO`·`.KQ` |
 | `prices.kr.eodhd` | `eodhd.bulk_quarantine@1` | `qveris-bulk-quarantine-*` `quarantine` | 사유 `provider_reported_partial`, 거래소 `KO`·`KQ`, 모든 행이 값 검사 통과. 첫 template은 `eodhd.bars@1`에서 파생 |
 | `prices.kr.eodhd.ref` | `eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1` | 위 두 모양 | 위와 같음. bulk의 첫 template은 `eodhd.bars_adjusted@1`에서 파생 |
@@ -1730,9 +1790,9 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
 
 **KR 일간 bulk.** 경고와 함께 끝난 KR 일간 bulk 응답은 DV-294에 따라 행 전부가 `quarantine`에 남으므로, KR 일간
 가격은 bulk route로만 이어진다. route가 이 테이블을 맡으면(조건을 만족하는 행이 하나라도 있으면) 먼저 모든 행이
-깨끗한 응답 경로(`qveris_native._bar`)와 같은 값 검사를 통과하는지 센다. 유효한 JSON, open·high·low·close·
+깨끗한 응답 경로(`qveris_native._bar`)와 같은 값 검사를, 조건을 만족하는(받는) 행에만, 통과하는지 센다. 유효한 JSON, open·high·low·close·
 adjusted_close·volume이 모두 유한한 JSON 숫자(문자열·null·불리언 아님), 가격 > 0, 거래량 >= 0,
-low <= min(open, close), high >= max(open, close), low <= high, `YYYY-MM-DD` 날짜다. 한 행이라도 어기면 그
+low <= min(open, close), high >= max(open, close), low <= high, `YYYY-MM-DD` 날짜다. 받는 행이 한 행이라도 어기면 그
 테이블 전체를 승격하지 않고 `value_check`로 센다(`mixed`보다 먼저 본다). 경고 응답을 값 검사 없이 통과시키지
 않기 위해서다. chain에 bulk 매퍼의 generation이 아직 없으면(운영자가 `aas data kr-prices`로 이력만 올린 chain)
 같은 dataset의 이력 매퍼(`eodhd.bars@1`, `.ref`는 `eodhd.bars_adjusted@1`) 최신 committed 명세에서 매퍼 이름만
@@ -1754,7 +1814,8 @@ route 매퍼의 generation이 chain에 없을 때 선언한 template으로 시�
 달력 dataset의 committed head이고(없으면 `no_calendar`), identity를 해석하는 template은 실행의 snapshot을
 pin한다(없으면 `identity_unavailable`). 보고의 `started`가 참이고 `template_spec_sha256`은 null이다. 시작한 뒤에는
 그 generation의 명세가 template이다. 이름 붙이지 않으면 `no_head`로 남고 기다리는 원천 수를 센다. `aas maintain`은
-아직 이름을 넘기지 않는다(켜기는 운영 결정). 유지보수 명세는 template에서 다음만 바꾼다.
+설치본 `runtime.json`의 `jobs.start`(아래 설정, 기본 빈 목록)에 적힌 dataset만 이름 붙여 넘긴다(켜기는 운영
+결정이라 코드에 박지 않는다). 유지보수 명세는 template에서 다음만 바꾼다.
 
 - `target.parent`: dataset head.
 - `sources`: 새 원천 테이블 하나.
@@ -1790,11 +1851,17 @@ SELECT만, 새 상태 없음). 형식은 [운영 문서](../operations.md#하루
 끝난 것이다. 운영자의 승격이 pin한 원천은 첫 유지보수 실행에서 한 번 더 계획되어 `unchanged`로 기록되고, head보다
 이른 내려받기는 `stale`이라 head를 대체하지 않는다.
 
-매퍼가 아직 없는 dataset(import 때 identity가 없거나 다르다고 보류된 US 행의 `prices.us.eodhd` 재처리)의 수집 원천은
-승격하지 않고 `unmapped`에 dataset별 테이블 수로 남는다. 그 행의 사유는 `provider_reported_partial`이 아니라서
-`eodhd.bulk_quarantine@1`에서 세션 날짜가 없고(거부됨), @1의 뜻을 바꾸면 이미 게시된 KR generation의 manifest가
-다시 계산되지 않는다. 경고와 함께 끝난 US 일간 bulk 응답은 위 US bulk route가 KR과 같은 방식(값 검사, 이력
-명세에서 파생한 template)으로 잇는다.
+US 일간 bulk route는 `eodhd.bulk_quarantine@2`로 잇는다. `@1`은 `provider_reported_partial`만 세션 날짜를
+주는 계약(DV-153)이라 import 때 identity가 없어 보류된 행을 승격할 수 없고, `@1`의 뜻을 바꾸면 이미 게시된
+generation의 manifest가 다시 계산되지 않으므로 새 major를 둔다. route는 `@1`을 이어 받지 않으므로(`continues`
+없음) chain에 `@2` generation이 없으면 `eodhd.bars@1` 명세에서 template을 파생하고, 앞서 `@1`로 게시된
+generation과 그 원천의 `maintain_source@1` 기록은 그대로다. route가 받는 행은 `@2` 승격 사유의 US 행이고, 다른
+사유의 US 행과 거래소를 읽을 수 없는 행은 `holds`로 남겨 테이블을 `mixed`로 만들지 않는다. 값 검사는 매퍼가
+행마다 하므로 값이 나쁜 행(받는 행이든 다른 사유로 보류된 행이든)이 섞여도 같은 테이블의 유효한 행은 승격된다.
+보류 사유별 행 수는 단계 보고의 `source_outcomes`(generation manifest와 빈 delta의 `promotion_coverage@1`에도
+같은 값)에 남는다. 받는 행이 없는 US 테이블(모든 행이 `@2`가 남기는 사유)은 승격하지 않고 `unmapped`에
+dataset별 테이블 수로 남는다. KR route는 `@1` 그대로이고, 받는 행이 아닌 다른 사유 행이 섞인 KR 테이블은
+`mixed`로 건너뛴다(`@1`은 행을 남길 수 없다).
 
 **보고와 종료 코드.** 실행 보고(`aas-maintain-report-v1`)는 단계마다의 결과, 실패한 단계, 멈춘 공급자를 담고
 정확한 bytes를 `raw/`에, 같은 bytes를 `<runtime>/maintain-report.json`에 둔다. `stage_resources`는 단계마다
@@ -1864,7 +1931,9 @@ issuer_id     = "iss-" + sha256(정규 JSON ["aas-issuer-v1", anchor_namespace, 
 
 - 영구 anchor는 공급자가 재사용하거나 재배정하지 않는 식별자다. instrument는 `norgate_assetid`,
   `krx_isin`(KRX 상장 종목의 ISIN, 검사 숫자 확인. 국가 접두어는 발행인의 나라이므로 KRX에 상장한 외국
-  기업은 자기 ISIN(예: `KY`)을 쓴다), issuer는 `sec_cik`(10자리 0 채움), `dart_corp_code`(8자리)다.
+  기업은 자기 ISIN(예: `KY`)을 쓴다), `us_isin`(날짜가 있는 EODHD US 목록에 새로 나타난 상장의 ISIN.
+  검사 숫자 확인, 국가 접두어는 `krx_isin`처럼 발행인의 나라), issuer는 `sec_cik`(10자리 0 채움),
+  `dart_corp_code`(8자리)다.
   namespace가 하나 늘 때는 이 목록과 정규 표기 검사를 함께 추가한다.
 - 티커·EODHD 심볼·KRX 단축코드·경로·날짜는 anchor가 아니며 발급을 거부한다. 정규 표기가 아닌
   token(앞자리 0 누락 CIK, 검사 숫자가 틀린 ISIN 등)도 고쳐 쓰지 않고 거부한다.
@@ -1993,8 +2062,20 @@ commit된 원천을 pin과 대조해 읽고 문서와 보고를 새 파일에 �
 ### US 등록
 
 US identity는 다섯 원천을 identity 매퍼로 읽어 `aas-identity-registry-v1` 문서 하나로 만들고, 그 문서를
-`aas identity register`로 덧붙인다. 코드는 `storage/us_identity.py`다. Norgate는 동결 원천이므로 instrument는
-Norgate security master와 그보다 늦은 Norgate history 내보내기에서만 나온다.
+`aas identity register`로 덧붙인다. 코드는 `storage/us_identity.py`다. Norgate는 동결 원천이므로 이 문서의
+instrument는 Norgate security master와 그보다 늦은 Norgate history 내보내기에서만 나온다(새 상장의 `us_isin`
+instrument는 [유지보수 실행](#유지보수-실행)의 목록 증분이 등록한다).
+
+**ISIN 상품이 먼저 가진 날.** master 행의 티커 구간(상장 행은 아래 claim 구간, 상폐 행은 접미사를 뗀 티커의
+`first_date`~`last_date`)이나 그 asset ID의 export 창 claim 구간(개명한 새 티커도)이 그 티커의 등록 목록 claim을
+가진 `us_isin` 상품과 겹치면, 그 행은 ISIN 상품에
+합치지도, 따로 발급하지도 않고 문서에서 뺀다(`listings.isin_instrument_held`). 그 행의 asset ID·심볼·EODHD·FMP·
+issuer 주장과 export claim은 모두 남지 않는다. master에 없고 export만 아는 series도 같은 판정으로
+`exports.isin_instrument_held`에 남는다. 두 구간은 `_without_held` 한 곳에서 판정하고, 뺀 series 때문에 다른
+series의 창이 생기면(보유자·공유 티커가 줄어서) 다시 판정한다. Norgate는 지금 구독하지 않아 그 행을 ISIN 상품으로 옮기는
+흡수 경로는 쓰는 곳 없이 신원·export·소비자(universe, classification) 표면만 넓혔으므로 걷어냈다(G105, 결정은
+Norgate 재구독 전에 다시 정한다). 그래서 같은 증권이 두 상품이 되지 않는다. 반대 순서(Norgate 먼저)면 목록의
+ISIN이 Norgate 상품에 이어진다([유지보수 실행](#유지보수-실행)).
 
 | 매퍼 | 원천 | 만드는 행 |
 | --- | --- | --- |
@@ -3284,11 +3365,39 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-558 | Qveris `USDKRW.FOREX` 일간 이력 원천은 `fx.usdkrw.eodhd` generation으로 승격되고, 달력이 열지 않은 날은 시점이 null이며 바뀐 종가는 SUPERSEDE다 | `tests/storage/test_qveris_fx.py::test_usdkrw_forex_history_promotes_to_fx_usdkrw_eodhd` | 구현 |
 | DV-559 | 유지보수 route는 head 없는 `actions.*.eodhd`·`fx.usdkrw.eodhd` 원천을 `no_head` 후보로 보고, 호출자가 이름 붙인 dataset만 선언한 시작 template으로 시작하며(달력 head 없으면 `no_calendar`, snapshot 없으면 `identity_unavailable`), 시작한 chain은 자기 명세로 이어진다 | `tests/storage/test_qveris_actions.py::test_the_new_routes_see_collected_sources_and_start_only_named_datasets` | 구현 |
 | DV-560 | `status.kr.kind` route는 KIND 목록을 후보로 보고 legacy 모양을 `shape`로 건너뛰며, 이름 붙인 경우에만 수집일 partition으로 시작한다 | `tests/storage/test_kind_status.py::test_the_status_route_starts_the_kind_chain_only_when_named` | 구현 |
-| DV-561 | US 목록의 해석되지 않은 날은 사유마다 심볼 종류와 처리(`register`·`unresolved`·`out_of_scope`)를 보고하고, 상품을 가리키는 행은 종류와 상관없이 범위 밖이 아니며 claim은 생기지 않는다 | `tests/storage/test_us_symbols.py::test_every_unresolved_day_has_a_symbol_class_and_a_disposition` | 구현 |
+| DV-561 | US 목록의 해석되지 않은 날은 사유마다 심볼 종류와 처리(`register`·`unresolved`·`out_of_scope`)를 보고하고, 상품을 가리키는 행은 종류와 상관없이 범위 밖이 아니며 종류와 처리는 claim을 만들지 않는다(ISIN이 있는 새 상장은 DV-570으로 등록된다) | `tests/storage/test_us_symbols.py::test_every_unresolved_day_has_a_symbol_class_and_a_disposition` | 구현 |
 | DV-562 | `standing_unresolved`의 `prices.us.eodhd` 항목은 기다리는 행을 지금의 판정으로 사유·종류·처리별로 세고, 목록이 없는 날은 `list_not_observed`, 곧 등록될 날은 `list_claimable`, 등록된 날은 `resolved`다 | `tests/storage/test_us_symbols.py::test_the_standing_summary_counts_waiting_us_rows_by_reason_class_and_disposition` | 구현 |
-| DV-563 | 경고 US bulk 테이블은 이력 명세에서 파생한 `eodhd.bulk_quarantine@1` template(`US`→`USD`)으로 `prices.us.eodhd`를 잇고, import 때 identity가 없어 보류된 US 테이블은 route가 맡지 않고 `unmapped`에 남는다 | `tests/storage/test_maintain_promotion.py::test_a_warned_us_bulk_day_continues_the_us_chain_and_identity_held_rows_stay_out` | 구현 |
+| DV-563 | 경고 US bulk 테이블은 이력 명세에서 파생한 `eodhd.bulk_quarantine@2` template(`US`→`USD`)으로 `prices.us.eodhd`를 잇는다 | `tests/storage/test_maintain_promotion.py::test_a_warned_us_bulk_day_continues_the_us_chain_with_the_v2_mapper` | 구현 |
 | DV-564 | `reporting` 범위는 등록된 발행인이 없어도 읽은 색인에서 정기 보고서를 낸 제출자의 공시를 원하고 그 문서를 묻어 승격하며, 정기 보고서가 없는 제출자는 범위 밖으로 센다 | `tests/storage/test_us_collection.py::test_the_reporting_scope_wants_filers_of_periodic_reports_and_promotes_them` | 구현 |
 | DV-565 | 호출 상한을 넘는 문서 요청은 가장 이른 공시일 순으로 묻고 남은 요청은 다음 실행이 잇는다 | `tests/storage/test_us_collection.py::test_a_backlog_over_the_call_budget_is_asked_oldest_first_over_runs` | 구현 |
 | DV-566 | 유지보수 Qveris 계획은 US 종목 목록을 상장(`delisted=0`)과 상장폐지(`delisted=1`) 둘 다 관측일마다 묻는다 | `tests/application/test_maintain_qveris.py::test_the_us_symbol_lists_are_asked_listed_and_delisted_every_day` | 구현 |
 | DV-567 | `status.us.eodhd`는 첫 상장폐지 목록의 상품을 모두 `last_bar` 추정(`delisting_inferred`)으로 두고 2026-07-29~첫 관측일 구간만 `survivorship_unverified`를 달며, 다음 목록에서 전날 상장 목록에 있던 ISIN은 `observed`와 `last_bar` 사건을 함께 얻는다 | `tests/storage/test_us_delisted.py::test_delisted_lists_give_inferred_then_observed_events_by_isin` | 구현 |
 | DV-568 | 같은 티커의 다른 ISIN은 다른 상품의 사건이고, ISIN이 없거나 등록되지 않은 행은 미해결로 남아 `standing_unresolved`의 `status.us.eodhd` 항목에 사유·종류별로 세어진다 | `tests/storage/test_us_delisted.py::test_delisted_lists_give_inferred_then_observed_events_by_isin` | 구현 |
+| DV-569 | `us_isin`은 instrument anchor이고 그 ID는 고정된 해시 형식을 따르며, 기존 anchor의 ID는 바뀌지 않는다 | `tests/storage/test_identity_mint.py::test_identity_id_formats_are_frozen` | 구현 |
+| DV-570 | 등록되지 않은 유효 USD ISIN의 새 상장(앞 보유자 없음, 상장 종류)은 `mint('us_isin', ISIN)`과 anchor assertion, 그날 claim으로 등록되고, 같은 ISIN·다른 티커는 같은 상품, 같은 티커·다른 ISIN은 다른 상품이며, ISIN 없는 행과 상장 종류가 아닌 행은 미해결로 남는다 | `tests/storage/test_us_isin_anchor.py::test_a_new_listing_is_registered_on_its_isin_and_a_row_without_one_stays_unresolved` | 구현 |
+| DV-571 | ISIN이 없는 Norgate 상품이 앞서 가진 심볼의 미등록 ISIN은 새 상품을 만들지 않고 `list_isin_unregistered`(`register`)로 남는다 | `tests/storage/test_us_isin_anchor.py::test_a_new_isin_is_not_registered_over_a_symbol_whose_holder_has_no_isin` | 구현 |
+| DV-572 | Norgate 상품이 먼저면 그 등록 claim이 덮는 날의 목록 ISIN이 그 상품에 이어지고 뒤의 날은 같은 상품으로 claim되며 상품은 하나다 | `tests/storage/test_us_isin_anchor.py::test_norgate_first_then_the_isin_joins_the_norgate_instrument` | 구현 |
+| DV-573 | `us_isin` 상품이 먼저면 그 목록 claim과 티커 구간이 겹치는 뒤의 Norgate master 행은 합치지도 발급하지도 않고 `isin_instrument_held`로 빠지며(상품은 하나), 다시 만든 문서도 새로 등록할 것이 없다 | `tests/storage/test_us_isin_anchor.py::test_isin_first_then_a_norgate_listing_over_its_claims_is_held_apart` | 구현 |
+| DV-574 | `standing_unresolved`에서 ISIN 있는 새 상장의 행은 등록 전 `list_claimable`, 등록 뒤 `resolved`이고 ISIN 없는 행은 `list_isin_missing`으로 남는다 | `tests/storage/test_us_isin_anchor.py::test_the_standing_summary_moves_a_new_listing_from_claimable_to_resolved` | 구현 |
+| DV-575 | `eodhd.bulk_quarantine@2`는 보류 사유표대로 `provider_reported_partial`과 import identity 누락 행 중 값 검사를 통과한 행만 옮기고, 다른 사유·값 검사 실패 행은 파티션 날짜 없이 `mapped`·`value_check`·`held` 결과로 센다 | `tests/storage/test_promotion_mappers.py::test_eodhd_bulk_quarantine_v2_maps_admitted_holds_and_counts_the_rest` | 구현 |
+| DV-576 | import 때 identity가 없어 보류된 US 행은 `@2`로 snapshot이 해석하는 것만 승격되고, 해석되지 않는 행은 값 없이 `unresolved`로 기다리다 등록 뒤 승격되며, 다른 사유 행은 남고 그 사유만 있는 테이블은 `unmapped`다. 사유별 행 수는 단계의 `source_outcomes`에 남는다 | `tests/storage/test_maintain_promotion.py::test_identity_held_us_rows_promote_by_the_reason_table_and_wait_for_their_identity` | 구현 |
+| DV-577 | 경고 US 테이블에 값 검사를 어긴 행(그 사유로 보류된 행, 값이 나쁜 부분 응답 행)이 섞여도 유효한 행은 승격되고 나머지는 사유별로 세어진다 | `tests/storage/test_maintain_promotion.py::test_rows_held_for_their_values_keep_no_valid_row_of_a_warned_us_table_out` | 구현 |
+| DV-578 | `@2`를 더해도 `eodhd.bulk_quarantine@1` KR bulk generation의 manifest SHA-256은 기록된 값 그대로다 | `tests/storage/test_maintain_promotion.py::test_a_bulk_quarantine_v1_generation_keeps_its_manifest` | 구현 |
+| DV-579 | route의 값 검사는 받는 행에만 적용되므로 다른 사유로 보류된 행이 섞인 KR `@1` 테이블은 `value_check`가 아니라 `mixed`로 건너뛴다 | `tests/storage/test_maintain_promotion.py::test_the_kr_check_judges_only_accepted_rows_and_leaves_other_holds_mixed` | 구현 |
+| DV-580 | 유지보수 실행은 `jobs.start`에 적힌 dataset만 선언한 template으로 시작하고 적히지 않은 것은 `no_head`로 남으며, 선행 조건이 없어 막힌 시작은 종료 코드 0으로 보고만 하고, 같은 설정의 두 번째 실행은 아무것도 시작하지 않는다 | `tests/application/test_maintain_start.py::test_a_run_starts_only_the_configured_datasets_and_a_second_run_starts_nothing` | 구현 |
+| DV-581 | 유지보수 계획은 `jobs.start`로 시작될 route(`started`)와 막힌 사유를 보고하고 설치본의 바이트를 바꾸지 않는다 | `tests/application/test_maintain_start.py::test_a_plan_reports_what_the_configured_start_would_do_and_writes_nothing` | 구현 |
+| DV-582 | `jobs.start`의 알 수 없는 이름, 시작 선언이 없는 dataset, 반복과 잘못된 타입은 설정 전체를 거부한다 | `tests/application/test_maintain_start.py::test_an_unknown_or_unstartable_start_refuses_the_whole_configuration` | 구현 |
+| DV-583 | 같은 build에서 뒤에 발급된 ISIN 상품이 앞서 받아들인 bridge의 날을 가리키면 그 bridge는 문서에 남지 않고 `list_contradicted`로 세어진다 | `tests/storage/test_us_isin_anchor.py::test_an_isin_registered_later_in_the_build_withdraws_a_bridge_it_contradicts` | 구현 |
+| DV-584 | 같은 build에서 뒤에 Norgate 상품에 이어진 ISIN이 앞서 받아들인 bridge의 날을 가리켜도 그 bridge는 남지 않는다 | `tests/storage/test_us_isin_anchor.py::test_an_isin_joined_to_a_norgate_instrument_later_withdraws_a_bridge_it_contradicts` | 구현 |
+| DV-585 | FMP ISIN이 같거나 다르거나 자산 종류가 달라도 ISIN 상품의 목록 claim과 겹치는 Norgate 행은 똑같이 `isin_instrument_held`로 빠지고, FMP의 다른 ISIN도 등록되지 않는다 | `tests/storage/test_us_isin_anchor.py::test_isin_first_then_a_norgate_listing_over_its_claims_is_held_apart` | 구현 |
+| DV-586 | 목록 ISIN은 자산 종류가 다른 Norgate 상품에 이어지지 않고 `list_isin_type_differs`로 남는다 | `tests/storage/test_us_isin_anchor.py::test_a_list_isin_does_not_join_a_norgate_instrument_of_another_asset_type` | 구현 |
+| DV-587 | master에서 미해결로 빠진 Norgate 목록(`isin_instrument_held`, 같은 이유로 `assetid_repeated`)의 export가 master보다 길어도 그 asset ID는 export claim도 상품도 남기지 않아 build는 등록되고 그 목록만 미해결로 남는다 | `tests/storage/test_us_isin_anchor.py::test_a_listing_left_out_of_an_isin_instrument_gives_no_export_claim` | 구현 |
+| DV-588 | ISIN 상품에 빠진 Norgate 행의 export가 보인 새 이름(`AAA`→`BBB`)도 `BBB.US` claim과 export 창을 남기지 않는다(흡수 경로를 걷어내 합쳐진 행이 없다) | `tests/storage/test_us_isin_anchor.py::test_a_listing_left_out_of_an_isin_instrument_gives_no_export_claim` | 구현 |
+| DV-589 | 늦게 알려진 ISIN의 앞선 행이 앞 실행에서 등록된 bridge의 날을 다른 상품으로 보이면, 두 실행으로 나눠도 그 ISIN은 발급되지 않고 `list_registered_conflict`로 남으며 등록된 bridge는 그대로다 | `tests/storage/test_us_isin_anchor.py::test_an_isin_whose_earlier_row_contradicts_a_registered_bridge_is_not_registered` | 구현 |
+| DV-590 | 앞선 행이 등록 claim과 모순되는 미등록 ISIN은 Norgate 상품에도 이어지지 않고 `list_registered_conflict`로 남는다 | `tests/storage/test_us_isin_anchor.py::test_an_isin_whose_earlier_row_contradicts_a_registered_claim_joins_no_instrument` | 구현 |
+| DV-591 | `eodhd`/`isin` anchor만 가진 상품(ISIN으로 발급한 상품, 목록이 처음 ISIN을 이은 Norgate 상품)도 상장폐지 목록에 나타나면 `observed`와 `last_bar` 사건을 둘 다 받는다 | `tests/storage/test_us_delisted.py::test_an_instrument_named_by_its_eodhd_isin_gets_both_delisting_events` | 구현 |
+| DV-592 | 한 ISIN이 같은 상품의 `fmp`/`isin`과 `eodhd`/`isin`이면 사건은 한 번씩이고, 두 키가 다른 상품을 가리키면 어느 쪽에도 사건이 없고 원천은 미해결, 대기 집계는 `isin_ambiguous`다 | `tests/storage/test_us_delisted.py::test_one_isin_under_both_providers_names_one_instrument_or_stays_ambiguous` | 구현 |
+| DV-593 | 미해결로 기록된 상장폐지 원천은 뒤에 `eodhd`/`isin`이 등록돼 해석 행이 바뀌면 유지보수가 다시 계획해 승격한다(`key_members`가 매퍼의 모든 키를 본다) | `tests/storage/test_us_delisted.py::test_a_waiting_list_is_promoted_once_a_list_joins_its_isin_at_eodhd` | 구현 |
+| DV-594 | master는 화요일에 끝나도 export가 금요일까지 늘린 상장의 창이 ISIN 상품의 수요일 목록 claim과 겹치면, 그 상장은 export claim과 함께 `isin_instrument_held`로 빠지고 build는 등록된다 | `tests/storage/test_us_isin_anchor.py::test_a_series_whose_export_window_holds_an_isin_claim_is_left_out` | 구현 |
+| DV-595 | export가 상장을 `AAA`→`BBB`로 개명해 늘린 창이 ISIN 상품의 `BBB.US` claim과 겹쳐도, master에 없는 export series의 창이 겹쳐도 같은 판정으로 빠진다(후자는 `exports.isin_instrument_held`) | `tests/storage/test_us_isin_anchor.py::test_a_series_whose_export_window_holds_an_isin_claim_is_left_out` | 구현 |
+| DV-596 | master 첫 날보다 이른 export 행은 claim을 만들지 않아, ISIN 상품이 그 앞날 티커를 가져도 상장은 빠지지 않고 겹침 없이 등록된다 | `tests/storage/test_us_isin_anchor.py::test_an_export_reaching_before_the_master_claims_nothing_over_an_isin_claim` | 구현 |

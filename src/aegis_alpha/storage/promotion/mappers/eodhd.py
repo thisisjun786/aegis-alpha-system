@@ -25,7 +25,12 @@ price with basis ``total_return``.
 ``eodhd.bars_quarantine@1`` reads the rows a daily-bar history download held back as
 invalid (``EodhdBarsQuarantine``); they become ``invalid`` bars that keep no values.
 
-For all five:
+``eodhd.bulk_quarantine@2`` reads the shape of ``eodhd.bulk_quarantine@1`` and maps the rows
+held for a partial response or for want of an import-time identity whose values pass the
+clean path's bar checks; every other row stays held and is counted as an outcome
+(``EodhdBulkQuarantineV2``). ``@1`` is unchanged.
+
+For all six:
 
 - The instrument is the pinned identity snapshot's resolution of the assertion key
   (``eodhd``, ``eodhd_symbol``, ``<code>.<exchange>``) at the local start of the session
@@ -202,15 +207,15 @@ def _json_path(field: str) -> str:
     return sql_literal("$." + field)
 
 
-def _json_number(field: str) -> str:
+def _json_number(field: str, json: str = _JSON) -> str:
     """A JSON number as binary64, or NULL when it is another type or a too-wide integer.
 
     An integer is recognized by its text, since DuckDB types one of 2^64 or more as
     ``DOUBLE``; any integer above 2^53 in absolute value is NULL.
     """
     path = _json_path(field)
-    kind = f"json_type({_JSON}, {path})"
-    text = f"json_extract_string({_JSON}, {path})"
+    kind = f"json_type({json}, {path})"
+    text = f"json_extract_string({json}, {path})"
     return (
         f"CASE WHEN {kind} IN ('UBIGINT', 'BIGINT', 'DOUBLE') AND "
         f"regexp_full_match({text}, '-?[0-9]+') THEN CASE WHEN "
@@ -324,6 +329,147 @@ class EodhdBulkQuarantine(_BulkQuarantine):
 class EodhdBulkQuarantineAdjusted(_BulkQuarantine):
     name: Final = "eodhd.bulk_quarantine_adjusted"
     _adjusted = True
+
+
+# The hold reasons ``eodhd.bulk_quarantine@2`` maps once the row's values pass: a partial
+# response, and a clean response row the import held only for want of an import-time
+# identity (``qveris_native._identity``, raised before any value was checked).
+IDENTITY_REQUIRED: Final = "explicit instrument identity is required"
+ADMITTED_V2: Final = (PARTIAL_FLAG, IDENTITY_REQUIRED)
+_PRICES: Final = ("open", "high", "low", "close", "adjusted_close")
+_RAW_JSON: Final = "CASE WHEN json_valid(source_row_json) THEN source_row_json END"
+
+
+def _admitted_reason() -> str:
+    return f"reason IN ({', '.join(sql_literal(reason) for reason in ADMITTED_V2)})"
+
+
+def _admitted(json: str) -> str:
+    """An admitted reason whose row passes the clean response path's bar checks.
+
+    Those of ``qveris_native._bar_values`` and an ISO date: open, high, low, close,
+    adjusted close and volume finite JSON numbers (an integer beyond 2^53 is none), prices
+    above zero, volume not negative, low at most min(open, close), high at least
+    max(open, close), low at most high, and a ``YYYY-MM-DD`` date that exists.
+    """
+    # Each number is parsed once and bound by a lambda: repeating the parse in every check
+    # makes the expression large enough to exhaust DuckDB's memory on a few thousand rows.
+    numbers = ", ".join(_json_number(name, "j") for name in (*_PRICES, "volume"))
+    o, h, low, c, a, v = (f"n[{index}]" for index in range(1, 7))
+    text = "json_extract_string(j, '$.date')"
+    values = [
+        *(f"isfinite({value})" for value in (o, h, low, c, a, v)),
+        *(f"{value} > 0" for value in (o, h, low, c, a)),
+        f"{v} >= 0",
+        f"{low} <= least({o}, {c})",
+        f"{h} >= greatest({o}, {c})",
+        f"{low} <= {h}",
+    ]
+    bound = (
+        f"list_transform([[{numbers}]], lambda n: "
+        + " AND ".join(f"coalesce({check}, false)" for check in values)
+        + ")[1]"
+    )
+    checks = [
+        "json_type(j, '$.date') = 'VARCHAR'",
+        f"regexp_full_match({text}, '{_DAY}')",
+        f"TRY_CAST({text} AS DATE) IS NOT NULL",
+        bound,
+    ]
+    parsed = (
+        f"list_transform([{json}], lambda j: "
+        + " AND ".join(f"coalesce({check}, false)" for check in checks)
+        + ")[1]"
+    )
+    return f"coalesce(({_admitted_reason()}) AND {parsed}, false)"
+
+
+class EodhdBulkQuarantineV2:
+    """``eodhd.bulk_quarantine@2``: the held rows of one EODHD exchange-wide daily download.
+
+    The source shape, arguments, token, currency, ingestion, row flag and domain columns are
+    those of ``eodhd.bulk_quarantine@1``. It differs in which rows it maps: a row whose
+    reason is in ``ADMITTED_V2`` and whose values pass ``_admitted``'s bar checks (so every
+    mapped bar is ``present``). Every other row is left held: it gets no partition date and
+    no mapped row, and its outcome (``mapped:``, ``value_check:`` for an admitted reason
+    whose values fail, ``held:`` for any other reason, each followed by the reason) is
+    counted in the generation's ``source_outcomes``, so it neither blocks the step nor
+    drops out uncounted. The instrument is only ever the pinned snapshot's resolution of
+    the token; a row it does not resolve stays ``unresolved``.
+    """
+
+    name: Final = "eodhd.bulk_quarantine"
+    major: Final = 2
+    provider: Final = "eodhd"
+    source_prefixes: Final = ()
+    domain: Final = "prices"
+    partition_sql: Final = (
+        f"CASE WHEN {_admitted(_RAW_JSON)} "
+        f"THEN TRY_CAST(json_extract_string({_RAW_JSON}, '$.date') AS DATE) END"
+    )
+    date_column: Final = "session_date"
+    time_inputs: Final[Mapping[str, InputKind]] = {"session_date": "date"}
+    row_flags: Final[Mapping[str, str]] = {PARTIAL_FLAG: "_aas_f_" + PARTIAL_FLAG}
+    manifest_items: Final = None
+    expands: Final = False
+
+    def check_args(self, args: Mapping[str, object]) -> None:
+        if set(args) != {"timezone", "currencies"}:
+            raise ValueError(f"{self.name}@2 takes exactly timezone and currencies arguments")
+        _check_zone(f"{self.name}@2", args)
+        _check_currencies(f"{self.name}@2", args)
+
+    def source_columns(self) -> Mapping[str, frozenset[str]]:
+        return {"reason": frozenset({"VARCHAR"}), "source_row_json": frozenset({"VARCHAR"})}
+
+    def numeric_columns(self, args: Mapping[str, object]) -> Mapping[str, str]:
+        del args
+        return dict.fromkeys(_VALUES, "DOUBLE")
+
+    def identity(self, args: Mapping[str, object]) -> IdentityKey:
+        del args
+        return IdentityKey("eodhd", "eodhd_symbol")
+
+    def outcome(self, args: Mapping[str, object]) -> str:
+        del args
+        return (
+            f"CASE WHEN {_admitted(_RAW_JSON)} THEN 'mapped:' "
+            f"WHEN coalesce({_admitted_reason()}, false) THEN 'value_check:' "
+            "ELSE 'held:' END || coalesce(reason, '')"
+        )
+
+    def select(self, source: str, args: Mapping[str, object]) -> str:
+        currencies = args["currencies"]
+        assert isinstance(currencies, dict)  # noqa: S101 -- check_args admitted the shape
+        exchange = _json_text("exchange_short_name")
+        currency = " ".join(
+            f"WHEN {sql_literal(code)} THEN {sql_literal(str(name))}"
+            for code, name in sorted(currencies.items())
+        )
+        columns = [
+            "_aas_pin",
+            "_aas_ordinal",
+            "_aas_row_hash",
+            "CAST(NULL AS BIGINT) AS _aas_ingested_at_us",
+            f"{_json_text('code')} || '.' || {exchange} AS _aas_token",
+            f"TRY_CAST(json_extract_string({_JSON}, '$.date') AS DATE) AS session_date",
+            f"CASE {exchange} {currency} END AS currency",
+            *(f"{_json_number(name)} AS {name}" for name in _VALUES),
+            *(f"false AS {quote_identifier('_aas_a_' + name)}" for name in _VALUES),
+            f"reason = {sql_literal(PARTIAL_FLAG)} AS _aas_partial",
+        ]
+        parsed = (
+            f"SELECT {', '.join(columns)} FROM (SELECT *, {_RAW_JSON} AS {_JSON} "  # noqa: S608 -- engine-named relation
+            f"FROM {source}) WHERE {_admitted(_JSON)}"
+        )
+        return _prices(
+            zone=args["timezone"],
+            values=_VALUES,
+            absent={name: quote_identifier("_aas_a_" + name) for name in _VALUES},
+            adjusted=False,
+            extra=f", _aas_partial AS {self.row_flags[PARTIAL_FLAG]}",
+            inner=parsed,
+        )
 
 
 def _held_day(json: str) -> str:

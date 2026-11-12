@@ -1,7 +1,8 @@
 """Native identity registry: issuers, opaque instrument mint and immutable assertions.
 
 An issuer and an instrument are named by an opaque ID minted from one permanent anchor
-(a SEC CIK, a DART corp code, a Norgate asset ID, a KRX ISIN). Tickers, paths and dates
+(a SEC CIK, a DART corp code, a Norgate asset ID, a KRX ISIN, a new US listing's
+ISIN). Tickers, paths and dates
 are never anchors; they are ``identity_assertions`` with valid and knowledge intervals.
 Every row is append-only: a correction is a new assertion that names the one it
 supersedes, so nothing here issues an UPDATE or DELETE.
@@ -61,6 +62,11 @@ def _krx_isin(token: str) -> str:
     return _identifier(IdentifierType.ISIN, token)
 
 
+def _us_isin(token: str) -> str:
+    # The ISIN of a US-listed instrument, whatever the issuer's country prefix.
+    return _identifier(IdentifierType.ISIN, token)
+
+
 def _dart_corp_code(token: str) -> str:
     if re.fullmatch(r"[0-9]{8}", token) is None:
         raise IdentityAnchorError("dart_corp_code must be eight digits")
@@ -72,6 +78,7 @@ def _dart_corp_code(token: str) -> str:
 INSTRUMENT_ANCHORS: Mapping[str, Callable[[str], str]] = {
     "norgate_assetid": lambda token: _identifier(IdentifierType.NORGATE_ASSETID, token),
     "krx_isin": _krx_isin,
+    "us_isin": _us_isin,
 }
 ISSUER_ANCHORS: Mapping[str, Callable[[str], str]] = {
     "sec_cik": lambda token: _identifier(IdentifierType.CIK, token),

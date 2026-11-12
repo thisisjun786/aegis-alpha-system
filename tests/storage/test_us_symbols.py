@@ -338,7 +338,7 @@ def test_every_unresolved_day_has_a_symbol_class_and_a_disposition() -> None:
         _kind("AAA", ISIN_C, "Common Stock"),  # a registered ISIN of another holder
         _kind("BBB", None, "Common Stock"),  # a held symbol whose row lost its ISIN
         _kind("CCC", bad_check_digit(ISIN_C), "Common Stock"),
-        _kind("DDD", isin("000000044", "US"), "Common Stock"),  # a new listing
+        _kind("DDD", isin("000000044", "US"), "Common Stock"),  # a new listing: registered
         _kind("EEE", None, "Mutual Fund"),
         _kind("FFF", isin("000000066", "US"), "Warrant"),
         _kind("HHH", ISIN_B, "Common Stock"), _kind("III", ISIN_B, "ETF"),
@@ -350,7 +350,7 @@ def test_every_unresolved_day_has_a_symbol_class_and_a_disposition() -> None:
         "list_isin_invalid": {"common_stock": 1},
         "list_isin_missing": {"common_stock": 1, "mutual_fund": 1},
         "list_isin_repeated": {"common_stock": 1, "etf": 1},
-        "list_isin_unregistered": {"common_stock": 2, "warrant": 1},
+        "list_isin_unregistered": {"common_stock": 1, "warrant": 1},
         "list_not_bracketed": {"preferred": 1},
         "list_symbol_moved": {"common_stock": 1},
     }
@@ -358,11 +358,10 @@ def test_every_unresolved_day_has_a_symbol_class_and_a_disposition() -> None:
         "out_of_scope": {"list_isin_missing": 1, "list_isin_unregistered": 1},
         "register": {"list_isin_missing": 1, "list_isin_unregistered": 1},
         "unresolved": {"list_isin_invalid": 1, "list_isin_repeated": 2,
-                       "list_isin_unregistered": 1, "list_not_bracketed": 1,
-                       "list_symbol_moved": 1},
+                       "list_not_bracketed": 1, "list_symbol_moved": 1},
     }  # fmt: skip
-    # The class and disposition only report: no class reaches a claim.
-    assert report["claims"] == 0
+    # The class and disposition only report; the one claim is the new listing's own ISIN.
+    assert (report["claims"], report["registered_instruments"]) == (1, 1)
 
 
 @pytest.mark.parametrize(
@@ -551,13 +550,13 @@ def test_list_claims_reach_a_new_snapshot_and_promote_the_rows_they_waited_for(
     quiet = promote_datasets(ws, apply=True, now_us=11, routes=[ROUTE], identity=cutover)
     assert (quiet["unresolved"], quiet["standing_unresolved"]) == ([], standing)
 
-    # Wednesday's US list names AAA by its registered ISIN; NEW is a new listing.
-    _import_list(ws, WED, [_row("AAA", ISIN_A), _row("NEW", isin("000000077", "US"))])
+    # Wednesday's US list names AAA by its registered ISIN; NEW's row has no ISIN.
+    _import_list(ws, WED, [_row("AAA", ISIN_A), _row("NEW", None)])
     advanced = maintain_identity.advance(ws, apply=True, now_us=_now())
     assert advanced["new_sources"] == {"eodhd": 0, "kind": 0, "dart": 0}
     us = cast("dict[str, object]", advanced["us_symbols"])
     assert (us["new_sources"], us["claims"]) == (1, 1)
-    assert us["unresolved"] == {"list_isin_unregistered": ["NEW.US"]}
+    assert us["unresolved"] == {"list_isin_missing": ["NEW.US"]}
     snapshot = cast("dict[str, str]", advanced["snapshot"])
     assert advanced["snapshot_registered"] is True
     assert snapshot["snapshot_id"] != cutover["snapshot_id"]
@@ -578,7 +577,7 @@ def test_list_claims_reach_a_new_snapshot_and_promote_the_rows_they_waited_for(
     assert standing_unresolved(ws)["prices.us.eodhd"] == {
         "sources": 1, "rows": 2, "rows_unavailable": 0, "unresolved_tokens": 1,
         "unpublished_sources": 0, "oldest_date": WED.isoformat(),
-        **_breakdown({"list_isin_unregistered": ("common_stock", 1)}, resolved=1)}  # fmt: skip
+        **_breakdown({"list_isin_missing": ("common_stock", 1)}, resolved=1)}  # fmt: skip
 
     # Thursday's claim starts within Wednesday's latest possible instants (14 hours past the
     # UTC day), so Wednesday's waiting source is planned once more; Friday's claim is not.
@@ -638,24 +637,24 @@ def test_the_standing_summary_counts_waiting_us_rows_by_reason_class_and_disposi
     # mutual fund without an ISIN, and GONE is not listed at all.
     _import_list(ws, WED, [_row("AAA", ISIN_A), _row("NEW", isin("000000077", "US")),
                            _kind("MFX", None, "Mutual Fund")])  # fmt: skip
-    listed = {"list_isin_missing": 1, "list_isin_unregistered": 1, "list_not_observed": 1}
+    listed = {"list_isin_missing": 1, "list_not_observed": 1}
     classes = {"list_isin_missing": {"mutual_fund": 1},
-               "list_isin_unregistered": {"common_stock": 1},
                "list_not_observed": {"unknown": 1}}  # fmt: skip
-    # Judged now, AAA's day would be claimed: the identity stage registers it next.
+    # Judged now, AAA's day would be claimed and NEW registered on its own ISIN: the
+    # identity stage registers both next.
     assert standing_unresolved(ws)["prices.us.eodhd"] == {
         **base,
-        "rows_by_reason": {"list_claimable": 1, **listed},
-        "rows_by_class": {"list_claimable": {"common_stock": 1}, **classes},
-        "rows_by_disposition": {"out_of_scope": 1, "register": 1, "unresolved": 2},
+        "rows_by_reason": {"list_claimable": 2, **listed},
+        "rows_by_class": {"list_claimable": {"common_stock": 2}, **classes},
+        "rows_by_disposition": {"out_of_scope": 1, "register": 2, "unresolved": 1},
     }
     maintain_identity.advance(ws, apply=True, now_us=_now())
-    # Registered, AAA's row is resolved; its source waits for the next promotion.
+    # Registered, AAA's and NEW's rows are resolved; their source waits for the next promotion.
     assert standing_unresolved(ws)["prices.us.eodhd"] == {
         **base,
-        "rows_by_reason": {"resolved": 1, **listed},
+        "rows_by_reason": {"resolved": 2, **listed},
         "rows_by_class": classes,
-        "rows_by_disposition": {"out_of_scope": 1, "unresolved": 2},
+        "rows_by_disposition": {"out_of_scope": 1, "unresolved": 1},
     }
 
 
@@ -684,7 +683,7 @@ def test_a_bridge_promotes_every_held_session_once_and_a_later_day_replans_nothi
 
     # A list with nothing to claim registers nothing and pins no snapshot.
     friday = date(2026, 9, 18)
-    _import_list(ws, friday, [_row("NEW", isin("000000077", "US"))])
+    _import_list(ws, friday, [_row("NEW", None)])
     counts = _counts(ws)
     quiet = maintain_identity.advance(ws, apply=True, now_us=_now())
     assert cast("dict[str, object]", quiet["us_symbols"])["registry"] == "no_new_claims"
@@ -692,7 +691,7 @@ def test_a_bridge_promotes_every_held_session_once_and_a_later_day_replans_nothi
 
     # The first list naming AAA by its ISIN, Monday 09-21: a plan registers nothing ...
     monday = date(2026, 9, 21)
-    _import_list(ws, monday, [_row("AAA", ISIN_A), _row("NEW", isin("000000077", "US"))])
+    _import_list(ws, monday, [_row("AAA", ISIN_A), _row("NEW", None)])
     planned = maintain_identity.advance(ws, apply=False, now_us=_now())
     assert cast("dict[str, object]", planned["us_symbols"])["claims"] == 1
     assert _counts(ws) == counts

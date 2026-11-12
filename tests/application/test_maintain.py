@@ -382,8 +382,9 @@ def test_a_us_symbol_list_is_collected_imported_and_read_by_the_identity_stage(
     assert identity["new_sources"] == {"eodhd": 0, "kind": 0, "dart": 0}
     us = cast("dict[str, object]", identity["us_symbols"])
     # Both lists are new sources; the delisted list's rows are skipped as no listed rows.
-    assert (us["new_sources"], us["claims"], us["registry"]) == (2, 0, "no_new_claims")
-    assert us["unresolved"] == {"list_isin_unregistered": ["AAA.US"]}
+    # AAA is a new listing: its ISIN mints its instrument and claims its day.
+    assert (us["new_sources"], us["claims"], us["registered_instruments"]) == (2, 1, 1)
+    assert us["unresolved"] == {}
     # The same day again: the list is covered until tomorrow.
     world.clock.advance(hours=1)
     again = world.run()

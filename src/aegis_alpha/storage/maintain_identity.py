@@ -151,7 +151,7 @@ def _advance_us(
     built, read = us_symbols.build_from_workspace(workspace, fresh, earlier)
     report: dict[str, object] = {"new_sources": len(fresh), "inputs": len(fresh),
                                  "veto_sources": read, **built.report()}  # fmt: skip
-    if not built.assertions:
+    if not built.assertions and not built.identifiers:
         report["registry"] = "no_new_claims"
         return report, False
     raw = canonical_json_bytes(built.document())
