@@ -120,7 +120,7 @@ from aegis_alpha.storage.calendar_declaration import packaged_declaration, parse
 from aegis_alpha.storage.dataset_catalog import CATALOG, catalog_entry
 from aegis_alpha.storage.kr_prices import CURRENCIES as KR_CURRENCIES
 from aegis_alpha.storage.market import generation_chain
-from aegis_alpha.storage.membership_pins import IdentityPin, membership_parts
+from aegis_alpha.storage.membership_pins import KEY_MEMBERS_SQL, IdentityPin, membership_parts
 from aegis_alpha.storage.promotion import formats
 from aegis_alpha.storage.promotion.engine import dataset_head, promote
 from aegis_alpha.storage.promotion.mappers import IdentityKey, mapper
@@ -693,11 +693,7 @@ def key_members(workspace: Workspace, pin: Mapping[str, str], key: IdentityKey) 
         rows.extend(
             (str(token), str(instrument), int(start), None if end is None else int(end))
             for token, instrument, start, end in workspace.state.execute(
-                "SELECT a.token, a.instrument_id, m.valid_from_us, m.valid_to_us "
-                "FROM identity_snapshot_members m JOIN identity_assertions a "
-                "USING (assertion_id) WHERE m.snapshot_id IN (SELECT value FROM json_each(?)) "
-                "AND m.known_to_us IS NULL AND a.provider=? AND a.namespace=?",
-                (json.dumps(names), provider, namespace),
+                KEY_MEMBERS_SQL, (json.dumps(names), provider, namespace)
             )
         )
     # SQLite's ORDER BY 1, 2, 3, 4: an open end (NULL) sorts first.

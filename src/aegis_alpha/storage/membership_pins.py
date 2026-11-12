@@ -651,6 +651,20 @@ PART_OVERLAP_SQL = (
 )
 
 
+# The current members of one (provider, namespace) identity key across a snapshot's parts:
+# token, instrument_id, valid_from_us, valid_to_us, in no particular order. Parameters: a
+# JSON array of part snapshot ids (unique), the provider, then the namespace. Both CROSS
+# JOINs fix the order parts -> members -> assertions: left to the planner, SQLite drives
+# from the provider-key index and probes every part once per key assertion, which grows
+# with (key assertions x parts).
+KEY_MEMBERS_SQL = (
+    "SELECT a.token, a.instrument_id, m.valid_from_us, m.valid_to_us "
+    "FROM json_each(?) j CROSS JOIN identity_snapshot_members m ON m.snapshot_id=j.value "
+    "CROSS JOIN identity_assertions a ON a.assertion_id=m.assertion_id "
+    "WHERE m.known_to_us IS NULL AND a.provider=? AND a.namespace=?"
+)
+
+
 def _manifest_rules(
     connection: sqlite3.Connection, parts: Sequence[IdentityPin | UniversePin]
 ) -> None:

@@ -946,6 +946,86 @@ def test_part_overlap_query_materializes_the_member_join_once() -> None:
     assert any(re.match(r"SEARCH [xy] USING AUTOMATIC ", step) for step in plan), plan
 
 
+# The key-member query as first shipped, with the join order left to the planner. It is the
+# oracle the fixed-order product query must agree with; only its plan was slow.
+LEGACY_KEY_MEMBERS_SQL = (
+    "SELECT a.token, a.instrument_id, m.valid_from_us, m.valid_to_us "
+    "FROM identity_snapshot_members m JOIN identity_assertions a "
+    "USING (assertion_id) WHERE m.snapshot_id IN (SELECT value FROM json_each(?)) "
+    "AND m.known_to_us IS NULL AND a.provider=? AND a.namespace=?"
+)
+
+
+def test_key_members_query_matches_legacy_on_a_many_part_snapshot() -> None:
+    """Same rows, in the same order once sorted as the callers sort them, for every key.
+
+    Members of an unnamed snapshot, closed (``known_to_us``) members and other keys'
+    assertions must stay out; open and closed valid ends and repeated tokens stay in.
+    """
+    generator = random.Random(20261112)  # noqa: S311 -- reproducible synthetic cases
+    connection = overlap_store()
+    names = [membership_pins.part_name("m", index) for index in range(60)]
+    keys = [("p", "ticker"), ("p", "isin"), ("q", "ticker")]
+    for name in [*names, "other"]:
+        for ordinal in range(40):
+            provider, namespace = generator.choice(keys)
+            start = generator.randint(0, 50)
+            end = None if generator.random() < OPEN_END_SHARE else start + generator.randint(1, 9)
+            closed = generator.random() < OPEN_END_SHARE
+            assertion = f"{name}/{ordinal}"
+            connection.execute(
+                "INSERT INTO identity_assertions VALUES (?,?,?,?,?,?,?,0,NULL,'s',?)",
+                (
+                    assertion,
+                    f"I{generator.randint(0, 30)}",
+                    provider,
+                    namespace,
+                    f"T{generator.randint(0, 30)}",
+                    start,
+                    end,
+                    "a" * 64,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO identity_snapshot_members VALUES (?,?,?,?,?,0,?)",
+                (name, ordinal, assertion, start, end, 1 if closed else None),
+            )
+    for provider, namespace in [*keys, ("p", "absent")]:
+        parameters = (json.dumps(names), provider, namespace)
+        legacy, product = (
+            connection.execute(
+                f"SELECT * FROM ({sql}) ORDER BY 1, 2, 3, 4",  # noqa: S608 -- fixed module constants
+                parameters,
+            ).fetchall()
+            for sql in (LEGACY_KEY_MEMBERS_SQL, membership_pins.KEY_MEMBERS_SQL)
+        )
+        assert product == legacy
+        assert (len(product) > 0) == (namespace != "absent"), (provider, namespace)
+    connection.close()
+
+
+def test_key_members_query_drives_from_the_part_list() -> None:
+    """Parts, then their members, then each member's assertion by key, on every SQLite.
+
+    Left to the planner, SQLite reads the key's assertions through ``identity_provider_key``
+    and probes every part once per assertion, so its cost grows with key assertions times
+    parts. The wording of each step varies across SQLite releases; the order does not.
+    """
+    connection = overlap_store()
+    plan = [
+        row[3]
+        for row in connection.execute(
+            f"EXPLAIN QUERY PLAN {membership_pins.KEY_MEMBERS_SQL}", ("[]", "p", "ticker")
+        )
+    ]
+    connection.close()
+    assert re.match(r"SCAN (j|json_each)\b", plan[0]), plan
+    members = next(i for i, step in enumerate(plan) if step.startswith("SEARCH m "))
+    assertions = next(i for i, step in enumerate(plan) if step.startswith("SEARCH a "))
+    assert members < assertions, plan
+    assert "identity_provider_key" not in plan[assertions], plan
+
+
 def _member(
     token: str,
     valid: tuple[int, int | None] = (0, None),

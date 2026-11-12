@@ -50,6 +50,7 @@ from aegis_alpha.storage.market import (
 from aegis_alpha.storage.market_integrity import check_core_names
 from aegis_alpha.storage.market_schema import DOMAIN_VERSIONS, DOMAINS, NATURAL_KEYS
 from aegis_alpha.storage.membership_pins import (
+    KEY_MEMBERS_SQL,
     IdentityPin,
     membership_parts,
     verify_membership_pin,
@@ -342,13 +343,7 @@ def _identity(
         )
     names = [cast("IdentityPin", part).snapshot_id for part in parts] or [pin.snapshot_id]
     for provider, namespace in key.pairs():
-        cursor = workspace.state.execute(
-            "SELECT a.token, a.instrument_id, m.valid_from_us, m.valid_to_us "
-            "FROM identity_snapshot_members m JOIN identity_assertions a USING (assertion_id) "
-            "WHERE m.snapshot_id IN (SELECT value FROM json_each(?)) AND m.known_to_us IS NULL "
-            "AND a.provider=? AND a.namespace=?",
-            (json.dumps(names), provider, namespace),
-        )
+        cursor = workspace.state.execute(KEY_MEMBERS_SQL, (json.dumps(names), provider, namespace))
         while batch := cursor.fetchmany(_BATCH):
             market.executemany(
                 f"INSERT INTO {IDENTITY_ROWS} VALUES (?, ?, ?, ?)", [tuple(row) for row in batch]
