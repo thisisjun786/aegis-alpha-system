@@ -19,6 +19,7 @@ from __future__ import annotations
 
 # ruff: noqa: S608 -- every dynamic identifier is engine-owned and quoted; values are bound.
 import hashlib
+import itertools
 import json
 import time
 from dataclasses import dataclass, field
@@ -334,6 +335,7 @@ KEY_MEMBERS_SQL: Final = (
     "AND a.assertion_id = m.assertion_id AND a.provider=? AND a.namespace=?"
 )
 _SHARED_PREFIX: Final = "_aas_shared_"
+_INSTANCES: Final = itertools.count()
 
 
 class SharedInputs:
@@ -361,9 +363,15 @@ class SharedInputs:
         self._verified: set[tuple[str, str]] = set()
         self._generations: set[GenerationPin] = set()
         self._tables: dict[tuple[object, ...], str] = {}
+        # A plan outside the pass (a pending promotion's replan) opens its own instance on the
+        # same connection: names unique per instance keep it from replacing or dropping ours.
+        self._namespace = next(_INSTANCES)
+
+    def _name(self) -> str:
+        return f"{_SHARED_PREFIX}{self._namespace}_{len(self._tables)}"
 
     def _create(self, columns: str) -> str:
-        name = f"{_SHARED_PREFIX}{len(self._tables)}"
+        name = self._name()
         self._workspace.market.execute(f"CREATE OR REPLACE TEMP TABLE {name} {columns}")
         return name
 
@@ -417,7 +425,7 @@ class SharedInputs:
         key = ("reference", reference.pin, reference.domain, reference.revisions)
         found = self._tables.get(key)
         if found is None:
-            found = f"{_SHARED_PREFIX}{len(self._tables)}"
+            found = self._name()
             load(found)
             self._tables[key] = found
         return found

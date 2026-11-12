@@ -3418,3 +3418,4 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-600 | 키 멤버 읽기는 pin한 snapshot의 멤버에서 출발해, pin 밖의 같은 키 assertion이 열 배로 늘어도 비용이 거의 그대로다 | `tests/storage/test_maintain_identity_rows.py::test_the_key_read_costs_the_pinned_members_not_the_registry` | 구현 |
 | DV-601 | `status.us.eodhd` 실행은 참조한 `prices.us.eodhd` chain을 pin마다 한 번 검증·적재하고, 시작과 이어 붙이는 실행의 발행 결과는 원천마다 하던 때와 같다 | `tests/storage/test_maintain_identity_rows.py::test_a_status_start_pass_and_a_continuing_pass_publish_what_the_per_source_load_did` | 구현 |
 | DV-602 | 공유 identity 테이블은 채우기가 중간에 실패하면 등록되지 않아, 다음 원천이 일부만 채워진 행을 재사용하지 않는다 | `tests/storage/test_maintain_identity_rows.py::test_a_load_that_failed_midway_leaves_no_partial_rows_for_the_next_source` | 구현 |
+| DV-603 | 같은 연결에서 따로 연 공유 입력(대기 중인 승격의 재계획)이 실행의 공유 테이블을 덮어쓰거나 지우지 않는다 | `tests/storage/test_maintain_identity_rows.py::test_a_second_instance_on_the_connection_neither_replaces_nor_drops_the_first_ones_tables` | 구현 |

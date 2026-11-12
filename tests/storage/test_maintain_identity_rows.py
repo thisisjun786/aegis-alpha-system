@@ -311,6 +311,24 @@ def test_a_load_that_failed_midway_leaves_no_partial_rows_for_the_next_source(
     assert count == (4500,)
 
 
+def test_a_second_instance_on_the_connection_neither_replaces_nor_drops_the_first_ones_tables(
+    ws: Workspace,
+) -> None:
+    pin = _snapshot(ws)
+    first = engine.SharedInputs(ws)
+    second = engine.SharedInputs(ws)
+    try:
+        mine = first.table(pin, TICKER_AND_SYMBOL)
+        other = second.table(pin, TICKER_AND_SYMBOL)
+        assert other != mine
+        second.close()
+        count = ws.market.execute(f"SELECT count(*) FROM {first.table(pin, TICKER_AND_SYMBOL)}")
+        assert count.fetchone() == (4500,)
+    finally:
+        first.close()
+        second.close()
+
+
 def _steps_of(connection: sqlite3.Connection, pin: IdentityPin) -> int:
     """SQLite virtual-machine steps (in hundreds) to read the key's members of ``pin``."""
     names = _parts(connection, pin)
