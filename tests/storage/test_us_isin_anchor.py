@@ -366,6 +366,64 @@ def test_a_listing_left_out_of_an_isin_instrument_gives_no_export_claim(ws: Work
     assert _holders(ws, "eodhd_symbol", "BBB.US") == set()
 
 
+def _tuesday_master(ws: Workspace) -> str:
+    """A Norgate master listing A as AAA from 2001 through Tuesday 09-08."""
+    rows = [master(int(A), "AAA", first_date="2001-02-05", last_date=TUE.isoformat())]
+    return commit(ws, "norgate-master", "observations", table(rows, MASTER_SCHEMA))
+
+
+@pytest.mark.parametrize(
+    ("listed", "assetid", "name", "reason"),
+    [("AAA", A, "AAA", "listings"), ("BBB", A, "BBB", "listings"),
+     ("CCC", "900002", "CCC", "exports")],
+    ids=["export_extends_the_ticker", "export_renames_it", "export_only_series"],
+)  # fmt: skip
+def test_a_series_whose_export_window_holds_an_isin_claim_is_left_out(
+    ws: Workspace, listed: str, assetid: str, name: str, reason: str
+) -> None:
+    # X's instrument holds ``listed`` on Wednesday. The master ends A's AAA on Tuesday, so its
+    # own span misses that day, but an export carries ``assetid`` as ``name`` on to Friday:
+    # its window would claim Wednesday too. That series is left out with its export claims,
+    # and the build registers everything else.
+    _import_list(ws, WED, [_row(listed, X)])
+    assert _advance(ws)["registered_instruments"] == 1
+    exports = _export(ws, assetid, name, [TUE, WED, THU, FRI])
+    built = build_from_workspace(ws, master=_tuesday_master(ws), exports=exports)
+    unresolved = cast("dict[str, dict[str, list[str]]]", built.report()["unresolved"])
+    assert unresolved[reason] == {"isin_instrument_held": [assetid]}
+    assert built.windows == {}
+    tokens = {str(row["anchor_token"]) for row in
+              cast("list[dict[str, object]]", built.document["instruments"])}  # fmt: skip
+    assert assetid not in tokens
+    assert [claim for claim in _symbol_claims(built.document)
+            if claim[0] == f"{listed}.US"] == []  # fmt: skip
+    registered = cast("dict[str, int]", _register(ws, built)["new"])
+    assert registered["instruments"] == len(tokens)
+    assert _holders(ws, "eodhd_symbol", f"{listed}.US") == {_isin_instrument(X)}
+
+
+def test_an_export_reaching_before_the_master_claims_nothing_over_an_isin_claim(
+    ws: Workspace,
+) -> None:
+    # X's instrument holds AAA on Wednesday; the master lists A as AAA from Thursday through
+    # Friday, and an export shows A from Tuesday. An export claims only after the master's
+    # last session, so A's AAA claim starts Thursday, overlaps nothing, and A registers.
+    _import_list(ws, WED, [_row("AAA", X)])
+    assert _advance(ws)["registered_instruments"] == 1
+    rows = [master(int(A), "AAA", first_date=THU.isoformat(), last_date=FRI.isoformat())]
+    master_id = commit(ws, "norgate-master", "observations", table(rows, MASTER_SCHEMA))
+    exports = _export(ws, A, "AAA", [TUE, WED, THU, FRI])
+    built = build_from_workspace(ws, master=master_id, exports=exports)
+    unresolved = cast("dict[str, dict[str, list[str]]]", built.report()["unresolved"])
+    assert unresolved["listings"] == {}
+    assert built.windows == {}
+    assert [claim for claim in _symbol_claims(built.document) if claim[0] == "AAA.US"] == [
+        ("AAA.US", IA, str(session_start_us(THU)), str(session_start_us(FRI + timedelta(days=1))))
+    ]
+    assert cast("dict[str, int]", _register(ws, built)["new"])["instruments"] == 1
+    assert _holders(ws, "eodhd_symbol", "AAA.US") == {_isin_instrument(X), IA}
+
+
 def test_the_standing_summary_moves_a_new_listing_from_claimable_to_resolved(
     ws: Workspace,
 ) -> None:

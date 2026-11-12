@@ -1446,26 +1446,78 @@ def _ticker_span(listing: Listing, bounds: _Bounds) -> tuple[str, int, int] | No
     return us_ticker(match[1]), session_start_us(listing.first_date), end
 
 
-def _held(accepted: Sequence[Listing], bounds: _Bounds, claims: Sequence[IsinClaim]) -> set[str]:
-    """The asset IDs whose ticker span holds a registered list claim of a ``us_isin``
-    instrument of that ticker: the ISIN instrument holds those days, so the listing is
-    left out rather than merged into it or minted beside it."""
+def _held(spans: Iterable[tuple[str, str, int, int]], claims: Sequence[IsinClaim]) -> set[str]:
+    """The asset IDs one of whose ``(asset ID, ticker, start, end)`` spans holds a registered
+    list claim of a ``us_isin`` instrument of that ticker: the ISIN instrument holds those
+    days, so the series is left out rather than merged into it or minted beside it."""
     by_symbol: dict[str, list[IsinClaim]] = defaultdict(list)
     for claim in claims:
         by_symbol[claim.symbol].append(claim)
+    return {assetid for assetid, ticker, start, end in spans
+            if any(claim.start < end and start < claim.end
+                   for claim in by_symbol.get(f"{ticker}.US", []))}  # fmt: skip
+
+
+@dataclass(slots=True)
+class _Kept:
+    """The listings and export claims a build keeps once ISIN-held series are left out."""
+
+    accepted: list[Listing]
+    exported: _Exported
+    windows: dict[str, _Claim]
+    unresolved: dict[str, list[str]]
+    held: set[str]
+
+
+def _without_held(  # noqa: PLR0913 -- the judgment reads the master's and the exports' views
+    accepted: Sequence[Listing],
+    listings: Sequence[Listing],
+    series: Sequence[ExportSeries],
+    *,
+    repeated: set[str],
+    bounds: _Bounds,
+    claims: Sequence[IsinClaim],
+) -> _Kept:
+    """Leave out every series whose ticker spans, the master's and its export window's
+    alike, hold a registered list claim of a ``us_isin`` instrument, with all it would add.
+
+    Leaving a series out only frees tickers for the others (fewer holders, fewer sharers,
+    no later start), so the windows are judged again until no other series is held.
+    """
     held: set[str] = set()
-    for listing in accepted:
-        span = _ticker_span(listing, bounds)
-        if span is not None and any(claim.start < span[2] and span[1] < claim.end
-                                    for claim in by_symbol.get(f"{span[0]}.US", [])):  # fmt: skip
-            held.add(listing.assetid)
-    return held
+    while True:
+        kept = _Kept([item for item in accepted if item.assetid not in held], _Exported(),
+                     {}, defaultdict(list), held)  # fmt: skip
+        admitted = _admitted(series, listings, kept.accepted, held, kept.unresolved)
+        _export_instruments(admitted, listings, kept.exported)
+        holders: dict[str, set[str]] = defaultdict(set)
+        for listing in kept.accepted:
+            if listing.listed and listing.symbol not in repeated:
+                holders[us_ticker(listing.symbol)].add(listing.assetid)
+        kept.windows = _export_window(
+            admitted,
+            holders=holders,
+            master={listing.assetid: listing for listing in kept.accepted},
+            through=bounds.through,
+            exported=kept.exported,
+            unresolved=kept.unresolved,
+        )
+        spans = [(listing.assetid, *span) for listing in kept.accepted
+                 if (span := _ticker_span(listing, bounds)) is not None]  # fmt: skip
+        spans += [
+            (claim.assetid, ticker, *claim.interval) for ticker, claim in kept.windows.items()
+        ]
+        found = _held(spans, claims)
+        if not found:
+            return kept
+        held = held | found
 
 
 def _admitted(
     series: Sequence[ExportSeries],
     listings: Sequence[Listing],
     accepted: Sequence[Listing],
+    held: set[str],
     unresolved: dict[str, list[str]],
 ) -> list[ExportSeries]:
     """The export series that may give instruments, names and claims.
@@ -1473,13 +1525,14 @@ def _admitted(
     The master lists US equities only; an export naming one of its asset IDs as a
     reference series contradicts it, so that series gives no instrument and no name. A
     master listing left unresolved (a repeated asset ID, or one an ISIN instrument's list
-    claims hold) declares no instrument, so its export series claims nothing either.
+    claims hold) declares no instrument, so its export series claims nothing either, and
+    neither does a series only the exports know that such claims hold (``held``).
     """
     known = {listing.assetid for listing in listings}
     differing = [item.assetid for item in series if not item.equity and item.assetid in known]
     if differing:
         unresolved["export_database_differs_from_master"].extend(differing)
-    left_out = set(differing) | (known - {listing.assetid for listing in accepted})
+    left_out = set(differing) | held | (known - {listing.assetid for listing in accepted})
     return [item for item in series if item.assetid not in left_out]
 
 
@@ -1500,8 +1553,9 @@ def build_us_registry(  # noqa: PLR0913 -- one keyword per source kind
     asset ID and assertions by provider, namespace and token, so the same sources always
     give the same bytes. ``listed`` are the registered symbol-list claims FMP and SEC rows
     are judged against beside the master's and the exports'; the document never repeats them.
-    ``isin_listed`` are the registered list claims of ``us_isin`` instruments; a listing
-    showing the same ticker over one of them is left out (``_held``).
+    ``isin_listed`` are the registered list claims of ``us_isin`` instruments; a series
+    the master or an export shows under the same ticker over one of them is left out
+    (``_without_held``).
     """
     unresolved: dict[str, dict[str, list[str]]] = {
         key: defaultdict(list)
@@ -1511,9 +1565,20 @@ def build_us_registry(  # noqa: PLR0913 -- one keyword per source kind
     listings, mappers[MASTER_MAPPER] = map_norgate_master(master)
     accepted, repeated = _accepted(listings, unresolved["listings"])
     bounds = _bounds(accepted)
-    held = _held(accepted, bounds, isin_listed)
-    unresolved["listings"]["isin_instrument_held"].extend(sorted(held, key=int))
-    accepted = [listing for listing in accepted if listing.assetid not in held]
+    series: list[ExportSeries] = []
+    if exports:
+        series, conflicting, mappers[EXPORT_MAPPER] = map_norgate_exports(exports)
+        unresolved["exports"]["export_assetid_repeated"].extend(conflicting)
+    kept = _without_held(
+        accepted, listings, series, repeated=repeated, bounds=bounds, claims=isin_listed
+    )
+    known = {listing.assetid for listing in listings}
+    for assetid in sorted(kept.held, key=int):
+        group = "listings" if assetid in known else "exports"
+        unresolved[group]["isin_instrument_held"].append(assetid)
+    for reason, found in kept.unresolved.items():
+        unresolved["exports"][reason].extend(found)
+    accepted, exported = kept.accepted, kept.exported
     profiles, refused, mappers[FMP_MAPPER] = map_fmp_profiles(fmp)
     tickers = _bounded(
         _tickers(
@@ -1524,26 +1589,8 @@ def build_us_registry(  # noqa: PLR0913 -- one keyword per source kind
         unresolved["tickers"],
     )
     claims = _master_claims(tickers, bounds)
-    exported = _Exported()
-    if exports:
-        series, conflicting, mappers[EXPORT_MAPPER] = map_norgate_exports(exports)
-        unresolved["exports"]["export_assetid_repeated"].extend(conflicting)
-        series = _admitted(series, listings, accepted, unresolved["exports"])
-        _export_instruments(series, listings, exported)
-        holders: dict[str, set[str]] = defaultdict(set)
-        for listing in accepted:
-            if listing.listed and listing.symbol not in repeated:
-                holders[us_ticker(listing.symbol)].add(listing.assetid)
-        windows = _export_window(
-            series,
-            holders=holders,
-            master={listing.assetid: listing for listing in accepted},
-            through=bounds.through,
-            exported=exported,
-            unresolved=unresolved["exports"],
-        )
-        for ticker, claim in windows.items():
-            claims.setdefault(ticker, []).append(claim)
+    for ticker, claim in kept.windows.items():
+        claims.setdefault(ticker, []).append(claim)
     etf = {listing.assetid: listing.asset_type == "etf" for listing in accepted}
     for item in listed:
         claims.setdefault(item.symbol.removesuffix(".US"), []).append(
