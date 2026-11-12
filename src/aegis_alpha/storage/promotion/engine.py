@@ -313,6 +313,22 @@ def _sources(workspace: Workspace, spec: PromotionSpec, plan: PromotionPlan) -> 
     return found
 
 
+def _insert_columns(
+    market: duckdb.DuckDBPyConnection,
+    table: str,
+    types: Sequence[str],
+    rows: Sequence[Sequence[object]],
+) -> None:
+    """Append ``rows`` to ``table`` in one statement: one list per column, unnested together."""
+    if not rows:
+        return
+    columns = ", ".join(f"unnest(?::{kind}[])" for kind in types)
+    market.execute(
+        f"INSERT INTO {table} SELECT {columns}",
+        [[row[index] for row in rows] for index in range(len(types))],
+    )
+
+
 def _identity(
     workspace: Workspace, spec: PromotionSpec, plan: PromotionPlan, budget: ComputeBudget
 ) -> None:
@@ -350,8 +366,8 @@ def _identity(
             (json.dumps(names), provider, namespace),
         )
         while batch := cursor.fetchmany(_BATCH):
-            market.executemany(
-                f"INSERT INTO {IDENTITY_ROWS} VALUES (?, ?, ?, ?)", [tuple(row) for row in batch]
+            _insert_columns(
+                market, IDENTITY_ROWS, ("VARCHAR", "VARCHAR", "BIGINT", "BIGINT"), batch
             )
 
 
@@ -459,8 +475,10 @@ def _fix(  # noqa: PLR0913 -- the query, its key, and where the computed value g
     while batch := market.execute(
         f"{query} AND ({names}) > ({marks}) ORDER BY {names} LIMIT {_BATCH}", last
     ).fetchall():
-        market.executemany(
-            f"INSERT INTO {fix} VALUES ({marks}, ?)",
+        _insert_columns(
+            market,
+            fix,
+            [*(_KEY_TYPES[name] for name in key), "VARCHAR"],
             [(*row[: len(key)], compute(tuple(row))) for row in batch],
         )
         last = [int(value) for value in batch[-1][: len(key)]]
@@ -546,8 +564,10 @@ def _stage_items(
             lacking.append(source.pin.source_id)
             continue
         for start in range(0, len(items), _BATCH):
-            market.executemany(
-                f"INSERT INTO {MANIFEST_ITEMS} VALUES (?, ?)",
+            _insert_columns(
+                market,
+                MANIFEST_ITEMS,
+                ("INTEGER", "VARCHAR"),
                 [
                     (index, formats.canonical(item).decode())
                     for item in items[start : start + _BATCH]
@@ -864,9 +884,7 @@ def _scope_sql(workspace: Workspace, spec: PromotionSpec, alias: str) -> str:
         market = workspace.market
         subject = _q(resolved_column(spec.domain))
         market.execute(f"CREATE OR REPLACE TEMP TABLE {_t('scope')} (instrument_id VARCHAR)")
-        market.executemany(
-            f"INSERT INTO {_t('scope')} VALUES (?)", [[item] for item in policy.instruments]
-        )
+        _insert_columns(market, _t("scope"), ("VARCHAR",), [[item] for item in policy.instruments])
         condition += f" AND {alias}.{subject} IN (SELECT instrument_id FROM {_t('scope')})"
     return condition
 
