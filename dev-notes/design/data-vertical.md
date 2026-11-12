@@ -714,12 +714,14 @@ New York 날짜다. 그 밖의 구간에는 이 flag가 없다.
 
 오늘 목록은 pin된 상장폐지 목록 중 가장 늦게 받은 것이고, 나머지(유지보수가 함께 pin하는 이른 날짜의 마지막
 상장 목록, 마지막 상장폐지 목록, 첫 상장폐지 목록)는 비교에만 쓰고 행을 만들지 않는다. 상품은 ISIN을 그 행의
-수집 시각에 등록된 FMP `isin`으로 해석해서만 닿는다. 같은 티커라도 ISIN이 다르면 다른 상품이고, ISIN이 없거나
+수집 시각에 등록된 FMP 또는 EODHD `isin`으로 해석해서만 닿는다(`us_symbols`는 ISIN으로 발급한 상품의 anchor와
+목록이 Norgate 상품에 처음 잇는 ISIN을 `eodhd`/`isin`으로 등록한다). 두 공급자가 한 ISIN을 같은 상품에 주면 그
+상품 하나이고, 다른 상품에 주면 어느 쪽도 고르지 않고 모호함(`ambiguous`)으로 미해결이다. 같은 티커라도 ISIN이 다르면 다른 상품이고, ISIN이 없거나
 snapshot에 없는 행은 미해결로 남는다(위험 7). 코드·이름에서 아무것도 끌어내지 않는다. 그런 행은 엔진이
 미해결로 세도록 관측일을 시작으로 한 `last_bar` 사건 하나로만 옮기고, 미해결 행은 저장되지 않는다. 오늘
 목록에서 반복된 ISIN은 source row hash가 가장 작은 행 하나만 옮긴다. 시간 입력 `status_date`는 두 사건 모두
 관측일이며 명세는 `America/New_York` `local_day_end@1`을 쓰므로 시점은 목록 수집 시각으로 낮춰진다(그 목록 전에는
-상장폐지를 알 수 없다). 매퍼는 엔진의 `IDENTITY_ROWS`(snapshot의 `fmp`/`isin` 행)로 해석될 상품을 찾아 bar에
+상장폐지를 알 수 없다). 매퍼는 엔진의 `IDENTITY_ROWS`(snapshot의 `fmp`/`isin`과 `eodhd`/`isin` 행)로 해석될 상품을 찾아 bar에
 잇는다. 저장되는 해석은 엔진의 해석뿐이다. 목록끼리 비교하므로 파티션 날짜가 없다.
 
 ## 결정적 공통 열
@@ -3390,3 +3392,6 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-588 | ISIN 상품에 빠진 Norgate 행의 export가 보인 새 이름(`AAA`→`BBB`)도 `BBB.US` claim과 export 창을 남기지 않는다(흡수 경로를 걷어내 합쳐진 행이 없다) | `tests/storage/test_us_isin_anchor.py::test_a_listing_left_out_of_an_isin_instrument_gives_no_export_claim` | 구현 |
 | DV-589 | 늦게 알려진 ISIN의 앞선 행이 앞 실행에서 등록된 bridge의 날을 다른 상품으로 보이면, 두 실행으로 나눠도 그 ISIN은 발급되지 않고 `list_registered_conflict`로 남으며 등록된 bridge는 그대로다 | `tests/storage/test_us_isin_anchor.py::test_an_isin_whose_earlier_row_contradicts_a_registered_bridge_is_not_registered` | 구현 |
 | DV-590 | 앞선 행이 등록 claim과 모순되는 미등록 ISIN은 Norgate 상품에도 이어지지 않고 `list_registered_conflict`로 남는다 | `tests/storage/test_us_isin_anchor.py::test_an_isin_whose_earlier_row_contradicts_a_registered_claim_joins_no_instrument` | 구현 |
+| DV-591 | `eodhd`/`isin` anchor만 가진 상품(ISIN으로 발급한 상품, 목록이 처음 ISIN을 이은 Norgate 상품)도 상장폐지 목록에 나타나면 `observed`와 `last_bar` 사건을 둘 다 받는다 | `tests/storage/test_us_delisted.py::test_an_instrument_named_by_its_eodhd_isin_gets_both_delisting_events` | 구현 |
+| DV-592 | 한 ISIN이 같은 상품의 `fmp`/`isin`과 `eodhd`/`isin`이면 사건은 한 번씩이고, 두 키가 다른 상품을 가리키면 어느 쪽에도 사건이 없고 원천은 미해결, 대기 집계는 `isin_ambiguous`다 | `tests/storage/test_us_delisted.py::test_one_isin_under_both_providers_names_one_instrument_or_stays_ambiguous` | 구현 |
+| DV-593 | 미해결로 기록된 상장폐지 원천은 뒤에 `eodhd`/`isin`이 등록돼 해석 행이 바뀌면 유지보수가 다시 계획해 승격한다(`key_members`가 매퍼의 모든 키를 본다) | `tests/storage/test_us_delisted.py::test_a_waiting_list_is_promoted_once_a_list_joins_its_isin_at_eodhd` | 구현 |

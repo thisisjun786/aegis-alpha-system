@@ -32,14 +32,23 @@ from aegis_alpha.storage.maintain_promotion import (
 from aegis_alpha.storage.promotion.engine import promote
 from aegis_alpha.storage.promotion.mappers import IDENTITY_ROWS, mapper, reference_table
 from aegis_alpha.storage.promotion.mappers.eodhd_delisted import BARS, LAST_BAR, OBSERVED
+from aegis_alpha.storage.us_symbols import ISIN_ANCHOR
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
 from tests.storage.kr_identity_support import eodhd_job, isin, symbol
-from tests.storage.promotion_support import add_source, at, bar, spec
+from tests.storage.promotion_support import add_source, at, bar, spec, us
 
 A, B, C = "910001", "910002", "910003"
 IA, IB, IC = (mint_instrument("norgate_assetid", value) for value in (A, B, C))
 ISIN_A, ISIN_B, ISIN_C = isin("000000011", "US"), isin("000000022", "US"), isin("000000033", "US")
 UNREGISTERED = isin("000000099", "US")
+NORGATE = "norgate_assetid"
+# An instrument us_symbols minted from a new listing's ISIN, a Norgate instrument that first got
+# its ISIN from a list, and one ISIN two providers tie to two instruments.
+ISIN_D, ISIN_E, ISIN_X = isin("000000044", "US"), isin("000000055", "US"), isin("000000066", "US")
+E, F = "910005", "910006"
+ID, IE = mint_instrument(ISIN_ANCHOR, ISIN_D), mint_instrument(NORGATE, E)
+IF, IX = mint_instrument(NORGATE, F), mint_instrument(ISIN_ANCHOR, ISIN_X)
+THU_LIST_US = us(at("2026-09-10T21:00:00"))
 NEW_YORK = ZoneInfo("America/New_York")
 FRI, MON = date(2026, 9, 11), date(2026, 9, 14)
 DAY_RULE = {"rule": "local_day_end@1", "basis": "record", "input": "session_date",
@@ -61,53 +70,79 @@ def _start(day: date) -> int:
     return (moment - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(microseconds=1)
 
 
-def _registry(ws: Workspace, link: str) -> dict[str, str]:
-    """Three instruments: each a Norgate anchor, a bar symbol and a registered FMP ISIN."""
+type _Isin = tuple[str, str, int]
+"""An ISIN assertion: provider (``fmp`` or ``eodhd``), ISIN and the first instant it holds."""
+type _Listing = tuple[tuple[str, str], str, tuple[_Isin, ...]]
+"""An instrument: its anchor, its EODHD bar symbol and its ISIN assertions."""
 
-    def claim(anchor: str, provider: str, namespace: str, token: str) -> dict[str, object]:
-        return {"instrument": {"anchor_namespace": "norgate_assetid", "anchor_token": anchor},
-                "provider": provider, "namespace": namespace, "token": token,
-                "valid_from_us": UNBOUNDED, "valid_to_us": None, "known_from_us": 1,
-                "supersedes_assertion_id": None, "source_snapshot_id": "sl:" + link,
-                "source_hash": hashlib.sha256(token.encode()).hexdigest()}  # fmt: skip
+LISTINGS: tuple[_Listing, ...] = (
+    ((NORGATE, A), "AAA.US", (("fmp", ISIN_A, UNBOUNDED),)),
+    ((NORGATE, B), "OLDB.US", (("fmp", ISIN_B, UNBOUNDED),)),
+    ((NORGATE, C), "OLDC.US", (("fmp", ISIN_C, UNBOUNDED),)),
+)
 
-    rows = ((A, "AAA.US", ISIN_A), (B, "OLDB.US", ISIN_B), (C, "OLDC.US", ISIN_C))
+
+def _claim(  # noqa: PLR0913, PLR0917 -- one assertion spells every registry field it varies
+    anchor: tuple[str, str],
+    provider: str,
+    namespace: str,
+    token: str,
+    link: str,
+    valid_from: int = UNBOUNDED,
+) -> dict[str, object]:
+    return {"instrument": {"anchor_namespace": anchor[0], "anchor_token": anchor[1]},
+            "provider": provider, "namespace": namespace, "token": token,
+            "valid_from_us": valid_from, "valid_to_us": None, "known_from_us": 1,
+            "supersedes_assertion_id": None, "source_snapshot_id": "sl:" + link,
+            "source_hash": hashlib.sha256(f"{provider}:{token}".encode()).hexdigest()}  # fmt: skip
+
+
+def _instrument(anchor: tuple[str, str]) -> dict[str, object]:
+    return {"anchor_namespace": anchor[0], "anchor_token": anchor[1], "issuer": None,
+            "asset_type": "unclassified", "venue": "XNYS"}  # fmt: skip
+
+
+def _registry(ws: Workspace, link: str, listings: tuple[_Listing, ...]) -> dict[str, str]:
+    """Each listing's anchor, bar symbol and ISIN assertions, snapshotted as ``us-delisted``.
+
+    A Norgate instrument's anchor is its ``norgate``/``norgate_assetid`` assertion; an
+    instrument minted from an ISIN (``us_isin``) is anchored by its ``eodhd``/``isin`` one,
+    as ``us_symbols`` registers it.
+    """
+    assertions: list[dict[str, object]] = []
+    for anchor, ticker, isins in listings:
+        if anchor[0] == NORGATE:
+            assertions.append(_claim(anchor, "norgate", NORGATE, anchor[1], link))
+        assertions.append(_claim(anchor, "eodhd", "eodhd_symbol", ticker, link))
+        assertions.extend(_claim(anchor, provider, "isin", token, link, valid_from)
+                          for provider, token, valid_from in isins)  # fmt: skip
     document = {
         "schema": "aas-identity-registry-v1",
         "issuers": [],
-        "instruments": [
-            {
-                "anchor_namespace": "norgate_assetid",
-                "anchor_token": anchor,
-                "issuer": None,
-                "asset_type": "unclassified",
-                "venue": "XNYS",
-            }
-            for anchor, _, _ in rows
-        ],
-        "assertions": [
-            item
-            for anchor, ticker, code in rows
-            for item in (
-                claim(anchor, "norgate", "norgate_assetid", anchor),
-                claim(anchor, "eodhd", "eodhd_symbol", ticker),
-                claim(anchor, "fmp", "isin", code),
-            )
-        ],
+        "instruments": [_instrument(anchor) for anchor, _, _ in listings],
+        "assertions": assertions,
     }
     register_identities(ws.state, parse_registry(document), apply=True)
-    report = snapshot_identities(ws.state, "us-delisted", created_at_us=5, apply=True)
+    return _snapshot(ws, "us-delisted", 5)
+
+
+def _snapshot(ws: Workspace, name: str, created_at_us: int) -> dict[str, str]:
+    report = snapshot_identities(ws.state, name, created_at_us=created_at_us, apply=True)
     return {"snapshot_id": str(report["snapshot_id"]), "content_hash": str(report["content_hash"])}
 
 
-def _bars(ws: Workspace) -> dict[str, str]:
+def _bars(
+    ws: Workspace,
+    listings: tuple[_Listing, ...] = LISTINGS,
+    extra: tuple[tuple[str, date], ...] = (),
+) -> dict[str, str]:
     """AAA trades through Friday; OLDB's last bar is 2026-08-14 and OLDC's 2026-07-20."""
     rows = [("AAA.US", date(2026, 9, 10)), ("AAA.US", FRI), ("OLDB.US", date(2026, 8, 14)),
-            ("OLDC.US", date(2026, 7, 20))]  # fmt: skip
+            ("OLDC.US", date(2026, 7, 20)), *extra]  # fmt: skip
     retrieved = at("2026-09-12T10:00:00")
     pin = add_source(ws, [bar(name, day, 10.0, retrieved=retrieved, currency="USD")
                           for name, day in rows], tag="us-bars", linked=retrieved)  # fmt: skip
-    identity = _registry(ws, pin["source_id"])
+    identity = _registry(ws, pin["source_id"], listings)
     published = promote(ws, *spec([pin], identity, dataset="prices.us.eodhd", decimals=FLOATS,
                                   rules={"available_at_us": DAY_RULE,
                                          "revision_known_at_us": DAY_RULE},
@@ -324,3 +359,103 @@ def test_an_unknown_isin_in_the_earlier_listed_list_still_flags_the_survivorship
     assert (IB, LAST_BAR, "delisting_inferred") in flags
     assert (IB, LAST_BAR, "survivorship_unverified") in flags
     assert all(event != OBSERVED for _, event, _, _ in _events(ws))
+
+
+ISIN_LISTINGS: tuple[_Listing, ...] = (
+    *LISTINGS,
+    # Minted from its ISIN: the eodhd/isin assertion is its anchor, held from the start.
+    ((ISIN_ANCHOR, ISIN_D), "NEWD.US", (("eodhd", ISIN_D, UNBOUNDED),)),
+    # A Norgate instrument a list joined its ISIN to: eodhd/isin from that list's retrieval.
+    ((NORGATE, E), "NORE.US", (("eodhd", ISIN_E, THU_LIST_US),)),
+)
+ISIN_BARS = (("NEWD.US", FRI), ("NORE.US", FRI))
+
+
+def _delisted_on_monday(
+    ws: Workspace, identity: dict[str, str], rows: list[dict[str, object]]
+) -> dict[str, object]:
+    """``rows`` are listed Thursday and Friday, absent from Friday's (first) delisted list and
+    on Monday's: observed on Monday. Returns Monday's run."""
+    _list(ws, "2026-09-10T21:00:00Z", "0", rows)
+    _list(ws, "2026-09-11T21:00:00Z", "0", rows)
+    _list(ws, "2026-09-11T22:00:00Z", "1", [_row("OLD", ISIN_B)])
+    _run(ws, identity, 10)
+    _list(ws, "2026-09-14T21:00:00Z", "0", [])
+    _list(ws, "2026-09-14T22:00:00Z", "1", rows)
+    return _run(ws, identity, 20)
+
+
+def _both_events(instrument: str) -> list[tuple[str, str, int, str]]:
+    return [
+        (instrument, LAST_BAR, _start(FRI + timedelta(days=1)), "eodhd_delisted_last_bar"),
+        (instrument, OBSERVED, _start(MON), "eodhd_delisted_observed"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("code", "value", "instrument"),
+    [("NEWD", ISIN_D, ID), ("NORE", ISIN_E, IE)],
+    ids=["minted_from_its_isin", "norgate_joined_by_a_list"],
+)
+def test_an_instrument_named_by_its_eodhd_isin_gets_both_delisting_events(
+    ws: Workspace, code: str, value: str, instrument: str
+) -> None:
+    identity = _bars(ws, ISIN_LISTINGS, ISIN_BARS)
+    run = _delisted_on_monday(ws, identity, [_row(code, value)])
+    (source,) = cast("list[dict[str, object]]", run["sources"])
+    assert source["status"] != "unresolved"
+    assert [item for item in _events(ws) if item[0] == instrument] == _both_events(instrument)
+    assert standing_unresolved(ws).get("status.us.eodhd") is None
+
+
+def test_one_isin_under_both_providers_names_one_instrument_or_stays_ambiguous(
+    ws: Workspace,
+) -> None:
+    listings: tuple[_Listing, ...] = (
+        # AAA's ISIN at FMP and, joined later by a list, at EODHD: one instrument.
+        ((NORGATE, A), "AAA.US", (("fmp", ISIN_A, UNBOUNDED), ("eodhd", ISIN_A, THU_LIST_US))),
+        ((NORGATE, B), "OLDB.US", (("fmp", ISIN_B, UNBOUNDED),)),
+        # ISIN_X is a Norgate instrument's at FMP and an ISIN-minted instrument's at EODHD.
+        ((NORGATE, F), "XF.US", (("fmp", ISIN_X, UNBOUNDED),)),
+        ((ISIN_ANCHOR, ISIN_X), "XM.US", (("eodhd", ISIN_X, UNBOUNDED),)),
+    )
+    identity = _bars(ws, listings, (("XF.US", FRI), ("XM.US", FRI)))
+    run = _delisted_on_monday(ws, identity, [_row("AAA", ISIN_A), _row("XF", ISIN_X)])
+    (source,) = cast("list[dict[str, object]]", run["sources"])
+    assert source["status"] == "unresolved"
+    events = _events(ws)
+    assert [item for item in events if item[0] == IA] == _both_events(IA)
+    # Neither holder of ISIN_X is picked.
+    assert [item for item in events if item[0] in {IF, IX}] == []
+    standing = standing_unresolved(ws)["status.us.eodhd"]
+    assert standing["rows_by_reason"] == {"isin_ambiguous": 1, "resolved": 1}
+
+
+def test_a_waiting_list_is_promoted_once_a_list_joins_its_isin_at_eodhd(ws: Workspace) -> None:
+    identity = _bars(ws, (*LISTINGS, ((NORGATE, E), "NORE.US", ())), (("NORE.US", FRI),))
+    # Friday's list starts the chain; Monday's names NORE by an ISIN nobody registered yet,
+    # so its source is recorded as waiting on the identity rows it was judged against.
+    _list(ws, "2026-09-11T22:00:00Z", "1", [_row("AAA", ISIN_A)])
+    _run(ws, identity, 10)
+    _list(ws, "2026-09-14T22:00:00Z", "1", [_row("NORE", ISIN_E)])
+    first = _run(ws, identity, 20)
+    (source,) = cast("list[dict[str, object]]", first["sources"])
+    assert source["status"] == "unresolved"
+    # A later symbol-list build joins ISIN_E to the Norgate instrument, as us_symbols does.
+    ((link,),) = ws.state.execute(
+        "SELECT DISTINCT substr(source_snapshot_id, 4) FROM identity_assertions"
+    ).fetchall()
+    document = {
+        "schema": "aas-identity-registry-v1",
+        "issuers": [],
+        "instruments": [_instrument((NORGATE, E))],
+        "assertions": [_claim((NORGATE, E), "eodhd", "isin", ISIN_E, str(link), THU_LIST_US)],
+    }
+    register_identities(ws.state, parse_registry(document), apply=True)
+    # The waiting source is planned again, since the rows it would resolve with changed.
+    second = _run(ws, _snapshot(ws, "us-delisted-joined", 6), 30)
+    (source,) = cast("list[dict[str, object]]", second["sources"])
+    assert source["status"] == "promoted"
+    assert [item for item in _events(ws) if item[0] == IE] == [
+        (IE, LAST_BAR, _start(FRI + timedelta(days=1)), "eodhd_delisted_last_bar"),
+    ]
