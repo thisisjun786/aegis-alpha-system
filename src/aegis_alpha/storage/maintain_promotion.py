@@ -123,7 +123,7 @@ from aegis_alpha.storage.market import generation_chain
 from aegis_alpha.storage.membership_pins import IdentityPin, membership_parts
 from aegis_alpha.storage.promotion import formats
 from aegis_alpha.storage.promotion.engine import dataset_head, promote
-from aegis_alpha.storage.promotion.mappers import mapper
+from aegis_alpha.storage.promotion.mappers import IdentityKey, mapper
 from aegis_alpha.storage.promotion.mappers.eodhd import ADMITTED_V2
 from aegis_alpha.storage.promotion.mappers.fred import vintage_partitions
 from aegis_alpha.storage.promotion.spec import SPEC_SCHEMA
@@ -677,30 +677,32 @@ def _done(
     return done
 
 
-def key_members_sha256(workspace: Workspace, pin: Mapping[str, str], provider: str,
-                       namespace: str) -> str:  # fmt: skip
+def key_members_sha256(workspace: Workspace, pin: Mapping[str, str], key: IdentityKey) -> str:
     """SHA-256 of the rows a snapshot resolves one identity key with (the engine's view)."""
-    return key_members(workspace, pin, provider, namespace).sha256()
+    return key_members(workspace, pin, key).sha256()
 
 
-def key_members(workspace: Workspace, pin: Mapping[str, str], provider: str,
-                namespace: str) -> KeyMembers:  # fmt: skip
-    """The rows a snapshot resolves one identity key with (the engine's view)."""
+def key_members(workspace: Workspace, pin: Mapping[str, str], key: IdentityKey) -> KeyMembers:
+    """The rows a snapshot resolves one identity key with (the engine's view): the members of
+    each of its ``(provider, namespace)`` keys, ordered as one key's alone."""
     snapshot = IdentityPin(pin["snapshot_id"], pin["content_hash"])
     parts = membership_parts(workspace.state, snapshot)
     names = [cast("IdentityPin", part).snapshot_id for part in parts] or [snapshot.snapshot_id]
-    rows = workspace.state.execute(
-        "SELECT a.token, a.instrument_id, m.valid_from_us, m.valid_to_us "
-        "FROM identity_snapshot_members m JOIN identity_assertions a USING (assertion_id) "
-        "WHERE m.snapshot_id IN (SELECT value FROM json_each(?)) AND m.known_to_us IS NULL "
-        "AND a.provider=? AND a.namespace=? ORDER BY 1, 2, 3, 4",
-        (json.dumps(names), provider, namespace),
-    ).fetchall()
-    return KeyMembers(
-        snapshot.snapshot_id,
-        [(str(token), str(instrument), int(start), None if end is None else int(end))
-         for token, instrument, start, end in rows],
-    )  # fmt: skip
+    rows: list[Member] = []
+    for provider, namespace in key.pairs():
+        rows.extend(
+            (str(token), str(instrument), int(start), None if end is None else int(end))
+            for token, instrument, start, end in workspace.state.execute(
+                "SELECT a.token, a.instrument_id, m.valid_from_us, m.valid_to_us "
+                "FROM identity_snapshot_members m JOIN identity_assertions a "
+                "USING (assertion_id) WHERE m.snapshot_id IN (SELECT value FROM json_each(?)) "
+                "AND m.known_to_us IS NULL AND a.provider=? AND a.namespace=?",
+                (json.dumps(names), provider, namespace),
+            )
+        )
+    # SQLite's ORDER BY 1, 2, 3, 4: an open end (NULL) sorts first.
+    rows.sort(key=lambda row: (row[0], row[1], row[2], row[3] is not None, row[3] or 0))
+    return KeyMembers(snapshot.snapshot_id, rows)
 
 
 def _resolution(
@@ -718,7 +720,7 @@ def _resolution(
     key = mapper(mapper_name).identity(args)
     if key is None:
         return None
-    return key_members(workspace, snapshot, key.provider, key.namespace)
+    return key_members(workspace, snapshot, key)
 
 
 def _template(
@@ -1198,7 +1200,8 @@ def delisted_breakdown(
 ) -> dict[str, object]:
     """The rows of waiting US delisted lists by why their ISIN names no instrument now.
 
-    Judged against the registry's current FMP ``isin`` owners, as the engine resolves:
+    Judged against the registry's current FMP and EODHD ``isin`` owners, as the engine
+    resolves:
     ``isin_missing`` (no ISIN: never derived, risk 7), ``isin_invalid``,
     ``isin_unregistered``, ``isin_ambiguous`` (several instruments) or ``resolved`` (the
     source waits for the next promotion), and the same by symbol class. SELECT only.

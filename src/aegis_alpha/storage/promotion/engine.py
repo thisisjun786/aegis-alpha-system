@@ -316,7 +316,7 @@ def _sources(workspace: Workspace, spec: PromotionSpec, plan: PromotionPlan) -> 
 def _identity(
     workspace: Workspace, spec: PromotionSpec, plan: PromotionPlan, budget: ComputeBudget
 ) -> None:
-    """Load the pinned snapshot's current resolution rows for the mapper's assertion key."""
+    """Load the pinned snapshot's current resolution rows for each of the mapper's keys."""
     market = workspace.market
     market.execute(
         f"CREATE OR REPLACE TEMP TABLE {IDENTITY_ROWS} (token VARCHAR, instrument_id VARCHAR, "
@@ -341,17 +341,18 @@ def _identity(
             workspace.state, part, max_materialization_bytes=budget.available_bytes
         )
     names = [cast("IdentityPin", part).snapshot_id for part in parts] or [pin.snapshot_id]
-    cursor = workspace.state.execute(
-        "SELECT a.token, a.instrument_id, m.valid_from_us, m.valid_to_us "
-        "FROM identity_snapshot_members m JOIN identity_assertions a USING (assertion_id) "
-        "WHERE m.snapshot_id IN (SELECT value FROM json_each(?)) AND m.known_to_us IS NULL "
-        "AND a.provider=? AND a.namespace=?",
-        (json.dumps(names), key.provider, key.namespace),
-    )
-    while batch := cursor.fetchmany(_BATCH):
-        market.executemany(
-            f"INSERT INTO {IDENTITY_ROWS} VALUES (?, ?, ?, ?)", [tuple(row) for row in batch]
+    for provider, namespace in key.pairs():
+        cursor = workspace.state.execute(
+            "SELECT a.token, a.instrument_id, m.valid_from_us, m.valid_to_us "
+            "FROM identity_snapshot_members m JOIN identity_assertions a USING (assertion_id) "
+            "WHERE m.snapshot_id IN (SELECT value FROM json_each(?)) AND m.known_to_us IS NULL "
+            "AND a.provider=? AND a.namespace=?",
+            (json.dumps(names), provider, namespace),
         )
+        while batch := cursor.fetchmany(_BATCH):
+            market.executemany(
+                f"INSERT INTO {IDENTITY_ROWS} VALUES (?, ?, ?, ?)", [tuple(row) for row in batch]
+            )
 
 
 def _calendars(workspace: Workspace, spec: PromotionSpec, budget: ComputeBudget) -> dict[int, str]:

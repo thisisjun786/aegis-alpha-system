@@ -52,8 +52,8 @@ holds all revisions of the chain instead of the heads, to be read as of an insta
 
 A mapper with an identity key may also read ``IDENTITY_ROWS``: one row
 ``(token VARCHAR, instrument_id VARCHAR, valid_from_us BIGINT, valid_to_us BIGINT)`` per
-pinned snapshot member of its key, the rows the engine resolves ``_aas_id_token`` with, so it
-can join a referenced generation on the instrument a row will resolve to. The engine's
+pinned snapshot member of each of its keys, the rows the engine resolves ``_aas_id_token``
+with, so it can join a referenced generation on the instrument a row will resolve to. The engine's
 resolution of the row stays the only one stored.
 """
 
@@ -79,6 +79,14 @@ class IdentityKey:
 
     provider: str
     namespace: str
+    also: tuple[tuple[str, str], ...] = ()
+    """Further ``(provider, namespace)`` keys whose members resolve the same tokens: a token
+    naming one instrument through several keys resolves to it, one naming several instruments
+    is ambiguous, as within one key."""
+
+    def pairs(self) -> tuple[tuple[str, str], ...]:
+        """Every ``(provider, namespace)`` key, this one first."""
+        return ((self.provider, self.namespace), *self.also)
 
 
 @dataclass(frozen=True, slots=True)
