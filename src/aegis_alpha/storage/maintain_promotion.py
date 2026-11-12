@@ -120,9 +120,9 @@ from aegis_alpha.storage.calendar_declaration import packaged_declaration, parse
 from aegis_alpha.storage.dataset_catalog import CATALOG, catalog_entry
 from aegis_alpha.storage.kr_prices import CURRENCIES as KR_CURRENCIES
 from aegis_alpha.storage.market import generation_chain
-from aegis_alpha.storage.membership_pins import IdentityPin, membership_parts
+from aegis_alpha.storage.membership_pins import IdentityPin
 from aegis_alpha.storage.promotion import formats
-from aegis_alpha.storage.promotion.engine import dataset_head, promote
+from aegis_alpha.storage.promotion.engine import SharedInputs, dataset_head, promote
 from aegis_alpha.storage.promotion.mappers import IdentityKey, mapper
 from aegis_alpha.storage.promotion.mappers.eodhd import ADMITTED_V2
 from aegis_alpha.storage.promotion.mappers.fred import vintage_partitions
@@ -262,8 +262,9 @@ class Route:
     the table neither ``mixed`` nor another route's."""
     start: Start | None = None
     """The first template of a dataset no chain holds yet, used when the caller names it."""
-    context: Callable[[Workspace, Candidate], list[dict[str, str]]] | None = None
-    """The earlier tables of the shape a step pins after the new one (read, never recorded)."""
+    context: Callable[[Workspace], Callable[[Candidate], list[dict[str, str]]]] | None = None
+    """The earlier tables of the shape a step pins after the new one (read, never recorded):
+    called once per route run, it gives each candidate's tables."""
 
     @property
     def mappers(self) -> tuple[str, ...]:
@@ -324,53 +325,71 @@ def _new_york_date(text: object) -> date | None:
     return moment.astimezone(ZoneInfo("America/New_York")).date()
 
 
-def us_list_context(workspace: Workspace, item: Candidate) -> list[dict[str, str]]:
-    """The US lists ``eodhd.delisted@1`` compares a delisted list with.
+def us_list_context(workspace: Workspace) -> Callable[[Candidate], list[dict[str, str]]]:
+    """The US lists ``eodhd.delisted@1`` compares a delisted list with, per candidate.
 
     Of the committed US lists of the candidate's columns retrieved on an earlier New York
     date (a run asks today's listed list just before today's delisted one): the latest
     listed list, the latest delisted list and the first delisted list, in that order and
     each once. Each list is one table whose rows share one request and retrieval.
+
+    The installation's sources, the committed US list tables and each table's summary are
+    read once for the route's run and shared by its candidates: a promotion pass commits no
+    source, and a committed table never changes.
     """
-    found = workspace.market.execute(
-        f"SELECT max(retrieved_at_utc) FROM {_quote(item.target)}"  # noqa: S608 -- a quoted table
-    ).fetchone()
-    at = None if found is None else _new_york_date(found[0])
-    columns: tuple[str, ...] | None = None
-    lists: list[tuple[str, str, dict[str, str]]] = []
     shas = {str(row["source_id"]): str(row["sha256"]) for row in list_sources(workspace)}
     tables = list(committed_tables(workspace, us_symbols.SOURCE_PREFIX))
-    for table in tables:
-        if table.source_id == item.pin["source_id"]:
-            columns = tuple(table.columns)
-    for table in tables:
-        entry = table.entry
-        if (
-            table.store != "market"
-            or entry["name"] != item.pin["table"]
-            or entry["format"] != "arrow"
-            or not entry["rows"]
-            or table.source_id == item.pin["source_id"]
-            or tuple(table.columns) != columns
-        ):
-            continue  # fmt: skip
-        target = _quote(str(entry["target"]))
-        row = workspace.market.execute(
-            f"SELECT bool_and(coalesce(({_US_LIST}), false)), min(delisted), max(delisted), "  # noqa: S608 -- a fixed predicate over a quoted table
-            f"max(retrieved_at_utc) FROM {target}"
+    summaries: dict[str, tuple[object, ...] | None] = {}
+
+    def summary(target: str) -> tuple[object, ...] | None:
+        if target not in summaries:
+            summaries[target] = workspace.market.execute(
+                f"SELECT bool_and(coalesce(({_US_LIST}), false)), min(delisted), max(delisted), "  # noqa: S608 -- a fixed predicate over a quoted table
+                f"max(retrieved_at_utc) FROM {target}"
+            ).fetchone()
+        return summaries[target]
+
+    def context(item: Candidate) -> list[dict[str, str]]:
+        found = workspace.market.execute(
+            f"SELECT max(retrieved_at_utc) FROM {_quote(item.target)}"  # noqa: S608 -- a quoted table
         ).fetchone()
-        day = None if row is None else _new_york_date(row[3])
-        if (
-            row is None
-            or row[0] is not True
-            or row[1] != row[2]
-            or None in (at, day)
-            or not (cast("date", day) < cast("date", at))
-        ):
-            continue
-        pin = {"source_id": table.source_id, "source_sha256": shas[table.source_id],
-               "table": item.pin["table"], "digest": str(entry["digest"])}  # fmt: skip
-        lists.append((str(row[1]), str(row[3]), pin))
+        at = None if found is None else _new_york_date(found[0])
+        columns: tuple[str, ...] | None = None
+        lists: list[tuple[str, str, dict[str, str]]] = []
+        for table in tables:
+            if table.source_id == item.pin["source_id"]:
+                columns = tuple(table.columns)
+        for table in tables:
+            entry = table.entry
+            if (
+                table.store != "market"
+                or entry["name"] != item.pin["table"]
+                or entry["format"] != "arrow"
+                or not entry["rows"]
+                or table.source_id == item.pin["source_id"]
+                or tuple(table.columns) != columns
+            ):
+                continue  # fmt: skip
+            row = summary(_quote(str(entry["target"])))
+            day = None if row is None else _new_york_date(row[3])
+            if (
+                row is None
+                or row[0] is not True
+                or row[1] != row[2]
+                or None in (at, day)
+                or not (cast("date", day) < cast("date", at))
+            ):
+                continue
+            pin = {"source_id": table.source_id, "source_sha256": shas[table.source_id],
+                   "table": item.pin["table"], "digest": str(entry["digest"])}  # fmt: skip
+            lists.append((str(row[1]), str(row[3]), pin))
+        return _chosen(lists)
+
+    return context
+
+
+def _chosen(lists: list[tuple[str, str, dict[str, str]]]) -> list[dict[str, str]]:
+    """The latest listed, the latest delisted and the first delisted list, each once."""
     listed = [one for one in lists if one[0] == "0"]
     delisted = [one for one in lists if one[0] == "1"]
     chosen = [
@@ -682,24 +701,27 @@ def key_members_sha256(workspace: Workspace, pin: Mapping[str, str], key: Identi
     return key_members(workspace, pin, key).sha256()
 
 
-def key_members(workspace: Workspace, pin: Mapping[str, str], key: IdentityKey) -> KeyMembers:
+def key_members(
+    workspace: Workspace,
+    pin: Mapping[str, str],
+    key: IdentityKey,
+    identities: SharedInputs | None = None,
+) -> KeyMembers:
     """The rows a snapshot resolves one identity key with (the engine's view): the members of
-    each of its ``(provider, namespace)`` keys, ordered as one key's alone."""
+    each of its ``(provider, namespace)`` keys, ordered as one key's alone. ``identities``
+    shares the rows with the pass's promotions, which resolve with the same table."""
     snapshot = IdentityPin(pin["snapshot_id"], pin["content_hash"])
-    parts = membership_parts(workspace.state, snapshot)
-    names = [cast("IdentityPin", part).snapshot_id for part in parts] or [snapshot.snapshot_id]
-    rows: list[Member] = []
-    for provider, namespace in key.pairs():
-        rows.extend(
+    shared = SharedInputs(workspace) if identities is None else identities
+    try:
+        rows: list[Member] = [
             (str(token), str(instrument), int(start), None if end is None else int(end))
-            for token, instrument, start, end in workspace.state.execute(
-                "SELECT a.token, a.instrument_id, m.valid_from_us, m.valid_to_us "
-                "FROM identity_snapshot_members m JOIN identity_assertions a "
-                "USING (assertion_id) WHERE m.snapshot_id IN (SELECT value FROM json_each(?)) "
-                "AND m.known_to_us IS NULL AND a.provider=? AND a.namespace=?",
-                (json.dumps(names), provider, namespace),
-            )
-        )
+            for token, instrument, start, end in workspace.market.execute(
+                f"SELECT * FROM {shared.table(snapshot, key)}"  # noqa: S608 -- the engine's temp table
+            ).fetchall()
+        ]
+    finally:
+        if identities is None:
+            shared.close()
     # SQLite's ORDER BY 1, 2, 3, 4: an open end (NULL) sorts first.
     rows.sort(key=lambda row: (row[0], row[1], row[2], row[3] is not None, row[3] or 0))
     return KeyMembers(snapshot.snapshot_id, rows)
@@ -710,6 +732,7 @@ def _resolution(
     template: Mapping[str, object],
     mapper_name: str,
     identity: Mapping[str, str] | None,
+    identities: SharedInputs,
 ) -> KeyMembers | None:
     """The identity-key members of the snapshot a maintenance spec of ``template`` pins."""
     pinned = cast("dict[str, str] | None", template.get("identity_snapshot"))
@@ -720,7 +743,7 @@ def _resolution(
     key = mapper(mapper_name).identity(args)
     if key is None:
         return None
-    return key_members(workspace, snapshot, key)
+    return key_members(workspace, snapshot, key, identities)
 
 
 def _template(
@@ -976,6 +999,7 @@ def _promote_source(  # noqa: PLR0913 -- one source's steps and the run's inputs
     apply: bool,
     identity: Mapping[str, str] | None,
     resolution: KeyMembers | None,
+    identities: SharedInputs,
     budget: ComputeBudget | None,
     now_us: int,
     evaluate: bool = True,
@@ -998,7 +1022,9 @@ def _promote_source(  # noqa: PLR0913 -- one source's steps and the run's inputs
             results.append(summary)
             continue
         try:
-            result = promote(workspace, raw, sha256, apply=apply, budget=budget)
+            result = promote(
+                workspace, raw, sha256, apply=apply, budget=budget, identities=identities
+            )
         except (ValueError, duckdb.Error) as error:
             # A database error (out of memory under the compute budget) refuses this
             # source; the other datasets of the pass still run.
@@ -1047,10 +1073,55 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
     planning their promotions. With ``identity_failed`` (the run's identity stage did not
     complete), a route whose template pins an identity snapshot promotes nothing. A
     dataset named in ``start`` whose chain holds no generation of a route's mappers starts
-    from the route's declared ``start`` template.
+    from the route's declared ``start`` template. Every source of the pass resolves with
+    identity rows read and verified once per snapshot and key (``SharedInputs``): the pass
+    writes no identity registry.
     """
     if apply and not evaluate:
         raise ValueError("an applied maintenance promotion evaluates every step")
+    identities = SharedInputs(workspace)
+    try:
+        runs = _promote_routes(
+            workspace,
+            apply=apply,
+            identity=identity,
+            identity_failed=identity_failed,
+            identities=identities,
+            budget=budget,
+            now_us=now_us,
+            routes=routes,
+            evaluate=evaluate,
+            start=start,
+        )
+    finally:
+        identities.close()
+    refused = [run.dataset_id for run in runs if run.status == "refused"]
+    unresolved = sorted({run.dataset_id for run in runs for item in run.sources
+                         if item["status"] == UNRESOLVED})  # fmt: skip
+    return {
+        "mode": "apply" if apply else "plan",
+        "datasets": [run.report() for run in runs],
+        "refused": refused,
+        "unresolved": unresolved,
+        "standing_unresolved": standing_unresolved(workspace),
+        "unmapped": unmapped(workspace),
+        "provider_calls": 0,
+    }
+
+
+def _promote_routes(  # noqa: PLR0913 -- the pass's explicit inputs
+    workspace: Workspace,
+    *,
+    apply: bool,
+    identity: Mapping[str, str] | None,
+    identity_failed: bool,
+    identities: SharedInputs,
+    budget: ComputeBudget | None,
+    now_us: int,
+    routes: Sequence[Route],
+    evaluate: bool,
+    start: Collection[str],
+) -> list[DatasetRun]:
     linked = _linked(workspace)
     shas = {str(row["source_id"]): str(row["sha256"]) for row in list_sources(workspace)}
     runs: list[DatasetRun] = []
@@ -1064,7 +1135,9 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
             # The chain continues with the mapper its latest generation used.
             run.mapper = route.mapper if found is None else found[1]
             resolution = (
-                None if found is None else _resolution(workspace, found[2], run.mapper, identity)
+                None
+                if found is None
+                else _resolution(workspace, found[2], run.mapper, identity, identities)
             )
             done = _done(workspace, dataset_id, resolution)
             pending = candidates(workspace, route, linked, shas, run.skipped, done=done)
@@ -1080,6 +1153,7 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
                 run.status = "identity_unavailable" if pending else "current"
                 run.skipped["identity_unavailable"] = len(pending)
                 continue
+            lists = None if route.context is None or not pending else route.context(workspace)
             for item in pending:
                 result = _promote_source(
                     workspace,
@@ -1089,10 +1163,11 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
                     apply=apply,
                     identity=identity,
                     resolution=resolution,
+                    identities=identities,
                     budget=budget,
                     now_us=now_us,
                     evaluate=evaluate,
-                    context=() if route.context is None else route.context(workspace, item),
+                    context=() if lists is None else lists(item),
                 )
                 run.sources.append(result)
                 if result["status"] == "refused":
@@ -1100,18 +1175,7 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
             if run.status != "refused" and run.sources:
                 run.status = "advanced" if apply else "planned"
             run.head = dataset_head(workspace, dataset_id)
-    refused = [run.dataset_id for run in runs if run.status == "refused"]
-    unresolved = sorted({run.dataset_id for run in runs for item in run.sources
-                         if item["status"] == UNRESOLVED})  # fmt: skip
-    return {
-        "mode": "apply" if apply else "plan",
-        "datasets": [run.report() for run in runs],
-        "refused": refused,
-        "unresolved": unresolved,
-        "standing_unresolved": standing_unresolved(workspace),
-        "unmapped": unmapped(workspace),
-        "provider_calls": 0,
-    }
+    return runs
 
 
 def standing_unresolved(workspace: Workspace) -> dict[str, dict[str, object]]:

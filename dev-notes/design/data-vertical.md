@@ -1828,6 +1828,17 @@ pin한다(없으면 `identity_unavailable`). 보고의 `started`가 참이고 `t
   `identity_unavailable`로 보고하며 그 원천은 다음 실행을 기다린다.
 - `tombstone_policy`: `never`. 원천 하나는 전체 snapshot이 아니므로 유지보수 generation은 record를 지우지 않는다.
 
+한 실행(`promote_datasets` 한 번)은 원천마다 같은 입력을 다시 읽지 않는다. 엔진의 `SharedInputs`가 (snapshot ID,
+content hash, 키 쌍)마다 identity 행을 한 번 읽어 DuckDB 임시 테이블에 두고, snapshot pin의 검증도 한 번만 한다.
+`key_members`와 모든 원천의 `IDENTITY_ROWS`가 그 테이블에서 온다. 매퍼가 참조하는 generation pin(`status.us.eodhd`의
+`prices.us.eodhd`)도 pin마다 chain 검증과 적재를 한 번만 하고, 표식·카탈로그 확인은 원천마다 그대로 한다.
+`us_list_context`는 설치본의 원천 목록, US 목록 테이블과 그 요약을 route 실행마다 한 번 읽는다. 근거는 셋이다.
+등록된 snapshot은 content hash가 멤버를 고정하고 assertion은 덧붙이기만 한다. 발행된 generation은 바뀌지 않는다.
+실행 안에서는 identity 레지스트리도 원천도 쓰지 않는다(identity 등록은 그 앞 `identity` 단계의 일이다).
+키 멤버 읽기는 pin한 part의 멤버에서 출발해 assertion을 기본 키로 찾는다(`CROSS JOIN`). 그래서 pin 밖의 같은 키
+assertion이 늘어도 비용이 늘지 않는다. 발행 내용, manifest, 명세 해시, 원천 결과와 `unresolved_token_count`는
+원천마다 읽던 때와 같다.
+
 매퍼와 그 인자, 시간·숫자·품질 규칙은 template 그대로이므로 유지보수가 chain의 규칙을 바꾸지 않는다. 더 늦은
 시간 규칙 세대 dataset(`<dataset>.r<N>`)도 자기 template으로 같은 방식으로 이어진다. 새 원천은 `sl:` 연결 시각,
 같으면 원천 ID 순서다. 한 원천의 모든 단계가 승격되거나 변하지 않았으면 그 원천은 그 dataset에서 끝난 것이고,
@@ -3401,3 +3412,6 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-594 | master는 화요일에 끝나도 export가 금요일까지 늘린 상장의 창이 ISIN 상품의 수요일 목록 claim과 겹치면, 그 상장은 export claim과 함께 `isin_instrument_held`로 빠지고 build는 등록된다 | `tests/storage/test_us_isin_anchor.py::test_a_series_whose_export_window_holds_an_isin_claim_is_left_out` | 구현 |
 | DV-595 | export가 상장을 `AAA`→`BBB`로 개명해 늘린 창이 ISIN 상품의 `BBB.US` claim과 겹쳐도, master에 없는 export series의 창이 겹쳐도 같은 판정으로 빠진다(후자는 `exports.isin_instrument_held`) | `tests/storage/test_us_isin_anchor.py::test_a_series_whose_export_window_holds_an_isin_claim_is_left_out` | 구현 |
 | DV-596 | master 첫 날보다 이른 export 행은 claim을 만들지 않아, ISIN 상품이 그 앞날 티커를 가져도 상장은 빠지지 않고 겹침 없이 등록된다 | `tests/storage/test_us_isin_anchor.py::test_an_export_reaching_before_the_master_claims_nothing_over_an_isin_claim` | 구현 |
+| DV-597 | 한 유지보수 실행은 같은 snapshot·키의 identity 행을 원천 수와 상관없이 한 번 읽고 snapshot pin을 한 번 검증하며, 공유한 행은 원천마다 읽던 행과 다중집합이 같고 시작 route와 이어 붙이는 실행의 발행 결과도 같다 | `tests/storage/test_maintain_identity_rows.py::test_a_pass_reads_the_snapshot_members_as_often_for_three_sources_as_for_one`, `::test_the_shared_rows_are_the_rows_each_source_loaded`, `::test_a_start_pass_and_a_continuing_pass_publish_what_the_per_source_load_did` | 구현 |
+| DV-598 | 키 멤버 읽기는 pin한 snapshot의 멤버에서 출발해, pin 밖의 같은 키 assertion이 열 배로 늘어도 비용이 거의 그대로다 | `tests/storage/test_maintain_identity_rows.py::test_the_key_read_costs_the_pinned_members_not_the_registry` | 구현 |
+| DV-599 | `status.us.eodhd` 실행은 참조한 `prices.us.eodhd` chain을 pin마다 한 번 검증·적재하고, 시작과 이어 붙이는 실행의 발행 결과는 원천마다 하던 때와 같다 | `tests/storage/test_maintain_identity_rows.py::test_a_status_start_pass_and_a_continuing_pass_publish_what_the_per_source_load_did` | 구현 |

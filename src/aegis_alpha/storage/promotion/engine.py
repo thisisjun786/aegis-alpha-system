@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     import duckdb
 
     from aegis_alpha.storage.market_inputs import GenerationPin
+    from aegis_alpha.storage.promotion.mappers import IdentityKey, Reference
     from aegis_alpha.storage.source_reader import SourcePin
     from aegis_alpha.storage.workspace import Workspace
 
@@ -234,8 +235,15 @@ def _columns(market: duckdb.DuckDBPyConnection, relation: str) -> dict[str, str]
 # --- pinned inputs -------------------------------------------------------------------------
 
 
-def _verify_pin(workspace: Workspace, pin: GenerationPin, budget: ComputeBudget) -> list[str]:
-    """Check a generation pin against its marker and catalog; return its chain's IDs."""
+def _verify_pin(
+    workspace: Workspace,
+    pin: GenerationPin,
+    budget: ComputeBudget,
+    shared: SharedInputs | None = None,
+) -> list[str]:
+    """Check a generation pin against its marker and catalog; return its chain's IDs.
+
+    With ``shared`` the chain's bulk verification runs once per pin in the pass."""
     marker = marker_for(workspace.market, pin.generation_id)
     if (
         marker["dataset_id"] != pin.dataset_id
@@ -253,7 +261,10 @@ def _verify_pin(workspace: Workspace, pin: GenerationPin, budget: ComputeBudget)
         is None
     ):
         raise ValueError(f"generation pin {pin.dataset_id}@{pin.version} is not committed")
-    verify_generation_bulk(workspace.market, pin.generation_id, budget=budget)
+    if shared is None or not shared.generation_verified(pin):
+        verify_generation_bulk(workspace.market, pin.generation_id, budget=budget)
+        if shared is not None:
+            shared.verified_generation(pin)
     return [
         str(item["generation_id"]) for item in generation_chain(workspace.market, pin.generation_id)
     ]
@@ -313,6 +324,109 @@ def _sources(workspace: Workspace, spec: PromotionSpec, plan: PromotionPlan) -> 
     return found
 
 
+# One key's current members of the named snapshot parts. CROSS JOIN keeps SQLite's join order:
+# the pinned parts' members drive the loop and each probes its assertion by primary key, so
+# assertions of the key outside the pin (other snapshots, later registrations) cost nothing.
+KEY_MEMBERS_SQL: Final = (
+    "SELECT a.token, a.instrument_id, m.valid_from_us, m.valid_to_us "
+    "FROM identity_snapshot_members m CROSS JOIN identity_assertions a "
+    "WHERE m.snapshot_id IN (SELECT value FROM json_each(?)) AND m.known_to_us IS NULL "
+    "AND a.assertion_id = m.assertion_id AND a.provider=? AND a.namespace=?"
+)
+_SHARED_PREFIX: Final = "_aas_shared_"
+
+
+class SharedInputs:
+    """The identity rows and referenced generations of a promotion pass, read and verified once.
+
+    One promotion pass (``maintain_promotion.promote_datasets``) promotes many sources under
+    the same snapshot and generation pins. A registered snapshot is immutable: its content
+    hash fixes every member (``verify_membership_pin`` rebuilds the hash from them), and
+    assertions are append-only rows that registration never changes. Nothing a pass runs
+    writes the identity registry (only ``identity.register_identities`` and the
+    ``membership_pins`` registrations do, in the identity stage before promotion), so the rows
+    of one (snapshot ID, content hash, key pairs) and the result of verifying one pin hold for
+    the whole pass. A published generation is immutable too (no-clobber; a pass only appends
+    new generations), so a generation pin verified and loaded once keeps its rows even when
+    the pass moves its dataset's head. Use one instance per pass and close it; a pass that
+    registered identities in between would need a new one.
+
+    The tables live in DuckDB temp tables on the workspace connection, outside the engine's
+    ``_aas_p_`` names, so dropping a plan's temp tables leaves them for the next source.
+    """
+
+    def __init__(self, workspace: Workspace) -> None:
+        self._workspace = workspace
+        self._parts: dict[tuple[str, str], list[str]] = {}
+        self._verified: set[tuple[str, str]] = set()
+        self._generations: set[GenerationPin] = set()
+        self._tables: dict[tuple[object, ...], str] = {}
+
+    def _create(self, key: tuple[object, ...], columns: str) -> str:
+        name = f"{_SHARED_PREFIX}{len(self._tables)}"
+        self._workspace.market.execute(f"CREATE OR REPLACE TEMP TABLE {name} {columns}")
+        self._tables[key] = name
+        return name
+
+    def _names(self, pin: IdentityPin) -> list[str]:
+        found = self._parts.get((pin.snapshot_id, pin.content_hash))
+        if found is None:
+            parts = membership_parts(self._workspace.state, pin)
+            found = [cast("IdentityPin", part).snapshot_id for part in parts] or [pin.snapshot_id]
+            self._parts[(pin.snapshot_id, pin.content_hash)] = found
+        return found
+
+    def verify(self, pin: IdentityPin, budget: ComputeBudget) -> None:
+        """Verify the pin's parts (or its v1 document) the first time it is asked."""
+        if (pin.snapshot_id, pin.content_hash) in self._verified:
+            return
+        parts = membership_parts(self._workspace.state, pin)
+        for part in parts or (pin,):
+            verify_membership_pin(
+                self._workspace.state, part, max_materialization_bytes=budget.available_bytes
+            )
+        self._verified.add((pin.snapshot_id, pin.content_hash))
+
+    def table(self, pin: IdentityPin, key: IdentityKey) -> str:
+        """The temp table of the pin's current members of each of the key's pairs."""
+        pairs = tuple(key.pairs())
+        found = self._tables.get(("identity", pin.snapshot_id, pin.content_hash, pairs))
+        if found is not None:
+            return found
+        market = self._workspace.market
+        name = self._create(
+            ("identity", pin.snapshot_id, pin.content_hash, pairs),
+            "(token VARCHAR, instrument_id VARCHAR, valid_from_us BIGINT, valid_to_us BIGINT)",
+        )
+        names = json.dumps(self._names(pin))
+        for provider, namespace in pairs:
+            cursor = self._workspace.state.execute(KEY_MEMBERS_SQL, (names, provider, namespace))
+            while batch := cursor.fetchmany(_BATCH):
+                _insert_columns(market, name, ("VARCHAR", "VARCHAR", "BIGINT", "BIGINT"), batch)
+        return name
+
+    def generation_verified(self, pin: GenerationPin) -> bool:
+        return pin in self._generations
+
+    def verified_generation(self, pin: GenerationPin) -> None:
+        self._generations.add(pin)
+
+    def reference(self, reference: Reference, load: Callable[[str], None]) -> str:
+        """The temp table ``load`` fills with the reference's rows, filled once per pin."""
+        key = ("reference", reference.pin, reference.domain, reference.revisions)
+        found = self._tables.get(key)
+        if found is None:
+            found = f"{_SHARED_PREFIX}{len(self._tables)}"
+            load(found)
+            self._tables[key] = found
+        return found
+
+    def close(self) -> None:
+        for name in self._tables.values():
+            self._workspace.market.execute(f"DROP TABLE IF EXISTS temp.{name}")
+        self._tables.clear()
+
+
 def _insert_columns(
     market: duckdb.DuckDBPyConnection,
     table: str,
@@ -330,7 +444,11 @@ def _insert_columns(
 
 
 def _identity(
-    workspace: Workspace, spec: PromotionSpec, plan: PromotionPlan, budget: ComputeBudget
+    workspace: Workspace,
+    spec: PromotionSpec,
+    plan: PromotionPlan,
+    budget: ComputeBudget,
+    identities: SharedInputs | None,
 ) -> None:
     """Load the pinned snapshot's current resolution rows for each of the mapper's keys."""
     market = workspace.market
@@ -351,24 +469,13 @@ def _identity(
     ):
         plan.blocking.append(f"identity snapshot {pin.snapshot_id} is not registered")
         return
-    parts = membership_parts(workspace.state, pin)
-    for part in parts or (pin,):
-        verify_membership_pin(
-            workspace.state, part, max_materialization_bytes=budget.available_bytes
-        )
-    names = [cast("IdentityPin", part).snapshot_id for part in parts] or [pin.snapshot_id]
-    for provider, namespace in key.pairs():
-        cursor = workspace.state.execute(
-            "SELECT a.token, a.instrument_id, m.valid_from_us, m.valid_to_us "
-            "FROM identity_snapshot_members m JOIN identity_assertions a USING (assertion_id) "
-            "WHERE m.snapshot_id IN (SELECT value FROM json_each(?)) AND m.known_to_us IS NULL "
-            "AND a.provider=? AND a.namespace=?",
-            (json.dumps(names), provider, namespace),
-        )
-        while batch := cursor.fetchmany(_BATCH):
-            _insert_columns(
-                market, IDENTITY_ROWS, ("VARCHAR", "VARCHAR", "BIGINT", "BIGINT"), batch
-            )
+    rows = SharedInputs(workspace) if identities is None else identities
+    try:
+        rows.verify(pin, budget)
+        market.execute(f"INSERT INTO {IDENTITY_ROWS} SELECT * FROM {rows.table(pin, key)}")
+    finally:
+        if identities is None:
+            rows.close()
 
 
 def _calendars(workspace: Workspace, spec: PromotionSpec, budget: ComputeBudget) -> dict[int, str]:
@@ -390,16 +497,22 @@ def _calendars(workspace: Workspace, spec: PromotionSpec, budget: ComputeBudget)
     return tables
 
 
-def _references(workspace: Workspace, spec: PromotionSpec, budget: ComputeBudget) -> None:
+def _references(
+    workspace: Workspace,
+    spec: PromotionSpec,
+    budget: ComputeBudget,
+    shared: SharedInputs | None = None,
+) -> None:
     """Load the head rows of each generation the mapper references into its temp table.
 
     The pin is checked like a calendar pin, and its dataset must hold the referenced
     domain. Only the domain columns of non-TOMBSTONE heads are loaded, with the two instants
     a strict reader judges them by, ``available_at_us`` and ``revision_known_at_us``; a
-    reference declared with ``revisions`` loads every revision of the chain instead.
+    reference declared with ``revisions`` loads every revision of the chain instead. With
+    ``shared`` each pin's rows are verified and read once per pass and copied from there.
     """
     for name, reference in references(spec.mapper, spec.mapper_args).items():
-        chain = _verify_pin(workspace, reference.pin, budget)
+        chain = _verify_pin(workspace, reference.pin, budget, shared)
         found = workspace.state.execute(
             "SELECT domain FROM datasets WHERE dataset_id=?", (reference.pin.dataset_id,)
         ).fetchone()
@@ -407,30 +520,44 @@ def _references(workspace: Workspace, spec: PromotionSpec, budget: ComputeBudget
             raise ValueError(
                 f"mapper reference {name} must pin a {reference.domain} dataset generation"
             )
-        columns = ", ".join(
-            _q(column)
-            for column in (
-                *(column for column, _ in DOMAINS[reference.domain]),
-                "available_at_us",
-                "revision_known_at_us",
-            )
-        )
-        if reference.revisions:
-            workspace.market.execute(
-                f"CREATE OR REPLACE TEMP TABLE {reference_table(name)} AS SELECT "
-                f"{', '.join('p.' + column for column in columns.split(', '))}, "
-                "g.sequence AS _aas_sequence, p.op, p.record_id, p.revision_id "
-                f"FROM {_q(reference.domain)} p JOIN market_generations g "
-                "ON g.generation_id = p.generation_id "
-                "WHERE p.generation_id IN (SELECT unnest(?::JSON::VARCHAR[]))",
-                [json.dumps(chain)],
-            )
+        target = reference_table(name)
+        if shared is None:
+            _load_reference(workspace, target, reference, chain)
             continue
+        loaded = shared.reference(
+            reference,
+            lambda table, item=reference, ids=chain: _load_reference(workspace, table, item, ids),
+        )
+        workspace.market.execute(f"CREATE OR REPLACE TEMP TABLE {target} AS SELECT * FROM {loaded}")
+
+
+def _load_reference(
+    workspace: Workspace, table: str, reference: Reference, chain: list[str]
+) -> None:
+    columns = ", ".join(
+        _q(column)
+        for column in (
+            *(column for column, _ in DOMAINS[reference.domain]),
+            "available_at_us",
+            "revision_known_at_us",
+        )
+    )
+    if reference.revisions:
         workspace.market.execute(
-            f"CREATE OR REPLACE TEMP TABLE {reference_table(name)} AS SELECT {columns} "
-            f"FROM ({_heads_sql(reference.domain)}) WHERE op <> 'TOMBSTONE'",
+            f"CREATE OR REPLACE TEMP TABLE {table} AS SELECT "
+            f"{', '.join('p.' + column for column in columns.split(', '))}, "
+            "g.sequence AS _aas_sequence, p.op, p.record_id, p.revision_id "
+            f"FROM {_q(reference.domain)} p JOIN market_generations g "
+            "ON g.generation_id = p.generation_id "
+            "WHERE p.generation_id IN (SELECT unnest(?::JSON::VARCHAR[]))",
             [json.dumps(chain)],
         )
+        return
+    workspace.market.execute(
+        f"CREATE OR REPLACE TEMP TABLE {table} AS SELECT {columns} "
+        f"FROM ({_heads_sql(reference.domain)}) WHERE op <> 'TOMBSTONE'",
+        [json.dumps(chain)],
+    )
 
 
 # --- the SQL pipeline ----------------------------------------------------------------------
@@ -1415,9 +1542,17 @@ def _report(
 
 
 def plan_promotion(
-    workspace: Workspace, spec: PromotionSpec, *, budget: ComputeBudget | None = None
+    workspace: Workspace,
+    spec: PromotionSpec,
+    *,
+    budget: ComputeBudget | None = None,
+    identities: SharedInputs | None = None,
 ) -> PromotionPlan:
-    """Compute everything a promotion writes, writing nothing; temp tables stay for apply."""
+    """Compute everything a promotion writes, writing nothing; temp tables stay for apply.
+
+    ``identities`` shares identity rows and referenced generations across the promotions of
+    one pass (see ``SharedInputs``); without it the plan reads and verifies them itself.
+    """
     budget = budget or _DEFAULT_BUDGET
     market = workspace.market
     limit_duckdb(market, budget)
@@ -1432,9 +1567,9 @@ def plan_promotion(
     if version < 2:  # noqa: PLR2004 -- quality_flags arrive in v2
         plan.blocking.append("quality flags need core schema v2; run aas db migrate --to 2")
     sources = _sources(workspace, spec, plan)
-    _identity(workspace, spec, plan, budget)
+    _identity(workspace, spec, plan, budget, identities)
     calendars = _calendars(workspace, spec, budget)
-    _references(workspace, spec, budget)
+    _references(workspace, spec, budget, identities)
     decimal_rules.install(market)
     _stage_sources(workspace, spec, sources, plan)
     _stage_items(workspace, spec, sources, plan)
@@ -1584,13 +1719,14 @@ def _release_plan(market: duckdb.DuckDBPyConnection) -> None:
 # --- apply, recovery and verification ------------------------------------------------------
 
 
-def promote(
+def promote(  # noqa: PLR0913 -- the spec, its mode and the pass's shared inputs
     workspace: Workspace,
     raw: bytes,
     sha256: str,
     *,
     apply: bool,
     budget: ComputeBudget | None = None,
+    identities: SharedInputs | None = None,
 ) -> dict[str, object]:
     """Plan, or apply, one promotion spec; the same request returns its existing generation."""
     budget = budget or _DEFAULT_BUDGET
@@ -1613,7 +1749,7 @@ def promote(
         if pending:
             raise ValueError("finish or quarantine the pending promotion before another")
     try:
-        plan = plan_promotion(workspace, spec, budget=budget)
+        plan = plan_promotion(workspace, spec, budget=budget, identities=identities)
         result = {"mode": "apply" if apply else "plan", "reused": False, **plan.summary()}
         if not apply:
             return {**result, "published": False}
