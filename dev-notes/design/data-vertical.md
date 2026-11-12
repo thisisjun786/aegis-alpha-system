@@ -2067,9 +2067,12 @@ instrument는 Norgate security master와 그보다 늦은 Norgate history 내보
 instrument는 [유지보수 실행](#유지보수-실행)의 목록 증분이 등록한다).
 
 **ISIN 상품이 먼저 가진 날.** master 행의 티커 구간(상장 행은 아래 claim 구간, 상폐 행은 접미사를 뗀 티커의
-`first_date`~`last_date`)이 그 티커의 등록 목록 claim을 가진 `us_isin` 상품과 겹치면, 그 행은 ISIN 상품에
+`first_date`~`last_date`)이나 그 asset ID의 export 창 claim 구간(개명한 새 티커도)이 그 티커의 등록 목록 claim을
+가진 `us_isin` 상품과 겹치면, 그 행은 ISIN 상품에
 합치지도, 따로 발급하지도 않고 문서에서 뺀다(`listings.isin_instrument_held`). 그 행의 asset ID·심볼·EODHD·FMP·
-issuer 주장과 export claim은 모두 남지 않는다. Norgate는 지금 구독하지 않아 그 행을 ISIN 상품으로 옮기는
+issuer 주장과 export claim은 모두 남지 않는다. master에 없고 export만 아는 series도 같은 판정으로
+`exports.isin_instrument_held`에 남는다. 두 구간은 `_without_held` 한 곳에서 판정하고, 뺀 series 때문에 다른
+series의 창이 생기면(보유자·공유 티커가 줄어서) 다시 판정한다. Norgate는 지금 구독하지 않아 그 행을 ISIN 상품으로 옮기는
 흡수 경로는 쓰는 곳 없이 신원·export·소비자(universe, classification) 표면만 넓혔으므로 걷어냈다(G105, 결정은
 Norgate 재구독 전에 다시 정한다). 그래서 같은 증권이 두 상품이 되지 않는다. 반대 순서(Norgate 먼저)면 목록의
 ISIN이 Norgate 상품에 이어진다([유지보수 실행](#유지보수-실행)).
@@ -3395,3 +3398,6 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-591 | `eodhd`/`isin` anchor만 가진 상품(ISIN으로 발급한 상품, 목록이 처음 ISIN을 이은 Norgate 상품)도 상장폐지 목록에 나타나면 `observed`와 `last_bar` 사건을 둘 다 받는다 | `tests/storage/test_us_delisted.py::test_an_instrument_named_by_its_eodhd_isin_gets_both_delisting_events` | 구현 |
 | DV-592 | 한 ISIN이 같은 상품의 `fmp`/`isin`과 `eodhd`/`isin`이면 사건은 한 번씩이고, 두 키가 다른 상품을 가리키면 어느 쪽에도 사건이 없고 원천은 미해결, 대기 집계는 `isin_ambiguous`다 | `tests/storage/test_us_delisted.py::test_one_isin_under_both_providers_names_one_instrument_or_stays_ambiguous` | 구현 |
 | DV-593 | 미해결로 기록된 상장폐지 원천은 뒤에 `eodhd`/`isin`이 등록돼 해석 행이 바뀌면 유지보수가 다시 계획해 승격한다(`key_members`가 매퍼의 모든 키를 본다) | `tests/storage/test_us_delisted.py::test_a_waiting_list_is_promoted_once_a_list_joins_its_isin_at_eodhd` | 구현 |
+| DV-594 | master는 화요일에 끝나도 export가 금요일까지 늘린 상장의 창이 ISIN 상품의 수요일 목록 claim과 겹치면, 그 상장은 export claim과 함께 `isin_instrument_held`로 빠지고 build는 등록된다 | `tests/storage/test_us_isin_anchor.py::test_a_series_whose_export_window_holds_an_isin_claim_is_left_out` | 구현 |
+| DV-595 | export가 상장을 `AAA`→`BBB`로 개명해 늘린 창이 ISIN 상품의 `BBB.US` claim과 겹쳐도, master에 없는 export series의 창이 겹쳐도 같은 판정으로 빠진다(후자는 `exports.isin_instrument_held`) | `tests/storage/test_us_isin_anchor.py::test_a_series_whose_export_window_holds_an_isin_claim_is_left_out` | 구현 |
+| DV-596 | master 첫 날보다 이른 export 행은 claim을 만들지 않아, ISIN 상품이 그 앞날 티커를 가져도 상장은 빠지지 않고 겹침 없이 등록된다 | `tests/storage/test_us_isin_anchor.py::test_an_export_reaching_before_the_master_claims_nothing_over_an_isin_claim` | 구현 |
