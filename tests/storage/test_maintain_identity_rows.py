@@ -17,6 +17,7 @@ import time
 from collections.abc import Iterator, Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
@@ -47,6 +48,7 @@ from tests.storage.test_us_delisted import ROUTE as STATUS
 
 if TYPE_CHECKING:
     from aegis_alpha.compute_resources import ComputeBudget
+    from aegis_alpha.storage.promotion.mappers import Reference
 
 FIRST = date(2026, 8, 31)
 ROUTES_US = [route for route in ROUTES if route.dataset_id == "actions.us.eodhd"]
@@ -304,11 +306,34 @@ def test_a_load_that_failed_midway_leaves_no_partial_rows_for_the_next_source(
             pytest.raises(duckdb.Error),
         ):
             rows.table(pin, TICKER_AND_SYMBOL)
+        assert _shared_tables(ws) == []
         shared = rows.table(pin, TICKER_AND_SYMBOL)
         count = ws.market.execute(f"SELECT count(*) FROM {shared}").fetchone()
     finally:
         rows.close()
     assert count == (4500,)
+    assert _shared_tables(ws) == []
+
+
+def test_a_reference_load_that_failed_leaves_no_table_behind(ws: Workspace) -> None:
+    rows = engine.SharedInputs(ws)
+
+    def load(table: str) -> None:
+        ws.market.execute(f"CREATE TEMP TABLE {table} AS SELECT 1 AS x")
+        raise duckdb.Error("out of memory")
+
+    reference = cast("Reference", SimpleNamespace(pin="pin", domain="prices", revisions=False))
+    with pytest.raises(duckdb.Error):
+        rows.reference(reference, load)
+    assert _shared_tables(ws) == []
+    rows.close()
+
+
+def _shared_tables(ws: Workspace) -> list[str]:
+    found = ws.market.execute(
+        "SELECT table_name FROM duckdb_tables() WHERE temporary AND table_name LIKE '_aas_shared_%'"
+    ).fetchall()
+    return [str(row[0]) for row in found]
 
 
 def test_a_second_instance_on_the_connection_neither_replaces_nor_drops_the_first_ones_tables(

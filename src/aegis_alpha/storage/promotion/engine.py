@@ -404,15 +404,25 @@ class SharedInputs:
         name = self._create(
             "(token VARCHAR, instrument_id VARCHAR, valid_from_us BIGINT, valid_to_us BIGINT)",
         )
-        names = json.dumps(self._names(pin))
         # Registered only once filled: a load that failed midway (a database error under the
-        # compute budget) must not leave a partial table for the next source to reuse.
-        for provider, namespace in pairs:
-            cursor = self._workspace.state.execute(KEY_MEMBERS_SQL, (names, provider, namespace))
-            while batch := cursor.fetchmany(_BATCH):
-                _insert_columns(market, name, ("VARCHAR", "VARCHAR", "BIGINT", "BIGINT"), batch)
+        # compute budget) must neither leave a partial table for the next source to reuse nor
+        # an unregistered one that ``close`` does not know.
+        try:
+            names = json.dumps(self._names(pin))
+            for provider, namespace in pairs:
+                cursor = self._workspace.state.execute(
+                    KEY_MEMBERS_SQL, (names, provider, namespace)
+                )
+                while batch := cursor.fetchmany(_BATCH):
+                    _insert_columns(market, name, ("VARCHAR", "VARCHAR", "BIGINT", "BIGINT"), batch)
+        except BaseException:
+            self._drop(name)
+            raise
         self._tables[("identity", pin.snapshot_id, pin.content_hash, pairs)] = name
         return name
+
+    def _drop(self, name: str) -> None:
+        self._workspace.market.execute(f"DROP TABLE IF EXISTS temp.{name}")
 
     def generation_verified(self, pin: GenerationPin) -> bool:
         return pin in self._generations
@@ -426,13 +436,17 @@ class SharedInputs:
         found = self._tables.get(key)
         if found is None:
             found = self._name()
-            load(found)
+            try:
+                load(found)
+            except BaseException:
+                self._drop(found)
+                raise
             self._tables[key] = found
         return found
 
     def close(self) -> None:
         for name in self._tables.values():
-            self._workspace.market.execute(f"DROP TABLE IF EXISTS temp.{name}")
+            self._drop(name)
         self._tables.clear()
 
 
