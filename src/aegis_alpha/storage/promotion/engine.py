@@ -362,10 +362,9 @@ class SharedInputs:
         self._generations: set[GenerationPin] = set()
         self._tables: dict[tuple[object, ...], str] = {}
 
-    def _create(self, key: tuple[object, ...], columns: str) -> str:
+    def _create(self, columns: str) -> str:
         name = f"{_SHARED_PREFIX}{len(self._tables)}"
         self._workspace.market.execute(f"CREATE OR REPLACE TEMP TABLE {name} {columns}")
-        self._tables[key] = name
         return name
 
     def _names(self, pin: IdentityPin) -> list[str]:
@@ -395,14 +394,16 @@ class SharedInputs:
             return found
         market = self._workspace.market
         name = self._create(
-            ("identity", pin.snapshot_id, pin.content_hash, pairs),
             "(token VARCHAR, instrument_id VARCHAR, valid_from_us BIGINT, valid_to_us BIGINT)",
         )
         names = json.dumps(self._names(pin))
+        # Registered only once filled: a load that failed midway (a database error under the
+        # compute budget) must not leave a partial table for the next source to reuse.
         for provider, namespace in pairs:
             cursor = self._workspace.state.execute(KEY_MEMBERS_SQL, (names, provider, namespace))
             while batch := cursor.fetchmany(_BATCH):
                 _insert_columns(market, name, ("VARCHAR", "VARCHAR", "BIGINT", "BIGINT"), batch)
+        self._tables[("identity", pin.snapshot_id, pin.content_hash, pairs)] = name
         return name
 
     def generation_verified(self, pin: GenerationPin) -> bool:

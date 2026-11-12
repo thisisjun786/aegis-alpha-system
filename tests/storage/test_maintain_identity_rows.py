@@ -14,12 +14,13 @@ import hashlib
 import json
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
+import duckdb
 import pyarrow as pa
 import pytest
 
@@ -45,8 +46,6 @@ from tests.storage.test_us_delisted import ISIN_A, ISIN_B, _bars, _list, _row
 from tests.storage.test_us_delisted import ROUTE as STATUS
 
 if TYPE_CHECKING:
-    import duckdb
-
     from aegis_alpha.compute_resources import ComputeBudget
 
 FIRST = date(2026, 8, 31)
@@ -278,6 +277,38 @@ def test_the_shared_rows_are_the_rows_each_source_loaded(ws: Workspace) -> None:
     assert ws.market.execute(
         "SELECT count(*) FROM per_source WHERE token = '100000'"
     ).fetchone() == (0,)
+
+
+def test_a_load_that_failed_midway_leaves_no_partial_rows_for_the_next_source(
+    ws: Workspace,
+) -> None:
+    pin = _snapshot(ws)
+    calls = [0]
+    real = engine._insert_columns  # noqa: SLF001 -- fail the engine's batch insert
+
+    def fail_on_second(
+        market: duckdb.DuckDBPyConnection,
+        table: str,
+        types: Sequence[str],
+        rows: Sequence[Sequence[object]],
+    ) -> None:
+        calls[0] += 1
+        if calls[0] == 2:  # noqa: PLR2004 -- the second key pair
+            raise duckdb.Error("out of memory")
+        real(market, table, types, rows)
+
+    rows = engine.SharedInputs(ws)
+    try:
+        with (
+            patch.object(engine, "_insert_columns", fail_on_second),
+            pytest.raises(duckdb.Error),
+        ):
+            rows.table(pin, TICKER_AND_SYMBOL)
+        shared = rows.table(pin, TICKER_AND_SYMBOL)
+        count = ws.market.execute(f"SELECT count(*) FROM {shared}").fetchone()
+    finally:
+        rows.close()
+    assert count == (4500,)
 
 
 def _steps_of(connection: sqlite3.Connection, pin: IdentityPin) -> int:
