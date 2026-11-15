@@ -1653,14 +1653,17 @@ head chain의 market 행과 패키지 선언 달력만 읽어 구하며 새 상�
 | `stale_reasons` | `lag`(lag가 임계값 초과), `zero_promotion`(아래 연속 실행 수가 기준 이상) |
 | `stale_series` | 시리즈 기대(`periods`)에서 자기 임계값(`series_stale_after`에 있으면 그 값, 없으면 `stale_after`)을 넘은 시리즈 ID. 시리즈 dataset은 이 목록이 비어 있지 않을 때 `lag`로 `stale`이다 |
 | `zero_promotion_runs` | 수집 단계가 성공했는데 head가 그대로이고 데이터가 뒤처진(또는 기대 날짜가 없는) 연속 실행 수. 직전 보고의 `sequence`와 이 값을 이어 센다 |
+| `survivorship` | `instrument_status` chain에만 값이 있다. 현재 행에 상장폐지(`delisted`) 사건이 하나도 없으면 `unverified`(그 chain만으로는 생존자 편향을 확인할 수 없다), 있으면 `delisting_events`. 다른 도메인은 `null` |
+| `unresolved_listings` | KIND 목록 기대(`status.kr.kind`)에만 값이 있다. 가장 늦은 서울 수집일의 KIND 목록들을 승격한 `maintain_source@1` 기록이 미해결로 남긴 단축코드 수의 합. 기록이 없으면 `null` |
 
 도메인별 `data_through` 열은 `prices`·`calendar_sessions` `session_date`, `corporate_actions` `ex_date`,
-`instrument_status` `effective_from_us`의 UTC 날짜, `fundamentals` `available_at_us`의 UTC 날짜,
+`instrument_status` `effective_from_us`의 UTC 날짜(`status.kr.kind`는 서울 날짜), `fundamentals` `available_at_us`의 UTC 날짜,
 `macro_observations` `observation_period`, `fx_rates` `fixing_at_us`의 UTC 날짜, `filings` `filed_date`,
 `classifications` `effective_from`이다. 기대는 dataset마다 하나다. US·KR 일봉·기업행동과 SEC는 그 거래소(XNYS,
 XKRX)에서 실행 시각까지 마감한 마지막 세션, OpenDART는 서울 날짜의 전일(lag는 XKRX 세션 수), ALFRED·FRED·BOK·OECD는
 시리즈마다 최근 관측 기간에서 추정한 주기(평일·주·월·분기·반기·년)로 한 주기가 더 지난 기간까지(dataset의 lag는
-가장 뒤처진 시리즈)이고, 선언 달력·KIND 상장상태·분류는 기대가 없다. H.10이 매주 월요일(휴일이면 다음 영업일)에 지난주
+가장 뒤처진 시리즈)이고, KIND 상장상태(`status.kr.kind`)는 수집된 KIND 목록이 적은 가장 늦은 상장일까지(lag는 그 사이 XKRX
+세션 수, 임계값 20: 새 상장은 주간 EODHD 목록이 ISIN을 이어야 사건이 된다), 선언 달력·분류는 기대가 없다. H.10이 매주 월요일(휴일이면 다음 영업일)에 지난주
 일별 값을 공표하는 `DEXKOUS`·`DTWEXBGS`는 `macro.us.alfred`에서 임계값 5(정상 주 월요일 lag 4, 휴일 주 5)를 따로
 갖고, 같은 공표로만 head가 오르는 `fx.usdkrw.fred`의 연속 실행 기준은 7회(정상 주 6회, 휴일 주 7회)다. 데이터셋 전체
 임계값은 올리지 않으므로 매일 공표되는 시리즈는 그대로 lag 3에서 `stale`이다. 임계값, 연속 실행 기준(기본 5회,
@@ -1673,7 +1676,7 @@ XKRX)에서 실행 시각까지 마감한 마지막 세션, OpenDART는 서울 �
  "watermarks": {"qveris/all": {"through_us": 1785139200000000, "version": "12"}},
  "data_through": "2026-07-01", "expected_through": "2026-07-27", "lag_sessions": 17,
  "lag_unit": "sessions", "stale_after": 2, "freshness": "stale", "stale_reasons": ["lag"],
- "stale_series": [], "zero_promotion_runs": 3}
+ "stale_series": [], "zero_promotion_runs": 3, "survivorship": null, "unresolved_listings": null}
 ```
 
 위 값도 형식 예시일 뿐 측정값이 아니다.

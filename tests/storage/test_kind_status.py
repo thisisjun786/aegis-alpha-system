@@ -24,7 +24,7 @@ from aegis_alpha.storage.identity import (
     snapshot_identities,
 )
 from aegis_alpha.storage.kr_identity import build_from_workspace, eodhd_unit, import_unit, kind_unit
-from aegis_alpha.storage.maintain_promotion import ROUTES, promote_datasets, unmapped
+from aegis_alpha.storage.maintain_promotion import ROUTES, dataset_heads, promote_datasets, unmapped
 from aegis_alpha.storage.promotion.engine import dataset_head, promote
 from aegis_alpha.storage.promotion.mappers import IdentityKey, mapper
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
@@ -54,10 +54,15 @@ def ws(tmp_path: Path) -> Iterator[Workspace]:
         yield workspace
 
 
-def _kind(ws: Workspace, day: str) -> dict[str, str]:
-    """A KOSPI list collected on ``day``: one company twice (two regions), one unregistered."""
-    rows = [("합성전자", LISTED, "1975-06-11"), ("합성전자", LISTED, "1975-06-11"),
-            ("합성바이오", UNLISTED, "2011-03-04")]  # fmt: skip
+def _kind(
+    ws: Workspace, day: str, listed: tuple[str, str] = ("1975-06-11", "2011-03-04")
+) -> dict[str, str]:
+    """A KOSPI list collected on ``day``: one company twice (two regions), one unregistered.
+
+    ``listed`` gives the registered and the unregistered company's listing dates.
+    """
+    rows = [("합성전자", LISTED, listed[0]), ("합성전자", LISTED, listed[0]),
+            ("합성바이오", UNLISTED, listed[1])]  # fmt: skip
     cells = [(None, "서울특별시"), (None, "경기도")]
     unit = kind_unit(*kind_listing(rows, retrieved=f"{day}T06:05:48Z", cells=cells))
     committed = import_unit(ws, unit)
@@ -171,3 +176,27 @@ def test_the_status_route_starts_the_kind_chain_only_when_named(ws: Workspace) -
     ).fetchone()
     assert tuple(rules) == ("kind.status@1",)
     assert ws.market.execute("SELECT count(*) FROM instrument_status").fetchone() == (1,)
+
+
+def test_the_kind_chain_reports_seoul_dates_its_lag_to_the_lists_and_unverified_survivorship(
+    ws: Workspace,
+) -> None:
+    (route,) = [item for item in ROUTES if item.dataset_id == "status.kr.kind"]
+    # The registered company listed on 06-30; the one no list binds to an ISIN on 08-03.
+    first = _kind(ws, "2026-09-06", ("2026-06-30", "2026-08-03"))
+    identity = _identity(ws, first)
+    promote_datasets(ws, apply=True, now_us=2, routes=[route], identity=identity,
+                     start=frozenset({"status.kr.kind"}))  # fmt: skip
+    (head,) = [item for item in dataset_heads(ws, now=datetime(2026, 9, 7, 3, tzinfo=UTC))
+               if item["dataset_id"] == "status.kr.kind"]  # fmt: skip
+    # The listing starts at the Seoul start of 06-30 (06-29 15:00 UTC): its date is 06-30.
+    # The lists name a listing on 08-03 no event reaches: XKRX sessions 07-01..31 (07-17,
+    # Constitution Day, is closed from 2026) and 08-03 are 23 behind.
+    assert {key: head[key] for key in ("data_through", "expected_through", "lag_sessions",
+                                       "lag_unit", "stale_after", "freshness",
+                                       "stale_reasons")} == {
+        "data_through": "2026-06-30", "expected_through": "2026-08-03", "lag_sessions": 23,
+        "lag_unit": "sessions", "stale_after": 20, "freshness": "stale",
+        "stale_reasons": ["lag"]}  # fmt: skip
+    # No list states a delisting, and the newest list left one short code unresolved.
+    assert (head["survivorship"], head["unresolved_listings"]) == ("unverified", 1)
