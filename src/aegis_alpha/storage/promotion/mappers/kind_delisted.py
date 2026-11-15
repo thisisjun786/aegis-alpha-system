@@ -11,7 +11,8 @@ a delisting is a short code that leaves both lists:
   Seoul date than today's and on neither of today's two lists. The event starts at the Seoul
   start of today's date. A code that moves between the markets stays on one of today's lists
   and is no event. With only one of today's lists pinned nothing is observed: the other may
-  still name the code, and the second list's promotion observes it.
+  still name the code, and the second list's promotion observes it. An older list of a market
+  and day a later one supersedes is pinned alone (``kind_list_context``) and observes nothing.
 - ``kind_delisted_last_bar`` (``date_basis=last_bar``, ``status_event_id``
   ``kind:delisted:last_bar``): the Seoul start of the day after the instrument's last bar in
   the pinned ``bars`` chain (``prices.kr.eodhd``) on or before today, read as of today's latest

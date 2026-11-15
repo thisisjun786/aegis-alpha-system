@@ -478,6 +478,12 @@ def _kind_context(lists: Sequence[_KindList], source_id: str) -> list[dict[str, 
     own = next((one for one in lists if one[3]["source_id"] == source_id), None)
     if own is None:
         return []
+    # A later list of the same market and date supersedes the candidate: only the newest
+    # list of a day observes, so an older one missing a code never delists it.
+    if any(one[0] == own[0] and one[1] == own[1]
+           and (one[2], one[3]["source_id"]) > (own[2], own[3]["source_id"])
+           for one in lists):  # fmt: skip
+        return []
     # A later list would move today's date: only the candidate's date and earlier ones.
     others = sorted((one for one in lists
                      if one[3]["source_id"] != source_id and one[1] <= own[1]),
@@ -504,7 +510,8 @@ def kind_list_context(workspace: Workspace) -> Callable[[Candidate], list[dict[s
     Of the committed KIND lists (one ``list_id`` and retrieval per table) other than the
     candidate: the other market's latest list of the candidate's Seoul date, each market's
     latest list of an earlier Seoul date, and the first list, in that order and each once.
-    The committed tables and their summaries are read once for the route's run.
+    A candidate a later list of its market and Seoul date supersedes gets none, so it observes
+    nothing. The committed tables and their summaries are read once for the route's run.
     """
     lists = _kind_lists(workspace)
     return lambda item: _kind_context(lists, item.pin["source_id"])

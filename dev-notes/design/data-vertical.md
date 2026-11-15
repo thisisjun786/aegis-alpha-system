@@ -693,7 +693,8 @@ part를 함께 pin한다. `CAPITAL` close는 비조정 close를 그 뒤 모든 �
 
 `kind.delisted@1`은 KIND 목록(`list_id`, `short_code`, `retrieved_at_utc`)에서 상장폐지를 만든다. KIND는
 상장폐지도 그 날짜도 말하지 않으므로, 앞 서울 날짜의 두 시장 마지막 목록 중 하나에 있고 오늘(pin한 목록의 가장
-늦은 서울 날짜) 두 목록 어디에도 없는 코드를 상장폐지로 본다. 시장을 옮긴 코드는 오늘 목록 하나에 남아 사건이
+늦은 서울 날짜) 두 목록 어디에도 없는 코드를 상장폐지로 본다. 같은 시장·같은 서울 날짜에 더 늦게 받은 목록이 있으면 앞
+목록은 아무것도 관측하지 않으므로, 그날 가장 늦은 목록만 관측한다. 시장을 옮긴 코드는 오늘 목록 하나에 남아 사건이
 아니다. 오늘 목록이 한 시장뿐이면 아무것도 관측하지 않고, 두 번째 목록의 승격이 관측한다. 사건은 둘이다.
 `kind:delisted:observed`(`reason` `kind_delisted_observed`)는 오늘의 서울 0시, `kind:delisted:last_bar`(`reason`
 `kind_delisted_last_bar`)는 `prices.kr.eodhd`에서 오늘 이전 마지막 bar(오늘의 가장 늦은 수집 시각에 알려진 개정)

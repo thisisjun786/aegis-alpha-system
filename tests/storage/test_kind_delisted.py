@@ -60,15 +60,19 @@ def _lists(
     lists: Mapping[str, tuple[tuple[str, ...], ...]] = LISTS,
 ) -> list[str]:
     """Each day's KOSPI and KOSDAQ list, collected at 15:05 in Seoul; their source IDs."""
-    sources = []
-    for index, day in enumerate(days):
-        for list_id, codes in lists.items():
-            rows = [(f"합성{code}", code, "2000-01-04") for code in codes[index]]
-            retrieved = f"{day.isoformat()}T06:05:48Z"
-            unit = kind_unit(*kind_listing(rows, list_id=list_id, retrieved=retrieved))
-            import_unit(ws, unit)
-            sources.append(unit.content.source_id)
-    return sources
+    return [_list(ws, list_id, day, codes[index])
+            for index, day in enumerate(days) for list_id, codes in lists.items()]  # fmt: skip
+
+
+def _list(
+    ws: Workspace, list_id: str, day: date, codes: tuple[str, ...], at_utc: str = "06:05:48"
+) -> str:
+    """One KIND list collected on ``day`` at ``at_utc``; its source ID."""
+    rows = [(f"합성{code}", code, "2000-01-04") for code in codes]
+    retrieved = f"{day.isoformat()}T{at_utc}Z"
+    unit = kind_unit(*kind_listing(rows, list_id=list_id, retrieved=retrieved))
+    import_unit(ws, unit)
+    return unit.content.source_id
 
 
 def _identity(ws: Workspace, kind: list[str]) -> dict[str, str]:
@@ -165,3 +169,28 @@ def test_nothing_is_observed_until_both_of_todays_lists_are_committed(ws: Worksp
                      start=frozenset({"status.kr.kind.delisted"}))  # fmt: skip
     ib = mint_instrument("krx_isin", ISINS[B])
     assert [event[:2] for event in _delistings(ws)] == sorted([(ib, OBSERVED), (ib, LAST_BAR)])
+
+
+def _same_day_lists(ws: Workspace, older: tuple[str, ...], newer: tuple[str, ...]) -> None:
+    """The first day's lists, then two KOSDAQ lists of the second day an hour apart."""
+    first = _lists(ws, DAYS[:1], {"kind-kospi": ((A,),), "kind-kosdaq": ((C, E),)})
+    second = [_list(ws, "kind-kospi", DAYS[1], (A,)),
+              _list(ws, "kind-kosdaq", DAYS[1], older),
+              _list(ws, "kind-kosdaq", DAYS[1], newer, "07:05:48")]  # fmt: skip
+    identity = _identity(ws, [*first, *second])
+    _bars(ws, identity, DAYS[0])
+    promote_datasets(ws, apply=True, now_us=20, routes=[DELISTED], identity=identity,
+                     start=frozenset({"status.kr.kind.delisted"}))  # fmt: skip
+
+
+def test_an_older_list_of_the_same_market_and_day_observes_nothing(ws: Workspace) -> None:
+    # The older KOSDAQ list lacks C; the newer one of the same day still holds it.
+    _same_day_lists(ws, (E,), (C, E))
+    assert _delistings(ws) == []
+
+
+def test_a_code_the_newest_list_of_the_day_drops_is_delisted(ws: Workspace) -> None:
+    # The older KOSDAQ list still holds C; the newer one of the same day drops it.
+    _same_day_lists(ws, (C, E), (E,))
+    ic = mint_instrument("krx_isin", ISINS[C])
+    assert _delistings(ws) == [(ic, OBSERVED, _seoul(DAYS[1]), "kind_delisted_observed", [])]
