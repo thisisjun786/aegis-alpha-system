@@ -16,7 +16,7 @@ from typing import cast
 
 import pytest
 
-from aegis_alpha.storage import maintain_identity
+from aegis_alpha.storage import maintain_identity, maintain_promotion
 from aegis_alpha.storage.identity import (
     mint_instrument,
     parse_registry,
@@ -734,6 +734,91 @@ def test_a_bridge_promotes_every_held_session_once_and_a_later_day_replans_nothi
     newer = cast("dict[str, str]", later["snapshot"])
     settled = _run(promote_datasets(ws, apply=True, now_us=40, routes=[ROUTE], identity=newer))
     assert (settled["status"], settled["sources"]) == ("current", [])
+
+
+def _waiting_days(ws: Workspace) -> tuple[dict[str, str], list[dict[str, object]]]:
+    """Wednesday's bars wait under an unpartitioned template (the US bulk chain's), then
+    Wednesday's, Thursday's and Friday's lists each register a claim and a pass promotes."""
+    first = _bars(ws, TUE, "AAA.US")
+    cutover = _register_base(ws, first["source_id"])
+    template = spec([first], cutover, dataset="prices.us.eodhd", decimals=FLOATS,
+                    rules={"available_at_us": DAY_RULE, "revision_known_at_us": DAY_RULE},
+                    mapper={"name": "eodhd.bars@1", "args": {"timezone": NEW_YORK}})  # fmt: skip
+    assert promote(ws, *template, apply=True)["published"] is True
+    waiting = _bars(ws, WED, "AAA.US", "NEW.US")
+    passes = [promote_datasets(ws, apply=True, now_us=10, routes=[ROUTE], identity=cutover)]
+    for at_us, (day, rows) in enumerate(
+        ((WED, [_row("AAA", ISIN_A), _row("NEW", None)]), (THU, [_row("AAA", ISIN_A)]),
+         (FRI, [_row("AAA", ISIN_A)])), start=20,
+    ):  # fmt: skip
+        _import_list(ws, day, rows)
+        advanced = maintain_identity.advance(ws, apply=True, now_us=_now())
+        assert cast("dict[str, object]", advanced["us_symbols"])["claims"] == 1
+        snapshot = cast("dict[str, str]", advanced["snapshot"])
+        passes.append(promote_datasets(ws, apply=True, now_us=at_us, routes=[ROUTE],
+                                       identity=snapshot))  # fmt: skip
+    return waiting, passes
+
+
+def _sources(report: dict[str, object]) -> list[tuple[object, object]]:
+    return [(item["source_id"], item["status"])
+            for item in cast("list[dict[str, object]]", _run(report)["sources"])]  # fmt: skip
+
+
+def test_an_unpartitioned_waiting_source_is_planned_again_only_for_a_claim_over_its_dates(
+    ws: Workspace,
+) -> None:
+    waiting, (held, covered, adjacent, later) = _waiting_days(ws)
+    # The operator's Tuesday source is planned once and recorded unchanged.
+    (source,) = [item for item in cast("list[dict[str, object]]", _run(held)["sources"])
+                 if item["source_id"] == waiting["source_id"]]  # fmt: skip
+    assert source["status"] == "unresolved"
+    # The record names the dates of the source's rows, as a partitioned step's does.
+    identity = cast("dict[str, object]", source["identity"])
+    assert identity["key_scope"] == {"from": WED.isoformat(), "to": THU.isoformat()}
+    none: dict[str, object] = {"sources": 0, "reasons": {}}
+    assert (held["replanned_waiting"], _run(held)["replanned_waiting"]) == (none, none)
+
+    # Wednesday's claim covers the source's date: planned again, AAA promoted, NEW waits.
+    assert _sources(covered) == [(waiting["source_id"], "unresolved")]
+    once: dict[str, object] = {"sources": 1, "reasons": {"scoped_key_changed": 1}}
+    assert (covered["replanned_waiting"], _run(covered)["replanned_waiting"]) == (once, once)
+    rows = ws.market.execute(
+        "SELECT session_date FROM prices WHERE instrument_id=? ORDER BY 1", (IA,)
+    ).fetchall()
+    assert rows == [(TUE,), (WED,)]
+    # Thursday's claim starts within Wednesday's latest instants in some zone: planned once.
+    assert _sources(adjacent) == [(waiting["source_id"], "unresolved")]
+    # Friday's claim is two New York days on: nothing is planned again.
+    assert (_run(later)["status"], _run(later)["sources"]) == ("current", [])
+    assert later["replanned_waiting"] == none
+
+
+def test_a_dated_scope_publishes_what_planning_every_waiting_source_again_publishes(
+    ws: Workspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def published(workspace: Workspace) -> tuple[list[tuple[object, ...]], list[object]]:
+        prices = workspace.market.execute(
+            "SELECT instrument_id, session_date, open, high, low, close, volume, value_state, "
+            "available_at_us, revision_known_at_us, op FROM prices ORDER BY 1, 2, op"
+        ).fetchall()
+        versions = workspace.state.execute(
+            "SELECT sequence, row_count, status FROM dataset_versions "
+            "WHERE dataset_id='prices.us.eodhd' ORDER BY sequence"
+        ).fetchall()
+        return prices, versions
+
+    _, scoped = _waiting_days(ws)
+    root = tmp_path / "whole-key"
+    initialize(root)
+    # Without the dated scope every record keeps the whole key: each claim plans it again.
+    monkeypatch.setattr(maintain_promotion, "DATED_IDENTITY", frozenset())
+    with open_workspace(root, writable=True, strategy_write=True) as other:
+        waiting, whole = _waiting_days(other)
+        assert _sources(whole[-1]) == [(waiting["source_id"], "unresolved")]
+        assert whole[-1]["replanned_waiting"] == {"sources": 1, "reasons": {"key_changed": 1}}
+        assert _sources(scoped[-1]) == []
+        assert published(ws) == published(other)
 
 
 def test_two_maintenance_runs_of_rejected_lists_register_nothing(ws: Workspace) -> None:

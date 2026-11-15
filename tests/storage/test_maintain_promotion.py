@@ -662,6 +662,31 @@ def test_a_recent_watermark_over_weeks_old_data_is_stale_by_its_session_lag(
         "2026-07-01", 0, "current")  # fmt: skip
 
 
+def _memory_limit(ws: Workspace) -> int:
+    found = ws.market.execute("SELECT parse_formatted_bytes(current_setting('memory_limit'))")
+    return int(cast("tuple[int]", found.fetchone())[0])
+
+
+def test_heads_are_read_under_the_lower_duckdb_limit_and_the_limit_is_restored(
+    ws: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _bars_downloaded_late(ws, "prices.kr.eodhd")
+    expected = _heads(ws, JULY_RUN)
+    ws.market_resources = {**ws.market_resources, "memory_limit": "4GB"}
+    ws.reset_market_limits()
+    before = _memory_limit(ws)
+    read = maintain_promotion._dataset_heads  # noqa: SLF001 -- the reads the limit bounds
+    limits: list[int] = []
+
+    def probe(workspace: Workspace, *, now: datetime) -> list[dict[str, object]]:
+        limits.append(_memory_limit(workspace))
+        return read(workspace, now=now)
+
+    monkeypatch.setattr(maintain_promotion, "_dataset_heads", probe)
+    assert _heads(ws, JULY_RUN) == expected
+    assert (limits, _memory_limit(ws)) == ([maintain_promotion.HEADS_MEMORY_BYTES], before)
+
+
 def test_a_tombstoned_newest_bar_does_not_count_as_data(ws: Workspace) -> None:
     stamp = at("2026-07-27T08:00:00")
     first = add_source(

@@ -1589,6 +1589,9 @@ identity 단계는 그 목록의 행을 등록된 FMP ISIN으로 Norgate 상품�
 [유지보수 실행](design/data-vertical.md#유지보수-실행)이 소유한다.
 
 **보고의 `promote` 단계.** `unresolved`는 이번 실행이 `unresolved`로 기록한 dataset 목록이다(뜻은 그대로).
+`replanned_waiting`(실행과 각 dataset 항목)은 이번에 계획한 원천 중 앞서 `unresolved`로 기록돼 다시 계획된 원천 수
+(`sources`)와 이유별 수(`reasons`)다: `key_changed`는 범위 없는 기록의 키 전체 SHA-256이, `scoped_key_changed`는
+기록한 날짜 범위의 SHA-256이 바뀐 것이고, `no_identity`는 이번 실행이 키를 해석하지 않은 것이다.
 `standing_unresolved`는 새 원천이 없는 날에도 매 실행 나오는 dataset별 요약이고, 저장된 `maintain_source@1`
 품질 검사만 읽는다(새 상태·공급자 호출 없음, 종료 코드 영향 없음). 원천마다 가장 늦은 기록이 `unresolved`인
 것만 센다. 해당 원천이 없는 dataset은 키가 없고, 모두 없으면 `{}`다.
