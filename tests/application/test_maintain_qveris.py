@@ -33,6 +33,10 @@ from tests.data.qveris_support import ScriptedQveris, account_key, bar
 pytestmark = pytest.mark.xdist_group("qveris-account-lease")
 
 TODAY = date(2026, 9, 17)
+EMPTY_USAGE = {"execution_id": "exec-1", "outcome": "empty_result", "reason_code": "result.empty",
+               "charge_outcome": "failed_not_charged", "success": False,
+               "billable_success": False, "quantity": None, "actual_amount_credits": "0.0",
+               "settled_amount_credits": "0.0"}  # fmt: skip
 MON, TUE, WED = date(2026, 9, 14), date(2026, 9, 15), date(2026, 9, 16)
 POLICY = QverisPolicy(exchanges=("US",), datasets=("prices",), since={"US": MON})
 
@@ -56,6 +60,10 @@ def _ask(root: Path, job: QverisJob, state: str, *, batch: str | None = None) ->
     _write(root, f"{base}/0000.intent.json", intent)
     if state == "failed":
         _write(root, f"{base}/0000.billing.json", {"over_quote": False})
+    elif state == "empty":  # Qveris's settled, uncharged empty answer for a day of actions
+        _write(root, f"{base}/0000.raw", {"execution_id": "exec-1", "success": False,
+                                          "result": {"status_code": 200, "data": []}})  # fmt: skip
+        _write(root, f"{base}/0000.billing.json", {"over_quote": False, "usage": EMPTY_USAGE})
     elif state == "quarantined" and batch is None:
         _write(root, f"{base}/0000.quarantine.json", {"status": "SETTLEMENT_UNKNOWN"})
 
@@ -234,6 +242,51 @@ def test_settled_failures_back_off_and_retry_after_the_first_asks(tmp_path: Path
         (date(2026, 9, 10), "failed_retry"),
         (MON, "failed_retry"),
     ]
+
+
+def test_a_quarantined_ask_neither_counts_in_nor_ends_a_row_of_failures(tmp_path: Path) -> None:
+    root = tmp_path / "raw"
+    day = date(2026, 9, 1)
+    for observed in (date(2026, 9, 2), date(2026, 9, 3), date(2026, 9, 5)):
+        _ask(root, _prices(day, observed), "failed")
+    _ask(root, _prices(day, date(2026, 9, 7)), "quarantined")  # asked again the next day
+    _ask(root, _prices(day, date(2026, 9, 8)), "failed")
+    policy = QverisPolicy(exchanges=("US",), datasets=("prices",), since={"US": TODAY},
+                          extra_sessions={"US": (day,)})  # fmt: skip
+    # The fourth failure of the row waits eight days after its observation date.
+    waiting = plan_requests(root, policy, today=date(2026, 9, 15))
+    assert waiting.failing == [{"job_id": "maintain-US-prices-2026-09-01", "failed_asks": 4,
+                                "retry_on": "2026-09-16"}]  # fmt: skip
+    assert (waiting.planned, waiting.waiting) == ([], 1)
+    due = plan_requests(root, policy, today=date(2026, 9, 16))
+    assert [(item.day, item.reason) for item in due.planned] == [(day, "failed_retry")]
+
+
+def test_empty_action_answers_are_reported_apart_from_failures(tmp_path: Path) -> None:
+    root = tmp_path / "raw"
+    empty_day, failed_day = date(2026, 9, 1), date(2026, 9, 2)
+    observed = (date(2026, 9, 2), date(2026, 9, 3), date(2026, 9, 5), date(2026, 9, 8),
+                date(2026, 9, 12), date(2026, 9, 16))  # fmt: skip
+    for each in observed:
+        _ask(root, daily_job("KO", "dividends", empty_day, each), "empty")
+    for each in observed[1:3]:
+        _ask(root, daily_job("KO", "dividends", failed_day, each), "failed")
+    assert sorted((ask.job.parameters["date"], ask.state, ask.empty)
+                  for asks in raw_asks(root).values() for ask in asks[-1:]) == [
+        ("2026-09-01", "failed", True),
+        ("2026-09-02", "failed", False),
+    ]  # fmt: skip
+    policy = QverisPolicy(exchanges=("KO",), datasets=("dividends",), since={"KO": TODAY},
+                          extra_sessions={"KO": (empty_day, failed_day)})  # fmt: skip
+    plan = plan_requests(root, policy, today=TODAY)
+    # Six empty answers in a row: not a failure in the report, and the same wait as one.
+    assert plan.empty == [{"job_id": "maintain-KO-dividends-2026-09-01", "empty_asks": 6,
+                           "retry_on": "2026-10-18"}]  # fmt: skip
+    assert plan.failing == [{"job_id": "maintain-KO-dividends-2026-09-02", "failed_asks": 2,
+                             "retry_on": "2026-09-07"}]  # fmt: skip
+    assert [(item.day, item.reason) for item in plan.planned] == [(failed_day, "failed_retry")]
+    report = plan.report()
+    assert (report["empty_answers"], report["failing"]) == (plan.empty, plan.failing)
 
 
 # --- warned asks: partial successes, judged row by row ---------------------------------------

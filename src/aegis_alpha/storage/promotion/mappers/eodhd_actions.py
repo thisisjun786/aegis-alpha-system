@@ -7,7 +7,18 @@ ex-date ``date``, the provider's values as text, and the collection instant
 ``retrieved_at``. The collector already held every row of a warned download, every row
 without an explicit identity and every value that is not a positive decimal in the
 ``quarantine`` table, and it refuses a download that names one symbol twice, so a rows
-table holds at most one action per symbol and type. These mappers read the rows tables only.
+table holds at most one action per symbol and type. These two mappers read the rows tables.
+
+``eodhd.splits_quarantine@1`` and ``eodhd.dividends_quarantine@1`` read the held table of
+one such download (``qveris-splits-quarantine-*``, ``qveris-dividends-quarantine-*``
+``quarantine``): ``reason`` and the provider row as JSON text (``code``, ``exchange``,
+``date``, ``split`` or ``dividend``, ``currency``, ``unadjustedValue``, ``recordDate``,
+``paymentDate``). Only the reason ``provider_reported_partial`` is mapped: the provider
+answered with a warning and the row passed the clean path's value checks. Its values are the
+JSON texts the collector would have kept (a JSON number as its token text, an empty text as
+none) and map as above; every such row carries the row flag ``provider_reported_partial``.
+Any other reason has no ex-date and is refused as missing a required column. The row has no
+collection instant, so ingestion is the source's ``sl:`` link time.
 
 Their values have the shape of the Norgate action mappers (``norgate_actions``):
 
@@ -52,21 +63,48 @@ _TERM: Final = r"[0-9]+(\.[0-9]+)?"
 _CURRENCY: Final = "regexp_full_match(coalesce(dividend_currency, ''), '[A-Z]{3}')"
 _DAY: Final = '"date"'
 _NO_VALUE: Final = "CAST(NULL AS DECIMAL(38,12))"
+PARTIAL_FLAG: Final = "provider_reported_partial"
+_FLAG_COLUMN: Final = "_aas_f_" + PARTIAL_FLAG
+_JSON: Final = "_aas_json"
+_RAW_JSON: Final = "CASE WHEN json_valid(source_row_json) THEN source_row_json END"
+
+
+def _held_text(field: str) -> str:
+    """A held row's provider value as the collector's text: a JSON text or number, else NULL."""
+    path = sql_literal("$." + field)
+    kind = f"json_type({_JSON}, {path})"
+    return (
+        f"CASE WHEN {kind} IN ('VARCHAR', 'UBIGINT', 'BIGINT', 'DOUBLE') "
+        f"THEN nullif(json_extract_string({_JSON}, {path}), '') END"
+    )
+
+
+def _held_day(json: str) -> str:
+    """The ex-date of a mapped held row: a partial-response row with an ISO date."""
+    text = f"json_extract_string({json}, '$.date')"
+    return (
+        f"CASE WHEN reason = {sql_literal(PARTIAL_FLAG)} AND json_valid(source_row_json) AND "
+        f"json_type({json}, '$.date') = 'VARCHAR' AND "
+        f"regexp_full_match({text}, '[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}') "
+        f"THEN TRY_CAST({text} AS DATE) END"
+    )
 
 
 class _EodhdActions:
     provider: Final = "eodhd"
     domain: Final = "corporate_actions"
     major: Final = 1
-    partition_sql: Final = '"date"'
     date_column: Final = "effective_date"
     time_inputs: Final[Mapping[str, InputKind]] = {"ex_date": "date"}
-    row_flags: Final[Mapping[str, str]] = {}
     manifest_items: Final = None
     expands: Final = False
     name: str
     source_prefixes: tuple[str, ...]
+    partition_sql: str
+    row_flags: Mapping[str, str]
     _values: tuple[str, ...]
+    _flag: str = ""
+    """The row flag column a held-row mapper adds to its select."""
 
     def check_args(self, args: Mapping[str, object]) -> None:
         label = f"{self.name}@{self.major}"
@@ -88,6 +126,10 @@ class _EodhdActions:
     def outcome(self, args: Mapping[str, object]) -> None:
         del args
 
+    def _relation(self, source: str) -> str:
+        """The rows-table columns the select reads, from ``source``."""
+        return source
+
     def _select(self, source: str, args: Mapping[str, object], kind: str, columns: str) -> str:
         zone = str(args["timezone"])
         return (
@@ -96,13 +138,38 @@ class _EodhdActions:
             f"provider_symbol AS _aas_id_token, {zone_start_us(zone, _DAY)} AS _aas_id_at_us, "
             f"{sql_literal(kind + ':')} || strftime(\"date\", '%Y-%m-%d') AS action_id, "
             f'{sql_literal(kind)} AS action_type, "date" AS ex_date, {columns}, '
-            f'"date" AS effective_date, "date" AS _aas_t_ex_date FROM {source}'
+            f'"date" AS effective_date, "date" AS _aas_t_ex_date{self._flag} '
+            f"FROM {self._relation(source)}"
         )
 
 
-class EodhdSplits(_EodhdActions):
-    name: Final = "eodhd.splits"
-    source_prefixes: Final[tuple[str, ...]] = ("qveris-splits-",)
+class _Held:
+    """The held rows of one exchange-day download, read as the rows table's columns."""
+
+    source_prefixes: Final[tuple[str, ...]] = ()
+    partition_sql: Final = _held_day(_RAW_JSON)
+    row_flags: Final[Mapping[str, str]] = {PARTIAL_FLAG: _FLAG_COLUMN}
+    _flag: Final = f", _aas_partial AS {_FLAG_COLUMN}"
+    _fields: Mapping[str, str]
+    """Each rows-table column the select reads and the provider field it comes from."""
+
+    def source_columns(self) -> Mapping[str, frozenset[str]]:
+        return {"reason": _TEXT, "source_row_json": _TEXT}
+
+    def _relation(self, source: str) -> str:
+        values = ", ".join(f"{_held_text(field)} AS {column}"
+                           for column, field in self._fields.items())  # fmt: skip
+        return (
+            "(SELECT _aas_pin, _aas_ordinal, _aas_row_hash, "  # noqa: S608 -- engine-named relation
+            "CAST(NULL AS TIMESTAMP WITH TIME ZONE) AS retrieved_at, "
+            f"{_held_text('code')} || '.' || {_held_text('exchange')} AS provider_symbol, "
+            f'{_held_day(_JSON)} AS "date", {values}, '
+            f"reason = {sql_literal(PARTIAL_FLAG)} AS _aas_partial "
+            f"FROM (SELECT *, {_RAW_JSON} AS {_JSON} FROM {source}))"
+        )
+
+
+class _Splits(_EodhdActions):
     _values: Final = ("split",)
 
     def numeric_columns(self, args: Mapping[str, object]) -> Mapping[str, str]:
@@ -127,9 +194,7 @@ class EodhdSplits(_EodhdActions):
         )
 
 
-class EodhdDividends(_EodhdActions):
-    name: Final = "eodhd.dividends"
-    source_prefixes: Final[tuple[str, ...]] = ("qveris-dividends-",)
+class _Dividends(_EodhdActions):
     _values: Final = (
         "dividend",
         "dividend_currency",
@@ -155,3 +220,33 @@ class EodhdDividends(_EodhdActions):
             f"CASE WHEN {_CURRENCY} THEN dividend_currency END AS currency, "
             f"CASE WHEN {present} THEN 'present' ELSE 'invalid' END AS value_state",
         )
+
+
+class EodhdSplits(_Splits):
+    name: Final = "eodhd.splits"
+    source_prefixes: Final[tuple[str, ...]] = ("qveris-splits-",)
+    partition_sql: Final = _DAY
+    row_flags: Final[Mapping[str, str]] = {}
+
+
+class EodhdDividends(_Dividends):
+    name: Final = "eodhd.dividends"
+    source_prefixes: Final[tuple[str, ...]] = ("qveris-dividends-",)
+    partition_sql: Final = _DAY
+    row_flags: Final[Mapping[str, str]] = {}
+
+
+class EodhdSplitsQuarantine(_Held, _Splits):
+    name: Final = "eodhd.splits_quarantine"
+    _fields: Final[Mapping[str, str]] = {"split": "split"}
+
+
+class EodhdDividendsQuarantine(_Held, _Dividends):
+    name: Final = "eodhd.dividends_quarantine"
+    _fields: Final[Mapping[str, str]] = {
+        "dividend": "dividend",
+        "dividend_currency": "currency",
+        "unadjusted_value": "unadjustedValue",
+        "record_date": "recordDate",
+        "payment_date": "paymentDate",
+    }

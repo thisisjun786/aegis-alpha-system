@@ -17,7 +17,11 @@ table with one failing accepted row is not promoted and is counted as ``value_ch
 daily bulk route (``eodhd.bulk_quarantine@2``) accepts the US rows held for a partial
 response or for want of an import-time identity and holds every other US row; its mapper
 checks each accepted row's values itself and leaves a failing one held, so no held row keeps
-the table's valid rows out.
+the table's valid rows out. The KR action routes of held rows (``eodhd.splits_quarantine@1``,
+``eodhd.dividends_quarantine@1``) promote a warned exchange day with the partial flag as the KR
+daily bulk route does, and name the clean answers they ``yields`` to: a claimed table with a
+row whose (symbol, ex-date) a committed KR rows table of the same action already holds is not
+promoted and is counted as ``answered``, so a clean answer is never superseded by a warned one.
 
 A route continues a chain; it never starts one. Its template is the spec of the latest
 committed generation of the dataset that used one of the route's mappers: its own, or
@@ -164,6 +168,17 @@ _US_SYMBOL: Final = "provider_symbol LIKE '%.US'"
 _KR_SYMBOL: Final = "(provider_symbol LIKE '%.KO' OR provider_symbol LIKE '%.KQ')"
 _KR_PARTIAL: Final = f"reason = 'provider_reported_partial' AND {_EXCHANGE} IN ('KO', 'KQ')"
 _KR_BULK_ARGS: Final = {"currencies": dict(KR_CURRENCIES)}
+# A held exchange-day action row names its exchange ``exchange``, not ``exchange_short_name``.
+_HELD_ACTION: Final = "CASE WHEN json_valid(source_row_json) THEN source_row_json END"
+_KR_ACTION_PARTIAL: Final = (
+    "reason = 'provider_reported_partial' AND "
+    f"json_extract_string({_HELD_ACTION}, '$.exchange') IN ('KO', 'KQ')"
+)
+_HELD_ACTION_KEY: Final = (
+    f"json_extract_string({_HELD_ACTION}, '$.code') || '.' || "
+    f"json_extract_string({_HELD_ACTION}, '$.exchange'), "
+    f"TRY_CAST(json_extract_string({_HELD_ACTION}, '$.date') AS DATE)"
+)
 _US_ADMITTED: Final = (
     f"reason IN ({', '.join(formats.sql_literal(item) for item in ADMITTED_V2)}) "
     f"AND {_EXCHANGE} = 'US'"
@@ -277,6 +292,10 @@ class Route:
     context: Callable[[Workspace], Callable[[Candidate], list[dict[str, str]]]] | None = None
     """The earlier tables of the shape a step pins after the new one (read, never recorded):
     called once per route run, it gives each candidate's tables."""
+    yields: tuple[str, str, str] | None = None
+    """The clean answers a held action table yields to: the prefix, table and row predicate of
+    the rows tables whose (``provider_symbol``, ``date``) a held row may also name. A claimed
+    table with one such row is not promoted and is counted as ``answered``."""
 
     @property
     def mappers(self) -> tuple[str, ...]:
@@ -322,19 +341,31 @@ _DELISTED_START: Final = Start(
     {},
     partitioned=False,
 )  # fmt: skip
+_KIND_LISTS: Final = "kind-listings-"
+# A KR delisting is known by the end of the Seoul day of today's KIND lists; the last bars
+# are read from the KR price head this pass advanced.
+_KIND_DELISTED_START: Final = Start(
+    {"bars": {"dataset_id": "prices.kr.eodhd", "version": _NO_GENERATION,
+              "generation_id": _NO_GENERATION, "chain_hash": _NO_GENERATION,
+              "manifest_hash": _NO_GENERATION}},
+    {"rule": "local_day_end@1", "basis": "record", "input": "status_date",
+     "args": {"timezone": "Asia/Seoul"}},
+    {},
+    partitioned=False,
+)  # fmt: skip
 _US_DELISTED: Final = "exchange_code = 'US' AND delisted = '1'"
 _US_LIST: Final = "exchange_code = 'US' AND delisted IN ('0', '1')"
 
 
-def _new_york_date(text: object) -> date | None:
-    """The New York date of a list's ``...Z`` retrieval text; None when it is no instant."""
+def _local_date(text: object, zone: str) -> date | None:
+    """The ``zone`` date of a list's ``...Z`` retrieval text; None when it is no instant."""
     try:
         moment = datetime.fromisoformat(str(text))
     except ValueError:
         return None
     if moment.tzinfo is None:
         return None
-    return moment.astimezone(ZoneInfo("America/New_York")).date()
+    return moment.astimezone(ZoneInfo(zone)).date()
 
 
 def us_list_context(workspace: Workspace) -> Callable[[Candidate], list[dict[str, str]]]:
@@ -365,7 +396,7 @@ def us_list_context(workspace: Workspace) -> Callable[[Candidate], list[dict[str
         found = workspace.market.execute(
             f"SELECT max(retrieved_at_utc) FROM {_quote(item.target)}"  # noqa: S608 -- a quoted table
         ).fetchone()
-        at = None if found is None else _new_york_date(found[0])
+        at = None if found is None else _local_date(found[0], "America/New_York")
         columns: tuple[str, ...] | None = None
         lists: list[tuple[str, str, dict[str, str]]] = []
         for table in tables:
@@ -383,7 +414,7 @@ def us_list_context(workspace: Workspace) -> Callable[[Candidate], list[dict[str
             ):
                 continue  # fmt: skip
             row = summary(_quote(str(entry["target"])))
-            day = None if row is None else _new_york_date(row[3])
+            day = None if row is None else _local_date(row[3], "America/New_York")
             if (
                 row is None
                 or row[0] is not True
@@ -414,6 +445,76 @@ def _chosen(lists: list[tuple[str, str, dict[str, str]]]) -> list[dict[str, str]
         if pin not in pins:
             pins.append(pin)
     return pins
+
+
+type _KindList = tuple[str, date, str, dict[str, str]]
+"""A committed KIND list: its ``list_id``, Seoul date, retrieval text and spec pin."""
+
+
+def _kind_lists(workspace: Workspace) -> list[_KindList]:
+    """Every committed KIND list table of one ``list_id`` and a ``...Z`` retrieval."""
+    shas = {str(row["source_id"]): str(row["sha256"]) for row in list_sources(workspace)}
+    lists: list[_KindList] = []
+    for table in committed_tables(workspace, _KIND_LISTS):
+        entry = table.entry
+        if (table.store != "market" or entry["name"] != "listings" or not entry["rows"]
+                or not {"list_id", "retrieved_at_utc"} <= set(table.columns)):  # fmt: skip
+            continue
+        row = workspace.market.execute(
+            f"SELECT min(list_id), max(list_id), max(retrieved_at_utc) "  # noqa: S608 -- a quoted table
+            f"FROM {_quote(str(entry['target']))}"
+        ).fetchone()
+        if row is None or row[0] != row[1]:
+            continue
+        day = _local_date(row[2], "Asia/Seoul")
+        if day is not None:
+            pin = {"source_id": table.source_id, "source_sha256": shas[table.source_id],
+                   "table": "listings", "digest": str(entry["digest"])}  # fmt: skip
+            lists.append((str(row[0]), day, str(row[2]), pin))
+    return lists
+
+
+def _kind_context(lists: Sequence[_KindList], source_id: str) -> list[dict[str, str]]:
+    own = next((one for one in lists if one[3]["source_id"] == source_id), None)
+    if own is None:
+        return []
+    # A later list of the same market and date supersedes the candidate: only the newest
+    # list of a day observes, so an older one missing a code never delists it.
+    if any(one[0] == own[0] and one[1] == own[1]
+           and (one[2], one[3]["source_id"]) > (own[2], own[3]["source_id"])
+           for one in lists):  # fmt: skip
+        return []
+    # A later list would move today's date: only the candidate's date and earlier ones.
+    others = sorted((one for one in lists
+                     if one[3]["source_id"] != source_id and one[1] <= own[1]),
+                    key=lambda one: (one[1], one[2], one[3]["source_id"]))  # fmt: skip
+    if not others:
+        return []
+    latest: dict[str, _KindList] = {}
+    for one in others:
+        if one[1] == own[1] and one[0] != own[0]:
+            latest["today"] = one
+        elif one[1] < own[1]:
+            latest[one[0]] = one
+    chosen = [latest[key] for key in ("today", *sorted(set(latest) - {"today"})) if key in latest]
+    pins: list[dict[str, str]] = []
+    for _, _, _, pin in [*chosen, others[0]]:
+        if pin not in pins:
+            pins.append(pin)
+    return pins
+
+
+def kind_list_context(workspace: Workspace) -> Callable[[Candidate], list[dict[str, str]]]:
+    """The KIND lists ``kind.delisted@1`` compares a list with, per candidate.
+
+    Of the committed KIND lists (one ``list_id`` and retrieval per table) other than the
+    candidate: the other market's latest list of the candidate's Seoul date, each market's
+    latest list of an earlier Seoul date, and the first list, in that order and each once.
+    A candidate a later list of its market and Seoul date supersedes gets none, so it observes
+    nothing. The committed tables and their summaries are read once for the route's run.
+    """
+    lists = _kind_lists(workspace)
+    return lambda item: _kind_context(lists, item.pin["source_id"])
 
 
 # In dependency order: SEC facts take each filing's acceptance from the filings head.
@@ -448,9 +549,19 @@ ROUTES: Final = (
           start=_actions("sessions.xkrx", "Asia/Seoul", {"ratio": "float_shortest@1"})),
     Route("actions.kr.eodhd", "eodhd.dividends@1", "qveris-dividends-", "dividends", _KR_SYMBOL,
           start=_actions("sessions.xkrx", "Asia/Seoul", {"amount": "decimal_text@1"})),
+    # After the clean KR action routes: a warned exchange day yields to a clean answer.
+    Route("actions.kr.eodhd", "eodhd.splits_quarantine@1", "qveris-splits-quarantine-",
+          "quarantine", _KR_ACTION_PARTIAL, derive_from="eodhd.splits@1",
+          yields=("qveris-splits-", "splits", _KR_SYMBOL)),
+    Route("actions.kr.eodhd", "eodhd.dividends_quarantine@1", "qveris-dividends-quarantine-",
+          "quarantine", _KR_ACTION_PARTIAL, derive_from="eodhd.dividends@1",
+          yields=("qveris-dividends-", "dividends", _KR_SYMBOL)),
     Route("fx.usdkrw.eodhd", "eodhd.fx_history@1", "qveris-fx-history-bars-", "bars",
           "base_currency = 'USD' AND quote_currency = 'KRW'", start=_FX_START),
     Route("status.kr.kind", "kind.status@1", "kind-listings-", "listings", start=_STATUS_START),
+    # After the KR price routes: the last bars come from the head they advanced.
+    Route("status.kr.kind.delisted", "kind.delisted@1", _KIND_LISTS, "listings",
+          start=_KIND_DELISTED_START, context=kind_list_context),
     # After the US price routes: the last bars come from the head they advanced.
     Route("status.us.eodhd", "eodhd.delisted@1", us_symbols.SOURCE_PREFIX, "symbols",
           _US_DELISTED, start=_DELISTED_START, context=us_list_context),
@@ -553,6 +664,7 @@ def candidates(  # noqa: PLR0913 -- the route and the pass's lookups
     """
     needed = {name for each in route.mappers for name in mapper(each).source_columns()}
     found: list[Candidate] = []
+    answered: set[tuple[str, date]] | None = None
     for table in committed_tables(workspace, route.prefix):
         entry = table.entry
         if table.store != "market" or entry["name"] != route.table or entry["format"] != "arrow":
@@ -573,6 +685,11 @@ def candidates(  # noqa: PLR0913 -- the route and the pass's lookups
             if reason:
                 skipped[reason] = skipped.get(reason, 0) + 1
             continue
+        if route.yields is not None:
+            answered = _answers(workspace, route.yields) if answered is None else answered
+            if _yielded(workspace, target, answered):
+                skipped["answered"] = skipped.get("answered", 0) + 1
+                continue
         pin = {
             "source_id": table.source_id,
             "source_sha256": shas[table.source_id],
@@ -588,6 +705,34 @@ def candidates(  # noqa: PLR0913 -- the route and the pass's lookups
             item.pin["source_id"],
         ),
     )
+
+
+def _answers(workspace: Workspace, shape: tuple[str, str, str]) -> set[tuple[str, date]]:
+    """(``provider_symbol``, ``date``) of every committed rows table of ``shape``'s rows."""
+    prefix, name, predicate = shape
+    found: set[tuple[str, date]] = set()
+    for table in committed_tables(workspace, prefix):
+        entry = table.entry
+        if table.store != "market" or entry["name"] != name or not entry["rows"]:
+            continue
+        found.update(
+            (str(symbol), day)
+            for symbol, day in workspace.market.execute(
+                f'SELECT DISTINCT provider_symbol, "date" FROM {_quote(str(entry["target"]))} '  # noqa: S608 -- a fixed predicate over a quoted table
+                f"WHERE coalesce(({predicate}), false)"
+            ).fetchall()
+        )
+    return found
+
+
+def _yielded(workspace: Workspace, target: str, answered: set[tuple[str, date]]) -> bool:
+    """Whether a held action row of ``target`` names a symbol and ex-date a clean answer holds."""
+    if not answered:
+        return False
+    rows = workspace.market.execute(
+        f"SELECT DISTINCT {_HELD_ACTION_KEY} FROM {_quote(target)}"  # noqa: S608 -- a fixed key over a quoted table
+    ).fetchall()
+    return any((str(symbol), day) in answered for symbol, day in rows)
 
 
 def _count(workspace: Workspace, predicate: str, target: str) -> int:
@@ -1225,26 +1370,23 @@ def _promote_routes(  # noqa: PLR0913 -- the pass's explicit inputs
     return runs
 
 
-def standing_unresolved(workspace: Workspace) -> dict[str, dict[str, object]]:
-    """Per dataset, the sources whose latest ``maintain_source@1`` record is ``unresolved``.
+type _SourceKey = tuple[str, str, str]
+"""A ``maintain_source@1`` record's dataset, source and table."""
 
-    Read from the persisted records alone, so a dataset that brought no new source this
-    pass is listed as long as its sources wait. ``sources`` counts them, ``rows`` sums
-    their source tables' rows (a source whose table can no longer be listed, a retired one,
-    is counted in ``rows_unavailable`` instead), ``unresolved_tokens`` sums the identity
-    tokens their latest records left unresolved, ``unpublished_sources`` counts those
-    whose latest record published nothing, and ``oldest_date`` is the earliest partition
-    date they cover (the UTC date of the first such record for an unpartitioned source).
-    A dataset without one is not listed. A US daily price dataset (``us_symbols.covers``)
-    also counts those sources' rows by reason, symbol class and disposition as the current
-    registry and US lists judge them (``us_symbols.unresolved_breakdown``).
-    """
-    latest: dict[tuple[str, str, str], tuple[int, bool, dict[str, object]]] = {}
-    first: dict[tuple[str, str, str], int] = {}
+
+def _source_records(
+    workspace: Workspace, dataset: str | None = None
+) -> tuple[dict[_SourceKey, tuple[int, bool, dict[str, object]]], dict[_SourceKey, int],
+           set[_SourceKey]]:  # fmt: skip
+    """Per source (of ``dataset``, else of every dataset): its latest record, its first
+    ``unresolved`` instant, and whether one published."""
+    latest: dict[_SourceKey, tuple[int, bool, dict[str, object]]] = {}
+    first: dict[_SourceKey, int] = {}
+    published: set[_SourceKey] = set()
     for dataset_id, result, reason, checked in workspace.state.execute(
         "SELECT dataset_id, result, reason, checked_at_us FROM quality_checks "
-        "WHERE rule_id=? ORDER BY checked_at_us, check_id",
-        (CHECK_RULE[0],),
+        "WHERE rule_id=? AND coalesce(dataset_id=?, true) ORDER BY checked_at_us, check_id",
+        (CHECK_RULE[0], dataset),
     ):
         body = cast("dict[str, object]", json.loads(str(reason)))
         pin = cast("dict[str, str]", body["source"])
@@ -1256,6 +1398,29 @@ def standing_unresolved(workspace: Workspace) -> dict[str, dict[str, object]]:
             latest[key] = (int(checked), waiting, body)
         if waiting:
             first.setdefault(key, int(checked))
+        steps = cast("list[dict[str, object]]", body.get("steps") or [])
+        if any(step.get("published") for step in steps):
+            published.add(key)
+    return latest, first, published
+
+
+def standing_unresolved(workspace: Workspace) -> dict[str, dict[str, object]]:
+    """Per dataset, the sources whose latest ``maintain_source@1`` record is ``unresolved``.
+
+    Read from the persisted records alone, so a dataset that brought no new source this
+    pass is listed as long as its sources wait. ``sources`` counts them, ``rows`` sums
+    their source tables' rows (a source whose table can no longer be listed, a retired one,
+    is counted in ``rows_unavailable`` instead), ``unresolved_tokens`` sums the identity
+    tokens their latest records left unresolved, ``unpublished_sources`` counts those
+    no record ever published (a source planned again after it published records an empty
+    delta, which publishes nothing but leaves its rows published), and ``oldest_date`` is
+    the earliest partition date they cover (the UTC date of the first such record for an
+    unpartitioned source).
+    A dataset without one is not listed. A US daily price dataset (``us_symbols.covers``)
+    also counts those sources' rows by reason, symbol class and disposition as the current
+    registry and US lists judge them (``us_symbols.unresolved_breakdown``).
+    """
+    latest, first, published = _source_records(workspace)
     summary: dict[str, dict[str, object]] = {}
     tables: dict[str, list[tuple[str, str]]] = {}
     for (dataset_id, source_id, table), (_, waiting, body) in sorted(latest.items()):
@@ -1277,7 +1442,7 @@ def standing_unresolved(workspace: Workspace) -> dict[str, dict[str, object]]:
         entry["unresolved_tokens"] = cast("int", entry["unresolved_tokens"]) + sum(
             int(cast("int", step.get("unresolved_token_count") or 0)) for step in steps
         )
-        if not any(step.get("published") for step in steps):
+        if (dataset_id, source_id, table) not in published:
             entry["unpublished_sources"] = cast("int", entry["unpublished_sources"]) + 1
         days = [
             cast("dict[str, str]", step["partition"])["from"]
@@ -1381,15 +1546,26 @@ class Expectation:
     Both count the lag in the venue's sessions. ``series``: each series' own period,
     inferred from its latest observation periods, is expected once one further period has
     passed after it ends; the lag counts periods and the dataset's is its worst series.
+    ``listing``: the latest listing date the dataset's collected KIND lists name; the lag
+    counts the venue's sessions after the data up to it, so a listing no event reaches yet
+    (an unresolved short code) shows as lag.
     ``none``: no date the data must reach (declared calendars, event domains).
     ``stale_after`` is the lag above which the dataset is stale; ``collector`` is the
-    maintenance stage that collects its sources.
+    maintenance stage that collects its sources. ``series_stale_after`` replaces
+    ``stale_after`` for the series it names (a daily series published once a week), and a
+    ``series`` dataset is stale when any series lags above its own threshold.
+    ``zero_promotion_after`` replaces ``STALE_AFTER_ZERO_PROMOTION_RUNS`` for the dataset.
+    ``zone`` is the zone whose date an instant domain's ``data_through`` counts in (UTC
+    when None).
     """
 
-    kind: Literal["session", "previous_day", "series", "none"]
+    kind: Literal["session", "previous_day", "series", "listing", "none"]
     calendar: str | None = None
     stale_after: int | None = None
     collector: str | None = None
+    series_stale_after: Mapping[str, int] = field(default_factory=dict)
+    zero_promotion_after: int | None = None
+    zone: str | None = None
 
 
 # The one place freshness thresholds live. A catalog dataset that is not frozen has an entry.
@@ -1403,14 +1579,25 @@ FRESHNESS: Final[Mapping[str, Expectation]] = {
     "fundamentals.us.sec": Expectation("session", "XNYS", 5, "sec"),
     "filings.kr.dart": Expectation("previous_day", "XKRX", 2, "dart"),
     "fundamentals.kr.dart": Expectation("previous_day", "XKRX", 5, "dart"),
-    "macro.us.alfred": Expectation("series", stale_after=2, collector="fred"),
-    "fx.usdkrw.fred": Expectation("series", stale_after=5, collector="fred"),
+    # H.10 publishes the previous week's daily rates each Monday (the next business day after
+    # a holiday): a Friday is four periods behind on the Monday run, five in a holiday week.
+    "macro.us.alfred": Expectation(
+        "series", stale_after=2, collector="fred", series_stale_after={"DEXKOUS": 5, "DTWEXBGS": 5}
+    ),
+    # The same weekly release advances the head once a week: six runs without a promotion
+    # in a normal week, seven in a holiday week.
+    "fx.usdkrw.fred": Expectation(
+        "series", stale_after=5, collector="fred", zero_promotion_after=7
+    ),
     "fx.usdkrw.eodhd": Expectation("session", "XNYS", 5, "qveris"),
     "macro.kr.bok": Expectation("series", stale_after=2),
     "macro.kr.oecd": Expectation("series", stale_after=2),
     "sessions.xnys": Expectation("none"),
     "sessions.xkrx": Expectation("none"),
-    "status.kr.kind": Expectation("none", collector="kind"),
+    # A listing starts at the Seoul start of its date: counted in Seoul, 2026-06-30 stays
+    # 06-30. New listings wait for a weekly EODHD list to bind their ISIN.
+    "status.kr.kind": Expectation("listing", "XKRX", 20, "kind", zone="Asia/Seoul"),
+    "status.kr.kind.delisted": Expectation("none", collector="kind"),
     "status.us.eodhd": Expectation("none", collector="qveris"),
     "classifications.us.sec": Expectation("none"),
     "classifications.kr.kind": Expectation("none", collector="kind"),
@@ -1423,19 +1610,23 @@ STALE_AFTER_ZERO_PROMOTION_RUNS: Final = 5
 FROZEN_PROVIDERS: Final = frozenset({"norgate", "fmp"})
 _SERIES_PERIODS: Final = 12
 _UTC_DAY: Final = "(DATE '1970-01-01' + CAST(floor({} / 86400000000.0) AS INTEGER))"
+# The instant whose date says how far an instant domain's data reaches.
+_INSTANTS: Final[Mapping[str, str]] = {
+    "instrument_status": '"effective_from_us"',
+    "fundamentals": '"available_at_us"',
+    "fx_rates": '"fixing_at_us"',
+    "feature_values": '"feature_at_us"',
+}
 # The column (or UTC date of an instant) that says how far each domain's data reaches.
 DATA_DATES: Final[Mapping[str, str]] = {
     "prices": '"session_date"',
     "corporate_actions": '"ex_date"',
-    "instrument_status": _UTC_DAY.format('"effective_from_us"'),
-    "fundamentals": _UTC_DAY.format('"available_at_us"'),
     "macro_observations": '"observation_period"',
-    "fx_rates": _UTC_DAY.format('"fixing_at_us"'),
     "filings": '"filed_date"',
     "classifications": '"effective_from"',
     "calendar_sessions": '"session_date"',
     "estimates": '"target_period"',
-    "feature_values": _UTC_DAY.format('"feature_at_us"'),
+    **{domain: _UTC_DAY.format(column) for domain, column in _INSTANTS.items()},
 }
 _SERIES_KEYS: Final = {"macro_observations": '"series_id"',
                        "fx_rates": '("base_currency" || \'/\' || "quote_currency")'}  # fmt: skip
@@ -1452,6 +1643,13 @@ def frozen(dataset_id: str) -> bool:
     return (entry is not None and entry.frozen) or bool(
         FROZEN_PROVIDERS & set(_base(dataset_id).split("."))
     )
+
+
+def stale_after_zero_promotion(dataset_id: str) -> int:
+    """The runs without a promotion after which the dataset is ``stale`` (``zero_promotion``)."""
+    found = FRESHNESS.get(_base(dataset_id))
+    override = None if found is None else found.zero_promotion_after
+    return STALE_AFTER_ZERO_PROMOTION_RUNS if override is None else override
 
 
 def collector(dataset_id: str) -> str | None:
@@ -1550,8 +1748,12 @@ _CURRENT: Final = (
 )
 
 
-def _data_through(workspace: Workspace, domain: str, generations: list[str]) -> date | None:
-    column = DATA_DATES.get(domain)
+def _data_through(
+    workspace: Workspace, domain: str, generations: list[str], zone: str | None
+) -> date | None:
+    """The latest data date of the chain; an instant domain's in ``zone`` when one is given."""
+    instant = _INSTANTS.get(domain) if zone is not None else None
+    column = DATA_DATES.get(domain) if instant is None else instant
     if column is None:
         return None
     current = _CURRENT.format(table=_quote(domain))
@@ -1559,7 +1761,53 @@ def _data_through(workspace: Workspace, domain: str, generations: list[str]) -> 
         f"SELECT max({column}) FROM {_quote(domain)} WHERE {current}",  # noqa: S608 -- code-owned columns and tables
         {"g": generations},
     ).fetchone()
-    return None if row is None else cast("date | None", row[0])
+    if row is None or row[0] is None or instant is None:
+        return None if row is None else cast("date | None", row[0])
+    moment = _EPOCH + timedelta(microseconds=int(row[0]))
+    return moment.astimezone(ZoneInfo(cast("str", zone))).date()
+
+
+def _listed_through(workspace: Workspace) -> date | None:
+    """The latest ``listed_on`` any committed KIND list (``kind.status@1``'s shape) names."""
+    days: list[date] = []
+    for table in committed_tables(workspace, _KIND_LISTS):
+        entry = table.entry
+        if (table.store != "market" or entry["name"] != "listings" or not entry["rows"]
+                or "listed_on" not in table.columns):  # fmt: skip
+            continue
+        row = workspace.market.execute(
+            f"SELECT max(TRY_CAST(listed_on AS DATE)) FROM {_quote(str(entry['target']))}"  # noqa: S608 -- a quoted table
+        ).fetchone()
+        if row is not None and row[0] is not None:
+            days.append(cast("date", row[0]))
+    return max(days, default=None)
+
+
+def _unresolved_listings(workspace: Workspace, dataset_id: str) -> int | None:
+    """The short codes the newest promoted KIND lists of the dataset left unresolved.
+
+    Summed from the latest ``maintain_source@1`` record of each list of the latest Seoul
+    collection date (a list's partition); None before maintenance recorded one.
+    """
+    latest, _, _ = _source_records(workspace, dataset_id)
+    found: dict[str, int] = {}
+    for _, _, body in latest.values():
+        for step in cast("list[dict[str, object]]", body.get("steps") or []):
+            partition = cast("dict[str, str] | None", step.get("partition"))
+            if partition is not None:
+                tokens = int(cast("int", step.get("unresolved_token_count") or 0))
+                found[partition["from"]] = found.get(partition["from"], 0) + tokens
+    return found[max(found)] if found else None
+
+
+def _survivorship(workspace: Workspace, generations: list[str]) -> str:
+    """``unverified`` for a status chain without a delisting; ``delisting_events`` otherwise."""
+    row = workspace.market.execute(
+        "SELECT count(*) FROM instrument_status WHERE status='delisted' AND "  # noqa: S608 -- the code-owned predicate
+        + _CURRENT.format(table="instrument_status"),
+        {"g": generations},
+    ).fetchone()
+    return "delisting_events" if row is not None and row[0] else "unverified"
 
 
 def _series_periods(
@@ -1577,6 +1825,57 @@ def _series_periods(
     return found
 
 
+def _series_freshness(
+    workspace: Workspace,
+    expectation: Expectation,
+    domain: str,
+    generations: list[str],
+    now: datetime,
+) -> tuple[date, int, list[str]] | None:
+    """The latest expected period, the worst lag and the series above their own threshold."""
+    today = now.astimezone(UTC).date()
+    lags = {series: found for series, periods in
+            _series_periods(workspace, domain, generations).items()
+            if (found := _series_lag(periods, today)) is not None}  # fmt: skip
+    if not lags:
+        return None
+    limits = expectation.series_stale_after
+    stale = sorted(
+        series for series, found in lags.items()
+        if found[1] > limits.get(series, cast("int", expectation.stale_after))
+    )  # fmt: skip
+    return max(found[0] for found in lags.values()), max(found[1] for found in lags.values()), stale
+
+
+def _lag(  # noqa: PLR0913, PLR0917 -- the head's chain, its data date and the result it fills
+    workspace: Workspace,
+    dataset_id: str,
+    chain: tuple[str, list[str]],
+    data: date,
+    now: datetime,
+    result: dict[str, object],
+) -> tuple[date | None, int | None]:
+    """The date the data should reach and its lag; fills the expectation's own fields."""
+    expectation = FRESHNESS.get(_base(dataset_id), Expectation("none"))
+    domain, generations = chain
+    expected: date | None = None
+    lag: int | None = None
+    if expectation.kind in {"session", "previous_day", "listing"}:
+        expected = (_listed_through(workspace) if expectation.kind == "listing"
+                    else _expected_day(expectation, now))  # fmt: skip
+        if expected is not None:
+            lag = _session_lag(cast("str", expectation.calendar), data, expected)
+            result["lag_unit"] = "sessions"
+        if expectation.kind == "listing":
+            result["unresolved_listings"] = _unresolved_listings(workspace, dataset_id)
+    elif expectation.kind == "series" and domain in _SERIES_KEYS:
+        found = _series_freshness(workspace, expectation, domain, generations, now)
+        if found is not None:
+            expected, lag, result["stale_series"] = found
+            result["lag_unit"] = "periods"
+    return expected, lag
+
+
 def freshness(
     workspace: Workspace, dataset_id: str, generation_id: str | None, now: datetime
 ) -> dict[str, object]:
@@ -1588,13 +1887,16 @@ def freshness(
         "data_through": None, "expected_through": None, "lag_sessions": None,
         "lag_unit": None, "stale_after": None, "freshness": "no_head",
         "stale_reasons": [], "stale_series": [], "zero_promotion_runs": None,
+        "survivorship": None, "unresolved_listings": None,
     }  # fmt: skip
     if generation_id is None:
         return result
     domain, generations = _chain(workspace, generation_id)
-    data = _data_through(workspace, domain, generations)
-    result["data_through"] = None if data is None else data.isoformat()
     expectation = FRESHNESS.get(_base(dataset_id), Expectation("none"))
+    data = _data_through(workspace, domain, generations, expectation.zone)
+    result["data_through"] = None if data is None else data.isoformat()
+    if domain == "instrument_status":
+        result["survivorship"] = _survivorship(workspace, generations)
     if frozen(dataset_id):
         result["freshness"] = "frozen"
         return result
@@ -1602,31 +1904,13 @@ def freshness(
         result["freshness"] = "no_data"
         return result
     result["freshness"] = "untracked"
-    expected: date | None = None
-    lag: int | None = None
-    if expectation.kind in {"session", "previous_day"}:
-        expected = _expected_day(expectation, now)
-        if expected is not None:
-            lag = _session_lag(cast("str", expectation.calendar), data, expected)
-            result["lag_unit"] = "sessions"
-    elif expectation.kind == "series" and domain in _SERIES_KEYS:
-        today = now.astimezone(UTC).date()
-        lags = {series: found for series, periods in
-                _series_periods(workspace, domain, generations).items()
-                if (found := _series_lag(periods, today)) is not None}  # fmt: skip
-        if lags:
-            expected = max(found[0] for found in lags.values())
-            lag = max(found[1] for found in lags.values())
-            result["lag_unit"] = "periods"
-            result["stale_series"] = sorted(
-                series for series, found in lags.items()
-                if found[1] > cast("int", expectation.stale_after)
-            )  # fmt: skip
+    expected, lag = _lag(workspace, dataset_id, (domain, generations), data, now, result)
     if lag is None:
         return result
     result.update(expected_through=cast("date", expected).isoformat(), lag_sessions=lag,
                   stale_after=expectation.stale_after)  # fmt: skip
-    stale = lag > cast("int", expectation.stale_after)
+    stale = (bool(result["stale_series"]) if expectation.kind == "series"
+             else lag > cast("int", expectation.stale_after))  # fmt: skip
     result["freshness"] = "stale" if stale else "current"
     result["stale_reasons"] = ["lag"] if stale else []
     return result

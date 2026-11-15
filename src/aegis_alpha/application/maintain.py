@@ -374,10 +374,11 @@ def promotion_streaks(
     A run counts when the dataset's collector stage succeeded, the head's sequence equals
     the previous report's and the data is behind (or has no expected date). An advanced
     head or data that is current resets the count; a run that did not collect carries it.
-    At ``STALE_AFTER_ZERO_PROMOTION_RUNS`` the dataset is ``stale`` (``zero_promotion``).
+    At ``STALE_AFTER_ZERO_PROMOTION_RUNS`` (or the dataset's own ``zero_promotion_after``)
+    the dataset is ``stale`` (``zero_promotion``).
     Frozen datasets and catalog datasets without a head are not counted.
     """
-    from aegis_alpha.storage.maintain_promotion import STALE_AFTER_ZERO_PROMOTION_RUNS, collector
+    from aegis_alpha.storage.maintain_promotion import collector, stale_after_zero_promotion
 
     for head in heads:
         if head["freshness"] in {"frozen", "no_head"}:
@@ -393,7 +394,7 @@ def promotion_streaks(
         else:
             runs = carried
         head["zero_promotion_runs"] = runs
-        if runs >= STALE_AFTER_ZERO_PROMOTION_RUNS:
+        if runs >= stale_after_zero_promotion(str(head["dataset_id"])):
             head["freshness"] = "stale"
             head["stale_reasons"] = [*cast("list[str]", head["stale_reasons"]), "zero_promotion"]
 

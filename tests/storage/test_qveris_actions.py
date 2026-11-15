@@ -68,9 +68,10 @@ def ws(tmp_path: Path) -> Iterator[Workspace]:
         yield workspace
 
 
-def replay(ws: Workspace, raw: Path, job: QverisJob, rows: list[dict[str, object]]) -> dict:
+def replay(ws: Workspace, raw: Path, job: QverisJob, rows: list[dict[str, object]], *,
+           warning: bool = False) -> dict:  # fmt: skip
     """Complete ``job`` with ``rows`` through the scripted gateway and import it; its pin."""
-    complete(raw, job, rows)
+    complete(raw, job, rows, warning=warning)
     (completion,), missing = completions(raw, fingerprints=[job.fingerprint])
     assert missing == []
     history = read_completed_job(raw, completion.fingerprint, completion.completion_sha256)
@@ -384,6 +385,8 @@ def test_the_new_routes_see_collected_sources_and_start_only_named_datasets(
         ("actions.us.eodhd", "eodhd.dividends@1"),
         ("actions.kr.eodhd", "eodhd.splits@1"),
         ("actions.kr.eodhd", "eodhd.dividends@1"),
+        ("actions.kr.eodhd", "eodhd.splits_quarantine@1"),
+        ("actions.kr.eodhd", "eodhd.dividends_quarantine@1"),
         ("fx.usdkrw.eodhd", "eodhd.fx_history@1"),
     }
     raw = tmp_path / "qveris"
@@ -400,7 +403,8 @@ def test_the_new_routes_see_collected_sources_and_start_only_named_datasets(
     planned = promote_datasets(ws, apply=True, now_us=1, routes=routes)
     assert unmapped(ws) == {}
     for key, run in _runs(planned).items():
-        expected = 0 if key == ("actions.kr.eodhd", "eodhd.splits@1") else 1
+        # No KR split and no warned day was collected: those routes have nothing to wait on.
+        expected = 0 if key[0] == "actions.kr.eodhd" and key[1] != "eodhd.dividends@1" else 1
         assert (run["status"], run["started"]) == ("no_head" if expected else "current", False), key
         assert cast("dict[str, int]", run["skipped"]).get("no_head", 0) == expected, key
     assert tuple(ws.state.execute("SELECT count(*) FROM dataset_versions").fetchone()) == (0,)
@@ -458,3 +462,131 @@ def test_the_new_routes_see_collected_sources_and_start_only_named_datasets(
     run = later[("actions.us.eodhd", "eodhd.splits@1")]
     assert (run["status"], run["started"]) == ("advanced", False)
     assert dataset_head(ws, "actions.us.eodhd") is not None
+
+
+# --- warned KR exchange days: promoted flagged, and never over a clean answer ---------------
+
+KR_ROUTES = [route for route in ROUTES if route.dataset_id == "actions.kr.eodhd"]
+
+
+def _kr_actions(ws: Workspace, code: str) -> list[tuple[Any, ...]]:
+    """(action_id, amount, op, flagged) of every stored KR revision of one symbol's actions."""
+    return ws.market.execute(
+        "SELECT a.action_id, a.amount, a.op, EXISTS (SELECT 1 FROM quality_flags f "
+        "WHERE f.generation_id = a.generation_id AND f.revision_id = a.revision_id "
+        "AND f.flag = 'provider_reported_partial') FROM corporate_actions a "
+        "WHERE a.instrument_id = ? ORDER BY a.action_id, a.available_at_us, a.op",
+        [instrument(code)],
+    ).fetchall()
+
+
+def test_a_warned_kr_action_day_is_promoted_flagged_and_yields_to_a_clean_answer(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    # The chain starts from a clean KO dividend day, as the KR action chains did.
+    clean = replay(ws, tmp_path / "clean", bulk_job("KO", "dividends", EX.isoformat()),
+                   [_dividend("123456", "KO", "100", unadjustedValue="100")])  # fmt: skip
+    identity = register_symbols(ws, clean["source_id"], ANCHORS, name="maintain-synthetic")
+    opens(ws, "XKRX", (EX, NEXT))
+    start = frozenset({"actions.kr.eodhd"})
+    started = _runs(promote_datasets(ws, apply=True, now_us=1, routes=KR_ROUTES,
+                                     identity=identity, start=start))  # fmt: skip
+    assert started[("actions.kr.eodhd", "eodhd.dividends@1")]["status"] == "advanced"
+
+    # A warned KQ day: its rows table is empty and its one row is held as partial.
+    warned = {**_dividend("654321", "KQ", 50, unadjustedValue=50), "date": NEXT.isoformat()}
+    replay(ws, tmp_path / "warned", bulk_job("KQ", "dividends", NEXT.isoformat()), [warned],
+           warning=True)  # fmt: skip
+    runs = _runs(promote_datasets(ws, apply=True, now_us=2, routes=KR_ROUTES, identity=identity))
+    assert cast("dict[str, int]", runs[("actions.kr.eodhd", "eodhd.dividends@1")]["skipped"])[
+        "empty"] == 1  # fmt: skip
+    run = runs[("actions.kr.eodhd", "eodhd.dividends_quarantine@1")]
+    assert (run["status"], run["derived_from"]) == ("advanced", "eodhd.dividends@1")
+    assert _kr_actions(ws, "654321.KQ") == [("dividend:2026-09-01", Decimal(50), "ASSERT", True)]
+
+    # The same KO day answered again with a warning names the clean answer's symbol and ex-date
+    # with another amount: the clean answer stands, and nothing is promoted over it.
+    versions = tuple(ws.state.execute("SELECT count(*) FROM dataset_versions").fetchone())
+    replay(ws, tmp_path / "again", bulk_job("KO", "dividends", EX.isoformat()),
+           [_dividend("123456", "KO", "999", unadjustedValue="999")], warning=True)  # fmt: skip
+    runs = _runs(promote_datasets(ws, apply=True, now_us=3, routes=KR_ROUTES, identity=identity))
+    run = runs[("actions.kr.eodhd", "eodhd.dividends_quarantine@1")]
+    assert (run["status"], cast("dict[str, int]", run["skipped"])["answered"]) == ("current", 1)
+    assert tuple(ws.state.execute("SELECT count(*) FROM dataset_versions").fetchone()) == versions
+    assert _kr_actions(ws, "123456.KO") == [("dividend:2026-08-31", Decimal(100), "ASSERT", False)]
+
+    # A clean answer arriving after a warned one supersedes it: one record, the clean value.
+    replay(ws, tmp_path / "late", bulk_job("KQ", "dividends", NEXT.isoformat()),
+           [{**warned, "dividend": "60", "unadjustedValue": "60"}])  # fmt: skip
+    promote_datasets(ws, apply=True, now_us=4, routes=KR_ROUTES, identity=identity)
+    assert _kr_actions(ws, "654321.KQ") == [
+        ("dividend:2026-09-01", Decimal(50), "ASSERT", True),
+        ("dividend:2026-09-01", Decimal(60), "SUPERSEDE", False),
+    ]
+
+
+def test_the_held_action_mappers_read_the_warned_rows_as_the_clean_mappers_do() -> None:
+    held: list[dict[str, object]] = [
+        {"reason": "provider_reported_partial", "source_row_json": json.dumps(row)}
+        for row in (
+            {"code": "654321", "exchange": "KQ", "date": "2026-08-31", "dividend": 361,
+             "currency": "KRW", "unadjustedValue": 361.5, "recordDate": "2026-09-01",
+             "paymentDate": ""},
+            {"code": "123456", "exchange": "KO", "date": "2026-08-31", "dividend": "7",
+             "currency": "KRW"},
+        )
+    ]  # fmt: skip
+    clean: list[dict[str, object]] = [
+        {"provider_symbol": "654321.KQ", "date": EX, "dividend": "361",
+         "dividend_currency": "KRW", "unadjusted_value": "361.5", "record_date": "2026-09-01",
+         "payment_date": None},
+        {"provider_symbol": "123456.KO", "date": EX, "dividend": "7",
+         "dividend_currency": "KRW"},
+    ]  # fmt: skip
+    columns = ("_aas_id_token, _aas_id_at_us, action_id, ex_date, record_date, pay_date, amount, "
+               "currency, value_state, _aas_t_ex_date")  # fmt: skip
+    args = {"timezone": SEOUL}
+    expected = [
+        ("654321.KQ", us_at(EX, -9), "dividend:2026-08-31", EX, date(2026, 9, 1), None, "361.5",
+         "KRW", "present", EX),
+        ("123456.KO", us_at(EX, -9), "dividend:2026-08-31", EX, None, None, None, "KRW",
+         "invalid", EX),
+    ]  # fmt: skip
+    assert _mapped(clean, "eodhd.dividends@1", args, columns) == expected
+    flagged = f"{columns}, _aas_ingested_at_us, _aas_f_provider_reported_partial"
+    found = _held_mapped(held, "eodhd.dividends_quarantine@1", args, flagged)
+    assert found == [(*row, None, True) for row in expected]
+    split: dict[str, object] = {
+        "reason": "provider_reported_partial",
+        "source_row_json": json.dumps(
+            {"code": "123456", "exchange": "KO", "date": "2026-08-31", "split": "5.000000/1.000000"}
+        ),
+    }
+    # Another hold reason has no ex-date, so the engine refuses it as missing a required column.
+    other: dict[str, object] = {**split, "reason": "invalid_split_ratio"}
+    assert _held_mapped([split, other], "eodhd.splits_quarantine@1", args,
+                        "_aas_id_token, action_type, ratio, value_state, ex_date") == [
+        ("123456.KO", "split", 5.0, "present", EX),
+        ("123456.KO", "split", 5.0, "present", None),
+    ]  # fmt: skip
+    found_mapper = mapper("eodhd.splits_quarantine@1")
+    assert (found_mapper.domain, found_mapper.source_prefixes) == ("corporate_actions", ())
+    assert found_mapper.identity(args) == IdentityKey("eodhd", "eodhd_symbol")
+
+
+def _held_mapped(
+    rows: list[dict[str, object]], name: str, args: Mapping[str, object], columns: str
+) -> list[tuple[Any, ...]]:
+    table = pa.table({key: [row[key] for row in rows] for key in ("reason", "source_row_json")})
+    connection = duckdb.connect()
+    connection.execute("SET TimeZone='UTC'")
+    connection.register("_arrow", table)
+    connection.execute(
+        "CREATE TABLE src AS SELECT 0::INTEGER AS _aas_pin, (row_number() OVER () - 1)::BIGINT "
+        "AS _aas_ordinal, 'h' || (row_number() OVER ()) AS _aas_row_hash, * FROM _arrow"
+    )
+    found = mapper(name)
+    found.check_args(dict(args))
+    return connection.execute(
+        f"SELECT {columns} FROM ({found.select('src', dict(args))}) ORDER BY _aas_ordinal"
+    ).fetchall()

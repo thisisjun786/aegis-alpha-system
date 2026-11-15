@@ -637,6 +637,36 @@ def _heads(ws: Workspace, now: datetime) -> dict[str, dict[str, object]]:
     return {str(item["dataset_id"]): item for item in maintain_promotion.dataset_heads(ws, now=now)}
 
 
+def test_a_source_that_once_published_is_not_unpublished_after_an_empty_replan(
+    ws: Workspace,
+) -> None:
+    _bars_downloaded_late(ws, "prices.kr.eodhd")
+    record = maintain_promotion._record  # noqa: SLF001 -- the writer of maintain_source records
+    partition = {"from": "2026-07-02", "to": "2026-07-03"}
+
+    def waiting(tag: str) -> dict[str, str]:
+        return add_source(ws, [bar("AAA.KO", date(2026, 7, 2), 101.0,
+                                   retrieved=at("2026-07-27T08:00:00"))], tag=tag)  # fmt: skip
+
+    def steps(*, published: bool) -> list[dict[str, object]]:
+        return [{"partition": partition, "published": published, "unresolved_token_count": 1}]
+
+    once = waiting("once")
+    # Promoted with one token waiting, then planned again under other key members: the
+    # rows are published already, so the second record is an empty delta.
+    record(ws, "prices.kr.eodhd", once, steps(published=True),
+           resolution={"key_sha256": "a" * 64}, now_us=10)  # fmt: skip
+    record(ws, "prices.kr.eodhd", once, steps(published=False),
+           resolution={"key_sha256": "b" * 64}, now_us=20)  # fmt: skip
+    standing = maintain_promotion.standing_unresolved(ws)["prices.kr.eodhd"]
+    assert (standing["sources"], standing["unpublished_sources"]) == (1, 0)
+    # A source no record published still counts.
+    record(ws, "prices.kr.eodhd", waiting("never"), steps(published=False),
+           resolution={"key_sha256": "a" * 64}, now_us=30)  # fmt: skip
+    standing = maintain_promotion.standing_unresolved(ws)["prices.kr.eodhd"]
+    assert (standing["sources"], standing["unpublished_sources"]) == (2, 1)
+
+
 def test_a_recent_watermark_over_weeks_old_data_is_stale_by_its_session_lag(
     ws: Workspace,
 ) -> None:
@@ -804,3 +834,24 @@ def test_macro_series_lag_by_their_own_publication_period(ws: Workspace) -> None
         "stale_reasons": ["lag"],
         "stale_series": ["SYNMONTHLY"],
     }
+
+
+def test_a_weekly_published_daily_series_is_stale_only_above_its_own_threshold(
+    ws: Workspace,
+) -> None:
+    # DEXKOUS (H.10, published each Monday for the week before) ends on Friday 11-06; a
+    # daily series without its own threshold ends on Tuesday 11-10.
+    _publish_macro(ws, "macro.us.alfred", {
+        "DEXKOUS": _weekdays(date(2026, 10, 1), date(2026, 11, 6)),
+        "SYNDAILY": _weekdays(date(2026, 10, 1), date(2026, 11, 10))})  # fmt: skip
+
+    def read(day: int) -> tuple[object, ...]:
+        head = _heads(ws, datetime(2026, 11, day, 3, tzinfo=UTC))["macro.us.alfred"]
+        return head["lag_sessions"], head["freshness"], head["stale_series"]
+
+    # Monday 11-16: DEXKOUS is four periods behind, SYNDAILY two; neither above its threshold.
+    assert read(16) == (4, "current", [])
+    # Tuesday: DEXKOUS five (a holiday week's release), SYNDAILY three, above the dataset's two.
+    assert read(17) == (5, "stale", ["SYNDAILY"])
+    # Wednesday: DEXKOUS six, above its own five.
+    assert read(18) == (6, "stale", ["DEXKOUS", "SYNDAILY"])

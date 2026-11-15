@@ -233,7 +233,9 @@ def _registry() -> dict[str, Mapper]:
     )
     from aegis_alpha.storage.promotion.mappers.eodhd_actions import (  # noqa: PLC0415
         EodhdDividends,
+        EodhdDividendsQuarantine,
         EodhdSplits,
+        EodhdSplitsQuarantine,
     )
     from aegis_alpha.storage.promotion.mappers.eodhd_delisted import (  # noqa: PLC0415
         EodhdDelisted,
@@ -248,6 +250,9 @@ def _registry() -> dict[str, Mapper]:
         EodhdFxHistory,
         fred_fx_series,
         norgate_fx_history,
+    )
+    from aegis_alpha.storage.promotion.mappers.kind_delisted import (  # noqa: PLC0415
+        KindDelisted,
     )
     from aegis_alpha.storage.promotion.mappers.kind_status import KindStatus  # noqa: PLC0415
     from aegis_alpha.storage.promotion.mappers.korea import KoreaObservations  # noqa: PLC0415
@@ -279,7 +284,9 @@ def _registry() -> dict[str, Mapper]:
         EodhdBulkQuarantineAdjusted(),
         EodhdBulkQuarantineV2(),
         EodhdDividends(),
+        EodhdDividendsQuarantine(),
         EodhdSplits(),
+        EodhdSplitsQuarantine(),
         EodhdDelisted(),
         EodhdFxHistory(),
         FmpEodNonSplit(),
@@ -301,6 +308,7 @@ def _registry() -> dict[str, Mapper]:
         KindIndustry(),
         KindIndustry(2),
         KindStatus(),
+        KindDelisted(),
         NorgateClassification(),
         SecSic(),
         SecCompanyfacts(),
