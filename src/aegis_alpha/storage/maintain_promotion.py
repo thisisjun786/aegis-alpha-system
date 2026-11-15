@@ -1285,22 +1285,18 @@ def _promote_routes(  # noqa: PLR0913 -- the pass's explicit inputs
     return runs
 
 
-def standing_unresolved(workspace: Workspace) -> dict[str, dict[str, object]]:
-    """Per dataset, the sources whose latest ``maintain_source@1`` record is ``unresolved``.
+type _SourceKey = tuple[str, str, str]
+"""A ``maintain_source@1`` record's dataset, source and table."""
 
-    Read from the persisted records alone, so a dataset that brought no new source this
-    pass is listed as long as its sources wait. ``sources`` counts them, ``rows`` sums
-    their source tables' rows (a source whose table can no longer be listed, a retired one,
-    is counted in ``rows_unavailable`` instead), ``unresolved_tokens`` sums the identity
-    tokens their latest records left unresolved, ``unpublished_sources`` counts those
-    whose latest record published nothing, and ``oldest_date`` is the earliest partition
-    date they cover (the UTC date of the first such record for an unpartitioned source).
-    A dataset without one is not listed. A US daily price dataset (``us_symbols.covers``)
-    also counts those sources' rows by reason, symbol class and disposition as the current
-    registry and US lists judge them (``us_symbols.unresolved_breakdown``).
-    """
-    latest: dict[tuple[str, str, str], tuple[int, bool, dict[str, object]]] = {}
-    first: dict[tuple[str, str, str], int] = {}
+
+def _source_records(
+    workspace: Workspace,
+) -> tuple[dict[_SourceKey, tuple[int, bool, dict[str, object]]], dict[_SourceKey, int],
+           set[_SourceKey]]:  # fmt: skip
+    """Per source: its latest record, its first ``unresolved`` instant, whether one published."""
+    latest: dict[_SourceKey, tuple[int, bool, dict[str, object]]] = {}
+    first: dict[_SourceKey, int] = {}
+    published: set[_SourceKey] = set()
     for dataset_id, result, reason, checked in workspace.state.execute(
         "SELECT dataset_id, result, reason, checked_at_us FROM quality_checks "
         "WHERE rule_id=? ORDER BY checked_at_us, check_id",
@@ -1316,6 +1312,29 @@ def standing_unresolved(workspace: Workspace) -> dict[str, dict[str, object]]:
             latest[key] = (int(checked), waiting, body)
         if waiting:
             first.setdefault(key, int(checked))
+        steps = cast("list[dict[str, object]]", body.get("steps") or [])
+        if any(step.get("published") for step in steps):
+            published.add(key)
+    return latest, first, published
+
+
+def standing_unresolved(workspace: Workspace) -> dict[str, dict[str, object]]:
+    """Per dataset, the sources whose latest ``maintain_source@1`` record is ``unresolved``.
+
+    Read from the persisted records alone, so a dataset that brought no new source this
+    pass is listed as long as its sources wait. ``sources`` counts them, ``rows`` sums
+    their source tables' rows (a source whose table can no longer be listed, a retired one,
+    is counted in ``rows_unavailable`` instead), ``unresolved_tokens`` sums the identity
+    tokens their latest records left unresolved, ``unpublished_sources`` counts those
+    no record ever published (a source planned again after it published records an empty
+    delta, which publishes nothing but leaves its rows published), and ``oldest_date`` is
+    the earliest partition date they cover (the UTC date of the first such record for an
+    unpartitioned source).
+    A dataset without one is not listed. A US daily price dataset (``us_symbols.covers``)
+    also counts those sources' rows by reason, symbol class and disposition as the current
+    registry and US lists judge them (``us_symbols.unresolved_breakdown``).
+    """
+    latest, first, published = _source_records(workspace)
     summary: dict[str, dict[str, object]] = {}
     tables: dict[str, list[tuple[str, str]]] = {}
     for (dataset_id, source_id, table), (_, waiting, body) in sorted(latest.items()):
@@ -1337,7 +1356,7 @@ def standing_unresolved(workspace: Workspace) -> dict[str, dict[str, object]]:
         entry["unresolved_tokens"] = cast("int", entry["unresolved_tokens"]) + sum(
             int(cast("int", step.get("unresolved_token_count") or 0)) for step in steps
         )
-        if not any(step.get("published") for step in steps):
+        if (dataset_id, source_id, table) not in published:
             entry["unpublished_sources"] = cast("int", entry["unpublished_sources"]) + 1
         days = [
             cast("dict[str, str]", step["partition"])["from"]

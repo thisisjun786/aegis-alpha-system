@@ -1610,7 +1610,7 @@ identity 단계는 그 목록의 행을 등록된 FMP ISIN으로 Norgate 상품�
 | `rows` | 그 원천 표들의 행 수 합 |
 | `rows_unavailable` | 표를 더 나열할 수 없어(은퇴 등) `rows`에 넣지 못한 원천 수 |
 | `unresolved_tokens` | 그 기록들의 단계별 `unresolved_token_count` 합 |
-| `unpublished_sources` | 가장 늦은 기록에서 어떤 단계도 게시하지 않은 원천 수 |
+| `unpublished_sources` | 어떤 기록도 게시하지 않은 원천 수. 게시된 뒤 다시 계획돼 빈 delta로 끝난 원천은 행이 이미 게시돼 있으므로 세지 않는다 |
 | `oldest_date` | 그 원천들이 덮는 가장 이른 partition 날짜(partition이 없으면 첫 `unresolved` 기록의 UTC 날짜) |
 | `rows_by_reason` | `prices.us.eodhd`(와 `.r<N>`)에만 있다. 그 원천 행을 지금의 registry와 US 목록으로 판정한 사유별 행 수. `resolved`(이제 등록 claim이 덮음, 다음 승격을 기다림), `list_claimable`(다음 identity 단계가 등록할 날), `list_not_observed`(그날 목록에 없음), 그 밖은 목록 사유(`list_isin_missing` 등) |
 | `rows_by_class` | 같은 항목. `resolved`가 아닌 사유마다 목록 `Type`의 종류별 행 수(`common_stock`, `etf`, `mutual_fund`, `warrant`, `unknown` 등) |

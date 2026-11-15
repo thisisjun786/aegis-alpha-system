@@ -637,6 +637,36 @@ def _heads(ws: Workspace, now: datetime) -> dict[str, dict[str, object]]:
     return {str(item["dataset_id"]): item for item in maintain_promotion.dataset_heads(ws, now=now)}
 
 
+def test_a_source_that_once_published_is_not_unpublished_after_an_empty_replan(
+    ws: Workspace,
+) -> None:
+    _bars_downloaded_late(ws, "prices.kr.eodhd")
+    record = maintain_promotion._record  # noqa: SLF001 -- the writer of maintain_source records
+    partition = {"from": "2026-07-02", "to": "2026-07-03"}
+
+    def waiting(tag: str) -> dict[str, str]:
+        return add_source(ws, [bar("AAA.KO", date(2026, 7, 2), 101.0,
+                                   retrieved=at("2026-07-27T08:00:00"))], tag=tag)  # fmt: skip
+
+    def steps(*, published: bool) -> list[dict[str, object]]:
+        return [{"partition": partition, "published": published, "unresolved_token_count": 1}]
+
+    once = waiting("once")
+    # Promoted with one token waiting, then planned again under other key members: the
+    # rows are published already, so the second record is an empty delta.
+    record(ws, "prices.kr.eodhd", once, steps(published=True),
+           resolution={"key_sha256": "a" * 64}, now_us=10)  # fmt: skip
+    record(ws, "prices.kr.eodhd", once, steps(published=False),
+           resolution={"key_sha256": "b" * 64}, now_us=20)  # fmt: skip
+    standing = maintain_promotion.standing_unresolved(ws)["prices.kr.eodhd"]
+    assert (standing["sources"], standing["unpublished_sources"]) == (1, 0)
+    # A source no record published still counts.
+    record(ws, "prices.kr.eodhd", waiting("never"), steps(published=False),
+           resolution={"key_sha256": "a" * 64}, now_us=30)  # fmt: skip
+    standing = maintain_promotion.standing_unresolved(ws)["prices.kr.eodhd"]
+    assert (standing["sources"], standing["unpublished_sources"]) == (2, 1)
+
+
 def test_a_recent_watermark_over_weeks_old_data_is_stale_by_its_session_lag(
     ws: Workspace,
 ) -> None:
