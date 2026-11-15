@@ -83,8 +83,15 @@ only the short ones (valid at most ``SHORT_DAYS`` days, such as a symbol list's 
 claims) that can hold at any instant of those dates in any time zone, because a mapper may
 resolve at a row's own instant rather than at the start of its date
 (``aas-maintain-key-scope-v1``). A claim registered for a later day then leaves the
-source settled, so daily identity increments do not plan every waiting source again; a
-record without a scope keeps the whole key's SHA-256. A refused or
+source settled, so daily identity increments do not plan every waiting source again. A
+source of an unpartitioned step whose mapper resolves each row at the local start of its
+partition date (the EODHD daily bars, ``DATED_IDENTITY``) names the scope of its rows'
+partition dates the same way, so a US daily bulk source waits through later days' claims
+too; a claim over one of its rows' dates plans it again. Any other record without a scope
+keeps the whole key's SHA-256. Each dataset run reports ``replanned_waiting``: of the
+sources it planned, those an ``unresolved`` record named before, by why the record no
+longer settles them (``key_changed`` over the whole key, ``scoped_key_changed`` over its
+scope, ``no_identity`` when the run resolves no key); the pass sums them. A refused or
 blocked step records nothing, so the source is planned again on the next run; a run that
 stopped between the steps of one source plans its done steps again as empty deltas.
 Sources an operator's promotion pinned are planned once more on the first maintenance
@@ -204,6 +211,11 @@ def _bar_values() -> str:
 
 
 _KR_VALUES: Final = _bar_values()
+DATED_IDENTITY: Final = frozenset({
+    "eodhd.bars@1", "eodhd.bars_adjusted@1", "eodhd.bulk_quarantine@1",
+    "eodhd.bulk_quarantine@2", "eodhd.bulk_quarantine_adjusted@1",
+})  # fmt: skip
+"""Mappers resolving each row's identity at the local start of its partition date."""
 _SUMMARY: Final = (
     "generation_id",
     "published",
@@ -477,6 +489,7 @@ class DatasetRun:
     started: bool = False
     sources: list[dict[str, object]] = field(default_factory=list)
     skipped: dict[str, int] = field(default_factory=dict)
+    replanned: dict[str, int] = field(default_factory=dict)
 
     def report(self) -> dict[str, object]:
         return {
@@ -489,7 +502,9 @@ class DatasetRun:
             "started": self.started,
             "sources": self.sources,
             "skipped": self.skipped,
-        }
+            "replanned_waiting": {"sources": sum(self.replanned.values()),
+                                  "reasons": dict(sorted(self.replanned.items()))},
+        }  # fmt: skip
 
 
 def _quote(name: str) -> str:
@@ -670,30 +685,36 @@ class KeyMembers:
 
 def _done(
     workspace: Workspace, dataset_id: str, members: KeyMembers | None
-) -> set[tuple[str, str]]:
-    """(source ID, table) pins a maintenance record or a coverage check already settles.
+) -> tuple[set[tuple[str, str]], dict[tuple[str, str], str]]:
+    """(source ID, table) pins a maintenance record or a coverage check already settles, and
+    why each other pin an ``unresolved`` record names is planned again (its latest record).
 
     An ``unresolved`` record settles its source only while the identity members the run
     would resolve with give the SHA-256 it recorded, over its scope when it names one.
     """
     done: set[tuple[str, str]] = set()
+    waiting: dict[tuple[str, str], str] = {}
     for rule, result, reason in workspace.state.execute(
         "SELECT rule_id, result, reason FROM quality_checks WHERE dataset_id=? "
-        "AND rule_id IN ('maintain_source', 'promotion_coverage')",
+        "AND rule_id IN ('maintain_source', 'promotion_coverage') ORDER BY checked_at_us",
         (dataset_id,),
     ):
         body = json.loads(str(reason))
         if rule == CHECK_RULE[0] and result == UNRESOLVED:
             recorded = cast("dict[str, object]", body.get("identity") or {})
             scope = cast("dict[str, str] | None", recorded.get("key_scope"))
-            if (
-                members is None
-                or recorded.get("key_sha256") != members.recorded(scope)["key_sha256"]
-            ):
+            if members is None:
+                stale = "no_identity"
+            elif recorded.get("key_sha256") != members.recorded(scope)["key_sha256"]:
+                stale = "key_changed" if scope is None else "scoped_key_changed"
+            else:
+                stale = None
+            if stale is not None:
+                waiting[(str(body["source"]["source_id"]), str(body["source"]["table"]))] = stale
                 continue
         pins = [body["source"]] if rule == CHECK_RULE[0] else body.get("sources", [])
         done.update((str(pin["source_id"]), str(pin["table"])) for pin in pins)
-    return done
+    return done, {pin: why for pin, why in waiting.items() if pin not in done}
 
 
 def key_members_sha256(workspace: Workspace, pin: Mapping[str, str], key: IdentityKey) -> str:
@@ -885,6 +906,18 @@ def _refreshed(workspace: Workspace, value: object) -> object:
     return value
 
 
+def _dates(workspace: Workspace, mapper_name: str, target: str) -> tuple[date, date] | None:
+    """``[first, last + 1 day)`` of the mapper's partition dates in the table, or None."""
+    day = mapper(mapper_name).partition_sql
+    bounds = workspace.market.execute(
+        f"SELECT min(TRY_CAST(({day}) AS DATE)), max(TRY_CAST(({day}) AS DATE)) "  # noqa: S608 -- registered mapper SQL over a quoted table
+        f"FROM {_quote(target)}"
+    ).fetchone()
+    if bounds is None or bounds[0] is None:
+        return None
+    return bounds[0], bounds[1] + timedelta(days=1)
+
+
 def _steps(
     workspace: Workspace, template: Mapping[str, object], mapper_name: str, item: Candidate
 ) -> list[Step]:
@@ -894,14 +927,21 @@ def _steps(
         return [
             Step(bounds) for bounds in vintage_partitions(workspace.market, _quote(item.target))
         ]
-    day = mapper(mapper_name).partition_sql
-    bounds = workspace.market.execute(
-        f"SELECT min(TRY_CAST(({day}) AS DATE)), max(TRY_CAST(({day}) AS DATE)) "  # noqa: S608 -- registered mapper SQL over a quoted table
-        f"FROM {_quote(item.target)}"
-    ).fetchone()
-    if bounds is None or bounds[0] is None:
-        return [Step(None)]
-    return [Step((bounds[0], bounds[1] + timedelta(days=1)))]
+    return [Step(_dates(workspace, mapper_name, item.target))]
+
+
+def _key_scope(
+    workspace: Workspace, mapper_name: str, item: Candidate, steps: Sequence[Mapping[str, object]]
+) -> dict[str, str] | None:
+    """The dates an ``unresolved`` record's key SHA-256 covers; None: the whole key."""
+    partitions = [cast("dict[str, str] | None", step.get("partition")) for step in steps]
+    if partitions and all(part is not None for part in partitions):
+        return {"from": min(cast("dict[str, str]", part)["from"] for part in partitions),
+                "to": max(cast("dict[str, str]", part)["to"] for part in partitions)}  # fmt: skip
+    if mapper_name not in DATED_IDENTITY:
+        return None
+    dates = _dates(workspace, mapper_name, item.target)
+    return None if dates is None else {"from": dates[0].isoformat(), "to": dates[1].isoformat()}
 
 
 def maintenance_spec(  # noqa: PLR0913 -- the template and every field maintenance advances
@@ -1038,15 +1078,10 @@ def _promote_source(  # noqa: PLR0913 -- one source's steps and the run's inputs
             return {**outcome, "status": "refused", "steps": results}
     published = any(step.get("published") for step in results)
     status = "promoted" if published else "unchanged" if apply else "planned"
-    partitions = [cast("dict[str, str] | None", step.get("partition")) for step in results]
-    scope = (
-        None
-        if not partitions or any(part is None for part in partitions)
-        else {"from": min(cast("dict[str, str]", part)["from"] for part in partitions),
-              "to": max(cast("dict[str, str]", part)["to"] for part in partitions)}
-    )  # fmt: skip
-    recorded = None if resolution is None else resolution.recorded(scope)
+    recorded = None
     if any(step.get("unresolved_token_count") for step in results):
+        if resolution is not None:
+            recorded = resolution.recorded(_key_scope(workspace, run.mapper, item, results))
         status = UNRESOLVED if apply else status
         outcome["identity"] = recorded
     if apply:
@@ -1098,11 +1133,19 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
     refused = [run.dataset_id for run in runs if run.status == "refused"]
     unresolved = sorted({run.dataset_id for run in runs for item in run.sources
                          if item["status"] == UNRESOLVED})  # fmt: skip
+    reasons: dict[str, int] = {}
+    for run in runs:
+        for why, count in run.replanned.items():
+            reasons[why] = reasons.get(why, 0) + count
     return {
         "mode": "apply" if apply else "plan",
         "datasets": [run.report() for run in runs],
         "refused": refused,
         "unresolved": unresolved,
+        "replanned_waiting": {
+            "sources": sum(reasons.values()),
+            "reasons": dict(sorted(reasons.items())),
+        },
         "standing_unresolved": standing_unresolved(workspace),
         "unmapped": unmapped(workspace),
         "provider_calls": 0,
@@ -1139,8 +1182,12 @@ def _promote_routes(  # noqa: PLR0913 -- the pass's explicit inputs
                 if found is None
                 else _resolution(workspace, found[2], run.mapper, identity, identities)
             )
-            done = _done(workspace, dataset_id, resolution)
+            done, waiting = _done(workspace, dataset_id, resolution)
             pending = candidates(workspace, route, linked, shas, run.skipped, done=done)
+            for item in pending:
+                why = waiting.get((item.pin["source_id"], item.pin["table"]))
+                if why is not None:
+                    run.replanned[why] = run.replanned.get(why, 0) + 1
             if found is None:
                 reason = blocked or ("no_head" if run.head is None else "no_template")
                 run.status = reason if pending else "current"
@@ -1585,12 +1632,33 @@ def freshness(
     return result
 
 
+HEADS_MEMORY_BYTES: Final = 1024**3
+"""DuckDB's memory limit while heads are read, when the connection's is higher."""
+
+
 def dataset_heads(workspace: Workspace, *, now: datetime) -> list[dict[str, object]]:
     """Every committed dataset's head, watermarks and data freshness at ``now``.
 
     A watermark is the latest ingestion time, not how far the data reaches; ``freshness``
     reports that. A catalog dataset without a committed version is listed as ``no_head``.
+
+    Freshness scans whole domain tables, and DuckDB keeps the blocks a scan read cached up
+    to its memory limit. The reads run under at most ``HEADS_MEMORY_BYTES``, which only
+    drops cached blocks (the scans hold no large state); the connection then returns to the
+    installation's limits (``Workspace.reset_market_limits``).
     """
+    market = workspace.market
+    found = market.execute("SELECT parse_formatted_bytes(current_setting('memory_limit'))")
+    if int(cast("tuple[int]", found.fetchone())[0]) <= HEADS_MEMORY_BYTES:
+        return _dataset_heads(workspace, now=now)
+    market.execute("SET memory_limit = ?", [f"{HEADS_MEMORY_BYTES}B"])
+    try:
+        return _dataset_heads(workspace, now=now)
+    finally:
+        workspace.reset_market_limits()
+
+
+def _dataset_heads(workspace: Workspace, *, now: datetime) -> list[dict[str, object]]:
     heads: list[dict[str, object]] = []
     for dataset_id, version, sequence, rows, generation_id in workspace.state.execute(
         "SELECT dataset_id, version, sequence, row_count, generation_id FROM dataset_versions v "

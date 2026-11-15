@@ -354,6 +354,58 @@ def test_two_daily_runs_continue_every_chain_and_repeat_nothing(tmp_path: Path) 
         assert {name: _head(ws, name) for name in heads} == advanced
 
 
+def test_the_reporting_scope_resumes_the_sec_documents_a_registered_run_wanted_none_of(
+    tmp_path: Path,
+) -> None:
+    world = World(tmp_path)
+    # No US issuer is registered: the default scope reads the indexes and wants nothing.
+    world.config = replace(world.config, sec=SecSettings(tmp_path / "unused"))
+    first = world.run()
+    assert first["exit_code"] == 0, first["failed_stages"]
+    assert [call for call in world.sec.calls if call[0] != "daily_index"] == []
+    stages = cast("dict[str, dict[str, object]]", first["stages"])
+    stalled = cast("dict[str, dict[str, dict[str, int]]]", stages["sec"]["pending"])
+    assert stalled["filings"]["submissions"]["wanted"] == 0
+    assert stalled["filings"]["submissions"]["outside_universe"] == 2
+
+    # The runtime configuration names the reporting scope: the daily plan wants the filings
+    # of the 10-Q filer from the indexes already read.
+    world.config = replace(world.config, sec=SecSettings(tmp_path / "unused", issuers="reporting"))
+    with open_workspace(world.home) as ws:
+        plan = plan_maintenance(ws, world.config, now=world.clock.now, policies=world.policies)
+    collect = cast(
+        "dict[str, dict[str, object]]", cast("dict[str, object]", plan["stages"])["collect"]
+    )
+    planned = cast("dict[str, dict[str, int]]", collect["sec"]["filings"])
+    assert planned["submissions"]["wanted"] == 2
+    assert planned["companyfacts"]["wanted"] == 1
+    assert collect["sec"]["requests"] == {"companyfacts:new_filing": 1,
+                                         "submissions:new_filing": 1}  # fmt: skip
+    calls = len(world.sec.calls)
+    world.clock.advance(hours=1)
+    resumed = world.run()
+    assert resumed["exit_code"] == 0, resumed["failed_stages"]
+    # The indexes stay answered; only the documents are asked.
+    assert world.sec.calls[calls:] == [("submissions", CIK), ("companyfacts", CIK)]
+    with open_workspace(world.home, writable=True, strategy_write=True) as ws:
+        heads = _cutover(ws)
+
+    # The next day's 10-Q filer is a reporting issuer too, and both SEC chains continue.
+    _advance(world)
+    calls = len(world.sec.calls)
+    second = world.run()
+    assert second["exit_code"] == 0, second["failed_stages"]
+    assert world.sec.calls[calls:] == [
+        ("daily_index", "2026-09-16"), ("submissions", OTHER), ("companyfacts", OTHER),
+    ]  # fmt: skip
+    statuses = _route_statuses(second)
+    assert statuses["filings.us.sec", "sec.submissions@1"] == "advanced"
+    assert statuses["fundamentals.us.sec", "sec.companyfacts@1"] == "advanced"
+    with open_workspace(world.home) as ws:
+        for name in ("filings.us.sec", "fundamentals.us.sec"):
+            assert cast("tuple[int, str]", _head(ws, name))[0] == heads[name][0] + 1, name
+
+
 def test_a_us_symbol_list_is_collected_imported_and_read_by_the_identity_stage(
     tmp_path: Path,
 ) -> None:

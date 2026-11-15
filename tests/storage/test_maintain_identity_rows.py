@@ -404,7 +404,8 @@ def test_a_pass_reads_the_snapshot_members_as_often_for_three_sources_as_for_one
     assert len(three) == len(one)
 
 
-PUBLISHED = "57bb40907cb0c83fa3978e4b134349c1095eafedd351ddb825ba2a9988b22a56"
+# The reports gained ``replanned_waiting``; without it the digests are those of dev 0efbb9a.
+PUBLISHED = "55a49ba46f9088441adb1d4f97fd823370fa89738f0a0d6d09c325e01883a71c"
 
 
 def _lists(ws: Workspace, days: list[date]) -> None:
@@ -456,4 +457,4 @@ def test_a_status_start_pass_and_a_continuing_pass_publish_what_the_per_source_l
     assert digest(found) == STATUS_PUBLISHED
 
 
-STATUS_PUBLISHED = "d1f747b8110c28595606046f7d5bc4ec11e92e210f02d7f57be0a47763487bff"
+STATUS_PUBLISHED = "82b3359aeaebde08019122979e47960546a985af1f2f9e8c650fb45d454c2f4c"
