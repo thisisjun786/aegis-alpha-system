@@ -1632,12 +1632,33 @@ def freshness(
     return result
 
 
+HEADS_MEMORY_BYTES: Final = 1024**3
+"""DuckDB's memory limit while heads are read, when the connection's is higher."""
+
+
 def dataset_heads(workspace: Workspace, *, now: datetime) -> list[dict[str, object]]:
     """Every committed dataset's head, watermarks and data freshness at ``now``.
 
     A watermark is the latest ingestion time, not how far the data reaches; ``freshness``
     reports that. A catalog dataset without a committed version is listed as ``no_head``.
+
+    Freshness scans whole domain tables, and DuckDB keeps the blocks a scan read cached up
+    to its memory limit. The reads run under at most ``HEADS_MEMORY_BYTES``, which only
+    drops cached blocks (the scans hold no large state); the connection then returns to the
+    installation's limits (``Workspace.reset_market_limits``).
     """
+    market = workspace.market
+    found = market.execute("SELECT parse_formatted_bytes(current_setting('memory_limit'))")
+    if int(cast("tuple[int]", found.fetchone())[0]) <= HEADS_MEMORY_BYTES:
+        return _dataset_heads(workspace, now=now)
+    market.execute("SET memory_limit = ?", [f"{HEADS_MEMORY_BYTES}B"])
+    try:
+        return _dataset_heads(workspace, now=now)
+    finally:
+        workspace.reset_market_limits()
+
+
+def _dataset_heads(workspace: Workspace, *, now: datetime) -> list[dict[str, object]]:
     heads: list[dict[str, object]] = []
     for dataset_id, version, sequence, rows, generation_id in workspace.state.execute(
         "SELECT dataset_id, version, sequence, row_count, generation_id FROM dataset_versions v "
