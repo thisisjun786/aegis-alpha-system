@@ -1635,7 +1635,7 @@ Qveris의 유료 크레딧은 실행 하나의 호출 수·크레딧 상한과, 
 | 묻기 상태 | 증거 |
 | --- | --- |
 | `completed`·`warned` | `complete.json`(`RAW_ACQUIRED`·`RAW_ACQUIRED_WITH_WARNINGS`). `warned`는 완료와 따로 세는 부분 성공이다 |
-| `failed` | intent가 있는 모든 page에 정산된 billing이 있고 완료가 없음. 답은 보존됐지만 쓸 수 없다 |
+| `failed` | intent가 있는 모든 page에 정산된 billing이 있고 완료가 없음. 답은 보존됐지만 쓸 수 없다. page 하나가 행위 거래소 하루의 정산된 무과금 빈 답(`qveris_daily.settled_empty`)이면 `empty`로 표시한다. 계획에서는 그대로 실패다 |
 | `quarantined` | billing 없는 page를 운영자가 page나 병렬 group 단위로 격리함. 결과는 알 수 없고 격리가 최악의 예약을 남겼다 |
 | `unsettled` | 격리되지 않은 billing 없는 page |
 
@@ -1644,8 +1644,11 @@ Qveris의 유료 크레딧은 실행 하나의 호출 수·크레딧 상한과, 
 `warned`는 요청을 `partial`로 덮는다. 행을 읽어 판정할 수 없는 `warned`(`unjudged`)도 다시 묻지 않는다(비용이 적은
 쪽). 덮이지 않은 요청에서 `unsettled` 묻기는 그 요청을 잡아 둔다(`held`). 그 밖에는 가장 늦은 묻기가 정한다. 이전
 관측일의 `failed`는 그 관측일 뒤 1, 2, 4, …, 최대 32일이 지나면 다시 묻는다(`failed_retry`). 간격은 연속한 정산된
-실패마다 두 배이고, 둘 이상 연속 실패한 요청은 다음 시도일과 함께 `failing`에 남는다. `quarantined`는 다음 날
-다시 묻는다(`uncertain_retry`). 격리된 page는 다시 실행되지 않고 요청이 새 job으로 물린다. 오늘 관측일의 묻기와
+실패마다 두 배이고, 둘 이상 연속 실패한 요청은 다음 시도일과 함께 `failing`에 남는다. 그 연속 실패가 모두
+`empty`인 요청은 `failing` 대신 `empty_answers`(`job_id`, `empty_asks`, `retry_on`)에 남는다. 간격은 같다(빈 답 뒤
+행이 온 날이 있으므로 빈 답을 "행위 없음"으로 확정하지 않는다). `quarantined`는 다음 날
+다시 묻는다(`uncertain_retry`). 격리된 page는 다시 실행되지 않고 요청이 새 job으로 물린다. 격리된 묻기는 연속
+실패에 세지도 끊지도 않으므로 그 뒤의 실패는 격리 전 연속을 잇는다. 오늘 관측일의 묻기와
 간격이 남은 실패는 기다린다(`waiting`). 물은 적이 없으면 `new`다. 종목 목록은 가장 늦은 완료의 관측일 뒤 `symbol_list_days` 동안 덮이고 그 뒤 다시 묻는다(`refresh`).
 
 실행은 이 순서로 상한이 남는 동안 묻는다. (1) 거래소(`US`는 XNYS, `KO`·`KQ`는 XKRX) 선언 달력의 열린
@@ -3445,3 +3448,5 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-611 | 깨끗한 KR 답이 이미 담은 (심볼, ex-date)를 가리키는 경고 테이블은 `answered`로 남아 generation을 만들지 않고 깨끗한 값이 그대로다 | `tests/storage/test_qveris_actions.py::test_a_warned_kr_action_day_is_promoted_flagged_and_yields_to_a_clean_answer` | 구현 |
 | DV-612 | 경고 답이 먼저 승격된 record에 뒤에 온 깨끗한 답은 같은 record의 SUPERSEDE이며 record는 하나다 | `tests/storage/test_qveris_actions.py::test_a_warned_kr_action_day_is_promoted_flagged_and_yields_to_a_clean_answer` | 구현 |
 | DV-613 | `eodhd.splits_quarantine@1`·`eodhd.dividends_quarantine@1`은 보류 행 JSON을 깨끗한 매퍼가 행 테이블에서 옮기는 것과 같은 도메인 열로 옮기고 flag를 달며, 수집 시각은 비우고, 다른 보류 사유의 행은 ex-date를 비운다 | `tests/storage/test_qveris_actions.py::test_the_held_action_mappers_read_the_warned_rows_as_the_clean_mappers_do` | 구현 |
+| DV-614 | 계획기는 행위 거래소 하루의 정산된 무과금 빈 답을 `failed`로 둔 채 `empty`로 표시하고, 연속 실패가 모두 빈 답인 요청은 `failing` 대신 `empty_answers`에 같은 `retry_on`으로 남긴다. 진짜 실패는 `failing`에 남는다 | `tests/application/test_maintain_qveris.py::test_empty_action_answers_are_reported_apart_from_failures` | 구현 |
+| DV-615 | 격리된 묻기는 연속 실패에 세지도 끊지도 않아, 실패 3회·격리·실패 뒤의 요청은 `failed_asks` 4이고 마지막 관측일 8일 뒤에 다시 묻는다 | `tests/application/test_maintain_qveris.py::test_a_quarantined_ask_neither_counts_in_nor_ends_a_row_of_failures` | 구현 |

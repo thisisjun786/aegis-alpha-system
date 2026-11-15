@@ -14,6 +14,9 @@ is read from its evidence:
   checks (``qveris_native.warned_value_failures``).
 - ``failed``: every page that has an intent also has a settled billing record and the job
   has no completion. The provider answered and the answer is kept, but it was not usable.
+  A failed ask whose one page is Qveris's settled, uncharged empty answer for an exchange day
+  of actions (``qveris_daily.settled_empty``) is marked ``empty``: it is still a failure for
+  planning, since an empty day may be answered with rows later, but the report counts it apart.
 - ``quarantined``: a page without billing that the operator quarantined (the page itself
   or its parallel group). Its outcome is unknown; the quarantine kept the worst-case
   reservation.
@@ -33,10 +36,12 @@ usage event for its search, is a transient error: it is reported as a quarantine
 candidate (job and page) and is never quarantined here. An ask of an earlier observation
 date that ``failed`` is asked again (``failed_retry``) 1, 2, 4, ... up to 32 days after
 it, doubling with each settled failure in a row (``failing`` lists requests with more
-than one); a ``partial_retry`` waits the same way, a warned ask to ask again counting as
-one of that row, and one that is ``quarantined`` is asked again the next day
-(``uncertain_retry``): the quarantined page never runs again, the request is asked as a
-new job. An ask of the current
+than one, ``empty_answers`` instead those whose every failure of that row is ``empty``); a
+``partial_retry`` waits the same way, a warned ask to ask again counting as one of that row,
+and one that is ``quarantined`` is asked again the next day (``uncertain_retry``): the
+quarantined page never runs again, the request is asked as a new job. A quarantined ask
+neither counts in nor ends a row of failures, so a failure after it keeps the doubled wait.
+An ask of the current
 observation date, or a failure still backing off, waits (``waiting``).
 A request never asked is ``new``. KR symbol lists are covered for ``symbol_list_days`` after
 the observation date of their latest completion and are then asked again (``refresh``); the
@@ -89,7 +94,12 @@ from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast
 
-from aegis_alpha.application.qveris_daily import EXCHANGES, daily_job, declaration_for
+from aegis_alpha.application.qveris_daily import (
+    EXCHANGES,
+    daily_job,
+    declaration_for,
+    settled_empty,
+)
 from aegis_alpha.data.descriptor_tree import DescriptorTree, DescriptorTreeError
 from aegis_alpha.data.qveris_contracts import (
     EOD_HISTORY_JSON_TOOL,
@@ -260,6 +270,7 @@ class RawAsk:
     evidence: tuple[tuple[str, str], ...]  # (relative path, SHA-256) of the deciding files
     warnings: tuple[PageWarning, ...] = ()  # a warned ask's pages, as recorded
     transient: tuple[TransientPage, ...] = ()  # an unsettled ask's 5xx pages
+    empty: bool = False  # a failed ask that is the settled, uncharged empty answer
 
     @property
     def fingerprint(self) -> str:
@@ -396,7 +407,8 @@ def _ask(tree: DescriptorTree, name: str, batches: frozenset[str]) -> tuple[Qver
         if "quarantined" in states
         else "failed"
     )
-    return job, RawAsk(job, state, tuple(evidence), transient=tuple(transient))
+    empty = state == "failed" and settled_empty(tree, base, job, intents)
+    return job, RawAsk(job, state, tuple(evidence), transient=tuple(transient), empty=empty)
 
 
 def raw_asks(raw_root: Path | None) -> dict[Request, list[RawAsk]]:
@@ -459,6 +471,7 @@ class QverisPlan:
     warned: list[tuple[RawAsk, str, int | None]] = field(default_factory=list)
     waiting: int = 0
     failing: list[dict[str, object]] = field(default_factory=list)
+    empty: list[dict[str, object]] = field(default_factory=list)
     calendars: dict[str, str] = field(default_factory=dict)
     windows: dict[str, dict[str, str] | None] = field(default_factory=dict)
     undeclared: dict[str, int] = field(default_factory=dict)
@@ -483,6 +496,7 @@ class QverisPlan:
             "quarantine_candidates": self.candidates,
             "waiting": self.waiting,
             "failing": self.failing,
+            "empty_answers": self.empty,
             "calendars": self.calendars,
             "windows": self.windows,
             "undeclared_days": self.undeclared,
@@ -565,12 +579,19 @@ def _decide(  # noqa: PLR0911 -- one decision per evidence state
 
 def failed_streak(asks: Sequence[RawAsk], again: Callable[[RawAsk], bool] = _never) -> int:
     """The number of settled failures (and warned asks to ask again) that end the asks."""
-    count = 0
+    return len(_failures(asks, again))
+
+
+def _failures(asks: Sequence[RawAsk], again: Callable[[RawAsk], bool]) -> list[RawAsk]:
+    """The settled failures (and warned asks to ask again) that end the asks, quarantines aside."""
+    found: list[RawAsk] = []
     for ask in reversed(asks):
+        if ask.state == "quarantined":
+            continue
         if ask.state != "failed" and not (ask.state == "warned" and again(ask)):
             break
-        count += 1
-    return count
+        found.append(ask)
+    return found
 
 
 def retry_after(asks: Sequence[RawAsk], again: Callable[[RawAsk], bool] = _never) -> int:
@@ -706,13 +727,16 @@ def plan_requests(  # noqa: C901 -- one pass deciding and reporting every candid
         if found and found[-1].state in {"unsettled", "failed"}:
             plan.resumable.append(found[-1].job)
         decision, ask = _decide(found, today, fresh_after=fresh_after, again=again)
-        streak = failed_streak(found, again)
-        if streak > 1 and decision in {"backoff", "failed_retry", "partial_retry"}:
-            plan.failing.append({
-                "job_id": job.job_id, "failed_asks": streak,
-                "retry_on": (cast("RawAsk", ask).observation_date
-                             + timedelta(days=retry_after(found, again))).isoformat(),
-            })  # fmt: skip
+        failures = _failures(found, again)
+        if len(failures) > 1 and decision in {"backoff", "failed_retry", "partial_retry"}:
+            retry_on = (cast("RawAsk", ask).observation_date
+                        + timedelta(days=retry_after(found, again))).isoformat()  # fmt: skip
+            if all(item.empty for item in failures):
+                plan.empty.append({"job_id": job.job_id, "empty_asks": len(failures),
+                                   "retry_on": retry_on})  # fmt: skip
+            else:
+                plan.failing.append({"job_id": job.job_id, "failed_asks": len(failures),
+                                     "retry_on": retry_on})  # fmt: skip
         if ask is not None and ask.state == "warned":
             plan.warned.append((ask, decision, held(ask)))
         if decision == "covered":

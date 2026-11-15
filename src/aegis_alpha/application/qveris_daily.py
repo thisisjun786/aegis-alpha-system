@@ -59,7 +59,7 @@ class RawAttempts:
     """Requests answered only with settled empty answers: the latest one's observation date."""
 
 
-def _settled_empty(tree: DescriptorTree, base: str, job: QverisJob, intents: list[str]) -> bool:
+def settled_empty(tree: DescriptorTree, base: str, job: QverisJob, intents: list[str]) -> bool:
     """Whether a job's one page is Qveris's settled, uncharged empty answer."""
     page = f"{base}/{intents[0].removesuffix('.intent.json')}"
     if len(intents) != 1 or not all(
@@ -101,7 +101,7 @@ def raw_attempts(raw_root: Path | None) -> RawAttempts:
                     body = tree.read_bytes(f"{base}/{intents[0]}", max_bytes=_MAX_DOCUMENT)
                     job = QverisJob.from_document(object_value(load_json(body)).get("job"))
                     request = _request(job)
-                    if _settled_empty(tree, base, job, intents):
+                    if settled_empty(tree, base, job, intents):
                         empty[request] = max(empty.get(request, job.observation_date),
                                              job.observation_date)  # fmt: skip
                     else:
