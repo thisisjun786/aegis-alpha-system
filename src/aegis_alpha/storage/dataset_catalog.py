@@ -196,7 +196,7 @@ CATALOG: Final[tuple[CatalogEntry, ...]] = (
         "actions.kr.eodhd",
         "corporate_actions",
         "canonical",
-        _EODHD_ACTIONS,
+        (*_EODHD_ACTIONS, "eodhd.dividends_quarantine@1", "eodhd.splits_quarantine@1"),
         ("exdate_open@1",),
         _ACTION_NUMBERS,
     ),

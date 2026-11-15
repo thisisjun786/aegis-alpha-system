@@ -674,6 +674,13 @@ part를 함께 pin한다. `CAPITAL` close는 비조정 close를 그 뒤 모든 �
   넘긴다. `currency`는 `dividend_currency`가 대문자 세 글자일 때 그 값, `record_date`·`pay_date`는 `YYYY-MM-DD`일 때만
   남는다. 금액이 양의 십진수가 아니거나 통화가 ISO 코드가 아니면 `invalid`다. 달력은 US가 `sessions.xnys`,
   KR이 `sessions.xkrx`다.
+- `eodhd.splits_quarantine@1`과 `eodhd.dividends_quarantine@1`은 같은 내려받기의 보류 테이블
+  (`qveris-splits-quarantine-*`·`qveris-dividends-quarantine-*` `quarantine`: `reason`과 공급자 행 JSON의 `code`,
+  `exchange`, `date`, `split` 또는 `dividend`·`currency`·`unadjustedValue`·`recordDate`·`paymentDate`)을 읽는다. 사유
+  `provider_reported_partial`(경고된 응답이고 값 검사를 통과한 행)만 옮기며, 값은 수집기가 남겼을 텍스트(JSON
+  숫자는 그 토큰 텍스트, 빈 텍스트는 없음)로 읽어 위 두 매퍼와 같은 열로 옮기고 모든 행에 행 flag
+  `provider_reported_partial`을 단다. 다른 사유의 행은 ex-date가 없어 필수 열 누락으로 거부된다. 행에 수집 시각이
+  없으므로 수집 시각은 원천의 `sl:` 연결 시각이다.
 
 `kind.status@1`은 KIND 목록(`kind-listings-*` `listings`의 `short_code`, `listed_on`, `retrieved_at_utc`,
 `kind.listings@1`이 읽는 열)을 `instrument_status`의 `listed` 사건(`status_event_id` `kind:listed`, `reason`
@@ -1192,7 +1199,7 @@ ASCII escape와 바이트까지 같다.
 | `actions.us.norgate` | `corporate_actions` | canonical | `norgate.dividends@1`, `norgate.capital_adjustments@1` | `exdate_open@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 예 | Norgate 조정 가격 part의 `CAPITAL` 행 전체. 배당이 첫 generation, 자본 사건이 그 child이고 파티션 없이 이력 전체가 한 generation이다. 달력은 `sessions.xnys` |
 | `actions.us.fmp.ref` | `corporate_actions` | reference | `fmp.dividends@1`, `fmp.splits@1` | `exdate_open@1` | `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage` | 예 | FMP 동결 배당·분할 응답. 정정은 revision 번호순 generation. 달력은 `sessions.xnys` |
 | `actions.us.eodhd` | `corporate_actions` | canonical | `eodhd.dividends@1`, `eodhd.splits@1` | `exdate_open@1` | `decimal_text@1`, `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage`, `volume_precision_limited` | 아니오 | Qveris 거래소 일간 `splits`·`dividends` 수집 원천([Qveris 수집과 원천 적재](#qveris-수집과-원천-적재))의 `US` 행. 배당 금액은 원문 텍스트, 분할 비율은 binary64. 달력은 `sessions.xnys`. [기업행동과 상장 상태 매퍼](#기업행동과-상장-상태-매퍼) |
-| `actions.kr.eodhd` | `corporate_actions` | canonical | `eodhd.dividends@1`, `eodhd.splits@1` | `exdate_open@1` | `decimal_text@1`, `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage`, `volume_precision_limited` | 아니오 | 같은 수집 원천의 `KO`·`KQ` 행. 달력은 `sessions.xkrx` |
+| `actions.kr.eodhd` | `corporate_actions` | canonical | `eodhd.dividends@1`, `eodhd.splits@1`, `eodhd.dividends_quarantine@1`, `eodhd.splits_quarantine@1` | `exdate_open@1` | `decimal_text@1`, `float_shortest@1` | 없음 | `decimal_rounding_tie`, `provider_float_storage`, `provider_reported_partial`, `volume_precision_limited` | 아니오 | 같은 수집 원천의 `KO`·`KQ` 행. 달력은 `sessions.xkrx` |
 | `status.us.norgate` | `instrument_status` | canonical | `norgate.status@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | Norgate master의 상장(`event` `listed`)이 첫 generation, 상장폐지(`delisted`)가 그 child. `America/New_York`, 근거 `record` |
 | `status.us.eodhd` | `instrument_status` | canonical | `eodhd.delisted@1` | `local_day_end@1` | 없음 | 없음 | `delisting_inferred`, `survivorship_unverified`, `time_precision_day` | 아니오 | Qveris EODHD US 상장폐지 목록(`delisted=1`)의 `delisted` 사건. 날짜 근거는 `reason`의 `observed`(전날 상장 → 오늘 상장폐지)와 `last_bar`(`prices.us.eodhd` 마지막 bar 다음 날). [기업행동과 상장 상태 매퍼](#기업행동과-상장-상태-매퍼) |
 | `status.kr.kind` | `instrument_status` | canonical | `kind.status@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | KIND 상장법인목록 수집 원천(`kind-listings-*`)의 상장(`listed`) 사건, 상장일 기준 Asia/Seoul. 단축코드는 [KR 등록](#kr-등록)의 identity snapshot으로 해석. 목록은 상장폐지를 말하지 않는다 |
@@ -1784,6 +1791,7 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
 | `prices.kr.eodhd.ref` | `eodhd.bars_adjusted@1`, `eodhd.bulk_quarantine_adjusted@1` | 위 두 모양 | 위와 같음. bulk의 첫 template은 `eodhd.bars_adjusted@1`에서 파생 |
 | `actions.us.eodhd` | `eodhd.splits@1`, `eodhd.dividends@1` | `qveris-splits-*` `splits`, `qveris-dividends-*` `dividends` | 심볼이 `.US`. 시작 선언: `exdate_open@1`(`sessions.xnys`), `America/New_York` |
 | `actions.kr.eodhd` | `eodhd.splits@1`, `eodhd.dividends@1` | 위 두 모양 | 심볼이 `.KO`·`.KQ`. 시작 선언: `exdate_open@1`(`sessions.xkrx`), `Asia/Seoul` |
+| `actions.kr.eodhd` | `eodhd.splits_quarantine@1`, `eodhd.dividends_quarantine@1` | `qveris-splits-quarantine-*`·`qveris-dividends-quarantine-*` `quarantine` | 사유 `provider_reported_partial`, JSON `exchange`가 `KO`·`KQ`. 깨끗한 KR 행위 route 뒤에 돈다. 첫 template은 `eodhd.splits@1`·`eodhd.dividends@1`에서 파생. 깨끗한 답이 먼저다(`yields`): 한 행이라도 KR 행 테이블(`qveris-splits-*` `splits`, `qveris-dividends-*` `dividends`)이 이미 담은 (`provider_symbol`, ex-date)를 가리키면 그 테이블은 승격하지 않고 `answered`로 센다 |
 | `fx.usdkrw.eodhd` | `eodhd.fx_history@1` | `qveris-fx-history-bars-*` `bars` | 쌍이 USD/KRW. 시작 선언: `local_day_end@1`(`timezone` `UTC`, 달력 없음), `timezone` `UTC` |
 | `status.kr.kind` | `kind.status@1` | `kind-listings-*` `listings` | `short_code`·`listed_on`·`retrieved_at_utc` 열. 시작 선언: Asia/Seoul `local_day_end@1` |
 | `status.us.eodhd` | `eodhd.delisted@1` | `qveris-eodhd-exchange-symbols-*` `symbols` | 모든 행이 `exchange_code` `US`, `delisted` `1`. US price route 뒤에 돈다. 이른 New York 날짜의 같은 열 US 목록 중 마지막 상장 목록·마지막 상장폐지 목록·첫 상장폐지 목록을 새 원천 뒤에 함께 pin한다(기록은 새 원천만). 시작 선언: `America/New_York` `local_day_end@1`, 파티션 없음, `bars`는 `prices.us.eodhd`의 committed head(없으면 `no_reference`) |
@@ -1801,6 +1809,14 @@ bulk 매퍼로 바꾸고 인자에 `currencies`(`kr_prices.CURRENCIES`)를 더�
 같다. 파생은 bulk generation이 없을 때만 하고, 한 번 생기면 그 최신 명세가 template이다. head가 없는 chain은
 파생하지 않는다(`no_head`). 보고의 `template_spec_sha256`은 파생 원본 명세의 해시이고 `derived_from`이 원본
 매퍼를 밝힌다(파생이 아니면 null).
+
+KR 행위의 경고 응답도 같은 방식으로 승격된다(DV-294의 "경고 응답 행은 보류"를 일봉처럼 행위에 푼 확장).
+`eodhd.splits_quarantine@1`·`eodhd.dividends_quarantine@1` route는 KR chain의 `eodhd.splits@1`·`eodhd.dividends@1`
+최신 명세에서 매퍼 이름만 바꾼 명세를 첫 template으로 쓰고, 옮긴 행에는 `provider_reported_partial` flag가 붙는다.
+같은 (심볼, ex-date)에 깨끗한 답과 경고 답이 함께 오면 깨끗한 답이 먼저다. 깨끗한 답이 먼저 수집되면 그것을
+가리키는 경고 테이블은 `answered`로 남아 승격되지 않는다(같은 거래소 하루의 다른 답이므로 테이블 전체를 남긴다).
+경고 답이 먼저 승격되면 뒤에 온 깨끗한 답은 같은 record의 SUPERSEDE(값이 같으면 SKIP)가 되므로 record는 하나다.
+빈 깨끗한 답(행 없는 행 테이블)은 가리키는 행이 없어 경고 답을 막지 않는다.
 
 route는 chain을 이어 붙일 뿐 시작하지 않는다(호출자가 이름 붙인 시작 선언 route만 예외, 아래). template은 그 dataset에서 route의 매퍼, 또는 route가 이어 받는
 이전 major 매퍼를 쓴 가장 늦은 committed generation의 명세(운영자의 백필이거나 앞선 유지보수 generation)이고,
@@ -3425,3 +3441,7 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-607 | 날짜 범위로 덜 다시 계획해도 게시되는 가격 행과 dataset 버전은 매번 키 전체로 다시 계획하던 때와 같다 | `tests/storage/test_us_symbols.py::test_a_dated_scope_publishes_what_planning_every_waiting_source_again_publishes` | 구현 |
 | DV-608 | head 단계는 DuckDB 메모리 한도를 `HEADS_MEMORY_BYTES` 이하로 낮춘 채 읽고 끝나면 연결을 설치본의 한도(`reset_market_limits`)로 되돌리며, 읽은 head는 낮추지 않았을 때와 같다 | `tests/storage/test_maintain_promotion.py::test_heads_are_read_under_the_lower_duckdb_limit_and_the_limit_is_restored` | 구현 |
 | DV-609 | 등록된 US 발행인이 없어 `registered` 범위가 아무 SEC 문서도 원하지 않은 설치본은 `sec.issuers`를 `reporting`으로 바꾸면 일일 계획이 읽은 색인의 정기 보고서 제출자 공시를 원하고, 실행은 색인을 다시 묻지 않고 그 문서를 물어 두 SEC chain을 잇는다 | `tests/application/test_maintain.py::test_the_reporting_scope_resumes_the_sec_documents_a_registered_run_wanted_none_of` | 구현 |
+| DV-610 | 경고된 KR 배당 거래소 하루의 보류 행은 `eodhd.dividends_quarantine@1` route가 chain의 `eodhd.dividends@1` 명세에서 파생한 template으로 `actions.kr.eodhd`에 `provider_reported_partial` flag와 함께 승격되고, 빈 행 테이블은 `empty`로 센다 | `tests/storage/test_qveris_actions.py::test_a_warned_kr_action_day_is_promoted_flagged_and_yields_to_a_clean_answer` | 구현 |
+| DV-611 | 깨끗한 KR 답이 이미 담은 (심볼, ex-date)를 가리키는 경고 테이블은 `answered`로 남아 generation을 만들지 않고 깨끗한 값이 그대로다 | `tests/storage/test_qveris_actions.py::test_a_warned_kr_action_day_is_promoted_flagged_and_yields_to_a_clean_answer` | 구현 |
+| DV-612 | 경고 답이 먼저 승격된 record에 뒤에 온 깨끗한 답은 같은 record의 SUPERSEDE이며 record는 하나다 | `tests/storage/test_qveris_actions.py::test_a_warned_kr_action_day_is_promoted_flagged_and_yields_to_a_clean_answer` | 구현 |
+| DV-613 | `eodhd.splits_quarantine@1`·`eodhd.dividends_quarantine@1`은 보류 행 JSON을 깨끗한 매퍼가 행 테이블에서 옮기는 것과 같은 도메인 열로 옮기고 flag를 달며, 수집 시각은 비우고, 다른 보류 사유의 행은 ex-date를 비운다 | `tests/storage/test_qveris_actions.py::test_the_held_action_mappers_read_the_warned_rows_as_the_clean_mappers_do` | 구현 |

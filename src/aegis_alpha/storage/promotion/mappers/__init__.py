@@ -233,7 +233,9 @@ def _registry() -> dict[str, Mapper]:
     )
     from aegis_alpha.storage.promotion.mappers.eodhd_actions import (  # noqa: PLC0415
         EodhdDividends,
+        EodhdDividendsQuarantine,
         EodhdSplits,
+        EodhdSplitsQuarantine,
     )
     from aegis_alpha.storage.promotion.mappers.eodhd_delisted import (  # noqa: PLC0415
         EodhdDelisted,
@@ -279,7 +281,9 @@ def _registry() -> dict[str, Mapper]:
         EodhdBulkQuarantineAdjusted(),
         EodhdBulkQuarantineV2(),
         EodhdDividends(),
+        EodhdDividendsQuarantine(),
         EodhdSplits(),
+        EodhdSplitsQuarantine(),
         EodhdDelisted(),
         EodhdFxHistory(),
         FmpEodNonSplit(),

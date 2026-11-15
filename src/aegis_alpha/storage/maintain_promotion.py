@@ -17,7 +17,11 @@ table with one failing accepted row is not promoted and is counted as ``value_ch
 daily bulk route (``eodhd.bulk_quarantine@2``) accepts the US rows held for a partial
 response or for want of an import-time identity and holds every other US row; its mapper
 checks each accepted row's values itself and leaves a failing one held, so no held row keeps
-the table's valid rows out.
+the table's valid rows out. The KR action routes of held rows (``eodhd.splits_quarantine@1``,
+``eodhd.dividends_quarantine@1``) promote a warned exchange day with the partial flag as the KR
+daily bulk route does, and name the clean answers they ``yields`` to: a claimed table with a
+row whose (symbol, ex-date) a committed KR rows table of the same action already holds is not
+promoted and is counted as ``answered``, so a clean answer is never superseded by a warned one.
 
 A route continues a chain; it never starts one. Its template is the spec of the latest
 committed generation of the dataset that used one of the route's mappers: its own, or
@@ -164,6 +168,17 @@ _US_SYMBOL: Final = "provider_symbol LIKE '%.US'"
 _KR_SYMBOL: Final = "(provider_symbol LIKE '%.KO' OR provider_symbol LIKE '%.KQ')"
 _KR_PARTIAL: Final = f"reason = 'provider_reported_partial' AND {_EXCHANGE} IN ('KO', 'KQ')"
 _KR_BULK_ARGS: Final = {"currencies": dict(KR_CURRENCIES)}
+# A held exchange-day action row names its exchange ``exchange``, not ``exchange_short_name``.
+_HELD_ACTION: Final = "CASE WHEN json_valid(source_row_json) THEN source_row_json END"
+_KR_ACTION_PARTIAL: Final = (
+    "reason = 'provider_reported_partial' AND "
+    f"json_extract_string({_HELD_ACTION}, '$.exchange') IN ('KO', 'KQ')"
+)
+_HELD_ACTION_KEY: Final = (
+    f"json_extract_string({_HELD_ACTION}, '$.code') || '.' || "
+    f"json_extract_string({_HELD_ACTION}, '$.exchange'), "
+    f"TRY_CAST(json_extract_string({_HELD_ACTION}, '$.date') AS DATE)"
+)
 _US_ADMITTED: Final = (
     f"reason IN ({', '.join(formats.sql_literal(item) for item in ADMITTED_V2)}) "
     f"AND {_EXCHANGE} = 'US'"
@@ -277,6 +292,10 @@ class Route:
     context: Callable[[Workspace], Callable[[Candidate], list[dict[str, str]]]] | None = None
     """The earlier tables of the shape a step pins after the new one (read, never recorded):
     called once per route run, it gives each candidate's tables."""
+    yields: tuple[str, str, str] | None = None
+    """The clean answers a held action table yields to: the prefix, table and row predicate of
+    the rows tables whose (``provider_symbol``, ``date``) a held row may also name. A claimed
+    table with one such row is not promoted and is counted as ``answered``."""
 
     @property
     def mappers(self) -> tuple[str, ...]:
@@ -448,6 +467,13 @@ ROUTES: Final = (
           start=_actions("sessions.xkrx", "Asia/Seoul", {"ratio": "float_shortest@1"})),
     Route("actions.kr.eodhd", "eodhd.dividends@1", "qveris-dividends-", "dividends", _KR_SYMBOL,
           start=_actions("sessions.xkrx", "Asia/Seoul", {"amount": "decimal_text@1"})),
+    # After the clean KR action routes: a warned exchange day yields to a clean answer.
+    Route("actions.kr.eodhd", "eodhd.splits_quarantine@1", "qveris-splits-quarantine-",
+          "quarantine", _KR_ACTION_PARTIAL, derive_from="eodhd.splits@1",
+          yields=("qveris-splits-", "splits", _KR_SYMBOL)),
+    Route("actions.kr.eodhd", "eodhd.dividends_quarantine@1", "qveris-dividends-quarantine-",
+          "quarantine", _KR_ACTION_PARTIAL, derive_from="eodhd.dividends@1",
+          yields=("qveris-dividends-", "dividends", _KR_SYMBOL)),
     Route("fx.usdkrw.eodhd", "eodhd.fx_history@1", "qveris-fx-history-bars-", "bars",
           "base_currency = 'USD' AND quote_currency = 'KRW'", start=_FX_START),
     Route("status.kr.kind", "kind.status@1", "kind-listings-", "listings", start=_STATUS_START),
@@ -553,6 +579,7 @@ def candidates(  # noqa: PLR0913 -- the route and the pass's lookups
     """
     needed = {name for each in route.mappers for name in mapper(each).source_columns()}
     found: list[Candidate] = []
+    answered: set[tuple[str, date]] | None = None
     for table in committed_tables(workspace, route.prefix):
         entry = table.entry
         if table.store != "market" or entry["name"] != route.table or entry["format"] != "arrow":
@@ -573,6 +600,11 @@ def candidates(  # noqa: PLR0913 -- the route and the pass's lookups
             if reason:
                 skipped[reason] = skipped.get(reason, 0) + 1
             continue
+        if route.yields is not None:
+            answered = _answers(workspace, route.yields) if answered is None else answered
+            if _yielded(workspace, target, answered):
+                skipped["answered"] = skipped.get("answered", 0) + 1
+                continue
         pin = {
             "source_id": table.source_id,
             "source_sha256": shas[table.source_id],
@@ -588,6 +620,34 @@ def candidates(  # noqa: PLR0913 -- the route and the pass's lookups
             item.pin["source_id"],
         ),
     )
+
+
+def _answers(workspace: Workspace, shape: tuple[str, str, str]) -> set[tuple[str, date]]:
+    """(``provider_symbol``, ``date``) of every committed rows table of ``shape``'s rows."""
+    prefix, name, predicate = shape
+    found: set[tuple[str, date]] = set()
+    for table in committed_tables(workspace, prefix):
+        entry = table.entry
+        if table.store != "market" or entry["name"] != name or not entry["rows"]:
+            continue
+        found.update(
+            (str(symbol), day)
+            for symbol, day in workspace.market.execute(
+                f'SELECT DISTINCT provider_symbol, "date" FROM {_quote(str(entry["target"]))} '  # noqa: S608 -- a fixed predicate over a quoted table
+                f"WHERE coalesce(({predicate}), false)"
+            ).fetchall()
+        )
+    return found
+
+
+def _yielded(workspace: Workspace, target: str, answered: set[tuple[str, date]]) -> bool:
+    """Whether a held action row of ``target`` names a symbol and ex-date a clean answer holds."""
+    if not answered:
+        return False
+    rows = workspace.market.execute(
+        f"SELECT DISTINCT {_HELD_ACTION_KEY} FROM {_quote(target)}"  # noqa: S608 -- a fixed key over a quoted table
+    ).fetchall()
+    return any((str(symbol), day) in answered for symbol, day in rows)
 
 
 def _count(workspace: Workspace, predicate: str, target: str) -> int:
