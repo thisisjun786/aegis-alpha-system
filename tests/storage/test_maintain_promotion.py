@@ -834,3 +834,24 @@ def test_macro_series_lag_by_their_own_publication_period(ws: Workspace) -> None
         "stale_reasons": ["lag"],
         "stale_series": ["SYNMONTHLY"],
     }
+
+
+def test_a_weekly_published_daily_series_is_stale_only_above_its_own_threshold(
+    ws: Workspace,
+) -> None:
+    # DEXKOUS (H.10, published each Monday for the week before) ends on Friday 11-06; a
+    # daily series without its own threshold ends on Tuesday 11-10.
+    _publish_macro(ws, "macro.us.alfred", {
+        "DEXKOUS": _weekdays(date(2026, 10, 1), date(2026, 11, 6)),
+        "SYNDAILY": _weekdays(date(2026, 10, 1), date(2026, 11, 10))})  # fmt: skip
+
+    def read(day: int) -> tuple[object, ...]:
+        head = _heads(ws, datetime(2026, 11, day, 3, tzinfo=UTC))["macro.us.alfred"]
+        return head["lag_sessions"], head["freshness"], head["stale_series"]
+
+    # Monday 11-16: DEXKOUS is four periods behind, SYNDAILY two; neither above its threshold.
+    assert read(16) == (4, "current", [])
+    # Tuesday: DEXKOUS five (a holiday week's release), SYNDAILY three, above the dataset's two.
+    assert read(17) == (5, "stale", ["SYNDAILY"])
+    # Wednesday: DEXKOUS six, above its own five.
+    assert read(18) == (6, "stale", ["DEXKOUS", "SYNDAILY"])

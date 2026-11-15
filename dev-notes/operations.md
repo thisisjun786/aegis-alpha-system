@@ -1648,10 +1648,10 @@ head chain의 market 행과 패키지 선언 달력만 읽어 구하며 새 상�
 | `expected_through` | 이 실행 시각에 데이터가 닿아야 할 날짜. 기대가 없거나 동결이면 `null` |
 | `lag_sessions` | `data_through` 뒤로 `expected_through`까지 빠진 수. 단위는 `lag_unit` |
 | `lag_unit` | `sessions`(해당 거래소 세션 수) 또는 `periods`(시리즈 주기 수) |
-| `stale_after` | 이 lag를 넘으면 `stale`인 임계값 |
+| `stale_after` | 이 lag를 넘으면 `stale`인 임계값. 시리즈 dataset에서는 자기 임계값이 따로 없는 시리즈의 값이다 |
 | `freshness` | `current`, `stale`, `frozen`(구독이 끝난 Norgate·FMP), `untracked`(기대 날짜 없음), `no_data`(날짜 있는 행 없음), `no_head` |
 | `stale_reasons` | `lag`(lag가 임계값 초과), `zero_promotion`(아래 연속 실행 수가 기준 이상) |
-| `stale_series` | 시리즈 기대(`periods`)에서 임계값을 넘은 시리즈 ID |
+| `stale_series` | 시리즈 기대(`periods`)에서 자기 임계값(`series_stale_after`에 있으면 그 값, 없으면 `stale_after`)을 넘은 시리즈 ID. 시리즈 dataset은 이 목록이 비어 있지 않을 때 `lag`로 `stale`이다 |
 | `zero_promotion_runs` | 수집 단계가 성공했는데 head가 그대로이고 데이터가 뒤처진(또는 기대 날짜가 없는) 연속 실행 수. 직전 보고의 `sequence`와 이 값을 이어 센다 |
 
 도메인별 `data_through` 열은 `prices`·`calendar_sessions` `session_date`, `corporate_actions` `ex_date`,
@@ -1660,8 +1660,12 @@ head chain의 market 행과 패키지 선언 달력만 읽어 구하며 새 상�
 `classifications` `effective_from`이다. 기대는 dataset마다 하나다. US·KR 일봉·기업행동과 SEC는 그 거래소(XNYS,
 XKRX)에서 실행 시각까지 마감한 마지막 세션, OpenDART는 서울 날짜의 전일(lag는 XKRX 세션 수), ALFRED·FRED·BOK·OECD는
 시리즈마다 최근 관측 기간에서 추정한 주기(평일·주·월·분기·반기·년)로 한 주기가 더 지난 기간까지(dataset의 lag는
-가장 뒤처진 시리즈)이고, 선언 달력·KIND 상장상태·분류는 기대가 없다. 임계값, 연속 실행 기준(5회)과 동결 공급자는
-`storage/maintain_promotion.py`의 `FRESHNESS`, `STALE_AFTER_ZERO_PROMOTION_RUNS`, `FROZEN_PROVIDERS` 한 곳에 있다.
+가장 뒤처진 시리즈)이고, 선언 달력·KIND 상장상태·분류는 기대가 없다. H.10이 매주 월요일(휴일이면 다음 영업일)에 지난주
+일별 값을 공표하는 `DEXKOUS`·`DTWEXBGS`는 `macro.us.alfred`에서 임계값 5(정상 주 월요일 lag 4, 휴일 주 5)를 따로
+갖고, 같은 공표로만 head가 오르는 `fx.usdkrw.fred`의 연속 실행 기준은 7회(정상 주 6회, 휴일 주 7회)다. 데이터셋 전체
+임계값은 올리지 않으므로 매일 공표되는 시리즈는 그대로 lag 3에서 `stale`이다. 임계값, 연속 실행 기준(기본 5회,
+`zero_promotion_after`로 dataset마다 덮어씀)과 동결 공급자는 `storage/maintain_promotion.py`의 `FRESHNESS`,
+`STALE_AFTER_ZERO_PROMOTION_RUNS`, `FROZEN_PROVIDERS` 한 곳에 있다.
 이 필드는 추가된 것이라 보고 스키마 이름은 `aas-maintain-report-v1` 그대로다.
 
 ```json

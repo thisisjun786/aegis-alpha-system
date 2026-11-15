@@ -971,6 +971,23 @@ def test_runs_that_collect_but_never_promote_a_lagging_head_mark_it_stale() -> N
     assert (current["zero_promotion_runs"], current["freshness"]) == (0, "current")
 
 
+def test_a_weekly_published_dataset_is_stale_after_its_own_zero_promotion_runs() -> None:
+    fred = frozenset({"fred"})
+    head: dict[str, object] = {"dataset_id": "fx.usdkrw.fred", "sequence": 7, "lag_sessions": 1,
+                               "freshness": "current", "stale_reasons": [],
+                               "zero_promotion_runs": 0}  # fmt: skip
+    seen = []
+    for _ in range(7):
+        prior = head
+        head = {**prior, "freshness": "current", "stale_reasons": []}
+        promotion_streaks([head], {"fx.usdkrw.fred": prior}, fred)
+        seen.append((head["zero_promotion_runs"], head["freshness"]))
+    # The weekly release advances the head once a week: six runs without one are normal.
+    assert seen == [(1, "current"), (2, "current"), (3, "current"), (4, "current"),
+                    (5, "current"), (6, "current"), (7, "stale")]  # fmt: skip
+    assert head["stale_reasons"] == ["zero_promotion"]
+
+
 def _kr_new_listing(world: KrWorld, *, symbol_list: bool) -> None:
     """KIND lists a new company and both days' KO sessions trade it; EODHD lists it if asked."""
     world.listings.append(("합성신규", "000777", "2026-09-16"))

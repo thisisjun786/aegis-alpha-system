@@ -1462,13 +1462,18 @@ class Expectation:
     passed after it ends; the lag counts periods and the dataset's is its worst series.
     ``none``: no date the data must reach (declared calendars, event domains).
     ``stale_after`` is the lag above which the dataset is stale; ``collector`` is the
-    maintenance stage that collects its sources.
+    maintenance stage that collects its sources. ``series_stale_after`` replaces
+    ``stale_after`` for the series it names (a daily series published once a week), and a
+    ``series`` dataset is stale when any series lags above its own threshold.
+    ``zero_promotion_after`` replaces ``STALE_AFTER_ZERO_PROMOTION_RUNS`` for the dataset.
     """
 
     kind: Literal["session", "previous_day", "series", "none"]
     calendar: str | None = None
     stale_after: int | None = None
     collector: str | None = None
+    series_stale_after: Mapping[str, int] = field(default_factory=dict)
+    zero_promotion_after: int | None = None
 
 
 # The one place freshness thresholds live. A catalog dataset that is not frozen has an entry.
@@ -1482,8 +1487,16 @@ FRESHNESS: Final[Mapping[str, Expectation]] = {
     "fundamentals.us.sec": Expectation("session", "XNYS", 5, "sec"),
     "filings.kr.dart": Expectation("previous_day", "XKRX", 2, "dart"),
     "fundamentals.kr.dart": Expectation("previous_day", "XKRX", 5, "dart"),
-    "macro.us.alfred": Expectation("series", stale_after=2, collector="fred"),
-    "fx.usdkrw.fred": Expectation("series", stale_after=5, collector="fred"),
+    # H.10 publishes the previous week's daily rates each Monday (the next business day after
+    # a holiday): a Friday is four periods behind on the Monday run, five in a holiday week.
+    "macro.us.alfred": Expectation(
+        "series", stale_after=2, collector="fred", series_stale_after={"DEXKOUS": 5, "DTWEXBGS": 5}
+    ),
+    # The same weekly release advances the head once a week: six runs without a promotion
+    # in a normal week, seven in a holiday week.
+    "fx.usdkrw.fred": Expectation(
+        "series", stale_after=5, collector="fred", zero_promotion_after=7
+    ),
     "fx.usdkrw.eodhd": Expectation("session", "XNYS", 5, "qveris"),
     "macro.kr.bok": Expectation("series", stale_after=2),
     "macro.kr.oecd": Expectation("series", stale_after=2),
@@ -1531,6 +1544,13 @@ def frozen(dataset_id: str) -> bool:
     return (entry is not None and entry.frozen) or bool(
         FROZEN_PROVIDERS & set(_base(dataset_id).split("."))
     )
+
+
+def stale_after_zero_promotion(dataset_id: str) -> int:
+    """The runs without a promotion after which the dataset is ``stale`` (``zero_promotion``)."""
+    found = FRESHNESS.get(_base(dataset_id))
+    override = None if found is None else found.zero_promotion_after
+    return STALE_AFTER_ZERO_PROMOTION_RUNS if override is None else override
 
 
 def collector(dataset_id: str) -> str | None:
@@ -1697,15 +1717,17 @@ def freshness(
             expected = max(found[0] for found in lags.values())
             lag = max(found[1] for found in lags.values())
             result["lag_unit"] = "periods"
+            limits = expectation.series_stale_after
             result["stale_series"] = sorted(
                 series for series, found in lags.items()
-                if found[1] > cast("int", expectation.stale_after)
+                if found[1] > limits.get(series, cast("int", expectation.stale_after))
             )  # fmt: skip
     if lag is None:
         return result
     result.update(expected_through=cast("date", expected).isoformat(), lag_sessions=lag,
                   stale_after=expectation.stale_after)  # fmt: skip
-    stale = lag > cast("int", expectation.stale_after)
+    stale = (bool(result["stale_series"]) if expectation.kind == "series"
+             else lag > cast("int", expectation.stale_after))  # fmt: skip
     result["freshness"] = "stale" if stale else "current"
     result["stale_reasons"] = ["lag"] if stale else []
     return result
