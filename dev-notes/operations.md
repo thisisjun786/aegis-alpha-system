@@ -1559,7 +1559,8 @@ identity 증분 계획, dataset마다 새 원천과 단계를 낸다. `--promoti
   "providers": {
     "kind": {"enabled": true},
     "dart": {"enabled": true, "key_file": "opendart-api-key", "max_calls": 2000, "daily_quota": 19000},
-    "sec": {"enabled": true, "user_agent_file": "sec-user-agent", "max_calls": 2000, "since": "2026-08-31"},
+    "sec": {"enabled": true, "user_agent_file": "sec-user-agent", "max_calls": 2000, "issuers": "reporting",
+            "since": "2026-08-31"},
     "fred": {"enabled": true, "key_file": "fred-api-key", "max_calls": 500},
     "qveris": {"enabled": true, "key_file": "qveris-api-key", "raw_root": "/path/to/raw/qveris",
                "identity": "/path/to/qveris-bulk-identity.json",
@@ -1569,6 +1570,13 @@ identity 증분 계획, dataset마다 새 원천과 단계를 낸다. `--promoti
   }
 }
 ```
+
+`sec.issuers`를 적지 않으면 `registered`다. US 발행인이 identity에 없으면 이 범위는 색인만 받고 SEC 문서를 묻지
+않아 `filings.us.sec`·`fundamentals.us.sec`이 멈춘다(`stages.sec.pending.filings`의 `wanted` 0). 예시의
+`reporting`은 읽은 색인에서 정기 보고서를 낸 제출자의 submissions·companyfacts를 묻는다. 바꾼 다음 실행은
+이미 읽은 색인을 다시 묻지 않고, 밀린 문서를 가장 이른 공시일 순으로 `sec.max_calls`까지 물으며 나머지는
+다음 실행이 잇는다. 남은 양은 `aas maintain plan`의 `stages.collect.sec.requests`다. 되돌리려면 `registered`로
+바꾸거나 키를 지운다. 이미 받은 원천과 승격한 generation은 그대로 남는다.
 
 `symbol_lists`의 `US`는 상장 목록(`delisted=0`)과 상장폐지 목록(`delisted=1`)을 매일 묻는다(KR 목록은
 `symbol_list_days`마다). 상장폐지 목록이 더해져 US 목록 요청은 하루 1회 늘었다. 상장폐지 목록은

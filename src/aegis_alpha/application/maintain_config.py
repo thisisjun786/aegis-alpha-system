@@ -30,7 +30,7 @@ refused like any other configuration error, never ignored.
              "daily_quota": 19000},
     "kind": {"enabled": true},
     "sec": {"enabled": true, "user_agent_file": "sec-user-agent", "max_calls": 2000,
-            "issuers": "registered", "since": "2026-08-31"},
+            "issuers": "reporting", "since": "2026-08-31"},
     "fred": {"enabled": true, "key_file": "fred-api-key", "max_calls": 500}
   }
 }
