@@ -64,6 +64,7 @@ def test_eodhd_bars_maps_synthetic_fixture() -> None:
         "kind.industry@1",
         "kind.industry@2",
         "kind.status@1",
+        "kind.delisted@1",
         "eodhd.dividends@1",
         "eodhd.dividends_quarantine@1",
         "eodhd.splits@1",

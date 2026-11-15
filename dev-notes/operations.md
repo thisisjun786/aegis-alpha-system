@@ -1685,12 +1685,13 @@ XKRX)에서 실행 시각까지 마감한 마지막 세션, OpenDART는 서울 �
 `aas data promote`(또는 `data kr-prices`, `calendar refresh`)로 만들고, 그 뒤 실행이 새로 수집된 원천을 그
 명세의 규칙으로 이어 붙인다. head가 없는 dataset은 `no_head`로 보고된다.
 
-`actions.us.eodhd`, `actions.kr.eodhd`, `fx.usdkrw.eodhd`, `status.kr.kind`, `status.us.eodhd` route는 첫 template을 코드에
+`actions.us.eodhd`, `actions.kr.eodhd`, `fx.usdkrw.eodhd`, `status.kr.kind`, `status.kr.kind.delisted`, `status.us.eodhd` route는 첫 template을 코드에
 선언해 두었다(시작 선언). `aas maintain run`과 `plan`은 설치본 `runtime.json`의 `jobs.start`에 적힌 dataset만 시작할
 dataset으로 넘긴다. 기본은 빈 목록이라 이 dataset들은 `no_head`로 보고되고 `skipped.no_head`가 기다리는 원천 테이블
 수를 센다. 시작은 운영 DB에 첫 generation을 쓰는 일이라 켜는 시점은 운영자(카이·준 승인)가 정하고 코드에 박지
 않는다. 켜진 실행에서 선언이 pin할 달력 head가 없으면 `no_calendar`, identity snapshot이
-없으면 `identity_unavailable`, 매퍼가 참조할 generation(`status.us.eodhd`의 `prices.us.eodhd` head)이 없으면
+없으면 `identity_unavailable`, 매퍼가 참조할 generation(`status.us.eodhd`의 `prices.us.eodhd` head, `status.kr.kind.delisted`의
+`prices.kr.eodhd` head)이 없으면
 `no_reference`로 보고하고 아무것도 쓰지 않는다. `status.us.eodhd`의 첫 generation은 그때까지 쌓인 상장폐지 목록 중
 가장 이른 것부터 시작하고, 그 목록의 종목은 모두 `last_bar` 추정이다. 시작한 dataset 항목은 `started: true`이고
 `template_spec_sha256`은 null이다. 그 밖의 항목은 `started: false`다.

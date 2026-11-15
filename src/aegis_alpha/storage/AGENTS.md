@@ -249,7 +249,7 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   pins (to current heads), the maintenance identity snapshot and a `never` tombstone advanced,
   and a `maintain_source@1` quality check marks the source done. It starts a chain only from a
   route's declared `start` template for a dataset the caller names in `start` (`actions.*.eodhd`,
-  `fx.usdkrw.eodhd`, `status.kr.kind`, `status.us.eodhd`; `aas maintain` names those its
+  `fx.usdkrw.eodhd`, `status.kr.kind`, `status.kr.kind.delisted`, `status.us.eodhd`; `aas maintain` names those its
   `runtime.json` lists in `jobs.start`, none by default), and never changes a
   chain's rules or mapper: `classifications.kr.kind` continues a chain whose
   latest generation used `kind.industry@1` under `@1`, and moves to `kind.industry@2` only

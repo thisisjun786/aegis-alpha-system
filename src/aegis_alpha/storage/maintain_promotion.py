@@ -341,19 +341,31 @@ _DELISTED_START: Final = Start(
     {},
     partitioned=False,
 )  # fmt: skip
+_KIND_LISTS: Final = "kind-listings-"
+# A KR delisting is known by the end of the Seoul day of today's KIND lists; the last bars
+# are read from the KR price head this pass advanced.
+_KIND_DELISTED_START: Final = Start(
+    {"bars": {"dataset_id": "prices.kr.eodhd", "version": _NO_GENERATION,
+              "generation_id": _NO_GENERATION, "chain_hash": _NO_GENERATION,
+              "manifest_hash": _NO_GENERATION}},
+    {"rule": "local_day_end@1", "basis": "record", "input": "status_date",
+     "args": {"timezone": "Asia/Seoul"}},
+    {},
+    partitioned=False,
+)  # fmt: skip
 _US_DELISTED: Final = "exchange_code = 'US' AND delisted = '1'"
 _US_LIST: Final = "exchange_code = 'US' AND delisted IN ('0', '1')"
 
 
-def _new_york_date(text: object) -> date | None:
-    """The New York date of a list's ``...Z`` retrieval text; None when it is no instant."""
+def _local_date(text: object, zone: str) -> date | None:
+    """The ``zone`` date of a list's ``...Z`` retrieval text; None when it is no instant."""
     try:
         moment = datetime.fromisoformat(str(text))
     except ValueError:
         return None
     if moment.tzinfo is None:
         return None
-    return moment.astimezone(ZoneInfo("America/New_York")).date()
+    return moment.astimezone(ZoneInfo(zone)).date()
 
 
 def us_list_context(workspace: Workspace) -> Callable[[Candidate], list[dict[str, str]]]:
@@ -384,7 +396,7 @@ def us_list_context(workspace: Workspace) -> Callable[[Candidate], list[dict[str
         found = workspace.market.execute(
             f"SELECT max(retrieved_at_utc) FROM {_quote(item.target)}"  # noqa: S608 -- a quoted table
         ).fetchone()
-        at = None if found is None else _new_york_date(found[0])
+        at = None if found is None else _local_date(found[0], "America/New_York")
         columns: tuple[str, ...] | None = None
         lists: list[tuple[str, str, dict[str, str]]] = []
         for table in tables:
@@ -402,7 +414,7 @@ def us_list_context(workspace: Workspace) -> Callable[[Candidate], list[dict[str
             ):
                 continue  # fmt: skip
             row = summary(_quote(str(entry["target"])))
-            day = None if row is None else _new_york_date(row[3])
+            day = None if row is None else _local_date(row[3], "America/New_York")
             if (
                 row is None
                 or row[0] is not True
@@ -433,6 +445,69 @@ def _chosen(lists: list[tuple[str, str, dict[str, str]]]) -> list[dict[str, str]
         if pin not in pins:
             pins.append(pin)
     return pins
+
+
+type _KindList = tuple[str, date, str, dict[str, str]]
+"""A committed KIND list: its ``list_id``, Seoul date, retrieval text and spec pin."""
+
+
+def _kind_lists(workspace: Workspace) -> list[_KindList]:
+    """Every committed KIND list table of one ``list_id`` and a ``...Z`` retrieval."""
+    shas = {str(row["source_id"]): str(row["sha256"]) for row in list_sources(workspace)}
+    lists: list[_KindList] = []
+    for table in committed_tables(workspace, _KIND_LISTS):
+        entry = table.entry
+        if (table.store != "market" or entry["name"] != "listings" or not entry["rows"]
+                or not {"list_id", "retrieved_at_utc"} <= set(table.columns)):  # fmt: skip
+            continue
+        row = workspace.market.execute(
+            f"SELECT min(list_id), max(list_id), max(retrieved_at_utc) "  # noqa: S608 -- a quoted table
+            f"FROM {_quote(str(entry['target']))}"
+        ).fetchone()
+        if row is None or row[0] != row[1]:
+            continue
+        day = _local_date(row[2], "Asia/Seoul")
+        if day is not None:
+            pin = {"source_id": table.source_id, "source_sha256": shas[table.source_id],
+                   "table": "listings", "digest": str(entry["digest"])}  # fmt: skip
+            lists.append((str(row[0]), day, str(row[2]), pin))
+    return lists
+
+
+def _kind_context(lists: Sequence[_KindList], source_id: str) -> list[dict[str, str]]:
+    own = next((one for one in lists if one[3]["source_id"] == source_id), None)
+    if own is None:
+        return []
+    # A later list would move today's date: only the candidate's date and earlier ones.
+    others = sorted((one for one in lists
+                     if one[3]["source_id"] != source_id and one[1] <= own[1]),
+                    key=lambda one: (one[1], one[2], one[3]["source_id"]))  # fmt: skip
+    if not others:
+        return []
+    latest: dict[str, _KindList] = {}
+    for one in others:
+        if one[1] == own[1] and one[0] != own[0]:
+            latest["today"] = one
+        elif one[1] < own[1]:
+            latest[one[0]] = one
+    chosen = [latest[key] for key in ("today", *sorted(set(latest) - {"today"})) if key in latest]
+    pins: list[dict[str, str]] = []
+    for _, _, _, pin in [*chosen, others[0]]:
+        if pin not in pins:
+            pins.append(pin)
+    return pins
+
+
+def kind_list_context(workspace: Workspace) -> Callable[[Candidate], list[dict[str, str]]]:
+    """The KIND lists ``kind.delisted@1`` compares a list with, per candidate.
+
+    Of the committed KIND lists (one ``list_id`` and retrieval per table) other than the
+    candidate: the other market's latest list of the candidate's Seoul date, each market's
+    latest list of an earlier Seoul date, and the first list, in that order and each once.
+    The committed tables and their summaries are read once for the route's run.
+    """
+    lists = _kind_lists(workspace)
+    return lambda item: _kind_context(lists, item.pin["source_id"])
 
 
 # In dependency order: SEC facts take each filing's acceptance from the filings head.
@@ -477,6 +552,9 @@ ROUTES: Final = (
     Route("fx.usdkrw.eodhd", "eodhd.fx_history@1", "qveris-fx-history-bars-", "bars",
           "base_currency = 'USD' AND quote_currency = 'KRW'", start=_FX_START),
     Route("status.kr.kind", "kind.status@1", "kind-listings-", "listings", start=_STATUS_START),
+    # After the KR price routes: the last bars come from the head they advanced.
+    Route("status.kr.kind.delisted", "kind.delisted@1", _KIND_LISTS, "listings",
+          start=_KIND_DELISTED_START, context=kind_list_context),
     # After the US price routes: the last bars come from the head they advanced.
     Route("status.us.eodhd", "eodhd.delisted@1", us_symbols.SOURCE_PREFIX, "symbols",
           _US_DELISTED, start=_DELISTED_START, context=us_list_context),
@@ -1512,6 +1590,7 @@ FRESHNESS: Final[Mapping[str, Expectation]] = {
     # A listing starts at the Seoul start of its date: counted in Seoul, 2026-06-30 stays
     # 06-30. New listings wait for a weekly EODHD list to bind their ISIN.
     "status.kr.kind": Expectation("listing", "XKRX", 20, "kind", zone="Asia/Seoul"),
+    "status.kr.kind.delisted": Expectation("none", collector="kind"),
     "status.us.eodhd": Expectation("none", collector="qveris"),
     "classifications.us.sec": Expectation("none"),
     "classifications.kr.kind": Expectation("none", collector="kind"),
@@ -1542,7 +1621,6 @@ DATA_DATES: Final[Mapping[str, str]] = {
     "estimates": '"target_period"',
     **{domain: _UTC_DAY.format(column) for domain, column in _INSTANTS.items()},
 }
-_KIND_LISTS: Final = "kind-listings-"
 _SERIES_KEYS: Final = {"macro_observations": '"series_id"',
                        "fx_rates": '("base_currency" || \'/\' || "quote_currency")'}  # fmt: skip
 

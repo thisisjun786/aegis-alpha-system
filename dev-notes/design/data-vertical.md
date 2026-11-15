@@ -691,6 +691,17 @@ part를 함께 pin한다. `CAPITAL` close는 비조정 close를 그 뒤 모든 �
 지역만 다른 반복 행은 (`short_code`, `listed_on`, `retrieved_at_utc`)마다 한 번만 옮기고, 한 코드에 상장일이
 둘이면 자연키 반복으로 거부한다.
 
+`kind.delisted@1`은 KIND 목록(`list_id`, `short_code`, `retrieved_at_utc`)에서 상장폐지를 만든다. KIND는
+상장폐지도 그 날짜도 말하지 않으므로, 앞 서울 날짜의 두 시장 마지막 목록 중 하나에 있고 오늘(pin한 목록의 가장
+늦은 서울 날짜) 두 목록 어디에도 없는 코드를 상장폐지로 본다. 시장을 옮긴 코드는 오늘 목록 하나에 남아 사건이
+아니다. 오늘 목록이 한 시장뿐이면 아무것도 관측하지 않고, 두 번째 목록의 승격이 관측한다. 사건은 둘이다.
+`kind:delisted:observed`(`reason` `kind_delisted_observed`)는 오늘의 서울 0시, `kind:delisted:last_bar`(`reason`
+`kind_delisted_last_bar`)는 `prices.kr.eodhd`에서 오늘 이전 마지막 bar(오늘의 가장 늦은 수집 시각에 알려진 개정)
+다음 날의 서울 0시에 시작한다. 코드가 마지막으로 있던 목록이 오늘보다 하루 넘게 앞서면 두 사건 모두, 마지막 bar
+다음 날이 첫 목록보다 앞서면 `last_bar` 사건도 `survivorship_unverified`를 단다. 상품은 (`kind`, `krx_short_code`)
+claim으로만 오늘의 가장 늦은 수집 시각에 해석하며 추론한 ISIN·코드·이름은 쓰지 않는다. 해석되지 않는 코드는
+`observed` 사건 하나로만 옮겨 엔진이 미해결로 센다.
+
 `norgate.status@1`은 Norgate security master(`assetid`, `is_delisted`, `first_date`·`last_date` 텍스트)를
 `instrument_status`로 옮긴다. 인자 `event`가 master 행마다 사건 하나를 고른다. `listed`(모든 행)는
 `first_date`의 현지 0시에 시작하며, 이 날짜는 Norgate 시리즈의 첫 세션이라 실제 상장보다 늦을 수 있다
@@ -1203,6 +1214,7 @@ ASCII escape와 바이트까지 같다.
 | `status.us.norgate` | `instrument_status` | canonical | `norgate.status@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | Norgate master의 상장(`event` `listed`)이 첫 generation, 상장폐지(`delisted`)가 그 child. `America/New_York`, 근거 `record` |
 | `status.us.eodhd` | `instrument_status` | canonical | `eodhd.delisted@1` | `local_day_end@1` | 없음 | 없음 | `delisting_inferred`, `survivorship_unverified`, `time_precision_day` | 아니오 | Qveris EODHD US 상장폐지 목록(`delisted=1`)의 `delisted` 사건. 날짜 근거는 `reason`의 `observed`(전날 상장 → 오늘 상장폐지)와 `last_bar`(`prices.us.eodhd` 마지막 bar 다음 날). [기업행동과 상장 상태 매퍼](#기업행동과-상장-상태-매퍼) |
 | `status.kr.kind` | `instrument_status` | canonical | `kind.status@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | KIND 상장법인목록 수집 원천(`kind-listings-*`)의 상장(`listed`) 사건, 상장일 기준 Asia/Seoul. 단축코드는 [KR 등록](#kr-등록)의 identity snapshot으로 해석. 목록은 상장폐지를 말하지 않는다 |
+| `status.kr.kind.delisted` | `instrument_status` | canonical | `kind.delisted@1` | `local_day_end@1` | 없음 | 없음 | `survivorship_unverified`, `time_precision_day` | 아니오 | KIND 두 시장 목록에서 사라진 단축코드의 `delisted` 사건. 날짜 근거는 `reason`의 `observed`(앞 날짜 목록 → 오늘 두 목록에 없음)와 `last_bar`(`prices.kr.eodhd` 마지막 bar 다음 날). 운영 `jobs.start`에는 없다 |
 | `filings.us.sec` | `filings` | canonical | `sec.submissions@1` | `source_column@1` | 없음 | 없음 | 없음 | 아니오 | SEC submissions의 접수 시각 `acceptanceDateTime`. [SEC 공시와 재무](#sec-공시와-재무) |
 | `filings.kr.dart` | `filings` | canonical | `dart.fnltt_filings@1` | `local_day_end@1` | 없음 | 없음 | `time_precision_day` | 아니오 | DART 재무제표 응답의 접수번호, 접수일 기준 Asia/Seoul. 공시 목록(`list.json`) 수집 원천의 매퍼(`dart.list`)는 레지스트리에 없다(Linear AAS-77) |
 | `fundamentals.us.sec` | `fundamentals` | canonical | `sec.companyfacts@1` | `source_column@1` | `decimal_text@1` | 없음 | `volume_precision_limited` | 아니오 | companyfacts. 공시마다 자기 record(accession은 dimensions). 시점은 pin한 `filings.us.sec` generation에서 accession으로 조인한 `accepted_at_us`이고 조인되지 않은 사실은 null. 같은 accession의 값이 바뀌면 SUPERSEDE |
@@ -1608,7 +1620,7 @@ commit된 것으로 계속한다. 공급자 하나의 거부나 실패가 다른
 곧 아무것도 시작하지 않음). `run`과 `plan`은 이 목록을 `promote_datasets(start=...)`에 넘긴다. 카탈로그에도 route에도
 없는 이름(`.r<N>` 포함)은 `unknown datasets`, route가 시작을 선언하지 않은 이름(`prices.us.eodhd` 등)은
 `no declared start`, 같은 이름의 반복과 문자열 목록이 아닌 값도 설정 전체를 거부한다. 지금 넣을 수 있는 이름은
-`actions.us.eodhd`, `actions.kr.eodhd`, `fx.usdkrw.eodhd`, `status.kr.kind`, `status.us.eodhd`다. 목록에 있어도
+`actions.us.eodhd`, `actions.kr.eodhd`, `fx.usdkrw.eodhd`, `status.kr.kind`, `status.kr.kind.delisted`, `status.us.eodhd`다. 목록에 있어도
 chain에 그 route 매퍼의 generation이 이미 있으면 시작하지 않고 그 명세로 잇는다. 그래서 같은 설정으로 두 번째
 실행은 아무것도 시작하지 않는다. 선행 조건이 없어 막힌 시작(`no_calendar`, `identity_unavailable`,
 `no_reference`)은 아무것도 쓰지 않고 보고만 하며 실패가 아니다(종료 코드에 영향 없음). `promote` 단계 보고의
@@ -1797,6 +1809,7 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
 | `actions.kr.eodhd` | `eodhd.splits_quarantine@1`, `eodhd.dividends_quarantine@1` | `qveris-splits-quarantine-*`·`qveris-dividends-quarantine-*` `quarantine` | 사유 `provider_reported_partial`, JSON `exchange`가 `KO`·`KQ`. 깨끗한 KR 행위 route 뒤에 돈다. 첫 template은 `eodhd.splits@1`·`eodhd.dividends@1`에서 파생. 깨끗한 답이 먼저다(`yields`): 한 행이라도 KR 행 테이블(`qveris-splits-*` `splits`, `qveris-dividends-*` `dividends`)이 이미 담은 (`provider_symbol`, ex-date)를 가리키면 그 테이블은 승격하지 않고 `answered`로 센다 |
 | `fx.usdkrw.eodhd` | `eodhd.fx_history@1` | `qveris-fx-history-bars-*` `bars` | 쌍이 USD/KRW. 시작 선언: `local_day_end@1`(`timezone` `UTC`, 달력 없음), `timezone` `UTC` |
 | `status.kr.kind` | `kind.status@1` | `kind-listings-*` `listings` | `short_code`·`listed_on`·`retrieved_at_utc` 열. 시작 선언: Asia/Seoul `local_day_end@1` |
+| `status.kr.kind.delisted` | `kind.delisted@1` | `kind-listings-*` `listings` | `list_id`·`short_code`·`retrieved_at_utc` 열. KR price route 뒤에 돈다. 같은 서울 날짜의 다른 시장 마지막 목록, 시장마다 이른 서울 날짜의 마지막 목록, 첫 목록을 새 원천 뒤에 함께 pin한다(기록은 새 원천만). 시작 선언: Asia/Seoul `local_day_end@1`, 파티션 없음, `bars`는 `prices.kr.eodhd`의 committed head(없으면 `no_reference`) |
 | `status.us.eodhd` | `eodhd.delisted@1` | `qveris-eodhd-exchange-symbols-*` `symbols` | 모든 행이 `exchange_code` `US`, `delisted` `1`. US price route 뒤에 돈다. 이른 New York 날짜의 같은 열 US 목록 중 마지막 상장 목록·마지막 상장폐지 목록·첫 상장폐지 목록을 새 원천 뒤에 함께 pin한다(기록은 새 원천만). 시작 선언: `America/New_York` `local_day_end@1`, 파티션 없음, `bars`는 `prices.us.eodhd`의 committed head(없으면 `no_reference`) |
 
 **KR 일간 bulk.** 경고와 함께 끝난 KR 일간 bulk 응답은 DV-294에 따라 행 전부가 `quarantine`에 남으므로, KR 일간
@@ -3455,3 +3468,7 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-622 | `fx.usdkrw.fred`는 `zero_promotion_after` 7을 따라 승격 없는 수집 실행 6회까지 `current`이고 7회째에 `zero_promotion`으로 `stale`이다 | `tests/application/test_maintain.py::test_a_weekly_published_dataset_is_stale_after_its_own_zero_promotion_runs` | 구현 |
 | DV-623 | `status.kr.kind` head의 `data_through`는 상장 사건 시작의 서울 날짜이고(06-30 상장은 06-30), 기대는 수집된 KIND 목록이 적은 가장 늦은 상장일이며 lag는 그 사이 XKRX 세션 수라 이벤트가 닿지 못한 상장이 있으면 임계값 20을 넘어 `stale`이다 | `tests/storage/test_kind_status.py::test_the_kind_chain_reports_seoul_dates_its_lag_to_the_lists_and_unverified_survivorship` | 구현 |
 | DV-624 | 상장폐지 사건이 없는 `instrument_status` chain의 head는 `survivorship` `unverified`를 싣고, `status.kr.kind` head는 가장 늦은 서울 수집일 KIND 목록의 미해결 단축코드 수를 `unresolved_listings`로 싣는다 | `tests/storage/test_kind_status.py::test_the_kind_chain_reports_seoul_dates_its_lag_to_the_lists_and_unverified_survivorship` | 구현 |
+| DV-625 | `kind.delisted@1`은 합성 KIND 목록 3일치에서 두 목록 모두에서 사라진 코드 하나에만 `observed`(오늘 서울 0시)와 `last_bar`(마지막 bar 다음 날) 사건을 내고, 시장을 옮긴 코드와 그대로인 코드에는 사건이 없으며, 첫 목록보다 앞선 `last_bar` 사건만 `survivorship_unverified`다 | `tests/storage/test_kind_delisted.py::test_a_code_that_leaves_both_kind_lists_is_the_one_delisting` | 구현 |
+| DV-626 | `status.kr.kind.delisted`를 시작해도 `kind.status@1` chain의 head와 행은 바뀌지 않는다 | `tests/storage/test_kind_delisted.py::test_a_code_that_leaves_both_kind_lists_is_the_one_delisting` | 구현 |
+| DV-627 | 코드가 마지막으로 있던 목록과 오늘 사이가 하루를 넘으면 두 사건 모두 `survivorship_unverified`다 | `tests/storage/test_kind_delisted.py::test_a_delisting_after_a_gap_between_lists_is_survivorship_unverified` | 구현 |
+| DV-628 | 오늘 목록이 한 시장뿐이면 아무 상장폐지도 관측하지 않고, 다른 시장 목록이 들어온 뒤 사라진 코드만 사건이 된다 | `tests/storage/test_kind_delisted.py::test_nothing_is_observed_until_both_of_todays_lists_are_committed` | 구현 |

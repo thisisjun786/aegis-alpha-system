@@ -251,6 +251,9 @@ def _registry() -> dict[str, Mapper]:
         fred_fx_series,
         norgate_fx_history,
     )
+    from aegis_alpha.storage.promotion.mappers.kind_delisted import (  # noqa: PLC0415
+        KindDelisted,
+    )
     from aegis_alpha.storage.promotion.mappers.kind_status import KindStatus  # noqa: PLC0415
     from aegis_alpha.storage.promotion.mappers.korea import KoreaObservations  # noqa: PLC0415
     from aegis_alpha.storage.promotion.mappers.norgate import NorgateFxCloses  # noqa: PLC0415
@@ -305,6 +308,7 @@ def _registry() -> dict[str, Mapper]:
         KindIndustry(),
         KindIndustry(2),
         KindStatus(),
+        KindDelisted(),
         NorgateClassification(),
         SecSic(),
         SecCompanyfacts(),
