@@ -271,17 +271,24 @@ def _verify_pin(
     ]
 
 
-def _heads_sql(domain: str) -> str:
+def _heads_sql(domain: str, records: str | None = None) -> str:
     """Every record's head over a chain bound as one JSON string array.
 
     A scalar binding avoids the driver's per-element Python type discovery on long
     ancestry lists; DuckDB decodes exactly the same IDs before projecting the heads.
+
+    ``records`` (a query of record IDs) keeps only those records' heads. It filters the
+    rows before they are ranked: the rank partitions by record, so a dropped record never
+    changes another's head, while DuckDB does not move a filter over the ranked result
+    below the ranking and would rank the whole chain first.
     """
+    kept = "" if records is None else f" AND p.record_id IN ({records})"
     return (
         "SELECT * EXCLUDE (_aas_rank) FROM (SELECT p.*, row_number() OVER "
         "(PARTITION BY p.record_id ORDER BY g.sequence DESC) AS _aas_rank "
         f"FROM {_q(domain)} p JOIN market_generations g ON g.generation_id = p.generation_id "
-        "WHERE p.generation_id IN (SELECT unnest(?::JSON::VARCHAR[]))) WHERE _aas_rank = 1"
+        f"WHERE p.generation_id IN (SELECT unnest(?::JSON::VARCHAR[])){kept}) "
+        "WHERE _aas_rank = 1"
     )
 
 
@@ -432,7 +439,7 @@ class SharedInputs:
 
     def reference(self, reference: Reference, load: Callable[[str], None]) -> str:
         """The temp table ``load`` fills with the reference's rows, filled once per pin."""
-        key = ("reference", reference.pin, reference.domain, reference.revisions)
+        key = ("reference", reference.pin, reference.domain, reference.revisions, reference.columns)
         found = self._tables.get(key)
         if found is None:
             found = self._name()
@@ -557,10 +564,11 @@ def _references(
 def _load_reference(
     workspace: Workspace, table: str, reference: Reference, chain: list[str]
 ) -> None:
+    domain = [column for column, _ in DOMAINS[reference.domain]]
     columns = ", ".join(
         _q(column)
         for column in (
-            *(column for column, _ in DOMAINS[reference.domain]),
+            *(domain if reference.columns is None else reference.columns),
             "available_at_us",
             "revision_known_at_us",
         )
@@ -980,15 +988,16 @@ def _diff(
 ) -> None:
     market = workspace.market
     domain = spec.domain
-    scope = "false"
+    records = f"SELECT record_id FROM {_t('rows')} WHERE record_id IS NOT NULL"
     if spec.tombstone.mode == "absent_in_full_snapshot":
+        # A full snapshot also needs the heads its scope holds that the source lacks.
         scope = _scope_sql(workspace, spec, "p")
-    market.execute(
-        f"CREATE OR REPLACE TEMP TABLE {_t('head')} AS SELECT * FROM ({_heads_sql(domain)}) p "
-        f"WHERE p.record_id IN (SELECT record_id FROM {_t('rows')} WHERE record_id IS NOT NULL) "
-        f"OR ({scope})",
-        [json.dumps(chain)],
-    )
+        heads = (
+            f"SELECT * FROM ({_heads_sql(domain)}) p WHERE p.record_id IN ({records}) OR ({scope})"
+        )
+    else:
+        heads = _heads_sql(domain, records)
+    market.execute(f"CREATE OR REPLACE TEMP TABLE {_t('head')} AS {heads}", [json.dumps(chain)])
     op = (
         "CASE WHEN h.record_id IS NULL THEN 'ASSERT' WHEN h.op = 'TOMBSTONE' THEN 'SUPERSEDE' "
         f"WHEN {_comparison(domain, fields=fields, mapped_fields=mapped_fields)} THEN 'SKIP' "

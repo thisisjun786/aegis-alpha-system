@@ -322,7 +322,9 @@ def test_a_reference_load_that_failed_leaves_no_table_behind(ws: Workspace) -> N
         ws.market.execute(f"CREATE TEMP TABLE {table} AS SELECT 1 AS x")
         raise duckdb.Error("out of memory")
 
-    reference = cast("Reference", SimpleNamespace(pin="pin", domain="prices", revisions=False))
+    reference = cast(
+        "Reference", SimpleNamespace(pin="pin", domain="prices", revisions=False, columns=None)
+    )
     with pytest.raises(duckdb.Error):
         rows.reference(reference, load)
     assert _shared_tables(ws) == []

@@ -7,6 +7,7 @@ times are written out, revision identities come from ``formats.revision_id``.
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Iterator
 from datetime import date
@@ -23,6 +24,7 @@ from aegis_alpha.storage.bulk_generation import ParentChangedError, PublicationO
 from aegis_alpha.storage.identity import mint_instrument
 from aegis_alpha.storage.promotion import engine, formats
 from aegis_alpha.storage.promotion.engine import promote, verify_promotion
+from aegis_alpha.storage.promotion.spec import parse_spec
 from aegis_alpha.storage.publication import recover_operations
 from aegis_alpha.storage.verification import verify_workspace
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
@@ -226,6 +228,52 @@ def test_head_diff_decides_operation(ws: Workspace) -> None:
     back = prices(ws, str(third["generation_id"]))[0]
     assert back["supersedes_revision_id"] == rows[(BBB, D1)]["revision_id"]
     assert verify_workspace(ws)["verified"] is True
+
+
+def _scans_below(node: dict[str, object], *, aggregate: bool = False) -> list[tuple[str, bool]]:
+    """Each scanned table of an EXPLAIN (FORMAT json) tree, and whether a GROUP BY is above it."""
+    name = str(node["name"])
+    found = []
+    if name == "SEQ_SCAN":
+        info = cast("dict[str, object]", node["extra_info"])
+        found.append((str(info["Table"]), aggregate))
+    for child in cast("list[dict[str, object]]", node["children"]):
+        found += _scans_below(child, aggregate=aggregate or name.endswith("GROUP_BY"))
+    return found
+
+
+def test_the_head_diff_keeps_the_source_records_before_ranking_the_chain(
+    ws: Workspace,
+) -> None:
+    first_pin, identity = _setup(
+        ws, [bar("AAA.KO", D1, 100.0, retrieved=LATE), bar("BBB.KQ", D1, 50.0, retrieved=LATE)]
+    )
+    first = _apply(ws, spec([first_pin], identity))
+    second_pin = add_source(
+        ws, [bar("AAA.KO", D1, 101.0, retrieved=LATER)], tag="b", linked=at("2025-01-21T00:00:00")
+    )
+    raw, sha256 = spec([second_pin], identity, parent=str(first["generation_id"]))
+    ws.market.execute("CALL enable_logging('QueryLog')")
+    try:
+        engine.plan_promotion(ws, parse_spec(raw, sha256))
+        prefix = f"CREATE OR REPLACE TEMP TABLE {engine._t('head')} AS "  # noqa: SLF001
+        (statement,) = [
+            str(message)
+            for (message,) in ws.market.execute(
+                "SELECT message FROM duckdb_logs WHERE type = 'QueryLog' ORDER BY timestamp"
+            ).fetchall()
+            if str(message).startswith(prefix)
+        ]
+        tree = ws.market.execute(
+            "EXPLAIN (FORMAT json) " + statement.removeprefix(prefix),
+            [json.dumps([str(first["generation_id"])])],
+        ).fetchall()[0][1]
+    finally:
+        ws.market.execute("CALL disable_logging()")
+        engine._drop(ws.market)  # noqa: SLF001 -- the plan's temp tables
+    scans = [scan for root in json.loads(tree) for scan in _scans_below(root)]
+    # The source's records filter the chain's rows before the ranking aggregates them.
+    assert [ranked for table, ranked in scans if table.endswith(engine._t("rows"))] == [True]  # noqa: SLF001
 
 
 def test_tombstone_requires_full_snapshot_policy(ws: Workspace) -> None:

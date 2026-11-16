@@ -117,6 +117,7 @@ import json
 import re
 from bisect import bisect_left, bisect_right
 from calendar import monthrange
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from functools import cache
@@ -145,7 +146,7 @@ from aegis_alpha.storage.source_library import list_sources, list_tables
 from aegis_alpha.storage.state import atomic
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Mapping, Sequence
+    from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 
     from aegis_alpha.compute_resources import ComputeBudget
     from aegis_alpha.storage.workspace import Workspace
@@ -1256,9 +1257,43 @@ def promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
     from the route's declared ``start`` template. Every source of the pass resolves with
     identity rows read and verified once per snapshot and key (``SharedInputs``): the pass
     writes no identity registry.
+
+    The pass runs under at most ``PROMOTE_MEMORY_BYTES`` of DuckDB memory. Above it, DuckDB
+    keeps the blocks its scans of the long domain chains read cached up to the limit, so the
+    process holds the whole share for the stage; a plan's working set spills instead.
     """
     if apply and not evaluate:
         raise ValueError("an applied maintenance promotion evaluates every step")
+    with _lowered_market_limit(workspace, PROMOTE_MEMORY_BYTES):
+        return _promote_datasets(
+            workspace,
+            apply=apply,
+            identity=identity,
+            identity_failed=identity_failed,
+            budget=budget,
+            now_us=now_us,
+            routes=routes,
+            evaluate=evaluate,
+            start=start,
+        )
+
+
+PROMOTE_MEMORY_BYTES: Final = 4 * 1024**3
+"""DuckDB's memory limit while a maintenance pass promotes, when the connection's is higher."""
+
+
+def _promote_datasets(  # noqa: PLR0913 -- the pass's explicit inputs
+    workspace: Workspace,
+    *,
+    apply: bool,
+    identity: Mapping[str, str] | None,
+    identity_failed: bool,
+    budget: ComputeBudget | None,
+    now_us: int,
+    routes: Sequence[Route],
+    evaluate: bool,
+    start: Collection[str],
+) -> dict[str, object]:
     identities = SharedInputs(workspace)
     try:
         runs = _promote_routes(
@@ -1920,6 +1955,25 @@ HEADS_MEMORY_BYTES: Final = 1024**3
 """DuckDB's memory limit while heads are read, when the connection's is higher."""
 
 
+@contextmanager
+def _lowered_market_limit(workspace: Workspace, limit: int) -> Iterator[None]:
+    """Run under DuckDB memory limit ``limit`` when the connection's is higher.
+
+    Lowering only drops cached blocks; the connection then returns to the installation's
+    limits (``Workspace.reset_market_limits``).
+    """
+    market = workspace.market
+    found = market.execute("SELECT parse_formatted_bytes(current_setting('memory_limit'))")
+    if int(cast("tuple[int]", found.fetchone())[0]) <= limit:
+        yield
+        return
+    market.execute("SET memory_limit = ?", [f"{limit}B"])
+    try:
+        yield
+    finally:
+        workspace.reset_market_limits()
+
+
 def dataset_heads(workspace: Workspace, *, now: datetime) -> list[dict[str, object]]:
     """Every committed dataset's head, watermarks and data freshness at ``now``.
 
@@ -1928,18 +1982,10 @@ def dataset_heads(workspace: Workspace, *, now: datetime) -> list[dict[str, obje
 
     Freshness scans whole domain tables, and DuckDB keeps the blocks a scan read cached up
     to its memory limit. The reads run under at most ``HEADS_MEMORY_BYTES``, which only
-    drops cached blocks (the scans hold no large state); the connection then returns to the
-    installation's limits (``Workspace.reset_market_limits``).
+    drops cached blocks (the scans hold no large state).
     """
-    market = workspace.market
-    found = market.execute("SELECT parse_formatted_bytes(current_setting('memory_limit'))")
-    if int(cast("tuple[int]", found.fetchone())[0]) <= HEADS_MEMORY_BYTES:
+    with _lowered_market_limit(workspace, HEADS_MEMORY_BYTES):
         return _dataset_heads(workspace, now=now)
-    market.execute("SET memory_limit = ?", [f"{HEADS_MEMORY_BYTES}B"])
-    try:
-        return _dataset_heads(workspace, now=now)
-    finally:
-        workspace.reset_market_limits()
 
 
 def _dataset_heads(workspace: Workspace, *, now: datetime) -> list[dict[str, object]]:
