@@ -45,7 +45,8 @@ counted, and refuses them for every other mapper.
 A mapper may join generations of other datasets that its spec arguments pin
 (``references``): SEC company facts read each filing's acceptance time from a pinned
 ``filings`` generation. The engine verifies each pin, loads the head rows of its chain
-(no TOMBSTONE) with the referenced domain's columns into ``reference_table(name)``, and
+(no TOMBSTONE) with the referenced domain's columns (those the reference names in
+``columns``, when it does) into ``reference_table(name)``, and
 the mapper's SELECT reads that table as it reads the source relation. Every reference also
 carries ``available_at_us`` and ``revision_known_at_us``; one declared with ``revisions``
 holds all revisions of the chain instead of the heads, to be read as of an instant.
@@ -99,6 +100,9 @@ class Reference:
     """Load every revision of the chain (tombstones included, each with its generation's
     ``_aas_sequence``) instead of the record heads, so the mapper can read the chain as of an
     instant."""
+    columns: tuple[str, ...] | None = None
+    """The domain columns the mapper reads (every domain column when None); the two instants
+    are loaded either way. A long referenced chain then holds only what the join needs."""
 
 
 def reference_pin(value: object, name: str) -> GenerationPin:

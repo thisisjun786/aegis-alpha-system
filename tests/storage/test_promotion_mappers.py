@@ -636,7 +636,9 @@ def test_sec_companyfacts_maps_synthetic_fixture() -> None:
     assert facts.identity(args) is None
     assert facts.numeric_columns(args) == {"value": "VARCHAR"}
     assert references(facts, args) == {
-        "filings": Reference("filings", GenerationPin(**_FILINGS_PIN))
+        "filings": Reference(
+            "filings", GenerationPin(**_FILINGS_PIN), columns=("filing_id", "accepted_at_us")
+        )
     }
     connection = duckdb.connect()
     connection.execute("SET TimeZone='UTC'")

@@ -20,8 +20,10 @@ import pytest
 from aegis_alpha.storage import source_library
 from aegis_alpha.storage.identity import mint_issuer
 from aegis_alpha.storage.legacy_import.public import SUBMISSION_FILINGS
-from aegis_alpha.storage.promotion import formats
+from aegis_alpha.storage.promotion import engine, formats
 from aegis_alpha.storage.promotion.engine import promote, verify_promotion
+from aegis_alpha.storage.promotion.mappers import reference_table
+from aegis_alpha.storage.promotion.mappers.sec import FILINGS_REFERENCE
 from aegis_alpha.storage.promotion.spec import parse_spec
 from aegis_alpha.storage.raw import put_raw
 from aegis_alpha.storage.source_identity import SourceContent, SourceFile
@@ -314,6 +316,26 @@ def test_facts_are_known_from_their_filing_acceptance(ws: Workspace) -> None:
     )
     assert again["published"] is False
     assert again["empty_delta"] is True
+
+
+def test_facts_hold_only_each_filing_acceptance_of_the_filings_head(ws: Workspace) -> None:
+    _, filings = _filings(
+        ws, [_filing("0000000001", A1, "2025-02-10", "2025-02-10T21:30:00.000Z")], "f1"
+    )
+    facts = _commit(ws, FACT_SCHEMA, "facts", [_fact(A1, "100")], "c1")
+    raw, sha256 = _spec([facts], domain="fundamentals", dataset="fundamentals.us.sec",
+                        filings=filings)  # fmt: skip
+    try:
+        engine.plan_promotion(ws, parse_spec(raw, sha256))
+        held = ws.market.execute(
+            "SELECT column_name FROM duckdb_columns() WHERE table_name = ? ORDER BY column_index",
+            [reference_table(FILINGS_REFERENCE)],
+        ).fetchall()
+    finally:
+        engine._drop(ws.market)  # noqa: SLF001 -- the plan's temp tables
+    assert [name for (name,) in held] == [
+        "filing_id", "accepted_at_us", "available_at_us", "revision_known_at_us"
+    ]  # fmt: skip
 
 
 def test_a_later_filings_generation_completes_unmatched_facts(ws: Workspace) -> None:

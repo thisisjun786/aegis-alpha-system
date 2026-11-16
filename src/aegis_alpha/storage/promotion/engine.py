@@ -439,7 +439,7 @@ class SharedInputs:
 
     def reference(self, reference: Reference, load: Callable[[str], None]) -> str:
         """The temp table ``load`` fills with the reference's rows, filled once per pin."""
-        key = ("reference", reference.pin, reference.domain, reference.revisions)
+        key = ("reference", reference.pin, reference.domain, reference.revisions, reference.columns)
         found = self._tables.get(key)
         if found is None:
             found = self._name()
@@ -564,10 +564,11 @@ def _references(
 def _load_reference(
     workspace: Workspace, table: str, reference: Reference, chain: list[str]
 ) -> None:
+    domain = [column for column, _ in DOMAINS[reference.domain]]
     columns = ", ".join(
         _q(column)
         for column in (
-            *(column for column, _ in DOMAINS[reference.domain]),
+            *(domain if reference.columns is None else reference.columns),
             "available_at_us",
             "revision_known_at_us",
         )

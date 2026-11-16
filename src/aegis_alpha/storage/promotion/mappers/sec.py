@@ -184,7 +184,10 @@ class SecCompanyfacts:
 
     def references(self, args: Mapping[str, object]) -> Mapping[str, Reference]:
         pin = reference_pin(args[FILINGS_REFERENCE], "sec.companyfacts@1 filings")
-        return {FILINGS_REFERENCE: Reference("filings", pin)}
+        # The join reads each filing's acceptance alone, not the whole filings head.
+        return {
+            FILINGS_REFERENCE: Reference("filings", pin, columns=("filing_id", "accepted_at_us"))
+        }
 
     def source_columns(self) -> Mapping[str, frozenset[str]]:
         return {
