@@ -13,7 +13,7 @@ from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -27,9 +27,12 @@ from aegis_alpha.storage.maintain_promotion import (
     promote_datasets,
 )
 from aegis_alpha.storage.market import publish_generation
-from aegis_alpha.storage.promotion.engine import dataset_head, promote
+from aegis_alpha.storage.promotion.engine import SharedInputs, dataset_head, promote
 from aegis_alpha.storage.state import atomic
 from aegis_alpha.storage.workspace import Workspace, initialize, open_workspace
+
+if TYPE_CHECKING:
+    from aegis_alpha.compute_resources import ComputeBudget
 from tests.storage.promotion_support import (
     PARTIAL,
     add_bulk_source,
@@ -715,6 +718,44 @@ def test_heads_are_read_under_the_lower_duckdb_limit_and_the_limit_is_restored(
     monkeypatch.setattr(maintain_promotion, "_dataset_heads", probe)
     assert _heads(ws, JULY_RUN) == expected
     assert (limits, _memory_limit(ws)) == ([maintain_promotion.HEADS_MEMORY_BYTES], before)
+
+
+def test_a_pass_promotes_under_the_lower_duckdb_limit_and_the_limit_is_restored(
+    ws: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = add_source(ws, [bar("AAA.KO", DAY1, 100.0, retrieved=at("2026-09-14T08:00:00"))],
+                       tag="day1", linked=at("2026-09-14T09:00:00"))  # fmt: skip
+    identity = register_symbols(ws, first["source_id"])
+    template = spec([first], identity, partition={"from": DAY1.isoformat(), "to": DAY2.isoformat()})
+    promote(ws, *template, apply=True)
+    add_source(ws, [bar("AAA.KO", DAY2, 101.0, retrieved=at("2026-09-15T08:00:00"))],
+               tag="day2", linked=at("2026-09-15T09:00:00"))  # fmt: skip
+    ws.market_resources = {**ws.market_resources, "memory_limit": "8GB"}
+    ws.reset_market_limits()
+    before = _memory_limit(ws)
+    real = maintain_promotion.promote
+    limits: list[int] = []
+
+    def probe(  # noqa: PLR0913 -- promote's own parameters
+        workspace: Workspace,
+        raw: bytes,
+        sha256: str,
+        *,
+        apply: bool,
+        budget: ComputeBudget | None = None,
+        identities: SharedInputs | None = None,
+    ) -> dict[str, object]:
+        limits.append(_memory_limit(workspace))
+        return real(workspace, raw, sha256, apply=apply, budget=budget, identities=identities)
+
+    monkeypatch.setattr(maintain_promotion, "promote", probe)
+    report = promote_datasets(ws, apply=True, now_us=1, routes=[ROUTE])
+    run = _datasets(report)[("prices.kr.eodhd", "eodhd.bars@1")]
+    assert [item["status"] for item in cast("list[dict[str, object]]", run["sources"])] == [
+        "unchanged", "promoted"]  # fmt: skip
+    # A plan lowers the limit further to its budget's share; it never rises above the pass's.
+    assert limits[0] == max(limits) == maintain_promotion.PROMOTE_MEMORY_BYTES
+    assert _memory_limit(ws) == before
 
 
 def test_a_tombstoned_newest_bar_does_not_count_as_data(ws: Workspace) -> None:

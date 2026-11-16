@@ -3479,3 +3479,4 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-624 | 오늘 목록이 한 시장뿐이면 아무 상장폐지도 관측하지 않고, 다른 시장 목록이 들어온 뒤 사라진 코드만 사건이 된다 | `tests/storage/test_kind_delisted.py::test_nothing_is_observed_until_both_of_todays_lists_are_committed` | 구현 |
 | DV-625 | tombstone 범위가 없는 승격의 head 비교는 원천이 가진 `record_id`로 chain 행을 먼저 거른 뒤 순위를 매긴다(계획에서 원천 행 표 읽기가 집계 아래에 있다) | `tests/storage/test_promotion_engine.py::test_the_head_diff_keeps_the_source_records_before_ranking_the_chain` | 구현 |
 | DV-626 | `sec.companyfacts@1`의 filings 참조는 head의 `filing_id`·`accepted_at_us`와 두 시점 열만 싣는다 | `tests/storage/test_sec_promotion.py::test_facts_hold_only_each_filing_acceptance_of_the_filings_head` | 구현 |
+| DV-627 | 유지보수 promote 단계는 DuckDB 메모리 한도를 `PROMOTE_MEMORY_BYTES` 이하로 낮춘 채 원천을 계획·게시하고 끝나면 연결을 설치본의 한도(`reset_market_limits`)로 되돌린다 | `tests/storage/test_maintain_promotion.py::test_a_pass_promotes_under_the_lower_duckdb_limit_and_the_limit_is_restored` | 구현 |
