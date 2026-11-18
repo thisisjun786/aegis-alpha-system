@@ -19,6 +19,7 @@ import duckdb
 import pyarrow as pa
 import pytest
 
+from aegis_alpha.compute_resources import ComputeBudget
 from aegis_alpha.storage.identity import (
     decode_registry,
     mint_instrument,
@@ -28,8 +29,8 @@ from aegis_alpha.storage.identity import (
 )
 from aegis_alpha.storage.kr_identity import UNBOUNDED
 from aegis_alpha.storage.legacy_import.norgate import HISTORY
-from aegis_alpha.storage.promotion import formats
-from aegis_alpha.storage.promotion.engine import promote
+from aegis_alpha.storage.promotion import engine, formats
+from aegis_alpha.storage.promotion.engine import SharedInputs, promote
 from aegis_alpha.storage.promotion.mappers import REGISTRY, IdentityKey, mapper
 from aegis_alpha.storage.promotion.mappers.norgate_prices import signed_series
 from aegis_alpha.storage.promotion.spec import parse_spec
@@ -655,6 +656,72 @@ def test_us_prices_promote_through_the_export_registry(ws: Workspace) -> None:
         "WHERE generation_id=?",
         [reference["generation_id"]],
     ).fetchall() == [(_instrument(40), "close", "reference", "XXX")]
+
+
+def test_a_pass_verifies_a_cross_provider_reference_once_and_reads_only_the_delta_sessions(
+    ws: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    master_id = commit(
+        ws, "norgate-master", "observations",
+        table([master(1, "AAA", last_date="2026-09-10")], MASTER_SCHEMA),
+    )  # fmt: skip
+    equities = _export(
+        ws,
+        [history(1, "AAA", "2026-09-08", "10"), history(1, "AAA", "2026-09-09", "20"),
+         history(1, "AAA", "2026-09-10", "30")],
+    )  # fmt: skip
+    registry = build_from_workspace(ws, master=master_id, exports=export_sources(ws))
+    register_identities(
+        ws.state,
+        decode_registry(registry.raw(), expected_file_sha256=registry.sha256()),
+        apply=True,
+    )
+    identity = _snapshot(ws, "us")
+    norgate = promote(
+        ws,
+        *_spec([equities], identity, mapper_name="norgate.prices_none@1",
+               dataset="prices.us.norgate", decimals=dict.fromkeys(FIVE, "decimal_text@1")),
+        apply=True,
+    )  # fmt: skip
+    rule = {
+        "rule": "cross_provider_mismatch@1",
+        "args": {"reference": _generation_pin("prices.us.norgate", norgate),
+                 "column": "close", "tolerance": "0.001"},
+    }  # fmt: skip
+    checked: list[str] = []
+    verify = engine.verify_generation_bulk
+
+    def counted(
+        market: duckdb.DuckDBPyConnection, generation_id: str, *, budget: ComputeBudget
+    ) -> dict[str, object]:
+        checked.append(generation_id)
+        return verify(market, generation_id, budget=budget)
+
+    monkeypatch.setattr(engine, "verify_generation_bulk", counted)
+    late = at("2026-09-11T00:00:00")
+    shared = SharedInputs(ws)
+    parent = None
+    found = []
+    try:
+        # One bulk download per day, promoted in one pass as maintenance does.
+        for day, close in ((date(2026, 9, 8), 10.5), (date(2026, 9, 9), 20.0)):
+            pin = add_source(ws, [bar("AAA.US", day, close, retrieved=late, currency="USD")],
+                             tag=f"us-{day}")  # fmt: skip
+            applied = promote(
+                ws,
+                *_spec([pin], identity, mapper_name="eodhd.bars@1", dataset="prices.us.eodhd",
+                       decimals=dict.fromkeys(FIVE, "float_shortest@1"), quality=[rule],
+                       parent=parent),
+                apply=True, identities=shared,
+            )  # fmt: skip
+            parent = str(applied["generation_id"])
+            found.append(_flags(ws, parent))
+    finally:
+        shared.close()
+    assert checked.count(str(norgate["generation_id"])) == 1
+    # Each day is judged against Norgate's close of the same session only.
+    assert found == [[(_instrument(1), date(2026, 9, 8), "cross_provider_mismatch", "close")],
+                     []]  # fmt: skip
 
 
 def test_norgate_adjusted_parts_promote_with_float_storage_flags(ws: Workspace) -> None:

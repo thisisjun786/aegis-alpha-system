@@ -271,18 +271,19 @@ def _verify_pin(
     ]
 
 
-def _heads_sql(domain: str, records: str | None = None) -> str:
+def _heads_sql(domain: str, kept: str | None = None) -> str:
     """Every record's head over a chain bound as one JSON string array.
 
     A scalar binding avoids the driver's per-element Python type discovery on long
     ancestry lists; DuckDB decodes exactly the same IDs before projecting the heads.
 
-    ``records`` (a query of record IDs) keeps only those records' heads. It filters the
-    rows before they are ranked: the rank partitions by record, so a dropped record never
-    changes another's head, while DuckDB does not move a filter over the ranked result
-    below the ranking and would rank the whole chain first.
+    ``kept`` (a condition on ``p`` testing only the record ID or natural-key columns, which
+    every revision of a record shares) keeps only the heads of the records it holds for. It
+    filters the rows before they are ranked: the rank partitions by record, so a dropped
+    record never changes another's head, while DuckDB does not move a filter over the ranked
+    result below the ranking and would rank the whole chain first.
     """
-    kept = "" if records is None else f" AND p.record_id IN ({records})"
+    kept = "" if kept is None else f" AND {kept}"
     return (
         "SELECT * EXCLUDE (_aas_rank) FROM (SELECT p.*, row_number() OVER "
         "(PARTITION BY p.record_id ORDER BY g.sequence DESC) AS _aas_rank "
@@ -508,14 +509,19 @@ def _identity(
             rows.close()
 
 
-def _calendars(workspace: Workspace, spec: PromotionSpec, budget: ComputeBudget) -> dict[int, str]:
+def _calendars(
+    workspace: Workspace,
+    spec: PromotionSpec,
+    budget: ComputeBudget,
+    shared: SharedInputs | None = None,
+) -> dict[int, str]:
     """Load each calendar rule's pinned sessions; map the time column index to its table."""
     tables: dict[int, str] = {}
     for index, column in enumerate(TIME_COLUMNS):
         rule = spec.time_rules[column]
         if rule.calendar is None:
             continue
-        chain = _verify_pin(workspace, rule.calendar, budget)
+        chain = _verify_pin(workspace, rule.calendar, budget, shared)
         name = _t(f"cal{index}")
         workspace.market.execute(
             f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT session_date, open_at_us, close_at_us "
@@ -996,7 +1002,7 @@ def _diff(
             f"SELECT * FROM ({_heads_sql(domain)}) p WHERE p.record_id IN ({records}) OR ({scope})"
         )
     else:
-        heads = _heads_sql(domain, records)
+        heads = _heads_sql(domain, f"p.record_id IN ({records})")
     market.execute(f"CREATE OR REPLACE TEMP TABLE {_t('head')} AS {heads}", [json.dumps(chain)])
     op = (
         "CASE WHEN h.record_id IS NULL THEN 'ASSERT' WHEN h.op = 'TOMBSTONE' THEN 'SUPERSEDE' "
@@ -1215,12 +1221,14 @@ def _has_fields(market: duckdb.DuckDBPyConnection) -> bool:
     return "fields" in _columns(market, _t("head"))
 
 
-def _flags(
+def _flags(  # noqa: PLR0913 -- the plan's flags and the pass's shared inputs
     workspace: Workspace,
     spec: PromotionSpec,
     flags: list[_Flag],
     budget: ComputeBudget,
     refusals: list[str],
+    *,
+    shared: SharedInputs | None = None,
 ) -> dict[str, int]:
     """Write ``_aas_p_flags``, one row per (revision, rule, flag) with the columns it names.
 
@@ -1228,7 +1236,9 @@ def _flags(
     instrument, session, interval, bar end, basis and currency (the price key without the
     role, which differs between a canonical and a reference dataset), so an adjusted
     reference never judges an unadjusted value and a row matches at most one reference.
-    A flag key repeated within the delta is refused before anything is prepared.
+    A flag key repeated within the delta is refused before anything is prepared. Only the
+    reference heads of the delta's instruments and sessions are read, and with ``shared``
+    each reference pin is verified once per pass.
     """
     market = workspace.market
     groups: dict[tuple[str, str, str], list[_Flag]] = {}
@@ -1255,12 +1265,19 @@ def _flags(
             f"{detail} AS detail FROM {_t('delta')} WHERE {anyone}"
         )
     for rule in spec.quality_rules:
-        chain = _verify_pin(workspace, rule.reference, budget)
+        chain = _verify_pin(workspace, rule.reference, budget, shared)
         column = _q(rule.column)
         keys = ", ".join(_q(name) for name in _COMPARED_KEYS)
+        # A delta row matches a reference row of its own instrument and session only; both
+        # are NOT NULL key columns, so the filter drops whole records and nothing that matches.
+        within = " AND ".join(
+            f"p.{_q(name)} IN (SELECT {_q(name)} FROM {_t('delta')})"
+            for name in ("instrument_id", "session_date")
+        )
         market.execute(
             f"CREATE OR REPLACE TEMP TABLE {_t('ref')} AS SELECT {keys}, {column} AS v "
-            f"FROM ({_heads_sql('prices')}) WHERE op <> 'TOMBSTONE' AND value_state = 'present'",
+            f"FROM ({_heads_sql('prices', within)}) "
+            "WHERE op <> 'TOMBSTONE' AND value_state = 'present'",
             [json.dumps(chain)],
         )
         tolerance = f"CAST('{rule.tolerance}' AS DECIMAL(38,12))"
@@ -1600,7 +1617,7 @@ def plan_promotion(
         plan.blocking.append("quality flags need core schema v2; run aas db migrate --to 2")
     sources = _sources(workspace, spec, plan)
     _identity(workspace, spec, plan, budget, identities)
-    calendars = _calendars(workspace, spec, budget)
+    calendars = _calendars(workspace, spec, budget, identities)
     _references(workspace, spec, budget, identities)
     decimal_rules.install(market)
     _stage_sources(workspace, spec, sources, plan)
@@ -1623,7 +1640,9 @@ def plan_promotion(
     time_flags = _delta(
         workspace, spec, sources, flags, stage_fields=stage_fields, mapped_fields=fields
     )
-    flag_counts = _flags(workspace, spec, flags + time_flags, budget, plan.refusals)
+    flag_counts = _flags(
+        workspace, spec, flags + time_flags, budget, plan.refusals, shared=identities
+    )
     operations = {
         str(op): int(count)
         for op, count in market.execute(
