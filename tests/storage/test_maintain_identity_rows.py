@@ -407,7 +407,9 @@ def test_a_pass_reads_the_snapshot_members_as_often_for_three_sources_as_for_one
 
 
 # The reports gained ``replanned_waiting``; without it the digests are those of dev 0efbb9a.
-PUBLISHED = "55a49ba46f9088441adb1d4f97fd823370fa89738f0a0d6d09c325e01883a71c"
+# The waiting records name aas-maintain-key-scope-v2 digests (and the check IDs they give);
+# masked of those, everything equals what v1 recorded.
+PUBLISHED = "f3f6f5614d0d1297f89c82d63c3af45a2407cb7d5371bc537c8d8229b1d1830f"
 
 
 def _lists(ws: Workspace, days: list[date]) -> None:

@@ -578,6 +578,34 @@ def test_a_scoped_key_covers_every_instant_of_its_dates_and_nothing_two_days_on(
     assert scoped(("LATE.US", "ins-d", later, later + 24 * hour)) == unchanged
 
 
+def test_a_scoped_key_covers_the_long_rows_that_can_hold_within_its_dates_and_no_other() -> None:
+    # A one-day partition of 2026-09-16. A long row (over eight days, or open) changes the
+    # scoped key only when it can hold at some instant of that date in some zone, the
+    # evening retrieval instants included; one that ended or starts days away does not.
+    day = date(2026, 9, 16)
+    week = 7 * 24 * 3_600_000_000
+    base: list[tuple[str, str, int, int | None]] = [("AAA.US", "ins-a", -(2**63), None)]
+
+    def scoped(*extra: tuple[str, str, int, int | None]) -> str:
+        return KeyMembers("s", sorted([*base, *extra])).scoped_sha256(day, day + timedelta(days=1))
+
+    unchanged = scoped()
+    # Ended two days before, or starting two days after, the date: never consulted.
+    ended = _instant(datetime(2026, 9, 14, 4, tzinfo=UTC))
+    later = _instant(datetime(2026, 9, 18, 4, tzinfo=UTC))
+    assert scoped(("OLD.US", "ins-b", ended - 2 * week, ended)) == unchanged
+    assert scoped(("LATE.US", "ins-c", later, None)) == unchanged
+    assert scoped(("LATE.US", "ins-c", later, later + 2 * week)) == unchanged
+    # Over the date, open from before it, ending in Seoul's 09-16 before New York's starts,
+    # or starting at a New York retrieval late on 09-16 (03:15 UTC on 09-17).
+    seoul = _instant(datetime(2026, 9, 15, 20, tzinfo=UTC))
+    evening = _instant(datetime(2026, 9, 17, 3, 15, tzinfo=UTC))
+    assert scoped(("NEW.US", "ins-d", ended, later)) != unchanged
+    assert scoped(("NEW.US", "ins-d", ended, None)) != unchanged
+    assert scoped(("NEW.US", "ins-d", seoul - 2 * week, seoul)) != unchanged
+    assert scoped(("NEW.US", "ins-d", evening, None)) != unchanged
+
+
 def test_a_scoped_key_does_not_depend_on_the_order_of_its_rows() -> None:
     day = date(2026, 9, 16)
     hour = 3_600_000_000
@@ -609,13 +637,14 @@ _FROZEN: list[tuple[str, str, int, int | None]] = [
 
 
 def test_the_key_digests_are_frozen() -> None:
-    # aas-maintain-key-scope-v1: sha256 of canonical JSON
-    # ["aas-maintain-key-scope-v1", sha256(canonical(sorted long rows)), sorted inside rows];
+    # aas-maintain-key-scope-v2: sha256 of canonical JSON
+    # ["aas-maintain-key-scope-v2", sha256(canonical(sorted long rows that can hold within
+    # the dates)), sorted inside rows] (here AAA and EEE, BBB having ended a week before);
     # the whole key: sha256 of canonical JSON of every row in the engine's order. The long
     # rows are given in reverse so the scoped digest cannot depend on the caller's order.
     scoped = KeyMembers("s", list(reversed(_FROZEN))).scoped_sha256(date(2026, 9, 16),
                                                                     date(2026, 9, 17))  # fmt: skip
-    assert scoped == "8ce88adbad30b77cd720ed8bbeef836afef7fbcb41b7b237e23445954a9c9cd1"
+    assert scoped == "a36cfbdaf55385085e11040ea8a7265e0cd4000083e72d3434df2b57ac693cd0"
     assert KeyMembers("s", _FROZEN).sha256() == (
         "dc93aa5cb1c7124afe9cd864d8b171151e1b5fe26f4437d048971187d8c53cd6"
     )

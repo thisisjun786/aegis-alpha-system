@@ -82,12 +82,14 @@ whose rows the pinned snapshot left ``unresolved`` or ``ambiguous`` is recorded
 mapper's identity key with; it is planned again once the snapshot a run would pin
 resolves that key with other rows, so a listing registered later reaches its rows. When
 every step of the source has a partition, the record names that scope (``key_scope``,
-the first ``from`` and last ``to``) and the SHA-256 covers the key's long-lived rows and
-only the short ones (valid at most ``SHORT_DAYS`` days, such as a symbol list's per-day
-claims) that can hold at any instant of those dates in any time zone, because a mapper may
+the first ``from`` and last ``to``) and the SHA-256 covers only the key's rows, long-lived
+and short (valid at most ``SHORT_DAYS`` days, such as a symbol list's per-day claims)
+alike, that can hold at any instant of those dates in any time zone, because a mapper may
 resolve at a row's own instant rather than at the start of its date
-(``aas-maintain-key-scope-v1``). A claim registered for a later day then leaves the
-source settled, so daily identity increments do not plan every waiting source again. A
+(``aas-maintain-key-scope-v2``; a record of v1, which took every long-lived row, no longer
+matches and is planned once more). A claim registered for a later day, or a long-lived row
+that starts after the dates or ended before them, then leaves the source settled, so daily
+identity increments do not plan every waiting source again. A
 source of an unpartitioned step whose mapper resolves each row at the local start of its
 partition date (the EODHD daily bars, ``DATED_IDENTITY``) names the scope of its rows'
 partition dates the same way, so a US daily bulk source waits through later days' claims
@@ -154,7 +156,7 @@ if TYPE_CHECKING:
 CHECK_RULE: Final = ("maintain_source", "1")
 UNRESOLVED: Final = "unresolved"
 _LINK: Final = "sl:"
-SCOPE_FORMAT: Final = "aas-maintain-key-scope-v1"
+SCOPE_FORMAT: Final = "aas-maintain-key-scope-v2"
 SHORT_DAYS: Final = 8
 _DAY_US: Final = 86_400_000_000
 _ZONE_US: Final = 14 * 3_600_000_000
@@ -780,44 +782,54 @@ class KeyMembers:
 
     snapshot_id: str
     rows: list[Member]
-    _long: str | None = None
+    _long: list[Member] | None = None
+    _scoped: dict[tuple[date, date], str] = field(default_factory=dict)
     _short: list[Member] | None = None
     _starts: list[int] = field(default_factory=list)
+    _whole: str | None = None
 
     def sha256(self) -> str:
-        """SHA-256 of every row (``key_members_sha256``)."""
-        return hashlib.sha256(formats.canonical([list(row) for row in self.rows])).hexdigest()
+        """SHA-256 of every row (``key_members_sha256``), computed once."""
+        if self._whole is None:
+            rows = [list(row) for row in self.rows]
+            self._whole = hashlib.sha256(formats.canonical(rows)).hexdigest()
+        return self._whole
 
-    def _split(self) -> tuple[str, list[Member]]:
+    def _split(self) -> tuple[list[Member], list[Member]]:
         if self._long is None or self._short is None:
             limit = SHORT_DAYS * _DAY_US
             short = [row for row in self.rows if row[3] is not None and row[3] - row[2] <= limit]
             kept = set(short)
             # Sorted here, not trusted from the caller, so the hash never follows input order.
-            long = [
-                list(row)
-                for row in sorted(
-                    (row for row in self.rows if row not in kept),
-                    key=lambda row: (row[0], row[1], row[2], row[3] is None, row[3] or 0),
-                )
-            ]
-            self._long = hashlib.sha256(formats.canonical(long)).hexdigest()
+            self._long = sorted(
+                (row for row in self.rows if row not in kept),
+                key=lambda row: (row[0], row[1], row[2], row[3] is None, row[3] or 0),
+            )
             self._short = sorted(short, key=lambda row: row[2])
             self._starts = [row[2] for row in self._short]
         return self._long, self._short
 
     def scoped_sha256(self, first: date, stop: date) -> str:
-        """SHA-256 of the long rows and the short rows that can hold at any instant of the
-        dates ``[first, stop)`` in any time zone."""
+        """SHA-256 of the rows, long and short alike, that can hold at any instant of the dates
+        ``[first, stop)`` in any time zone; computed once per scope."""
+        found = self._scoped.get((first, stop))
+        if found is not None:
+            return found
         long, short = self._split()
         low = _utc_start_us(first) - _ZONE_US
         # Any instant of the dates in any zone: a mapper may resolve at a row's retrieval
-        # instant (KIND lists late in the evening), not at the start of its date.
+        # instant (KIND lists late in the evening), not at the start of its date. A row holds
+        # from its start up to its end, so one starting after ``high`` or ending by ``low``
+        # resolves nothing the scope holds.
         high = _utc_start_us(stop) + _ZONE_US
+        held = [list(row) for row in long if row[2] <= high and (row[3] is None or row[3] > low)]
         begin = bisect_left(self._starts, low - SHORT_DAYS * _DAY_US)
         end = bisect_right(self._starts, high)
         inside = sorted(list(row) for row in short[begin:end] if cast("int", row[3]) > low)
-        return hashlib.sha256(formats.canonical([SCOPE_FORMAT, long, inside])).hexdigest()
+        held_sha256 = hashlib.sha256(formats.canonical(held)).hexdigest()
+        digest = hashlib.sha256(formats.canonical([SCOPE_FORMAT, held_sha256, inside])).hexdigest()
+        self._scoped[(first, stop)] = digest
+        return digest
 
     def recorded(self, scope: Mapping[str, str] | None) -> dict[str, object]:
         """The ``identity`` a record names for a source of ``scope`` (None: unpartitioned)."""
@@ -894,14 +906,19 @@ def key_members(
     return KeyMembers(snapshot.snapshot_id, rows)
 
 
-def _resolution(
+def _resolution(  # noqa: PLR0913 -- the template, the run's snapshot and the pass's rows
     workspace: Workspace,
     template: Mapping[str, object],
     mapper_name: str,
     identity: Mapping[str, str] | None,
     identities: SharedInputs,
+    *,
+    members: dict[tuple[object, ...], KeyMembers],
 ) -> KeyMembers | None:
-    """The identity-key members of the snapshot a maintenance spec of ``template`` pins."""
+    """The identity-key members of the snapshot a maintenance spec of ``template`` pins.
+
+    ``members`` keeps each snapshot key's rows for the pass, so their digests are computed
+    once however many datasets and records use them."""
     pinned = cast("dict[str, str] | None", template.get("identity_snapshot"))
     if pinned is None:
         return None
@@ -910,7 +927,10 @@ def _resolution(
     key = mapper(mapper_name).identity(args)
     if key is None:
         return None
-    return key_members(workspace, snapshot, key, identities)
+    found = (snapshot["snapshot_id"], snapshot["content_hash"], key.pairs())
+    if found not in members:
+        members[found] = key_members(workspace, snapshot, key, identities)
+    return members[found]
 
 
 def _template(
@@ -1348,6 +1368,7 @@ def _promote_routes(  # noqa: PLR0913 -- the pass's explicit inputs
     linked = _linked(workspace)
     shas = {str(row["source_id"]): str(row["sha256"]) for row in list_sources(workspace)}
     runs: list[DatasetRun] = []
+    members: dict[tuple[object, ...], KeyMembers] = {}
     for route in routes:
         for dataset_id in _datasets(workspace, route.dataset_id):
             run = DatasetRun(dataset_id, route.mapper)
@@ -1360,7 +1381,9 @@ def _promote_routes(  # noqa: PLR0913 -- the pass's explicit inputs
             resolution = (
                 None
                 if found is None
-                else _resolution(workspace, found[2], run.mapper, identity, identities)
+                else _resolution(
+                    workspace, found[2], run.mapper, identity, identities, members=members
+                )
             )
             done, waiting = _done(workspace, dataset_id, resolution)
             pending = candidates(workspace, route, linked, shas, run.skipped, done=done)

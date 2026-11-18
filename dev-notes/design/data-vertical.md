@@ -1780,8 +1780,8 @@ template의 snapshot을 그대로 쓴다. US의 Norgate master, FMP profile, SEC
   해석된다). 나머지(ISIN 없는 새 상장, 무효·반복 ISIN, 이동·앞 보유자 없음 등)는 `unresolved`로 사유와 함께
   남는다. ISIN이 있는 새 상장은 위 ISIN anchor 규칙으로 등록되므로 미해결 사유에 남지 않는다.
   보고의 `unresolved_classes`(사유→종류→날 수)와 `unresolved_dispositions`(처리→사유→날 수)가 이를 담는다.
-- 8일보다 긴 공백을 잇는 claim은 짧은 행(8일 이하)이 아니라 긴 행이므로, 그런 claim이 생기면 기다리던 모든
-  `unresolved` 원천이 한 번 다시 계획되고(보류 세션의 따라잡기), 그 뒤의 하루 claim은 다시 계획을 부르지 않는다.
+- 8일보다 긴 공백을 잇는 claim은 짧은 행(8일 이하)이 아니라 긴 행이므로, 그런 claim이 생기면 그 claim이 걸친
+  날짜의 `unresolved` 원천이 한 번 다시 계획되고(보류 세션의 따라잡기), 그 뒤의 하루 claim은 다시 계획을 부르지 않는다.
 
 `aas identity us-build`는 등록된 목록 claim을 다시 만들지 않고 읽어 master·export claim과 함께 FMP·SEC 행을 판정하는
 구간으로 쓴다(마지막 목록 날 뒤는 `fmp_after_symbol_list`). 그래서 `check_registered`는 그 원천을 요구하지 않고
@@ -1885,8 +1885,10 @@ generation, 결과 `promoted`·`unchanged`)를 남긴다. 검사 ID는 (dataset,
 매퍼 identity key(provider, namespace)로 그 snapshot이 해석에 쓰는 행(정정되지 않은 member의 token, instrument,
 유효 구간)의 SHA-256을 함께 남긴다. 그 원천은 실행이 pin할 snapshot의 그 행이 달라지면 다시 계획되므로 뒤에 등록된 상장이 해석하는 행이
 빠지지 않는다. 원천의 모든 단계에 partition이 있으면 기록은 그 범위(`key_scope`, 첫 `from`과 마지막 `to`)를
-남기고, SHA-256은 key의 긴 행과 짧은 행(유효 구간이 8일 이하, 목록의 하루 claim 같은) 중 어느 시간대에서든 그
-날짜들의 **어느 시각에든** 성립할 수 있는 것만 덮는다(`aas-maintain-key-scope-v1`). 매퍼가 날짜의 시작이 아니라 행의
+남기고, SHA-256은 key의 긴 행과 짧은 행(유효 구간이 8일 이하, 목록의 하루 claim 같은)을 가리지 않고 어느 시간대에서든 그
+날짜들의 **어느 시각에든** 성립할 수 있는 것만 덮는다(`aas-maintain-key-scope-v2`). 긴 행도 그 날짜들 뒤에 시작하거나 그 앞에
+끝났으면 덮지 않는다. 긴 행을 모두 덮던 `aas-maintain-key-scope-v1` 기록은 SHA-256이 달라 한 번 더 계획되고 v2로 다시
+기록된다. 매퍼가 날짜의 시작이 아니라 행의
 수집 시각에 해석할 수 있기 때문이다(예: 서울 23:30에 받은 KIND 목록). 그래서 바로 다음 날의 claim은 그 원천을 한 번 더
 계획하게 하고, 그보다 뒤의 claim은 그러지 않는다. 그래서 뒤 날짜의 claim이 등록돼도
 그 원천은 다시 계획되지 않고, 매일의 identity 증분이 기다리는 모든 원천을 다시 계획하지 않는다. 범위가 없는
@@ -2280,9 +2282,14 @@ ISIN이 Norgate 상품에 이어진다([유지보수 실행](#유지보수-실�
 - `verify_generation_bulk`는 chain의 모든 marker link를 기록된 hash로 다시 계산하고, 대상 generation의
   행만 다시 해시하며 그 앞 head에 대한 revision 규칙을 검사한다. `deep=True`는 모든 delta를 다시 해시한다.
 - chain marker는 pin한 dataset의 해당 sequence까지 한 쿼리로 읽고 실제 parent 링크를 따라간다.
-  승격의 head 조회와 대량 revision 검사는 조상 ID를 JSON 문자열 하나로 전달해 DuckDB 안에서 배열로
+  대량 revision 검사는 조상 ID를 JSON 문자열 하나로 전달해 DuckDB 안에서 배열로
   해석한다. generation마다 SQL을 호출하거나 Python 배열 원소마다 타입을 판별하는 비용을 없애며,
-  저장 형식·hash·revision 규칙과 모든 chain link 검증은 유지한다.
+  저장 형식·hash·revision 규칙과 모든 chain link 검증은 유지한다. 승격의 chain 조회(head, 참조,
+  부분 응답 행 수)는 조상 ID를 SQL 문자열 상수 목록으로 쓴다(`engine._in_chain`). DuckDB는 상수일 때만
+  `generation_id` zone map으로 다른 generation의 행그룹을 건너뛰고, 바인딩하거나 unnest한 목록이면 도메인의
+  모든 행그룹·모든 열을 읽은 뒤 거른다(사본의 `prices` 2억 6천만 행에서 승격 1건의 head 조회가 42 GB에서
+  1–2.5 GB로 준다). `cross_provider_mismatch`의 기준 head는 delta의 instrument와 세션의 것만 읽고,
+  기준 pin은 한 패스에서 한 번만 검증한다.
 - 대량 COMMIT의 예외만으로 게시되지 않았다고 판단하지 않는다. 먼저 ROLLBACK하고 새 읽기 트랜잭션에서
   dataset head와 marker를 다시 읽는다. 계획과 같은 marker·행·flag가 검증되면 그 generation을 반환하고
   승격은 catalog 완료를 계속한다. marker도 행·flag도 없을 때만 취소를 증명하고 원래 오류를 전파한다.
@@ -3387,7 +3394,7 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-532 | 앞선 실행이 거부한 관측은 뒤 실행의 bridge에 대한 거부권으로 다시 읽힌다 | `tests/storage/test_us_symbols.py::test_an_earlier_run_s_rejected_rows_still_veto_a_later_bridge` | 구현 |
 | DV-533 | 무작위 시나리오에서 한 번의 build는 목록 순서와 무관하고, 다른 상품·다른 심볼 관측이 있는 날이나 다른 상품의 등록 claim을 덮지 않으며, 모든 claim이 등록·수용 claim에서 이어진다 | `tests/storage/test_us_symbol_invariants.py::test_batch_builds_are_order_free_and_safe` | 구현 |
 | DV-534 | 덮는 날 순서로 한 실행씩 도착한 목록으로 유지보수 identity 단계가 등록하는 claim은 한 번의 build와 같다 | `tests/storage/test_us_symbol_invariants.py::test_run_by_run_maintenance_registers_what_one_build_finds` | 구현 |
-| DV-535 | `aas-maintain-key-scope-v1`(범위 key)와 key 전체의 SHA-256은 고정된 기대값을 가진다 | `tests/storage/test_maintain_promotion.py::test_the_key_digests_are_frozen` | 구현 |
+| DV-535 | `aas-maintain-key-scope-v2`(범위 key)와 key 전체의 SHA-256은 고정된 기대값을 가진다 | `tests/storage/test_maintain_promotion.py::test_the_key_digests_are_frozen` | 구현 |
 | DV-536 | 이력만 있는 KR chain의 경고 bulk 테이블은 유지보수가 이력 명세에서 파생한 template으로 `provider_reported_partial` flag와 `partition_row_count@1`을 남기며 승격하고, 다시 실행하면 아무것도 쓰지 않는다(`.ref` 포함) | `tests/storage/test_maintain_promotion.py::test_a_warned_kr_bulk_day_continues_a_chain_only_the_history_built` | 구현 |
 | DV-537 | 파생 template으로 만든 KR bulk 유지보수 명세는 `aas data kr-prices`가 같은 날 bulk 단계에 쓰는 명세와 같다 | `tests/storage/test_maintain_promotion.py::test_a_derived_bulk_spec_is_the_one_kr_prices_writes_for_that_day` | 구현 |
 | DV-538 | chain에 bulk generation이 있으면 파생하지 않고 그 명세를 template으로 쓴다 | `tests/storage/test_maintain_promotion.py::test_a_chain_with_a_bulk_generation_continues_from_it_without_deriving` | 구현 |
@@ -3480,3 +3487,5 @@ checksum은 테스트에 기록된 값으로 고정된다.
 | DV-625 | tombstone 범위가 없는 승격의 head 비교는 원천이 가진 `record_id`로 chain 행을 먼저 거른 뒤 순위를 매긴다(계획에서 원천 행 표 읽기가 집계 아래에 있다) | `tests/storage/test_promotion_engine.py::test_the_head_diff_keeps_the_source_records_before_ranking_the_chain` | 구현 |
 | DV-626 | `sec.companyfacts@1`의 filings 참조는 head의 `filing_id`·`accepted_at_us`와 두 시점 열만 싣는다 | `tests/storage/test_sec_promotion.py::test_facts_hold_only_each_filing_acceptance_of_the_filings_head` | 구현 |
 | DV-627 | 유지보수 promote 단계는 DuckDB 메모리 한도를 `PROMOTE_MEMORY_BYTES` 이하로 낮춘 채 원천을 계획·게시하고 끝나면 연결을 설치본의 한도(`reset_market_limits`)로 되돌린다 | `tests/storage/test_maintain_promotion.py::test_a_pass_promotes_under_the_lower_duckdb_limit_and_the_limit_is_restored` | 구현 |
+| DV-628 | 범위 key의 SHA-256은 그 날짜들의 어느 시각에도 성립할 수 없는 긴 행(앞서 끝났거나 뒤에 시작하는)으로는 바뀌지 않고, 성립할 수 있는 긴 행(서울·뉴욕 저녁 시각 포함)으로는 바뀐다 | `tests/storage/test_maintain_promotion.py::test_a_scoped_key_covers_the_long_rows_that_can_hold_within_its_dates_and_no_other` | 구현 |
+| DV-629 | `aas-maintain-key-scope-v1`로 기록된 대기 원천은 오류 없이 한 번 다시 계획되어 새 게시 없이 v2로 기록되고, 그다음 실행에서는 계획되지 않는다 | `tests/storage/test_us_symbols.py::test_a_record_of_the_first_scope_format_is_planned_once_more_then_settles` | 구현 |

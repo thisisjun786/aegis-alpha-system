@@ -321,10 +321,15 @@ contract. This is a new embedded implementation, not a port of retired SQLite.
   cross-dataset parents and invalid sequence bounds are refused. Callers still verify
   every chain hash and the same delta/revision rules; batching removes per-ancestor SQL
   round trips without a persistent cache, schema change or weakened verification.
-  Bulk revision checks and promotion head queries bind ancestry as one JSON string,
-  decoded to `VARCHAR[]` inside DuckDB. This is only parameter transport, not a stored
-  format: it preserves escaped IDs and avoids per-ID Python scalar-type discovery in
-  the driver. Direct Python lists make repeated plan/apply checks grow with the chain.
+  Bulk revision checks bind ancestry as one JSON string, decoded to `VARCHAR[]` inside
+  DuckDB. This is only parameter transport, not a stored format: it preserves escaped IDs
+  and avoids per-ID Python scalar-type discovery in the driver. Direct Python lists make
+  repeated plan/apply checks grow with the chain. Promotion chain queries (heads,
+  references, partition counts) name the chain as SQL string literals instead
+  (`engine._in_chain`), because DuckDB skips row groups by their `generation_id` zone maps
+  only for constants; a bound or unnested list reads every row group of the domain, every
+  column, before filtering. A cross-provider rule reads only the reference heads of the
+  delta's instruments and sessions.
 - `source_identity` owns the content source ID (`aas-source-id-v1` over the raw
   addresses, sizes and hashes of the original files plus the output schema major)
   and the `sl:` link. Loader code and transform hashes go to `metadata.lineage`,

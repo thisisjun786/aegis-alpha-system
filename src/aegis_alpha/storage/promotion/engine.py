@@ -271,24 +271,33 @@ def _verify_pin(
     ]
 
 
-def _heads_sql(domain: str, records: str | None = None) -> str:
-    """Every record's head over a chain bound as one JSON string array.
+def _in_chain(chain: Sequence[str]) -> str:
+    """``p.generation_id`` is one of ``chain``, named as SQL string literals.
 
-    A scalar binding avoids the driver's per-element Python type discovery on long
-    ancestry lists; DuckDB decodes exactly the same IDs before projecting the heads.
-
-    ``records`` (a query of record IDs) keeps only those records' heads. It filters the
-    rows before they are ranked: the rank partitions by record, so a dropped record never
-    changes another's head, while DuckDB does not move a filter over the ranked result
-    below the ranking and would rank the whole chain first.
+    DuckDB skips a row group whose ``generation_id`` zone map holds none of the constants, so
+    a chain query reads its own generations' row groups; a bound or unnested list leaves every
+    row group of the domain, every column, to be read before the filter.
     """
-    kept = "" if records is None else f" AND p.record_id IN ({records})"
+    if not chain:
+        return "false"
+    return f"p.generation_id IN ({', '.join(formats.sql_literal(item) for item in chain)})"
+
+
+def _heads_sql(domain: str, chain: Sequence[str], kept: str | None = None) -> str:
+    """Every record's head over ``chain`` (see ``_in_chain``).
+
+    ``kept`` (a condition on ``p`` testing only the record ID or natural-key columns, which
+    every revision of a record shares) keeps only the heads of the records it holds for. It
+    filters the rows before they are ranked: the rank partitions by record, so a dropped
+    record never changes another's head, while DuckDB does not move a filter over the ranked
+    result below the ranking and would rank the whole chain first.
+    """
+    kept = "" if kept is None else f" AND {kept}"
     return (
         "SELECT * EXCLUDE (_aas_rank) FROM (SELECT p.*, row_number() OVER "
         "(PARTITION BY p.record_id ORDER BY g.sequence DESC) AS _aas_rank "
         f"FROM {_q(domain)} p JOIN market_generations g ON g.generation_id = p.generation_id "
-        f"WHERE p.generation_id IN (SELECT unnest(?::JSON::VARCHAR[])){kept}) "
-        "WHERE _aas_rank = 1"
+        f"WHERE {_in_chain(chain)}{kept}) WHERE _aas_rank = 1"
     )
 
 
@@ -508,20 +517,25 @@ def _identity(
             rows.close()
 
 
-def _calendars(workspace: Workspace, spec: PromotionSpec, budget: ComputeBudget) -> dict[int, str]:
+def _calendars(
+    workspace: Workspace,
+    spec: PromotionSpec,
+    budget: ComputeBudget,
+    shared: SharedInputs | None = None,
+) -> dict[int, str]:
     """Load each calendar rule's pinned sessions; map the time column index to its table."""
     tables: dict[int, str] = {}
     for index, column in enumerate(TIME_COLUMNS):
         rule = spec.time_rules[column]
         if rule.calendar is None:
             continue
-        chain = _verify_pin(workspace, rule.calendar, budget)
+        chain = _verify_pin(workspace, rule.calendar, budget, shared)
         name = _t(f"cal{index}")
         workspace.market.execute(
             f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT session_date, open_at_us, close_at_us "
-            f"FROM ({_heads_sql('calendar_sessions')}) WHERE op <> 'TOMBSTONE' "
+            f"FROM ({_heads_sql('calendar_sessions', chain)}) WHERE op <> 'TOMBSTONE' "
             "AND calendar_id = ? AND venue = ?",
-            [json.dumps(chain), rule.args["calendar_id"], rule.args["venue"]],
+            [rule.args["calendar_id"], rule.args["venue"]],
         )
         tables[index] = name
     return tables
@@ -579,15 +593,12 @@ def _load_reference(
             f"{', '.join('p.' + column for column in columns.split(', '))}, "
             "g.sequence AS _aas_sequence, p.op, p.record_id, p.revision_id "
             f"FROM {_q(reference.domain)} p JOIN market_generations g "
-            "ON g.generation_id = p.generation_id "
-            "WHERE p.generation_id IN (SELECT unnest(?::JSON::VARCHAR[]))",
-            [json.dumps(chain)],
+            f"ON g.generation_id = p.generation_id WHERE {_in_chain(chain)}"
         )
         return
     workspace.market.execute(
         f"CREATE OR REPLACE TEMP TABLE {table} AS SELECT {columns} "
-        f"FROM ({_heads_sql(reference.domain)}) WHERE op <> 'TOMBSTONE'",
-        [json.dumps(chain)],
+        f"FROM ({_heads_sql(reference.domain, chain)}) WHERE op <> 'TOMBSTONE'"
     )
 
 
@@ -993,11 +1004,12 @@ def _diff(
         # A full snapshot also needs the heads its scope holds that the source lacks.
         scope = _scope_sql(workspace, spec, "p")
         heads = (
-            f"SELECT * FROM ({_heads_sql(domain)}) p WHERE p.record_id IN ({records}) OR ({scope})"
+            f"SELECT * FROM ({_heads_sql(domain, chain)}) p "
+            f"WHERE p.record_id IN ({records}) OR ({scope})"
         )
     else:
-        heads = _heads_sql(domain, records)
-    market.execute(f"CREATE OR REPLACE TEMP TABLE {_t('head')} AS {heads}", [json.dumps(chain)])
+        heads = _heads_sql(domain, chain, f"p.record_id IN ({records})")
+    market.execute(f"CREATE OR REPLACE TEMP TABLE {_t('head')} AS {heads}")
     op = (
         "CASE WHEN h.record_id IS NULL THEN 'ASSERT' WHEN h.op = 'TOMBSTONE' THEN 'SUPERSEDE' "
         f"WHEN {_comparison(domain, fields=fields, mapped_fields=mapped_fields)} THEN 'SKIP' "
@@ -1215,12 +1227,14 @@ def _has_fields(market: duckdb.DuckDBPyConnection) -> bool:
     return "fields" in _columns(market, _t("head"))
 
 
-def _flags(
+def _flags(  # noqa: PLR0913 -- the plan's flags and the pass's shared inputs
     workspace: Workspace,
     spec: PromotionSpec,
     flags: list[_Flag],
     budget: ComputeBudget,
     refusals: list[str],
+    *,
+    shared: SharedInputs | None = None,
 ) -> dict[str, int]:
     """Write ``_aas_p_flags``, one row per (revision, rule, flag) with the columns it names.
 
@@ -1228,7 +1242,9 @@ def _flags(
     instrument, session, interval, bar end, basis and currency (the price key without the
     role, which differs between a canonical and a reference dataset), so an adjusted
     reference never judges an unadjusted value and a row matches at most one reference.
-    A flag key repeated within the delta is refused before anything is prepared.
+    A flag key repeated within the delta is refused before anything is prepared. Only the
+    reference heads of the delta's instruments and sessions are read, and with ``shared``
+    each reference pin is verified once per pass.
     """
     market = workspace.market
     groups: dict[tuple[str, str, str], list[_Flag]] = {}
@@ -1255,13 +1271,19 @@ def _flags(
             f"{detail} AS detail FROM {_t('delta')} WHERE {anyone}"
         )
     for rule in spec.quality_rules:
-        chain = _verify_pin(workspace, rule.reference, budget)
+        chain = _verify_pin(workspace, rule.reference, budget, shared)
         column = _q(rule.column)
         keys = ", ".join(_q(name) for name in _COMPARED_KEYS)
+        # A delta row matches a reference row of its own instrument and session only; both
+        # are NOT NULL key columns, so the filter drops whole records and nothing that matches.
+        within = " AND ".join(
+            f"p.{_q(name)} IN (SELECT {_q(name)} FROM {_t('delta')})"
+            for name in ("instrument_id", "session_date")
+        )
         market.execute(
             f"CREATE OR REPLACE TEMP TABLE {_t('ref')} AS SELECT {keys}, {column} AS v "
-            f"FROM ({_heads_sql('prices')}) WHERE op <> 'TOMBSTONE' AND value_state = 'present'",
-            [json.dumps(chain)],
+            f"FROM ({_heads_sql('prices', chain, within)}) "
+            "WHERE op <> 'TOMBSTONE' AND value_state = 'present'"
         )
         tolerance = f"CAST('{rule.tolerance}' AS DECIMAL(38,12))"
         same = " AND ".join(
@@ -1339,14 +1361,14 @@ def _partition_check(
                 "row_number() OVER (PARTITION BY p.record_id ORDER BY g.sequence DESC) "
                 f"AS _aas_rank FROM {_q(spec.domain)} p JOIN market_generations g "
                 "ON g.generation_id = p.generation_id "
-                "WHERE p.generation_id IN (SELECT unnest(?::JSON::VARCHAR[])) "
+                f"WHERE {_in_chain(chain)} "
                 f"AND p.{day} >= ?::DATE - INTERVAL {_REFERENCE_LOOKBACK_DAYS} DAY "
                 f"AND p.{day} <= ?::DATE) h "
                 "WHERE _aas_rank = 1 AND op <> 'TOMBSTONE' GROUP BY 1 "
                 "HAVING NOT bool_or(EXISTS (SELECT 1 FROM quality_flags f "
                 "WHERE f.generation_id = h.generation_id AND f.record_id = h.record_id "
                 "AND f.revision_id = h.revision_id AND f.flag = ?)) ORDER BY 1",
-                [json.dumps(chain), found[0][0], found[-1][0], PARTIAL_FLAG],
+                [found[0][0], found[-1][0], PARTIAL_FLAG],
             ).fetchall()
         ]
     dates = []
@@ -1600,7 +1622,7 @@ def plan_promotion(
         plan.blocking.append("quality flags need core schema v2; run aas db migrate --to 2")
     sources = _sources(workspace, spec, plan)
     _identity(workspace, spec, plan, budget, identities)
-    calendars = _calendars(workspace, spec, budget)
+    calendars = _calendars(workspace, spec, budget, identities)
     _references(workspace, spec, budget, identities)
     decimal_rules.install(market)
     _stage_sources(workspace, spec, sources, plan)
@@ -1623,7 +1645,9 @@ def plan_promotion(
     time_flags = _delta(
         workspace, spec, sources, flags, stage_fields=stage_fields, mapped_fields=fields
     )
-    flag_counts = _flags(workspace, spec, flags + time_flags, budget, plan.refusals)
+    flag_counts = _flags(
+        workspace, spec, flags + time_flags, budget, plan.refusals, shared=identities
+    )
     operations = {
         str(op): int(count)
         for op, count in market.execute(

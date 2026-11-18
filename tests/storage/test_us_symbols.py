@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Iterator
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -24,7 +24,13 @@ from aegis_alpha.storage.identity import (
     snapshot_identities,
 )
 from aegis_alpha.storage.kr_identity import UNBOUNDED, SourceRows, eodhd_unit, import_unit
-from aegis_alpha.storage.maintain_promotion import Route, promote_datasets, standing_unresolved
+from aegis_alpha.storage.maintain_promotion import (
+    KeyMembers,
+    Route,
+    promote_datasets,
+    standing_unresolved,
+)
+from aegis_alpha.storage.promotion import formats
 from aegis_alpha.storage.promotion.engine import promote
 from aegis_alpha.storage.us_identity import (
     UsRegistry,
@@ -794,6 +800,49 @@ def test_an_unpartitioned_waiting_source_is_planned_again_only_for_a_claim_over_
     assert later["replanned_waiting"] == none
 
 
+def _scoped_v1(members: KeyMembers, first: date, stop: date) -> str:
+    """``aas-maintain-key-scope-v1``: every long row of the key and the short rows that can
+    hold at an instant of the dates in some zone."""
+    day, zone = 86_400_000_000, 14 * 3_600_000_000
+    short = [row for row in members.rows if row[3] is not None and row[3] - row[2] <= 8 * day]
+    long = [list(row) for row in members.rows if row not in short]
+    low, high = (
+        _us(datetime.combine(first, time(), UTC)) - zone,
+        _us(datetime.combine(stop, time(), UTC)) + zone,
+    )
+    inside = sorted(list(row) for row in short if row[2] <= high and cast("int", row[3]) > low)
+    long.sort(key=lambda row: (row[0], row[1], row[2], row[3] is None, row[3] or 0))
+    whole = hashlib.sha256(formats.canonical(long)).hexdigest()
+    return hashlib.sha256(
+        formats.canonical(["aas-maintain-key-scope-v1", whole, inside])
+    ).hexdigest()
+
+
+def test_a_record_of_the_first_scope_format_is_planned_once_more_then_settles(
+    ws: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _bars(ws, TUE, "AAA.US")
+    cutover = _register_base(ws, first["source_id"])
+    template = spec([first], cutover, dataset="prices.us.eodhd", decimals=FLOATS,
+                    rules={"available_at_us": DAY_RULE, "revision_known_at_us": DAY_RULE},
+                    mapper={"name": "eodhd.bars@1", "args": {"timezone": NEW_YORK}})  # fmt: skip
+    assert promote(ws, *template, apply=True)["published"] is True
+    waiting = _bars(ws, WED, "AAA.US", "NEW.US")
+    with monkeypatch.context() as patched:
+        patched.setattr(KeyMembers, "scoped_sha256", _scoped_v1)
+        held = promote_datasets(ws, apply=True, now_us=10, routes=[ROUTE], identity=cutover)
+    assert (waiting["source_id"], "unresolved") in _sources(held)
+    # Under the current format the stored digest differs: planned again once, nothing new
+    # published, and recorded under the current format.
+    again = promote_datasets(ws, apply=True, now_us=20, routes=[ROUTE], identity=cutover)
+    assert _sources(again) == [(waiting["source_id"], "unresolved")]
+    assert again["replanned_waiting"] == {"sources": 1, "reasons": {"scoped_key_changed": 1}}
+    (source,) = cast("list[dict[str, object]]", _run(again)["sources"])
+    assert not any(step["published"] for step in cast("list[dict[str, object]]", source["steps"]))
+    settled = promote_datasets(ws, apply=True, now_us=30, routes=[ROUTE], identity=cutover)
+    assert (_run(settled)["status"], _run(settled)["sources"]) == ("current", [])
+
+
 def test_a_dated_scope_publishes_what_planning_every_waiting_source_again_publishes(
     ws: Workspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -819,6 +868,40 @@ def test_a_dated_scope_publishes_what_planning_every_waiting_source_again_publis
         assert whole[-1]["replanned_waiting"] == {"sources": 1, "reasons": {"key_changed": 1}}
         assert _sources(scoped[-1]) == []
         assert published(ws) == published(other)
+
+
+def test_a_pass_hashes_a_keys_members_once_for_every_waiting_record(
+    ws: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _bars(ws, TUE, "AAA.US")
+    cutover = _register_base(ws, first["source_id"])
+    template = spec([first], cutover, dataset="prices.us.eodhd", decimals=FLOATS,
+                    rules={"available_at_us": DAY_RULE, "revision_known_at_us": DAY_RULE},
+                    mapper={"name": "eodhd.bars@1", "args": {"timezone": NEW_YORK}})  # fmt: skip
+    assert promote(ws, *template, apply=True)["published"] is True
+    for day in (WED, THU, FRI):
+        _bars(ws, day, "NEW.US")
+    # Records without a scope compare the whole key's SHA-256, one per waiting source.
+    monkeypatch.setattr(maintain_promotion, "DATED_IDENTITY", frozenset())
+    held = promote_datasets(ws, apply=True, now_us=10, routes=[ROUTE], identity=cutover)
+    # The operator's source is recorded unchanged; the three waiting ones unresolved.
+    assert [status for _, status in _sources(held)] == ["unchanged"] + ["unresolved"] * 3
+    hashed: list[object] = []
+    canonical = maintain_promotion.formats.canonical
+
+    def counted(value: object) -> bytes:
+        if (
+            isinstance(value, list)
+            and value
+            and all(isinstance(row, list) and len(row) == 4 for row in value)
+        ):
+            hashed.append(value)
+        return canonical(value)
+
+    monkeypatch.setattr(maintain_promotion.formats, "canonical", counted)
+    settled = promote_datasets(ws, apply=True, now_us=20, routes=[ROUTE], identity=cutover)
+    assert (_run(settled)["status"], _run(settled)["sources"]) == ("current", [])
+    assert len(hashed) == 1
 
 
 def test_two_maintenance_runs_of_rejected_lists_register_nothing(ws: Workspace) -> None:
