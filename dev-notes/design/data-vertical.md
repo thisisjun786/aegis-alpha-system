@@ -2280,9 +2280,14 @@ ISIN이 Norgate 상품에 이어진다([유지보수 실행](#유지보수-실�
 - `verify_generation_bulk`는 chain의 모든 marker link를 기록된 hash로 다시 계산하고, 대상 generation의
   행만 다시 해시하며 그 앞 head에 대한 revision 규칙을 검사한다. `deep=True`는 모든 delta를 다시 해시한다.
 - chain marker는 pin한 dataset의 해당 sequence까지 한 쿼리로 읽고 실제 parent 링크를 따라간다.
-  승격의 head 조회와 대량 revision 검사는 조상 ID를 JSON 문자열 하나로 전달해 DuckDB 안에서 배열로
+  대량 revision 검사는 조상 ID를 JSON 문자열 하나로 전달해 DuckDB 안에서 배열로
   해석한다. generation마다 SQL을 호출하거나 Python 배열 원소마다 타입을 판별하는 비용을 없애며,
-  저장 형식·hash·revision 규칙과 모든 chain link 검증은 유지한다.
+  저장 형식·hash·revision 규칙과 모든 chain link 검증은 유지한다. 승격의 chain 조회(head, 참조,
+  부분 응답 행 수)는 조상 ID를 SQL 문자열 상수 목록으로 쓴다(`engine._in_chain`). DuckDB는 상수일 때만
+  `generation_id` zone map으로 다른 generation의 행그룹을 건너뛰고, 바인딩하거나 unnest한 목록이면 도메인의
+  모든 행그룹·모든 열을 읽은 뒤 거른다(사본의 `prices` 2억 6천만 행에서 승격 1건의 head 조회가 42 GB에서
+  1–2.5 GB로 준다). `cross_provider_mismatch`의 기준 head는 delta의 instrument와 세션의 것만 읽고,
+  기준 pin은 한 패스에서 한 번만 검증한다.
 - 대량 COMMIT의 예외만으로 게시되지 않았다고 판단하지 않는다. 먼저 ROLLBACK하고 새 읽기 트랜잭션에서
   dataset head와 marker를 다시 읽는다. 계획과 같은 marker·행·flag가 검증되면 그 generation을 반환하고
   승격은 catalog 완료를 계속한다. marker도 행·flag도 없을 때만 취소를 증명하고 원래 오류를 전파한다.

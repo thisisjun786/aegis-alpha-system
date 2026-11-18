@@ -265,8 +265,7 @@ def test_the_head_diff_keeps_the_source_records_before_ranking_the_chain(
             if str(message).startswith(prefix)
         ]
         tree = ws.market.execute(
-            "EXPLAIN (FORMAT json) " + statement.removeprefix(prefix),
-            [json.dumps([str(first["generation_id"])])],
+            "EXPLAIN (FORMAT json) " + statement.removeprefix(prefix)
         ).fetchall()[0][1]
     finally:
         ws.market.execute("CALL disable_logging()")
@@ -274,6 +273,55 @@ def test_the_head_diff_keeps_the_source_records_before_ranking_the_chain(
     scans = [scan for root in json.loads(tree) for scan in _scans_below(root)]
     # The source's records filter the chain's rows before the ranking aggregates them.
     assert [ranked for table, ranked in scans if table.endswith(engine._t("rows"))] == [True]  # noqa: SLF001
+
+
+def _scan_filters(node: dict[str, object]) -> list[tuple[str, str]]:
+    """Each scanned table of an EXPLAIN (FORMAT json) tree and the filters its scan applies."""
+    found = []
+    if str(node["name"]) == "SEQ_SCAN":
+        info = cast("dict[str, object]", node["extra_info"])
+        found.append((str(info["Table"]), json.dumps(info.get("Filters", ""))))
+    for child in cast("list[dict[str, object]]", node["children"]):
+        found += _scan_filters(child)
+    return found
+
+
+def test_the_head_diff_scan_skips_other_generations_by_their_chain_constants(
+    ws: Workspace,
+) -> None:
+    first_pin, identity = _setup(
+        ws, [bar("AAA.KO", D1, 100.0, retrieved=LATE), bar("BBB.KQ", D1, 50.0, retrieved=LATE)]
+    )
+    first = _apply(ws, spec([first_pin], identity))
+    second_pin = add_source(
+        ws, [bar("AAA.KO", D1, 101.0, retrieved=LATER)], tag="b", linked=at("2025-01-21T00:00:00")
+    )
+    raw, sha256 = spec([second_pin], identity, parent=str(first["generation_id"]))
+    ws.market.execute("CALL enable_logging('QueryLog')")
+    try:
+        engine.plan_promotion(ws, parse_spec(raw, sha256))
+        prefix = f"CREATE OR REPLACE TEMP TABLE {engine._t('head')} AS "  # noqa: SLF001
+        (statement,) = [
+            str(message)
+            for (message,) in ws.market.execute(
+                "SELECT message FROM duckdb_logs WHERE type = 'QueryLog' ORDER BY timestamp"
+            ).fetchall()
+            if str(message).startswith(prefix)
+        ]
+        tree = ws.market.execute(
+            "EXPLAIN (FORMAT json) " + statement.removeprefix(prefix)
+        ).fetchall()[0][1]
+    finally:
+        ws.market.execute("CALL disable_logging()")
+        engine._drop(ws.market)  # noqa: SLF001 -- the plan's temp tables
+    scans = [scan for root in json.loads(tree) for scan in _scan_filters(root)]
+    # The domain scan itself tests the chain's IDs, so DuckDB can skip row groups by their
+    # generation_id zone maps instead of reading every row group of the domain.
+    assert [
+        str(first["generation_id"]) in filters and "generation_id" in filters
+        for table, filters in scans
+        if table.endswith(".prices")
+    ] == [True]
 
 
 def test_tombstone_requires_full_snapshot_policy(ws: Workspace) -> None:
