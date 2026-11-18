@@ -821,6 +821,40 @@ def test_a_dated_scope_publishes_what_planning_every_waiting_source_again_publis
         assert published(ws) == published(other)
 
 
+def test_a_pass_hashes_a_keys_members_once_for_every_waiting_record(
+    ws: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _bars(ws, TUE, "AAA.US")
+    cutover = _register_base(ws, first["source_id"])
+    template = spec([first], cutover, dataset="prices.us.eodhd", decimals=FLOATS,
+                    rules={"available_at_us": DAY_RULE, "revision_known_at_us": DAY_RULE},
+                    mapper={"name": "eodhd.bars@1", "args": {"timezone": NEW_YORK}})  # fmt: skip
+    assert promote(ws, *template, apply=True)["published"] is True
+    for day in (WED, THU, FRI):
+        _bars(ws, day, "NEW.US")
+    # Records without a scope compare the whole key's SHA-256, one per waiting source.
+    monkeypatch.setattr(maintain_promotion, "DATED_IDENTITY", frozenset())
+    held = promote_datasets(ws, apply=True, now_us=10, routes=[ROUTE], identity=cutover)
+    # The operator's source is recorded unchanged; the three waiting ones unresolved.
+    assert [status for _, status in _sources(held)] == ["unchanged"] + ["unresolved"] * 3
+    hashed: list[object] = []
+    canonical = maintain_promotion.formats.canonical
+
+    def counted(value: object) -> bytes:
+        if (
+            isinstance(value, list)
+            and value
+            and all(isinstance(row, list) and len(row) == 4 for row in value)
+        ):
+            hashed.append(value)
+        return canonical(value)
+
+    monkeypatch.setattr(maintain_promotion.formats, "canonical", counted)
+    settled = promote_datasets(ws, apply=True, now_us=20, routes=[ROUTE], identity=cutover)
+    assert (_run(settled)["status"], _run(settled)["sources"]) == ("current", [])
+    assert len(hashed) == 1
+
+
 def test_two_maintenance_runs_of_rejected_lists_register_nothing(ws: Workspace) -> None:
     # Each run reads only its own new list: Thursday's run never takes Wednesday's
     # rejected rows as the earlier end, so a hostile pair of lists cannot rebind AAA to B

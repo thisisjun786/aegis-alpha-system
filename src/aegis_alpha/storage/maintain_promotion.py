@@ -783,10 +783,14 @@ class KeyMembers:
     _long: str | None = None
     _short: list[Member] | None = None
     _starts: list[int] = field(default_factory=list)
+    _whole: str | None = None
 
     def sha256(self) -> str:
-        """SHA-256 of every row (``key_members_sha256``)."""
-        return hashlib.sha256(formats.canonical([list(row) for row in self.rows])).hexdigest()
+        """SHA-256 of every row (``key_members_sha256``), computed once."""
+        if self._whole is None:
+            rows = [list(row) for row in self.rows]
+            self._whole = hashlib.sha256(formats.canonical(rows)).hexdigest()
+        return self._whole
 
     def _split(self) -> tuple[str, list[Member]]:
         if self._long is None or self._short is None:
@@ -894,14 +898,19 @@ def key_members(
     return KeyMembers(snapshot.snapshot_id, rows)
 
 
-def _resolution(
+def _resolution(  # noqa: PLR0913 -- the template, the run's snapshot and the pass's rows
     workspace: Workspace,
     template: Mapping[str, object],
     mapper_name: str,
     identity: Mapping[str, str] | None,
     identities: SharedInputs,
+    *,
+    members: dict[tuple[object, ...], KeyMembers],
 ) -> KeyMembers | None:
-    """The identity-key members of the snapshot a maintenance spec of ``template`` pins."""
+    """The identity-key members of the snapshot a maintenance spec of ``template`` pins.
+
+    ``members`` keeps each snapshot key's rows for the pass, so their digests are computed
+    once however many datasets and records use them."""
     pinned = cast("dict[str, str] | None", template.get("identity_snapshot"))
     if pinned is None:
         return None
@@ -910,7 +919,10 @@ def _resolution(
     key = mapper(mapper_name).identity(args)
     if key is None:
         return None
-    return key_members(workspace, snapshot, key, identities)
+    found = (snapshot["snapshot_id"], snapshot["content_hash"], key.pairs())
+    if found not in members:
+        members[found] = key_members(workspace, snapshot, key, identities)
+    return members[found]
 
 
 def _template(
@@ -1348,6 +1360,7 @@ def _promote_routes(  # noqa: PLR0913 -- the pass's explicit inputs
     linked = _linked(workspace)
     shas = {str(row["source_id"]): str(row["sha256"]) for row in list_sources(workspace)}
     runs: list[DatasetRun] = []
+    members: dict[tuple[object, ...], KeyMembers] = {}
     for route in routes:
         for dataset_id in _datasets(workspace, route.dataset_id):
             run = DatasetRun(dataset_id, route.mapper)
@@ -1360,7 +1373,9 @@ def _promote_routes(  # noqa: PLR0913 -- the pass's explicit inputs
             resolution = (
                 None
                 if found is None
-                else _resolution(workspace, found[2], run.mapper, identity, identities)
+                else _resolution(
+                    workspace, found[2], run.mapper, identity, identities, members=members
+                )
             )
             done, waiting = _done(workspace, dataset_id, resolution)
             pending = candidates(workspace, route, linked, shas, run.skipped, done=done)
